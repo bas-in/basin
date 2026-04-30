@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "extended_protocol",
+  "name": "Postgres extended-query protocol works end-to-end",
+  "claim": "tokio-postgres / asyncpg / JDBC default extended-query path runs CREATE / INSERT($1,$2) / prepared SELECT against Basin without falling back to simple_query.",
+  "passed": true,
+  "primary": {
+    "label": "Extended-protocol queries that succeed",
+    "value": 1.0,
+    "unit": "fraction",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "driver": "tokio-postgres 0.7",
+    "passed_queries": 10,
+    "total_queries": 10
+  },
+  "generated_at": "@1777589057"
+}

@@ -1,0 +1,23 @@
+{
+  "viability": [
+    "compression_ratio",
+    "idle_tenant_ram",
+    "predicate_pushdown",
+    "tenant_deletion",
+    "isolation_under_load",
+    "large_dataset_pointquery",
+    "vector_search",
+    "durable_catalog",
+    "extended_protocol",
+    "orm_compat"
+  ],
+  "scaling": [
+    "idle_tenants",
+    "data_size",
+    "concurrency",
+    "noisy_neighbor"
+  ],
+  "compare": [
+    "postgres"
+  ]
+}

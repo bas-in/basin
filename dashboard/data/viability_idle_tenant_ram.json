@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "idle_tenant_ram",
+  "name": "Idle-tenant RAM cost",
+  "claim": "Basin holds many idle tenants in one process for under 500 KiB each.",
+  "passed": true,
+  "primary": {
+    "label": "per_tenant_kib",
+    "value": 0.768,
+    "unit": "KiB",
+    "bar": {
+      "op": "less_than",
+      "value": 500.0
+    }
+  },
+  "details": {
+    "rss_after_kib": 5776,
+    "rss_before_kib": 5008,
+    "tenants": 1000
+  },
+  "generated_at": "@1777589192"
+}

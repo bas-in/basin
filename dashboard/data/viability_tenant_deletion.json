@@ -1,0 +1,20 @@
+{
+  "kind": "viability",
+  "id": "tenant_deletion",
+  "name": "Tenant deletion latency",
+  "claim": "Deleting a tenant of 1000 small files completes in under 1 second.",
+  "passed": true,
+  "primary": {
+    "label": "elapsed_ms",
+    "value": 34.470041,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 1000.0
+    }
+  },
+  "details": {
+    "files": 1000
+  },
+  "generated_at": "@1777589213"
+}

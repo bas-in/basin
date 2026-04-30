@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "large_dataset_pointquery",
+  "name": "Large-dataset point query",
+  "claim": "Point queries on a 10M-row dataset return in under 1 second.",
+  "passed": true,
+  "primary": {
+    "label": "point_query_ms",
+    "value": 30.72275,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 1000.0
+    }
+  },
+  "details": {
+    "files": 10,
+    "rows": 10000000,
+    "seed_elapsed_s": 10.86395475
+  },
+  "generated_at": "@1777589208"
+}

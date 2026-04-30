@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "durable_catalog",
+  "name": "Durable catalog: rows survive restart",
+  "claim": "Catalog metadata persists across basin-server restarts",
+  "passed": true,
+  "primary": {
+    "label": "rows survived restart",
+    "value": 1.0,
+    "unit": "bool",
+    "bar": {
+      "op": "equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "rows_after_restart": 3,
+    "rows_inserted": 3,
+    "schema": "basin_catalog_smoke_01kqg90xc9zqsmxh2mbmmjfwvm"
+  },
+  "generated_at": "@1777589056"
+}

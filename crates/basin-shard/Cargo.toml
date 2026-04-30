@@ -1,0 +1,30 @@
+[package]
+name = "basin-shard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-storage.workspace = true
+basin-catalog.workspace = true
+basin-wal.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-test.workspace = true

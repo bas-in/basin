@@ -1,0 +1,31 @@
+[package]
+name = "basin-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-vector.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+parquet.workspace = true
+object_store.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-test.workspace = true

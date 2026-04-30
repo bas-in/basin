@@ -1,0 +1,21 @@
+[package]
+name = "basin-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+uuid.workspace = true
+chrono.workspace = true

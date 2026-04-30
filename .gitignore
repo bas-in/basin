@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+.env
+.envrc
+.idea/
+.vscode/
+*.profraw
+/tmp/
