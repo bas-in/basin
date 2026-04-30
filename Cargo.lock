@@ -853,6 +853,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "object_store",
  "serde",
  "serde_json",
  "tempfile",

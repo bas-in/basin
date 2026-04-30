@@ -78,20 +78,28 @@ metric where Basin loses to PG.
 - [ ] Compactor: WAL segments → Parquet, atomic catalog commit
 - [ ] Dashboard: insert-latency card flips green vs PG
 
-## 4 — Shard owners + eviction (Phase 3, ~3 months)
+## 4 — Shard owners + eviction (Phase 3, ~3 months) — **v0.1 shipped 2026-05-01**
 
 Fixes the noisy-neighbor 42× p99 degradation surfaced on the dashboard.
 Enables genuinely many-tenant scale (every tenant has their own in-mem
 state; idle tenants evict). First time we can measure cold-start
 latency.
 
-- [ ] `basin-shard`: process holding `(tenant_id, partition) → in-mem state`
-- [ ] Lazy load tenant state from WAL + Parquet on first request
-- [ ] Idle eviction (default 5 min) with metrics on evictions
-- [ ] Read path: point-lookup by primary key from RAM
+- [x] `basin-shard`: in-process map of `(tenant_id, partition) → in-mem state`
+- [x] Lazy load tenant state from WAL + Parquet on first request
+- [x] Idle eviction (default 5 min) with metrics on evictions
+- [x] Read path: in-RAM tail merged with Parquet base; predicate eval on tail
+- [x] Background compactor: WAL → Parquet → catalog commit → WAL truncate
+- [x] Per-partition `RwLock`; outer map lock held only for lookup/insert
 - [ ] `basin-placement`: `(tenant, partition) → owner` map, etcd/FDB backed
 - [ ] Consistent hashing with virtual nodes
 - [ ] Fast failover: reassign shards within seconds on owner unreachable
+- [ ] On-disk `last_compacted_lsn` marker so cold load doesn't re-replay
+      already-compacted ranges (today: WAL truncate prevents duplicates,
+      but we still scan the truncated remainder)
+- [ ] Engine integration: route INSERT through shard owner instead of
+      synchronous Parquet write — turns `compare_postgres` insert row from
+      red to green
 - [ ] Bench: cold start < 200 ms, hot point-lookup < 1 ms
 - [ ] Dashboard: noisy-neighbor card flips green; cold-start card lights up
 

@@ -29,7 +29,7 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
 use basin_common::{PartitionKey, TableName, TenantId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
-use basin_integration_tests::dashboard::{
+use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
 use object_store::local::LocalFileSystem;

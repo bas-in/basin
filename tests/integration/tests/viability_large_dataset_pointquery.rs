@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
 use basin_common::{PartitionKey, TableName, TenantId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
-use basin_integration_tests::dashboard::{report_viability, BarOp, PrimaryMetric};
+use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;

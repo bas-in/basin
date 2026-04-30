@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_common::{PartitionKey, TableName, TenantId};
-use basin_integration_tests::dashboard::{report_viability, BarOp, PrimaryMetric};
+use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use serde_json::json;

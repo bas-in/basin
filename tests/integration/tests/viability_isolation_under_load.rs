@@ -19,7 +19,7 @@ use arrow_array::{Array, StringArray};
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
 use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
-use basin_integration_tests::dashboard::{report_viability, BarOp, PrimaryMetric};
+use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;

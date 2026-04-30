@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use basin_common::TenantId;
-use basin_integration_tests::dashboard::{report_viability, BarOp, PrimaryMetric};
+use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_router::{RunningServer, ServerConfig, StaticTenantResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;

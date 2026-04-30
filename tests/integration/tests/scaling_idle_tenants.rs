@@ -30,7 +30,7 @@ use std::time::Instant;
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{TableName, TenantId};
-use basin_integration_tests::dashboard::{
+use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
 use basin_storage::{Storage, StorageConfig};
