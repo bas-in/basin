@@ -1,0 +1,28 @@
+[package]
+name = "basin-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "basin-server"
+path = "src/main.rs"
+
+[dependencies]
+basin-common.workspace = true
+basin-storage.workspace = true
+basin-catalog.workspace = true
+basin-engine.workspace = true
+basin-router.workspace = true
+
+tokio.workspace = true
+object_store.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-postgres.workspace = true

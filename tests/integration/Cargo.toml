@@ -1,0 +1,36 @@
+[package]
+name = "basin-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-storage.workspace = true
+basin-catalog.workspace = true
+basin-engine.workspace = true
+basin-router.workspace = true
+basin-vector.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+object_store.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio-postgres.workspace = true
+walkdir = "2"
+async-trait.workspace = true
+ulid.workspace = true
+
+[lib]
+path = "src/lib.rs"

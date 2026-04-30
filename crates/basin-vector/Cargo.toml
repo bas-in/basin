@@ -1,0 +1,27 @@
+[package]
+name = "basin-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# HNSW. instant-distance is small, well-maintained, pure Rust, and exposes
+# the index as a serialisable structure — what we need for the
+# /tenants/{id}/tables/{name}/index/{col}.hnsw file format. The `with-serde`
+# feature is required so HnswMap implements Serialize/Deserialize.
+instant-distance = { version = "0.6", features = ["with-serde"] }
+
+[dev-dependencies]
+tempfile.workspace = true

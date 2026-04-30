@@ -1,0 +1,33 @@
+{
+  "kind": "compare",
+  "id": "postgres",
+  "name": "Basin vs Postgres 18 (no index, 1M rows)",
+  "claim": "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed point queries.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "On-disk bytes",
+      "basin": 8952667.0,
+      "postgres": 101195776.0,
+      "unit": "bytes",
+      "better": "basin",
+      "ratio_text": "pg / basin = 11.30x"
+    },
+    {
+      "label": "Point query p50",
+      "basin": 36.134792,
+      "postgres": 14.533,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.40x"
+    },
+    {
+      "label": "Insert 1M rows",
+      "basin": 11393.565625000001,
+      "postgres": 3019.741083,
+      "unit": "ms",
+      "better": "postgres"
+    }
+  ],
+  "generated_at": "@1777591116"
+}

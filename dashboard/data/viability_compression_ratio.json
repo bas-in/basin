@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "compression_ratio",
+  "name": "Audit-log Parquet vs CSV",
+  "claim": "Audit-log data is at least 10x smaller than CSV.",
+  "passed": true,
+  "primary": {
+    "label": "ratio (csv / parquet)",
+    "value": 20.220711243237197,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 10.0
+    }
+  },
+  "details": {
+    "csv_bytes": 126513913,
+    "parquet_bytes": 6256650,
+    "rows": 1000000
+  },
+  "generated_at": "@1777589191"
+}

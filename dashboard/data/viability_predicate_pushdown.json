@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "predicate_pushdown",
+  "name": "Predicate pushdown vs full scan",
+  "claim": "A point query reads at least 10x less than a full scan would.",
+  "passed": true,
+  "primary": {
+    "label": "reduction_x (full_scan_bytes / point_query_bytes)",
+    "value": 46.79353575599368,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 10.0
+    }
+  },
+  "details": {
+    "file_bytes": 5453088,
+    "full_scan_bytes": 5449388,
+    "point_query_bytes": 116456
+  },
+  "generated_at": "@1777589212"
+}

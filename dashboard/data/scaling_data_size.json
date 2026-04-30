@@ -1,0 +1,66 @@
+{
+  "kind": "scaling",
+  "id": "data_size",
+  "name": "Single-tenant data size scale-up",
+  "claim": "Storage is linear in row count; point-query latency stays bounded.",
+  "passed": true,
+  "x_axis": {
+    "key": "rows",
+    "label": "row count"
+  },
+  "series": [
+    {
+      "key": "disk_mib",
+      "label": "Disk",
+      "unit": "MiB"
+    },
+    {
+      "key": "bytes_per_row",
+      "label": "Bytes / row",
+      "unit": "B"
+    },
+    {
+      "key": "point_ms_p50",
+      "label": "Point query p50",
+      "unit": "ms"
+    },
+    {
+      "key": "scan_ms_p50",
+      "label": "Full scan p50",
+      "unit": "ms"
+    }
+  ],
+  "rows": [
+    {
+      "bytes_per_row": 8.25075,
+      "disk_mib": 0.7868528366088867,
+      "point_ms_p50": 23.25675,
+      "rows": 100000,
+      "scan_ms_p50": 55.460125
+    },
+    {
+      "bytes_per_row": 8.239334,
+      "disk_mib": 7.857641220092773,
+      "point_ms_p50": 23.255000000000003,
+      "rows": 1000000,
+      "scan_ms_p50": 556.892084
+    },
+    {
+      "bytes_per_row": 8.2410518,
+      "disk_mib": 78.59279441833496,
+      "point_ms_p50": 36.234207999999995,
+      "rows": 10000000,
+      "scan_ms_p50": 5595.657042
+    }
+  ],
+  "primary": {
+    "label": "point query p50 growth (10M / 100k)",
+    "value": 1.5580082341685746,
+    "unit": "x",
+    "bar": {
+      "op": "less_than",
+      "value": 5.0
+    }
+  },
+  "generated_at": "@1777589129"
+}

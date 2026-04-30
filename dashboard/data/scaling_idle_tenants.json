@@ -1,0 +1,64 @@
+{
+  "kind": "scaling",
+  "id": "idle_tenants",
+  "name": "Idle-tenant cost curve",
+  "claim": "RAM cost stays small per idle tenant as the tenant count grows.",
+  "passed": true,
+  "x_axis": {
+    "key": "tenants",
+    "label": "tenants"
+  },
+  "series": [
+    {
+      "key": "per_tenant_kib",
+      "label": "Per-tenant RSS",
+      "unit": "KiB"
+    },
+    {
+      "key": "provision_ms",
+      "label": "Provision time",
+      "unit": "ms"
+    },
+    {
+      "key": "rss_delta_kib",
+      "label": "RSS delta",
+      "unit": "KiB"
+    }
+  ],
+  "rows": [
+    {
+      "per_tenant_kib": 0.48,
+      "provision_ms": 0.46925,
+      "rss_delta_kib": 48,
+      "tenants": 100
+    },
+    {
+      "per_tenant_kib": 0.624,
+      "provision_ms": 4.758083,
+      "rss_delta_kib": 624,
+      "tenants": 1000
+    },
+    {
+      "per_tenant_kib": 0.5024,
+      "provision_ms": 21.958916,
+      "rss_delta_kib": 2512,
+      "tenants": 5000
+    },
+    {
+      "per_tenant_kib": 0.6704,
+      "provision_ms": 51.1435,
+      "rss_delta_kib": 6704,
+      "tenants": 10000
+    }
+  ],
+  "primary": {
+    "label": "max per_tenant_kib across scales",
+    "value": 0.6704,
+    "unit": "KiB",
+    "bar": {
+      "op": "less_than",
+      "value": 5.0
+    }
+  },
+  "generated_at": "@1777589129"
+}
