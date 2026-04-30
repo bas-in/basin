@@ -212,3 +212,5 @@ pub(crate) trait WalImpl: Send + Sync {
 }
 
 mod file_wal;
+mod segment;
+mod state;

@@ -21,7 +21,7 @@ use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::TenantId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
-use basin_integration_tests::dashboard::{report_postgres_compare, CompareMetric, WhichWins};
+use basin_integration_tests::benchmark::{report_postgres_compare, CompareMetric, WhichWins};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls};

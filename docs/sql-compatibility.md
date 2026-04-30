@@ -108,4 +108,4 @@ cargo test -p basin-integration-tests --test orm_smoke -- --nocapture
 The test seeds a fresh `TempDir` per run and binds an ephemeral port,
 so it's safe to run in parallel with other integration tests. The
 machine-readable result lands at
-`dashboard/data/viability_orm_compat.json`.
+`benchmark/data/viability_orm_compat.json`.

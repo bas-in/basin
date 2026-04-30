@@ -113,6 +113,14 @@ impl Shard {
     pub fn stats(&self) -> ShardStats {
         self.inner.stats()
     }
+
+    /// Test-only: pull out the concrete in-process implementation so the
+    /// inline tests can drive its synchronous helpers. Returns `None` if a
+    /// future backend swap replaces the in-process map.
+    #[cfg(test)]
+    pub(crate) fn impl_handle(&self) -> Option<Arc<in_process::InProcessShard>> {
+        self.inner.as_in_process()
+    }
 }
 
 impl std::fmt::Debug for Shard {
@@ -177,6 +185,11 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle;
     fn stats(&self) -> ShardStats;
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
+    /// Test-only downcast for the inline test suite.
+    #[cfg(test)]
+    fn as_in_process(&self) -> Option<Arc<in_process::InProcessShard>> {
+        None
+    }
 }
 
 #[async_trait]

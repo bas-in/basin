@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use basin_common::TenantId;
-use basin_integration_tests::dashboard::{report_viability, BarOp, PrimaryMetric};
+use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_router::{ServerConfig, StaticTenantResolver};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
