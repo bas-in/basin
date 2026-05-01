@@ -11,9 +11,10 @@
 
 <p align="center">
   <a href="./WEDGE.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="benchmarks" src="https://img.shields.io/badge/benchmarks-13%2F14_passing-brightgreen?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: disk wins" src="https://img.shields.io/badge/vs_postgres-disk_12.5%C3%97_smaller-blue?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="point query 3x faster" src="https://img.shields.io/badge/point_query-3.13%C3%97_faster_than_PG-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS.md"><img alt="benchmarks" src="https://img.shields.io/badge/benchmarks-15%2F16_passing-brightgreen?style=flat-square"></a>
+  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: disk 12.5x smaller" src="https://img.shields.io/badge/vs_postgres-disk_12.5%C3%97_smaller-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: 10x more conns" src="https://img.shields.io/badge/vs_postgres-10%C3%97_more_conns-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: 47x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-47%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
   <a href="./CAPABILITIES.md"><img alt="capabilities" src="https://img.shields.io/badge/capabilities-matrix-blue?style=flat-square"></a>
   <a href="./docs/decisions/"><img alt="decisions" src="https://img.shields.io/badge/decisions-ADR_tracked-blueviolet?style=flat-square"></a>
   <a href="./LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square"></a>
@@ -29,22 +30,44 @@ One architecture from a 10 MB hobbyist tenant to a 100 TB enterprise tenant. No 
 
 ---
 
-## The numbers (vs Postgres 18, same workload)
+## The numbers (vs Postgres 18, same workload, same hardware)
+
+### Storage and query performance
 
 | | Basin | Postgres | Result |
 |---|---|---|---|
 | **On-disk size** (1 M audit-log rows) | **8.1 MiB** | 96.5 MiB | **Basin wins 12.5×** |
 | **Compression vs CSV** (audit logs) | **20.22×** smaller | ~1× | Basin wins decisively |
-| **Point query p50** (no index either side) | **4.64 ms** | 14.5 ms | **Basin wins 3.13×** |
-| **Insert 1 M rows** (100 × 10k batches) | **2.54 s** | 3.25 s | **Basin wins 1.28×** |
-| **Single-row INSERT throughput** | **17,740 / sec** | n/a | 0.056 ms per insert through full pipeline |
-| **Idle-tenant RAM cost** (1,000 tenants) | **1.2 KiB / tenant** | ~10 MB / tenant (one DB each) | **Basin wins ~10,000×** |
-| **Tenant deletion** (1,000 files) | **34 ms** | seconds — minutes | **Basin wins** |
+| **Point query p50** (no index either side) | **4.04 ms** | 14.08 ms | **Basin wins 3.48×** |
+| **Insert 1 M rows** (100 × 10k batches) | **2.41 s** | 2.61 s | **Basin wins 1.09×** |
+| **Single-row INSERT throughput** (full pipeline) | **22,300 / sec** | n/a | 0.045 ms per insert |
 | **Predicate pushdown** (1-of-1M point query) | **46.8×** byte reduction | requires an index | Basin wins without an index |
-| **Noisy-neighbor p99 ratio** | **2.27×** | n/a | Passes the < 5× bar |
 
-Full dashboard: open [`benchmark/index.html`](./benchmark/index.html) directly (no server needed).
-Live regenerable report: [`benchmark/RESULTS.md`](./benchmark/RESULTS.md).
+### Server lifecycle and concurrency
+
+| | Basin | Postgres | Result |
+|---|---|---|---|
+| **Connections held under 1,000-conn flood** | **1,000** | 100 (hard wall) | **Basin wins 10×, structural** |
+| **Refused connections under flood** | **0** | 900 | Basin doesn't refuse a single one |
+| **RAM per held-open connection** | **165 KiB** | 7,895 KiB | **Basin wins 47.7×** |
+| **Connection-accept latency p50** | **1.17 ms** | 1.37 ms | Basin wins 1.17× |
+
+The connection-scaling and RSS results are the **structural** advantage of being a from-scratch Rust-on-tokio server vs Postgres's fork-per-connection model. They don't shrink as the workload grows; they get more dramatic.
+
+### Multi-tenant lifecycle
+
+| | Basin | Postgres | Result |
+|---|---|---|---|
+| **Idle-tenant RAM cost** (1,000 tenants) | **1.2 KiB / tenant** | ~10 MB / tenant (one DB each) | **Basin wins ~10,000×** |
+| **Schema migration** `ADD COLUMN` (100K rows, no default) | **0.04 ms** (metadata-only) | 1.45 ms | Basin wins ~37× |
+| **Tenant deletion** (100K rows / 100 files, local FS) | 4.77 ms | 3.47 ms | PG wins 0.73× — honest, see below |
+| **Cross-tenant isolation under 2,000 mixed ops** | **0 leaks** | n/a | Structural via bucket prefix |
+| **Noisy-neighbor p99 degradation** | **2.27×** | n/a | Passes the < 5× bar |
+
+> **Honest mixed result on tenant deletion at 100K rows on local FS:** PG's `DROP SCHEMA CASCADE` is a few catalog rows and an `unlink`; Basin's `O(file count)` deletion does 100 separate `delete()` calls. The wedge claim — bucket-prefix delete vs vacuum / extent walks — surfaces at scale (multi-GB tenants on S3), not on a small tmpfs table. Reported as-measured; the dashboard tells the full story.
+
+Full live dashboard: open [`benchmark/index.html`](./benchmark/index.html) directly (no server needed).
+Auto-regenerated Markdown report: [`benchmark/RESULTS.md`](./benchmark/RESULTS.md).
 
 ---
 

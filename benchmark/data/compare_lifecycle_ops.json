@@ -1,0 +1,26 @@
+{
+  "kind": "compare",
+  "id": "lifecycle_ops",
+  "name": "Lifecycle ops: tenant deletion + ADD COLUMN",
+  "claim": "Basin makes tenant teardown a list+delete and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "Tenant deletion (1 tenant, 100K rows)",
+      "basin": 4.77275,
+      "postgres": 3.47375,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.73x"
+    },
+    {
+      "label": "ADD COLUMN on 100K rows (Basin: catalog-only simulation; engine doesn't parse ALTER yet)",
+      "basin": 0.038333,
+      "postgres": 1.4468750000000001,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 37.74x"
+    }
+  ],
+  "generated_at": "@1777597108"
+}

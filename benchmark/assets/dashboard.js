@@ -1,6 +1,6 @@
 // Basin dashboard renderer.
 // Prefers window.__BASIN_RESULTS (populated by data/results.js, generated
-// by dashboard/bundle.py) so the page works when index.html is opened
+// by benchmark/bundle.py) so the page works when index.html is opened
 // directly via file://. Falls back to fetch() of the per-id JSON files
 // when the bundle is absent — that path requires a local HTTP server
 // because browsers block fetch over file://.
@@ -198,7 +198,7 @@
       const err = new Error("not_found");
       err.notFound = true;
       err.message =
-        "data/results.js missing — run `python3 dashboard/bundle.py` after `cargo test`";
+        "data/results.js missing — run `python3 benchmark/bundle.py` after `cargo test`";
       throw err;
     }
     const res = await fetch(path, { cache: "no-store" });
@@ -997,7 +997,7 @@
     } catch (e) {
       const msg =
         location.protocol === "file:"
-          ? "Manifest could not be loaded. Run `python3 dashboard/bundle.py` after `cargo test` to regenerate dashboard/data/results.js, then reload."
+          ? "Manifest could not be loaded. Run `python3 benchmark/bundle.py` after `cargo test` to regenerate benchmark/data/results.js, then reload."
           : `Manifest could not be loaded: ${e.message || e}`;
       const banner = el("div", { class: "card card--error" }, [
         cardHeader("Dashboard data unavailable", msg, errorPill("ERROR")),

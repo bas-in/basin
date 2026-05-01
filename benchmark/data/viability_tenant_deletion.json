@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "elapsed_ms",
-    "value": 37.678916,
+    "value": 38.643042,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -16,5 +16,5 @@
   "details": {
     "files": 1000
   },
-  "generated_at": "@1777595073"
+  "generated_at": "@1777597138"
 }
