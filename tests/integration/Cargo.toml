@@ -13,6 +13,8 @@ basin-catalog.workspace = true
 basin-engine.workspace = true
 basin-router.workspace = true
 basin-vector.workspace = true
+basin-shard.workspace = true
+basin-wal.workspace = true
 
 tokio.workspace = true
 futures.workspace = true

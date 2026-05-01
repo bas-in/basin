@@ -49,10 +49,17 @@ use basin_common::{Result, TenantId};
 /// `storage` and `catalog` are shared across all tenant sessions; per-tenant
 /// scoping happens *inside* the engine, not by handing out per-tenant
 /// instances.
+///
+/// `shard` is optional. When `Some`, INSERTs route through the shard owner's
+/// WAL-acked write path, and SELECTs trigger a synchronous compaction beforehand
+/// so the Parquet base reflects the in-RAM tail (Option A in the design notes).
+/// When `None`, the engine falls back to its legacy synchronous Parquet write
+/// path — kept for tests that haven't yet been migrated to construct a shard.
 #[derive(Clone)]
 pub struct EngineConfig {
     pub storage: basin_storage::Storage,
     pub catalog: Arc<dyn basin_catalog::Catalog>,
+    pub shard: Option<basin_shard::Shard>,
 }
 
 /// The Basin SQL engine. Cheap to clone (`Arc` inside).
@@ -169,6 +176,7 @@ mod convert;
 mod ddl;
 mod dml;
 mod executor;
+mod fast_select;
 mod prepared;
 mod session;
 mod types;
@@ -194,7 +202,11 @@ mod tests {
             root_prefix: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
-        Engine::new(EngineConfig { storage, catalog })
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
     }
 
     /// Pull the column `name` out of the first batch as i64 values.

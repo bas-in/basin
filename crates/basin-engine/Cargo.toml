@@ -11,6 +11,8 @@ basin-common.workspace = true
 basin-storage.workspace = true
 basin-catalog.workspace = true
 basin-vector.workspace = true
+basin-shard.workspace = true
+basin-wal.workspace = true
 
 tokio.workspace = true
 futures.workspace = true

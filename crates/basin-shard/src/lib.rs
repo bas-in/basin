@@ -114,6 +114,17 @@ impl Shard {
         self.inner.stats()
     }
 
+    /// Synchronously drain every resident partition's in-memory tail into
+    /// Parquet, committing through the catalog and truncating the WAL.
+    ///
+    /// Engines that share read paths with batch analytics use this to make a
+    /// just-written batch visible to a downstream `SELECT` that reads through
+    /// the Parquet base (no tail-merge), trading a small latency hit on the
+    /// query for not having to teach the analytical pipeline about tails.
+    pub async fn flush_to_parquet(&self) -> Result<()> {
+        self.inner.flush_to_parquet().await
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -185,6 +196,7 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle;
     fn stats(&self) -> ShardStats;
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
+    async fn flush_to_parquet(&self) -> Result<()>;
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<in_process::InProcessShard>> {

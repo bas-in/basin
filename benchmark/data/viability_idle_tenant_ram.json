@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "per_tenant_kib",
-    "value": 0.768,
+    "value": 0.656,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "rss_after_kib": 5776,
-    "rss_before_kib": 5008,
+    "rss_after_kib": 5856,
+    "rss_before_kib": 5200,
     "tenants": 1000
   },
-  "generated_at": "@1777589192"
+  "generated_at": "@1777595056"
 }

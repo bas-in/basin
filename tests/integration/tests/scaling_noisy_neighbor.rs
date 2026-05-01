@@ -149,6 +149,7 @@ async fn scaling_4_noisy_neighbor() {
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
+        shard: None,
     });
     let quiet_sess = engine.open_session(quiet_tenant).await.unwrap();
     // Warm DataFusion once.

@@ -7,27 +7,27 @@
   "metrics": [
     {
       "label": "On-disk bytes",
-      "basin": 8952667.0,
-      "postgres": 101195776.0,
+      "basin": 8099659.0,
+      "postgres": 101203968.0,
       "unit": "bytes",
       "better": "basin",
-      "ratio_text": "pg / basin = 11.30x"
+      "ratio_text": "pg / basin = 12.49x"
     },
     {
       "label": "Point query p50",
-      "basin": 36.134792,
-      "postgres": 14.533,
+      "basin": 94.031459,
+      "postgres": 705.279,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.40x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 7.50x"
     },
     {
       "label": "Insert 1M rows",
-      "basin": 11393.565625000001,
-      "postgres": 3019.741083,
+      "basin": 25347.759209,
+      "postgres": 97417.56891599999,
       "unit": "ms",
-      "better": "postgres"
+      "better": "basin"
     }
   ],
-  "generated_at": "@1777591116"
+  "generated_at": "@1777596802"
 }

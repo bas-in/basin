@@ -50,7 +50,11 @@ async fn viability_5_isolation_under_load() {
         root_prefix: None,
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
-    let engine = Engine::new(EngineConfig { storage, catalog });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
 
     // Provision tenants. Each gets its own sentinel marker (the tenant id
     // string itself — guaranteed unique). Open a session per tenant so the

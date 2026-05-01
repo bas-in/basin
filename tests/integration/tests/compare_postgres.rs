@@ -15,7 +15,7 @@
 #![allow(clippy::print_stdout)]
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
@@ -227,16 +227,37 @@ async fn scaling_5_compare_postgres() {
     let pg_point_p50 = median(&pg_point_ms);
 
     // ---- Basin path --------------------------------------------------------
+    // Wire the WAL + shard owner. INSERTs route through the shard (WAL ack
+    // first, then a background compactor flushes to Parquet). SELECTs trigger
+    // a synchronous compaction so the Parquet base reflects the in-RAM tail
+    // (Option A); this keeps the existing DataFusion path working unchanged.
     let dir = TempDir::new().unwrap();
+    let wal_dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+    let wal = basin_wal::Wal::open(basin_wal::WalConfig {
+        object_store: Arc::new(wal_fs),
+        root_prefix: None,
+        flush_interval: Duration::from_millis(200),
+        flush_max_bytes: 1024 * 1024,
+    })
+    .await
+    .unwrap();
+    let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
+    let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
         catalog,
+        shard: Some(shard),
     });
     let tenant = TenantId::new();
     let sess = engine.open_session(tenant).await.unwrap();
@@ -261,8 +282,6 @@ async fn scaling_5_compare_postgres() {
         row_idx += INSERT_BATCH as i64;
     }
     let basin_insert_ms = basin_insert_started.elapsed().as_secs_f64() * 1000.0;
-
-    let basin_disk_bytes = dir_size_parquet(dir.path());
 
     // Basin point query: 5 samples.
     let mut basin_point_ms: Vec<f64> = Vec::with_capacity(5);
@@ -296,6 +315,12 @@ async fn scaling_5_compare_postgres() {
         basin_point_ms.push(elapsed);
     }
     let basin_point_p50 = median(&basin_point_ms);
+
+    // Disk measurement happens after the SELECTs so the synchronous compaction
+    // has flushed every WAL-resident batch to Parquet. Measuring before any
+    // SELECT would undercount, since the tail still lives in RAM + WAL until
+    // the first read drains it via the engine's tail-visibility hook.
+    let basin_disk_bytes = dir_size_parquet(dir.path());
 
     // ---- Print -------------------------------------------------------------
     let basin_mib = basin_disk_bytes as f64 / (1024.0 * 1024.0);
@@ -368,6 +393,12 @@ async fn scaling_5_compare_postgres() {
         metrics,
         None,
     );
+
+    // Stop the shard's background loops + close the WAL before the runtime
+    // shuts down, otherwise the file-backed WAL emits a warning when its
+    // background flusher is dropped mid-flight.
+    bg.shutdown().await;
+    wal.close().await.unwrap();
 
     // Drop the schema explicitly first; the guard remains as the safety net.
     drop(_guard);

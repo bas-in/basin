@@ -2,12 +2,12 @@
 //!
 //! Every viability / scaling / comparison test calls one of the `report_*`
 //! functions below at the end. Each writes a file to
-//! `<repo_root>/dashboard/data/<id>.json`, atomically replacing any prior
+//! `<repo_root>/benchmark/data/<id>.json`, atomically replacing any prior
 //! result, with the schema the dashboard `index.html` expects.
 //!
 //! Files are independent — different tests can run in parallel without
 //! racing on a shared file. The dashboard knows the list of expected IDs
-//! from `dashboard/data/manifest.json` (also written by these helpers when
+//! from `benchmark/data/manifest.json` (also written by these helpers when
 //! the test category is reported).
 //!
 //! The functions are infallible from the test's perspective: any IO failure
@@ -20,17 +20,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-const DASHBOARD_DIR: &str = "dashboard/data";
+const DATA_DIR: &str = "benchmark/data";
 
-/// Path to `<repo_root>/dashboard/data/`. Resolved from this crate's
+/// Path to `<repo_root>/benchmark/data/`. Resolved from this crate's
 /// `CARGO_MANIFEST_DIR` (= `tests/integration`) walked up two parents.
 fn data_dir() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(Path::parent)
-        .map(|p| p.join(DASHBOARD_DIR))
-        .unwrap_or_else(|| PathBuf::from(DASHBOARD_DIR))
+        .map(|p| p.join(DATA_DIR))
+        .unwrap_or_else(|| PathBuf::from(DATA_DIR))
 }
 
 fn now_iso() -> String {
@@ -115,7 +115,7 @@ pub struct CompareMetric {
     pub ratio_text: Option<String>,
 }
 
-/// One viability-test record. Emitted to `dashboard/data/viability_<id>.json`.
+/// One viability-test record. Emitted to `benchmark/data/viability_<id>.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ViabilityReport<'a> {
     pub kind: &'static str,
@@ -128,7 +128,7 @@ pub struct ViabilityReport<'a> {
     pub generated_at: String,
 }
 
-/// One scaling-curve record. Emitted to `dashboard/data/scaling_<id>.json`.
+/// One scaling-curve record. Emitted to `benchmark/data/scaling_<id>.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScalingReport<'a> {
     pub kind: &'static str,
@@ -258,8 +258,8 @@ mod tests {
         let p = data_dir();
         let s = p.to_string_lossy();
         assert!(
-            s.ends_with("dashboard/data"),
-            "data dir should end at dashboard/data, got {s}"
+            s.ends_with("benchmark/data"),
+            "data dir should end at benchmark/data, got {s}"
         );
     }
 

@@ -9,7 +9,8 @@
     "vector_search",
     "durable_catalog",
     "extended_protocol",
-    "orm_compat"
+    "orm_compat",
+    "shard_insert_path"
   ],
   "scaling": [
     "idle_tenants",
