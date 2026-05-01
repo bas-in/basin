@@ -134,11 +134,19 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 | Per-tenant metrics (ops/s, p50/p99, RAM, S3 IO) | 🛠 | minimal today |
 | OpenTelemetry traces | 🛠 | wired through router → engine → storage |
 | Structured logs (`tracing` JSON) | ✅ | format selectable at startup |
-| Connection pooling at the edge | ◻️ | post extended-query |
+| Connection pooling (`basin-pool`) | ◻️ scoped | [ADR 0007](./docs/decisions/0007-connection-pooling.md). Native `TenantSession` cache, ~1 week build. Pgbouncer is the wrong tool — see ADR. |
 | Rate limiting | ◻️ | per-tenant throttles |
 | Bring-your-own-bucket | ◻️ | Phase 6 |
 | Bring-your-own-key (KMS) | ◻️ | Phase 6 |
 | Stripe billing integration | ◻️ | Phase 6 |
+
+## Auth and REST API
+
+| Capability | Status | Notes |
+|---|---|---|
+| `basin-auth` (signup, signin, magic-link, password reset, JWT, refresh) | ◻️ scoped | [ADR 0005](./docs/decisions/0005-auth-system.md). Requires SMTP at startup. Trigger: $50k+ ARR contract or BaaS pivot. |
+| `basin-rest` (PostgREST-compatible HTTP layer) | ◻️ scoped | [ADR 0006](./docs/decisions/0006-rest-api-layer.md). Depends on basin-auth. Trigger: 0005 shipped + paying customer asks. |
+| Real PostgREST (Haskell) sitting in front of Basin | 🚫 | needs `pg_catalog` / `information_schema` — 2–4 month slog with ongoing maintenance. Building basin-rest natively is ~3 weeks instead. |
 
 ## What we're not building, and what to use instead
 

@@ -11,7 +11,8 @@ window.__BASIN_RESULTS = {
       "vector_search",
       "durable_catalog",
       "extended_protocol",
-      "orm_compat"
+      "orm_compat",
+      "shard_insert_path"
     ],
     "scaling": [
       "idle_tenants",
@@ -33,29 +34,29 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "On-disk bytes",
-          "basin": 8952667.0,
+          "basin": 8099659.0,
           "postgres": 101195776.0,
           "unit": "bytes",
           "better": "basin",
-          "ratio_text": "pg / basin = 11.30x"
+          "ratio_text": "pg / basin = 12.49x"
         },
         {
           "label": "Point query p50",
-          "basin": 36.134792,
-          "postgres": 14.533,
+          "basin": 4.64225,
+          "postgres": 14.537,
           "unit": "ms",
-          "better": "postgres",
-          "ratio_text": "pg / basin = 0.40x"
+          "better": "basin",
+          "ratio_text": "pg / basin = 3.13x"
         },
         {
           "label": "Insert 1M rows",
-          "basin": 11393.565625000001,
-          "postgres": 3019.741083,
+          "basin": 2538.3987079999997,
+          "postgres": 3248.588625,
           "unit": "ms",
-          "better": "postgres"
+          "better": "basin"
         }
       ],
-      "generated_at": "@1777591116"
+      "generated_at": "@1777595595"
     },
     "scaling_concurrency": {
       "kind": "scaling",
@@ -87,39 +88,39 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 19969.0,
-          "per_task_qps": 51.333333333333336,
-          "total_qps": 51.333333333333336
+          "median_latency_us": 20237.0,
+          "per_task_qps": 50.333333333333336,
+          "total_qps": 50.333333333333336
         },
         {
           "concurrency": 4,
-          "median_latency_us": 21207.0,
-          "per_task_qps": 47.833333333333336,
-          "total_qps": 191.33333333333334
+          "median_latency_us": 21466.0,
+          "per_task_qps": 46.333333333333336,
+          "total_qps": 185.33333333333334
         },
         {
           "concurrency": 16,
-          "median_latency_us": 67836.0,
-          "per_task_qps": 15.166666666666666,
-          "total_qps": 242.66666666666666
+          "median_latency_us": 68957.0,
+          "per_task_qps": 14.4375,
+          "total_qps": 231.0
         },
         {
           "concurrency": 64,
-          "median_latency_us": 257152.0,
-          "per_task_qps": 3.9739583333333335,
-          "total_qps": 254.33333333333334
+          "median_latency_us": 286435.0,
+          "per_task_qps": 3.8072916666666665,
+          "total_qps": 243.66666666666666
         }
       ],
       "primary": {
         "label": "total_qps speed-up (64 / 1)",
-        "value": 4.954545454545454,
+        "value": 4.841059602649006,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 4.0
         }
       },
-      "generated_at": "@1777589072"
+      "generated_at": "@1777594944"
     },
     "scaling_data_size": {
       "kind": "scaling",
@@ -157,35 +158,35 @@ window.__BASIN_RESULTS = {
         {
           "bytes_per_row": 8.25075,
           "disk_mib": 0.7868528366088867,
-          "point_ms_p50": 23.25675,
+          "point_ms_p50": 23.400333,
           "rows": 100000,
-          "scan_ms_p50": 55.460125
+          "scan_ms_p50": 56.145042
         },
         {
           "bytes_per_row": 8.239334,
           "disk_mib": 7.857641220092773,
-          "point_ms_p50": 23.255000000000003,
+          "point_ms_p50": 23.906084,
           "rows": 1000000,
-          "scan_ms_p50": 556.892084
+          "scan_ms_p50": 565.695959
         },
         {
           "bytes_per_row": 8.2410518,
           "disk_mib": 78.59279441833496,
-          "point_ms_p50": 36.234207999999995,
+          "point_ms_p50": 37.035584,
           "rows": 10000000,
-          "scan_ms_p50": 5595.657042
+          "scan_ms_p50": 5929.9151249999995
         }
       ],
       "primary": {
         "label": "point query p50 growth (10M / 100k)",
-        "value": 1.5580082341685746,
+        "value": 1.5826947419936288,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777589129"
+      "generated_at": "@1777595002"
     },
     "scaling_idle_tenants": {
       "kind": "scaling",
@@ -216,47 +217,47 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_tenant_kib": 0.48,
-          "provision_ms": 0.46925,
-          "rss_delta_kib": 48,
+          "per_tenant_kib": 2.4,
+          "provision_ms": 0.480666,
+          "rss_delta_kib": 240,
           "tenants": 100
         },
         {
-          "per_tenant_kib": 0.624,
-          "provision_ms": 4.758083,
-          "rss_delta_kib": 624,
+          "per_tenant_kib": 0.704,
+          "provision_ms": 4.907916,
+          "rss_delta_kib": 704,
           "tenants": 1000
         },
         {
           "per_tenant_kib": 0.5024,
-          "provision_ms": 21.958916,
+          "provision_ms": 23.016125,
           "rss_delta_kib": 2512,
           "tenants": 5000
         },
         {
-          "per_tenant_kib": 0.6704,
-          "provision_ms": 51.1435,
-          "rss_delta_kib": 6704,
+          "per_tenant_kib": 0.6992,
+          "provision_ms": 52.733166,
+          "rss_delta_kib": 6992,
           "tenants": 10000
         }
       ],
       "primary": {
         "label": "max per_tenant_kib across scales",
-        "value": 0.6704,
+        "value": 2.4,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777589129"
+      "generated_at": "@1777595002"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
       "id": "noisy_neighbor",
       "name": "Noisy-neighbor degradation",
       "claim": "A heavy noisy tenant doesn't crater a quiet tenant's p99 latency.",
-      "passed": false,
+      "passed": true,
       "x_axis": {
         "key": "scenario",
         "label": "scenario"
@@ -275,31 +276,31 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "p50_ms": 3.080875,
-          "p99_ms": 3.6622920000000003,
+          "p50_ms": 0.5902499999999999,
+          "p99_ms": 0.919708,
           "scenario": "baseline"
         },
         {
-          "p50_ms": 12.905042,
-          "p99_ms": 72.750417,
+          "p50_ms": 1.1308749999999999,
+          "p99_ms": 2.086834,
           "scenario": "under_load"
         },
         {
-          "p50_ms": 4.188758713027955,
-          "p99_ms": 19.86472323888974,
+          "p50_ms": 1.9159254553155443,
+          "p99_ms": 2.269017992667238,
           "scenario": "ratio"
         }
       ],
       "primary": {
         "label": "p99 ratio (under_load / baseline)",
-        "value": 19.86472323888974,
+        "value": 2.269017992667238,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777589150"
+      "generated_at": "@1777595736"
     },
     "viability_compression_ratio": {
       "kind": "viability",
@@ -321,7 +322,7 @@ window.__BASIN_RESULTS = {
         "parquet_bytes": 6256650,
         "rows": 1000000
       },
-      "generated_at": "@1777589191"
+      "generated_at": "@1777595056"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -341,9 +342,9 @@ window.__BASIN_RESULTS = {
       "details": {
         "rows_after_restart": 3,
         "rows_inserted": 3,
-        "schema": "basin_catalog_smoke_01kqg90xc9zqsmxh2mbmmjfwvm"
+        "schema": "basin_catalog_smoke_01kqgem37f8yekffjwbjd6ae5h"
       },
-      "generated_at": "@1777589056"
+      "generated_at": "@1777594928"
     },
     "viability_extended_protocol": {
       "kind": "viability",
@@ -365,7 +366,7 @@ window.__BASIN_RESULTS = {
         "passed_queries": 10,
         "total_queries": 10
       },
-      "generated_at": "@1777589057"
+      "generated_at": "@1777594930"
     },
     "viability_idle_tenant_ram": {
       "kind": "viability",
@@ -375,7 +376,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "per_tenant_kib",
-        "value": 0.768,
+        "value": 0.656,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
@@ -383,11 +384,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "rss_after_kib": 5776,
-        "rss_before_kib": 5008,
+        "rss_after_kib": 5856,
+        "rss_before_kib": 5200,
         "tenants": 1000
       },
-      "generated_at": "@1777589192"
+      "generated_at": "@1777595056"
     },
     "viability_isolation_under_load": {
       "kind": "viability",
@@ -405,11 +406,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_s": 1.2313015,
+        "elapsed_s": 1.394769375,
         "ops": 2000,
         "tenants": 50
       },
-      "generated_at": "@1777589195"
+      "generated_at": "@1777595057"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
@@ -419,7 +420,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "point_query_ms",
-        "value": 30.72275,
+        "value": 26.587,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -429,9 +430,9 @@ window.__BASIN_RESULTS = {
       "details": {
         "files": 10,
         "rows": 10000000,
-        "seed_elapsed_s": 10.86395475
+        "seed_elapsed_s": 11.755067625
       },
-      "generated_at": "@1777589208"
+      "generated_at": "@1777595069"
     },
     "viability_orm_compat": {
       "kind": "viability",
@@ -504,7 +505,7 @@ window.__BASIN_RESULTS = {
         ],
         "total": 7
       },
-      "generated_at": "@1777589875"
+      "generated_at": "@1777594929"
     },
     "viability_predicate_pushdown": {
       "kind": "viability",
@@ -526,7 +527,29 @@ window.__BASIN_RESULTS = {
         "full_scan_bytes": 5449388,
         "point_query_bytes": 116456
       },
-      "generated_at": "@1777589212"
+      "generated_at": "@1777595073"
+    },
+    "viability_shard_insert_path": {
+      "kind": "viability",
+      "id": "shard_insert_path",
+      "name": "Shard-acked INSERT path",
+      "claim": "Single-row INSERTs route through the WAL + shard owner and acks fast enough that point INSERT throughput is no longer Parquet-bound.",
+      "passed": true,
+      "primary": {
+        "label": "inserts_per_sec",
+        "value": 17740.929000908585,
+        "unit": "inserts/sec",
+        "bar": {
+          "op": "greater_than_or_equal",
+          "value": 50.0
+        }
+      },
+      "details": {
+        "elapsed_ms": 56.366834,
+        "ms_per_insert": 0.056366834,
+        "n_inserts": 1000
+      },
+      "generated_at": "@1777595864"
     },
     "viability_tenant_deletion": {
       "kind": "viability",
@@ -536,7 +559,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "elapsed_ms",
-        "value": 34.470041,
+        "value": 37.678916,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -546,7 +569,7 @@ window.__BASIN_RESULTS = {
       "details": {
         "files": 1000
       },
-      "generated_at": "@1777589213"
+      "generated_at": "@1777595073"
     },
     "viability_vector_search": {
       "kind": "viability",
@@ -556,7 +579,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "HNSW speed-up vs brute-force",
-        "value": 1.7238249518478765,
+        "value": 2.0531808687648248,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -576,7 +599,7 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "brute_ms": 173.851625,
+        "brute_ms": 217.48575,
         "dim": 64,
         "hnsw_ids": [
           3764,
@@ -590,13 +613,13 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "hnsw_ms": 100.85225,
+        "hnsw_ms": 105.92625,
         "overlap": 10,
         "rows": 5000,
         "sql_rows": 100,
         "top_k": 10
       },
-      "generated_at": "@1777589184"
+      "generated_at": "@1777595049"
     }
   }
 };

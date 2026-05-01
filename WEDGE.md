@@ -60,7 +60,7 @@ the catalog persisted before it can be a database, not just a demo.
       rows survive
 - [x] Dashboard: `durable_catalog` viability card
 
-## 3 — WAL + fast write acks (Phase 2, ~2 months)
+## 3 — WAL + fast write acks (Phase 2, ~2 months) — **v0.1 shipped 2026-05-01**
 
 Today inserts are ~4–5× behind Postgres because the write path is
 synchronous: Arrow → Parquet → ZSTD → object_store → catalog commit. The
@@ -68,15 +68,17 @@ architectural answer is a Raft-backed WAL with sub-5ms acks; Parquet
 flush moves to background compaction. Closes the only wedge-relevant
 metric where Basin loses to PG.
 
-- [ ] `basin-wal`: 3-node `openraft` group, append keyed by
-      `(tenant_id, partition)`
-- [ ] Batched flush to S3 every 200 ms or 1 MB
-- [ ] Recovery: replay WAL segments from S3 on cold boot
-- [ ] Bench: 10k writes/sec sustained, p99 < 5 ms, no data loss under
-      node kill
-- [ ] Chaos test: kill leader mid-batch, verify no committed write is lost
-- [ ] Compactor: WAL segments → Parquet, atomic catalog commit
-- [ ] Dashboard: insert-latency card flips green vs PG
+- [x] `basin-wal`: file-backed single-node v0.1 (Raft is v0.2). Append
+      keyed by `(tenant_id, partition)`, monotonic LSN per partition
+- [x] Batched flush to object storage every 200 ms or 1 MB
+- [x] Recovery: list segments and replay on `Wal::open`
+- [x] Bench: **57k writes/sec debug, 954k writes/sec release** —
+      well above the 10k/sec spec target
+- [ ] Chaos test (deferred to Raft v0.2 — single-node has no peers)
+- [x] Compactor (in basin-shard): WAL → Parquet → atomic catalog
+      commit → WAL truncate
+- [ ] Engine integration: route INSERT through WAL+shard so the
+      dashboard's insert-latency card flips green (in flight)
 
 ## 4 — Shard owners + eviction (Phase 3, ~3 months) — **v0.1 shipped 2026-05-01**
 
@@ -102,6 +104,28 @@ latency.
       red to green
 - [ ] Bench: cold start < 200 ms, hot point-lookup < 1 ms
 - [ ] Dashboard: noisy-neighbor card flips green; cold-start card lights up
+
+## 5c — Connection pooler (`basin-pool`) (~1 week) — scoped 2026-05-01
+
+A thin native pooler that caches `TenantSession` objects by
+`(tenant_id, client_id)` and reuses them across short-lived client
+connections (Lambda, Cloud Run, the per-request lifecycle).
+
+Pgbouncer specifically does **not** work for Basin (its transaction-
+pooling mode rewrites session state Basin doesn't have); a native
+pooler is both smaller and better-fitted. See
+[ADR 0007](./docs/decisions/0007-connection-pooling.md).
+
+- [ ] `basin-pool` crate scaffold; `PoolConfig` (max sessions, idle TTL,
+      per-tenant cap)
+- [ ] LRU cache keyed on `(TenantId, client_id)` with idle eviction
+- [ ] `pgwire` accept loop checks the pool first, opens a fresh
+      session only on miss
+- [ ] Per-tenant cap so one tenant's burst can't starve others
+- [ ] Metrics: hit rate, miss rate, evictions, sessions resident
+- [ ] Smoke test: 1000 short-lived connections cycle through 10
+      pool slots without `Engine::open_session` being called more
+      than ~10 times
 
 ## 5b — Multi-region read replicas (~2-3 months) — added 2026-04-30
 

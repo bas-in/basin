@@ -596,9 +596,15 @@
     const series = report.series || [];
     const rows = report.rows || [];
 
-    // Decide axes
+    // Decide axes. If any x-value is non-numeric, fall back to a categorical
+    // bar chart (Chart.js's linear scale silently drops string x-values, so
+    // line-mode would render an empty chart for tests like noisy_neighbor
+    // whose x-axis is a scenario name).
     const xValues = rows.map((r) => r[xAxis.key]);
-    const useLogX = spansOrders(xValues, 2);
+    const isCategorical = xValues.some(
+      (v) => typeof v !== "number" || !Number.isFinite(v),
+    );
+    const useLogX = !isCategorical && spansOrders(xValues, 2);
 
     // Group series by unit for multi-Y-axis support
     const units = Array.from(new Set(series.map((s) => s.unit || "")));
@@ -625,6 +631,17 @@
       const unit = s.unit || "";
       const yAxisID = "y" + units.indexOf(unit);
       const color = SERIES_COLORS[i % SERIES_COLORS.length];
+      if (isCategorical) {
+        return {
+          label: s.label || s.key,
+          data: rows.map((r) => r[s.key]),
+          backgroundColor: color,
+          borderColor: color,
+          borderWidth: 0,
+          borderRadius: 4,
+          yAxisID,
+        };
+      }
       return {
         label: s.label || s.key,
         data: rows.map((r) => ({ x: r[xAxis.key], y: r[s.key] })),
@@ -650,9 +667,44 @@
     chartWrap.appendChild(canvas);
     left.appendChild(chartWrap);
 
+    const xScale = isCategorical
+      ? {
+          type: "category",
+          title: {
+            display: true,
+            text: xAxis.label || xAxis.key,
+            color: "#64748b",
+            font: { size: 11 },
+          },
+          grid: { display: false },
+          ticks: { color: "#64748b" },
+        }
+      : {
+          type: useLogX ? "logarithmic" : "linear",
+          title: {
+            display: true,
+            text: xAxis.label || xAxis.key,
+            color: "#64748b",
+            font: { size: 11 },
+          },
+          grid: { color: "#f1f5f9" },
+          ticks: {
+            color: "#64748b",
+            callback: (v) => {
+              if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+              if (Math.abs(v) >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
+              return v;
+            },
+          },
+        };
+
+    const chartData = isCategorical
+      ? { labels: xValues.map((v) => String(v)), datasets }
+      : { datasets };
+
     const chartConfig = {
-      type: "line",
-      data: { datasets },
+      type: isCategorical ? "bar" : "line",
+      data: chartData,
       options: {
         responsive: true,
         maintainAspectRatio: false,
@@ -680,24 +732,7 @@
           },
         },
         scales: {
-          x: {
-            type: useLogX ? "logarithmic" : "linear",
-            title: {
-              display: true,
-              text: xAxis.label || xAxis.key,
-              color: "#64748b",
-              font: { size: 11 },
-            },
-            grid: { color: "#f1f5f9" },
-            ticks: {
-              color: "#64748b",
-              callback: (v) => {
-                if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
-                if (Math.abs(v) >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
-                return v;
-              },
-            },
-          },
+          x: xScale,
           ...yAxes,
         },
       },

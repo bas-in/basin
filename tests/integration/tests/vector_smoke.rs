@@ -90,6 +90,7 @@ async fn vector_search_smoke() {
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
+        shard: None,
     });
 
     let tenant = TenantId::new();

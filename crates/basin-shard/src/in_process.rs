@@ -464,6 +464,10 @@ impl ShardImpl for InProcessShard {
         Arc::new(self.share_clone())
     }
 
+    async fn flush_to_parquet(&self) -> Result<()> {
+        self.compact_all().await
+    }
+
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))

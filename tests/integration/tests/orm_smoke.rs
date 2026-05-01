@@ -46,7 +46,11 @@ async fn start_server() -> TestServer {
     });
     let catalog: Arc<dyn basin_catalog::Catalog> =
         Arc::new(basin_catalog::InMemoryCatalog::new());
-    let engine = basin_engine::Engine::new(basin_engine::EngineConfig { storage, catalog });
+    let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
 
     let mut map = HashMap::new();
     map.insert("alice".to_owned(), TenantId::new());

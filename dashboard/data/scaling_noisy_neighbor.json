@@ -3,7 +3,7 @@
   "id": "noisy_neighbor",
   "name": "Noisy-neighbor degradation",
   "claim": "A heavy noisy tenant doesn't crater a quiet tenant's p99 latency.",
-  "passed": true,
+  "passed": false,
   "x_axis": {
     "key": "scenario",
     "label": "scenario"
@@ -22,29 +22,29 @@
   ],
   "rows": [
     {
-      "p50_ms": 0.5902499999999999,
-      "p99_ms": 0.919708,
+      "p50_ms": 3.369875,
+      "p99_ms": 13.568999999999999,
       "scenario": "baseline"
     },
     {
-      "p50_ms": 1.1308749999999999,
-      "p99_ms": 2.086834,
+      "p50_ms": 10.945459,
+      "p99_ms": 99.28637499999999,
       "scenario": "under_load"
     },
     {
-      "p50_ms": 1.9159254553155443,
-      "p99_ms": 2.269017992667238,
+      "p50_ms": 3.2480311584257575,
+      "p99_ms": 7.31714754219176,
       "scenario": "ratio"
     }
   ],
   "primary": {
     "label": "p99 ratio (under_load / baseline)",
-    "value": 2.269017992667238,
+    "value": 7.31714754219176,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1777595736"
+  "generated_at": "@1777593122"
 }

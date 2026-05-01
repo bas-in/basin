@@ -13,6 +13,7 @@ use sqlparser::parser::Parser;
 use crate::convert::{batch_df_to_ws, schema_df_to_ws};
 use crate::ddl::schema_from_columns;
 use crate::dml::batch_from_rows;
+use crate::fast_select::{execute_simple_select, match_simple_select};
 use crate::session::refresh_table;
 use crate::{ExecResult, TenantSession};
 
@@ -37,7 +38,14 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     match stmt {
         Statement::CreateTable(ct) => exec_create_table(sess, ct).await,
         Statement::Insert(ins) => exec_insert(sess, ins).await,
-        Statement::Query(_) => exec_select(sess, sql).await,
+        Statement::Query(_) => {
+            // Try the point-query fast path first. It only matches a tightly
+            // constrained shape; on any rejection we fall back to DataFusion.
+            if let Some(plan) = match_simple_select(&stmt) {
+                return execute_simple_select(sess, plan).await;
+            }
+            exec_select(sess, sql).await
+        }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
         other => Err(BasinError::internal(format!(
             "unsupported in PoC: {other}"
@@ -96,6 +104,21 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     let row_count = batch.num_rows();
     let part = PartitionKey::default_key();
 
+    // Shard-enabled path. The shard owner appends to its WAL, acks once durable,
+    // and lets its background compactor drain into Parquet + commit through the
+    // catalog later. We do *not* call `append_data_files` ourselves here: that
+    // would race the compactor's own commit and produce a duplicate snapshot.
+    if let Some(shard) = sess.engine.config().shard.as_ref() {
+        let handle = shard.get(&sess.tenant, &part).await?;
+        handle.write_batch(&table, batch).await?;
+        // SELECT-side handles tail-visibility (Option A: force-compact). Skip
+        // the DataFusion ListingTable refresh here; reads will trigger it.
+        return Ok(ExecResult::Empty {
+            tag: format!("INSERT 0 {row_count}"),
+        });
+    }
+
+    // Legacy synchronous path (no shard configured).
     let df = sess
         .engine
         .config()
@@ -147,6 +170,34 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
 }
 
 async fn exec_select(sess: &TenantSession, sql: &str) -> Result<ExecResult> {
+    // Option A for tail-visibility: when the shard is wired in, the in-RAM
+    // tail produced by INSERTs hasn't yet landed in Parquet. Force a synchronous
+    // flush + catalog commit before planning so DataFusion's ListingTable scan
+    // sees the just-written rows. After the flush we refresh every table this
+    // session has touched so the cached `ListingTable` picks up the new data
+    // file. This trades a small per-SELECT latency cost for keeping joins /
+    // aggregations / projections on the existing planner without teaching them
+    // about the tail.
+    if let Some(shard) = sess.engine.config().shard.as_ref() {
+        shard.flush_to_parquet().await?;
+        let tables: Vec<_> = sess
+            .engine
+            .config()
+            .catalog
+            .list_tables(&sess.tenant)
+            .await?;
+        for table in &tables {
+            crate::session::refresh_table(
+                &sess.engine,
+                &sess.tenant,
+                &sess.ctx,
+                &sess.state,
+                table,
+            )
+            .await?;
+        }
+    }
+
     let df = sess
         .ctx
         .sql(sql)
@@ -158,10 +209,38 @@ async fn exec_select(sess: &TenantSession, sql: &str) -> Result<ExecResult> {
     // workspace version).
     let df_schema = df.schema().inner().clone();
     let ws_schema = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
-    let df_batches = df
-        .collect()
+
+    // Change C: when the shard is wired in we know there are large per-tenant
+    // tails on the same runtime. Move the DataFusion executor onto the
+    // blocking thread pool so its parquet-decode loop can't pin the
+    // cooperative tokio workers a quiet tenant's point queries run on. Tests
+    // that run without a shard keep the single-await path and behave as
+    // before.
+    let df_batches = if sess.engine.config().shard.is_some() {
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| BasinError::internal(format!("create plan: {e}")))?;
+        let task_ctx = sess.ctx.task_ctx();
+        let join = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| BasinError::internal(format!("blocking runtime: {e}")))?;
+            rt.block_on(async {
+                datafusion::physical_plan::collect(plan, task_ctx)
+                    .await
+                    .map_err(|e| BasinError::internal(format!("execute: {e}")))
+            })
+        })
         .await
-        .map_err(|e| BasinError::internal(format!("execute: {e}")))?;
+        .map_err(|e| BasinError::internal(format!("spawn_blocking join: {e}")))?;
+        join?
+    } else {
+        df.collect()
+            .await
+            .map_err(|e| BasinError::internal(format!("execute: {e}")))?
+    };
     let mut batches: Vec<RecordBatch> = Vec::with_capacity(df_batches.len());
     for b in df_batches.iter() {
         batches.push(batch_df_to_ws(b)?);

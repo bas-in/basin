@@ -112,7 +112,11 @@ async fn boot_server(
             .expect("connect postgres catalog");
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(pg_catalog);
     let engine =
-        basin_engine::Engine::new(basin_engine::EngineConfig { storage, catalog });
+        basin_engine::Engine::new(basin_engine::EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        });
 
     let mut map = HashMap::new();
     map.insert(user.to_owned(), tenant);

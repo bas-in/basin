@@ -121,6 +121,7 @@ async fn viability_6_large_dataset_pointquery() {
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
+        shard: None,
     });
     let sess = engine.open_session(tenant).await.unwrap();
 

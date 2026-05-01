@@ -22,6 +22,22 @@
 //! BASIN_CATALOG=postgres://pc@127.0.0.1:5432/postgres   # durable, persists across restarts
 //! BASIN_CATALOG_SCHEMA=basin_catalog                    # optional, default = basin_catalog
 //! ```
+//!
+//! ## WAL + shard owner
+//!
+//! Two env vars gate the new WAL-acked write path:
+//!
+//! ```text
+//! BASIN_SHARD_ENABLED=1     # default 0; when 1, INSERTs route through basin-shard
+//! BASIN_WAL_DIR=/tmp/wal    # default ${BASIN_DATA_DIR}/wal
+//! ```
+//!
+//! When `BASIN_SHARD_ENABLED=1`, the server opens a `basin-wal::Wal` rooted at
+//! `BASIN_WAL_DIR`, constructs a `basin-shard::Shard` over it, and hands a clone
+//! into `EngineConfig::shard`. The shard's background eviction + compaction
+//! loops are spawned and shut down cleanly on Ctrl-C. With the flag unset the
+//! engine falls back to its legacy synchronous Parquet write path so existing
+//! demos remain reproducible.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -41,6 +57,7 @@ async fn main() -> Result<()> {
         bind = %cfg.bind,
         data_dir = %cfg.data_dir.display(),
         tenants = cfg.tenants.len(),
+        shard_enabled = cfg.shard_enabled,
         "starting basin-server"
     );
 
@@ -65,9 +82,45 @@ async fn main() -> Result<()> {
             Arc::new(cat)
         }
     };
+
+    // Optional WAL + shard owner. Constructed when BASIN_SHARD_ENABLED=1 so we
+    // can ship the wedge-deepening change incrementally without breaking demos
+    // that don't have a writable WAL directory available.
+    let mut shard_handles: Option<(basin_shard::Shard, basin_shard::ShardBackgroundHandle, basin_wal::Wal)> = None;
+    let shard_for_engine: Option<basin_shard::Shard> = if cfg.shard_enabled {
+        std::fs::create_dir_all(&cfg.wal_dir)
+            .with_context(|| format!("create WAL dir {}", cfg.wal_dir.display()))?;
+        let wal_fs = LocalFileSystem::new_with_prefix(&cfg.wal_dir)
+            .with_context(|| format!("WAL LocalFileSystem at {}", cfg.wal_dir.display()))?;
+        let wal = basin_wal::Wal::open(basin_wal::WalConfig {
+            object_store: Arc::new(wal_fs),
+            root_prefix: None,
+            flush_interval: std::time::Duration::from_millis(200),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .context("open WAL")?;
+        let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
+            storage.clone(),
+            catalog.clone(),
+            wal.clone(),
+        ));
+        let bg = shard.spawn_background();
+        tracing::info!(
+            wal_dir = %cfg.wal_dir.display(),
+            "shard owner enabled; INSERTs will route through WAL + compactor"
+        );
+        let to_engine = shard.clone();
+        shard_handles = Some((shard, bg, wal));
+        Some(to_engine)
+    } else {
+        None
+    };
+
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
+        shard: shard_for_engine,
     });
 
     let mut resolver = StaticTenantResolver::default();
@@ -76,19 +129,45 @@ async fn main() -> Result<()> {
         resolver = resolver.with_entry(user, tenant);
     }
 
-    basin_router::run(ServerConfig {
+    // Run the router until Ctrl-C, then shut down the shard's background loops
+    // and close the WAL. Order matters: stop accepting writes (router exit),
+    // then drain compactions (shutdown), then close the WAL — that way no
+    // segment is mid-flush when the file handles drop.
+    let (router_tx, router_rx) = tokio::sync::oneshot::channel();
+    let server_cfg = ServerConfig {
         bind_addr: cfg.bind,
         engine,
         tenant_resolver: Arc::new(resolver),
-    })
-    .await
-    .map_err(|e| anyhow!("router exited: {e}"))?;
+    };
+
+    let router_join = tokio::spawn(async move {
+        basin_router::run_with_shutdown(server_cfg, router_rx).await
+    });
+
+    // Wait for Ctrl-C, then signal the router to stop.
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("shutdown signal received");
+    let _ = router_tx.send(());
+    let router_result = router_join.await.map_err(|e| anyhow!("router join: {e}"))?;
+
+    if let Some((_, bg, wal)) = shard_handles.take() {
+        tracing::info!("draining shard background loops");
+        bg.shutdown().await;
+        tracing::info!("closing WAL");
+        if let Err(e) = wal.close().await {
+            tracing::warn!(error = %e, "WAL close failed");
+        }
+    }
+
+    router_result.map_err(|e| anyhow!("router exited: {e}"))?;
     Ok(())
 }
 
 struct Cfg {
     bind: SocketAddr,
     data_dir: PathBuf,
+    wal_dir: PathBuf,
+    shard_enabled: bool,
     tenants: Vec<(String, TenantId)>,
     catalog: CatalogBackend,
 }
@@ -109,6 +188,13 @@ impl Cfg {
         let data_dir: PathBuf = std::env::var("BASIN_DATA_DIR")
             .unwrap_or_else(|_| "./.basin-data".to_string())
             .into();
+        let wal_dir: PathBuf = std::env::var("BASIN_WAL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir.join("wal"));
+        let shard_enabled = matches!(
+            std::env::var("BASIN_SHARD_ENABLED").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        );
         let raw = std::env::var("BASIN_TENANTS").unwrap_or_else(|_| "alice=*".to_string());
         let mut tenants = Vec::new();
         for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -129,7 +215,7 @@ impl Cfg {
             return Err(anyhow!("BASIN_TENANTS produced no entries"));
         }
         let catalog = parse_catalog_env()?;
-        Ok(Self { bind, data_dir, tenants, catalog })
+        Ok(Self { bind, data_dir, wal_dir, shard_enabled, tenants, catalog })
     }
 }
 
