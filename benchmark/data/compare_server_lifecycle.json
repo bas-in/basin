@@ -1,0 +1,41 @@
+{
+  "kind": "compare",
+  "id": "server_lifecycle",
+  "name": "Server lifecycle: accept, conn-scaling, RSS/conn",
+  "claim": "Basin's tokio-task model handles dramatically more connections at lower memory than PG's process-per-connection.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "Connection accept latency p50",
+      "basin": 1.165708,
+      "postgres": 1.3675,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.17x"
+    },
+    {
+      "label": "Connections held under 1000-conn flood",
+      "basin": 1000.0,
+      "postgres": 100.0,
+      "unit": "conns",
+      "better": "basin",
+      "ratio_text": "basin / pg = 10.00x"
+    },
+    {
+      "label": "Refused conns under 1000-conn flood",
+      "basin": 0.0,
+      "postgres": 900.0,
+      "unit": "conns",
+      "better": "basin"
+    },
+    {
+      "label": "RSS per held-open connection",
+      "basin": 165.44,
+      "postgres": 7895.68,
+      "unit": "KiB",
+      "better": "basin",
+      "ratio_text": "pg / basin = 47.73x"
+    }
+  ],
+  "generated_at": "@1777597121"
+}

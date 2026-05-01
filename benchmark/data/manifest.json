@@ -19,6 +19,8 @@
     "noisy_neighbor"
   ],
   "compare": [
-    "postgres"
+    "postgres",
+    "server_lifecycle",
+    "lifecycle_ops"
   ]
 }

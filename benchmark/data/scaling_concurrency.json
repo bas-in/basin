@@ -28,37 +28,37 @@
   "rows": [
     {
       "concurrency": 1,
-      "median_latency_us": 59649.0,
-      "per_task_qps": 17.333333333333332,
-      "total_qps": 17.333333333333332
+      "median_latency_us": 2588.0,
+      "per_task_qps": 388.3333333333333,
+      "total_qps": 388.3333333333333
     },
     {
       "concurrency": 4,
-      "median_latency_us": 61534.0,
-      "per_task_qps": 15.583333333333334,
-      "total_qps": 62.333333333333336
+      "median_latency_us": 2898.0,
+      "per_task_qps": 263.25,
+      "total_qps": 1053.0
     },
     {
       "concurrency": 16,
-      "median_latency_us": 215593.0,
-      "per_task_qps": 5.395833333333333,
-      "total_qps": 86.33333333333333
+      "median_latency_us": 9758.0,
+      "per_task_qps": 83.91666666666667,
+      "total_qps": 1342.6666666666667
     },
     {
       "concurrency": 64,
-      "median_latency_us": 956051.0,
-      "per_task_qps": 1.5260416666666667,
-      "total_qps": 97.66666666666667
+      "median_latency_us": 44289.0,
+      "per_task_qps": 22.59375,
+      "total_qps": 1446.0
     }
   ],
   "primary": {
-    "label": "total_qps speed-up (64 / 1)",
-    "value": 5.634615384615385,
+    "label": "peak speed-up vs C=1",
+    "value": 3.7236051502145924,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
-      "value": 4.0
+      "value": 3.5
     }
   },
-  "generated_at": "@1777596843"
+  "generated_at": "@1777597927"
 }

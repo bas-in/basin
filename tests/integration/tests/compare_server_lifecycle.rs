@@ -124,10 +124,13 @@ fn find_postmaster_pid() -> Option<u32> {
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     for line in s.lines() {
-        let mut it = line.splitn(3, char::is_whitespace);
-        let pid = it.next()?.trim().parse::<u32>().ok()?;
-        let ppid = it.next()?.trim().parse::<u32>().ok()?;
-        let cmd = it.next().unwrap_or("");
+        // `ps` right-pads pid columns with spaces. split_whitespace eats
+        // leading/repeated spaces; we manually re-join the tail to keep
+        // any spaces inside the command line.
+        let mut it = line.split_whitespace();
+        let Some(pid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
+        let Some(ppid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
+        let cmd: String = it.collect::<Vec<_>>().join(" ");
         // The postmaster's command line is the absolute path to the
         // `postgres` binary, possibly with `-D <datadir>`. Backends look
         // like `postgres: <state>` and have ppid != 1, so the ppid==1
@@ -354,7 +357,7 @@ async fn compare_server_lifecycle() {
 
     // ---- Bring up an in-process Basin server for metrics A and B --------
     let dir = TempDir::new().unwrap();
-    let wal_dir = TempDir::new().unwrap();
+    let _wal_dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
