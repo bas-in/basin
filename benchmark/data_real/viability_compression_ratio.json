@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "bucket": "basin-bucket",
+    "bucket": "baisn-test",
     "csv_bytes": 126513913,
-    "endpoint": "http://127.0.0.1:9000",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "parquet_bytes": 6256650,
     "rows": 1000000
   },
-  "generated_at": "@1777602442"
+  "generated_at": "@1777924970"
 }

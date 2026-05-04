@@ -3,10 +3,10 @@
   "id": "update_delete",
   "name": "UPDATE / DELETE via copy-on-write (real S3)",
   "claim": "An UPDATE and a DELETE on a 10K-row real-S3 table commit end-to-end (parser → executor → S3 rewrite → catalog Replace snapshot) in under 2 seconds.",
-  "passed": true,
+  "passed": false,
   "primary": {
     "label": "UPDATE+DELETE elapsed (ms)",
-    "value": 19.070709,
+    "value": 9804.811751000001,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -14,13 +14,13 @@
     }
   },
   "details": {
-    "bucket": "basin-bucket",
-    "delete_ms": 8.469709,
-    "endpoint": "http://127.0.0.1:9000",
+    "bucket": "baisn-test",
+    "delete_ms": 4698.283042,
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "remaining_rows": 9997,
     "rows": 10000,
-    "total_ms": 19.070709,
-    "update_ms": 10.600999999999999
+    "total_ms": 9804.811751000001,
+    "update_ms": 5106.528709
   },
-  "generated_at": "@1777668394"
+  "generated_at": "@1777924771"
 }

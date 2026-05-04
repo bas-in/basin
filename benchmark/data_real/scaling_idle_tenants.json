@@ -28,25 +28,25 @@
   "rows": [
     {
       "per_tenant_kib": 0.16,
-      "provision_ms": 0.089417,
+      "provision_ms": 0.081625,
       "rss_delta_kib": 16,
       "tenants": 100
     },
     {
-      "per_tenant_kib": 0.464,
-      "provision_ms": 0.7993330000000001,
-      "rss_delta_kib": 464,
+      "per_tenant_kib": 0.448,
+      "provision_ms": 0.784458,
+      "rss_delta_kib": 448,
       "tenants": 1000
     },
     {
-      "per_tenant_kib": 0.4672,
-      "provision_ms": 3.926291,
-      "rss_delta_kib": 2336,
+      "per_tenant_kib": 0.4704,
+      "provision_ms": 3.839291,
+      "rss_delta_kib": 2352,
       "tenants": 5000
     },
     {
       "per_tenant_kib": 0.6864,
-      "provision_ms": 8.973042000000001,
+      "provision_ms": 8.863667000000001,
       "rss_delta_kib": 6864,
       "tenants": 10000
     }
@@ -60,5 +60,5 @@
       "value": 5.0
     }
   },
-  "generated_at": "@1777668425"
+  "generated_at": "@1777924761"
 }

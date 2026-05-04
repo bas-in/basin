@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "inserts_per_sec",
-    "value": 8422.267211166241,
+    "value": 16571.75882290797,
     "unit": "inserts/sec",
     "bar": {
       "op": "greater_than_or_equal",
@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "bucket": "basin-bucket",
-    "elapsed_ms": 118.732875,
-    "endpoint": "http://127.0.0.1:9000",
-    "ms_per_insert": 0.118732875,
+    "bucket": "baisn-test",
+    "elapsed_ms": 60.343624999999996,
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+    "ms_per_insert": 0.060343625,
     "n_inserts": 1000
   },
-  "generated_at": "@1777602528"
+  "generated_at": "@1777924616"
 }

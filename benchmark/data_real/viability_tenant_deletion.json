@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "elapsed_ms",
-    "value": 321.710208,
+    "value": 7992.65625,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "bucket": "basin-bucket",
-    "endpoint": "http://127.0.0.1:9000",
+    "bucket": "baisn-test",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "files": 1000
   },
-  "generated_at": "@1777602457"
+  "generated_at": "@1777924724"
 }

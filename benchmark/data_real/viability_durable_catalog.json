@@ -2,11 +2,11 @@
   "kind": "viability",
   "id": "durable_catalog",
   "name": "Durable catalog: rows survive restart (real S3)",
-  "claim": "Catalog metadata persists across basin-server restarts (postgres-backed catalog + real-S3 storage)",
-  "passed": false,
+  "claim": "Catalog metadata + S3-resident parquet survives a basin-server restart: rows written through pgwire come back identical after the server is dropped and a fresh server is started against the same Postgres schema and the same S3 prefix.",
+  "passed": true,
   "primary": {
     "label": "rows survived restart",
-    "value": 0.0,
+    "value": 1.0,
     "unit": "bool",
     "bar": {
       "op": "equal",
@@ -14,8 +14,11 @@
     }
   },
   "details": {
-    "reason": "[postgres] not in test config",
-    "skipped": true
+    "bucket": "baisn-test",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+    "rows_after_restart": 3,
+    "rows_inserted": 3,
+    "schema": "basin_s3_durable_catalog_01kqtb5mnrmwdc1ryygvnas2pj"
   },
-  "generated_at": "@1777668964"
+  "generated_at": "@1777926862"
 }

@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "bucket": "basin-bucket",
-    "elapsed_s": 1.640497584,
-    "endpoint": "http://127.0.0.1:9000",
+    "bucket": "baisn-test",
+    "elapsed_s": 236.883908417,
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "ops": 1000,
     "tenants": 50
   },
-  "generated_at": "@1777602485"
+  "generated_at": "@1777925344"
 }
