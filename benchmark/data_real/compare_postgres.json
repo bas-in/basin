@@ -2,9 +2,33 @@
   "kind": "compare",
   "id": "postgres",
   "name": "Basin (real S3) vs Postgres 18 (no index, 100K rows)",
-  "claim": "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed point queries.",
-  "available": false,
-  "metrics": [],
-  "generated_at": "@1777602607",
-  "note": "postgres unavailable"
+  "claim": "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed point queries — even with the S3 round-trip cost.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "On-disk bytes",
+      "basin": 825075.0,
+      "postgres": 10149888.0,
+      "unit": "bytes",
+      "better": "basin",
+      "ratio_text": "pg / basin = 12.30x"
+    },
+    {
+      "label": "Point query p50",
+      "basin": 1760.030916,
+      "postgres": 4.538,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.00x"
+    },
+    {
+      "label": "Insert 100K rows",
+      "basin": 409.723291,
+      "postgres": 411.874958,
+      "unit": "ms",
+      "better": "basin"
+    }
+  ],
+  "generated_at": "@1777926749",
+  "note": "Basin storage on real S3; PG on local 18. Insert path: WAL + shard with in-RAM WAL store."
 }

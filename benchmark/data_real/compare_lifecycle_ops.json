@@ -2,9 +2,26 @@
   "kind": "compare",
   "id": "lifecycle_ops",
   "name": "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-  "claim": "Basin makes tenant teardown a list+delete and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
-  "available": false,
-  "metrics": [],
-  "generated_at": "@1777602634",
-  "note": "postgres unavailable"
+  "claim": "Basin makes tenant teardown a list+delete and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "Tenant deletion (1 tenant, 100K rows in 100 files; basin on S3)",
+      "basin": 2445.0791249999997,
+      "postgres": 6.540667,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.00x"
+    },
+    {
+      "label": "ADD COLUMN on 100K rows (Basin: catalog-only simulation; engine doesn't parse ALTER yet)",
+      "basin": 0.021665999999999998,
+      "postgres": 5.346375,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 246.76x"
+    }
+  ],
+  "generated_at": "@1777926779",
+  "note": "Basin storage on real S3 — tenant deletion is parallel DELETE round-trips, not unlinked inodes."
 }

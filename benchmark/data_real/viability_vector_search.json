@@ -14,16 +14,16 @@
     }
   },
   "details": {
-    "brute_ms": 182.66175,
-    "bucket": "basin-bucket",
+    "brute_ms": 5388.278625,
+    "bucket": "baisn-test",
     "dim": 64,
-    "endpoint": "http://127.0.0.1:9000",
-    "hnsw_ms": 103.35187499999999,
-    "hnsw_speedup_x": 1.767377224651222,
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+    "hnsw_ms": 4504.4055,
+    "hnsw_speedup_x": 1.1962241465605172,
     "overlap": 10,
     "rows": 5000,
     "sql_rows": 100,
     "top_k": 10
   },
-  "generated_at": "@1777604459"
+  "generated_at": "@1777924637"
 }

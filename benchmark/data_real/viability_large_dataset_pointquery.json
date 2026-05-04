@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "point_query_ms",
-    "value": 36.9095,
+    "value": 1727.475792,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "bucket": "basin-bucket",
-    "endpoint": "http://127.0.0.1:9000",
+    "bucket": "baisn-test",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "files": 10,
     "rows": 10000000,
-    "seed_elapsed_s": 9.126907875
+    "seed_elapsed_s": 27.433862458
   },
-  "generated_at": "@1777602475"
+  "generated_at": "@1777925581"
 }

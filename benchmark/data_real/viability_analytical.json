@@ -15,14 +15,14 @@
   },
   "details": {
     "analytical_ms": null,
-    "bucket": "basin-bucket",
-    "endpoint": "http://127.0.0.1:9000",
-    "engine_ms_oltp_on_s3": 82.948875,
+    "bucket": "baisn-test",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+    "engine_ms_oltp_on_s3": 13711.041233200001,
     "files": 10,
     "groups": 16,
     "rows": 1000000,
     "speedup": 0.0,
     "v01_limitation": "basin-analytical requires local_fs_root; DuckDB httpfs is v0.2"
   },
-  "generated_at": "@1777667789"
+  "generated_at": "@1777924733"
 }
