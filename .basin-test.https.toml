@@ -1,0 +1,28 @@
+# Basin integration-test config — local MinIO over HTTPS with HTTP/2.
+# Use with: BASIN_TEST_CONFIG=./.basin-test.https.toml cargo test ...
+#
+# Setup:
+#   BASIN_LOCAL_S3_TLS=1 ./benchmark/start_local_s3.sh --bg
+# Cert at .basin-local-s3-certs/{public.crt,private.key} (self-signed, IP=127.0.0.1).
+#
+# `http2_only = true` forces reqwest to negotiate h2 over TLS via ALPN.
+# h2 multiplexes many concurrent streams over one TCP socket, eliminating
+# HTTP/1.1 head-of-line blocking when one tenant's bulk transfer would
+# otherwise tie up the connection pool.
+
+[s3]
+bucket = "basin-bucket"
+region = "us-east-1"
+prefix = "basin-test"
+
+access_key_id     = "basinminioadmin"
+secret_access_key = "basinminiosecret123"
+session_token     = ""
+
+# HTTPS endpoint — self-signed cert. With reqwest + object_store this
+# requires `with_allow_invalid_certificates(true)` (already wired below
+# via the `accept_invalid_certs` flag).
+endpoint = "https://127.0.0.1:9000"
+allow_http = false
+http2_only = true
+accept_invalid_certs = true

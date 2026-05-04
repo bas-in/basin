@@ -11,7 +11,8 @@
 
 <p align="center">
   <a href="./WEDGE.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="benchmarks" src="https://img.shields.io/badge/benchmarks-15%2F16_passing-brightgreen?style=flat-square"></a>
+  <a href="./benchmark/RESULTS.md"><img alt="tests: 266 passing" src="https://img.shields.io/badge/tests-266_passing-brightgreen?style=flat-square"></a>
+  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: point query 3.5x faster" src="https://img.shields.io/badge/vs_postgres-point_3.5%C3%97_faster-blue?style=flat-square"></a>
   <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: disk 12.5x smaller" src="https://img.shields.io/badge/vs_postgres-disk_12.5%C3%97_smaller-blue?style=flat-square"></a>
   <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: 10x more conns" src="https://img.shields.io/badge/vs_postgres-10%C3%97_more_conns-blue?style=flat-square"></a>
   <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: 47x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-47%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
@@ -41,7 +42,7 @@ One architecture from a 10 MB hobbyist tenant to a 100 TB enterprise tenant. No 
 | **Point query p50** (no index either side) | **4.04 ms** | 14.08 ms | **Basin wins 3.48×** |
 | **Insert 1 M rows** (100 × 10k batches) | **2.41 s** | 2.61 s | **Basin wins 1.09×** |
 | **Single-row INSERT throughput** (full pipeline) | **22,300 / sec** | n/a | 0.045 ms per insert |
-| **Predicate pushdown** (1-of-1M point query) | **46.8×** byte reduction | requires an index | Basin wins without an index |
+| **Predicate pushdown** (1-of-1M point query) | **101.18×** byte reduction | requires an index | Basin wins without an index |
 
 ### Server lifecycle and concurrency
 
@@ -73,13 +74,27 @@ Auto-regenerated Markdown report: [`benchmark/RESULTS.md`](./benchmark/RESULTS.m
 
 ## Quick tour
 
-Boot the server:
+Boot the server. The minimal config is one line; the full config layers in
+the WAL, shard owner, connection pool, JWT auth, and REST endpoint:
 
 ```sh
+# Minimum viable basin-server (pgwire only, in-memory catalog):
+cargo run -p basin-server
+
+# Production-shaped boot with everything wired together:
 BASIN_BIND=127.0.0.1:5433 \
 BASIN_DATA_DIR=/tmp/basin \
 BASIN_TENANTS='alice=*,bob=*' \
 BASIN_CATALOG=postgres://localhost:5432/postgres \
+BASIN_SHARD_ENABLED=1 \
+BASIN_POOL_ENABLED=1 \
+BASIN_AUTH_ENABLED=1 \
+  BASIN_AUTH_JWT_SECRET=$(openssl rand -hex 32) \
+  BASIN_AUTH_SMTP_HOST=smtp.example.com BASIN_AUTH_SMTP_PORT=587 \
+  BASIN_AUTH_SMTP_USERNAME=u BASIN_AUTH_SMTP_PASSWORD=p \
+  BASIN_AUTH_SMTP_FROM=noreply@example.com BASIN_AUTH_SMTP_TLS=starttls \
+BASIN_REST_ENABLED=1 BASIN_REST_BIND=127.0.0.1:5434 \
+BASIN_ANALYTICAL_ENABLED=1 \
 cargo run -p basin-server
 ```
 

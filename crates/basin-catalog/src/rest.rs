@@ -81,6 +81,17 @@ impl Catalog for RestCatalog {
         unimplemented!("RestCatalog::append_data_files lands in Phase 2")
     }
 
+    async fn replace_data_files(
+        &self,
+        _tenant: &TenantId,
+        _table: &TableName,
+        _expected_snapshot: SnapshotId,
+        _removed_paths: Vec<String>,
+        _added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        unimplemented!("RestCatalog::replace_data_files lands in Phase 2")
+    }
+
     async fn list_snapshots(
         &self,
         _tenant: &TenantId,

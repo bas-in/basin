@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "tenant_deletion",
+  "name": "Tenant deletion latency (real S3)",
+  "claim": "Deleting a tenant of 1000 small files completes in under 60 seconds on real S3.",
+  "passed": true,
+  "primary": {
+    "label": "elapsed_ms",
+    "value": 321.710208,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 60000.0
+    }
+  },
+  "details": {
+    "bucket": "basin-bucket",
+    "endpoint": "http://127.0.0.1:9000",
+    "files": 1000
+  },
+  "generated_at": "@1777602457"
+}

@@ -1,0 +1,10 @@
+{
+  "kind": "compare",
+  "id": "server_lifecycle",
+  "name": "Server lifecycle: accept, conn-scaling, RSS/conn (real S3)",
+  "claim": "Basin's tokio-task model handles dramatically more connections at lower memory than PG's process-per-connection.",
+  "available": false,
+  "metrics": [],
+  "generated_at": "@1777668705",
+  "note": "postgres unavailable"
+}

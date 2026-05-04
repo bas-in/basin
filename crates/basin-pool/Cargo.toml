@@ -1,0 +1,22 @@
+[package]
+name = "basin-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-engine.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+basin-storage.workspace = true
+basin-catalog.workspace = true
+object_store.workspace = true

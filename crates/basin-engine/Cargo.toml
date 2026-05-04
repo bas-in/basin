@@ -13,6 +13,7 @@ basin-catalog.workspace = true
 basin-vector.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
+basin-analytical.workspace = true
 
 tokio.workspace = true
 futures.workspace = true

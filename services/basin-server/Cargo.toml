@@ -18,12 +18,17 @@ basin-engine.workspace = true
 basin-router.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
+basin-pool.workspace = true
+basin-auth.workspace = true
+basin-rest.workspace = true
+basin-analytical.workspace = true
 
 tokio.workspace = true
 object_store.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+mimalloc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

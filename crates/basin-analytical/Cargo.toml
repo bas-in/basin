@@ -9,6 +9,15 @@ publish = false
 [dependencies]
 basin-common.workspace = true
 basin-catalog.workspace = true
+basin-storage.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+object_store.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+duckdb.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

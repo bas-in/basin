@@ -11,6 +11,9 @@ members = [
     "crates/basin-placement",
     "crates/basin-analytical",
     "crates/basin-vector",
+    "crates/basin-pool",
+    "crates/basin-auth",
+    "crates/basin-rest",
     "services/basin-server",
     "tests/integration",
 ]
@@ -34,6 +37,9 @@ basin-placement = { path = "crates/basin-placement" }
 basin-analytical = { path = "crates/basin-analytical" }
 basin-engine = { path = "crates/basin-engine" }
 basin-vector = { path = "crates/basin-vector" }
+basin-pool = { path = "crates/basin-pool" }
+basin-auth = { path = "crates/basin-auth" }
+basin-rest = { path = "crates/basin-rest" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -73,18 +79,52 @@ datafusion = "44"
 pgwire = "0.28"
 sqlparser = "0.52"
 
+# Analytical engine. DuckDB is a sync C++ embedded database; we drive it via
+# spawn_blocking from the async layer. `bundled` builds DuckDB from source so
+# CI doesn't need a system libduckdb. First compile is ~5-10 minutes; cached
+# afterwards. Pinned to 1.2.x because that line tracks `arrow ^54`, matching
+# our workspace arrow-* version; bumping arrow is a separate, larger change.
+duckdb = { version = "=1.2.2", features = ["bundled"] }
+
 # Compact binary serialisation, used for the HNSW index segment format.
 bincode = "1.3"
+
+# Bounded LRU caches: parquet footer metadata in basin-storage::reader and
+# parsed HNSW segments in basin-storage::vector_index. Keeps hot reads off
+# the metadata round-trip / re-parse path.
+lru = "0.12"
+
+# High-performance allocator. Plugged in as the global allocator inside
+# basin-server; allocator-heavy paths (Parquet decode, JSON encode, Arrow
+# batch construction) benefit measurably under load.
+mimalloc = { version = "0.1", default-features = false }
+
+# Auth + REST stack. lettre for SMTP, jsonwebtoken for JWT issue/verify,
+# bcrypt for password hashing, governor for rate-limiting, axum for the
+# HTTP layer. Keep these versions pinned at workspace level so basin-auth
+# and basin-rest agree on the JWT/HTTP types they pass between each other.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname"] }
+jsonwebtoken = "9"
+bcrypt = "0.16"
+governor = "0.7"
+axum = { version = "0.7", features = ["json", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+http = "1"
+hyper = "1"
 
 # Test
 tempfile = "3"
 tokio-test = "0.4"
 proptest = "1"
 tokio-postgres = "0.7"
+# Test-config file parsing for tests/integration/src/test_config.rs.
+# Tiny, well-maintained, default features off to keep build minimal.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 16
 debug = 1
 
 [profile.bench]

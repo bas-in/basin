@@ -1,0 +1,24 @@
+{
+  "kind": "viability",
+  "id": "update_delete",
+  "name": "UPDATE / DELETE via copy-on-write",
+  "claim": "An UPDATE and a DELETE on a 10K-row table commit end-to-end (parser → executor → storage rewrite → catalog Replace snapshot) in under 2 seconds.",
+  "passed": true,
+  "primary": {
+    "label": "UPDATE+DELETE elapsed (ms)",
+    "value": 57.120000000000005,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 2000.0
+    }
+  },
+  "details": {
+    "delete_ms": 27.17125,
+    "remaining_rows": 9997,
+    "rows": 10000,
+    "total_ms": 57.120000000000005,
+    "update_ms": 29.94875
+  },
+  "generated_at": "@1777619717"
+}

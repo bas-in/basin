@@ -1,0 +1,50 @@
+{
+  "kind": "scaling",
+  "id": "noisy_neighbor",
+  "name": "Noisy-neighbor degradation (real S3)",
+  "claim": "On real S3, a heavy noisy tenant doesn't crater a quiet tenant's p99 latency.",
+  "passed": true,
+  "x_axis": {
+    "key": "scenario",
+    "label": "scenario"
+  },
+  "series": [
+    {
+      "key": "p50_ms",
+      "label": "p50 latency",
+      "unit": "ms"
+    },
+    {
+      "key": "p99_ms",
+      "label": "p99 latency",
+      "unit": "ms"
+    }
+  ],
+  "rows": [
+    {
+      "p50_ms": 1021.1563749999999,
+      "p99_ms": 1300.5408750000001,
+      "scenario": "baseline"
+    },
+    {
+      "p50_ms": 1000.9192090000001,
+      "p99_ms": 1642.423709,
+      "scenario": "under_load"
+    },
+    {
+      "p50_ms": 0.9801821087392224,
+      "p99_ms": 1.2628774232105544,
+      "scenario": "ratio"
+    }
+  ],
+  "primary": {
+    "label": "p99 ratio (under_load / baseline)",
+    "value": 1.2628774232105544,
+    "unit": "x",
+    "bar": {
+      "op": "less_than",
+      "value": 5.0
+    }
+  },
+  "generated_at": "@1777923749"
+}

@@ -9,6 +9,8 @@ publish = false
 [dependencies]
 basin-common.workspace = true
 basin-engine.workspace = true
+basin-pool.workspace = true
+basin-auth.workspace = true
 
 tokio.workspace = true
 futures.workspace = true
@@ -25,3 +27,13 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# JWT resolver tests stand up a live `AuthService` against PG; the
+# tokio-postgres / ulid / uuid deps are only needed for the per-test schema
+# guard and the test issuer. They mirror what basin-auth's own tests use.
+tokio-postgres.workspace = true
+ulid.workspace = true
+uuid.workspace = true
+# Pool-acquire test in protocol.rs needs to construct a real Engine + Pool.
+basin-storage.workspace = true
+basin-catalog.workspace = true
+object_store.workspace = true

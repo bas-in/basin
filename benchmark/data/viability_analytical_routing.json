@@ -1,0 +1,26 @@
+{
+  "kind": "viability",
+  "id": "analytical_routing",
+  "name": "Analytical routing speedup through basin-engine",
+  "claim": "Same SQL through the same engine entry point: with the analytical engine attached, GROUP BY queries route to DuckDB and finish at least 1.5x faster than the OLTP-only baseline on a 1M-row dataset spread across 10 Parquet files.",
+  "passed": true,
+  "primary": {
+    "label": "analytical_routing_speedup (oltp_ms / routed_ms)",
+    "value": 4.669302621469592,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 1.5
+    }
+  },
+  "details": {
+    "files": 10,
+    "groups": 16,
+    "oltp_ms": 484.06170000000003,
+    "routed_ms": 103.66895,
+    "routings": 5,
+    "rows": 1000000,
+    "speedup": 4.669302621469592
+  },
+  "generated_at": "@1777619681"
+}

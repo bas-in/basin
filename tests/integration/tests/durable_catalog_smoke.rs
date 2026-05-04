@@ -126,6 +126,7 @@ async fn boot_server(
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
         tenant_resolver: resolver,
+        pool: None,
     })
     .await
     .expect("server failed to bind")

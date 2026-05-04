@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "point_query_ms",
-    "value": 29.338124999999998,
+    "value": 23.743,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -16,7 +16,7 @@
   "details": {
     "files": 10,
     "rows": 10000000,
-    "seed_elapsed_s": 14.513066083
+    "seed_elapsed_s": 10.806179083
   },
-  "generated_at": "@1777597133"
+  "generated_at": "@1777619708"
 }

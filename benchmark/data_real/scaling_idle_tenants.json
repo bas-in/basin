@@ -1,0 +1,64 @@
+{
+  "kind": "scaling",
+  "id": "idle_tenants",
+  "name": "Idle-tenant cost curve (real S3)",
+  "claim": "RAM cost stays small per idle tenant as the tenant count grows, with a real-S3 Storage attached.",
+  "passed": true,
+  "x_axis": {
+    "key": "tenants",
+    "label": "tenants"
+  },
+  "series": [
+    {
+      "key": "per_tenant_kib",
+      "label": "Per-tenant RSS",
+      "unit": "KiB"
+    },
+    {
+      "key": "provision_ms",
+      "label": "Provision time",
+      "unit": "ms"
+    },
+    {
+      "key": "rss_delta_kib",
+      "label": "RSS delta",
+      "unit": "KiB"
+    }
+  ],
+  "rows": [
+    {
+      "per_tenant_kib": 0.16,
+      "provision_ms": 0.089417,
+      "rss_delta_kib": 16,
+      "tenants": 100
+    },
+    {
+      "per_tenant_kib": 0.464,
+      "provision_ms": 0.7993330000000001,
+      "rss_delta_kib": 464,
+      "tenants": 1000
+    },
+    {
+      "per_tenant_kib": 0.4672,
+      "provision_ms": 3.926291,
+      "rss_delta_kib": 2336,
+      "tenants": 5000
+    },
+    {
+      "per_tenant_kib": 0.6864,
+      "provision_ms": 8.973042000000001,
+      "rss_delta_kib": 6864,
+      "tenants": 10000
+    }
+  ],
+  "primary": {
+    "label": "max per_tenant_kib across scales",
+    "value": 0.6864,
+    "unit": "KiB",
+    "bar": {
+      "op": "less_than",
+      "value": 5.0
+    }
+  },
+  "generated_at": "@1777668425"
+}

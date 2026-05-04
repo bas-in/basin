@@ -35,7 +35,8 @@ use std::collections::HashMap;
 use arrow_schema::{DataType, Field};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Value,
+    Assignment, AssignmentTarget, BinaryOperator, Expr, FromTable, ObjectName, Query, SetExpr,
+    Statement, TableFactor, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -254,9 +255,91 @@ async fn infer_param_types(
         Statement::Query(q) => {
             walk_select_for_predicates(sess, &q, out).await?;
         }
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => {
+            // Resolve the target table once; placeholder slots in SET and
+            // WHERE are typed against its column list.
+            if let TableFactor::Table { name, .. } = &table.relation {
+                if let Ok(tn) = name_to_table(name) {
+                    if let Ok(meta) = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.tenant, &tn)
+                        .await
+                    {
+                        let schema = (*meta.schema).clone();
+                        infer_assignments(&assignments, &schema, out);
+                        if let Some(pred) = &selection {
+                            walk_pred(
+                                pred,
+                                &[(tn.as_str().to_owned(), schema)],
+                                out,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Statement::Delete(del) => {
+            // Single-table DELETE only — the engine rejects multi-table
+            // forms at execute time and we mirror the same scope here.
+            let tables = match &del.from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+            };
+            if let Some(twj) = tables.first() {
+                if let TableFactor::Table { name, .. } = &twj.relation {
+                    if let Ok(tn) = name_to_table(name) {
+                        if let Ok(meta) = sess
+                            .engine
+                            .config()
+                            .catalog
+                            .load_table(&sess.tenant, &tn)
+                            .await
+                        {
+                            let schema = (*meta.schema).clone();
+                            if let Some(pred) = &del.selection {
+                                walk_pred(
+                                    pred,
+                                    &[(tn.as_str().to_owned(), schema)],
+                                    out,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// Pin SET-clause placeholder slots to the destination column's data type.
+/// `SET col = $1` → slot 0 takes the type of `col`.
+fn infer_assignments(
+    assignments: &[Assignment],
+    schema: &arrow_schema::Schema,
+    out: &mut [DataType],
+) {
+    for a in assignments {
+        if let AssignmentTarget::ColumnName(name) = &a.target {
+            if name.0.len() == 1 {
+                let col = &name.0[0].value;
+                if let Some(n) = placeholder_index(&a.value) {
+                    if let (Some(slot), Some(dt)) =
+                        (out.get_mut(n - 1), column_type(schema, col))
+                    {
+                        *slot = dt;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn name_to_table(name: &ObjectName) -> Result<TableName> {

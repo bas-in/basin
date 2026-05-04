@@ -39,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -70,6 +71,22 @@ pub struct Engine {
 
 pub(crate) struct EngineInner {
     pub(crate) cfg: EngineConfig,
+    /// Optional analytical (DuckDB) backend. When `Some`, the executor's
+    /// router checks `analytical_route::is_analytical` before each statement
+    /// and forwards qualifying queries here. Wired in via
+    /// [`Engine::with_analytical`] so existing `EngineConfig` literals across
+    /// the workspace stay byte-stable.
+    pub(crate) analytical: Option<basin_analytical::AnalyticalEngine>,
+    /// Counter incremented every time a statement is successfully served by
+    /// the analytical path. Exposed via [`Engine::analytical_routing_count`]
+    /// so integration tests can assert that routing actually happened
+    /// without resorting to log scraping.
+    pub(crate) analytical_routing_count: AtomicU64,
+    /// Per-tenant noisy-tenant detector. Reads its bit when a session is
+    /// opened (to choose `target_partitions`) and bumps it after every
+    /// successful `TenantSession::execute`. See `noisy_detector` module
+    /// for the full rationale.
+    pub(crate) noisy_detector: crate::noisy_detector::NoisyDetector,
     // additional state (DataFusion runtime, per-tenant context cache) lives
     // in the implementation module; intentionally not exposed here.
 }
@@ -77,12 +94,78 @@ pub(crate) struct EngineInner {
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self {
-            inner: Arc::new(EngineInner { cfg }),
+            inner: Arc::new(EngineInner {
+                cfg,
+                analytical: None,
+                analytical_routing_count: AtomicU64::new(0),
+                noisy_detector: crate::noisy_detector::NoisyDetector::new(),
+            }),
         }
+    }
+
+    /// Attach an [`AnalyticalEngine`](basin_analytical::AnalyticalEngine) to
+    /// this engine. Returns a new `Engine` (cheap; only the inner `Arc` is
+    /// rebuilt) so callers can keep the original analytical-less engine
+    /// around if they need it.
+    ///
+    /// When attached, the router's [`is_analytical`](crate::analytical_route)
+    /// heuristic decides per statement whether the analytical path is taken;
+    /// any failure on that path falls back to the OLTP DataFusion engine
+    /// transparently. See `analytical_route` and `executor::execute` for
+    /// the heuristic and the fallback contract.
+    pub fn with_analytical(self, analytical: basin_analytical::AnalyticalEngine) -> Self {
+        let cfg = self.inner.cfg.clone();
+        Self {
+            inner: Arc::new(EngineInner {
+                cfg,
+                analytical: Some(analytical),
+                analytical_routing_count: AtomicU64::new(0),
+                noisy_detector: crate::noisy_detector::NoisyDetector::new(),
+            }),
+        }
+    }
+
+    /// O(1) lookup: is `tenant`'s recent query rate above the noisy
+    /// threshold? Returns `false` for tenants we've never seen. See
+    /// [`crate::noisy_detector`] for the threshold and decay constants.
+    ///
+    /// This is a *hint* the engine consumes when constructing a session
+    /// (to downshift `target_partitions`); it is also intended to be read
+    /// by the `basin-storage` fair-share scheduler to demote a tenant's
+    /// I/O priority. It is not a hard cap.
+    pub fn is_noisy(&self, tenant: &TenantId) -> bool {
+        self.inner.noisy_detector.is_noisy(tenant)
+    }
+
+    /// Crate-private: bump this tenant's query-rate counter. Called from
+    /// `TenantSession::execute` after the statement completes (successfully
+    /// or not — every attempt counts toward the rate, since failed queries
+    /// still consumed I/O budget).
+    pub(crate) fn record_query(&self, tenant: &TenantId) {
+        self.inner.noisy_detector.record_query(tenant);
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.inner.cfg
+    }
+
+    /// Optional analytical engine attached via [`Engine::with_analytical`].
+    pub(crate) fn analytical(&self) -> Option<&basin_analytical::AnalyticalEngine> {
+        self.inner.analytical.as_ref()
+    }
+
+    /// Internal hook used by the executor to record successful analytical
+    /// routings. Crate-private so external callers can't tamper with the
+    /// counter (only [`Engine::analytical_routing_count`] is exposed).
+    pub(crate) fn note_analytical_routed(&self) {
+        self.inner.analytical_routing_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of statements successfully routed to the analytical path
+    /// since this `Engine` was built. Test-only instrumentation; production
+    /// code should rely on tracing for routing visibility.
+    pub fn analytical_routing_count(&self) -> u64 {
+        self.inner.analytical_routing_count.load(Ordering::Relaxed)
     }
 
     /// Open a session bound to `tenant`. The catalog namespace is created on
@@ -112,7 +195,12 @@ impl TenantSession {
     /// or a side-effect tag for DML/DDL ([`ExecResult::Empty`]).
     #[tracing::instrument(skip(self, sql), fields(tenant=%self.tenant, sql=%sql.lines().next().unwrap_or("")))]
     pub async fn execute(&self, sql: &str) -> Result<ExecResult> {
-        crate::executor::execute(self, sql).await
+        let result = crate::executor::execute(self, sql).await;
+        // Bump the noisy-tenant rate estimator regardless of success: a
+        // failed query still consumed I/O permits + planner time, which is
+        // exactly what the detector is meant to throttle. O(1).
+        self.engine.record_query(&self.tenant);
+        result
     }
 
     /// Prepare an SQL statement with `$N`-style parameter placeholders. Returns
@@ -172,11 +260,14 @@ pub enum ExecResult {
     },
 }
 
+mod analytical_route;
 mod convert;
 mod ddl;
 mod dml;
+mod dml_mutate;
 mod executor;
 mod fast_select;
+mod noisy_detector;
 mod prepared;
 mod session;
 mod types;
@@ -525,5 +616,580 @@ mod tests {
             matches!(err, basin_common::BasinError::InvalidSchema(_)),
             "got {err:?}"
         );
+    }
+
+    // --- UPDATE / DELETE -------------------------------------------------------
+
+    async fn seed_five_rows(sess: &TenantSession) {
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute(
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_removes_matching_rows() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let res = sess.execute("DELETE FROM t WHERE id = 3").await.unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 4);
+                let ids = col_i64(&batches, "id");
+                assert!(!ids.contains(&3), "id 3 still present: {ids:?}");
+                assert_eq!(ids, vec![1, 2, 4, 5]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_with_no_matches_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        // Snapshot before to make sure no new file gets written.
+        let cat = eng.config().catalog.clone();
+        let table = basin_common::TableName::new("t").unwrap();
+        let before = cat.load_table(&sess.tenant(), &table).await.unwrap();
+
+        let res = sess.execute("DELETE FROM t WHERE id = 999").await.unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 0"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let after = cat.load_table(&sess.tenant(), &table).await.unwrap();
+        assert_eq!(
+            before.current_snapshot, after.current_snapshot,
+            "no-op DELETE must not advance snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_all_rows_drops_files() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        // `WHERE id < 1000` matches every row in the table.
+        let res = sess.execute("DELETE FROM t WHERE id < 1000").await.unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 5"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess.execute("SELECT id FROM t").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => assert_eq!(total_rows(&batches), 0),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // The catalog snapshot must have recorded the removal.
+        let table = basin_common::TableName::new("t").unwrap();
+        let head = eng
+            .config()
+            .catalog
+            .load_table(&sess.tenant(), &table)
+            .await
+            .unwrap();
+        let cur = head.current().unwrap();
+        assert_eq!(
+            cur.summary.operation,
+            basin_catalog::SnapshotOperation::Replace
+        );
+        assert_eq!(cur.summary.removed_files, 1);
+    }
+
+    #[tokio::test]
+    async fn update_changes_matching_rows() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let res = sess
+            .execute("UPDATE t SET name = 'X' WHERE id = 2")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess
+            .execute("SELECT name FROM t WHERE id = 2")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 1);
+                assert_eq!(col_string(&batches, "name"), vec!["X".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_does_not_touch_other_rows() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        sess.execute("UPDATE t SET name = 'X' WHERE id = 2")
+            .await
+            .unwrap();
+
+        let res = sess
+            .execute("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 5);
+                assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3, 4, 5]);
+                let names = col_string(&batches, "name");
+                assert_eq!(names[0], "a");
+                assert_eq!(names[1], "X");
+                assert_eq!(names[2], "c");
+                assert_eq!(names[3], "d");
+                assert_eq!(names[4], "e");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_with_no_matches_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let cat = eng.config().catalog.clone();
+        let table = basin_common::TableName::new("t").unwrap();
+        let before = cat.load_table(&sess.tenant(), &table).await.unwrap();
+
+        let res = sess
+            .execute("UPDATE t SET name = 'X' WHERE id = 999")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 0"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let after = cat.load_table(&sess.tenant(), &table).await.unwrap();
+        assert_eq!(before.current_snapshot, after.current_snapshot);
+    }
+
+    #[tokio::test]
+    async fn delete_then_select_through_engine() {
+        // Distinguishing test: the round trip exercises the same `execute`
+        // entry point a router would call, including the post-commit refresh
+        // that puts the new file set in front of DataFusion's listing table.
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        sess.execute("DELETE FROM t WHERE id = 1").await.unwrap();
+        sess.execute("DELETE FROM t WHERE id = 5").await.unwrap();
+
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![2, 3, 4]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_via_prepared_statement() {
+        // Distinguishing test: prepared-statement support has its own
+        // placeholder substitution path; UPDATE has to flow through it
+        // identically to INSERT/SELECT for ORM compatibility.
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let (h, schema) = sess
+            .prepare("UPDATE t SET name = $1 WHERE id = $2")
+            .await
+            .unwrap();
+        assert_eq!(schema.param_types.len(), 2);
+        assert_eq!(schema.param_types[0], arrow_schema::DataType::Utf8);
+        assert_eq!(schema.param_types[1], arrow_schema::DataType::Int64);
+
+        let bound = sess
+            .bind(
+                &h,
+                vec![ScalarParam::Text("Y".into()), ScalarParam::Int8(4)],
+            )
+            .await
+            .unwrap();
+        let res = sess.execute_bound(bound).await.unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // --- Compound WHERE: AND / OR / IS NULL / IN ----------------------------
+
+    #[tokio::test]
+    async fn update_with_and_predicate() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let res = sess
+            .execute("UPDATE t SET name = 'Z' WHERE id > 2 AND name = 'd'")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess.execute("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        let names = match res {
+            ExecResult::Rows { batches, .. } => col_string(&batches, "name"),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(names, vec!["a", "b", "c", "Z", "e"]);
+    }
+
+    #[tokio::test]
+    async fn update_with_or_predicate() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let res = sess
+            .execute("UPDATE t SET name = 'X' WHERE id = 1 OR id = 2")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 2"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess.execute("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        let names = match res {
+            ExecResult::Rows { batches, .. } => col_string(&batches, "name"),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(names, vec!["X", "X", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn delete_with_in_predicate() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let res = sess
+            .execute("DELETE FROM t WHERE id IN (1, 2, 3)")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 3"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![4, 5]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_with_is_null() {
+        // Seed a table with explicit NULLs in `name`. seed_five_rows uses
+        // NOT NULL columns, so we build our own here.
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT)")
+            .await
+            .unwrap();
+        sess.execute(
+            "INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'c'), (4, NULL), (5, 'e')",
+        )
+        .await
+        .unwrap();
+
+        let res = sess.execute("DELETE FROM t WHERE name IS NULL").await.unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 2"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1, 3, 5]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_with_compound_rejects_unsupported() {
+        // A function-call WHERE isn't representable in our predicate
+        // language; the engine must surface a clean InvalidSchema error
+        // rather than a partial DELETE.
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let err = sess
+            .execute("DELETE FROM t WHERE upper(name) = 'A'")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::InvalidSchema(_)),
+            "got {err:?}"
+        );
+
+        // The table contents must be untouched after the rejection.
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3, 4, 5]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_with_lte_gte_predicates() {
+        // `<=` / `>=` synthesise to `Lt OR Eq` / `Gt OR Eq` in the
+        // compound predicate. Make sure the synthesis matches semantics.
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        seed_five_rows(&sess).await;
+
+        let res = sess
+            .execute("UPDATE t SET name = 'Q' WHERE id <= 2")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 2"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess
+            .execute("UPDATE t SET name = 'R' WHERE id >= 5")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess.execute("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        let names = match res {
+            ExecResult::Rows { batches, .. } => col_string(&batches, "name"),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(names, vec!["Q", "Q", "c", "d", "R"]);
+    }
+
+    #[tokio::test]
+    async fn update_with_and_prunes_file() {
+        // Two files, two non-overlapping id ranges. The AND has one branch
+        // that fits one file's range; the file outside that range must be
+        // skipped entirely (its DataFileRef carries through to the new
+        // snapshot unchanged).
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .unwrap();
+
+        // File 1: ids 0..1000 with name='other'.
+        let mut s1 = String::from("INSERT INTO t VALUES ");
+        for i in 0..1000 {
+            if i > 0 {
+                s1.push(',');
+            }
+            s1.push_str(&format!("({i}, 'other')"));
+        }
+        sess.execute(&s1).await.unwrap();
+
+        // File 2: ids 999_000..999_500 — same row mostly, plus one with
+        // name='foo' so the matched count is 1.
+        let mut s2 = String::from("INSERT INTO t VALUES ");
+        for i in 999_000..999_500 {
+            if i > 999_000 {
+                s2.push(',');
+            }
+            let n = if i == 999_100 { "foo" } else { "other" };
+            s2.push_str(&format!("({i}, '{n}')"));
+        }
+        sess.execute(&s2).await.unwrap();
+
+        let table = basin_common::TableName::new("t").unwrap();
+        let storage = eng.config().storage.clone();
+        let before_paths: std::collections::HashSet<String> = storage
+            .list_data_files(&sess.tenant(), &table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path.as_ref().to_string())
+            .collect();
+        assert_eq!(before_paths.len(), 2, "expected two files seeded");
+
+        // The AND predicate's `id > 999_000` branch is outside file 1's
+        // range entirely; pruning must skip file 1.
+        let res = sess
+            .execute("UPDATE t SET name = 'Q' WHERE id > 999000 AND name = 'foo'")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let after_paths: std::collections::HashSet<String> = storage
+            .list_data_files(&sess.tenant(), &table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path.as_ref().to_string())
+            .collect();
+        let kept_unchanged: Vec<&String> =
+            after_paths.iter().filter(|p| before_paths.contains(*p)).collect();
+        assert_eq!(
+            kept_unchanged.len(),
+            1,
+            "expected 1 of 2 parent files to pass through unchanged"
+        );
+
+        let after = eng
+            .config()
+            .catalog
+            .load_table(&sess.tenant(), &table)
+            .await
+            .unwrap();
+        let head = after.current().unwrap();
+        assert_eq!(head.summary.removed_files, 1);
+    }
+
+    #[tokio::test]
+    async fn viability_update_delete_pruning() {
+        // Insert 1M rows in 10 files; DELETE one row from the last file.
+        // 9 of 10 files must survive the rewrite by-path-equality (proving
+        // file-level pruning kept them out of the rewrite loop entirely).
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .unwrap();
+
+        const ROWS_PER_FILE: i64 = 100_000;
+        const FILE_COUNT: i64 = 10;
+        for f in 0..FILE_COUNT {
+            let mut sql = String::with_capacity((ROWS_PER_FILE as usize) * 30);
+            sql.push_str("INSERT INTO t VALUES ");
+            let start = f * ROWS_PER_FILE;
+            for i in 0..ROWS_PER_FILE {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let id = start + i;
+                sql.push_str(&format!("({id}, 'r')"));
+            }
+            sess.execute(&sql).await.unwrap();
+        }
+
+        let table = basin_common::TableName::new("t").unwrap();
+        let storage = eng.config().storage.clone();
+        let before_paths: std::collections::HashSet<String> = storage
+            .list_data_files(&sess.tenant(), &table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path.as_ref().to_string())
+            .collect();
+        assert_eq!(before_paths.len(), FILE_COUNT as usize);
+
+        // 999_999 lives only in the last file (ids 900_000..999_999).
+        let res = sess
+            .execute("DELETE FROM t WHERE id = 999999")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let after_paths: std::collections::HashSet<String> = storage
+            .list_data_files(&sess.tenant(), &table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path.as_ref().to_string())
+            .collect();
+        let kept_unchanged: Vec<&String> =
+            after_paths.iter().filter(|p| before_paths.contains(*p)).collect();
+        assert_eq!(
+            kept_unchanged.len(),
+            (FILE_COUNT - 1) as usize,
+            "expected {} of {} files to survive pruning unchanged",
+            FILE_COUNT - 1,
+            FILE_COUNT
+        );
+
+        let after = eng
+            .config()
+            .catalog
+            .load_table(&sess.tenant(), &table)
+            .await
+            .unwrap();
+        let head = after.current().unwrap();
+        assert_eq!(head.summary.removed_files, 1);
+
+        // Sanity: the table now has 1M-1 rows.
+        let res = sess.execute("SELECT id FROM t").await.unwrap();
+        let total = match res {
+            ExecResult::Rows { batches, .. } => total_rows(&batches),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(total, (FILE_COUNT * ROWS_PER_FILE - 1) as usize);
     }
 }

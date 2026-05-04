@@ -50,7 +50,7 @@ pub(crate) async fn write_batch(
     let row_count = batch.num_rows() as u64;
 
     storage
-        .object_store()
+        .tenant_store(tenant)
         .put(&key, PutPayload::from_bytes(Bytes::from(bytes.clone())))
         .await
         .map_err(|e| BasinError::storage(format!("put {key}: {e}")))?;
@@ -116,32 +116,146 @@ fn extract_column_stats(
         out.insert(f.name().clone(), ColumnStats::default());
     }
 
+    // Aggregate across row groups using typed comparisons. The naive
+    // lexicographic merge from earlier was wrong for primitive types whose
+    // byte representation isn't order-preserving (e.g. little-endian
+    // integers, or any negative number). The pruning consumer relies on
+    // these bytes round-tripping back to the original min/max.
     for rg in meta.row_groups() {
         for col in rg.columns() {
             let name = col.column_descr().name().to_string();
             let entry = out.entry(name).or_default();
             if let Some(stats) = col.statistics() {
-                let nulls = stats.null_count_opt();
-                if let Some(n) = nulls {
+                if let Some(n) = stats.null_count_opt() {
                     entry.null_count = Some(entry.null_count.unwrap_or(0) + n);
                 }
-                if let Some(min) = stats.min_bytes_opt() {
-                    let min_vec = min.to_vec();
-                    entry.min_bytes = Some(match entry.min_bytes.take() {
-                        Some(prev) if prev <= min_vec => prev,
-                        _ => min_vec,
-                    });
-                }
-                if let Some(max) = stats.max_bytes_opt() {
-                    let max_vec = max.to_vec();
-                    entry.max_bytes = Some(match entry.max_bytes.take() {
-                        Some(prev) if prev >= max_vec => prev,
-                        _ => max_vec,
-                    });
-                }
+                merge_typed_stats(entry, stats);
             }
         }
     }
     Ok(out)
+}
+
+/// Merge a row-group's stats into the file-level entry, using a
+/// type-appropriate comparison so the running `min` is the actual smallest
+/// value across row groups (same for `max`). The bytes we store are the
+/// raw Parquet PLAIN encoding, which the pruning helper decodes per
+/// `DataType` to recover the typed value.
+fn merge_typed_stats(
+    entry: &mut ColumnStats,
+    stats: &parquet::file::statistics::Statistics,
+) {
+    use parquet::file::statistics::Statistics as ParquetStats;
+    match stats {
+        ParquetStats::Int64(s) => {
+            if let Some(min) = s.min_opt() {
+                let cur = entry.min_bytes.as_deref().and_then(decode_le_i64);
+                if !matches!(cur, Some(prev) if prev <= *min) {
+                    entry.min_bytes = Some(min.to_le_bytes().to_vec());
+                }
+            }
+            if let Some(max) = s.max_opt() {
+                let cur = entry.max_bytes.as_deref().and_then(decode_le_i64);
+                if !matches!(cur, Some(prev) if prev >= *max) {
+                    entry.max_bytes = Some(max.to_le_bytes().to_vec());
+                }
+            }
+        }
+        ParquetStats::Double(s) => {
+            if let Some(min) = s.min_opt() {
+                let cur = entry.min_bytes.as_deref().and_then(decode_le_f64);
+                if !matches!(cur, Some(prev) if prev <= *min) {
+                    entry.min_bytes = Some(min.to_le_bytes().to_vec());
+                }
+            }
+            if let Some(max) = s.max_opt() {
+                let cur = entry.max_bytes.as_deref().and_then(decode_le_f64);
+                if !matches!(cur, Some(prev) if prev >= *max) {
+                    entry.max_bytes = Some(max.to_le_bytes().to_vec());
+                }
+            }
+        }
+        ParquetStats::Boolean(s) => {
+            if let Some(min) = s.min_opt() {
+                let bytes = vec![if *min { 1u8 } else { 0u8 }];
+                let prev_min = entry
+                    .min_bytes
+                    .as_deref()
+                    .and_then(|b| b.first().copied())
+                    .map(|b| b != 0);
+                if !matches!(prev_min, Some(prev) if prev <= *min) {
+                    entry.min_bytes = Some(bytes);
+                }
+            }
+            if let Some(max) = s.max_opt() {
+                let bytes = vec![if *max { 1u8 } else { 0u8 }];
+                let prev_max = entry
+                    .max_bytes
+                    .as_deref()
+                    .and_then(|b| b.first().copied())
+                    .map(|b| b != 0);
+                if !matches!(prev_max, Some(prev) if prev >= *max) {
+                    entry.max_bytes = Some(bytes);
+                }
+            }
+        }
+        // Utf8 / ByteArray: lexicographic comparison is the same comparison
+        // SQL uses for strings, so byte-wise merge is correct.
+        ParquetStats::ByteArray(_) | ParquetStats::FixedLenByteArray(_) => {
+            if let Some(min_bytes) = stats.min_bytes_opt() {
+                let v = min_bytes.to_vec();
+                let keep = match entry.min_bytes.as_deref() {
+                    Some(prev) => prev > v.as_slice(),
+                    None => true,
+                };
+                if keep {
+                    entry.min_bytes = Some(v);
+                }
+            }
+            if let Some(max_bytes) = stats.max_bytes_opt() {
+                let v = max_bytes.to_vec();
+                let keep = match entry.max_bytes.as_deref() {
+                    Some(prev) => prev < v.as_slice(),
+                    None => true,
+                };
+                if keep {
+                    entry.max_bytes = Some(v);
+                }
+            }
+        }
+        // Other primitive types fall through with raw bytes; pruning will
+        // see them as Mixed (it only decodes the types we model in
+        // ScalarValue).
+        _ => {
+            if let Some(min) = stats.min_bytes_opt() {
+                if entry.min_bytes.is_none() {
+                    entry.min_bytes = Some(min.to_vec());
+                }
+            }
+            if let Some(max) = stats.max_bytes_opt() {
+                if entry.max_bytes.is_none() {
+                    entry.max_bytes = Some(max.to_vec());
+                }
+            }
+        }
+    }
+}
+
+fn decode_le_i64(b: &[u8]) -> Option<i64> {
+    if b.len() != 8 {
+        return None;
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(b);
+    Some(i64::from_le_bytes(a))
+}
+
+fn decode_le_f64(b: &[u8]) -> Option<f64> {
+    if b.len() != 8 {
+        return None;
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(b);
+    Some(f64::from_le_bytes(a))
 }
 

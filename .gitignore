@@ -8,3 +8,12 @@ Cargo.lock.bak
 .vscode/
 *.profraw
 /tmp/
+
+# Per-developer test config — contains real cloud credentials.
+# NEVER commit this file. The example template lives at .basin-test.example.toml.
+.basin-test.toml
+basin-test.toml
+
+.basin-local-s3-data
+.basin-local-s3.pid
+.basin-local-s3.log

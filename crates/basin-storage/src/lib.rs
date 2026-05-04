@@ -12,23 +12,32 @@
 
 #![forbid(unsafe_code)]
 
+mod concurrency;
 mod data_file;
+mod metadata_cache;
 mod paths;
 mod predicate;
 mod reader;
+mod scheduler;
 mod vector_index;
 mod writer;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use basin_common::{Result, TableName, TenantId};
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use tokio::sync::Semaphore;
 
 pub use data_file::{ColumnStats, DataFile};
-pub use predicate::{Predicate, ScalarValue};
-pub use vector_index::VectorHit;
+pub use predicate::{
+    evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
+    CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
+};
+pub use scheduler::{TenantIoStats, DEFAULT_GLOBAL_BUDGET};
+pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 
 use arrow_array::RecordBatch;
 
@@ -49,6 +58,19 @@ impl std::fmt::Debug for StorageConfig {
     }
 }
 
+/// Default per-tenant concurrent in-flight RPC cap. Must be ≥ the peak
+/// concurrent permits a single Parquet scan needs (DataFusion target
+/// partitions × parquet async range fan-out) AND ≥ that figure × the
+/// number of concurrent queries one tenant might run — otherwise the
+/// parquet reader's range fan-out deadlocks. Empirically cap=4 and
+/// cap=8 both deadlock under the s3_scaling_noisy_neighbor workload
+/// (4 concurrent full scans of 1M rows); 16 holds liveness. Per-tenant
+/// state is O(1) per tenant (~140 bytes for the Semaphore), so this
+/// scales to 1M tenants. v0.2 surfaces the value per tenant from the
+/// catalog so a noisy tenant can be capped without throttling quiet
+/// tenants.
+pub const DEFAULT_TENANT_CONCURRENCY: usize = 16;
+
 /// Read knobs for [`Storage::read`]. Filters are ANDed together.
 #[derive(Clone, Debug, Default)]
 pub struct ReadOptions {
@@ -66,7 +88,34 @@ pub struct Storage {
 struct Inner {
     object_store: Arc<dyn ObjectStore>,
     root_prefix: Option<ObjectPath>,
+    /// Footer cache for the read path. See `metadata_cache` for the
+    /// invalidation invariant (data files are immutable, so no explicit
+    /// eviction is required — LRU + delete-by-compactor is sufficient).
+    parquet_meta_cache: Arc<metadata_cache::ParquetMetaCache>,
+    /// Parsed-HNSW-segment cache for the vector-search path. Same
+    /// invariants apply.
+    hnsw_segment_cache: Arc<metadata_cache::HnswSegmentCache>,
+    /// Per-tenant concurrent-RPC semaphores, lazy-allocated on first
+    /// use. The mutex protects the map only — permits are acquired on
+    /// the [`Semaphore`] itself outside the mutex, so the lock is held
+    /// for nanoseconds and never across an `await`. We accept the cost
+    /// of one map lookup per RPC; on the hot path it's a HashMap probe
+    /// with `TenantId` (a [`Ulid`] under the hood, so cheap to hash).
+    tenant_semaphores: Mutex<HashMap<TenantId, Arc<Semaphore>>>,
+    /// Default permit count for a newly-created tenant semaphore.
+    default_tenant_concurrency: usize,
 }
+
+/// Default capacity for the Parquet footer cache. 1024 entries is a few MB
+/// of footer in the pessimistic case and sufficient to cover the working set
+/// of every benchmark currently in `tests/integration`.
+const DEFAULT_PARQUET_META_CACHE_CAP: usize = 1024;
+
+/// Default capacity for the HNSW segment cache. 256 segments at "few MB
+/// each" is the largest we'd want to hold in process; in practice the cache
+/// stays much smaller because workloads concentrate on a handful of
+/// segments per (tenant, table, column).
+const DEFAULT_HNSW_SEGMENT_CACHE_CAP: usize = 256;
 
 impl Storage {
     pub fn new(cfg: StorageConfig) -> Self {
@@ -74,12 +123,75 @@ impl Storage {
             inner: Arc::new(Inner {
                 object_store: cfg.object_store,
                 root_prefix: cfg.root_prefix,
+                parquet_meta_cache: Arc::new(metadata_cache::ParquetMetaCache::new(
+                    DEFAULT_PARQUET_META_CACHE_CAP,
+                )),
+                hnsw_segment_cache: Arc::new(metadata_cache::HnswSegmentCache::new(
+                    DEFAULT_HNSW_SEGMENT_CACHE_CAP,
+                )),
+                tenant_semaphores: Mutex::new(HashMap::new()),
+                default_tenant_concurrency: DEFAULT_TENANT_CONCURRENCY,
             }),
         }
     }
 
-    pub(crate) fn object_store(&self) -> &Arc<dyn ObjectStore> {
-        &self.inner.object_store
+    /// Per-tenant live I/O stats. Stub: the v0.2 scheduler exported
+    /// real numbers here; with the scheduler reverted, all fields are
+    /// zero. The noisy detector falls back to its own per-engine
+    /// counter.
+    pub fn tenant_stats(&self, _tenant: &TenantId) -> TenantIoStats {
+        TenantIoStats::default()
+    }
+
+
+    /// Per-tenant semaphore handle. Used internally to gate every
+    /// underlying object_store RPC behind a tenant-scoped permit pool.
+    /// Lazy-allocates on first call for a given tenant.
+    fn tenant_semaphore(&self, tenant: &TenantId) -> Arc<Semaphore> {
+        let mut map = self
+            .inner
+            .tenant_semaphores
+            .lock()
+            .expect("tenant semaphore map poisoned");
+        if let Some(s) = map.get(tenant) {
+            return s.clone();
+        }
+        let s = Arc::new(Semaphore::new(self.inner.default_tenant_concurrency));
+        map.insert(*tenant, s.clone());
+        s
+    }
+
+    /// Tenant-scoped view of the underlying object store. Every RPC
+    /// (get / put / list / head / delete / copy) is gated on this
+    /// tenant's semaphore so one tenant's heavy traffic cannot starve
+    /// another tenant's quiet traffic.
+    ///
+    /// This is the right thing to register with DataFusion's runtime
+    /// (`SessionContext::register_object_store`) for a session bound to
+    /// `tenant`: every range read DataFusion drives for that session
+    /// will then count against the tenant's permit pool.
+    pub fn tenant_object_store(&self, tenant: &TenantId) -> Arc<dyn ObjectStore> {
+        let sem = self.tenant_semaphore(tenant);
+        Arc::new(concurrency::TenantScopedStore::new(
+            self.inner.object_store.clone(),
+            sem,
+        ))
+    }
+
+    /// Internal accessor: returns the wrapped tenant-scoped store as a
+    /// concrete `Arc<dyn ObjectStore>`, identical to
+    /// [`tenant_object_store`] but at `pub(crate)` visibility for the
+    /// reader / writer / vector-index modules.
+    pub(crate) fn tenant_store(&self, tenant: &TenantId) -> Arc<dyn ObjectStore> {
+        self.tenant_object_store(tenant)
+    }
+
+    pub(crate) fn parquet_meta_cache(&self) -> &Arc<metadata_cache::ParquetMetaCache> {
+        &self.inner.parquet_meta_cache
+    }
+
+    pub(crate) fn hnsw_segment_cache(&self) -> &Arc<metadata_cache::HnswSegmentCache> {
+        &self.inner.hnsw_segment_cache
     }
 
     /// The underlying [`ObjectStore`]. Exposed so higher layers (e.g.
@@ -134,6 +246,40 @@ impl Storage {
         table: &TableName,
     ) -> Result<Vec<DataFile>> {
         reader::list_data_files(self, tenant, table).await
+    }
+
+    /// Like [`list_data_files`](Self::list_data_files) but populates each
+    /// returned [`DataFile::row_count`] and [`DataFile::column_stats`] by
+    /// fetching the Parquet footer (cached). Used by the copy-on-write
+    /// UPDATE/DELETE pruner; reading-path callers prefer the cheaper
+    /// `list_data_files`.
+    #[tracing::instrument(skip(self), fields(tenant=%tenant, table=%table))]
+    pub async fn list_data_files_with_stats(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+    ) -> Result<Vec<DataFile>> {
+        reader::list_data_files_with_stats(self, tenant, table).await
+    }
+
+    /// Read every batch from a single Parquet data file. Used by the
+    /// UPDATE/DELETE pruner when only some files need processing — the
+    /// table-wide [`read`](Self::read) would force us to merge all files
+    /// regardless of pruning.
+    ///
+    /// `path` must be a path returned by a prior [`list_data_files`]
+    /// against the same tenant; passing a foreign path is the caller's
+    /// bug (we only enforce tenant isolation at the listing/path-key
+    /// boundary, not on a raw `read_file`). The `tenant` argument is
+    /// purely so the read counts against this tenant's per-tenant
+    /// concurrency permit pool — it is not re-validated against `path`.
+    #[tracing::instrument(skip(self), fields(tenant=%tenant, path=%path))]
+    pub async fn read_file(
+        &self,
+        tenant: &TenantId,
+        path: &ObjectPath,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        reader::read_file(self, tenant, path).await
     }
 
     /// Approximate nearest-neighbour search across all HNSW segments for

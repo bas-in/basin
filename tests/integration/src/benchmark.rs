@@ -21,16 +21,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 const DATA_DIR: &str = "benchmark/data";
+const DATA_REAL_DIR: &str = "benchmark/data_real";
 
 /// Path to `<repo_root>/benchmark/data/`. Resolved from this crate's
 /// `CARGO_MANIFEST_DIR` (= `tests/integration`) walked up two parents.
+/// This is where LocalFS-backed (synthetic) test reports land.
 fn data_dir() -> PathBuf {
+    repo_relative(DATA_DIR)
+}
+
+/// Path to `<repo_root>/benchmark/data_real/`. This is where real-S3
+/// (or other real cloud backend) test reports land — kept separate from
+/// the synthetic LocalFS dashboard so the two stories don't get mixed.
+fn data_real_dir() -> PathBuf {
+    repo_relative(DATA_REAL_DIR)
+}
+
+fn repo_relative(rel: &str) -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(Path::parent)
-        .map(|p| p.join(DATA_DIR))
-        .unwrap_or_else(|| PathBuf::from(DATA_DIR))
+        .map(|p| p.join(rel))
+        .unwrap_or_else(|| PathBuf::from(rel))
 }
 
 fn now_iso() -> String {
@@ -246,6 +259,89 @@ pub fn report_postgres_compare(
     };
     let bytes = serde_json::to_vec_pretty(&report).expect("serialize compare");
     let path = data_dir().join(format!("compare_{id}.json"));
+    write_atomic(&path, &bytes);
+}
+
+// ----------------------------------------------------------------------------
+// Real-cloud variants — write to benchmark/data_real/ instead of data/.
+//
+// Used by tests in tests/integration/tests/s3_*.rs that hit a real S3 /
+// Backblaze B2 / R2 bucket configured in `.basin-test.toml`. The separate
+// directory keeps the LocalFS synthetic dashboard and the real-cloud
+// dashboard from polluting each other — different stories, different pages.
+// ----------------------------------------------------------------------------
+
+pub fn report_real_viability(
+    id: &str,
+    name: &str,
+    claim: &str,
+    passed: bool,
+    primary: PrimaryMetric,
+    details: serde_json::Value,
+) {
+    let report = ViabilityReport {
+        kind: "viability",
+        id,
+        name,
+        claim,
+        passed,
+        primary: &primary,
+        details: &details,
+        generated_at: now_iso(),
+    };
+    let bytes = serde_json::to_vec_pretty(&report).expect("serialize viability");
+    let path = data_real_dir().join(format!("viability_{id}.json"));
+    write_atomic(&path, &bytes);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn report_real_scaling(
+    id: &str,
+    name: &str,
+    claim: &str,
+    passed: bool,
+    x_axis: AxisSpec,
+    series: Vec<SeriesSpec>,
+    rows: Vec<serde_json::Value>,
+    primary: Option<PrimaryMetric>,
+) {
+    let report = ScalingReport {
+        kind: "scaling",
+        id,
+        name,
+        claim,
+        passed,
+        x_axis: &x_axis,
+        series: &series,
+        rows: &rows,
+        primary: primary.as_ref(),
+        generated_at: now_iso(),
+    };
+    let bytes = serde_json::to_vec_pretty(&report).expect("serialize scaling");
+    let path = data_real_dir().join(format!("scaling_{id}.json"));
+    write_atomic(&path, &bytes);
+}
+
+pub fn report_real_postgres_compare(
+    id: &str,
+    name: &str,
+    claim: &str,
+    available: bool,
+    metrics: Vec<CompareMetric>,
+    note: Option<&str>,
+) {
+    let report = CompareReport {
+        kind: "compare",
+        id,
+        name,
+        claim,
+        available,
+        metrics: &metrics,
+        generated_at: now_iso(),
+        note,
+    };
+    let bytes = serde_json::to_vec_pretty(&report).expect("serialize compare");
+    let path = data_real_dir().join(format!("compare_{id}.json"));
     write_atomic(&path, &bytes);
 }
 

@@ -1,0 +1,64 @@
+{
+  "kind": "scaling",
+  "id": "concurrency",
+  "name": "Concurrent reader fan-out (real S3)",
+  "claim": "On real S3, concurrent readers scale: per-query latency is network-bound, so adding parallel readers compounds throughput.",
+  "passed": true,
+  "x_axis": {
+    "key": "concurrency",
+    "label": "concurrent readers"
+  },
+  "series": [
+    {
+      "key": "total_qps",
+      "label": "Total QPS",
+      "unit": "qps"
+    },
+    {
+      "key": "per_task_qps",
+      "label": "Per-task QPS",
+      "unit": "qps"
+    },
+    {
+      "key": "median_latency_us",
+      "label": "Median latency",
+      "unit": "us"
+    }
+  ],
+  "rows": [
+    {
+      "concurrency": 1,
+      "median_latency_us": 23927.0,
+      "per_task_qps": 42.333333333333336,
+      "total_qps": 42.333333333333336
+    },
+    {
+      "concurrency": 4,
+      "median_latency_us": 25045.0,
+      "per_task_qps": 40.0,
+      "total_qps": 160.0
+    },
+    {
+      "concurrency": 16,
+      "median_latency_us": 67682.0,
+      "per_task_qps": 13.1875,
+      "total_qps": 211.0
+    },
+    {
+      "concurrency": 64,
+      "median_latency_us": 290475.0,
+      "per_task_qps": 3.5104166666666665,
+      "total_qps": 224.66666666666666
+    }
+  ],
+  "primary": {
+    "label": "peak speed-up vs C=1",
+    "value": 5.307086614173228,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 3.5
+    }
+  },
+  "generated_at": "@1777602567"
+}
