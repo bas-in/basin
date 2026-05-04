@@ -1,9 +1,11 @@
 # 0005 — Auth system (basin-auth)
 
-- **Status:** Accepted, deferred. Scope is locked here; build is gated on
-  the trigger below.
+- **Status:** Accepted. Build started 2026-05-01 by founder direction —
+  the original trigger ($50k+ ARR contract or explicit BaaS pivot) is
+  noted as overridden in writing rather than retroactively rewritten.
+  See "Trigger to start building" below for what was foregone.
 - **Date:** 2026-05-01
-- **Tags:** scope, auth, smtp, defers-to-trigger, related-to-0006
+- **Tags:** scope, auth, smtp, related-to-0006, trigger-overridden
 
 ## Context
 

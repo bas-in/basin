@@ -7,3 +7,4 @@
 //! plain-text summary of the same data.
 
 pub mod benchmark;
+pub mod test_config;

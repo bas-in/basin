@@ -13,6 +13,29 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred
 
 ---
 
+## Roadmap status — checkpoint 2026-05-01
+
+**The full WEDGE 1–5 + 5c slice is shipped.** All five items below are at
+v0.1 with passing benchmark coverage. Workspace tests: **216 / 216 passing,
+0 failures**. The dashboard stories are honest — every red card has a
+documented architectural reason (single-process limit, etc.) and a future
+trigger to revisit.
+
+Beyond the wedge, three additional crates landed by founder direction
+(see ADRs 0005/0006/0007): `basin-auth`, `basin-rest`, `basin-pool`. All
+are wired into `basin-server` behind opt-in env vars; defaults preserve
+the original PoC behaviour.
+
+**What's next, in priority order:**
+
+1. **Phase 0 customer interviews** — strategic, not engineering. Architecture is done; what's missing is paying customers.
+2. **Auto-mount `JwtTenantResolver` on pgwire when auth is enabled** — small follow-up flagged by the integration agent.
+3. **Engine `UPDATE` / `DELETE` support** — unlocks REST `PATCH` (currently 501) and a much wider ORM surface.
+4. **Phase 5 — analytical path** (DuckDB on Iceberg) — multi-week.
+5. **Phase 6 — production hardening** (multi-region read replicas, BYO-bucket, BYO-key, Stripe billing) — multi-month.
+
+---
+
 ## 1 — Extended pgwire protocol (~2 weeks) — **shipped 2026-05-01**
 
 The single biggest "is it usable" blocker. Without this, every popular

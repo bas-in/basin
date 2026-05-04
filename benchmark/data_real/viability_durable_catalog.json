@@ -1,0 +1,21 @@
+{
+  "kind": "viability",
+  "id": "durable_catalog",
+  "name": "Durable catalog: rows survive restart (real S3)",
+  "claim": "Catalog metadata persists across basin-server restarts (postgres-backed catalog + real-S3 storage)",
+  "passed": false,
+  "primary": {
+    "label": "rows survived restart",
+    "value": 0.0,
+    "unit": "bool",
+    "bar": {
+      "op": "equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "reason": "[postgres] not in test config",
+    "skipped": true
+  },
+  "generated_at": "@1777668964"
+}

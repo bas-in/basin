@@ -1,0 +1,29 @@
+{
+  "kind": "viability",
+  "id": "analytical_routing",
+  "name": "Analytical routing speedup through basin-engine (real S3)",
+  "claim": "Same SQL through the same engine entry point: with the analytical engine attached, GROUP BY queries route to DuckDB and finish at least 1.5x faster than the OLTP-only baseline on a 1M-row real-S3 dataset. v0.1 limitation: DuckDB needs a LocalFS root; httpfs is v0.2.",
+  "passed": false,
+  "primary": {
+    "label": "analytical_routing_speedup (oltp_ms / routed_ms)",
+    "value": 0.0,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 1.5
+    }
+  },
+  "details": {
+    "bucket": "basin-bucket",
+    "endpoint": "http://127.0.0.1:9000",
+    "files": 10,
+    "groups": 16,
+    "oltp_ms_on_s3": 84.5457166,
+    "routed_ms": null,
+    "routings": 0,
+    "rows": 1000000,
+    "speedup": 0.0,
+    "v01_limitation": "basin-analytical requires local_fs_root; DuckDB httpfs is v0.2"
+  },
+  "generated_at": "@1777668066"
+}

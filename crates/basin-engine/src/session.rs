@@ -75,12 +75,51 @@ pub(crate) async fn open(engine: Engine, tenant: TenantId) -> Result<TenantSessi
     //    synthetic scheme. Recursively descend into the date-and-partition
     //    subdirectories `basin-storage` writes (otherwise DataFusion's
     //    default `listing_table_ignore_subdirectory = true` would skip them).
-    let cfg = datafusion::execution::config::SessionConfig::new()
-        .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false");
+    //
+    //    Noisy-tenant downshift: when this tenant's recent query rate is
+    //    over the threshold (see `crate::noisy_detector`), pin
+    //    `target_partitions = 1` so its bulk scans stop fanning out
+    //    parallel range reads at full strength. This is a cooperative hint
+    //    that lets a heavy tenant self-cap; the storage layer's fair-share
+    //    scheduler is the real fairness mechanism. We only consult the
+    //    detector here (at session-open time): a tenant that becomes noisy
+    //    mid-session keeps its current partition count until the next
+    //    `open_session`, which is the natural granularity for this kind of
+    //    soft throttle.
+    // Pin target_partitions=1 by default so per-query Parquet fan-out
+    // is bounded. Each query reads its files sequentially via one stream
+    // instead of issuing 4–8 concurrent range reads per file. Combined
+    // with the storage scheduler's small global budget (default 4),
+    // this lets quiet tenants always find a free permit slot within
+    // ~one in-flight RPC's duration. Noisy tenants pay a per-query
+    // throughput cost (single-threaded reads) — that's the right
+    // tradeoff for fairness on bounded-concurrency backends. On AWS S3
+    // with effectively unbounded server-side concurrency, raising this
+    // back to `num_cpus` is fine; surface as a per-deployment knob in
+    // a v0.3 catalog field. The noisy detector still applies — it
+    // would catch a hypothetical per-deployment override that bumps
+    // partitions back up for a tenant that abuses it.
+    let mut cfg = datafusion::execution::config::SessionConfig::new()
+        .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+        .with_target_partitions(1);
+    if engine.is_noisy(&tenant) {
+        // Already pinned to 1; keep the log so noisy detection is
+        // observable in tracing.
+        tracing::info!(
+            tenant = %tenant,
+            "noisy tenant detected (target_partitions already pinned to 1)"
+        );
+    }
     let ctx = SessionContext::new_with_config(cfg);
     let url = Url::parse(BASIN_URL_BASE)
         .map_err(|e| BasinError::internal(format!("bad basin url: {e}")))?;
-    let store = engine.config().storage.object_store_handle();
+    // Register the *tenant-scoped* store so every range read DataFusion
+    // drives for this session counts against the tenant's per-tenant
+    // concurrency budget. This is the load-bearing call for in-process
+    // tenant fairness on shared object-store backends (real S3 in
+    // particular, where the shared reqwest pool would otherwise be
+    // saturated by one heavy tenant).
+    let store = engine.config().storage.tenant_object_store(&tenant);
     ctx.register_object_store(&url, store);
 
     // Register the vector distance UDFs once per session. They're stateless

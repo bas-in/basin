@@ -33,15 +33,21 @@ impl fmt::Display for SnapshotId {
 
 /// Iceberg-flavored summary of what a single snapshot did.
 ///
-/// Phase 1 only emits `Append` (no deletes, no overwrites, no compaction
-/// commits); the enum is shaped this way so additional ops slot in without
-/// breaking the public type.
+/// `added_*` fields cover newly-written files. `removed_files` is the count
+/// of data files dropped from the parent snapshot; non-zero only on
+/// [`SnapshotOperation::Replace`] commits (UPDATE / DELETE in copy-on-write
+/// mode).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotSummary {
     pub operation: SnapshotOperation,
     pub added_files: u64,
     pub added_rows: u64,
     pub added_bytes: u64,
+    /// Count of files removed from the parent snapshot. `0` on Append /
+    /// Genesis. `#[serde(default)]` so historic snapshots persisted before
+    /// this field existed deserialise cleanly.
+    #[serde(default)]
+    pub removed_files: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +57,12 @@ pub enum SnapshotOperation {
     /// assert on it.
     Genesis,
     Append,
+    /// Copy-on-write rewrite. UPDATE / DELETE produce this: a new snapshot
+    /// whose `data_files` set is the parent's minus the rewritten files plus
+    /// the freshly-written replacement files. Iceberg calls this an
+    /// `overwrite`; we name it `Replace` so the in-process semantics are
+    /// crisp even if a future REST catalog binding maps it to `overwrite`.
+    Replace,
 }
 
 /// One snapshot in a table's history. Snapshots are append-only; older

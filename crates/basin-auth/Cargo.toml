@@ -1,0 +1,43 @@
+[package]
+name = "basin-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-catalog.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+ulid.workspace = true
+uuid.workspace = true
+
+# Auth-specific deps (pinned at workspace level).
+lettre = { workspace = true, features = ["tokio1", "tokio1-rustls-tls"] }
+jsonwebtoken.workspace = true
+bcrypt.workspace = true
+governor.workspace = true
+
+# Postgres-backed auth schema. NoTls only — production deployments will swap
+# this at the connect call site once the catalog crate does.
+tokio-postgres = { workspace = true, features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+
+# Crypto helpers: sha256 of opaque tokens before storing, constant-time
+# comparison via `subtle`, hex encoding for token wire format. All transitive
+# dependencies of crates we already pull in, so they cost us nothing extra.
+sha2 = "0.10"
+subtle = "2"
+hex = "0.4"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-test.workspace = true

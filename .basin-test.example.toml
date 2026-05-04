@@ -1,0 +1,69 @@
+# Basin integration-test configuration.
+#
+# Copy to `.basin-test.toml` (which is gitignored) and fill in the values
+# that apply to your environment. Tests skip cleanly — printing `[skip]`
+# rather than failing — when their corresponding section is missing.
+#
+# Lookup order:
+#   1. $BASIN_TEST_CONFIG=<path>
+#   2. ./.basin-test.toml         (project-local, recommended)
+#   3. ~/.basin/test-config.toml  (per-user, shared across projects)
+#   4. else: every gated test prints `[skip]` and returns Ok
+#
+# NEVER commit `.basin-test.toml`. The example file (this one) is safe to
+# commit because it has no real credentials.
+
+# ----------------------------------------------------------------------------
+# Real S3 (or any S3-compatible service: AWS S3, Cloudflare R2, Tigris, Wasabi,
+# MinIO, etc.). Tests in tests/integration/tests/s3_*.rs gate on this section.
+#
+# Cost note: a full S3 test suite run costs roughly $0.02–$0.10 in S3 ops
+# plus a few MB of storage held for ~5 min. Tests use a unique sub-prefix
+# per run and DELETE everything they wrote on teardown (drop guard).
+# ----------------------------------------------------------------------------
+[s3]
+# Required when [s3] is present.
+bucket = "my-basin-test-bucket"
+region = "us-east-1"
+# Tests namespace under this prefix; they create
+# `<prefix>/<test_name>/<run_ulid>/` sub-prefixes and tear them down at end.
+prefix = "basin-test"
+
+# Credential resolution — pick ONE method. If multiple are set, `profile`
+# wins, then inline `access_key_id`, then the default AWS credentials chain.
+
+# Method 1 (recommended): AWS profile from ~/.aws/credentials.
+# profile = "default"
+
+# Method 2: default credentials chain.
+# Omit `profile` and `access_key_id` and the SDK uses environment variables,
+# IAM instance profiles, ECS task roles, etc. — same as the AWS CLI defaults.
+
+# Method 3: inline static keys. Riskier; never share `.basin-test.toml`.
+# access_key_id     = "AKIA..."
+# secret_access_key = "..."
+# session_token     = ""             # only for temporary credentials
+
+# Optional: non-AWS S3-compatible service (R2, MinIO, Tigris, Wasabi, etc.)
+# endpoint   = "https://<account>.r2.cloudflarestorage.com"
+# allow_http = false   # set true ONLY for plaintext local MinIO
+# http2_only = true    # AWS S3 / R2 / GCS over HTTPS support h2 multiplexing
+                       # — eliminates HTTP/1.1 head-of-line blocking when one
+                       # tenant's bulk transfer ties up the connection pool.
+                       # MinIO over plain HTTP does NOT speak h2c; leave false
+                       # there. Confirmed empirically on MinIO 2024-12 — the
+                       # server upgrades the connection but then returns
+                       # HTTP/1.1 framing.
+
+# ----------------------------------------------------------------------------
+# Postgres for the existing compare_postgres / compare_server_lifecycle /
+# compare_lifecycle_ops / durable_catalog_smoke tests. If you have PG running
+# locally with peer auth, you can leave the user blank — the existing default
+# of `127.0.0.1:5432 user=$USER` works.
+# ----------------------------------------------------------------------------
+# [postgres]
+# host = "127.0.0.1"
+# port = 5432
+# user = "pc"
+# password = ""        # empty for peer auth / Unix-socket / IAM
+# dbname = "postgres"

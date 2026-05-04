@@ -12,7 +12,9 @@ window.__BASIN_RESULTS = {
       "durable_catalog",
       "extended_protocol",
       "orm_compat",
-      "shard_insert_path"
+      "shard_insert_path",
+      "update_delete",
+      "analytical"
     ],
     "scaling": [
       "idle_tenants",
@@ -36,22 +38,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Tenant deletion (1 tenant, 100K rows)",
-          "basin": 4.77275,
-          "postgres": 3.47375,
+          "basin": 5.8405000000000005,
+          "postgres": 8.417167,
           "unit": "ms",
-          "better": "postgres",
-          "ratio_text": "pg / basin = 0.73x"
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.44x"
         },
         {
           "label": "ADD COLUMN on 100K rows (Basin: catalog-only simulation; engine doesn't parse ALTER yet)",
-          "basin": 0.038333,
-          "postgres": 1.4468750000000001,
+          "basin": 0.0165,
+          "postgres": 1.792917,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 37.74x"
+          "ratio_text": "pg / basin = 108.66x"
         }
       ],
-      "generated_at": "@1777597108"
+      "generated_at": "@1777619441"
     },
     "compare_postgres": {
       "kind": "compare",
@@ -70,21 +72,21 @@ window.__BASIN_RESULTS = {
         },
         {
           "label": "Point query p50",
-          "basin": 4.042917,
-          "postgres": 14.081,
+          "basin": 25.226374999999997,
+          "postgres": 14.405,
           "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 3.48x"
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.57x"
         },
         {
           "label": "Insert 1M rows",
-          "basin": 2408.3339170000004,
-          "postgres": 2613.648625,
+          "basin": 10821.825959,
+          "postgres": 3239.707334,
           "unit": "ms",
-          "better": "basin"
+          "better": "postgres"
         }
       ],
-      "generated_at": "@1777597152"
+      "generated_at": "@1777619462"
     },
     "compare_server_lifecycle": {
       "kind": "compare",
@@ -95,11 +97,11 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Connection accept latency p50",
-          "basin": 1.165708,
-          "postgres": 1.3675,
+          "basin": 0.9819169999999999,
+          "postgres": 1.344375,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.17x"
+          "ratio_text": "pg / basin = 1.37x"
         },
         {
           "label": "Connections held under 1000-conn flood",
@@ -118,14 +120,14 @@ window.__BASIN_RESULTS = {
         },
         {
           "label": "RSS per held-open connection",
-          "basin": 165.44,
-          "postgres": 7895.68,
+          "basin": 173.12,
+          "postgres": 7852.0,
           "unit": "KiB",
           "better": "basin",
-          "ratio_text": "pg / basin = 47.73x"
+          "ratio_text": "pg / basin = 45.36x"
         }
       ],
-      "generated_at": "@1777597121"
+      "generated_at": "@1777619482"
     },
     "scaling_concurrency": {
       "kind": "scaling",
@@ -157,39 +159,39 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 2588.0,
-          "per_task_qps": 388.3333333333333,
-          "total_qps": 388.3333333333333
+          "median_latency_us": 19505.0,
+          "per_task_qps": 52.666666666666664,
+          "total_qps": 52.666666666666664
         },
         {
           "concurrency": 4,
-          "median_latency_us": 2898.0,
-          "per_task_qps": 263.25,
-          "total_qps": 1053.0
+          "median_latency_us": 20883.0,
+          "per_task_qps": 48.916666666666664,
+          "total_qps": 195.66666666666666
         },
         {
           "concurrency": 16,
-          "median_latency_us": 9758.0,
-          "per_task_qps": 83.91666666666667,
-          "total_qps": 1342.6666666666667
+          "median_latency_us": 58450.0,
+          "per_task_qps": 15.833333333333334,
+          "total_qps": 253.33333333333334
         },
         {
           "concurrency": 64,
-          "median_latency_us": 44289.0,
-          "per_task_qps": 22.59375,
-          "total_qps": 1446.0
+          "median_latency_us": 252562.0,
+          "per_task_qps": 4.130208333333333,
+          "total_qps": 264.3333333333333
         }
       ],
       "primary": {
         "label": "peak speed-up vs C=1",
-        "value": 3.7236051502145924,
+        "value": 5.018987341772152,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.5
         }
       },
-      "generated_at": "@1777597927"
+      "generated_at": "@1777619553"
     },
     "scaling_data_size": {
       "kind": "scaling",
@@ -227,35 +229,35 @@ window.__BASIN_RESULTS = {
         {
           "bytes_per_row": 8.25075,
           "disk_mib": 0.7868528366088867,
-          "point_ms_p50": 64.008667,
+          "point_ms_p50": 23.116166,
           "rows": 100000,
-          "scan_ms_p50": 139.30295900000002
+          "scan_ms_p50": 54.567417
         },
         {
           "bytes_per_row": 8.239334,
           "disk_mib": 7.857641220092773,
-          "point_ms_p50": 114.352125,
+          "point_ms_p50": 22.128833,
           "rows": 1000000,
-          "scan_ms_p50": 2083.531625
+          "scan_ms_p50": 546.221583
         },
         {
           "bytes_per_row": 8.2410518,
           "disk_mib": 78.59279441833496,
-          "point_ms_p50": 152.16325,
+          "point_ms_p50": 27.661666,
           "rows": 10000000,
-          "scan_ms_p50": 14322.237625
+          "scan_ms_p50": 5512.658459
         }
       ],
       "primary": {
         "label": "point query p50 growth (10M / 100k)",
-        "value": 2.3772288524614957,
+        "value": 1.196637279728827,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777596998"
+      "generated_at": "@1777619609"
     },
     "scaling_idle_tenants": {
       "kind": "scaling",
@@ -286,40 +288,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_tenant_kib": 1.12,
-          "provision_ms": 0.9365,
-          "rss_delta_kib": 112,
+          "per_tenant_kib": 0.16,
+          "provision_ms": 1.6225,
+          "rss_delta_kib": 16,
           "tenants": 100
         },
         {
-          "per_tenant_kib": 0.88,
-          "provision_ms": 13.917542,
-          "rss_delta_kib": 880,
+          "per_tenant_kib": 0.768,
+          "provision_ms": 11.864667,
+          "rss_delta_kib": 768,
           "tenants": 1000
         },
         {
-          "per_tenant_kib": 0.5024,
-          "provision_ms": 44.272167,
-          "rss_delta_kib": 2512,
+          "per_tenant_kib": 0.4768,
+          "provision_ms": 34.336166,
+          "rss_delta_kib": 2384,
           "tenants": 5000
         },
         {
-          "per_tenant_kib": 0.7008,
-          "provision_ms": 132.18087500000001,
-          "rss_delta_kib": 7008,
+          "per_tenant_kib": 0.6864,
+          "provision_ms": 49.823917,
+          "rss_delta_kib": 6864,
           "tenants": 10000
         }
       ],
       "primary": {
         "label": "max per_tenant_kib across scales",
-        "value": 1.12,
+        "value": 0.768,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777596999"
+      "generated_at": "@1777619610"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
@@ -345,31 +347,82 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "p50_ms": 0.633,
-          "p99_ms": 0.926125,
+          "p50_ms": 0.855292,
+          "p99_ms": 1.0337910000000001,
           "scenario": "baseline"
         },
         {
-          "p50_ms": 1.109375,
-          "p99_ms": 2.091583,
+          "p50_ms": 1.026209,
+          "p99_ms": 1.9432500000000001,
           "scenario": "under_load"
         },
         {
-          "p50_ms": 1.752567140600316,
-          "p99_ms": 2.258424078823053,
+          "p50_ms": 1.199834676344453,
+          "p99_ms": 1.879731976772868,
           "scenario": "ratio"
         }
       ],
       "primary": {
         "label": "p99 ratio (under_load / baseline)",
-        "value": 2.258424078823053,
+        "value": 1.879731976772868,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777597154"
+      "generated_at": "@1777923359"
+    },
+    "viability_analytical": {
+      "kind": "viability",
+      "id": "analytical",
+      "name": "Analytical path speedup vs OLTP engine",
+      "claim": "On a 1M-row aggregate (count + avg + sum-of-lengths) with GROUP BY across 10 Parquet files, the DuckDB-backed analytical engine beats the DataFusion-on-listing-table OLTP engine by at least 1.5x on the same dataset.",
+      "passed": true,
+      "primary": {
+        "label": "analytical_speedup (engine_ms / analytical_ms)",
+        "value": 4.748911616369837,
+        "unit": "x",
+        "bar": {
+          "op": "greater_than_or_equal",
+          "value": 1.5
+        }
+      },
+      "details": {
+        "analytical_ms": 102.47995,
+        "engine_ms": 486.668225,
+        "files": 10,
+        "groups": 16,
+        "rows": 1000000,
+        "speedup": 4.748911616369837
+      },
+      "generated_at": "@1777619671"
+    },
+    "viability_analytical_routing": {
+      "kind": "viability",
+      "id": "analytical_routing",
+      "name": "Analytical routing speedup through basin-engine",
+      "claim": "Same SQL through the same engine entry point: with the analytical engine attached, GROUP BY queries route to DuckDB and finish at least 1.5x faster than the OLTP-only baseline on a 1M-row dataset spread across 10 Parquet files.",
+      "passed": true,
+      "primary": {
+        "label": "analytical_routing_speedup (oltp_ms / routed_ms)",
+        "value": 4.669302621469592,
+        "unit": "x",
+        "bar": {
+          "op": "greater_than_or_equal",
+          "value": 1.5
+        }
+      },
+      "details": {
+        "files": 10,
+        "groups": 16,
+        "oltp_ms": 484.06170000000003,
+        "routed_ms": 103.66895,
+        "routings": 5,
+        "rows": 1000000,
+        "speedup": 4.669302621469592
+      },
+      "generated_at": "@1777619681"
     },
     "viability_compression_ratio": {
       "kind": "viability",
@@ -391,7 +444,7 @@ window.__BASIN_RESULTS = {
         "parquet_bytes": 6256650,
         "rows": 1000000
       },
-      "generated_at": "@1777597111"
+      "generated_at": "@1777619689"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -411,9 +464,9 @@ window.__BASIN_RESULTS = {
       "details": {
         "rows_after_restart": 3,
         "rows_inserted": 3,
-        "schema": "basin_catalog_smoke_01kqggde4s8a7r13bjq7w99k66"
+        "schema": "basin_catalog_smoke_01kqh61h1gy29rwmg6rvgxd0b9"
       },
-      "generated_at": "@1777596807"
+      "generated_at": "@1777619485"
     },
     "viability_extended_protocol": {
       "kind": "viability",
@@ -435,7 +488,7 @@ window.__BASIN_RESULTS = {
         "passed_queries": 10,
         "total_queries": 10
       },
-      "generated_at": "@1777596821"
+      "generated_at": "@1777619498"
     },
     "viability_idle_tenant_ram": {
       "kind": "viability",
@@ -445,7 +498,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "per_tenant_kib",
-        "value": 0.96,
+        "value": 0.912,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
@@ -453,11 +506,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "rss_after_kib": 5872,
-        "rss_before_kib": 4912,
+        "rss_after_kib": 6016,
+        "rss_before_kib": 5104,
         "tenants": 1000
       },
-      "generated_at": "@1777597112"
+      "generated_at": "@1777619689"
     },
     "viability_isolation_under_load": {
       "kind": "viability",
@@ -475,11 +528,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_s": 2.1603164169999998,
+        "elapsed_s": 1.246663209,
         "ops": 2000,
         "tenants": 50
       },
-      "generated_at": "@1777597116"
+      "generated_at": "@1777619694"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
@@ -489,7 +542,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "point_query_ms",
-        "value": 29.338124999999998,
+        "value": 23.743,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -499,9 +552,9 @@ window.__BASIN_RESULTS = {
       "details": {
         "files": 10,
         "rows": 10000000,
-        "seed_elapsed_s": 14.513066083
+        "seed_elapsed_s": 10.806179083
       },
-      "generated_at": "@1777597133"
+      "generated_at": "@1777619708"
     },
     "viability_orm_compat": {
       "kind": "viability",
@@ -574,7 +627,7 @@ window.__BASIN_RESULTS = {
         ],
         "total": 7
       },
-      "generated_at": "@1777596814"
+      "generated_at": "@1777619492"
     },
     "viability_predicate_pushdown": {
       "kind": "viability",
@@ -584,7 +637,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "reduction_x (full_scan_bytes / point_query_bytes)",
-        "value": 46.79353575599368,
+        "value": 101.18441770647652,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -594,9 +647,9 @@ window.__BASIN_RESULTS = {
       "details": {
         "file_bytes": 5453088,
         "full_scan_bytes": 5449388,
-        "point_query_bytes": 116456
+        "point_query_bytes": 53856
       },
-      "generated_at": "@1777597136"
+      "generated_at": "@1777619712"
     },
     "viability_shard_insert_path": {
       "kind": "viability",
@@ -606,7 +659,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "inserts_per_sec",
-        "value": 22300.127967054326,
+        "value": 8236.45206590809,
         "unit": "inserts/sec",
         "bar": {
           "op": "greater_than_or_equal",
@@ -614,11 +667,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_ms": 44.842792,
-        "ms_per_insert": 0.044842792000000006,
+        "elapsed_ms": 121.4115,
+        "ms_per_insert": 0.1214115,
         "n_inserts": 1000
       },
-      "generated_at": "@1777597152"
+      "generated_at": "@1777619489"
     },
     "viability_tenant_deletion": {
       "kind": "viability",
@@ -628,7 +681,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "elapsed_ms",
-        "value": 38.643042,
+        "value": 48.300208,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -638,7 +691,31 @@ window.__BASIN_RESULTS = {
       "details": {
         "files": 1000
       },
-      "generated_at": "@1777597138"
+      "generated_at": "@1777619713"
+    },
+    "viability_update_delete": {
+      "kind": "viability",
+      "id": "update_delete",
+      "name": "UPDATE / DELETE via copy-on-write",
+      "claim": "An UPDATE and a DELETE on a 10K-row table commit end-to-end (parser \u2192 executor \u2192 storage rewrite \u2192 catalog Replace snapshot) in under 2 seconds.",
+      "passed": true,
+      "primary": {
+        "label": "UPDATE+DELETE elapsed (ms)",
+        "value": 57.120000000000005,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 2000.0
+        }
+      },
+      "details": {
+        "delete_ms": 27.17125,
+        "remaining_rows": 9997,
+        "rows": 10000,
+        "total_ms": 57.120000000000005,
+        "update_ms": 29.94875
+      },
+      "generated_at": "@1777619717"
     },
     "viability_vector_search": {
       "kind": "viability",
@@ -648,7 +725,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "HNSW speed-up vs brute-force",
-        "value": 2.0355581455942637,
+        "value": 1.8010941225421526,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -668,7 +745,7 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "brute_ms": 231.943625,
+        "brute_ms": 176.93520900000001,
         "dim": 64,
         "hnsw_ids": [
           3764,
@@ -682,13 +759,13 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "hnsw_ms": 113.945959,
+        "hnsw_ms": 98.237625,
         "overlap": 10,
         "rows": 5000,
         "sql_rows": 100,
         "top_k": 10
       },
-      "generated_at": "@1777597104"
+      "generated_at": "@1777619662"
     }
   }
 };

@@ -1,0 +1,24 @@
+{
+  "kind": "viability",
+  "id": "isolation_under_load",
+  "name": "Tenant isolation under concurrent load (real S3)",
+  "claim": "Concurrent multi-tenant traffic on S3 produces zero cross-tenant row leakage.",
+  "passed": true,
+  "primary": {
+    "label": "leaks",
+    "value": 0.0,
+    "unit": "leaks",
+    "bar": {
+      "op": "equal",
+      "value": 0.0
+    }
+  },
+  "details": {
+    "bucket": "basin-bucket",
+    "elapsed_s": 1.640497584,
+    "endpoint": "http://127.0.0.1:9000",
+    "ops": 1000,
+    "tenants": 50
+  },
+  "generated_at": "@1777602485"
+}

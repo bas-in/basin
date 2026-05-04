@@ -1042,6 +1042,83 @@ impl SessionFactory for EngineSessionFactory {
     }
 }
 
+/// Bridge to `basin_pool::SessionPool`. Acquires a `PooledSession` whose
+/// `Drop` returns the underlying `TenantSession` to the pool when the
+/// connection's session slot is cleared (i.e. when the per-connection state
+/// goes away).
+///
+/// `client_key` is `None` for now; the JWT-aware path that derives a
+/// per-user key from the bearer token is layered on by `JwtTenantResolver`
+/// elsewhere — keeping the pool key here `None` matches today's "username
+/// is the tenant" world.
+pub(crate) struct PooledSessionFactory {
+    pool: Arc<basin_pool::SessionPool>,
+}
+
+impl PooledSessionFactory {
+    pub(crate) fn new(pool: Arc<basin_pool::SessionPool>) -> Self {
+        Self { pool }
+    }
+}
+
+/// Per-connection wrapper that owns the `PooledSession`. We forward the
+/// `Session` trait through to the underlying `TenantSession`. Holding the
+/// `PooledSession` for the lifetime of the connection's slot is what keeps
+/// the engine session checked-out; when the slot drops, the wrapper drops,
+/// the `PooledSession` drops, and the engine session goes back to the pool.
+pub(crate) struct PooledSessionWrapper {
+    pooled: basin_pool::PooledSession,
+}
+
+#[async_trait]
+impl Session for PooledSessionWrapper {
+    async fn execute(&self, sql: &str) -> Result<ExecResult> {
+        self.pooled.session().execute(sql).await
+    }
+
+    async fn prepare(
+        &self,
+        sql: &str,
+    ) -> Result<(StatementHandle, StatementSchema)> {
+        self.pooled.session().prepare(sql).await
+    }
+
+    async fn bind(
+        &self,
+        handle: &StatementHandle,
+        params: Vec<ScalarParam>,
+    ) -> Result<BoundStatement> {
+        self.pooled.session().bind(handle, params).await
+    }
+
+    async fn execute_bound(&self, bound: BoundStatement) -> Result<ExecResult> {
+        self.pooled.session().execute_bound(bound).await
+    }
+
+    async fn describe_statement(
+        &self,
+        handle: &StatementHandle,
+    ) -> Result<StatementSchema> {
+        self.pooled.session().describe_statement(handle).await
+    }
+
+    async fn close_statement(&self, handle: &StatementHandle) {
+        self.pooled.session().close_statement(handle).await
+    }
+}
+
+#[async_trait]
+impl SessionFactory for PooledSessionFactory {
+    type Session = PooledSessionWrapper;
+    async fn open(
+        &self,
+        tenant: basin_common::TenantId,
+    ) -> Result<Arc<PooledSessionWrapper>> {
+        let pooled = self.pool.acquire(tenant, None).await?;
+        Ok(Arc::new(PooledSessionWrapper { pooled }))
+    }
+}
+
 /// Glue struct passed to `pgwire::tokio::process_socket`. One instance per
 /// connection; owns the session slot the simple-query handler reads from.
 pub(crate) struct BasinHandlers<F: SessionFactory + 'static> {
@@ -1515,5 +1592,46 @@ mod tests {
         .await;
         assert!(matches!(msgs[0], PgWireBackendMessage::CloseComplete(_)));
         assert!(state.lock().await.statements.is_empty());
+    }
+
+    /// Drive `PooledSessionFactory::open` end-to-end against a real `Engine` +
+    /// `SessionPool`. Two sequential `open`s for the same tenant should hit
+    /// the pool's cached session on the second call (one miss, one hit) — this
+    /// is what `BasinStartupHandler` will exercise once it's running over a
+    /// pool.
+    #[tokio::test]
+    async fn pool_session_factory_reuses_session_across_opens() {
+        use std::sync::Arc as StdArc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fs = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: StdArc::new(fs),
+            root_prefix: None,
+        });
+        let catalog: StdArc<dyn basin_catalog::Catalog> =
+            StdArc::new(basin_catalog::InMemoryCatalog::new());
+        let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        });
+        let pool = StdArc::new(basin_pool::SessionPool::new(
+            engine,
+            basin_pool::PoolConfig::default(),
+        ));
+        let factory = super::PooledSessionFactory::new(pool.clone());
+        let tenant = basin_common::TenantId::new();
+
+        // First open is a cold miss, releases on Drop, so the second sees the
+        // cached session.
+        let s1 = factory.open(tenant).await.unwrap();
+        drop(s1);
+        let s2 = factory.open(tenant).await.unwrap();
+        drop(s2);
+
+        let stats = pool.stats();
+        assert_eq!(stats.misses, 1, "first open is the only miss, got {stats:?}");
+        assert!(stats.hits >= 1, "second open should hit, got {stats:?}");
     }
 }

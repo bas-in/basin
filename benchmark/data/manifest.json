@@ -10,7 +10,9 @@
     "durable_catalog",
     "extended_protocol",
     "orm_compat",
-    "shard_insert_path"
+    "shard_insert_path",
+    "update_delete",
+    "analytical"
   ],
   "scaling": [
     "idle_tenants",

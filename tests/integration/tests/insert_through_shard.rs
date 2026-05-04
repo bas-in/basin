@@ -92,6 +92,7 @@ async fn start_server_with_shard() -> TestServer {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
         tenant_resolver: resolver,
+        pool: None,
     })
     .await
     .expect("server failed to bind");

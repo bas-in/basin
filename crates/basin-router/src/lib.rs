@@ -53,18 +53,24 @@ mod protocol;
 mod resolver;
 mod types;
 
-pub use resolver::{StaticTenantResolver, TenantResolver};
+pub use resolver::{JwtTenantResolver, StackedTenantResolver, StaticTenantResolver, TenantResolver};
 
 use crate::protocol::{
     BasinExtendedQueryHandler, BasinHandlers, BasinSimpleQueryHandlerSlot, BasinStartupHandler,
-    EngineSessionFactory, SessionFactory,
+    EngineSessionFactory, PooledSessionFactory, SessionFactory,
 };
 
 /// Configuration for the pgwire server.
+///
+/// `pool` is optional. When `Some`, the per-connection session is acquired from
+/// the pool (and returned to it on disconnect via `PooledSession::Drop`).
+/// When `None`, the legacy `Engine::open_session` path runs unchanged so
+/// deployments without a pool stay byte-for-byte identical.
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub engine: basin_engine::Engine,
     pub tenant_resolver: Arc<dyn TenantResolver>,
+    pub pool: Option<Arc<basin_pool::SessionPool>>,
 }
 
 /// Bind, listen, accept until the process is killed.
@@ -82,7 +88,7 @@ pub async fn run_with_shutdown(cfg: ServerConfig, shutdown: oneshot::Receiver<()
     let listener = TcpListener::bind(cfg.bind_addr).await.map_err(|e| {
         BasinError::Internal(format!("bind {} failed: {e}", cfg.bind_addr))
     })?;
-    accept_loop(listener, cfg.engine, cfg.tenant_resolver, shutdown).await
+    accept_loop(listener, cfg.engine, cfg.tenant_resolver, cfg.pool, shutdown).await
 }
 
 /// Bind synchronously (so the caller can read `local_addr`), then spawn the
@@ -98,7 +104,9 @@ pub async fn run_until_bound(cfg: ServerConfig) -> Result<RunningServer> {
     let (tx, rx) = oneshot::channel();
     let engine = cfg.engine;
     let resolver = cfg.tenant_resolver;
-    let join = tokio::spawn(async move { accept_loop(listener, engine, resolver, rx).await });
+    let pool = cfg.pool;
+    let join =
+        tokio::spawn(async move { accept_loop(listener, engine, resolver, pool, rx).await });
     Ok(RunningServer {
         local_addr,
         shutdown: tx,
@@ -118,30 +126,64 @@ async fn accept_loop(
     listener: TcpListener,
     engine: basin_engine::Engine,
     resolver: Arc<dyn TenantResolver>,
+    pool: Option<Arc<basin_pool::SessionPool>>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let factory = Arc::new(EngineSessionFactory(engine));
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                tracing::info!("router shutdown signaled");
-                return Ok(());
+    // The session factory is selected once per `accept_loop`. We avoid making
+    // `handle_connection` generic on two factory types by branching here and
+    // letting each arm parameterise its own task. Both factories produce the
+    // same engine `Session`, so the rest of the per-connection plumbing is
+    // shared.
+    if let Some(pool) = pool {
+        let factory = Arc::new(PooledSessionFactory::new(pool));
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::info!("router shutdown signaled");
+                    return Ok(());
+                }
+                res = listener.accept() => {
+                    let (sock, peer) = match res {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "accept failed");
+                            continue;
+                        }
+                    };
+                    let factory = factory.clone();
+                    let resolver = resolver.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(sock, peer, factory, resolver).await {
+                            tracing::warn!(error = %e, %peer, "connection ended with error");
+                        }
+                    });
+                }
             }
-            res = listener.accept() => {
-                let (sock, peer) = match res {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "accept failed");
-                        continue;
-                    }
-                };
-                let factory = factory.clone();
-                let resolver = resolver.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(sock, peer, factory, resolver).await {
-                        tracing::warn!(error = %e, %peer, "connection ended with error");
-                    }
-                });
+        }
+    } else {
+        let factory = Arc::new(EngineSessionFactory(engine));
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::info!("router shutdown signaled");
+                    return Ok(());
+                }
+                res = listener.accept() => {
+                    let (sock, peer) = match res {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "accept failed");
+                            continue;
+                        }
+                    };
+                    let factory = factory.clone();
+                    let resolver = resolver.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(sock, peer, factory, resolver).await {
+                            tracing::warn!(error = %e, %peer, "connection ended with error");
+                        }
+                    });
+                }
             }
         }
     }

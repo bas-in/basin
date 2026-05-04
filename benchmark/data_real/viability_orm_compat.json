@@ -1,0 +1,75 @@
+{
+  "kind": "viability",
+  "id": "orm_compat",
+  "name": "ORM-style query patterns work end-to-end (real S3)",
+  "claim": "Seven representative query shapes that real ORMs (Diesel, SeaORM, Prisma, ActiveRecord, SQLAlchemy) emit through the Postgres extended-query protocol succeed against Basin with real-S3 storage. Failure mode is a clear protocol error, not a hang.",
+  "passed": true,
+  "primary": {
+    "label": "Representative ORM patterns that succeed",
+    "value": 1.0,
+    "unit": "fraction",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 0.85
+    }
+  },
+  "details": {
+    "bucket": "basin-bucket",
+    "driver": "tokio-postgres 0.7",
+    "endpoint": "http://127.0.0.1:9000",
+    "passed": 7,
+    "patterns": [
+      {
+        "description": "INSERT … VALUES ($1,$2,$3), ($4,$5,$6), ($7,$8,$9)",
+        "error": null,
+        "id": "multirow_insert",
+        "orm_analogue": "Diesel `insert_into(t).values(&vec)`; ActiveRecord `insert_all`",
+        "passed": true
+      },
+      {
+        "description": "prepare once + query 100x",
+        "error": null,
+        "id": "prepared_reuse",
+        "orm_analogue": "Connection-pool prepared-statement cache (sqlx, asyncpg, HikariCP)",
+        "passed": true
+      },
+      {
+        "description": "WHERE id = $1 AND name = $2 AND active = $3 (i64, &str, bool)",
+        "error": null,
+        "id": "mixed_where",
+        "orm_analogue": "ActiveRecord `where(id:, name:, active:)`; Prisma `findMany({where:{...}})`",
+        "passed": true
+      },
+      {
+        "description": "INSERT INTO notes VALUES ($1, $2) with Option::<&str>::None",
+        "error": null,
+        "id": "null_param",
+        "orm_analogue": "Diesel `Option<String>`; Prisma optional field",
+        "passed": true
+      },
+      {
+        "description": "SELECT … LIMIT $1",
+        "error": null,
+        "id": "limit_param",
+        "orm_analogue": "Diesel `.limit(?)`; Prisma `take(n)`; SeaORM `limit(n)`",
+        "passed": true
+      },
+      {
+        "description": "INSERT … VALUES ($1) with \"O'Brien\"",
+        "error": null,
+        "id": "single_quote",
+        "orm_analogue": "Any text-input form bound through ORM-style $1 placeholders",
+        "passed": true
+      },
+      {
+        "description": "INSERT/SELECT BYTEA via $1",
+        "error": null,
+        "id": "bytea_roundtrip",
+        "orm_analogue": "Diesel `Vec<u8>`; Prisma `Bytes`",
+        "passed": true
+      }
+    ],
+    "total": 7
+  },
+  "generated_at": "@1777669549"
+}

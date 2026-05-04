@@ -1,10 +1,10 @@
 # 0006 — REST API layer (basin-rest)
 
-- **Status:** Accepted, deferred. Build is gated on
-  [ADR 0005](./0005-auth-system.md) (basin-auth) shipping first —
-  REST without auth is a footgun, not a feature.
+- **Status:** Accepted. Build started alongside ADR 0005 by founder
+  direction. The dependency on basin-auth shipping first is preserved —
+  basin-rest depends on basin-auth's JWT verification at runtime.
 - **Date:** 2026-05-01
-- **Tags:** scope, rest, http, postgrest, depends-on-0005
+- **Tags:** scope, rest, http, postgrest, depends-on-0005, trigger-overridden
 
 ## Context
 

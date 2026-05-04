@@ -55,7 +55,7 @@ impl TenantSession {
             by_file.entry(h.file_path.clone()).or_default().push(h);
         }
 
-        let store = storage.object_store_handle();
+        let store = storage.tenant_object_store(&self.tenant);
         let mut output_rows: Vec<(f32, RecordBatch)> = Vec::with_capacity(hits.len());
 
         for (path, group) in by_file {

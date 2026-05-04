@@ -1,0 +1,29 @@
+{
+  "kind": "viability",
+  "id": "vector_search",
+  "name": "Native vector search on real S3 (HNSW + brute-force agree)",
+  "claim": "On real S3, HNSW top-10 overlaps brute-force top-10 by >=7.",
+  "passed": true,
+  "primary": {
+    "label": "HNSW / brute-force overlap (out of 10)",
+    "value": 10.0,
+    "unit": "matches",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 7.0
+    }
+  },
+  "details": {
+    "brute_ms": 182.66175,
+    "bucket": "basin-bucket",
+    "dim": 64,
+    "endpoint": "http://127.0.0.1:9000",
+    "hnsw_ms": 103.35187499999999,
+    "hnsw_speedup_x": 1.767377224651222,
+    "overlap": 10,
+    "rows": 5000,
+    "sql_rows": 100,
+    "top_k": 10
+  },
+  "generated_at": "@1777604459"
+}

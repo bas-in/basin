@@ -1,0 +1,28 @@
+{
+  "kind": "viability",
+  "id": "analytical",
+  "name": "Analytical path speedup vs OLTP engine (real S3)",
+  "claim": "On a 1M-row aggregate (count + avg + sum-of-lengths) with GROUP BY across 10 Parquet files on real S3, DuckDB beats DataFusion by at least 1.5x. v0.1 limitation: DuckDB requires a LocalFS root; analytical-over-S3 needs httpfs wiring (v0.2). The card flips green when that lands.",
+  "passed": false,
+  "primary": {
+    "label": "analytical_speedup (engine_ms / analytical_ms)",
+    "value": 0.0,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 1.5
+    }
+  },
+  "details": {
+    "analytical_ms": null,
+    "bucket": "basin-bucket",
+    "endpoint": "http://127.0.0.1:9000",
+    "engine_ms_oltp_on_s3": 82.948875,
+    "files": 10,
+    "groups": 16,
+    "rows": 1000000,
+    "speedup": 0.0,
+    "v01_limitation": "basin-analytical requires local_fs_root; DuckDB httpfs is v0.2"
+  },
+  "generated_at": "@1777667789"
+}

@@ -1,0 +1,42 @@
+[package]
+name = "basin-rest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-engine.workspace = true
+basin-auth.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+# HTTP stack.
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http.workspace = true
+hyper.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-test.workspace = true
+basin-storage.workspace = true
+basin-catalog.workspace = true
+object_store.workspace = true
+tokio-postgres.workspace = true
+ulid.workspace = true
+uuid.workspace = true

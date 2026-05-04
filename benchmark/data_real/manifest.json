@@ -1,0 +1,21 @@
+{
+  "viability": [
+    "s3_credentials_smoke",
+    "compression_ratio",
+    "predicate_pushdown",
+    "tenant_deletion",
+    "large_dataset_pointquery",
+    "isolation_under_load",
+    "vector_search",
+    "shard_insert_path"
+  ],
+  "scaling": [
+    "data_size",
+    "concurrency",
+    "noisy_neighbor"
+  ],
+  "compare": [
+    "postgres",
+    "lifecycle_ops"
+  ]
+}

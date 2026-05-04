@@ -106,7 +106,7 @@ pub(crate) async fn build_indexes_for_batch(
         let mut buf: Vec<u8> = Vec::new();
         index.write_to(&mut buf)?;
         storage
-            .object_store()
+            .tenant_store(tenant)
             .put(&key, PutPayload::from_bytes(Bytes::from(buf)))
             .await
             .map_err(|e| BasinError::storage(format!("put hnsw {key}: {e}")))?;
@@ -140,7 +140,7 @@ pub(crate) async fn vector_search(
     distance: Distance,
 ) -> Result<Vec<VectorHit>> {
     let prefix = column_index_prefix(storage.root_prefix(), tenant, table, column);
-    let store = storage.object_store().clone();
+    let store = storage.tenant_store(tenant);
 
     // Build a map from data-file ULID to data-file path so we can return the
     // matching Parquet path with each hit. The two are linked by the shared
@@ -172,24 +172,34 @@ pub(crate) async fn vector_search(
         }
     }
 
-    let segment_results: Vec<Result<(ObjectPath, HnswIndex)>> = futures::stream::iter(paths)
-        .map(|loc| {
-            let store = store.clone();
-            async move {
-                let bytes = store
-                    .get(&loc)
-                    .await
-                    .map_err(|e| BasinError::storage(format!("get hnsw {loc}: {e}")))?
-                    .bytes()
-                    .await
-                    .map_err(|e| BasinError::storage(format!("read hnsw {loc}: {e}")))?;
-                let idx = HnswIndex::read_from(bytes.as_ref())?;
-                Ok::<_, BasinError>((loc, idx))
-            }
-        })
-        .buffer_unordered(16)
-        .collect()
-        .await;
+    // Per-segment cache: parsed `HnswIndex`es are immutable on disk (each
+    // is written once under a fresh ULID), so once cached we can reuse
+    // without invalidation. Same invariant as the parquet metadata cache.
+    let segment_cache = storage.hnsw_segment_cache().clone();
+    let segment_results: Vec<Result<(ObjectPath, std::sync::Arc<HnswIndex>)>> =
+        futures::stream::iter(paths)
+            .map(|loc| {
+                let store = store.clone();
+                let cache = segment_cache.clone();
+                async move {
+                    if let Some(cached) = cache.get(&loc) {
+                        return Ok::<_, BasinError>((loc, cached));
+                    }
+                    let bytes = store
+                        .get(&loc)
+                        .await
+                        .map_err(|e| BasinError::storage(format!("get hnsw {loc}: {e}")))?
+                        .bytes()
+                        .await
+                        .map_err(|e| BasinError::storage(format!("read hnsw {loc}: {e}")))?;
+                    let idx = std::sync::Arc::new(HnswIndex::read_from(bytes.as_ref())?);
+                    cache.insert(loc.clone(), idx.clone());
+                    Ok::<_, BasinError>((loc, idx))
+                }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
 
     let mut hits: Vec<VectorHit> = Vec::new();
     for r in segment_results {
@@ -243,6 +253,29 @@ fn index_segment_key(
     file_id: Ulid,
 ) -> ObjectPath {
     column_index_prefix(root, tenant, table, column).child(format!("{file_id}.hnsw"))
+}
+
+/// Public helper: given a data file path under the standard
+/// `tenants/{t}/tables/{tbl}/data/.../{ulid}.parquet` layout, return the
+/// HNSW sidecar path that *would* exist for `column` if that column had
+/// embeddings in this file. The engine uses this for best-effort cleanup
+/// after a copy-on-write rewrite drops the parent data file — stale
+/// sidecars are not a correctness bug (search merges across all
+/// segments) but they waste object-store quota over time.
+///
+/// Returns `None` if the data path can't be parsed (e.g. a bare
+/// non-tenant path), so the caller can skip cleanup without an error.
+pub fn vector_index_segment_key_for_data_file(
+    root: Option<&ObjectPath>,
+    tenant: &TenantId,
+    table: &TableName,
+    column: &str,
+    data_file_path: &str,
+) -> Option<ObjectPath> {
+    let last = data_file_path.rsplit('/').next()?;
+    let stem = last.strip_suffix(".parquet")?;
+    let ulid: Ulid = stem.parse().ok()?;
+    Some(index_segment_key(root, tenant, table, column, ulid))
 }
 
 /// Map an index-segment path back to the source data-file path. Both files

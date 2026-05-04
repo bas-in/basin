@@ -163,6 +163,7 @@ impl Catalog for PostgresCatalog {
             added_files: 0,
             added_rows: 0,
             added_bytes: 0,
+            removed_files: 0,
         };
         let genesis_summary_json = serde_json::to_value(&genesis_summary)
             .map_err(|e| BasinError::catalog(format!("serialise genesis summary: {e}")))?;
@@ -353,6 +354,7 @@ impl Catalog for PostgresCatalog {
             added_files,
             added_rows,
             added_bytes,
+            removed_files: 0,
         };
         let summary_json = serde_json::to_value(&summary)
             .map_err(|e| BasinError::catalog(format!("serialise summary: {e}")))?;
@@ -434,6 +436,122 @@ impl Catalog for PostgresCatalog {
         // Cheaper than reconstructing in-memory because schema_json
         // round-trip is the only network hop avoided, and correctness is
         // worth more than that microsecond.
+        self.load_table(tenant, table).await
+    }
+
+    #[instrument(
+        skip(self, removed_paths, added_files),
+        fields(
+            tenant = %tenant,
+            table = %table,
+            expected_snapshot = %expected_snapshot,
+            removed = removed_paths.len(),
+            added = added_files.len(),
+        ),
+    )]
+    async fn replace_data_files(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let table_str = table.to_string();
+
+        let added_files_count = added_files.len() as u64;
+        let added_rows: u64 = added_files.iter().map(|f| f.row_count).sum();
+        let added_bytes: u64 = added_files.iter().map(|f| f.size_bytes).sum();
+        let removed_files_count = removed_paths.len() as u64;
+        // Same delta-only convention as `append_data_files`: the snapshot row
+        // records the new files written by this commit. The engine handles
+        // physical removal of the old files from object storage.
+        let summary = SnapshotSummary {
+            operation: SnapshotOperation::Replace,
+            added_files: added_files_count,
+            added_rows,
+            added_bytes,
+            removed_files: removed_files_count,
+        };
+        let summary_json = serde_json::to_value(&summary)
+            .map_err(|e| BasinError::catalog(format!("serialise summary: {e}")))?;
+        let files_json = serde_json::to_value(&added_files)
+            .map_err(|e| BasinError::catalog(format!("serialise data files: {e}")))?;
+        // Suppress unused-warning. Path list is acted on by the engine; we
+        // record only the count in the snapshot summary.
+        let _ = removed_paths;
+
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("begin replace: {e}")))?;
+
+        // Same FOR UPDATE row-lock pattern as append: serialises commits on
+        // the same (tenant, table) without blocking other tables.
+        let row = tx
+            .query_opt(
+                &format!(
+                    "SELECT current_snapshot FROM {sch}.tables
+                     WHERE tenant_id = $1 AND table_name = $2
+                     FOR UPDATE"
+                ),
+                &[&tenant_str, &table_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("lock row: {e}")))?;
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        };
+        let current: i64 = row.get(0);
+        if (current as u64) != expected_snapshot.0 {
+            tx.rollback().await.ok();
+            return Err(BasinError::CommitConflict(format!(
+                "{tenant}/{table}: expected snapshot {expected_snapshot}, current is {current}"
+            )));
+        }
+
+        let new_id = expected_snapshot.next();
+        let parent_id_pg: i64 = expected_snapshot.0 as i64;
+        let new_id_pg: i64 = new_id.0 as i64;
+        let now = Utc::now();
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.snapshots
+                   (tenant_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
+                 VALUES ($1, $2, $3, $4, 'replace', $5, $6, $7)"
+            ),
+            &[
+                &tenant_str,
+                &table_str,
+                &new_id_pg,
+                &parent_id_pg,
+                &now,
+                &summary_json,
+                &files_json,
+            ],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("insert replace snapshot: {e}")))?;
+
+        tx.execute(
+            &format!(
+                "UPDATE {sch}.tables SET current_snapshot = $3
+                 WHERE tenant_id = $1 AND table_name = $2"
+            ),
+            &[&tenant_str, &table_str, &new_id_pg],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("update current_snapshot: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("commit replace: {e}")))?;
+        drop(client);
+
         self.load_table(tenant, table).await
     }
 
@@ -908,5 +1026,70 @@ mod tests {
         assert!(validate_schema_ident("1bad").is_err());
         assert!(validate_schema_ident("with-dash").is_err());
         assert!(validate_schema_ident("with space").is_err());
+    }
+
+    #[tokio::test]
+    async fn replace_data_files_concurrent_one_wins() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let cat = Arc::new(cat);
+        let t = TenantId::new();
+        let tbl = TableName::new("reprace").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("seed.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+
+        let c1 = cat.clone();
+        let c2 = cat.clone();
+        let t1 = t;
+        let t2 = t;
+        let tbl1 = tbl.clone();
+        let tbl2 = tbl.clone();
+        let h1 = tokio::spawn(async move {
+            c1.replace_data_files(
+                &t1,
+                &tbl1,
+                SnapshotId(1),
+                vec!["seed.parquet".to_string()],
+                vec![file("a.parquet", 1, 10)],
+            )
+            .await
+        });
+        let h2 = tokio::spawn(async move {
+            c2.replace_data_files(
+                &t2,
+                &tbl2,
+                SnapshotId(1),
+                vec!["seed.parquet".to_string()],
+                vec![file("b.parquet", 1, 10)],
+            )
+            .await
+        });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+
+        let conflicts = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(BasinError::CommitConflict(_))))
+            .count();
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(oks, 1, "exactly one replace must win: {r1:?} {r2:?}");
+        assert_eq!(
+            conflicts, 1,
+            "exactly one replace must conflict: {r1:?} {r2:?}"
+        );
+
+        let head = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(head.current_snapshot, SnapshotId(2));
+        let snap = head.current().unwrap();
+        assert_eq!(snap.summary.operation, SnapshotOperation::Replace);
+        assert_eq!(snap.summary.removed_files, 1);
     }
 }

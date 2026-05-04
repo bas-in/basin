@@ -39,6 +39,7 @@ impl TableState {
                 added_files: 0,
                 added_rows: 0,
                 added_bytes: 0,
+                removed_files: 0,
             },
         };
         Self {
@@ -215,8 +216,73 @@ impl Catalog for InMemoryCatalog {
                 added_files,
                 added_rows,
                 added_bytes,
+                removed_files: 0,
             },
         };
+        state.snapshots.push(snap);
+        state.current = new_id;
+        Ok(Self::build_metadata(tenant, table, &state))
+    }
+
+    #[instrument(
+        skip(self, removed_paths, added_files),
+        fields(
+            tenant = %tenant,
+            table = %table,
+            expected_snapshot = %expected_snapshot,
+            removed = removed_paths.len(),
+            added = added_files.len(),
+        ),
+    )]
+    async fn replace_data_files(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+
+        if state.current != expected_snapshot {
+            return Err(BasinError::CommitConflict(format!(
+                "{tenant}/{table}: expected snapshot {expected_snapshot}, current is {}",
+                state.current
+            )));
+        }
+
+        let parent = state.current;
+        let added_files_count = added_files.len() as u64;
+        let added_rows: u64 = added_files.iter().map(|f| f.row_count).sum();
+        let added_bytes: u64 = added_files.iter().map(|f| f.size_bytes).sum();
+        let removed_files_count = removed_paths.len() as u64;
+
+        // Per-snapshot data_files mirrors the Append convention: the snapshot
+        // records the *delta* (the new files written by this commit). The
+        // catalog isn't asked to materialise the full file set; the engine
+        // physically deletes the removed files from the object store as part
+        // of the same commit so subsequent listings see the new state.
+        let new_id = parent.next();
+        let snap = Snapshot {
+            id: new_id,
+            parent: Some(parent),
+            committed_at: Utc::now(),
+            data_files: added_files,
+            summary: SnapshotSummary {
+                operation: SnapshotOperation::Replace,
+                added_files: added_files_count,
+                added_rows,
+                added_bytes,
+                removed_files: removed_files_count,
+            },
+        };
+        // Suppress the "unused" warning for `removed_paths` — its value is
+        // recorded in the summary count above. The path list itself is the
+        // engine's responsibility to act on (file deletion); the catalog
+        // snapshot history records *that* the swap happened, not which old
+        // bytes were thrown away.
+        let _ = removed_paths;
         state.snapshots.push(snap);
         state.current = new_id;
         Ok(Self::build_metadata(tenant, table, &state))
@@ -451,5 +517,101 @@ mod tests {
             .unwrap();
         assert_eq!(meta.current_snapshot, SnapshotId(2));
         assert_eq!(meta.snapshots.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn replace_data_files_advances_snapshot() {
+        let cat = InMemoryCatalog::new();
+        let t = TenantId::new();
+        let tbl = TableName::new("rep").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("a.parquet", 10, 100)],
+        )
+        .await
+        .unwrap();
+
+        let meta = cat
+            .replace_data_files(
+                &t,
+                &tbl,
+                SnapshotId(1),
+                vec!["a.parquet".to_string()],
+                vec![file("b.parquet", 5, 60)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta.current_snapshot, SnapshotId(2));
+        let head = meta.current().unwrap();
+        assert_eq!(head.summary.operation, SnapshotOperation::Replace);
+        assert_eq!(head.summary.removed_files, 1);
+        assert_eq!(head.summary.added_files, 1);
+        assert_eq!(head.summary.added_rows, 5);
+        assert_eq!(head.summary.added_bytes, 60);
+        assert_eq!(head.parent, Some(SnapshotId(1)));
+    }
+
+    #[tokio::test]
+    async fn replace_data_files_concurrent_one_wins() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let t = TenantId::new();
+        let tbl = TableName::new("repmix").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        // Seed a real file so removed_paths references something concrete.
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("seed.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+
+        let c1 = cat.clone();
+        let c2 = cat.clone();
+        let t1 = t;
+        let t2 = t;
+        let tbl1 = tbl.clone();
+        let tbl2 = tbl.clone();
+        // Both racers see snapshot 1 and try to swap.
+        let h1 = tokio::spawn(async move {
+            c1.replace_data_files(
+                &t1,
+                &tbl1,
+                SnapshotId(1),
+                vec!["seed.parquet".to_string()],
+                vec![file("a.parquet", 1, 10)],
+            )
+            .await
+        });
+        let h2 = tokio::spawn(async move {
+            c2.replace_data_files(
+                &t2,
+                &tbl2,
+                SnapshotId(1),
+                vec!["seed.parquet".to_string()],
+                vec![file("b.parquet", 1, 10)],
+            )
+            .await
+        });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+
+        let conflicts = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(BasinError::CommitConflict(_))))
+            .count();
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(oks, 1, "exactly one replace must win: {r1:?} {r2:?}");
+        assert_eq!(
+            conflicts, 1,
+            "exactly one replace must conflict: {r1:?} {r2:?}"
+        );
+
+        let head = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(head.current_snapshot, SnapshotId(2));
     }
 }

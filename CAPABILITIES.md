@@ -36,7 +36,7 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 | `SHOW TABLES` | ✅ | per-tenant scoped |
 | `ORDER BY` / `LIMIT` | ✅ | full DataFusion support |
 | Joins (single-shard) | 🛠 | DataFusion handles them; not yet exercised in tests |
-| `UPDATE` / `DELETE` | ◻️ | requires row-level deletes; Iceberg v2 supports this |
+| `UPDATE` / `DELETE` | ✅ | Copy-on-write Iceberg v2. Single-scan partition; `replace_data_files` with optimistic concurrency on both catalog backends; physical deletion of replaced Parquet files. WHERE: `col OP literal` for `=`/`<`/`>`/`<=`/`>=` shipped; `AND`/`OR`/`IN`/`IS NULL` in flight. File-level pruning via column stats in flight. |
 | Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ◻️ | single-shard only when shipped |
 | Prepared statements with parameter bind | ✅ | shipped with extended-query protocol |
 | Foreign keys | ◻️ | single-shard only when shipped |
@@ -91,7 +91,7 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 | Capability | Status | Notes |
 |---|---|---|
 | OLTP path via DataFusion | ✅ | per-tenant `SessionContext` |
-| Analytical path via DuckDB / DataFusion direct on Iceberg | ◻️ | Phase 5 |
+| Analytical path via DuckDB on Iceberg | ✅ | `basin-analytical` v0.1 — 4.6× faster than DataFusion on 1M-row aggregates. LocalFS-only (S3 via DuckDB httpfs deferred to v0.2). Engine planner-heuristic routing deferred. |
 | Cross-shard query merging | 🚫 | single-process today; Phase 3 work |
 | Cost-based query rejection | ◻️ | "this query would cost $1k; reject" |
 
@@ -131,10 +131,10 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 
 | Capability | Status | Notes |
 |---|---|---|
-| Per-tenant metrics (ops/s, p50/p99, RAM, S3 IO) | 🛠 | minimal today |
-| OpenTelemetry traces | 🛠 | wired through router → engine → storage |
+| Per-tenant metrics (ops/s, p50/p99, RAM, S3 IO) | 🛠 | tracing spans on every layer; structured aggregation deferred |
+| OpenTelemetry traces | ✅ | wired through router → engine → shard → storage; OTLP export available via `BASIN_OTLP_ENDPOINT` |
 | Structured logs (`tracing` JSON) | ✅ | format selectable at startup |
-| Connection pooling (`basin-pool`) | ◻️ scoped | [ADR 0007](./docs/decisions/0007-connection-pooling.md). Native `TenantSession` cache, ~1 week build. Pgbouncer is the wrong tool — see ADR. |
+| Connection pooling (`basin-pool`) | ✅ | Native `TenantSession` cache; per-tenant cap; LRU eviction. Wired into `basin-server` behind `BASIN_POOL_ENABLED=1`. See [ADR 0007](./docs/decisions/0007-connection-pooling.md). |
 | Rate limiting | ◻️ | per-tenant throttles |
 | Bring-your-own-bucket | ◻️ | Phase 6 |
 | Bring-your-own-key (KMS) | ◻️ | Phase 6 |
@@ -144,8 +144,9 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 
 | Capability | Status | Notes |
 |---|---|---|
-| `basin-auth` (signup, signin, magic-link, password reset, JWT, refresh) | ◻️ scoped | [ADR 0005](./docs/decisions/0005-auth-system.md). Requires SMTP at startup. Trigger: $50k+ ARR contract or BaaS pivot. |
-| `basin-rest` (PostgREST-compatible HTTP layer) | ◻️ scoped | [ADR 0006](./docs/decisions/0006-rest-api-layer.md). Depends on basin-auth. Trigger: 0005 shipped + paying customer asks. |
+| `basin-auth` (signup, signin, magic-link, password reset, email verify, JWT, refresh) | ✅ | Requires SMTP at startup (fail-fast). Postgres-backed `auth.users`. JWT issued + verified per request. `BASIN_AUTH_ENABLED=1`. See [ADR 0005](./docs/decisions/0005-auth-system.md). |
+| `basin-rest` (PostgREST-compatible HTTP layer) | ✅ | `GET`/`POST`/`PATCH`/`DELETE` on `/rest/v1/<table>`. Bearer-JWT auth via `basin-auth`. `BASIN_REST_ENABLED=1` (requires auth). See [ADR 0006](./docs/decisions/0006-rest-api-layer.md). |
+| Pgwire JWT auth (`user` parameter carries bearer token) | ✅ | When auth is enabled, both pgwire and REST honor JWT. Static tenant map continues to work as fallback. |
 | Real PostgREST (Haskell) sitting in front of Basin | 🚫 | needs `pg_catalog` / `information_schema` — 2–4 month slog with ongoing maintenance. Building basin-rest natively is ~3 weeks instead. |
 
 ## What we're not building, and what to use instead

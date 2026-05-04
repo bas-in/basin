@@ -10,6 +10,7 @@ use sqlparser::ast::{ObjectName, SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+use crate::analytical_route::is_analytical;
 use crate::convert::{batch_df_to_ws, schema_df_to_ws};
 use crate::ddl::schema_from_columns;
 use crate::dml::batch_from_rows;
@@ -18,6 +19,12 @@ use crate::session::refresh_table;
 use crate::{ExecResult, TenantSession};
 
 pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResult> {
+    // Keep a reference to the SQL the user actually wrote. The rewriter
+    // below mangles vector operators into UDF calls; that rewrite is
+    // irrelevant to (and would only confuse) the analytical engine, which
+    // doesn't know our UDFs.
+    let raw_sql = sql;
+
     // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
@@ -39,6 +46,33 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         Statement::CreateTable(ct) => exec_create_table(sess, ct).await,
         Statement::Insert(ins) => exec_insert(sess, ins).await,
         Statement::Query(_) => {
+            // Analytical routing happens before the point-query fast path so
+            // an explicit `/*+ analytical */` hint on a shape that the fast
+            // path would otherwise grab still gets DuckDB. Aggregate /
+            // GROUP-BY queries don't match the fast path's pattern, so for
+            // those the order doesn't matter.
+            if let Some(analytical) = sess.engine.analytical() {
+                if is_analytical(&stmt, raw_sql) {
+                    match analytical.query(&sess.tenant, raw_sql).await {
+                        Ok(batches) => {
+                            sess.engine.note_analytical_routed();
+                            return Ok(rows_from_batches(batches));
+                        }
+                        Err(e) => {
+                            // Fallback: DuckDB rejects a fraction of the
+                            // dialect (e.g. some PG-isms, our vector UDFs).
+                            // The caller wrote the same SQL the OLTP engine
+                            // accepts; surface a hard error only if both
+                            // engines fail. v0.3 may tighten this.
+                            tracing::warn!(
+                                error = %e,
+                                "analytical path failed, falling back to OLTP engine"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Try the point-query fast path first. It only matches a tightly
             // constrained shape; on any rejection we fall back to DataFusion.
             if let Some(plan) = match_simple_select(&stmt) {
@@ -47,10 +81,40 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             exec_select(sess, sql).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
+        Statement::Delete(del) => crate::dml_mutate::exec_delete(sess, del).await,
+        Statement::Update {
+            table,
+            assignments,
+            from,
+            selection,
+            returning,
+        } => {
+            crate::dml_mutate::exec_update(
+                sess,
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+            )
+            .await
+        }
         other => Err(BasinError::internal(format!(
             "unsupported in PoC: {other}"
         ))),
     }
+}
+
+/// Wrap analytical-engine output in [`ExecResult::Rows`]. The schema comes
+/// from the first batch; an empty result still needs *some* schema, so we
+/// hand back an empty [`Schema`] in that case (the analytical engine doesn't
+/// expose a typed empty-result API in v0.1).
+fn rows_from_batches(batches: Vec<RecordBatch>) -> ExecResult {
+    let schema = match batches.first() {
+        Some(b) => b.schema(),
+        None => Arc::new(Schema::empty()),
+    };
+    ExecResult::Rows { schema, batches }
 }
 
 async fn exec_create_table(

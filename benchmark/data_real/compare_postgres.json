@@ -1,0 +1,10 @@
+{
+  "kind": "compare",
+  "id": "postgres",
+  "name": "Basin (real S3) vs Postgres 18 (no index, 100K rows)",
+  "claim": "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed point queries.",
+  "available": false,
+  "metrics": [],
+  "generated_at": "@1777602607",
+  "note": "postgres unavailable"
+}

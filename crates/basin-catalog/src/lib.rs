@@ -87,6 +87,27 @@ pub trait Catalog: Send + Sync {
         files: Vec<DataFileRef>,
     ) -> Result<TableMetadata>;
 
+    /// Atomically replace the data file set: the resulting snapshot's data
+    /// files = (parent.data_files − removed_paths) ∪ added_files.
+    ///
+    /// Used by copy-on-write UPDATE / DELETE: the engine reads the affected
+    /// data files, writes their replacements, and commits the swap in one
+    /// catalog round trip. Optimistic concurrency on `expected_snapshot` —
+    /// same contract as [`append_data_files`](Catalog::append_data_files).
+    /// Returns [`basin_common::BasinError::CommitConflict`] if the snapshot
+    /// has advanced. If `removed_paths` references a path that isn't in the
+    /// parent snapshot's data file set, the call returns
+    /// [`basin_common::BasinError::Catalog`] (caller bug — the path list
+    /// must come from a prior `load_table`).
+    async fn replace_data_files(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata>;
+
     /// Snapshots in commit order (oldest first). Used by point-in-time-restore
     /// and the analytical reader.
     async fn list_snapshots(

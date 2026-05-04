@@ -1,0 +1,23 @@
+{
+  "kind": "viability",
+  "id": "predicate_pushdown",
+  "name": "Predicate pushdown vs full scan (real S3)",
+  "claim": "On real S3, a point query reads at least 10x less than a full scan would.",
+  "passed": true,
+  "primary": {
+    "label": "reduction_x (full_scan_bytes / point_query_bytes)",
+    "value": 46.79353575599368,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 10.0
+    }
+  },
+  "details": {
+    "bucket": "basin-bucket",
+    "endpoint": "http://127.0.0.1:9000",
+    "full_scan_bytes": 5449388,
+    "point_query_bytes": 116456
+  },
+  "generated_at": "@1777602451"
+}

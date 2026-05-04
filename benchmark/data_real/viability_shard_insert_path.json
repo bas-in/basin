@@ -1,0 +1,24 @@
+{
+  "kind": "viability",
+  "id": "shard_insert_path",
+  "name": "Shard-acked INSERT path (real S3 storage)",
+  "claim": "Single-row INSERTs route through the WAL + shard owner; WAL absorbs S3 latency so user-visible throughput stays >= 50 inserts/sec.",
+  "passed": true,
+  "primary": {
+    "label": "inserts_per_sec",
+    "value": 8422.267211166241,
+    "unit": "inserts/sec",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 50.0
+    }
+  },
+  "details": {
+    "bucket": "basin-bucket",
+    "elapsed_ms": 118.732875,
+    "endpoint": "http://127.0.0.1:9000",
+    "ms_per_insert": 0.118732875,
+    "n_inserts": 1000
+  },
+  "generated_at": "@1777602528"
+}
