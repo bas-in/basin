@@ -1,0 +1,50 @@
+{
+  "kind": "viability",
+  "id": "page_cache",
+  "name": "Parquet page cache (Phase 5.7 A2)",
+  "claim": "Cold p99 of a 1000-iteration random-working-set point-query workload finishes under 75 ms. The 'cold' phase starts with an empty page cache (every working-set id is a miss); the 'warm' phase repeats the same workload (caches now populated) and is reported alongside as corroboration. The bar is set against COLD p99 so no implementation can pass by leaning on a pre-warmed cache. Workload: 100k rows across 10 Parquet files, 1000 hot ids drawn at fixed PRNG seed.",
+  "passed": true,
+  "primary": {
+    "label": "cold p99 ms",
+    "value": 1.2366670000000002,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 75.0
+    }
+  },
+  "details": {
+    "bar_cold_p99_ms": 75.0,
+    "batches": 10,
+    "cache_budget_bytes": 268435456,
+    "cold_hits": 3810,
+    "cold_misses": 6190,
+    "n_iterations": 1000,
+    "rows": [
+      {
+        "max_ms": 3.906,
+        "mean_ms": 0.789452457,
+        "min_ms": 0.238625,
+        "p50_ms": 1.080791,
+        "p999_ms": 1.4355419999999999,
+        "p99_ms": 1.2366670000000002,
+        "phase": "cold"
+      },
+      {
+        "max_ms": 0.31333300000000003,
+        "mean_ms": 0.24708254700000004,
+        "min_ms": 0.236208,
+        "p50_ms": 0.245916,
+        "p999_ms": 0.288666,
+        "p99_ms": 0.271542,
+        "phase": "warm"
+      }
+    ],
+    "seed": 13425777967503634925,
+    "total_rows": 100000,
+    "warm_hits_total": 13810,
+    "warm_misses_total": 6190,
+    "working_set_size": 1000
+  },
+  "generated_at": "@1777992455"
+}

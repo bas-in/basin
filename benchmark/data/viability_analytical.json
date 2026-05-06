@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "analytical_speedup (engine_ms / analytical_ms)",
-    "value": 4.748911616369837,
+    "value": 1.6658158720364091,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
@@ -14,12 +14,12 @@
     }
   },
   "details": {
-    "analytical_ms": 102.47995,
-    "engine_ms": 486.668225,
+    "analytical_ms": 52.016783399999994,
+    "engine_ms": 86.6503834,
     "files": 10,
     "groups": 16,
     "rows": 1000000,
-    "speedup": 4.748911616369837
+    "speedup": 1.6658158720364091
   },
-  "generated_at": "@1777619671"
+  "generated_at": "@1777992437"
 }

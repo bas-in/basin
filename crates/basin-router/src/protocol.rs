@@ -1000,7 +1000,7 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
                     )))
                 })?;
 
-                let session = self.factory.open(tenant).await.map_err(|e| {
+                let session = self.factory.open(tenant, &user).await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "FATAL".to_owned(),
                         "XX000".to_owned(),
@@ -1024,10 +1024,20 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
 /// for an authenticated tenant. We define this rather than depend on `Engine`
 /// directly so the test path can substitute a fake without touching the real
 /// engine (whose body is still `unimplemented!()`).
+///
+/// `_username` is the original pgwire `user` parameter (after JWT/static
+/// resolution to the same `TenantId`). The single-process and pool factories
+/// ignore it; the remote-shard factory uses it as the upstream `user`
+/// parameter so the upstream router resolves the same tenant. New
+/// implementations should default-impl-ignore it for backward compatibility.
 #[async_trait]
 pub(crate) trait SessionFactory: Send + Sync {
     type Session: Session + 'static;
-    async fn open(&self, tenant: basin_common::TenantId) -> Result<Arc<Self::Session>>;
+    async fn open(
+        &self,
+        tenant: basin_common::TenantId,
+        _username: &str,
+    ) -> Result<Arc<Self::Session>>;
 }
 
 /// Bridge to `basin_engine::Engine`.
@@ -1036,7 +1046,11 @@ pub(crate) struct EngineSessionFactory(pub basin_engine::Engine);
 #[async_trait]
 impl SessionFactory for EngineSessionFactory {
     type Session = TenantSession;
-    async fn open(&self, tenant: basin_common::TenantId) -> Result<Arc<TenantSession>> {
+    async fn open(
+        &self,
+        tenant: basin_common::TenantId,
+        _username: &str,
+    ) -> Result<Arc<TenantSession>> {
         let s = self.0.open_session(tenant).await?;
         Ok(Arc::new(s))
     }
@@ -1113,6 +1127,7 @@ impl SessionFactory for PooledSessionFactory {
     async fn open(
         &self,
         tenant: basin_common::TenantId,
+        _username: &str,
     ) -> Result<Arc<PooledSessionWrapper>> {
         let pooled = self.pool.acquire(tenant, None).await?;
         Ok(Arc::new(PooledSessionWrapper { pooled }))
@@ -1608,6 +1623,8 @@ mod tests {
         let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
             object_store: StdArc::new(fs),
             root_prefix: None,
+            disk_cache: None,
+        page_cache: None,
         });
         let catalog: StdArc<dyn basin_catalog::Catalog> =
             StdArc::new(basin_catalog::InMemoryCatalog::new());
@@ -1625,9 +1642,9 @@ mod tests {
 
         // First open is a cold miss, releases on Drop, so the second sees the
         // cached session.
-        let s1 = factory.open(tenant).await.unwrap();
+        let s1 = factory.open(tenant, "alice").await.unwrap();
         drop(s1);
-        let s2 = factory.open(tenant).await.unwrap();
+        let s2 = factory.open(tenant, "alice").await.unwrap();
         drop(s2);
 
         let stats = pool.stats();

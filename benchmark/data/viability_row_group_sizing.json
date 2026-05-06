@@ -1,0 +1,32 @@
+{
+  "kind": "viability",
+  "id": "row_group_sizing",
+  "name": "Per-table row-group sizing for point queries",
+  "claim": "A table with `row_group_rows = 4096` scans strictly fewer than half the rows of an identical table at the default 65,536-row group size when answering a `WHERE id = X` point query.",
+  "passed": true,
+  "primary": {
+    "label": "small_rg_scan_rows / default_rg_scan_rows",
+    "value": 0.0625,
+    "unit": "fraction",
+    "bar": {
+      "op": "less_than",
+      "value": 0.5
+    }
+  },
+  "details": {
+    "default_phase": {
+      "groups_considered": 1,
+      "groups_scanned": 1,
+      "rows_scanned_estimate": 65536
+    },
+    "default_rg_rows": 65536,
+    "rows": 16384,
+    "small_phase": {
+      "groups_considered": 4,
+      "groups_scanned": 1,
+      "rows_scanned_estimate": 4096
+    },
+    "small_rg_rows": 4096
+  },
+  "generated_at": "@1777992608"
+}

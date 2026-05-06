@@ -358,6 +358,8 @@ async fn s3_compare_server_lifecycle() {
     let storage = Storage::new(StorageConfig {
         object_store,
         root_prefix: Some(ObjectPath::from(run_prefix.as_str())),
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn basin_catalog::Catalog> =
         Arc::new(basin_catalog::InMemoryCatalog::new());
@@ -374,6 +376,7 @@ async fn s3_compare_server_lifecycle() {
         engine,
         tenant_resolver: resolver,
         pool: None,
+        shard_endpoints: None,
     })
     .await
     .expect("basin server failed to bind");

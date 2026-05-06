@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 use basin_common::{Result, TableName, TenantId};
 
-use crate::metadata::{DataFileRef, TableMetadata};
+use crate::metadata::{DataFileRef, PartitionSpec, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId};
 use crate::Catalog;
 
@@ -98,6 +98,15 @@ impl Catalog for RestCatalog {
         _table: &TableName,
     ) -> Result<Vec<Snapshot>> {
         unimplemented!("RestCatalog::list_snapshots lands in Phase 2")
+    }
+
+    async fn set_partition_spec(
+        &self,
+        _tenant: &TenantId,
+        _table: &TableName,
+        _spec: PartitionSpec,
+    ) -> Result<()> {
+        unimplemented!("RestCatalog::set_partition_spec lands in Phase 2")
     }
 }
 

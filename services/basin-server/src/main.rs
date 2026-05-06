@@ -123,9 +123,75 @@ async fn main() -> Result<()> {
         .with_context(|| format!("create data dir {}", cfg.data_dir.display()))?;
     let fs = LocalFileSystem::new_with_prefix(&cfg.data_dir)
         .with_context(|| format!("LocalFileSystem at {}", cfg.data_dir.display()))?;
+
+    // Production cache defaults: disk + page cache ON unless explicitly
+    // disabled. Knobs (in priority order, highest wins):
+    //
+    //   BASIN_DISK_CACHE_ROOT       (path; default <XDG_CACHE_HOME or ~/.cache>/basin/disk-cache)
+    //   BASIN_DISK_CACHE_MAX_BYTES  (u64; default 10 GiB — see StorageConfig::DEFAULT_DISK_CACHE_BYTES)
+    //   BASIN_PAGE_CACHE_MAX_BYTES  (u64; default 1 GiB — see StorageConfig::DEFAULT_PAGE_CACHE_BYTES)
+    //
+    // Setting `BASIN_DISK_CACHE_MAX_BYTES=0` disables the disk cache;
+    // `BASIN_PAGE_CACHE_MAX_BYTES=0` disables the page cache.
+    let disk_cache_root: PathBuf = std::env::var("BASIN_DISK_CACHE_ROOT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+                .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".cache")))
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            base.join("basin").join("disk-cache")
+        });
+    let disk_cache_max_bytes: u64 = std::env::var("BASIN_DISK_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(basin_storage::StorageConfig::DEFAULT_DISK_CACHE_BYTES);
+    let page_cache_max_bytes: u64 = std::env::var("BASIN_PAGE_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(basin_storage::StorageConfig::DEFAULT_PAGE_CACHE_BYTES);
+
+    let disk_cache = if disk_cache_max_bytes == 0 {
+        None
+    } else {
+        if let Err(e) = std::fs::create_dir_all(&disk_cache_root) {
+            tracing::warn!(
+                target = "basin_server",
+                error = %e,
+                path = %disk_cache_root.display(),
+                "disk_cache: cannot create root; cache will be disabled",
+            );
+            None
+        } else {
+            Some(basin_storage::DiskCacheConfig::new(
+                disk_cache_root.clone(),
+                disk_cache_max_bytes,
+            ))
+        }
+    };
+    let page_cache = if page_cache_max_bytes == 0 {
+        None
+    } else {
+        Some(basin_storage::PageCacheConfig::new(page_cache_max_bytes))
+    };
+    tracing::info!(
+        disk_cache_enabled = disk_cache.is_some(),
+        disk_cache_root = %disk_cache_root.display(),
+        disk_cache_max_bytes,
+        page_cache_enabled = page_cache.is_some(),
+        page_cache_max_bytes,
+        "storage cache configuration",
+    );
+
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
+        disk_cache,
+        page_cache,
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = match &cfg.catalog {
         CatalogBackend::Memory => {
@@ -284,6 +350,7 @@ async fn main() -> Result<()> {
         engine,
         tenant_resolver,
         pool,
+        shard_endpoints: None,
     };
 
     let router_join = tokio::spawn(async move {

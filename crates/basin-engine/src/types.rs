@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, TimeUnit};
 use basin_common::{BasinError, Result};
 use sqlparser::ast::DataType as SqlDataType;
+use sqlparser::ast::TimezoneInfo;
 
 /// Map a sqlparser column type to an Arrow [`DataType`]. Only the small set
 /// listed in the engine's PoC SQL contract is accepted; anything else is an
@@ -32,6 +33,23 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         | SqlDataType::Float(_) => Ok(DataType::Float64),
 
         SqlDataType::Bytea => Ok(DataType::Binary),
+
+        // TIMESTAMPTZ / TIMESTAMP WITH TIME ZONE → microsecond UTC. We
+        // only support the timezone-aware variant so partition-by-month
+        // arithmetic is unambiguous (and so the Phase 5.5 partition pruner
+        // can reason about wall-clock vs UTC without a coercion table).
+        // Naive `TIMESTAMP` (no zone) remains rejected — same policy as the
+        // previous PoC behaviour the regression test asserts.
+        SqlDataType::Timestamp(_, tz_info) => {
+            match tz_info {
+                TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => {
+                    Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+                }
+                _ => Err(BasinError::InvalidSchema(
+                    "TIMESTAMP without time zone is not supported in PoC; use TIMESTAMPTZ".into(),
+                )),
+            }
+        }
 
         // sqlparser's Postgres dialect parses unknown parameterised types
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form

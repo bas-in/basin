@@ -90,6 +90,15 @@ async fn scaling_2_data_size() {
         let storage = Storage::new(StorageConfig {
             object_store: Arc::new(fs),
             root_prefix: None,
+            // This test asserts that point-query latency stays within
+            // 5× as data size grows from 100k → 10M rows. Caches make
+            // smaller scales pure cache hits and inflate the ratio
+            // because the larger scale has to inspect many more file
+            // footers (cached but still O(n_files)). Keep caches off
+            // here so the scaling claim measures the storage path's
+            // structural cost rather than a cache-warmth ratio.
+            disk_cache: None,
+            page_cache: None,
         });
 
         let tenant = TenantId::new();

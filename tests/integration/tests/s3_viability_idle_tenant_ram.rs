@@ -73,6 +73,8 @@ async fn s3_viability_idle_tenant_ram() {
     let _storage = Storage::new(StorageConfig {
         object_store,
         root_prefix: Some(ObjectPath::from(run_prefix.as_str())),
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let table = TableName::new("events").unwrap();

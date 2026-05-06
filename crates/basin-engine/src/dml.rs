@@ -5,16 +5,21 @@
 
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
+
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Float32Type;
 use arrow_array::{
     ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, RecordBatch,
     StringArray,
 };
-use arrow_schema::{DataType, Schema};
-use basin_common::{BasinError, Result};
+use arrow_schema::{DataType, Schema, TimeUnit};
+use basin_catalog::PartitionSpec;
+use basin_common::{BasinError, PartitionKey, Result};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlparser::ast::{DataType as SqlDataType, Expr, UnaryOperator, Value};
 
 use crate::types::parse_vector_literal;
@@ -107,6 +112,20 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 let mut b = Float64Builder::with_capacity(rows.len());
                 for row in rows {
                     match coerce_f64(&row[col_idx])? {
+                        Some(v) => b.append_value(v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len())
+                    .with_data_type(field.data_type().clone());
+                for row in rows {
+                    match coerce_timestamp_micros(&row[col_idx])? {
                         Some(v) => b.append_value(v),
                         None => {
                             check_null_allowed(field)?;
@@ -464,6 +483,115 @@ fn coerce_vector(expr: &Expr, dim: usize, col: &str) -> Result<Option<Vec<f32>>>
     Ok(Some(parsed))
 }
 
+/// Decode a TIMESTAMPTZ literal into microseconds since the Unix epoch.
+///
+/// Accepts:
+/// - `'2026-04-15T12:00:00Z'` — RFC3339 with explicit zone.
+/// - `'2026-04-15 12:00:00+00'` — Postgres-style with explicit numeric zone.
+/// - `'2026-04-15 12:00:00'` — naive form, **interpreted as UTC**. We only
+///   support TIMESTAMPTZ at the column level, so a missing zone in the
+///   literal is unambiguous.
+/// - `123456789::BIGINT` casts already arrive pre-coerced as integers; we
+///   accept those here too so a caller can shove a microsecond value in
+///   directly without round-tripping through a string.
+/// - `NULL`.
+fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
+    // Strip an explicit `::TIMESTAMPTZ` cast wrapper if present; sqlparser
+    // surfaces it as `Expr::Cast`. The inner expression is what we coerce.
+    let inner = match expr {
+        Expr::Cast { expr: inner, .. } => inner.as_ref(),
+        Expr::Value(Value::Null) => return Ok(None),
+        _ => expr,
+    };
+    match inner {
+        Expr::Value(Value::SingleQuotedString(s))
+        | Expr::Value(Value::DoubleQuotedString(s))
+        | Expr::Value(Value::EscapedStringLiteral(s))
+        | Expr::Value(Value::NationalStringLiteral(s)) => {
+            let micros = parse_timestamp_string(s)?;
+            Ok(Some(micros))
+        }
+        Expr::Value(Value::Number(n, _)) => {
+            // Accept integer epoch microseconds. Negative values handled below.
+            let parsed: i64 = n.parse().map_err(|e| {
+                BasinError::InvalidSchema(format!("bad timestamp integer literal {n:?}: {e}"))
+            })?;
+            Ok(Some(parsed))
+        }
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
+            if let Expr::Value(Value::Number(n, _)) = inner.as_ref() {
+                let parsed: i64 = n.parse().map_err(|e| {
+                    BasinError::InvalidSchema(format!(
+                        "bad timestamp integer literal -{n:?}: {e}"
+                    ))
+                })?;
+                Ok(Some(-parsed))
+            } else {
+                Err(BasinError::InvalidSchema(format!(
+                    "expected timestamp literal, got {expr}"
+                )))
+            }
+        }
+        Expr::Value(Value::Null) => Ok(None),
+        other => Err(BasinError::InvalidSchema(format!(
+            "expected TIMESTAMPTZ literal, got {other}"
+        ))),
+    }
+}
+
+fn parse_timestamp_string(s: &str) -> Result<i64> {
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    let trimmed = s.trim();
+    // Try RFC3339 first.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        let utc: DateTime<Utc> = dt.with_timezone(&Utc);
+        return micros_from_dt(utc);
+    }
+    // Try a few common Postgres-shaped forms with explicit zones.
+    let formats = [
+        "%Y-%m-%d %H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%#z",
+        "%Y-%m-%dT%H:%M:%S%.f%#z",
+        "%Y-%m-%dT%H:%M:%S%#z",
+    ];
+    for fmt in formats {
+        if let Ok(dt) = DateTime::parse_from_str(trimmed, fmt) {
+            let utc: DateTime<Utc> = dt.with_timezone(&Utc);
+            return micros_from_dt(utc);
+        }
+    }
+    // Naive form: assume UTC.
+    let dt_formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"];
+    for fmt in dt_formats {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+            return micros_from_dt(dt);
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let naive: NaiveDateTime = date.and_hms_opt(0, 0, 0).unwrap();
+        let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+        return micros_from_dt(dt);
+    }
+    Err(BasinError::InvalidSchema(format!(
+        "unparseable TIMESTAMPTZ literal {s:?} (try RFC3339, e.g. 2026-04-15T12:00:00Z)"
+    )))
+}
+
+fn micros_from_dt(dt: DateTime<Utc>) -> Result<i64> {
+    // `timestamp_micros` returns `i64`; chrono represents valid in-range
+    // datetimes so the value is well-defined. We re-validate here so a
+    // future refactor catches any out-of-range path.
+    let micros = dt.timestamp_micros();
+    if micros == i64::MIN {
+        return Err(BasinError::InvalidSchema(format!(
+            "TIMESTAMPTZ {dt} out of range for microseconds-since-epoch"
+        )));
+    }
+    Ok(micros)
+}
+
 fn coerce_bool(expr: &Expr) -> Result<Option<bool>> {
     match expr {
         Expr::Value(Value::Boolean(b)) => Ok(Some(*b)),
@@ -485,6 +613,102 @@ fn peel_unary(expr: &Expr) -> (bool, &Expr) {
         }
     }
     (false, expr)
+}
+
+/// Group `rows` by the partition key derived from the partition column's
+/// per-row value. Returns `BTreeMap<PartitionKey, Vec<row>>` so iteration
+/// order is deterministic (matters for test stability and for the bench
+/// harness that compares snapshot listings byte-by-byte).
+///
+/// `RangeMonthly` produces keys of the form `year=YYYY/month=MM`. We accept
+/// the column as either an Arrow `Timestamp` (microsecond, milli, etc.)
+/// where the SQL literal has already been coerced to integer ticks, or as
+/// `Int64` interpreted as microseconds-since-epoch.
+pub(crate) fn group_rows_by_partition(
+    schema: &Schema,
+    rows: &[Vec<Expr>],
+    spec: &PartitionSpec,
+) -> Result<BTreeMap<PartitionKey, Vec<Vec<Expr>>>> {
+    let column = match spec {
+        PartitionSpec::Unpartitioned => {
+            // Caller should have shortcut to the default-partition path.
+            let mut out = BTreeMap::new();
+            out.insert(PartitionKey::default_key(), rows.to_vec());
+            return Ok(out);
+        }
+        PartitionSpec::RangeMonthly { column } => column.clone(),
+    };
+    let col_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == &column)
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "partition column {column} missing from INSERT schema"
+            ))
+        })?;
+    let field = schema.field(col_idx);
+    let unit = match field.data_type() {
+        DataType::Timestamp(unit, _) => Some(*unit),
+        DataType::Int64 => None,
+        other => {
+            return Err(BasinError::InvalidSchema(format!(
+                "partition column {column} has unsupported type {other:?}"
+            )));
+        }
+    };
+
+    let mut out: BTreeMap<PartitionKey, Vec<Vec<Expr>>> = BTreeMap::new();
+    for row in rows {
+        let value = &row[col_idx];
+        let micros = match unit {
+            Some(_) => match coerce_timestamp_micros(value)? {
+                Some(v) => v,
+                None => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "partition column {column} cannot be NULL on INSERT"
+                    )));
+                }
+            },
+            None => match coerce_i64(value)? {
+                Some(v) => v,
+                None => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "partition column {column} cannot be NULL on INSERT"
+                    )));
+                }
+            },
+        };
+        // Convert ticks to a chrono UTC DateTime. For non-microsecond
+        // Timestamp units we'd convert here; today the only unit emitted
+        // by basin-engine is microsecond UTC (see `types::arrow_data_type`),
+        // so a direct call is enough.
+        let dt = ticks_to_utc_micros(micros, unit)?;
+        let key = format!("year={:04}/month={:02}", dt.year(), dt.month());
+        let pkey = PartitionKey::new(key)?;
+        out.entry(pkey).or_default().push(row.clone());
+    }
+    Ok(out)
+}
+
+fn ticks_to_utc_micros(ticks: i64, unit: Option<TimeUnit>) -> Result<DateTime<Utc>> {
+    let micros = match unit.unwrap_or(TimeUnit::Microsecond) {
+        TimeUnit::Microsecond => ticks,
+        TimeUnit::Millisecond => ticks
+            .checked_mul(1000)
+            .ok_or_else(|| BasinError::InvalidSchema("timestamp overflow ms→us".into()))?,
+        TimeUnit::Nanosecond => ticks / 1000,
+        TimeUnit::Second => ticks
+            .checked_mul(1_000_000)
+            .ok_or_else(|| BasinError::InvalidSchema("timestamp overflow s→us".into()))?,
+    };
+    let secs = micros.div_euclid(1_000_000);
+    let sub_us = micros.rem_euclid(1_000_000) as u32;
+    Utc.timestamp_opt(secs, sub_us * 1000)
+        .single()
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!("timestamp {micros}us out of range"))
+        })
 }
 
 #[cfg(test)]

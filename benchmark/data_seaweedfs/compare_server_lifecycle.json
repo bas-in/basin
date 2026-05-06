@@ -1,0 +1,41 @@
+{
+  "kind": "compare",
+  "id": "server_lifecycle",
+  "name": "Server lifecycle: accept, conn-scaling, RSS/conn (real S3)",
+  "claim": "Basin's tokio-task model handles dramatically more connections at lower memory than PG's process-per-connection. Basin in-process server is wired to real S3; the subprocess RSS sample uses LocalFS because basin-server's S3 backend is v0.2.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "Connection accept latency p50",
+      "basin": 0.6914589999999999,
+      "postgres": 1.692209,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.45x"
+    },
+    {
+      "label": "Connections held under 1000-conn flood",
+      "basin": 1000.0,
+      "postgres": 100.0,
+      "unit": "conns",
+      "better": "basin",
+      "ratio_text": "basin / pg = 10.00x"
+    },
+    {
+      "label": "Refused conns under 1000-conn flood",
+      "basin": 0.0,
+      "postgres": 900.0,
+      "unit": "conns",
+      "better": "basin"
+    },
+    {
+      "label": "RSS per held-open connection",
+      "basin": 173.12,
+      "postgres": 7894.88,
+      "unit": "KiB",
+      "better": "basin",
+      "ratio_text": "pg / basin = 45.60x"
+    }
+  ],
+  "generated_at": "@1777929711"
+}

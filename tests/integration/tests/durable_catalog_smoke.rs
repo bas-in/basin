@@ -105,6 +105,8 @@ async fn boot_server(
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let pg_catalog =
         basin_catalog::PostgresCatalog::connect_with_schema(PG_URL, schema_name)
@@ -127,6 +129,7 @@ async fn boot_server(
         engine,
         tenant_resolver: resolver,
         pool: None,
+        shard_endpoints: None,
     })
     .await
     .expect("server failed to bind")

@@ -1,0 +1,55 @@
+{
+  "kind": "scaling",
+  "id": "compute_shards",
+  "name": "Compute sharding (router -> shard owners)",
+  "claim": "Hash tenant_id -> shard_id; pgwire connections route to the owning shard. Reconnects from the same tenant always land on the same shard, and load distributes evenly enough across shards.",
+  "passed": true,
+  "x_axis": {
+    "key": "shard",
+    "label": "shard index"
+  },
+  "series": [
+    {
+      "key": "tenants",
+      "label": "tenants on shard",
+      "unit": "count"
+    },
+    {
+      "key": "load_pct",
+      "label": "share of tenants",
+      "unit": "%"
+    }
+  ],
+  "rows": [
+    {
+      "load_pct": 22.0,
+      "shard": 0,
+      "tenants": 22
+    },
+    {
+      "load_pct": 27.0,
+      "shard": 1,
+      "tenants": 27
+    },
+    {
+      "load_pct": 37.0,
+      "shard": 2,
+      "tenants": 37
+    },
+    {
+      "load_pct": 14.0,
+      "shard": 3,
+      "tenants": 14
+    }
+  ],
+  "primary": {
+    "label": "max shard load",
+    "value": 37.0,
+    "unit": "%",
+    "bar": {
+      "op": "less_than",
+      "value": 50.0
+    }
+  },
+  "generated_at": "@1777992399"
+}

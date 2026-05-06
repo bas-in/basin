@@ -23,17 +23,24 @@ chrono.workspace = true
 pgwire.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
-tokio-test.workspace = true
-# JWT resolver tests stand up a live `AuthService` against PG; the
-# tokio-postgres / ulid / uuid deps are only needed for the per-test schema
-# guard and the test issuer. They mirror what basin-auth's own tests use.
+# Used by remote_shard.rs to forward pgwire traffic from the front router
+# to a chosen shard owner's pgwire listener. Same client crate the test
+# suite already uses; promoting it from dev-dep to regular dep keeps
+# pgwire types consistent across the route.
 tokio-postgres.workspace = true
-ulid.workspace = true
-uuid.workspace = true
-# Pool-acquire test in protocol.rs needs to construct a real Engine + Pool.
+# test_cluster helpers need a tempdir for the shared on-disk LocalFS, and
+# integration tests reach in via `pub mod test_cluster`. Keeping it as a
+# regular dep avoids feature-gating gymnastics for what is already a small
+# dev-quality helper.
+tempfile.workspace = true
+object_store.workspace = true
 basin-storage.workspace = true
 basin-catalog.workspace = true
-object_store.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+# JWT resolver tests stand up a live `AuthService` against PG; ulid / uuid
+# deps mirror what basin-auth's own tests use for the per-test schema
+# guard and the test issuer.
+ulid.workspace = true
+uuid.workspace = true

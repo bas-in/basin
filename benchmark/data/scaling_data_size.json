@@ -34,33 +34,33 @@
     {
       "bytes_per_row": 8.25075,
       "disk_mib": 0.7868528366088867,
-      "point_ms_p50": 23.116166,
+      "point_ms_p50": 6.2822499999999994,
       "rows": 100000,
-      "scan_ms_p50": 54.567417
+      "scan_ms_p50": 12.291542000000002
     },
     {
       "bytes_per_row": 8.239334,
       "disk_mib": 7.857641220092773,
-      "point_ms_p50": 22.128833,
+      "point_ms_p50": 5.531458000000001,
       "rows": 1000000,
-      "scan_ms_p50": 546.221583
+      "scan_ms_p50": 96.743666
     },
     {
       "bytes_per_row": 8.2410518,
       "disk_mib": 78.59279441833496,
-      "point_ms_p50": 27.661666,
+      "point_ms_p50": 6.5000409999999995,
       "rows": 10000000,
-      "scan_ms_p50": 5512.658459
+      "scan_ms_p50": 959.51125
     }
   ],
   "primary": {
     "label": "point query p50 growth (10M / 100k)",
-    "value": 1.196637279728827,
+    "value": 1.0346676747980421,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1777619609"
+  "generated_at": "@1777992422"
 }

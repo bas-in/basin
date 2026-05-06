@@ -424,11 +424,25 @@ async fn write_replacement(
         return Ok(Vec::new());
     }
     let part = PartitionKey::default_key();
+    // Honour the per-table writer overrides (bloom-filter columns,
+    // row-group size) on the rewrite path too; otherwise the
+    // copy-on-write replacement file would silently lose the table's
+    // configured pruning aids.
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, table)
+        .await?;
+    let opts = basin_storage::WriteOptions {
+        bloom_filter_columns: meta.bloom_filter_columns.clone(),
+        max_row_group_size: meta.row_group_rows,
+    };
     let df = sess
         .engine
         .config()
         .storage
-        .write_batch(&sess.tenant, table, &part, &merged)
+        .write_batch_with_options(&sess.tenant, table, &part, &merged, &opts)
         .await?;
     Ok(vec![DataFileRef {
         path: df.path.as_ref().to_string(),

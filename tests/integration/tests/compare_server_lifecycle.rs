@@ -362,6 +362,8 @@ async fn compare_server_lifecycle() {
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn basin_catalog::Catalog> =
         Arc::new(basin_catalog::InMemoryCatalog::new());
@@ -378,6 +380,7 @@ async fn compare_server_lifecycle() {
         engine,
         tenant_resolver: resolver,
         pool: None,
+        shard_endpoints: None,
     })
     .await
     .expect("basin server failed to bind");

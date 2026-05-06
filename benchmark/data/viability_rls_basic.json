@@ -1,0 +1,24 @@
+{
+  "kind": "viability",
+  "id": "rls_basic",
+  "name": "Row-level security: per-principal predicate injection",
+  "claim": "RLS isolates rows per `current_user` while preserving full visibility when disabled.",
+  "passed": true,
+  "primary": {
+    "label": "alice_rows_visible",
+    "value": 5.0,
+    "unit": "rows",
+    "bar": {
+      "op": "equal",
+      "value": 5.0
+    }
+  },
+  "details": {
+    "alice_rows_visible": 5,
+    "all_rows_after_drop_policy_with_rls_on": 0,
+    "all_rows_without_rls": 10,
+    "anonymous_rows_visible": 0,
+    "bob_rows_visible": 5
+  },
+  "generated_at": "@1777992605"
+}

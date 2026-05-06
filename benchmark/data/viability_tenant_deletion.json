@@ -2,19 +2,22 @@
   "kind": "viability",
   "id": "tenant_deletion",
   "name": "Tenant deletion latency",
-  "claim": "Deleting a tenant of 1000 small files completes in under 1 second.",
+  "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant_prefix completes in under 1 second (parallel/bulk delete on object stores).",
   "passed": true,
   "primary": {
-    "label": "elapsed_ms",
-    "value": 48.300208,
-    "unit": "ms",
+    "label": "delete_seconds",
+    "value": 0.005268375,
+    "unit": "s",
     "bar": {
       "op": "less_than",
-      "value": 1000.0
+      "value": 1.0
     }
   },
   "details": {
-    "files": 1000
+    "files_1000_count": 1000,
+    "files_1000_path_ms": 51.722375,
+    "files_100_count": 100,
+    "files_100_path_seconds": 0.005268375
   },
-  "generated_at": "@1777619713"
+  "generated_at": "@1777992608"
 }

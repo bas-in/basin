@@ -1,0 +1,75 @@
+{
+  "kind": "scaling",
+  "id": "perf_stack",
+  "name": "Full perf stack on a WAN-class point query",
+  "claim": "Same SELECT … WHERE id = X measured four ways under a 1000-iteration random-working-set point-query workload (1000 hot ids, fixed PRNG seed) with a 50 ms-per-RPC latency injector standing in for cross-region S3: (a) no cache, (b) +disk cache, (c) +page cache, (d) +bloom filter. Layer (a) shows the cold WAN cost (>200 ms p50), layer (d) lands cold p99 under 1500 ms (the tail is dominated by the fraction of iterations whose id wasn't yet cached and paid the full miss cost), and the headline claim is speedup ≥ 100× from (a)'s cold p50 to (d)'s cold p50.",
+  "passed": true,
+  "x_axis": {
+    "key": "stack_layer",
+    "label": "Stack layer"
+  },
+  "series": [
+    {
+      "key": "p50_ms",
+      "label": "p50 latency",
+      "unit": "ms"
+    },
+    {
+      "key": "p99_ms",
+      "label": "p99 latency",
+      "unit": "ms"
+    }
+  ],
+  "rows": [
+    {
+      "label": "(a) no cache",
+      "max_ms": 1050.827334,
+      "mean_ms": 580.2511652299997,
+      "min_ms": 477.39491699999996,
+      "p50_ms": 578.169375,
+      "p999_ms": 1050.827334,
+      "p99_ms": 585.287292,
+      "stack_layer": "a_baseline"
+    },
+    {
+      "label": "(b) +disk cache",
+      "max_ms": 1087.823917,
+      "mean_ms": 49.60906792,
+      "min_ms": 1.034042,
+      "p50_ms": 2.7117500000000003,
+      "p999_ms": 1087.823917,
+      "p99_ms": 601.478666,
+      "stack_layer": "b_disk"
+    },
+    {
+      "label": "(c) +page cache",
+      "max_ms": 1085.0570420000001,
+      "mean_ms": 49.261534125,
+      "min_ms": 0.36812500000000004,
+      "p50_ms": 2.3380419999999997,
+      "p999_ms": 1085.0570420000001,
+      "p99_ms": 598.5912500000001,
+      "stack_layer": "c_disk_page"
+    },
+    {
+      "label": "(d) +bloom filter",
+      "max_ms": 1138.183833,
+      "mean_ms": 66.68225608,
+      "min_ms": 0.259667,
+      "p50_ms": 1.995083,
+      "p999_ms": 1138.183833,
+      "p99_ms": 658.584375,
+      "stack_layer": "d_full"
+    }
+  ],
+  "primary": {
+    "label": "speedup p50 (a→d)",
+    "value": 289.7971538026237,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 100.0
+    }
+  },
+  "generated_at": "@1777993238"
+}

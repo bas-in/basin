@@ -12,13 +12,18 @@
     "orm_compat",
     "shard_insert_path",
     "update_delete",
-    "analytical"
+    "analytical",
+    "partition_pruning",
+    "rls_basic",
+    "rls_isolation",
+    "tiered_storage"
   ],
   "scaling": [
     "idle_tenants",
     "data_size",
     "concurrency",
-    "noisy_neighbor"
+    "noisy_neighbor",
+    "compute_shards"
   ],
   "compare": [
     "postgres",

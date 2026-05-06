@@ -1,0 +1,24 @@
+{
+  "kind": "viability",
+  "id": "durable_catalog",
+  "name": "Durable catalog: rows survive restart (real S3)",
+  "claim": "Catalog metadata + S3-resident parquet survives a basin-server restart: rows written through pgwire come back identical after the server is dropped and a fresh server is started against the same Postgres schema and the same S3 prefix.",
+  "passed": true,
+  "primary": {
+    "label": "rows survived restart",
+    "value": 1.0,
+    "unit": "bool",
+    "bar": {
+      "op": "equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "bucket": "basin-test",
+    "endpoint": "http://127.0.0.1:8333",
+    "rows_after_restart": 3,
+    "rows_inserted": 3,
+    "schema": "basin_s3_durable_catalog_01kqtdxzcd08nk13xv4zx2v5bk"
+  },
+  "generated_at": "@1777929748"
+}

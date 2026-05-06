@@ -50,6 +50,8 @@ async fn viability_4_tenant_deletion() {
     let storage = Storage::new(StorageConfig {
         object_store: fs.clone(),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
     let tenant = TenantId::new();
@@ -120,24 +122,64 @@ async fn viability_4_tenant_deletion() {
         if pass { "PASS" } else { "FAIL" }
     );
 
+    // Phase 5.8: tighter 100-file bar via the new
+    // `Storage::delete_tenant_prefix` API. The 1000-file run above used
+    // the raw `delete_stream` for back-compat with the v0.1 dashboard;
+    // the 100-file measurement below is the bar the optimised tenant
+    // deletion path is held to going forward (`delete_seconds < 1.0`).
+    //
+    // Setup: a fresh tenant with 100 files, then time the delete.
+    let tenant_100 = TenantId::new();
+    for i in 0..100 {
+        let start = (i * ROWS_PER_FILE) as i64;
+        let batch = build_batch(start, ROWS_PER_FILE);
+        storage
+            .write_batch(&tenant_100, &table, &part, &batch)
+            .await
+            .unwrap();
+    }
+    let start_100 = Instant::now();
+    let deleted_100 = storage
+        .delete_tenant_prefix(&tenant_100)
+        .await
+        .expect("delete_tenant_prefix");
+    let elapsed_100 = start_100.elapsed();
+    let elapsed_100_seconds = elapsed_100.as_secs_f64();
+    let pass_100 = elapsed_100_seconds < 1.0 && deleted_100 >= 100;
+    println!(
+        "[VIABILITY 4 / 100-file optimised path] files={}, elapsed={:.3} s (bar <1.0 s) {}",
+        deleted_100,
+        elapsed_100_seconds,
+        if pass_100 { "PASS" } else { "FAIL" }
+    );
+
     report_viability(
         "tenant_deletion",
         "Tenant deletion latency",
-        "Deleting a tenant of 1000 small files completes in under 1 second.",
-        pass,
+        "Deleting a tenant of 100 small files via Storage::delete_tenant_prefix \
+         completes in under 1 second (parallel/bulk delete on object stores).",
+        pass && pass_100,
         PrimaryMetric {
-            label: "elapsed_ms".into(),
-            value: elapsed_ms,
-            unit: "ms".into(),
-            bar: BarOp::lt(1000.0),
+            label: "delete_seconds".into(),
+            value: elapsed_100_seconds,
+            unit: "s".into(),
+            bar: BarOp::lt(1.0),
         },
         json!({
-            "files": deleted.len(),
+            "files_1000_path_ms": elapsed_ms,
+            "files_1000_count": deleted.len(),
+            "files_100_path_seconds": elapsed_100_seconds,
+            "files_100_count": deleted_100,
         }),
     );
 
     assert!(
         pass,
-        "deletion took {elapsed_ms:.1} ms, bar <1000 ms"
+        "1000-file deletion took {elapsed_ms:.1} ms, bar <1000 ms"
+    );
+    assert!(
+        pass_100,
+        "100-file delete_tenant_prefix took {elapsed_100_seconds:.3} s, bar <1.0 s; \
+         deleted_count={deleted_100}"
     );
 }

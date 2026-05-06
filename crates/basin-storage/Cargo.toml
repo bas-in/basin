@@ -26,6 +26,12 @@ serde_json.workspace = true
 ulid.workspace = true
 chrono.workspace = true
 lru.workspace = true
+# Disk-cache key hashing: SHA-256 of `(path, range)` is plenty for cache
+# keying (we don't need cryptographic strength, just collision resistance
+# on a content-addressed namespace). sha2 is already a transitive workspace
+# dep via basin-auth, so this costs no extra build time.
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,0 +1,49 @@
+{
+  "kind": "viability",
+  "id": "disk_cache",
+  "name": "NVMe disk cache (Phase 5.7 A1)",
+  "claim": "Cold p99 of a 1000-iteration random-working-set point-query workload, behind a 50 ms-per-RPC latency injector standing in for cross-region S3, finishes under 250 ms. The 'cold' phase starts with both the disk cache and the in-process metadata cache empty (every working-set id is a miss); the 'warm' phase repeats the same workload (caches now populated). The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache.",
+  "passed": true,
+  "primary": {
+    "label": "cold p99 ms",
+    "value": 3.746208,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 250.0
+    }
+  },
+  "details": {
+    "bar_cold_p99_ms": 250.0,
+    "batches": 10,
+    "cache_budget_bytes": 268435456,
+    "cold_inner_gets": 50,
+    "n_iterations": 1000,
+    "rows": [
+      {
+        "max_ms": 593.245542,
+        "mean_ms": 2.7182492060000016,
+        "min_ms": 1.039708,
+        "p50_ms": 1.086625,
+        "p999_ms": 114.66137499999999,
+        "p99_ms": 3.746208,
+        "phase": "cold"
+      },
+      {
+        "max_ms": 1.244792,
+        "mean_ms": 1.0845682309999995,
+        "min_ms": 1.034583,
+        "p50_ms": 1.079834,
+        "p999_ms": 1.234291,
+        "p99_ms": 1.181,
+        "phase": "warm"
+      }
+    ],
+    "seed": 13425777967503634925,
+    "simulated_latency_ms": 50,
+    "total_rows": 100000,
+    "warm_inner_gets": 0,
+    "working_set_size": 1000
+  },
+  "generated_at": "@1777992446"
+}

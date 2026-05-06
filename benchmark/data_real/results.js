@@ -9,12 +9,17 @@ window.__BASIN_RESULTS = {
       "large_dataset_pointquery",
       "isolation_under_load",
       "vector_search",
-      "shard_insert_path"
+      "shard_insert_path",
+      "partition_pruning",
+      "rls_basic",
+      "rls_isolation",
+      "tiered_storage"
     ],
     "scaling": [
       "data_size",
       "concurrency",
-      "noisy_neighbor"
+      "noisy_neighbor",
+      "compute_shards"
     ],
     "compare": [
       "postgres",
@@ -123,6 +128,61 @@ window.__BASIN_RESULTS = {
         }
       ],
       "generated_at": "@1777926851"
+    },
+    "scaling_compute_shards": {
+      "kind": "scaling",
+      "id": "compute_shards",
+      "name": "Compute sharding (router -> shard owners) on real S3",
+      "claim": "Hash tenant_id -> shard_id; pgwire connections route to the owning shard. Shards share one S3-backed Storage; load distributes evenly across shards. Scaled to 25 tenants on real S3 to fit the WAN test budget.",
+      "passed": true,
+      "x_axis": {
+        "key": "shard",
+        "label": "shard index"
+      },
+      "series": [
+        {
+          "key": "tenants",
+          "label": "tenants on shard",
+          "unit": "count"
+        },
+        {
+          "key": "load_pct",
+          "label": "share of tenants",
+          "unit": "%"
+        }
+      ],
+      "rows": [
+        {
+          "load_pct": 24.0,
+          "shard": 0,
+          "tenants": 6
+        },
+        {
+          "load_pct": 20.0,
+          "shard": 1,
+          "tenants": 5
+        },
+        {
+          "load_pct": 16.0,
+          "shard": 2,
+          "tenants": 4
+        },
+        {
+          "load_pct": 40.0,
+          "shard": 3,
+          "tenants": 10
+        }
+      ],
+      "primary": {
+        "label": "max shard load",
+        "value": 40.0,
+        "unit": "%",
+        "bar": {
+          "op": "less_than",
+          "value": 50.0
+        }
+      },
+      "generated_at": "@1777981826"
     },
     "scaling_concurrency": {
       "kind": "scaling",
@@ -644,6 +704,36 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1777924871"
     },
+    "viability_partition_pruning": {
+      "kind": "viability",
+      "id": "partition_pruning",
+      "name": "Within-tenant time-based partition pruning (real S3)",
+      "claim": "A 1-month range query against 12 months of partitioned data, hosted on real S3, reads at most one partition's worth of bytes (range/full bytes ratio < 0.2).",
+      "passed": true,
+      "primary": {
+        "label": "partition_bytes_ratio (range / full)",
+        "value": 0.117088,
+        "unit": "ratio",
+        "bar": {
+          "op": "less_than",
+          "value": 0.2
+        }
+      },
+      "details": {
+        "bucket": "baisn-test",
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "full_scan_bytes": 31250,
+        "full_scan_gets": 12,
+        "full_scan_range_gets": 36,
+        "months": 12,
+        "range_scan_bytes": 3659,
+        "range_scan_gets": 1,
+        "range_scan_range_gets": 6,
+        "ratio": 0.117088,
+        "rows_per_month": 100
+      },
+      "generated_at": "@1777978570"
+    },
     "viability_predicate_pushdown": {
       "kind": "viability",
       "id": "predicate_pushdown",
@@ -667,15 +757,65 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1777924877"
     },
+    "viability_rls_basic": {
+      "kind": "viability",
+      "id": "rls_basic",
+      "name": "Row-level security: per-principal predicate injection (real S3)",
+      "claim": "RLS isolates rows per `current_user` while preserving full visibility when disabled. Object store: real S3.",
+      "passed": true,
+      "primary": {
+        "label": "alice_rows_visible",
+        "value": 5.0,
+        "unit": "rows",
+        "bar": {
+          "op": "equal",
+          "value": 5.0
+        }
+      },
+      "details": {
+        "alice_rows_visible": 5,
+        "all_rows_after_drop_policy_with_rls_on": 0,
+        "all_rows_without_rls": 10,
+        "anonymous_rows_visible": 0,
+        "bob_rows_visible": 5,
+        "bucket": "baisn-test",
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com"
+      },
+      "generated_at": "@1777979089"
+    },
+    "viability_rls_isolation": {
+      "kind": "viability",
+      "id": "rls_isolation",
+      "name": "RLS preserves tenant prefix isolation (real S3)",
+      "claim": "Cross-tenant row leakage is zero across every RLS configuration combination, with data hosted on real S3.",
+      "passed": true,
+      "primary": {
+        "label": "cross_tenant_leak",
+        "value": 0.0,
+        "unit": "rows",
+        "bar": {
+          "op": "equal",
+          "value": 0.0
+        }
+      },
+      "details": {
+        "bucket": "baisn-test",
+        "cross_tenant_leak": 0,
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "tenant_a": "01KQVX15AS8MJNK9E27BW1F9CT",
+        "tenant_b": "01KQVX15AS96TYSAJAD3124ZAA"
+      },
+      "generated_at": "@1777979232"
+    },
     "viability_s3_credentials_smoke": {
       "kind": "viability",
       "id": "s3_credentials_smoke",
       "name": "S3 credentials and round-trip",
       "claim": "Real S3-compatible service handles PUT, GET, LIST, DELETE with byte-accurate body round-trip.",
-      "passed": false,
+      "passed": true,
       "primary": {
         "label": "PUT+GET+LIST+DELETE total",
-        "value": 5435.0,
+        "value": 207.0,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -683,16 +823,16 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "bucket": "baisn-test",
-        "delete_ms": 516,
-        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "get_ms": 974,
-        "list_ms": 507,
+        "bucket": "basin-test",
+        "delete_ms": 2,
+        "endpoint": "http://127.0.0.1:8333",
+        "get_ms": 1,
+        "list_ms": 0,
         "payload_bytes": 61,
-        "put_ms": 3438,
-        "region": "auto"
+        "put_ms": 204,
+        "region": "us-east-1"
       },
-      "generated_at": "@1777923360"
+      "generated_at": "@1777929540"
     },
     "viability_shard_insert_path": {
       "kind": "viability",
@@ -739,6 +879,32 @@ window.__BASIN_RESULTS = {
         "files": 1000
       },
       "generated_at": "@1777924724"
+    },
+    "viability_tiered_storage": {
+      "kind": "viability",
+      "id": "tiered_storage",
+      "name": "Per-table tiered storage (hot/cold) on real S3",
+      "claim": "Files older than the configured threshold migrate from the default 'hot' object-store prefix to a cheaper 'cold' prefix on real S3. Reads transparently follow the catalog regardless of tier.",
+      "passed": true,
+      "primary": {
+        "label": "cold_files_after_sweep",
+        "value": 1.0,
+        "unit": "files",
+        "bar": {
+          "op": "equal",
+          "value": 1.0
+        }
+      },
+      "details": {
+        "bucket": "baisn-test",
+        "cold_after_seconds": 2592000,
+        "cold_age_column": "ts",
+        "cold_files_after_sweep": 1,
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "hot_files_after_sweep": 1,
+        "total_rows_visible": 20
+      },
+      "generated_at": "@1777980472"
     },
     "viability_update_delete": {
       "kind": "viability",

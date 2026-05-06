@@ -11,11 +11,11 @@
 
 <p align="center">
   <a href="./WEDGE.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="tests: 266 passing" src="https://img.shields.io/badge/tests-266_passing-brightgreen?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: point query 3.5x faster" src="https://img.shields.io/badge/vs_postgres-point_3.5%C3%97_faster-blue?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: disk 12.5x smaller" src="https://img.shields.io/badge/vs_postgres-disk_12.5%C3%97_smaller-blue?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: 10x more conns" src="https://img.shields.io/badge/vs_postgres-10%C3%97_more_conns-blue?style=flat-square"></a>
-  <a href="./benchmark/RESULTS.md"><img alt="vs Postgres: 47x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-47%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_localfs.md"><img alt="tests: 266 passing" src="https://img.shields.io/badge/tests-266_passing-brightgreen?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: point query 3.5x faster" src="https://img.shields.io/badge/vs_postgres-point_3.5%C3%97_faster-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: disk 12.5x smaller" src="https://img.shields.io/badge/vs_postgres-disk_12.5%C3%97_smaller-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 10x more conns" src="https://img.shields.io/badge/vs_postgres-10%C3%97_more_conns-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 47x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-47%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
   <a href="./CAPABILITIES.md"><img alt="capabilities" src="https://img.shields.io/badge/capabilities-matrix-blue?style=flat-square"></a>
   <a href="./docs/decisions/"><img alt="decisions" src="https://img.shields.io/badge/decisions-ADR_tracked-blueviolet?style=flat-square"></a>
   <a href="./LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square"></a>
@@ -67,8 +67,8 @@ The connection-scaling and RSS results are the **structural** advantage of being
 
 > **Honest mixed result on tenant deletion at 100K rows on local FS:** PG's `DROP SCHEMA CASCADE` is a few catalog rows and an `unlink`; Basin's `O(file count)` deletion does 100 separate `delete()` calls. The wedge claim — bucket-prefix delete vs vacuum / extent walks — surfaces at scale (multi-GB tenants on S3), not on a small tmpfs table. Reported as-measured; the dashboard tells the full story.
 
-Full live dashboard: open [`benchmark/index.html`](./benchmark/index.html) directly (no server needed).
-Auto-regenerated Markdown report: [`benchmark/RESULTS.md`](./benchmark/RESULTS.md).
+Full live dashboard: open [`benchmark/index_localfs.html`](./benchmark/index_localfs.html) directly (no server needed).
+Auto-regenerated Markdown report: [`benchmark/RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md).
 
 ---
 
@@ -205,7 +205,7 @@ crates/
   basin-analytical  (Phase 5) DuckDB / DataFusion against Iceberg directly
 services/
   basin-server      single-process binary
-benchmark/          dashboard + auto-regenerated RESULTS.md
+benchmark/          dashboard + auto-regenerated RESULTS_localfs.md
 docs/
   architecture.md   the four-layer stack, in detail
   decisions/        ADRs — every "no" with the trigger that would change our mind
@@ -222,12 +222,12 @@ tests/integration/  cross-crate viability + scaling + Postgres comparisons
 cargo build --workspace
 cargo test  --workspace
 
-# Run the benchmark suite + regenerate dashboard / RESULTS.md:
+# Run the benchmark suite + regenerate dashboard / RESULTS_localfs.md:
 cargo test -p basin-integration-tests --tests -- --nocapture
 python3 benchmark/bundle.py
 
 # Then open the dashboard (no server required):
-open benchmark/index.html
+open benchmark/index_localfs.html
 ```
 
 ---

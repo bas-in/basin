@@ -93,6 +93,7 @@ pub(crate) struct EngineInner {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
+        crate::cron_glue::install();
         Self {
             inner: Arc::new(EngineInner {
                 cfg,
@@ -170,10 +171,35 @@ impl Engine {
 
     /// Open a session bound to `tenant`. The catalog namespace is created on
     /// demand if it does not yet exist.
+    ///
+    /// The session's `current_user` is the literal `"anonymous"` — RLS
+    /// policies that rely on an authenticated principal will treat the
+    /// session that way. To plumb a real principal through (e.g. from a
+    /// pgwire handshake or JWT), use [`Engine::open_session_as`].
     pub async fn open_session(&self, tenant: TenantId) -> Result<TenantSession> {
-        crate::session::open(self.clone(), tenant).await
+        crate::session::open(self.clone(), tenant, ANONYMOUS_USER.to_string()).await
+    }
+
+    /// Open a session bound to `tenant` and stamp `current_user` with the
+    /// given principal name. The principal is exactly the string returned
+    /// by SQL's `current_user` / `current_role` (we don't distinguish them
+    /// in v0.1 — both resolve to this same value).
+    ///
+    /// `current_user` is purely consumed by the row-level-security predicate
+    /// evaluator; the rest of the engine behaves identically regardless.
+    pub async fn open_session_as(
+        &self,
+        tenant: TenantId,
+        current_user: impl Into<String>,
+    ) -> Result<TenantSession> {
+        crate::session::open(self.clone(), tenant, current_user.into()).await
     }
 }
+
+/// Default principal stamped on a session opened without explicit auth. RLS
+/// policies that quote `current_user` against this constant will, by design,
+/// not match an authenticated user's rows.
+pub const ANONYMOUS_USER: &str = "anonymous";
 
 /// A handle to the engine scoped to a single tenant. All [`execute`] calls
 /// run as this tenant; there is no reset / impersonate API by design.
@@ -182,6 +208,10 @@ impl Engine {
 pub struct TenantSession {
     pub(crate) engine: Engine,
     pub(crate) tenant: TenantId,
+    /// Principal name that resolves SQL's `current_user`. Stamped at session
+    /// open time and never mutated thereafter. Read by the RLS predicate
+    /// rewriter; the rest of the engine ignores it.
+    pub(crate) current_user: String,
     pub(crate) ctx: datafusion::prelude::SessionContext,
     pub(crate) state: Arc<crate::session::SessionState>,
 }
@@ -189,6 +219,13 @@ pub struct TenantSession {
 impl TenantSession {
     pub fn tenant(&self) -> TenantId {
         self.tenant
+    }
+
+    /// Principal that resolves SQL's `current_user` for RLS predicates. For
+    /// sessions opened via [`Engine::open_session`] this is
+    /// [`ANONYMOUS_USER`].
+    pub fn current_user(&self) -> &str {
+        &self.current_user
     }
 
     /// Run one SQL statement. Returns either a result set ([`ExecResult::Rows`])
@@ -260,8 +297,10 @@ pub enum ExecResult {
     },
 }
 
+mod alter;
 mod analytical_route;
 mod convert;
+mod cron_glue;
 mod ddl;
 mod dml;
 mod dml_mutate;
@@ -269,6 +308,7 @@ mod executor;
 mod fast_select;
 mod noisy_detector;
 mod prepared;
+mod rls;
 mod session;
 mod types;
 mod udf;
@@ -291,6 +331,8 @@ mod tests {
         let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
             object_store: Arc::new(fs),
             root_prefix: None,
+            disk_cache: None,
+        page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
         Engine::new(EngineConfig {

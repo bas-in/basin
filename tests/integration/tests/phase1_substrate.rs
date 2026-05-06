@@ -58,6 +58,8 @@ fn storage_in(dir: &TempDir) -> Storage {
     Storage::new(StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     })
 }
 

@@ -237,6 +237,8 @@ async fn scaling_5_compare_postgres() {
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();

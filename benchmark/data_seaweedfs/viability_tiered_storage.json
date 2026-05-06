@@ -1,0 +1,26 @@
+{
+  "kind": "viability",
+  "id": "tiered_storage",
+  "name": "Per-table tiered storage (hot/cold) on real S3",
+  "claim": "Files older than the configured threshold migrate from the default 'hot' object-store prefix to a cheaper 'cold' prefix on real S3. Reads transparently follow the catalog regardless of tier.",
+  "passed": true,
+  "primary": {
+    "label": "cold_files_after_sweep",
+    "value": 1.0,
+    "unit": "files",
+    "bar": {
+      "op": "equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "bucket": "basin-test",
+    "cold_after_seconds": 2592000,
+    "cold_age_column": "ts",
+    "cold_files_after_sweep": 1,
+    "endpoint": "http://127.0.0.1:8333",
+    "hot_files_after_sweep": 1,
+    "total_rows_visible": 20
+  },
+  "generated_at": "@1777981662"
+}

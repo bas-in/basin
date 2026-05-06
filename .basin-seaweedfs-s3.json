@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "basin-admin",
+      "credentials": [
+        {
+          "accessKey": "basinseaweedadmin",
+          "secretKey": "basinseaweedsecret123"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

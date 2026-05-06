@@ -7,4 +7,6 @@
 //! plain-text summary of the same data.
 
 pub mod benchmark;
+pub mod cache_defaults;
 pub mod test_config;
+pub mod workload;

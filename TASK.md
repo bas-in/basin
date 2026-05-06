@@ -106,6 +106,104 @@ See `README.md` "Try the PoC" for usage.
 - [ ] Planner heuristic to route analytical queries off the OLTP path
 - [ ] Bench: 10 TB Iceberg scan completes in seconds via DuckDB
 
+## Phase 5.5 — Sharding axes beyond per-tenant (1–3 months)
+
+The primary sharding axis is per-tenant prefix (already structural). At
+scale, four secondary axes show up; each gets its own work item with
+explicit tests.
+
+- [ ] **Within-tenant time-based partitioning**: `CREATE TABLE … PARTITION
+      BY RANGE (ts)` writes new files under
+      `tenants/{id}/tables/{t}/year=YYYY/month=MM/...`. Reader prunes
+      partitions for time-range predicates. Iceberg `PartitionKey` is
+      already plumbed; only the SQL surface + path layout + pruner pass
+      are missing. Test: 1M-row scan with `WHERE ts BETWEEN ...` reads
+      one partition's bytes, not all.
+- [ ] **Compute sharding (router → shard owners)**: hash tenant_id →
+      shard_id, route pgwire connections to the owning shard's process.
+      Each shard owns the in-memory state for its tenants. All shards
+      share the same R2 bucket. Test: 4-shard cluster on localhost,
+      tenant requests land on the right shard 100% of runs, restart
+      survival, hot-tenant rebalance.
+- [ ] **Tiered storage (hot/cold)**: per-table age policy moves
+      cold Parquet files to a cheaper tier (S3 IA, R2 Infrequent
+      Access). Reader transparently fetches from whichever tier the
+      catalog points at. Compactor enforces the policy. Test: insert
+      data, mark age threshold, confirm files move + reads still work.
+- [ ] **Within-tenant whale handling (sub-shard)**: a 100×-larger
+      tenant gets pinned to a dedicated shard owner with bigger
+      compute. Cheap because data stays in shared R2. Folds into the
+      compute-sharding work — same router, just pinned mapping.
+
+## Phase 5.7 — Point-query latency: caching + indexes + hot tier (3-6 months)
+
+The critical path to "Postgres-replacement" credibility on point queries
+without giving up the prefix-isolation wedge. Three sub-phases by
+risk/effort, ordered to ship value early.
+
+**A. Quick wins (4 weeks, high leverage, no architectural shift):**
+- [ ] **A1 NVMe disk cache** — local SSD LRU between RAM and S3.
+      ~50ms cold S3 fetch → ~100µs warm SSD read. Mirrors Snowflake /
+      Databricks / ClickHouse Cloud architecture.
+- [ ] **A2 Parquet page cache (RAM)** — LRU of decoded data pages.
+      Already have footer cache; this extends to pages. Hot point query
+      hits at <1ms.
+- [ ] **A3 Bloom filters in Parquet footer** — opt-in per table; turns
+      80%+ of "might be here" row-group scans into structural skips.
+- [ ] **A4 Coalesced metadata in catalog** — keep row-group stats in
+      the catalog, not the footer. Cuts cold-query round-trips from
+      ~5 to ~2.
+
+**B. Indexing + clustering (8 weeks, real Postgres-class point queries):**
+- [ ] **B1 Per-tenant secondary indexes** — B-tree mapping
+      `(table, indexed_col) → (file, row_group, row)`. Stored as a
+      separate per-tenant file. Cached in RAM. `CREATE INDEX` SQL.
+- [ ] **B2 Range-partitioned / Z-ordered files** — `CLUSTER BY` on
+      `CREATE TABLE` physically sorts data so related rows live in the
+      same file. Combined with A3 bloom filters, point queries hit
+      one file.
+- [ ] **B3 Per-table row-group sizing** — smaller row groups (4k rows)
+      for point-heavy tables; trade scan throughput for seek
+      granularity.
+
+**C. Hot tier (6-8 weeks, the architectural commitment):**
+- [ ] **C1 In-memory hot ring** — per-tenant ring buffer for recent
+      writes (last 5 min or 100k rows, whichever first). Flushes to
+      Parquet on threshold or timer. Reads check ring first, fall
+      through to Parquet. Solves "90% of reads are on last week of
+      data" for audit-log / event-store / time-series shapes.
+- [ ] **C2 Embedded RocksDB hot tier (alt path)** — for tenants with
+      larger hot working sets that don't fit in RAM. Optional, gated
+      by tenant config.
+
+Decision points:
+- A1+A2+A3 alone may be enough to ship sub-10ms warm point queries —
+  measure first, then commit to B/C only if needed.
+- C is the architectural shift; only commit when a real customer
+  workload demands it (multi-week effort, opens new ops surface).
+
+## Phase 5.8 — pg_cron + http extension SQL surface (3 weeks)
+
+- [ ] **basin-cron** — pg_cron-compat scheduler. `cron.schedule(name,
+      schedule, sql)` etc. Per-tenant `cron.job` + `cron.job_run_details`.
+      Background runner per shard.
+- [ ] **basin-net** — pg_net + http extension SQL surface.
+      `http_get`/`http_post` (sync), `net.http_*` (async). Per-tenant
+      rate limit + URL allowlist (SSRF guard) + body cap + timeout.
+      Combined with basin-cron = full "scheduled HTTP work" without
+      Edge Functions.
+
+## Phase 5.6 — Row-level security (1 month)
+
+- [ ] `CREATE POLICY` SQL surface (Postgres-compatible syntax).
+- [ ] Catalog stores per-tenant per-table policies.
+- [ ] Engine injects predicate filters for `current_user` /
+      `current_role` into every query plan; bypassable only by table
+      owner.
+- [ ] Tests: same-table queries return different rows for different
+      authenticated principals; tenant isolation invariant holds when
+      RLS is enabled.
+
 ## Phase 6 — Production hardening (3–4 months)
 
 - [ ] Multi-region: regional WAL + S3 cross-region replication

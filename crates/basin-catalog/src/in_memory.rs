@@ -14,7 +14,7 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
-use crate::metadata::{DataFileRef, TableMetadata};
+use crate::metadata::{DataFileRef, PartitionSpec, Policy, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
 
@@ -24,6 +24,13 @@ struct TableState {
     schema: Arc<Schema>,
     current: SnapshotId,
     snapshots: Vec<Snapshot>,
+    partition_spec: PartitionSpec,
+    rls_enabled: bool,
+    policies: Vec<Policy>,
+    cold_after_seconds: Option<u64>,
+    cold_age_column: Option<String>,
+    bloom_filter_columns: Vec<String>,
+    row_group_rows: Option<usize>,
 }
 
 impl TableState {
@@ -46,6 +53,13 @@ impl TableState {
             schema,
             current: SnapshotId::GENESIS,
             snapshots: vec![genesis],
+            partition_spec: PartitionSpec::Unpartitioned,
+            rls_enabled: false,
+            policies: Vec::new(),
+            cold_after_seconds: None,
+            cold_age_column: None,
+            bloom_filter_columns: Vec::new(),
+            row_group_rows: None,
         }
     }
 }
@@ -103,6 +117,13 @@ impl InMemoryCatalog {
             current_snapshot: state.current,
             snapshots: state.snapshots.clone(),
             format_version: 2,
+            partition_spec: state.partition_spec.clone(),
+            rls_enabled: state.rls_enabled,
+            policies: state.policies.clone(),
+            cold_after_seconds: state.cold_after_seconds,
+            cold_age_column: state.cold_age_column.clone(),
+            bloom_filter_columns: state.bloom_filter_columns.clone(),
+            row_group_rows: state.row_group_rows,
         }
     }
 }
@@ -297,6 +318,88 @@ impl Catalog for InMemoryCatalog {
         let state = self.get_table(tenant, table).await?;
         let guard = state.lock().await;
         Ok(guard.snapshots.clone())
+    }
+
+    #[instrument(skip(self, spec), fields(tenant = %tenant, table = %table))]
+    async fn set_partition_spec(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        spec: PartitionSpec,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.partition_spec = spec;
+        Ok(())
+    }
+
+    #[instrument(skip(self, policies), fields(tenant = %tenant, table = %table))]
+    async fn set_rls_state(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        rls_enabled: bool,
+        policies: Vec<Policy>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.rls_enabled = rls_enabled;
+        state.policies = policies;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    async fn set_tier_policy(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        cold_after_seconds: Option<u64>,
+        cold_age_column: Option<String>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.cold_after_seconds = cold_after_seconds;
+        state.cold_age_column = cold_age_column;
+        Ok(())
+    }
+
+    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, n = columns.len()))]
+    async fn set_bloom_filter_columns(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.bloom_filter_columns = columns;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    async fn set_row_group_rows(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        rows: Option<usize>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.row_group_rows = rows;
+        Ok(())
+    }
+
+    #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
+    async fn set_schema(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        schema: Schema,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.schema = Arc::new(schema);
+        Ok(())
     }
 }
 

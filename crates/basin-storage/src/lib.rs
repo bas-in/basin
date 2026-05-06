@@ -14,30 +14,38 @@
 
 mod concurrency;
 mod data_file;
+mod disk_cache;
 mod metadata_cache;
+mod page_cache;
 mod paths;
 mod predicate;
 mod reader;
 mod scheduler;
+mod tier;
 mod vector_index;
 mod writer;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use basin_common::{Result, TableName, TenantId};
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use tokio::sync::Semaphore;
 
 pub use data_file::{ColumnStats, DataFile};
+pub use disk_cache::{DiskCacheConfig, DiskCacheCounters, DiskCachedStore};
+pub use page_cache::{PageCache, PageCacheConfig, PageCacheCounters, PageCacheCountersSnapshot};
 pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
     CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
 };
 pub use scheduler::{TenantIoStats, DEFAULT_GLOBAL_BUDGET};
+pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
+pub use writer::WriteOptions;
 
 use arrow_array::RecordBatch;
 
@@ -48,6 +56,112 @@ pub struct StorageConfig {
     /// Optional bucket sub-prefix that all tenant keys are nested under.
     /// `None` means keys live directly at the bucket root.
     pub root_prefix: Option<ObjectPath>,
+    /// Optional NVMe / local-SSD disk cache between Storage and the
+    /// underlying object store. `None` (the default) is the legacy
+    /// behaviour: every read goes straight to the inner store. When
+    /// `Some(...)`, the inner store is wrapped in a [`DiskCachedStore`]
+    /// **before** per-tenant wrapping so the wrapping order is
+    /// `TenantScopedStore -> DiskCachedStore -> real ObjectStore` —
+    /// every cache hit still counts against the requesting tenant's
+    /// per-tenant concurrency permit pool.
+    ///
+    /// See [`DiskCacheConfig`] for the cap / root-dir knobs and
+    /// [`DiskCachedStore`] for the cache shape, eviction policy, and
+    /// invalidation rules. The cache is opt-in: leaving this as `None`
+    /// keeps every existing test byte-identical to the pre-cache build.
+    pub disk_cache: Option<DiskCacheConfig>,
+    /// Optional in-RAM cache of decoded Parquet pages (Phase 5.7 A2).
+    /// `None` (the default) is the legacy behaviour: every read decodes
+    /// Parquet bytes into Arrow on every call. When `Some(...)`, the
+    /// reader probes a `(file_path, projection_hash, filters_hash)`
+    /// keyed cache before issuing the row-group scan; on hit it yields
+    /// the cached `Arc<RecordBatch>`es without touching the parquet
+    /// crate.
+    ///
+    /// Layered above the [`DiskCachedStore`]: page cache HIT skips
+    /// disk-cache + decode entirely; page cache MISS falls through to
+    /// the disk cache (which itself may HIT or MISS) and then decodes.
+    /// See [`PageCacheConfig`] for the byte budget knob and
+    /// [`PageCache`] for the eviction / invalidation rules.
+    pub page_cache: Option<PageCacheConfig>,
+}
+
+impl StorageConfig {
+    /// Default disk-cache budget when no override is supplied: 10 GiB.
+    /// Sized so a typical NVMe-backed deployment can cache the full
+    /// working set of a multi-tenant SaaS workload while leaving room
+    /// for the local filesystem itself; deployments with tighter disks
+    /// override via [`StorageConfig::default_disk_cache_with_root`] or
+    /// the `BASIN_DISK_CACHE_MAX_BYTES` env var on the production
+    /// server.
+    pub const DEFAULT_DISK_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+    /// Default page-cache budget when no override is supplied: 1 GiB.
+    /// Mirrors [`PageCacheConfig::default`].
+    pub const DEFAULT_PAGE_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+
+    /// Default disk-cache root directory.
+    ///
+    /// Resolution order:
+    /// 1. `BASIN_DISK_CACHE_ROOT` env var, if set and non-empty.
+    /// 2. `std::env::temp_dir().join("basin-disk-cache")` otherwise.
+    ///
+    /// The production server (`services/basin-server`) instead defaults
+    /// to `<XDG_CACHE_HOME or ~/.cache>/basin/disk-cache` because the
+    /// system temp dir is not durable across reboots. Tests deliberately
+    /// use the temp-dir fallback so per-test isolation is automatic.
+    pub fn default_disk_cache_root() -> std::path::PathBuf {
+        if let Ok(v) = std::env::var("BASIN_DISK_CACHE_ROOT") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return std::path::PathBuf::from(trimmed);
+            }
+        }
+        std::env::temp_dir().join("basin-disk-cache")
+    }
+
+    /// `Some(DiskCacheConfig)` populated from the default root + budget.
+    /// Convenience for tests / fixtures that want caches on without
+    /// hand-rolling the path.
+    pub fn default_disk_cache() -> DiskCacheConfig {
+        DiskCacheConfig::new(Self::default_disk_cache_root(), Self::DEFAULT_DISK_CACHE_BYTES)
+    }
+
+    /// Like [`default_disk_cache`](Self::default_disk_cache) but with an
+    /// explicit root. Tests pass a per-test tempdir so concurrent tests
+    /// don't share cache state.
+    pub fn default_disk_cache_with_root(root: impl Into<std::path::PathBuf>) -> DiskCacheConfig {
+        DiskCacheConfig::new(root, Self::DEFAULT_DISK_CACHE_BYTES)
+    }
+
+    /// `Some(PageCacheConfig)` populated from the default budget.
+    pub fn default_page_cache() -> PageCacheConfig {
+        PageCacheConfig::new(Self::DEFAULT_PAGE_CACHE_BYTES)
+    }
+}
+
+impl Default for StorageConfig {
+    /// Production-shaped defaults. The `object_store` slot is filled
+    /// with an [`object_store::memory::InMemory`] instance so the type
+    /// is `Default`-constructable; callers are expected to overwrite
+    /// `object_store` (and usually `root_prefix`) for any non-test use.
+    /// The cache fields are populated with sensible budgets:
+    /// disk cache rooted under [`Self::default_disk_cache_root`] with
+    /// [`Self::DEFAULT_DISK_CACHE_BYTES`], page cache with
+    /// [`Self::DEFAULT_PAGE_CACHE_BYTES`].
+    ///
+    /// Existing fixtures that build `StorageConfig { ..., disk_cache:
+    /// None, page_cache: None }` literally are unaffected — they
+    /// explicitly opt out, which is what the unit-test layer in the
+    /// per-crate `#[cfg(test)]` modules wants.
+    fn default() -> Self {
+        Self {
+            object_store: Arc::new(object_store::memory::InMemory::new()),
+            root_prefix: None,
+            disk_cache: Some(Self::default_disk_cache()),
+            page_cache: Some(Self::default_page_cache()),
+        }
+    }
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -104,6 +218,54 @@ struct Inner {
     tenant_semaphores: Mutex<HashMap<TenantId, Arc<Semaphore>>>,
     /// Default permit count for a newly-created tenant semaphore.
     default_tenant_concurrency: usize,
+    /// Process-wide counters incremented by the read path so tests can
+    /// assert that bloom-filter / stats pruning is doing real work.
+    /// `row_groups_considered` counts every row group in every Parquet
+    /// file the reader inspected; `row_groups_scanned` counts those that
+    /// survived pruning and were actually read. The difference is the
+    /// pruning win. Counters are best-effort and not load-bearing for
+    /// correctness — they exist purely for observability.
+    read_counters: Arc<ReadCounters>,
+    /// Optional in-RAM cache of decoded `RecordBatch`es. See
+    /// [`StorageConfig::page_cache`] for the rationale; `None` is the
+    /// default (every read decodes from Parquet bytes).
+    page_cache: Option<Arc<PageCache>>,
+}
+
+/// Best-effort counters for the read path. See [`Inner::read_counters`].
+#[derive(Debug, Default)]
+pub struct ReadCounters {
+    pub row_groups_considered: AtomicU64,
+    pub row_groups_scanned: AtomicU64,
+    pub row_groups_pruned_by_stats: AtomicU64,
+    pub row_groups_pruned_by_bloom: AtomicU64,
+}
+
+impl ReadCounters {
+    pub fn snapshot(&self) -> ReadCountersSnapshot {
+        ReadCountersSnapshot {
+            row_groups_considered: self.row_groups_considered.load(Ordering::Relaxed),
+            row_groups_scanned: self.row_groups_scanned.load(Ordering::Relaxed),
+            row_groups_pruned_by_stats: self.row_groups_pruned_by_stats.load(Ordering::Relaxed),
+            row_groups_pruned_by_bloom: self.row_groups_pruned_by_bloom.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.row_groups_considered.store(0, Ordering::Relaxed);
+        self.row_groups_scanned.store(0, Ordering::Relaxed);
+        self.row_groups_pruned_by_stats.store(0, Ordering::Relaxed);
+        self.row_groups_pruned_by_bloom.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Plain-data view of [`ReadCounters`]; cheap to copy for assertions.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadCountersSnapshot {
+    pub row_groups_considered: u64,
+    pub row_groups_scanned: u64,
+    pub row_groups_pruned_by_stats: u64,
+    pub row_groups_pruned_by_bloom: u64,
 }
 
 /// Default capacity for the Parquet footer cache. 1024 entries is a few MB
@@ -119,9 +281,42 @@ const DEFAULT_HNSW_SEGMENT_CACHE_CAP: usize = 256;
 
 impl Storage {
     pub fn new(cfg: StorageConfig) -> Self {
+        // If a disk cache is configured, wrap the supplied object store
+        // with [`DiskCachedStore`] *before* the per-tenant wrapping that
+        // [`Storage::tenant_object_store`] adds on top. The result is
+        // `TenantScopedStore -> DiskCachedStore -> real ObjectStore`
+        // for every read, which is what the design calls for: cache
+        // hits still count against the tenant's permit pool, and cache
+        // keys are content-addressed on the path (which always carries
+        // the tenant prefix) so cross-tenant key collisions are
+        // mechanically impossible.
+        //
+        // If construction of the cache fails (cache root not writable,
+        // for example), we fall back to the un-wrapped store and log
+        // — the cache is a performance tier, not the durability
+        // boundary.
+        let object_store = match cfg.disk_cache.clone() {
+            Some(dc) => match disk_cache::DiskCachedStore::new(cfg.object_store.clone(), dc) {
+                Ok(wrapped) => Arc::new(wrapped) as Arc<dyn ObjectStore>,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "basin_storage",
+                        error = %e,
+                        "disk_cache: setup failed; falling back to direct object store",
+                    );
+                    cfg.object_store
+                }
+            },
+            None => cfg.object_store,
+        };
+
+        let page_cache = cfg
+            .page_cache
+            .map(|pc| Arc::new(PageCache::new(pc)));
+
         Self {
             inner: Arc::new(Inner {
-                object_store: cfg.object_store,
+                object_store,
                 root_prefix: cfg.root_prefix,
                 parquet_meta_cache: Arc::new(metadata_cache::ParquetMetaCache::new(
                     DEFAULT_PARQUET_META_CACHE_CAP,
@@ -131,8 +326,26 @@ impl Storage {
                 )),
                 tenant_semaphores: Mutex::new(HashMap::new()),
                 default_tenant_concurrency: DEFAULT_TENANT_CONCURRENCY,
+                read_counters: Arc::new(ReadCounters::default()),
+                page_cache,
             }),
         }
+    }
+
+    /// Handle to the in-RAM page cache, or `None` if the cache is not
+    /// enabled. Exposed for observability and for tests that want to
+    /// assert hit/miss/eviction counters; production callers should
+    /// not poke at the cache directly.
+    pub fn page_cache(&self) -> Option<&Arc<PageCache>> {
+        self.inner.page_cache.as_ref()
+    }
+
+    /// Process-wide read counters. See [`ReadCounters`] for what is tracked.
+    /// These are observability-only and not part of the storage correctness
+    /// contract — production callers should ignore them; tests use them to
+    /// confirm that bloom / stats pruning is firing.
+    pub fn read_counters(&self) -> &Arc<ReadCounters> {
+        &self.inner.read_counters
     }
 
     /// Per-tenant live I/O stats. Stub: the v0.2 scheduler exported
@@ -190,6 +403,10 @@ impl Storage {
         &self.inner.parquet_meta_cache
     }
 
+    pub(crate) fn page_cache_handle(&self) -> Option<&Arc<PageCache>> {
+        self.inner.page_cache.as_ref()
+    }
+
     pub(crate) fn hnsw_segment_cache(&self) -> &Arc<metadata_cache::HnswSegmentCache> {
         &self.inner.hnsw_segment_cache
     }
@@ -225,6 +442,23 @@ impl Storage {
         batch: &RecordBatch,
     ) -> Result<DataFile> {
         writer::write_batch(self, tenant, table, partition, batch).await
+    }
+
+    /// Like [`write_batch`](Self::write_batch) but with explicit per-write
+    /// knobs (bloom-filter columns, row-group size). Used by callers that
+    /// have read [`basin_catalog::TableMetadata::bloom_filter_columns`] and
+    /// want the writer to materialise bloom filters in the Parquet footer.
+    /// All defaults preserve the legacy [`write_batch`] behaviour exactly.
+    #[tracing::instrument(skip(self, batch, opts), fields(tenant=%tenant, table=%table, partition=%partition, rows=batch.num_rows(), bloom_cols=opts.bloom_filter_columns.len()))]
+    pub async fn write_batch_with_options(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        partition: &basin_common::PartitionKey,
+        batch: &RecordBatch,
+        opts: &WriteOptions,
+    ) -> Result<DataFile> {
+        writer::write_batch_with_options(self, tenant, table, partition, batch, opts).await
     }
 
     /// Stream all rows for one tenant+table that match the read options.
@@ -280,6 +514,174 @@ impl Storage {
         path: &ObjectPath,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         reader::read_file(self, tenant, path).await
+    }
+
+    /// Copy a hot-tier data file to its cold-tier sibling and return the new
+    /// [`DataFile`] descriptor. The original hot file is **left in place** —
+    /// callers must atomically commit the catalog swap (`replace_data_files`)
+    /// first and only then call [`Self::delete_file`] on the old path. This
+    /// ordering ensures a crash mid-migration leaves the catalog pointing
+    /// at a still-valid object.
+    ///
+    /// `from` must already exist under `tables/<t>/data/...`. If it doesn't
+    /// follow the canonical layout the call returns `BasinError::Storage`.
+    /// Files already in the cold tier are returned unchanged (the descriptor
+    /// is rebuilt by re-stat'ing the cold object).
+    #[tracing::instrument(skip(self), fields(tenant=%tenant, from=%from))]
+    pub async fn migrate_to_cold(
+        &self,
+        tenant: &TenantId,
+        from: &ObjectPath,
+    ) -> Result<DataFile> {
+        // Already cold? Re-stat and return without touching anything.
+        if matches!(Tier::from_path(from.as_ref()), Tier::Cold) {
+            let store = self.tenant_store(tenant);
+            let head = store
+                .head(from)
+                .await
+                .map_err(|e| basin_common::BasinError::storage(format!("head {from}: {e}")))?;
+            return Ok(DataFile {
+                path: from.clone(),
+                size_bytes: head.size as u64,
+                row_count: 0,
+                column_stats: std::collections::BTreeMap::new(),
+                tier: Tier::Cold,
+            });
+        }
+
+        let to = paths::rewrite_to_cold(from).ok_or_else(|| {
+            basin_common::BasinError::storage(format!(
+                "migrate_to_cold: path does not match `tables/<t>/data/...`: {from}"
+            ))
+        })?;
+        let store = self.tenant_store(tenant);
+        // Belt-and-braces: confirm the target sits under this tenant's prefix.
+        // The path was derived from `from`, which already cleared this check
+        // at write time — we re-check defensively.
+        let expected_prefix = format!("tenants/{}/", tenant.as_prefix());
+        if !to.as_ref().contains(&expected_prefix) {
+            return Err(basin_common::BasinError::isolation(format!(
+                "migrate_to_cold target {to} missing tenant prefix {expected_prefix}"
+            )));
+        }
+        // Use `copy` (overwrites) rather than `copy_if_not_exists` because a
+        // stale prior attempt may have left a partial cold object behind; the
+        // ULID embedded in the filename keeps cold-vs-cold collisions out of
+        // the picture.
+        store
+            .copy(from, &to)
+            .await
+            .map_err(|e| basin_common::BasinError::storage(format!("copy {from} -> {to}: {e}")))?;
+        let head = store
+            .head(&to)
+            .await
+            .map_err(|e| basin_common::BasinError::storage(format!("head cold {to}: {e}")))?;
+        Ok(DataFile {
+            path: to,
+            size_bytes: head.size as u64,
+            row_count: 0,
+            column_stats: std::collections::BTreeMap::new(),
+            tier: Tier::Cold,
+        })
+    }
+
+    /// Best-effort delete of one tenant-owned object. Used by the tiering
+    /// compactor after an atomic catalog replace_data_files; failure is
+    /// logged but not propagated because the catalog is already authoritative
+    /// — a leftover hot object is wasted bytes, not a correctness violation.
+    ///
+    /// The caller is responsible for ensuring `path` is under `tenant`'s
+    /// prefix; we re-check defensively.
+    #[tracing::instrument(skip(self), fields(tenant=%tenant, path=%path))]
+    pub async fn delete_file(&self, tenant: &TenantId, path: &ObjectPath) -> Result<()> {
+        let expected_prefix = format!("tenants/{}/", tenant.as_prefix());
+        if !path.as_ref().contains(&expected_prefix) {
+            return Err(basin_common::BasinError::isolation(format!(
+                "delete_file: {path} missing tenant prefix {expected_prefix}"
+            )));
+        }
+        let store = self.tenant_store(tenant);
+        store
+            .delete(path)
+            .await
+            .map_err(|e| basin_common::BasinError::storage(format!("delete {path}: {e}")))?;
+        // Drop any cached decoded batches for this file. Disk-cache
+        // invalidation already happens inside `DiskCachedStore::delete`;
+        // the page cache is one layer up and needs its own hook.
+        if let Some(pc) = self.page_cache_handle() {
+            pc.invalidate_path(path);
+        }
+        Ok(())
+    }
+
+    /// Bulk-delete every object under `tenant`'s key prefix. Returns the
+    /// number of objects deleted.
+    ///
+    /// Implementation strategy:
+    ///
+    /// 1. List the tenant prefix through the per-tenant gated store, so
+    ///    the LIST itself counts against this tenant's permit pool.
+    /// 2. Pipe the resulting path stream through the **inner** object
+    ///    store's `delete_stream`, *not* the wrapped one. The wrapper's
+    ///    default `delete_stream` calls our gated `delete()` once per
+    ///    key and `.buffered(10)` — that means LocalFS gets 10-way
+    ///    parallel deletes (good) but S3 misses the native
+    ///    `DeleteObjects` batching (1000 keys per request, 20 batches in
+    ///    flight) that the AWS backend overrides. By piping into the
+    ///    inner store directly we get S3's bulk path on real cloud
+    ///    deployments and a 10-way `buffered` fan-out on LocalFS.
+    /// 3. The fan-out is still bounded — on LocalFS by `buffered(10)`,
+    ///    on S3 by the bucket-quota for `DeleteObjects`. We don't add
+    ///    another semaphore around the bulk path because the LIST in
+    ///    step 1 already counted against this tenant's pool, and the
+    ///    deletes themselves are bounded by the underlying store's
+    ///    own concurrency knobs.
+    ///
+    /// The method intentionally does *not* call `Catalog::drop_table`:
+    /// catalog state is the engine's responsibility. This method's
+    /// contract is "physically free the bytes under the tenant prefix".
+    /// A typical caller (the engine's tenant-deletion path) drops the
+    /// catalog rows first and only then asks storage to remove the data.
+    #[tracing::instrument(skip(self), fields(tenant=%tenant))]
+    pub async fn delete_tenant_prefix(&self, tenant: &TenantId) -> Result<usize> {
+        // Build the tenant's full prefix, honouring the optional root.
+        let mut p = self
+            .inner
+            .root_prefix
+            .clone()
+            .unwrap_or_else(|| ObjectPath::from(""));
+        p = p.child(paths::TENANTS_SEGMENT);
+        p = p.child(tenant.as_prefix());
+
+        // Step 1: gated LIST.
+        let gated = self.tenant_object_store(tenant);
+        let paths_stream = gated.list(Some(&p)).map_ok(|m| m.location).boxed();
+
+        // Step 2: hand the path stream to the *inner* store's
+        // `delete_stream`. On AWS this picks up the
+        // `aws::AmazonS3::delete_stream` override (1000-key batches,
+        // 20-way parallel); on LocalFS / GCS / Azure it falls through
+        // to the default `.buffered(10)` impl which still gives a 10×
+        // speedup over a serial loop.
+        let inner = self.inner.object_store.clone();
+        let deleted: Vec<ObjectPath> = inner
+            .delete_stream(paths_stream)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                basin_common::BasinError::storage(format!(
+                    "delete_tenant_prefix({tenant}): {e}"
+                ))
+            })?;
+        // Drop any cached decoded batches for each deleted file. Same
+        // rationale as `delete_file`: page cache lives one layer above
+        // the disk cache and needs its own invalidation hook.
+        if let Some(pc) = self.page_cache_handle() {
+            for p in &deleted {
+                pc.invalidate_path(p);
+            }
+        }
+        Ok(deleted.len())
     }
 
     /// Approximate nearest-neighbour search across all HNSW segments for
@@ -353,6 +755,8 @@ mod tests {
         Storage::new(StorageConfig {
             object_store: Arc::new(fs),
             root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
         })
     }
 
@@ -586,6 +990,8 @@ mod tests {
         let s = Storage::new(StorageConfig {
             object_store: counting.clone(),
             root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
         });
         let tenant = TenantId::new();
         let table = TableName::new("rg").unwrap();

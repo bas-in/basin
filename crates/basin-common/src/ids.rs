@@ -148,10 +148,26 @@ impl PartitionKey {
                 Self::MAX_LEN
             )));
         }
-        if s.contains('/') {
+        // `/` is allowed as a path-segment separator so a Hive-style key like
+        // `year=2026/month=04` round-trips through the storage layout. We
+        // still reject path-traversal segments and empty segments so the key
+        // can never escape the tenant prefix or produce malformed paths.
+        if s.starts_with('/') || s.ends_with('/') {
             return Err(BasinError::InvalidIdent(
-                "partition key may not contain '/'".into(),
+                "partition key may not start or end with '/'".into(),
             ));
+        }
+        for seg in s.split('/') {
+            if seg.is_empty() {
+                return Err(BasinError::InvalidIdent(
+                    "partition key has an empty segment".into(),
+                ));
+            }
+            if seg == "." || seg == ".." {
+                return Err(BasinError::InvalidIdent(
+                    "partition key segment may not be '.' or '..'".into(),
+                ));
+            }
         }
         Ok(Self(s))
     }
@@ -235,10 +251,21 @@ mod tests {
     }
 
     #[test]
-    fn partition_key_rejects_slash() {
-        assert!(PartitionKey::new("a/b").is_err());
+    fn partition_key_accepts_hive_style_segments() {
+        // Hive-style structured keys are accepted so the storage layer can
+        // map `(year, month)` into a directory chain.
+        PartitionKey::new("year=2026/month=04").unwrap();
         PartitionKey::new("region:us-east-1").unwrap();
         PartitionKey::default_key();
+    }
+
+    #[test]
+    fn partition_key_rejects_path_traversal_and_empty_segments() {
+        assert!(PartitionKey::new("/a").is_err());
+        assert!(PartitionKey::new("a/").is_err());
+        assert!(PartitionKey::new("a//b").is_err());
+        assert!(PartitionKey::new("a/../b").is_err());
+        assert!(PartitionKey::new("a/./b").is_err());
     }
 
     #[test]

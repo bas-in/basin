@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::instrument;
 
-use crate::metadata::{DataFileRef, TableMetadata};
+use crate::metadata::{DataFileRef, PartitionSpec, Policy, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
 
@@ -119,6 +119,57 @@ impl PostgresCatalog {
                         ON DELETE CASCADE
                 )"
             ),
+            // Phase 5.5 forward-compat: add the partition spec column on
+            // existing deployments. New deployments get it via the table-
+            // creation script above; this `ADD COLUMN IF NOT EXISTS` is a
+            // no-op there. Stored as JSONB so future spec variants don't
+            // need another migration.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS partition_spec_json JSONB"
+            ),
+            // Phase 5.6 forward-compat: row-level-security state. `rls_enabled`
+            // gates the engine's predicate-injection path; `policies_json`
+            // holds the (possibly empty) `Vec<Policy>` for that table. Both
+            // columns default to "no RLS" so old rows are equivalent to a
+            // freshly created table without any policy commands run.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS rls_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            ),
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS policies_json JSONB"
+            ),
+            // Phase 5.5: tiered-storage age policy. `cold_after_seconds` NULL
+            // means the policy is disabled (the default for back-compat);
+            // `cold_age_column` NULL means fall back to the partition column
+            // at sweep time. Both are additive — pre-tiering rows come back
+            // as `(None, None)` which preserves the prior behaviour.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS cold_after_seconds BIGINT"
+            ),
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS cold_age_column TEXT"
+            ),
+            // Phase 5.7 forward-compat: per-table bloom-filter column set.
+            // Stored as a JSONB array of column names; NULL / absent means
+            // "no bloom filters" — the default for back-compat. The writer
+            // reads this on every put to decide which columns get a native
+            // Parquet bloom filter section.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS bloom_filter_columns_json JSONB"
+            ),
+            // Phase 5.7 B3 forward-compat: per-table override of the
+            // Parquet writer's `max_row_group_size`. NULL means "use the
+            // writer default" (currently 65k rows) — the back-compat path.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS row_group_rows BIGINT"
+            ),
         ];
         let client = self.client.lock().await;
         for stmt in stmts {
@@ -193,14 +244,18 @@ impl Catalog for PostgresCatalog {
         .await
         .map_err(|e| BasinError::catalog(format!("ensure namespace: {e}")))?;
 
+        let default_spec_json = serde_json::to_value(PartitionSpec::Unpartitioned)
+            .map_err(|e| BasinError::catalog(format!("serialise partition spec: {e}")))?;
+        let empty_policies_json = serde_json::to_value::<Vec<Policy>>(Vec::new())
+            .map_err(|e| BasinError::catalog(format!("serialise policies: {e}")))?;
         let inserted = tx
             .execute(
                 &format!(
-                    "INSERT INTO {sch}.tables (tenant_id, table_name, schema_json, current_snapshot, format_version)
-                     VALUES ($1, $2, $3, 0, 2)
+                    "INSERT INTO {sch}.tables (tenant_id, table_name, schema_json, current_snapshot, format_version, partition_spec_json, rls_enabled, policies_json)
+                     VALUES ($1, $2, $3, 0, 2, $4, FALSE, $5)
                      ON CONFLICT (tenant_id, table_name) DO NOTHING"
                 ),
-                &[&tenant_str, &table_str, &schema_json],
+                &[&tenant_str, &table_str, &schema_json, &default_spec_json, &empty_policies_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("insert table: {e}")))?;
@@ -245,6 +300,13 @@ impl Catalog for PostgresCatalog {
                 summary: genesis_summary,
             }],
             format_version: 2,
+            partition_spec: PartitionSpec::Unpartitioned,
+            rls_enabled: false,
+            policies: Vec::new(),
+            cold_after_seconds: None,
+            cold_age_column: None,
+            bloom_filter_columns: Vec::new(),
+            row_group_rows: None,
         })
     }
 
@@ -258,7 +320,9 @@ impl Catalog for PostgresCatalog {
         let row_opt = client
             .query_opt(
                 &format!(
-                    "SELECT schema_json, current_snapshot, format_version
+                    "SELECT schema_json, current_snapshot, format_version, partition_spec_json,
+                            rls_enabled, policies_json, cold_after_seconds, cold_age_column,
+                            bloom_filter_columns_json, row_group_rows
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2"
                 ),
@@ -272,8 +336,40 @@ impl Catalog for PostgresCatalog {
         let schema_json: serde_json::Value = row.get(0);
         let current: i64 = row.get(1);
         let format_version: i16 = row.get(2);
+        let partition_spec_json: Option<serde_json::Value> = row.get(3);
+        let rls_enabled: bool = row.get(4);
+        let policies_json: Option<serde_json::Value> = row.get(5);
+        let cold_after_seconds_pg: Option<i64> = row.get(6);
+        let cold_age_column: Option<String> = row.get(7);
+        let bloom_filter_columns_json: Option<serde_json::Value> = row.get(8);
+        let row_group_rows_pg: Option<i64> = row.get(9);
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
+        let partition_spec = match partition_spec_json {
+            Some(v) => serde_json::from_value(v).map_err(|e| {
+                BasinError::catalog(format!("deserialise partition spec: {e}"))
+            })?,
+            None => PartitionSpec::Unpartitioned,
+        };
+        let policies: Vec<Policy> = match policies_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise policies: {e}")))?,
+            None => Vec::new(),
+        };
+        // Postgres BIGINT is i64; clamp negatives to None defensively (a
+        // negative threshold has no meaning and shouldn't propagate).
+        let cold_after_seconds = cold_after_seconds_pg.and_then(|v| u64::try_from(v).ok());
+        let bloom_filter_columns: Vec<String> = match bloom_filter_columns_json {
+            Some(v) => serde_json::from_value(v).map_err(|e| {
+                BasinError::catalog(format!("deserialise bloom_filter_columns: {e}"))
+            })?,
+            None => Vec::new(),
+        };
+        // Postgres BIGINT is i64; clamp negatives / wider-than-usize defensively.
+        // A negative row-group size has no meaning and shouldn't propagate; an
+        // overflow on 32-bit hosts likewise falls back to "use the default".
+        let row_group_rows: Option<usize> = row_group_rows_pg
+            .and_then(|v| if v >= 0 { usize::try_from(v).ok() } else { None });
 
         let snapshots = fetch_snapshots(&client, sch, &tenant_str, &table_str).await?;
         Ok(TableMetadata {
@@ -283,6 +379,13 @@ impl Catalog for PostgresCatalog {
             current_snapshot: SnapshotId(current as u64),
             snapshots,
             format_version: format_version as u8,
+            partition_spec,
+            rls_enabled,
+            policies,
+            cold_after_seconds,
+            cold_age_column,
+            bloom_filter_columns,
+            row_group_rows,
         })
     }
 
@@ -553,6 +656,190 @@ impl Catalog for PostgresCatalog {
         drop(client);
 
         self.load_table(tenant, table).await
+    }
+
+    #[instrument(skip(self, spec), fields(tenant = %tenant, table = %table))]
+    async fn set_partition_spec(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        spec: PartitionSpec,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let json = serde_json::to_value(&spec)
+            .map_err(|e| BasinError::catalog(format!("serialise partition spec: {e}")))?;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET partition_spec_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_partition_spec: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, policies), fields(tenant = %tenant, table = %table))]
+    async fn set_rls_state(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        rls_enabled: bool,
+        policies: Vec<Policy>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let json = serde_json::to_value(&policies)
+            .map_err(|e| BasinError::catalog(format!("serialise policies: {e}")))?;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET rls_enabled = $3, policies_json = $4
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &rls_enabled, &json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_rls_state: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    async fn set_tier_policy(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        cold_after_seconds: Option<u64>,
+        cold_age_column: Option<String>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        // Stored as BIGINT (i64); reject thresholds that don't fit before
+        // we even hit the database to keep the error message close to the
+        // caller. u64::MAX / 2 ≈ 1.4e10 years is plenty of headroom.
+        let cas_pg: Option<i64> = match cold_after_seconds {
+            Some(v) => Some(i64::try_from(v).map_err(|_| {
+                BasinError::catalog(format!("cold_after_seconds {v} overflows BIGINT"))
+            })?),
+            None => None,
+        };
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET cold_after_seconds = $3, cold_age_column = $4
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[
+                    &tenant.to_string(),
+                    &table.to_string(),
+                    &cas_pg,
+                    &cold_age_column,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_tier_policy: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, n = columns.len()))]
+    async fn set_bloom_filter_columns(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let json = serde_json::to_value(&columns).map_err(|e| {
+            BasinError::catalog(format!("serialise bloom_filter_columns: {e}"))
+        })?;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET bloom_filter_columns_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_bloom_filter_columns: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    async fn set_row_group_rows(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        rows: Option<usize>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        // Stored as BIGINT (i64); reject sizes that don't fit before we even
+        // hit the database. A `usize::MAX` row-group size is nonsensical
+        // anyway; the practical range is single-digit thousands to ~1M.
+        let rows_pg: Option<i64> = match rows {
+            Some(v) => Some(i64::try_from(v).map_err(|_| {
+                BasinError::catalog(format!("row_group_rows {v} overflows BIGINT"))
+            })?),
+            None => None,
+        };
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET row_group_rows = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &rows_pg],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_row_group_rows: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
+    async fn set_schema(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        schema: Schema,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let schema_json = serde_json::to_value(&schema)
+            .map_err(|e| BasinError::catalog(format!("serialise arrow schema: {e}")))?;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET schema_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &schema_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_schema: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, table = %table))]

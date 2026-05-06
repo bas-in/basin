@@ -85,6 +85,8 @@ fn engine_in(dir: &TempDir) -> Engine {
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     Engine::new(EngineConfig {

@@ -1,0 +1,55 @@
+{
+  "kind": "scaling",
+  "id": "compute_shards",
+  "name": "Compute sharding (router -> shard owners) on real S3",
+  "claim": "Hash tenant_id -> shard_id; pgwire connections route to the owning shard. Shards share one S3-backed Storage; load distributes evenly across shards. Scaled to 25 tenants on real S3 to fit the WAN test budget.",
+  "passed": true,
+  "x_axis": {
+    "key": "shard",
+    "label": "shard index"
+  },
+  "series": [
+    {
+      "key": "tenants",
+      "label": "tenants on shard",
+      "unit": "count"
+    },
+    {
+      "key": "load_pct",
+      "label": "share of tenants",
+      "unit": "%"
+    }
+  ],
+  "rows": [
+    {
+      "load_pct": 20.0,
+      "shard": 0,
+      "tenants": 5
+    },
+    {
+      "load_pct": 28.0,
+      "shard": 1,
+      "tenants": 7
+    },
+    {
+      "load_pct": 40.0,
+      "shard": 2,
+      "tenants": 10
+    },
+    {
+      "load_pct": 12.0,
+      "shard": 3,
+      "tenants": 3
+    }
+  ],
+  "primary": {
+    "label": "max shard load",
+    "value": 40.0,
+    "unit": "%",
+    "bar": {
+      "op": "less_than",
+      "value": 50.0
+    }
+  },
+  "generated_at": "@1777981848"
+}

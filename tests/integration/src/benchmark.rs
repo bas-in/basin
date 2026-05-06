@@ -30,10 +30,19 @@ fn data_dir() -> PathBuf {
     repo_relative(DATA_DIR)
 }
 
-/// Path to `<repo_root>/benchmark/data_real/`. This is where real-S3
-/// (or other real cloud backend) test reports land — kept separate from
-/// the synthetic LocalFS dashboard so the two stories don't get mixed.
+/// Path to the real-cloud / S3-compatible dashboard's data dir.
+///
+/// Default: `<repo_root>/benchmark/data_real/`. Override with
+/// `BASIN_BENCHMARK_DIR=<rel-path-from-repo-root>` to redirect cards
+/// elsewhere — e.g. `BASIN_BENCHMARK_DIR=benchmark/data_seaweedfs` to
+/// build the SeaweedFS-backed dashboard alongside the real-cloud one
+/// without mixing measurements.
 fn data_real_dir() -> PathBuf {
+    if let Ok(rel) = std::env::var("BASIN_BENCHMARK_DIR") {
+        if !rel.trim().is_empty() {
+            return repo_relative(&rel);
+        }
+    }
     repo_relative(DATA_REAL_DIR)
 }
 

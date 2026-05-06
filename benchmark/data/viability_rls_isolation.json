@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "rls_isolation",
+  "name": "RLS preserves tenant prefix isolation",
+  "claim": "Cross-tenant row leakage is zero across every RLS configuration combination.",
+  "passed": true,
+  "primary": {
+    "label": "cross_tenant_leak",
+    "value": 0.0,
+    "unit": "rows",
+    "bar": {
+      "op": "equal",
+      "value": 0.0
+    }
+  },
+  "details": {
+    "cross_tenant_leak": 0,
+    "tenant_a": "01KQW9W7RJJ8GRWR30ZYBFEE9C",
+    "tenant_b": "01KQW9W7RJ8MGAT4GGVAVYR1XW"
+  },
+  "generated_at": "@1777992605"
+}

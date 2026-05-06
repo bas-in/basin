@@ -111,6 +111,8 @@ async fn viability_1_compression_ratio() {
     let storage = Storage::new(StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
     let tenant = TenantId::new();

@@ -55,6 +55,8 @@ async fn start_server_with_shard() -> TestServer {
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(storage_fs),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn basin_catalog::Catalog> =
         Arc::new(basin_catalog::InMemoryCatalog::new());
@@ -93,6 +95,7 @@ async fn start_server_with_shard() -> TestServer {
         engine,
         tenant_resolver: resolver,
         pool: None,
+        shard_endpoints: None,
     })
     .await
     .expect("server failed to bind");

@@ -174,6 +174,182 @@ impl InProcessShard {
         self.compact_all().await
     }
 
+    /// Walk every resident tenant's tables and migrate any data file whose
+    /// `cold_age_column` max is older than `cold_after_seconds` into the
+    /// cold tier. The flow per file is:
+    ///
+    /// 1. Copy hot → cold (object_store::copy).
+    /// 2. Atomic catalog swap via `replace_data_files` — the new manifest
+    ///    references the cold path, dropping the hot one.
+    /// 3. Best-effort delete of the old hot object.
+    ///
+    /// Files already in the cold tier are skipped. Tables with no policy
+    /// (`cold_after_seconds = None`) are skipped. Errors per table are
+    /// logged but never propagated — one bad table mustn't stall the rest
+    /// of the sweep, same convention as `compact_all`.
+    pub(crate) async fn tiering_sweep(&self) -> Result<()> {
+        // Collect the set of tenants we know about. Resident partitions are
+        // the ground truth here — we only sweep tenants whose data we've
+        // touched. Cold-loading every tenant from a global registry would
+        // require an admin API the catalog doesn't expose by design.
+        let tenants: Vec<TenantId> = {
+            let map = self.partitions.lock().await;
+            let mut seen: HashSet<TenantId> = HashSet::new();
+            for (t, _) in map.keys() {
+                seen.insert(*t);
+            }
+            seen.into_iter().collect()
+        };
+
+        for tenant in tenants {
+            if let Err(e) = self.sweep_tenant(&tenant).await {
+                warn!(%tenant, error = %e, "tiering sweep failed for tenant; will retry next tick");
+            }
+        }
+        Ok(())
+    }
+
+    async fn sweep_tenant(&self, tenant: &TenantId) -> Result<()> {
+        let tables = self.cfg.catalog.list_tables(tenant).await?;
+        for table in tables {
+            if let Err(e) = self.sweep_table(tenant, &table).await {
+                warn!(
+                    %tenant,
+                    %table,
+                    error = %e,
+                    "tiering sweep failed for table; skipping",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn sweep_table(&self, tenant: &TenantId, table: &TableName) -> Result<()> {
+        let meta = self.cfg.catalog.load_table(tenant, table).await?;
+        let Some(threshold_secs) = meta.cold_after_seconds else {
+            return Ok(()); // Policy disabled.
+        };
+        // Resolve the timestamp column the policy uses. Explicit setting
+        // wins; otherwise fall back to the partition column. If neither is
+        // available, skip — the policy is well-formed but a no-op for this
+        // table until the user sets a column.
+        let age_column = match &meta.cold_age_column {
+            Some(c) => c.clone(),
+            None => match meta.partition_spec.partition_column() {
+                Some(c) => c.to_string(),
+                None => return Ok(()),
+            },
+        };
+
+        // Compute the cutoff in microseconds since the epoch (TIMESTAMPTZ
+        // Parquet stats decode as i64 microseconds). Negative thresholds
+        // would clip everything; we use saturating arithmetic to keep the
+        // code free of conversion panics on edge cases.
+        let now = chrono::Utc::now();
+        let threshold = chrono::Duration::seconds(threshold_secs as i64);
+        let cutoff_dt = now - threshold;
+        let cutoff_micros = cutoff_dt.timestamp_micros();
+        // We also handle Int64-as-epoch-seconds columns: same comparison
+        // applied at second granularity. We try both decodings per file
+        // and use whichever produces a sane answer.
+        let cutoff_seconds = cutoff_dt.timestamp();
+
+        let storage = &self.cfg.storage;
+        let files = storage.list_data_files_with_stats(tenant, table).await?;
+
+        let mut migrated = 0usize;
+        for f in files {
+            if matches!(f.tier, basin_storage::Tier::Cold) {
+                continue;
+            }
+            let Some(stats) = f.column_stats.get(&age_column) else {
+                continue;
+            };
+            let Some(max_bytes) = stats.max_bytes.as_deref() else {
+                continue;
+            };
+            // Decode max as either i64 microseconds (TIMESTAMPTZ) or
+            // i64 seconds (epoch); both are 8 bytes LE. We treat the
+            // file as cold-eligible if either decoding says so. In
+            // practice a policy is paired with one column type; the
+            // OR is safe because the wrong-decoding branch's cutoff
+            // is so far off-scale (microseconds vs seconds: 1e6×) that
+            // it can't false-positive against realistic data.
+            let max_micros = decode_le_i64(max_bytes);
+            let max_seconds = max_micros; // bytes are identical
+            let is_cold_micros = max_micros.map(|m| m < cutoff_micros).unwrap_or(false);
+            let is_cold_seconds = max_seconds.map(|m| m < cutoff_seconds).unwrap_or(false);
+            // Determine which decoding is likely correct: a "microseconds"
+            // value paired against the seconds cutoff would be off by 1e6,
+            // so it'd appear *not* cold (much greater than cutoff). The
+            // microseconds decoding is the canonical one; only fall back
+            // to seconds if max_micros looks unreasonably large for an
+            // epoch-seconds value (i.e. > year ~2200 in seconds → > 7e9).
+            let is_cold = is_cold_micros && {
+                // Sanity guard: if we got a value that's clearly not micros
+                // (looks like seconds), prefer the seconds verdict.
+                match max_micros {
+                    Some(m) if m.abs() < 7_000_000_000 => is_cold_seconds,
+                    _ => true,
+                }
+            };
+            if !is_cold {
+                continue;
+            }
+
+            // Migrate. Steps must be done in this order so a crash mid-way
+            // never makes the catalog point at a missing object:
+            //   1. Copy hot -> cold
+            //   2. Catalog: replace the hot file with the cold one
+            //   3. Delete the hot object
+            let cold_file = match storage.migrate_to_cold(tenant, &f.path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(path = %f.path, error = %e, "tier migrate copy failed; skipping file");
+                    continue;
+                }
+            };
+
+            let parent_snapshot = self.cfg.catalog.load_table(tenant, table).await?.current_snapshot;
+            let added = DataFileRef {
+                path: cold_file.path.as_ref().to_string(),
+                size_bytes: cold_file.size_bytes,
+                row_count: f.row_count,
+            };
+            let removed = vec![f.path.as_ref().to_string()];
+            match self
+                .cfg
+                .catalog
+                .replace_data_files(tenant, table, parent_snapshot, removed, vec![added])
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        path = %f.path,
+                        error = %e,
+                        "tier migrate catalog swap failed; cold object orphaned (will be reaped on retry)",
+                    );
+                    // Try to clean up the orphan cold copy. Failure here is
+                    // pure waste, not a correctness issue.
+                    let _ = storage.delete_file(tenant, &cold_file.path).await;
+                    continue;
+                }
+            }
+
+            // Catalog now points at the cold path; the hot file is safe to
+            // delete. Best-effort: a leftover hot object is wasted bytes.
+            if let Err(e) = storage.delete_file(tenant, &f.path).await {
+                warn!(path = %f.path, error = %e, "post-migrate hot delete failed");
+            }
+            migrated += 1;
+        }
+        if migrated > 0 {
+            tracing::info!(%tenant, %table, migrated, "tier migration complete");
+        }
+        Ok(())
+    }
+
     /// Walk the partition map and drop entries whose `last_active` is past the
     /// configured `eviction_idle` window. Skips partitions whose tail is
     /// non-empty — letting the compactor drain them first preserves the
@@ -468,10 +644,23 @@ impl ShardImpl for InProcessShard {
         self.compact_all().await
     }
 
+    async fn run_tiering_sweep(&self) -> Result<()> {
+        self.tiering_sweep().await
+    }
+
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))
     }
+}
+
+fn decode_le_i64(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(bytes);
+    Some(i64::from_le_bytes(a))
 }
 
 struct InProcessTenantHandle {
@@ -829,6 +1018,8 @@ mod tests {
         let storage = Storage::new(StorageConfig {
             object_store: Arc::new(storage_fs),
             root_prefix: None,
+            disk_cache: None,
+        page_cache: None,
         });
         let catalog = Arc::new(InMemoryCatalog::new());
         let wal = Wal::open(WalConfig {
@@ -941,6 +1132,8 @@ mod tests {
         let storage = Storage::new(StorageConfig {
             object_store: Arc::new(storage_fs),
             root_prefix: None,
+            disk_cache: None,
+        page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
         let wal_cfg = || WalConfig {

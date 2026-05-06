@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use object_store::path::Path as ObjectPath;
 use serde::{Deserialize, Serialize};
 
+use crate::tier::Tier;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataFile {
     /// Object key relative to whatever bucket the configured `ObjectStore`
@@ -17,6 +19,13 @@ pub struct DataFile {
     pub size_bytes: u64,
     pub row_count: u64,
     pub column_stats: BTreeMap<String, ColumnStats>,
+    /// Storage tier this file lives in. `#[serde(default)]` so manifests
+    /// written before the field existed deserialise to [`Tier::Hot`].
+    /// Listing helpers populate this from the path layout, so a file that
+    /// lives under `…/tables/<t>/cold/…` always reports `Cold` even if a
+    /// stale snapshot recorded otherwise.
+    #[serde(default)]
+    pub tier: Tier,
 }
 
 mod object_path_str {

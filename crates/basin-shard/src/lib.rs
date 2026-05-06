@@ -125,6 +125,19 @@ impl Shard {
         self.inner.flush_to_parquet().await
     }
 
+    /// Run one pass of the tiered-storage sweep. For every `(tenant, table)`
+    /// the shard has touched (i.e. has resident state for, OR has been seen
+    /// to live in the catalog under a known tenant), copy data files older
+    /// than `cold_after_seconds` into the cold tier and atomically swap the
+    /// catalog over.
+    ///
+    /// Exposed for tests and one-shot ops; the in-process compactor will
+    /// also call this from its background tick once we surface a tier
+    /// interval knob (TODO: align with `compaction_interval`).
+    pub async fn run_tiering_sweep(&self) -> Result<()> {
+        self.inner.run_tiering_sweep().await
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -197,6 +210,7 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn stats(&self) -> ShardStats;
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
     async fn flush_to_parquet(&self) -> Result<()>;
+    async fn run_tiering_sweep(&self) -> Result<()>;
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<in_process::InProcessShard>> {

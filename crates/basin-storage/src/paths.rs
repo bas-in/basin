@@ -7,12 +7,13 @@ use chrono::{DateTime, Datelike, Utc};
 use object_store::path::Path as ObjectPath;
 use ulid::Ulid;
 
+use crate::tier::Tier;
+
 /// Path under which all tenant data lives.
 pub(crate) const TENANTS_SEGMENT: &str = "tenants";
 const TABLES_SEGMENT: &str = "tables";
-const DATA_SEGMENT: &str = "data";
 
-/// Build the absolute object key for one new data file.
+/// Build the absolute object key for one new data file in the hot tier.
 ///
 /// Layout:
 /// `{root?}/tenants/{tenant}/tables/{table}/data/{partition}/yyyy/mm/dd/{ulid}.parquet`
@@ -28,38 +29,113 @@ pub(crate) fn data_file_key(
     now: DateTime<Utc>,
     file_id: Ulid,
 ) -> ObjectPath {
-    let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
-    p = p.child(TENANTS_SEGMENT);
-    p = p.child(tenant.as_prefix());
-    p = p.child(TABLES_SEGMENT);
-    p = p.child(table.as_str());
-    p = p.child(DATA_SEGMENT);
-    let part = partition.as_str();
-    let part_segment = if part.is_empty() {
-        PartitionKey::DEFAULT
-    } else {
-        part
-    };
-    p = p.child(part_segment);
-    p = p.child(format!("{:04}", now.year()));
-    p = p.child(format!("{:02}", now.month()));
-    p = p.child(format!("{:02}", now.day()));
-    p.child(format!("{file_id}.parquet"))
+    data_file_key_in_tier(root, tenant, table, partition, now, file_id, Tier::Hot)
 }
 
-/// Prefix that all of one tenant+table's data files live under. Used by
-/// listing.
-pub(crate) fn table_data_prefix(
+/// Tier-aware variant of [`data_file_key`]. Cold-tier writes land under
+/// `tables/{t}/cold/...` so a single object-store lifecycle rule on the
+/// `cold/` prefix can flip the underlying storage class to S3-IA / R2-IA.
+pub(crate) fn data_file_key_in_tier(
     root: Option<&ObjectPath>,
     tenant: &TenantId,
     table: &TableName,
+    partition: &PartitionKey,
+    now: DateTime<Utc>,
+    file_id: Ulid,
+    tier: Tier,
 ) -> ObjectPath {
     let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
     p = p.child(TENANTS_SEGMENT);
     p = p.child(tenant.as_prefix());
     p = p.child(TABLES_SEGMENT);
     p = p.child(table.as_str());
-    p.child(DATA_SEGMENT)
+    p = p.child(tier.segment());
+    let part = partition.as_str();
+    if part.is_empty() {
+        p = p.child(PartitionKey::DEFAULT);
+    } else {
+        // `/` inside a PartitionKey is a Hive-style path separator (see
+        // `PartitionKey::new` validation): callers pass `year=2026/month=04`
+        // and we expand each segment into its own directory level so listings
+        // and prefix-pruning work without percent-decoding.
+        for segment in part.split('/') {
+            p = p.child(segment);
+        }
+    }
+    p = p.child(format!("{:04}", now.year()));
+    p = p.child(format!("{:02}", now.month()));
+    p = p.child(format!("{:02}", now.day()));
+    p.child(format!("{file_id}.parquet"))
+}
+
+/// Prefix that all of one tenant+table's hot-tier data files live under.
+/// Used by listing.
+pub(crate) fn table_data_prefix(
+    root: Option<&ObjectPath>,
+    tenant: &TenantId,
+    table: &TableName,
+) -> ObjectPath {
+    table_tier_prefix(root, tenant, table, Tier::Hot)
+}
+
+/// Tier-aware variant of [`table_data_prefix`].
+pub(crate) fn table_tier_prefix(
+    root: Option<&ObjectPath>,
+    tenant: &TenantId,
+    table: &TableName,
+    tier: Tier,
+) -> ObjectPath {
+    let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
+    p = p.child(TENANTS_SEGMENT);
+    p = p.child(tenant.as_prefix());
+    p = p.child(TABLES_SEGMENT);
+    p = p.child(table.as_str());
+    p.child(tier.segment())
+}
+
+/// Translate a hot-tier object key into its cold-tier sibling: replace the
+/// single `tables/<t>/data/` segment with `tables/<t>/cold/`. Used by the
+/// compactor when migrating an existing file between tiers.
+///
+/// Returns `None` if the input doesn't follow the canonical layout (i.e. has
+/// no `tables/<t>/data/` segment) — callers treat that as a no-op.
+pub(crate) fn rewrite_to_cold(path: &ObjectPath) -> Option<ObjectPath> {
+    let s = path.as_ref();
+    let needle = "/tables/";
+    let mut search_from = 0usize;
+    while let Some(idx) = s[search_from..].find(needle) {
+        let abs = search_from + idx + needle.len();
+        let rest = &s[abs..];
+        let next_slash = rest.find('/')?;
+        let tier_slot = abs + next_slash + 1;
+        let tier_rest = &s[tier_slot..];
+        let tier_end = tier_rest.find('/')?;
+        if &tier_rest[..tier_end] == "data" {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..tier_slot]);
+            out.push_str("cold");
+            out.push_str(&tier_rest[tier_end..]);
+            return Some(ObjectPath::from(out));
+        }
+        search_from = abs;
+    }
+    // Bucket-relative form (no leading slash before `tables/`).
+    if s.starts_with("tables/") {
+        let after = "tables/".len();
+        let rest = &s[after..];
+        let next_slash = rest.find('/')?;
+        let tier_slot = after + next_slash + 1;
+        let tier_rest = &s[tier_slot..];
+        let tier_end = tier_rest.find('/')?;
+        if &tier_rest[..tier_end] == "data" {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..tier_slot]);
+            out.push_str("cold");
+            out.push_str(&tier_rest[tier_end..]);
+            return Some(ObjectPath::from(out));
+        }
+    }
+    None
 }
 
 /// Prefix that all of one tenant's data lives under. Used for the safety-net

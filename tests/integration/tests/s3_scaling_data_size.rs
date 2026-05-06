@@ -96,6 +96,12 @@ async fn s3_scaling_data_size() {
         let storage = Storage::new(StorageConfig {
             object_store: object_store.clone(),
             root_prefix: Some(ObjectPath::from(scale_prefix.as_str())),
+            // Same rationale as scaling_data_size.rs: this card asserts
+            // a structural scaling bar, not a cache-warmth ratio. Keep
+            // caches off so the 5× bar measures the storage path's
+            // intrinsic cost.
+            disk_cache: None,
+            page_cache: None,
         });
 
         let tenant = TenantId::new();

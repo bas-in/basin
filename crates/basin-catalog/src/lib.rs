@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use basin_common::{Result, TableName, TenantId};
 
 pub use in_memory::InMemoryCatalog;
-pub use metadata::{DataFileRef, TableMetadata};
+pub use metadata::{DataFileRef, PartitionSpec, Policy, PolicyCommand, TableMetadata};
 pub use postgres::PostgresCatalog;
 pub use rest::RestCatalog;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
@@ -115,4 +115,111 @@ pub trait Catalog: Send + Sync {
         tenant: &TenantId,
         table: &TableName,
     ) -> Result<Vec<Snapshot>>;
+
+    /// Set the partitioning declared for `(tenant, table)`. The engine calls
+    /// this after a `CREATE TABLE … PARTITION BY …` so subsequent INSERTs
+    /// see the spec via [`load_table`](Catalog::load_table).
+    ///
+    /// Idempotent: calling repeatedly with the same spec is a no-op. Calling
+    /// with a different spec on an existing table replaces the spec; the
+    /// engine itself rejects mid-life partition changes — this method is the
+    /// catalog's "store whatever you're told" trapdoor.
+    async fn set_partition_spec(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        spec: PartitionSpec,
+    ) -> Result<()>;
+
+    /// Replace the full RLS state for `(tenant, table)`. The engine collapses
+    /// `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` and every
+    /// `CREATE/ALTER/DROP POLICY` into one of these calls so the catalog
+    /// has a single, atomic write surface for the policy set. Default impl
+    /// is a no-op so existing catalog implementations stay buildable; the
+    /// in-memory and Postgres backends override this.
+    async fn set_rls_state(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        rls_enabled: bool,
+        policies: Vec<Policy>,
+    ) -> Result<()> {
+        let _ = (tenant, table, rls_enabled, policies);
+        Ok(())
+    }
+
+    /// Set the tiered-storage age policy for `(tenant, table)`. The compactor
+    /// reads this on its periodic sweep. Passing `cold_after_seconds = None`
+    /// disables the policy (the default). Default impl is a no-op so the
+    /// stub `RestCatalog` and any future backends stay buildable; the
+    /// in-memory and Postgres implementations override this.
+    async fn set_tier_policy(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        cold_after_seconds: Option<u64>,
+        cold_age_column: Option<String>,
+    ) -> Result<()> {
+        let _ = (tenant, table, cold_after_seconds, cold_age_column);
+        Ok(())
+    }
+
+    /// Configure the per-table bloom-filter column set. The writer consults
+    /// this on each `write_batch` call to decide which columns get a native
+    /// Parquet bloom filter section in the file footer; the reader uses the
+    /// same metadata implicitly (no extra catalog round-trip — the bloom
+    /// filter is in the Parquet file). Passing an empty `columns` vector
+    /// disables bloom filters for the table (the default for back-compat).
+    /// Default impl is a no-op so the stub `RestCatalog` and any future
+    /// backends stay buildable; the in-memory and Postgres implementations
+    /// override this.
+    async fn set_bloom_filter_columns(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let _ = (tenant, table, columns);
+        Ok(())
+    }
+
+    /// Override the writer's `max_row_group_size` for `(tenant, table)`.
+    /// `Some(n)` makes the next write group rows in chunks of `n`;
+    /// `None` (the default) restores the writer-global default. The
+    /// engine consults this on every INSERT and passes the value via
+    /// [`basin_storage::WriteOptions::max_row_group_size`]. Default impl
+    /// is a no-op so the stub `RestCatalog` and any future backends stay
+    /// buildable; the in-memory and Postgres implementations override
+    /// this. See `tests/integration/tests/viability_row_group_sizing.rs`.
+    async fn set_row_group_rows(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        rows: Option<usize>,
+    ) -> Result<()> {
+        let _ = (tenant, table, rows);
+        Ok(())
+    }
+
+    /// Replace the table's Arrow [`Schema`]. Used by `ALTER TABLE … ADD
+    /// COLUMN` (and any future evolutionary DDL — DROP COLUMN, type
+    /// widening, etc.). The catalog records the new schema; existing data
+    /// files keep their original Parquet schemas and the reader handles the
+    /// resulting null-padded columns transparently via Arrow's schema
+    /// projection.
+    ///
+    /// The catalog is intentionally permissive — it stores whatever the
+    /// engine hands it and trusts the engine to validate that the new
+    /// schema is a *legal* evolution (additive, types compatible). Default
+    /// impl is a no-op so the stub `RestCatalog` and any future backends
+    /// stay buildable.
+    async fn set_schema(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        schema: arrow_schema::Schema,
+    ) -> Result<()> {
+        let _ = (tenant, table, schema);
+        Ok(())
+    }
 }

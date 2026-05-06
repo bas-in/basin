@@ -342,6 +342,8 @@ mod tests {
         let storage = Storage::new(StorageConfig {
             object_store: Arc::new(fs),
             root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
         });
         let tenant = TenantId::new();
         let table = TableName::new("docs").unwrap();

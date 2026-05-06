@@ -2,21 +2,45 @@
   "kind": "viability",
   "id": "large_dataset_pointquery",
   "name": "Large-dataset point query",
-  "claim": "Point queries on a 10M-row dataset return in under 1 second.",
+  "claim": "Cold p99 of a 1000-iteration random-working-set point-query workload on a 10 M-row, 10-file dataset finishes under 100 ms. Each query picks a different id from a fixed-seed pool of 1000 hot ids, so the cache is exercised at realistic granularity rather than re-asking the same row. The bar is on COLD p99 (page + disk cache empty at the start of the run); a 'warm' phase is reported alongside.",
   "passed": true,
   "primary": {
-    "label": "point_query_ms",
-    "value": 23.743,
+    "label": "cold p99 ms",
+    "value": 8.157167,
     "unit": "ms",
     "bar": {
       "op": "less_than",
-      "value": 1000.0
+      "value": 100.0
     }
   },
   "details": {
+    "bar_cold_p99_ms": 100.0,
     "files": 10,
-    "rows": 10000000,
-    "seed_elapsed_s": 10.806179083
+    "n_iterations": 1000,
+    "rows": [
+      {
+        "max_ms": 20.639999999999997,
+        "mean_ms": 4.167074832000001,
+        "min_ms": 0.256416,
+        "p50_ms": 5.998833,
+        "p999_ms": 13.022666000000001,
+        "p99_ms": 8.157167,
+        "phase": "cold"
+      },
+      {
+        "max_ms": 0.7392920000000001,
+        "mean_ms": 0.26992946099999987,
+        "min_ms": 0.24695799999999998,
+        "p50_ms": 0.263541,
+        "p999_ms": 0.5912499999999999,
+        "p99_ms": 0.441958,
+        "phase": "warm"
+      }
+    ],
+    "seed": 13425777967503634925,
+    "seed_elapsed_s": 1.768206042,
+    "total_rows": 10000000,
+    "working_set_size": 1000
   },
-  "generated_at": "@1777619708"
+  "generated_at": "@1777992454"
 }

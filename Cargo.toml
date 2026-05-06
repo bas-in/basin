@@ -5,6 +5,7 @@ members = [
     "crates/basin-storage",
     "crates/basin-catalog",
     "crates/basin-engine",
+    "crates/basin-cron",
     "crates/basin-wal",
     "crates/basin-shard",
     "crates/basin-router",
@@ -36,6 +37,7 @@ basin-router = { path = "crates/basin-router" }
 basin-placement = { path = "crates/basin-placement" }
 basin-analytical = { path = "crates/basin-analytical" }
 basin-engine = { path = "crates/basin-engine" }
+basin-cron = { path = "crates/basin-cron" }
 basin-vector = { path = "crates/basin-vector" }
 basin-pool = { path = "crates/basin-pool" }
 basin-auth = { path = "crates/basin-auth" }
@@ -118,6 +120,11 @@ tempfile = "3"
 tokio-test = "0.4"
 proptest = "1"
 tokio-postgres = "0.7"
+# PRNG for benchmark workloads. Kept at workspace level so every test
+# crate that wants reproducible random ids points at the same major
+# version (0.8.x). Bumping to 0.9 changes `gen_range` semantics, which
+# would invalidate every published cold-p99 baseline.
+rand = "0.8"
 # Test-config file parsing for tests/integration/src/test_config.rs.
 # Tiny, well-maintained, default features off to keep build minimal.
 toml = { version = "0.8", default-features = false, features = ["parse"] }

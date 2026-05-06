@@ -170,6 +170,8 @@ async fn compare_lifecycle_ops() {
     let storage = Storage::new(StorageConfig {
         object_store: fs.clone(),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let tenant = TenantId::new();
     let table = TableName::new("events").unwrap();
@@ -250,6 +252,8 @@ async fn compare_lifecycle_ops() {
     let storage2 = Storage::new(StorageConfig {
         object_store: fs2.clone(),
         root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let tenant2 = TenantId::new();

@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "analytical_routing_speedup (oltp_ms / routed_ms)",
-    "value": 4.669302621469592,
+    "value": 1.681348127699039,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
@@ -16,11 +16,11 @@
   "details": {
     "files": 10,
     "groups": 16,
-    "oltp_ms": 484.06170000000003,
-    "routed_ms": 103.66895,
+    "oltp_ms": 87.61114180000001,
+    "routed_ms": 52.10767499999999,
     "routings": 5,
     "rows": 1000000,
-    "speedup": 4.669302621469592
+    "speedup": 1.681348127699039
   },
-  "generated_at": "@1777619681"
+  "generated_at": "@1777992441"
 }

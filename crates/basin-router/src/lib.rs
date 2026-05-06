@@ -50,15 +50,20 @@ use tokio::sync::{oneshot, Mutex};
 
 mod error;
 mod protocol;
+mod remote_shard;
 mod resolver;
+mod sharding;
+pub mod test_cluster;
 mod types;
 
 pub use resolver::{JwtTenantResolver, StackedTenantResolver, StaticTenantResolver, TenantResolver};
+pub use sharding::ShardMap;
 
 use crate::protocol::{
     BasinExtendedQueryHandler, BasinHandlers, BasinSimpleQueryHandlerSlot, BasinStartupHandler,
     EngineSessionFactory, PooledSessionFactory, SessionFactory,
 };
+use crate::remote_shard::RemoteShardSessionFactory;
 
 /// Configuration for the pgwire server.
 ///
@@ -66,11 +71,20 @@ use crate::protocol::{
 /// the pool (and returned to it on disconnect via `PooledSession::Drop`).
 /// When `None`, the legacy `Engine::open_session` path runs unchanged so
 /// deployments without a pool stay byte-for-byte identical.
+///
+/// `shard_endpoints` is optional. When `Some(vec)`, the router runs in
+/// compute-sharded mode: every authenticated connection is mapped via
+/// stable hashing of `TenantId` to one of the supplied endpoints, and
+/// pgwire traffic is forwarded to the upstream basin-router listening at
+/// that endpoint. The local `engine` and `pool` are unused in this mode
+/// but must still be supplied (the field is part of the trait surface).
+/// When `None`, behaviour is byte-identical to single-process Basin.
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub engine: basin_engine::Engine,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     pub pool: Option<Arc<basin_pool::SessionPool>>,
+    pub shard_endpoints: Option<Vec<String>>,
 }
 
 /// Bind, listen, accept until the process is killed.
@@ -88,7 +102,15 @@ pub async fn run_with_shutdown(cfg: ServerConfig, shutdown: oneshot::Receiver<()
     let listener = TcpListener::bind(cfg.bind_addr).await.map_err(|e| {
         BasinError::Internal(format!("bind {} failed: {e}", cfg.bind_addr))
     })?;
-    accept_loop(listener, cfg.engine, cfg.tenant_resolver, cfg.pool, shutdown).await
+    accept_loop(
+        listener,
+        cfg.engine,
+        cfg.tenant_resolver,
+        cfg.pool,
+        cfg.shard_endpoints,
+        shutdown,
+    )
+    .await
 }
 
 /// Bind synchronously (so the caller can read `local_addr`), then spawn the
@@ -105,8 +127,10 @@ pub async fn run_until_bound(cfg: ServerConfig) -> Result<RunningServer> {
     let engine = cfg.engine;
     let resolver = cfg.tenant_resolver;
     let pool = cfg.pool;
-    let join =
-        tokio::spawn(async move { accept_loop(listener, engine, resolver, pool, rx).await });
+    let shard_endpoints = cfg.shard_endpoints;
+    let join = tokio::spawn(async move {
+        accept_loop(listener, engine, resolver, pool, shard_endpoints, rx).await
+    });
     Ok(RunningServer {
         local_addr,
         shutdown: tx,
@@ -127,63 +151,76 @@ async fn accept_loop(
     engine: basin_engine::Engine,
     resolver: Arc<dyn TenantResolver>,
     pool: Option<Arc<basin_pool::SessionPool>>,
+    shard_endpoints: Option<Vec<String>>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     // The session factory is selected once per `accept_loop`. We avoid making
     // `handle_connection` generic on two factory types by branching here and
-    // letting each arm parameterise its own task. Both factories produce the
-    // same engine `Session`, so the rest of the per-connection plumbing is
-    // shared.
+    // letting each arm parameterise its own task. All factories produce a
+    // pgwire-compatible `Session`, so the rest of the per-connection
+    // plumbing is shared.
+    //
+    // Order of preference: shard mode > pool > local engine. Shard mode is
+    // the explicit opt-in for compute sharding; if it's set, the engine and
+    // pool are bypassed entirely.
+    if let Some(endpoints) = shard_endpoints {
+        if endpoints.is_empty() {
+            return Err(BasinError::Internal(
+                "shard_endpoints supplied but empty; need at least one endpoint".into(),
+            ));
+        }
+        let map = Arc::new(ShardMap::new(endpoints));
+        tracing::info!(
+            shards = map.endpoints().len(),
+            "router running in compute-sharded mode"
+        );
+        let factory = Arc::new(RemoteShardSessionFactory::new(map));
+        return run_accept_loop(listener, factory, resolver, &mut shutdown).await;
+    }
+
     if let Some(pool) = pool {
         let factory = Arc::new(PooledSessionFactory::new(pool));
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => {
-                    tracing::info!("router shutdown signaled");
-                    return Ok(());
-                }
-                res = listener.accept() => {
-                    let (sock, peer) = match res {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "accept failed");
-                            continue;
-                        }
-                    };
-                    let factory = factory.clone();
-                    let resolver = resolver.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(sock, peer, factory, resolver).await {
-                            tracing::warn!(error = %e, %peer, "connection ended with error");
-                        }
-                    });
-                }
+        return run_accept_loop(listener, factory, resolver, &mut shutdown).await;
+    }
+
+    let factory = Arc::new(EngineSessionFactory(engine));
+    run_accept_loop(listener, factory, resolver, &mut shutdown).await
+}
+
+/// Inner accept loop, parameterised on a single concrete factory type.
+/// Pulled out to share the loop body between the engine / pool / remote-shard
+/// arms in `accept_loop` without making `handle_connection` generic over a
+/// trait object.
+async fn run_accept_loop<F>(
+    listener: TcpListener,
+    factory: Arc<F>,
+    resolver: Arc<dyn TenantResolver>,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> Result<()>
+where
+    F: SessionFactory + 'static,
+{
+    loop {
+        tokio::select! {
+            _ = &mut *shutdown => {
+                tracing::info!("router shutdown signaled");
+                return Ok(());
             }
-        }
-    } else {
-        let factory = Arc::new(EngineSessionFactory(engine));
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => {
-                    tracing::info!("router shutdown signaled");
-                    return Ok(());
-                }
-                res = listener.accept() => {
-                    let (sock, peer) = match res {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "accept failed");
-                            continue;
-                        }
-                    };
-                    let factory = factory.clone();
-                    let resolver = resolver.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(sock, peer, factory, resolver).await {
-                            tracing::warn!(error = %e, %peer, "connection ended with error");
-                        }
-                    });
-                }
+            res = listener.accept() => {
+                let (sock, peer) = match res {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed");
+                        continue;
+                    }
+                };
+                let factory = factory.clone();
+                let resolver = resolver.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(sock, peer, factory, resolver).await {
+                        tracing::warn!(error = %e, %peer, "connection ended with error");
+                    }
+                });
             }
         }
     }

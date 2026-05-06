@@ -1,0 +1,33 @@
+# Basin integration-test config — local self-hosted SeaweedFS.
+# Use with:
+#   BASIN_TEST_CONFIG=./.basin-test.seaweedfs.toml \
+#     cargo test -p basin-integration-tests --test s3_credentials_smoke -- --ignored --nocapture
+#
+# Setup:
+#   weed server -s3 -ip=127.0.0.1 \
+#     -dir=./.basin-seaweedfs-data \
+#     -s3.port=8333 \
+#     -s3.config=./.basin-seaweedfs-s3.json \
+#     -volume.max=50 &
+#   echo "s3.bucket.create -name basin-test" | weed shell
+
+[s3]
+bucket = "basin-test"
+region = "us-east-1"
+prefix = "basin-test"
+
+access_key_id     = "basinseaweedadmin"
+secret_access_key = "basinseaweedsecret123"
+session_token     = ""
+
+endpoint   = "http://127.0.0.1:8333"
+allow_http = true
+http2_only = false
+accept_invalid_certs = false
+
+[postgres]
+host     = "127.0.0.1"
+port     = 5432
+user     = "pc"
+password = ""
+dbname   = "basin_test"

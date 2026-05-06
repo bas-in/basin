@@ -16,6 +16,7 @@ use chrono::Utc;
 use object_store::PutPayload;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use ulid::Ulid;
 
 use crate::data_file::{ColumnStats, DataFile};
@@ -28,12 +29,51 @@ use crate::Storage;
 /// per-table catalog options once the catalog grows them.
 const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 65_536;
 
+/// Default expected number of distinct values per row group for a bloom-
+/// filtered column. The bitset size (and therefore the false-positive rate)
+/// is computed from `(ndv, fpp)`. 1024 is a sensible starting value: for
+/// row-group sizes around 65k, most enum-shaped or moderately-cardinal
+/// columns sit comfortably below this; if the column is near-unique the
+/// filter stays useful at the configured FPP, just larger.
+const DEFAULT_BLOOM_NDV: u64 = 1024;
+/// Default false-positive probability target. 1% is the typical industry
+/// default; turning it tighter has diminishing returns vs. the bitset size
+/// it costs in the footer.
+const DEFAULT_BLOOM_FPP: f64 = 0.01;
+
+/// Knobs for [`write_batch_with_options`]. All defaults preserve the legacy
+/// behaviour exactly, so callers that don't care about bloom filters can
+/// keep using [`write_batch`] without churn.
+#[derive(Clone, Debug, Default)]
+pub struct WriteOptions {
+    /// Columns that should get a native Parquet bloom filter section. Empty
+    /// (the default) is the pre-bloom behaviour: no filter is written, the
+    /// reader's pruning is driven by min/max stats alone.
+    pub bloom_filter_columns: Vec<String>,
+    /// Override [`DEFAULT_MAX_ROW_GROUP_SIZE`]. `None` keeps the default.
+    /// Tests use this to force multiple row groups out of small batches so
+    /// the bloom-filter pruning path is observable.
+    pub max_row_group_size: Option<usize>,
+}
+
 pub(crate) async fn write_batch(
     storage: &Storage,
     tenant: &TenantId,
     table: &TableName,
     partition: &PartitionKey,
     batch: &RecordBatch,
+) -> Result<DataFile> {
+    write_batch_with_options(storage, tenant, table, partition, batch, &WriteOptions::default())
+        .await
+}
+
+pub(crate) async fn write_batch_with_options(
+    storage: &Storage,
+    tenant: &TenantId,
+    table: &TableName,
+    partition: &PartitionKey,
+    batch: &RecordBatch,
+    opts: &WriteOptions,
 ) -> Result<DataFile> {
     let data_ulid = Ulid::new();
     let key = data_file_key(
@@ -45,7 +85,7 @@ pub(crate) async fn write_batch(
         data_ulid,
     );
 
-    let bytes = encode_parquet(batch)?;
+    let bytes = encode_parquet(batch, opts)?;
     let size = bytes.len() as u64;
     let row_count = batch.num_rows() as u64;
 
@@ -67,23 +107,43 @@ pub(crate) async fn write_batch(
         size_bytes: size,
         row_count,
         column_stats,
+        // New writes always land in the hot tier. The compactor migrates files
+        // to cold later via `Storage::migrate_to_cold`.
+        tier: crate::tier::Tier::Hot,
     })
 }
 
-fn encode_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
+fn encode_parquet(batch: &RecordBatch, opts: &WriteOptions) -> Result<Vec<u8>> {
     // ZSTD level 1: ~3x faster writes than ZSTD-3 with only a few percent
     // worse compression on log-shaped data. Audit-log retention still beats
     // CSV by an order of magnitude (the wedge claim), and the synchronous
     // write path (no WAL yet) doesn't crater. Once basin-wal lands and the
     // background compactor exists, the long-tail Parquet files can be
     // re-encoded at ZSTD-3 or ZSTD-9 for archival storage.
-    let props = WriterProperties::builder()
-        .set_max_row_group_size(DEFAULT_MAX_ROW_GROUP_SIZE)
+    let max_row_group_size = opts
+        .max_row_group_size
+        .unwrap_or(DEFAULT_MAX_ROW_GROUP_SIZE);
+    let mut builder = WriterProperties::builder()
+        .set_max_row_group_size(max_row_group_size)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
         .set_compression(parquet::basic::Compression::ZSTD(
             parquet::basic::ZstdLevel::try_new(1).expect("ZSTD level 1 is valid"),
-        ))
-        .build();
+        ));
+
+    // Bloom filters are configured per-column. We only enable them on
+    // columns the caller asked for so the default (empty list) is
+    // byte-equivalent to the pre-bloom Parquet output. Each column gets the
+    // same default `(NDV, FPP)` knobs; per-column overrides are a future
+    // catalog hook.
+    for col_name in &opts.bloom_filter_columns {
+        let col = ColumnPath::from(col_name.as_str());
+        builder = builder
+            .set_column_bloom_filter_enabled(col.clone(), true)
+            .set_column_bloom_filter_ndv(col.clone(), DEFAULT_BLOOM_NDV)
+            .set_column_bloom_filter_fpp(col, DEFAULT_BLOOM_FPP);
+    }
+
+    let props = builder.build();
 
     let mut buf: Vec<u8> = Vec::with_capacity(batch.get_array_memory_size());
     {

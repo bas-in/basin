@@ -1,6 +1,7 @@
 //! Parquet reader with projection + predicate pushdown.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -17,30 +18,41 @@ use parquet::file::statistics::Statistics;
 
 use crate::data_file::{ColumnStats, DataFile};
 use crate::metadata_cache::{CachedParquetMeta, ParquetMetaCache};
-use crate::paths::table_data_prefix;
+use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache};
+use crate::paths::table_tier_prefix;
 use crate::predicate::{self, Predicate, ScalarValue};
-use crate::{ReadOptions, Storage};
+use crate::tier::Tier;
+use crate::{ReadCounters, ReadOptions, Storage};
 
 pub(crate) async fn list_data_files(
     storage: &Storage,
     tenant: &TenantId,
     table: &TableName,
 ) -> Result<Vec<DataFile>> {
-    let prefix = table_data_prefix(storage.root_prefix(), tenant, table);
+    // Walk both tier prefixes. Phase 5.5 introduces `tables/<t>/cold/`
+    // alongside the existing `tables/<t>/data/` so reads transparently see
+    // files migrated by the tiering compactor. Each file's `tier` field is
+    // derived from its path so callers don't have to know which prefix the
+    // listing came from.
     let store = storage.tenant_store(tenant);
     let mut files = Vec::new();
-    let mut stream = store.list(Some(&prefix));
-    while let Some(meta) = stream.next().await {
-        let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
-        if !meta.location.as_ref().ends_with(".parquet") {
-            continue;
+    for tier in [Tier::Hot, Tier::Cold] {
+        let prefix = table_tier_prefix(storage.root_prefix(), tenant, table, tier);
+        let mut stream = store.list(Some(&prefix));
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
+            if !meta.location.as_ref().ends_with(".parquet") {
+                continue;
+            }
+            let resolved_tier = Tier::from_path(meta.location.as_ref());
+            files.push(DataFile {
+                path: meta.location,
+                size_bytes: meta.size as u64,
+                row_count: 0,
+                column_stats: BTreeMap::new(),
+                tier: resolved_tier,
+            });
         }
-        files.push(DataFile {
-            path: meta.location,
-            size_bytes: meta.size as u64,
-            row_count: 0,
-            column_stats: BTreeMap::new(),
-        });
     }
     Ok(files)
 }
@@ -246,12 +258,15 @@ pub(crate) async fn read(
     table: &TableName,
     opts: ReadOptions,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-    let prefix = table_data_prefix(storage.root_prefix(), tenant, table);
     let store = storage.tenant_store(tenant);
     let tenant_id_string = tenant.as_prefix();
 
     let mut paths: Vec<ObjectPath> = Vec::new();
-    {
+    // Walk hot and cold tiers in turn. The reader is tier-agnostic — files
+    // live wherever the (compactor-driven) tier policy put them; here we
+    // just consume both prefixes.
+    for tier in [Tier::Hot, Tier::Cold] {
+        let prefix = table_tier_prefix(storage.root_prefix(), tenant, table, tier);
         let mut s = store.list(Some(&prefix));
         while let Some(meta) = s.next().await {
             let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
@@ -275,12 +290,16 @@ pub(crate) async fn read(
     let opts = Arc::new(opts);
     let store_for_stream = store.clone();
     let cache = storage.parquet_meta_cache().clone();
+    let counters = storage.read_counters().clone();
+    let page_cache = storage.page_cache_handle().cloned();
     let stream = futures::stream::iter(paths)
         .map(move |p| {
             let store = store_for_stream.clone();
             let opts = opts.clone();
             let cache = cache.clone();
-            async move { read_one(store, p, opts, cache).await }
+            let counters = counters.clone();
+            let page_cache = page_cache.clone();
+            async move { read_one(store, p, opts, cache, counters, page_cache).await }
         })
         .buffered(4)
         .map(|res: Result<BoxStream<'static, Result<RecordBatch>>>| match res {
@@ -306,7 +325,9 @@ pub(crate) async fn read_file(
     let opts = Arc::new(ReadOptions::default());
     let store = storage.tenant_store(tenant);
     let cache = storage.parquet_meta_cache().clone();
-    read_one(store, path.clone(), opts, cache).await
+    let counters = storage.read_counters().clone();
+    let page_cache = storage.page_cache_handle().cloned();
+    read_one(store, path.clone(), opts, cache, counters, page_cache).await
 }
 
 async fn read_one(
@@ -314,7 +335,40 @@ async fn read_one(
     path: ObjectPath,
     opts: Arc<ReadOptions>,
     meta_cache: Arc<ParquetMetaCache>,
+    counters: Arc<ReadCounters>,
+    page_cache: Option<Arc<PageCache>>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    // Page-cache fast path. Composes with everything below: a hit
+    // means we skip the parquet decode entirely and yield the cached
+    // `Arc<RecordBatch>`es directly. The key includes the projection
+    // and filter set so different SELECTs on the same file don't
+    // collide.
+    //
+    // We don't cache when there's a partition predicate set, because
+    // partition pruning is applied at a higher layer (`Storage::read`)
+    // by the caller and the cache key doesn't capture it. In practice
+    // the partition predicate is the default for v0.1, so this is a
+    // no-op guard.
+    let cache_key = page_cache.as_ref().map(|_| CacheKey {
+        path: path.clone(),
+        projection_hash: hash_projection(opts.projection.as_deref()),
+        filters_hash: hash_filters(&opts.filters),
+    });
+    if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key.as_ref()) {
+        if let Some(batches) = pc.get(key) {
+            // Hit: yield the cached batches as a stream. Each entry
+            // is an `Arc<RecordBatch>`; we clone the Arc and unwrap
+            // it into an owned `RecordBatch` because the public stream
+            // contract is `Result<RecordBatch>`. The clone is cheap
+            // (Arrow buffers are themselves Arc'd).
+            let owned: Vec<RecordBatch> =
+                batches.iter().map(|b| (**b).clone()).collect();
+            let s = futures::stream::iter(owned.into_iter().map(Ok));
+            return Ok(s.boxed());
+        }
+    }
+
+
     // Cache lookup. On hit we skip BOTH the footer fetch and the HEAD
     // round-trip — we have the file size in cache, so we can synthesise
     // an `ObjectMeta` (the `ParquetObjectReader` only reads `location`
@@ -378,17 +432,51 @@ async fn read_one(
         None => ProjectionMask::all(),
     };
 
-    // Row-group pruning by stats.
-    let kept: Vec<usize> = {
+    // Row-group pruning by stats. Tracks per-group `considered` and
+    // counts the stats-driven prunes; bloom-filter pruning is layered on
+    // afterwards because it needs an extra (async) byte-range read of the
+    // bloom-filter section in the Parquet footer.
+    let kept_after_stats: Vec<usize> = {
         let row_groups = builder.metadata().row_groups();
-        (0..row_groups.len())
-            .filter(|i| !row_group_pruned(&row_groups[*i], &arrow_schema, &opts.filters))
-            .collect()
+        let total = row_groups.len() as u64;
+        counters
+            .row_groups_considered
+            .fetch_add(total, Ordering::Relaxed);
+        let mut kept = Vec::with_capacity(row_groups.len());
+        let mut pruned = 0u64;
+        for (i, rg) in row_groups.iter().enumerate() {
+            if row_group_pruned(rg, &arrow_schema, &opts.filters) {
+                pruned += 1;
+            } else {
+                kept.push(i);
+            }
+        }
+        counters
+            .row_groups_pruned_by_stats
+            .fetch_add(pruned, Ordering::Relaxed);
+        kept
     };
 
-    let mut builder = builder
-        .with_projection(projection_mask.clone())
-        .with_row_groups(kept);
+    // Bloom-filter pruning. For every `Eq` predicate on a column whose
+    // bloom filter is present in the Parquet footer, ask the filter
+    // whether the value is `definitely-not-present` and drop the row
+    // group if so. We probe filters per-column lazily and short-circuit
+    // on the first proof of absence — so a single `Eq` filter against a
+    // bloomed column requires at most one byte-range fetch per row
+    // group, only for groups that survived stats pruning.
+    let mut builder = builder.with_projection(projection_mask.clone());
+    let kept = prune_with_bloom_filters(
+        &mut builder,
+        &arrow_schema,
+        kept_after_stats,
+        &opts.filters,
+        &counters,
+    )
+    .await?;
+    counters
+        .row_groups_scanned
+        .fetch_add(kept.len() as u64, Ordering::Relaxed);
+    let mut builder = builder.with_row_groups(kept);
 
     // Per-row filtering as a fallback. Pushed in via RowFilter so the parquet
     // reader can also use it for page index pruning where available.
@@ -406,6 +494,49 @@ async fn read_one(
         .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
 
     let mapped = stream.map(|res| res.map_err(|e| BasinError::storage(format!("parquet read: {e}"))));
+
+    // Page-cache write-through. We tee every successful batch into a
+    // `Mutex<Option<Vec<...>>>` and, when the underlying stream ends
+    // *successfully*, swap that buffer into the cache. On any error
+    // we drop the buffer so we don't cache partial reads.
+    if let (Some(pc), Some(key)) = (page_cache, cache_key) {
+        let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
+            Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let buf_for_each = buf.clone();
+        let buf_for_end = buf.clone();
+        let pc_for_end = pc.clone();
+        let key_for_end = key;
+        let collected = mapped.inspect(move |item| {
+            if let Ok(batch) = item {
+                if let Some(slot) = buf_for_each.lock().expect("page-cache buf").as_mut() {
+                    slot.push(Arc::new(batch.clone()));
+                }
+            } else {
+                // Error path: drop the buffer so we don't cache a
+                // partial result. Subsequent items are no-ops.
+                *buf_for_each.lock().expect("page-cache buf") = None;
+            }
+        });
+        // `chain` a single-element terminator stream that, when
+        // polled, performs the final insert. It yields nothing
+        // visible to the caller (filtered out by `flat_map` below).
+        let terminator = futures::stream::once(async move {
+            let final_buf = buf_for_end
+                .lock()
+                .expect("page-cache buf")
+                .take();
+            if let Some(batches) = final_buf {
+                pc_for_end.insert(key_for_end, batches);
+            }
+            None::<Result<RecordBatch>>
+        });
+        let with_terminator = collected
+            .map(Some)
+            .chain(terminator)
+            .filter_map(|x| async move { x });
+        return Ok(with_terminator.boxed());
+    }
+
     Ok(mapped.boxed())
 }
 
@@ -433,6 +564,107 @@ fn build_row_filter(
 
     // Combined RowFilter ANDs predicates.
     Ok(RowFilter::new(predicates))
+}
+
+/// Drop row groups whose bloom filters can prove a `Predicate::Eq`'s
+/// value is absent. Falls through (keeps the row group) on every kind of
+/// uncertainty: filter not present, type we can't hash equivalently to
+/// what the writer encoded, or the bloom-filter section itself failed to
+/// load. The contract is "definitely-not-present ⇒ skip"; everything
+/// else means "must read", so a bloom miss / read failure can never make
+/// us return a wrong answer (only slower).
+async fn prune_with_bloom_filters<T>(
+    builder: &mut ParquetRecordBatchStreamBuilder<T>,
+    arrow_schema: &SchemaRef,
+    candidate_groups: Vec<usize>,
+    filters: &[Predicate],
+    counters: &Arc<ReadCounters>,
+) -> Result<Vec<usize>>
+where
+    T: parquet::arrow::async_reader::AsyncFileReader + Send + 'static,
+{
+    use parquet::bloom_filter::Sbbf;
+
+    if filters.is_empty() || candidate_groups.is_empty() {
+        return Ok(candidate_groups);
+    }
+
+    // Pre-resolve the column indexes for the equality filters that are
+    // candidates for bloom-filter pruning. We only handle `Eq` predicates;
+    // range queries (`Gt` / `Lt`) can't be answered by a bloom filter.
+    let mut eq_filters: Vec<(usize, ScalarValue)> = Vec::new();
+    for f in filters {
+        if let Predicate::Eq(col, v) = f {
+            if let Ok(idx) = arrow_schema.index_of(col) {
+                eq_filters.push((idx, v.clone()));
+            }
+        }
+    }
+    if eq_filters.is_empty() {
+        return Ok(candidate_groups);
+    }
+
+    let mut kept = Vec::with_capacity(candidate_groups.len());
+    let mut bloom_pruned = 0u64;
+
+    'outer: for rg_idx in candidate_groups {
+        for (col_idx, value) in &eq_filters {
+            // No bloom filter recorded for this column in this row group →
+            // no information to act on; move to the next predicate.
+            let col_meta = builder.metadata().row_group(rg_idx).column(*col_idx);
+            if col_meta.bloom_filter_offset().is_none() {
+                continue;
+            }
+            let sbbf: Sbbf = match builder
+                .get_row_group_column_bloom_filter(rg_idx, *col_idx)
+                .await
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
+                // Read failure: fall back to "must read" — never let a
+                // network blip mask a real row.
+                Err(_) => continue,
+            };
+            if !bloom_check(&sbbf, value) {
+                bloom_pruned += 1;
+                continue 'outer;
+            }
+        }
+        kept.push(rg_idx);
+    }
+
+    counters
+        .row_groups_pruned_by_bloom
+        .fetch_add(bloom_pruned, Ordering::Relaxed);
+    Ok(kept)
+}
+
+/// Probe the bloom filter for `value`. Returns `true` for "may be
+/// present" and `false` for "definitely not present" — the latter is
+/// the only useful answer (Sbbf can't return `definitely-present`).
+/// Hashing matches what `arrow_writer::ArrowWriter` does internally
+/// (`AsBytes` over the primitive's native bytes; UTF-8 string bytes
+/// for `Utf8`).
+fn bloom_check(sbbf: &parquet::bloom_filter::Sbbf, value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Int64(v) => sbbf.check(v),
+        ScalarValue::UInt64(v) => sbbf.check(v),
+        ScalarValue::Float64(v) => sbbf.check(v),
+        ScalarValue::Utf8(s) => {
+            // `Sbbf::check<T: AsBytes>(value: &T)` requires `T: Sized`.
+            // `str` is unsized (E0277), so we go through `&str` (a fat
+            // pointer, but sized). `parquet::data_type` provides
+            // `impl AsBytes for &str`, which hashes the UTF-8 byte slice
+            // — the same bytes the writer inserted via
+            // `bloom_filter.insert(value.as_ref())` on a `ByteArray`
+            // column.
+            let s_ref: &str = s.as_str();
+            sbbf.check(&s_ref)
+        }
+        // Booleans aren't a meaningful bloom column — at most two distinct
+        // values, the filter is useless. Fall through to "may be present".
+        ScalarValue::Boolean(_) => true,
+    }
 }
 
 /// Decide if an entire row group can be pruned given the conjunction of

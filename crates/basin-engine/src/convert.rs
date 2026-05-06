@@ -20,11 +20,31 @@ use basin_common::{BasinError, Result};
 // Workspace-side (v54) imports.
 use arrow_array as ws_array;
 use arrow_schema as ws_schema;
+use arrow_schema::TimeUnit as WsTimeUnit;
 
 // DataFusion-side (v53) imports.
 use datafusion::arrow::array as df_array;
 use datafusion::arrow::array::Array as _;
 use datafusion::arrow::datatypes as df_schema;
+use datafusion::arrow::datatypes::TimeUnit as DfTimeUnit;
+
+fn timeunit_ws_to_df(u: &WsTimeUnit) -> DfTimeUnit {
+    match u {
+        WsTimeUnit::Second => DfTimeUnit::Second,
+        WsTimeUnit::Millisecond => DfTimeUnit::Millisecond,
+        WsTimeUnit::Microsecond => DfTimeUnit::Microsecond,
+        WsTimeUnit::Nanosecond => DfTimeUnit::Nanosecond,
+    }
+}
+
+fn timeunit_df_to_ws(u: &DfTimeUnit) -> WsTimeUnit {
+    match u {
+        DfTimeUnit::Second => WsTimeUnit::Second,
+        DfTimeUnit::Millisecond => WsTimeUnit::Millisecond,
+        DfTimeUnit::Microsecond => WsTimeUnit::Microsecond,
+        DfTimeUnit::Nanosecond => WsTimeUnit::Nanosecond,
+    }
+}
 
 /// Build a DataFusion-side `Schema` from a workspace-side `Schema`.
 pub(crate) fn schema_ws_to_df(s: &ws_schema::Schema) -> Result<df_schema::Schema> {
@@ -60,6 +80,10 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
         ws_schema::DataType::Float64 => df_schema::DataType::Float64,
         ws_schema::DataType::Float32 => df_schema::DataType::Float32,
         ws_schema::DataType::Binary => df_schema::DataType::Binary,
+        ws_schema::DataType::Timestamp(unit, tz) => df_schema::DataType::Timestamp(
+            timeunit_ws_to_df(unit),
+            tz.clone(),
+        ),
         ws_schema::DataType::FixedSizeList(child, n) => {
             df_schema::DataType::FixedSizeList(
                 Arc::new(df_schema::Field::new(
@@ -86,6 +110,10 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         df_schema::DataType::Float64 => ws_schema::DataType::Float64,
         df_schema::DataType::Float32 => ws_schema::DataType::Float32,
         df_schema::DataType::Binary => ws_schema::DataType::Binary,
+        df_schema::DataType::Timestamp(unit, tz) => ws_schema::DataType::Timestamp(
+            timeunit_df_to_ws(unit),
+            tz.clone(),
+        ),
         df_schema::DataType::FixedSizeList(child, n) => {
             ws_schema::DataType::FixedSizeList(
                 Arc::new(ws_schema::Field::new(
@@ -165,6 +193,84 @@ pub(crate) fn batch_df_to_ws(
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
                 Arc::new(ws_array::BinaryArray::from(vals))
+            }
+            ws_schema::DataType::Timestamp(unit, tz) => {
+                // Pass through the underlying i64 buffer; both arrow versions
+                // store Timestamp as PrimitiveArray<i64> with identical
+                // encoding, so we just rebuild on the workspace side using
+                // the typed array matching `unit`.
+                use arrow_array::types::{
+                    TimestampMicrosecondType as WsMicros,
+                    TimestampMillisecondType as WsMilli,
+                    TimestampNanosecondType as WsNanos,
+                    TimestampSecondType as WsSec,
+                };
+                use datafusion::arrow::array::TimestampMicrosecondArray as DfMicros;
+                use datafusion::arrow::array::TimestampMillisecondArray as DfMilli;
+                use datafusion::arrow::array::TimestampNanosecondArray as DfNanos;
+                use datafusion::arrow::array::TimestampSecondArray as DfSec;
+                let vals: Vec<Option<i64>> = match unit {
+                    WsTimeUnit::Microsecond => {
+                        let s = src.as_any().downcast_ref::<DfMicros>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected TimestampMicrosecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    WsTimeUnit::Millisecond => {
+                        let s = src.as_any().downcast_ref::<DfMilli>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected TimestampMillisecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    WsTimeUnit::Nanosecond => {
+                        let s = src.as_any().downcast_ref::<DfNanos>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected TimestampNanosecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    WsTimeUnit::Second => {
+                        let s = src.as_any().downcast_ref::<DfSec>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected TimestampSecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                };
+                let dt = ws_schema::DataType::Timestamp(unit.clone(), tz.clone());
+                let arr: Arc<dyn ws_array::Array> = match unit {
+                    WsTimeUnit::Microsecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsMicros>::from(vals).with_data_type(dt),
+                    ),
+                    WsTimeUnit::Millisecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsMilli>::from(vals).with_data_type(dt),
+                    ),
+                    WsTimeUnit::Nanosecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsNanos>::from(vals).with_data_type(dt),
+                    ),
+                    WsTimeUnit::Second => Arc::new(
+                        ws_array::PrimitiveArray::<WsSec>::from(vals).with_data_type(dt),
+                    ),
+                };
+                arr
             }
             ws_schema::DataType::FixedSizeList(child, n) => {
                 // Only the FixedSizeList<Float32> shape (vector(N)) is in

@@ -266,7 +266,11 @@ fn closed_segment_path(
     } else {
         partition.as_str()
     };
-    p = p.child(part);
+    // Mirror storage's path layout: a `/` inside a PartitionKey is a path
+    // separator, so we expand each segment into its own directory level.
+    for segment in part.split('/') {
+        p = p.child(segment);
+    }
     p.child(format!("{segment_id}.seg"))
 }
 
