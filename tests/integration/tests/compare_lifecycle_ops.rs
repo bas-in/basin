@@ -186,6 +186,7 @@ async fn compare_lifecycle_ops() {
             path: f.path.as_ref().to_string(),
             size_bytes: f.size_bytes,
             row_count: f.row_count,
+            column_stats: f.column_stats.clone(),
         });
     }
     // One catalog append registers every file in a single snapshot — the

@@ -96,6 +96,8 @@ impl Engine {
         crate::cron_glue::install();
         crate::net_glue::install();
         crate::cv_glue::install();
+        crate::geo_glue::install();
+        crate::trgm_glue::install();
         Self {
             inner: Arc::new(EngineInner {
                 cfg,
@@ -302,6 +304,7 @@ pub enum ExecResult {
 mod alter;
 mod analytical_route;
 mod convert;
+mod cost_check;
 mod cron_glue;
 mod cv_glue;
 mod ddl;
@@ -309,11 +312,13 @@ mod dml;
 mod dml_mutate;
 mod executor;
 mod fast_select;
+mod geo_glue;
 mod net_glue;
 mod noisy_detector;
 mod prepared;
 mod rls;
 mod session;
+mod trgm_glue;
 mod types;
 mod udf;
 mod vector_search;

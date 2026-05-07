@@ -496,6 +496,31 @@ impl Storage {
         reader::list_data_files_with_stats(self, tenant, table).await
     }
 
+    /// Like [`read`](Self::read) but reads only the supplied `paths`
+    /// instead of LIST'ing the table prefix. Used when the caller has
+    /// already pruned the file set — typically via Phase 5.7 A4 catalog
+    /// stats:
+    ///
+    /// 1. `Catalog::load_table` → `Snapshot::data_files` (each carries
+    ///    `DataFileRef::column_stats` since A4).
+    /// 2. Run [`evaluate_compound_for_pruning`] against each file's
+    ///    stats; drop the ones whose stats prove `NoMatch`.
+    /// 3. Pass the surviving paths to this method.
+    ///
+    /// Saves the LIST RPC plus, for catalog-pruned files, the per-file
+    /// Parquet footer fetch. Tenant-prefix enforcement still applies:
+    /// every path must contain the tenant prefix or the call returns
+    /// [`basin_common::BasinError::IsolationViolation`].
+    #[tracing::instrument(skip(self, paths, opts), fields(tenant=%tenant, n_paths=paths.len()))]
+    pub async fn read_paths(
+        &self,
+        tenant: &TenantId,
+        paths: Vec<ObjectPath>,
+        opts: ReadOptions,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        reader::read_paths(self, tenant, paths, opts).await
+    }
+
     /// Read every batch from a single Parquet data file. Used by the
     /// UPDATE/DELETE pruner when only some files need processing — the
     /// table-wide [`read`](Self::read) would force us to merge all files

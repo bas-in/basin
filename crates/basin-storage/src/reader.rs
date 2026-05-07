@@ -287,6 +287,44 @@ pub(crate) async fn read(
         }
     }
 
+    read_paths_inner(storage, tenant, paths, opts).await
+}
+
+/// Like [`read`] but reads only the supplied `paths` instead of LIST'ing
+/// the table prefix. Used when the caller has already pruned the file set
+/// — typically via Phase 5.7 A4 catalog stats: `Catalog::load_table` →
+/// `Snapshot::data_files` → `evaluate_compound_for_pruning` against each
+/// `DataFileRef::column_stats` → drop the files that prove `NoMatch`,
+/// then hand the survivors here. Skips one LIST RPC and (for files
+/// pruned at the catalog layer) one footer fetch each.
+///
+/// Tenant-prefix enforcement happens here too: every supplied path must
+/// contain the tenant prefix or the call returns
+/// [`BasinError::IsolationViolation`].
+pub(crate) async fn read_paths(
+    storage: &Storage,
+    tenant: &TenantId,
+    paths: Vec<ObjectPath>,
+    opts: ReadOptions,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    let expected = format!("tenants/{}/", tenant.as_prefix());
+    for p in &paths {
+        if !p.as_ref().contains(&expected) {
+            return Err(BasinError::isolation(format!(
+                "read_paths: {p} does not contain {expected}"
+            )));
+        }
+    }
+    read_paths_inner(storage, tenant, paths, opts).await
+}
+
+async fn read_paths_inner(
+    storage: &Storage,
+    tenant: &TenantId,
+    paths: Vec<ObjectPath>,
+    opts: ReadOptions,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    let store = storage.tenant_store(tenant);
     let opts = Arc::new(opts);
     let store_for_stream = store.clone();
     let cache = storage.parquet_meta_cache().clone();

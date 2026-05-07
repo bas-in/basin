@@ -17,11 +17,26 @@ pub(crate) fn error_response(err: &BasinError) -> ErrorResponse {
     info.into()
 }
 
+/// Pgwire `ErrorResponse` for the per-tenant rate-limiter (SQLSTATE
+/// `53400` — `configuration_limit_exceeded`). Same code Postgres itself
+/// raises for connection / statement quota breaches; drivers map it to a
+/// dedicated exception class so app code can retry-with-backoff distinct
+/// from a parse / permission error.
+pub(crate) fn rate_limit_exceeded_response() -> ErrorResponse {
+    let info = ErrorInfo::new(
+        "ERROR".to_owned(),
+        "53400".to_owned(),
+        "tenant pgwire rate limit exceeded; retry after a short backoff".to_owned(),
+    );
+    info.into()
+}
+
 fn classify(err: &BasinError) -> (&'static str, &'static str) {
     match err {
         BasinError::InvalidIdent(_) | BasinError::InvalidSchema(_) => ("ERROR", "42601"), // syntax_error
         BasinError::NotFound(_) => ("ERROR", "42704"), // undefined_object
         BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
+        BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
         BasinError::IsolationViolation(_) => ("FATAL", "XX000"),
         // Coarse-grained internal categories all collapse to XX000.
         BasinError::Storage(_)

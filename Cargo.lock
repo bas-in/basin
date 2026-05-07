@@ -824,6 +824,7 @@ dependencies = [
  "basin-catalog",
  "basin-common",
  "basin-engine",
+ "basin-shard",
  "basin-storage",
  "chrono",
  "object_store",
@@ -876,6 +877,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "basin-geo"
+version = "0.0.1"
+dependencies = [
+ "basin-common",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "basin-integration-tests"
 version = "0.0.1"
 dependencies = [
@@ -887,11 +898,14 @@ dependencies = [
  "basin-catalog",
  "basin-common",
  "basin-cron",
+ "basin-cv",
  "basin-engine",
+ "basin-geo",
  "basin-net",
  "basin-router",
  "basin-shard",
  "basin-storage",
+ "basin-trgm",
  "basin-vector",
  "basin-wal",
  "bytes",
@@ -1015,6 +1029,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "governor",
  "object_store",
  "pgwire",
  "tempfile",
@@ -1105,6 +1120,15 @@ dependencies = [
  "tokio-test",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "basin-trgm"
+version = "0.0.1"
+dependencies = [
+ "basin-common",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

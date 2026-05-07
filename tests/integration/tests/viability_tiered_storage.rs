@@ -180,6 +180,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
                 path: old_file.path.as_ref().to_string(),
                 size_bytes: old_file.size_bytes,
                 row_count: old_file.row_count,
+                column_stats: old_file.column_stats.clone(),
             }],
         )
         .await
@@ -194,6 +195,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
                 path: new_file.path.as_ref().to_string(),
                 size_bytes: new_file.size_bytes,
                 row_count: new_file.row_count,
+                column_stats: new_file.column_stats.clone(),
             }],
         )
         .await

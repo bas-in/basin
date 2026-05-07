@@ -84,6 +84,7 @@ fn parse_endpoint(ep: &str) -> Result<(&str, u16)> {
 ///   in by `prepare` and consumed by `bind`.
 pub(crate) struct RemoteShardSession {
     client: Client,
+    tenant: TenantId,
     prepared: Mutex<std::collections::HashMap<StatementHandle, RemotePrepared>>,
 }
 
@@ -93,9 +94,10 @@ struct RemotePrepared {
 }
 
 impl RemoteShardSession {
-    fn new(client: Client) -> Self {
+    fn new(client: Client, tenant: TenantId) -> Self {
         Self {
             client,
+            tenant,
             prepared: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -103,6 +105,10 @@ impl RemoteShardSession {
 
 #[async_trait]
 impl Session for RemoteShardSession {
+    fn tenant(&self) -> TenantId {
+        self.tenant
+    }
+
     async fn execute(&self, sql: &str) -> Result<ExecResult> {
         let msgs = self
             .client
@@ -499,7 +505,7 @@ impl SessionFactory for RemoteShardSessionFactory {
     ) -> Result<Arc<RemoteShardSession>> {
         let endpoint = self.map.shard_for(&tenant).to_owned();
         let client = connect_upstream(&endpoint, username).await?;
-        Ok(Arc::new(RemoteShardSession::new(client)))
+        Ok(Arc::new(RemoteShardSession::new(client, tenant)))
     }
 }
 

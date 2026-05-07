@@ -1156,6 +1156,7 @@ mod tests {
             path: path.into(),
             size_bytes: bytes,
             row_count: rows,
+            column_stats: std::collections::BTreeMap::new(),
         }
     }
 

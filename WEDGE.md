@@ -21,18 +21,27 @@ v0.1 with passing benchmark coverage. Workspace tests: **216 / 216 passing,
 documented architectural reason (single-process limit, etc.) and a future
 trigger to revisit.
 
-Beyond the wedge, three additional crates landed by founder direction
-(see ADRs 0005/0006/0007): `basin-auth`, `basin-rest`, `basin-pool`. All
-are wired into `basin-server` behind opt-in env vars; defaults preserve
-the original PoC behaviour.
+One core-DB crate landed alongside the wedge by founder direction
+(ADR 0007): `basin-pool`, the per-tenant connection pool that lets one
+process hold idle sessions for many tenants without `O(N)` resident
+state. Wired into `basin-server` behind `BASIN_POOL_ENABLED=1`;
+defaults preserve the original PoC behaviour.
 
-**What's next, in priority order:**
+The two cloud-platform crates that landed at the same time
+(`basin-auth`, `basin-rest`, ADRs 0005/0006) are tracked on
+[`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md). They are wired into
+`basin-server` so a single binary can serve both core and platform; the
+roadmap split is purely about scope discipline, not deployment topology.
+
+**What's next, in priority order (core DB only — see
+[`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md) for the platform side):**
 
 1. **Phase 0 customer interviews** — strategic, not engineering. Architecture is done; what's missing is paying customers.
-2. **Auto-mount `JwtTenantResolver` on pgwire when auth is enabled** — small follow-up flagged by the integration agent.
-3. **Engine `UPDATE` / `DELETE` support** — unlocks REST `PATCH` (currently 501) and a much wider ORM surface.
-4. **Phase 5 — analytical path** (DuckDB on Iceberg) — multi-week.
-5. **Phase 6 — production hardening** (multi-region read replicas, BYO-bucket, BYO-key, Stripe billing) — multi-month.
+2. ~~Engine `UPDATE` / `DELETE` support~~ — **shipped** (Iceberg copy-on-write).
+3. ~~A4 coalesced metadata in catalog~~ — **shipped** (file-level `column_stats` + `Storage::read_paths`).
+4. **B1 per-tenant secondary indexes** — biggest remaining point-query win.
+5. **B2 range-partitioned / Z-ordered files** — `CLUSTER BY` on `CREATE TABLE`.
+6. **Phase 6 — production hardening** (multi-region read replicas, cross-shard 2PC, point-in-time restore, branching/forking) — multi-month.
 
 ---
 

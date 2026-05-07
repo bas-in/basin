@@ -168,6 +168,7 @@ async fn viability_6_large_dataset_pointquery() {
             path: df.path.as_ref().to_string(),
             size_bytes: df.size_bytes,
             row_count: df.row_count,
+            column_stats: df.column_stats.clone(),
         });
     }
     let seed_elapsed = seed_started.elapsed();

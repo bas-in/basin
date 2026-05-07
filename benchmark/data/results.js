@@ -942,6 +942,37 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1777992442"
     },
+    "viability_continuous_aggregate": {
+      "kind": "viability",
+      "id": "continuous_aggregate",
+      "name": "TimescaleDB-style continuous aggregates",
+      "claim": "Auto-refreshed materialised view over a time-bucketed GROUP BY. The refresher rebuilds the materialisation on each interval tick; the CV appears as a regular table to readers.",
+      "passed": true,
+      "primary": {
+        "label": "cv_buckets",
+        "value": 5.0,
+        "unit": "buckets",
+        "bar": {
+          "op": "equal",
+          "value": 5.0
+        }
+      },
+      "details": {
+        "cv_rows_correct": true,
+        "initial_cv_rows": 5,
+        "post_refresh_counts_sorted": [
+          20,
+          20,
+          20,
+          20,
+          30
+        ],
+        "post_refresh_cv_rows": 5,
+        "refresh_idempotent": true,
+        "refresh_picks_up_new_rows": true
+      },
+      "generated_at": "@1778166976"
+    },
     "viability_disk_cache": {
       "kind": "viability",
       "id": "disk_cache",
@@ -1103,7 +1134,7 @@ window.__BASIN_RESULTS = {
         "rejected_malformed": true,
         "rows_returned": 2
       },
-      "generated_at": "@1778159340"
+      "generated_at": "@1778164387"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
@@ -1304,6 +1335,67 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1777992455"
     },
+    "viability_pg_trgm": {
+      "kind": "viability",
+      "id": "pg_trgm",
+      "name": "pg_trgm-compatible fuzzy text matching (similarity, word_similarity)",
+      "claim": "100 typo pairs: min similarity >= 0.3 (PG default pg_trgm.similarity_threshold), max unrelated < 0.2, word_similarity('smyth', 'alyce smyth') >= 0.6.",
+      "passed": true,
+      "primary": {
+        "label": "checks_passed",
+        "value": 3.0,
+        "unit": "checks",
+        "bar": {
+          "op": "equal",
+          "value": 3.0
+        }
+      },
+      "details": {
+        "max_typo_similarity": 0.625,
+        "max_unrelated_similarity": 0.3684210479259491,
+        "mean_typo_similarity": 0.4421353340148926,
+        "mean_unrelated_similarity": 0.2285783588886261,
+        "min_typo_similarity": 0.2222222238779068,
+        "pairs_total": 100,
+        "trgm_bytes_for_100_char_string": 246,
+        "trigrams_for_100_char_string": 82,
+        "typo_match_score": true,
+        "unrelated_score": true,
+        "word_similarity_correct": true,
+        "word_similarity_smyth_alyce_smyth": 1.0
+      },
+      "generated_at": "@1778166902"
+    },
+    "viability_postgis": {
+      "kind": "viability",
+      "id": "postgis",
+      "name": "PostGIS-compatible spatial subset (POINT, BOX2D, ST_Distance, ST_DWithin)",
+      "claim": "100 European points: Haversine within 1% of PostGIS ST_DistanceSphere; ST_DWithin matches truth set; WKB round-trip is byte-exact (21 B/point).",
+      "passed": true,
+      "primary": {
+        "label": "checks_passed",
+        "value": 3.0,
+        "unit": "checks",
+        "bar": {
+          "op": "equal",
+          "value": 3.0
+        }
+      },
+      "details": {
+        "dwithin_correct_count": true,
+        "dwithin_count": 22,
+        "dwithin_truth_count": 22,
+        "eiffel_big_ben_measured_m": 340539.3904442695,
+        "eiffel_big_ben_reference_m": 343556.0,
+        "haversine_relative_error": 0.008780546856205334,
+        "haversine_within_1pct": true,
+        "points_total": 100,
+        "wkb_bytes_per_point": 21,
+        "wkb_roundtrip_correct": true,
+        "wkb_total_bytes": 2100
+      },
+      "generated_at": "@1778164620"
+    },
     "viability_predicate_pushdown": {
       "kind": "viability",
       "id": "predicate_pushdown",
@@ -1494,6 +1586,31 @@ window.__BASIN_RESULTS = {
         "update_ms": 10.524916000000001
       },
       "generated_at": "@1777992608"
+    },
+    "viability_uuid": {
+      "kind": "viability",
+      "id": "uuid",
+      "name": "UUID column type + uuid-ossp/pgcrypto built-in functions",
+      "claim": "UUID column accepts canonical hyphenated literals and gen_random_uuid()/uuid_generate_v4() function calls on INSERT, stores 16 bytes RFC 4122, returns canonical hyphenated text on SELECT. digest()/encode()/decode() cover md5/sha1/sha224/sha256/sha384/sha512 + hex/base64/escape. crypt()/gen_salt('bf') produce bcrypt-shaped 60-char `$2b$NN$...` hashes that verify cleanly.",
+      "passed": true,
+      "primary": {
+        "label": "uuid_full_surface",
+        "value": 1.0,
+        "unit": "boolean",
+        "bar": {
+          "op": "equal",
+          "value": 1.0
+        }
+      },
+      "details": {
+        "alice_uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "bcrypt_format_correct": true,
+        "bcrypt_sample": "$2b$12$PMmEZTFhRmYcT7kkHdJdw.HfulCdjyYkSRrefxJvSWQVFaIsicuCu",
+        "random_uuid_unique_1000": true,
+        "sha256_hex_correct": true,
+        "uuid_roundtrip": true
+      },
+      "generated_at": "@1778164181"
     },
     "viability_vector_search": {
       "kind": "viability",

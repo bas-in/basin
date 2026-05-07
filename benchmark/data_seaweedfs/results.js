@@ -460,6 +460,81 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778115297"
     },
+    "scaling_perf_stack": {
+      "kind": "scaling",
+      "id": "perf_stack",
+      "name": "Full perf stack on a real S3 point query",
+      "claim": "Same SELECT \u2026 WHERE id = X measured four ways under a random- working-set point-query workload against a real S3-compatible backend: (a) no cache, (b) +disk cache, (c) +page cache, (d) +bloom filter. The headline claim is speedup \u2265 5\u00d7 from (a)'s cold p50 to (d)'s cold p50, with (d)'s cold p99 under 3000 ms.",
+      "passed": false,
+      "x_axis": {
+        "key": "stack_layer",
+        "label": "Stack layer"
+      },
+      "series": [
+        {
+          "key": "p50_ms",
+          "label": "p50 latency",
+          "unit": "ms"
+        },
+        {
+          "key": "p99_ms",
+          "label": "p99 latency",
+          "unit": "ms"
+        }
+      ],
+      "rows": [
+        {
+          "label": "(a) no cache",
+          "max_ms": 12.264166999999999,
+          "mean_ms": 6.745209979999998,
+          "min_ms": 5.831625,
+          "p50_ms": 6.6461250000000005,
+          "p999_ms": 12.264166999999999,
+          "p99_ms": 7.987208000000001,
+          "stack_layer": "a_baseline"
+        },
+        {
+          "label": "(b) +disk cache",
+          "max_ms": 18.621833000000002,
+          "mean_ms": 3.4542050200000007,
+          "min_ms": 1.840459,
+          "p50_ms": 2.7170829999999997,
+          "p999_ms": 18.621833000000002,
+          "p99_ms": 12.394625,
+          "stack_layer": "b_disk"
+        },
+        {
+          "label": "(c) +page cache",
+          "max_ms": 19.456167,
+          "mean_ms": 3.6569083,
+          "min_ms": 1.20075,
+          "p50_ms": 3.097125,
+          "p999_ms": 19.456167,
+          "p99_ms": 13.237125,
+          "stack_layer": "c_disk_page"
+        },
+        {
+          "label": "(d) +bloom filter",
+          "max_ms": 22.100208,
+          "mean_ms": 4.874558359999998,
+          "min_ms": 1.856167,
+          "p50_ms": 4.700792,
+          "p999_ms": 22.100208,
+          "p99_ms": 15.66875,
+          "stack_layer": "d_full"
+        }
+      ],
+      "primary": {
+        "label": "speedup p50 (a\u2192d)",
+        "value": 1.413830903388195,
+        "unit": "x",
+        "bar": {
+          "op": "greater_than_or_equal",
+          "value": 5.0
+        }
+      },
+      "generated_at": "@1778171743"
+    },
     "scaling_tenant_count": {
       "kind": "scaling",
       "id": "tenant_count",
@@ -566,6 +641,59 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778162019"
     },
+    "scaling_tenant_deletion_realistic": {
+      "kind": "scaling",
+      "id": "tenant_deletion_realistic",
+      "name": "Tenant deletion at scale, realistic SaaS schema, real S3 (Basin vs Postgres)",
+      "claim": "Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row \u00d7 every index + validates every FK on the cascade; Basin's tenant teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile.",
+      "passed": false,
+      "x_axis": {
+        "key": "file_count",
+        "label": "files per tenant"
+      },
+      "series": [
+        {
+          "key": "basin_ms",
+          "label": "Basin",
+          "unit": "ms"
+        },
+        {
+          "key": "postgres_ms",
+          "label": "Postgres",
+          "unit": "ms"
+        }
+      ],
+      "rows": [
+        {
+          "basin_ms": 31.847875,
+          "file_count": 100,
+          "pg_skipped": false,
+          "postgres_ms": 10.154333999999999
+        },
+        {
+          "basin_ms": 710.350417,
+          "file_count": 1000,
+          "pg_skipped": false,
+          "postgres_ms": 17.227833
+        },
+        {
+          "basin_ms": 1767.929,
+          "file_count": 5000,
+          "pg_skipped": false,
+          "postgres_ms": 17.13075
+        }
+      ],
+      "primary": {
+        "label": "Basin/Postgres ratio at 5000 files (realistic schema, real S3)",
+        "value": 103.20207813434907,
+        "unit": "ratio",
+        "bar": {
+          "op": "less_than",
+          "value": 1.0000000000000002
+        }
+      },
+      "generated_at": "@1778171770"
+    },
     "viability_alter_add_column": {
       "kind": "viability",
       "id": "alter_add_column",
@@ -589,6 +717,38 @@ window.__BASIN_RESULTS = {
         "rows_visible": 10
       },
       "generated_at": "@1778157141"
+    },
+    "viability_alter_table": {
+      "kind": "viability",
+      "id": "alter_table",
+      "name": "ALTER TABLE SQL surface (real S3)",
+      "claim": "Every ALTER form (ADD COLUMN, SET cold_after, SET cold_age_column, SET BLOOM FILTERS ON, ENABLE/DISABLE ROW LEVEL SECURITY, CREATE/DROP POLICY) parses, runs, and persists to the catalog when Storage is backed by a real S3-compatible object store.",
+      "passed": true,
+      "primary": {
+        "label": "alter_variants_passed",
+        "value": 8.0,
+        "unit": "variants",
+        "bar": {
+          "op": "equal",
+          "value": 8.0
+        }
+      },
+      "details": {
+        "bucket": "basin-test",
+        "endpoint": "http://127.0.0.1:8333",
+        "schema_cols_after_add_column": 5,
+        "variants_passed": [
+          "ADD COLUMN",
+          "SET cold_after",
+          "SET cold_age_column",
+          "SET BLOOM FILTERS ON",
+          "ENABLE ROW LEVEL SECURITY",
+          "CREATE POLICY",
+          "DROP POLICY",
+          "DISABLE ROW LEVEL SECURITY"
+        ]
+      },
+      "generated_at": "@1778171664"
     },
     "viability_analytical": {
       "kind": "viability",
@@ -760,6 +920,55 @@ window.__BASIN_RESULTS = {
         "rows": 1000000
       },
       "generated_at": "@1778115273"
+    },
+    "viability_disk_cache": {
+      "kind": "viability",
+      "id": "disk_cache",
+      "name": "NVMe disk cache (real S3)",
+      "claim": "Cold p99 of a random-working-set point-query workload finishes under 2500 ms when Storage is backed by a real S3-compatible object store. Cold pass starts with empty disk cache + empty metadata cache; warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache.",
+      "passed": true,
+      "primary": {
+        "label": "cold p99 ms",
+        "value": 5.354208,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 2500.0
+        }
+      },
+      "details": {
+        "bar_cold_p99_ms": 2500.0,
+        "batches": 10,
+        "bucket": "basin-test",
+        "cache_budget_bytes": 268435456,
+        "cold_to_warm_p50_ratio": 0.8897463210834835,
+        "endpoint": "http://127.0.0.1:8333",
+        "n_iterations": 200,
+        "rows": [
+          {
+            "max_ms": 14.522708,
+            "mean_ms": 2.4102854399999973,
+            "min_ms": 1.932458,
+            "p50_ms": 2.122416,
+            "p999_ms": 14.522708,
+            "p99_ms": 5.354208,
+            "phase": "cold"
+          },
+          {
+            "max_ms": 4.129625,
+            "mean_ms": 2.4971071199999977,
+            "min_ms": 2.2374169999999998,
+            "p50_ms": 2.385417,
+            "p999_ms": 4.129625,
+            "p99_ms": 3.459292,
+            "phase": "warm"
+          }
+        ],
+        "seed": 13425777967503634925,
+        "total_rows": 100000,
+        "working_set_size": 1000
+      },
+      "generated_at": "@1778171725"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -980,6 +1189,59 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778115247"
     },
+    "viability_page_cache": {
+      "kind": "viability",
+      "id": "page_cache",
+      "name": "Parquet page cache (real S3)",
+      "claim": "Cold p99 of a random-working-set point-query workload finishes under 2500 ms on a real S3-compatible backend. Cold pass starts with an empty page cache (every working-set id is a miss); warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache.",
+      "passed": true,
+      "primary": {
+        "label": "cold p99 ms",
+        "value": 4.471208,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 2500.0
+        }
+      },
+      "details": {
+        "bar_cold_p99_ms": 2500.0,
+        "batches": 10,
+        "bucket": "basin-test",
+        "cache_budget_bytes": 268435456,
+        "cold_hits": 190,
+        "cold_misses": 1810,
+        "cold_to_warm_p50_ratio": 1.6242526978852054,
+        "endpoint": "http://127.0.0.1:8333",
+        "n_iterations": 200,
+        "rows": [
+          {
+            "max_ms": 9.416458,
+            "mean_ms": 3.1796862949999998,
+            "min_ms": 1.158041,
+            "p50_ms": 3.292292,
+            "p999_ms": 9.416458,
+            "p99_ms": 4.471208,
+            "phase": "cold"
+          },
+          {
+            "max_ms": 7.2353749999999994,
+            "mean_ms": 2.2622099999999987,
+            "min_ms": 1.2069999999999999,
+            "p50_ms": 2.026958,
+            "p999_ms": 7.2353749999999994,
+            "p99_ms": 5.663083,
+            "phase": "warm"
+          }
+        ],
+        "seed": 13425777967503634925,
+        "total_rows": 100000,
+        "warm_hits_total": 2190,
+        "warm_misses_total": 1810,
+        "working_set_size": 1000
+      },
+      "generated_at": "@1778171735"
+    },
     "viability_partition_pruning": {
       "kind": "viability",
       "id": "partition_pruning",
@@ -1082,6 +1344,40 @@ window.__BASIN_RESULTS = {
         "tenant_b": "01KQZYTS3RJHHRH4Q0FDH50VCZ"
       },
       "generated_at": "@1778115241"
+    },
+    "viability_row_group_sizing": {
+      "kind": "viability",
+      "id": "row_group_sizing",
+      "name": "Per-table row-group sizing for point queries (real S3)",
+      "claim": "A table with `row_group_rows = 4096` scans strictly fewer than half the rows of an identical table at the default 65,536-row group size when answering a `WHERE id = X` point query, on a real S3-compatible backend.",
+      "passed": true,
+      "primary": {
+        "label": "small_rg_scan_rows / default_rg_scan_rows",
+        "value": 0.0625,
+        "unit": "fraction",
+        "bar": {
+          "op": "less_than",
+          "value": 0.5
+        }
+      },
+      "details": {
+        "bucket": "basin-test",
+        "default_phase": {
+          "groups_considered": 1,
+          "groups_scanned": 1,
+          "rows_scanned_estimate": 65536
+        },
+        "default_rg_rows": 65536,
+        "endpoint": "http://127.0.0.1:8333",
+        "rows": 16384,
+        "small_phase": {
+          "groups_considered": 4,
+          "groups_scanned": 1,
+          "rows_scanned_estimate": 4096
+        },
+        "small_rg_rows": 4096
+      },
+      "generated_at": "@1778171717"
     },
     "viability_s3_credentials_smoke": {
       "kind": "viability",

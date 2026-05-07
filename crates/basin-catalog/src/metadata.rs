@@ -1,5 +1,6 @@
 //! Table metadata — what a `load_table` call returns.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -83,17 +84,49 @@ impl PartitionSpec {
     }
 }
 
+/// Per-column file-level statistics persisted in the catalog alongside a
+/// [`DataFileRef`]. Mirrors the shape `basin-storage` extracts from a
+/// freshly-written Parquet footer (and the same shape used by the
+/// row-group pruning helper) so a catalog-stats prune is byte-equivalent
+/// to a footer-stats prune at file granularity.
+///
+/// Phase 5.7 A4: file-level coalesced stats only. Row-group-level stats
+/// stay in the Parquet footer for the deeper prune; B1 secondary indexes
+/// will subsume the row-group case via a separate per-tenant index file.
+///
+/// All fields default-deserialise so historic catalog rows that predate
+/// this struct come back as an empty `BTreeMap` on
+/// [`DataFileRef::column_stats`] — preserving the pre-A4 read path
+/// (which always fetched the footer).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnStats {
+    pub null_count: Option<u64>,
+    /// Best-effort min/max as a bytes-or-string blob, encoded by Parquet's
+    /// `Statistics::min_bytes` / `max_bytes`. Higher layers can decode
+    /// according to the Arrow schema.
+    pub min_bytes: Option<Vec<u8>>,
+    pub max_bytes: Option<Vec<u8>>,
+}
+
 /// Reference to a single Parquet data file already written by `basin-storage`.
 ///
-/// Phase 1 keeps this minimal. The Iceberg `DataFile` struct also carries
-/// per-column min/max stats, partition tuples, and split offsets; we'll grow
-/// into those as the storage layer learns to emit them.
+/// Phase 5.7 A4 lifts file-level [`ColumnStats`] up into the catalog so the
+/// reader's planning path can prune whole files without fetching their
+/// Parquet footers. The Iceberg `DataFile` struct also carries partition
+/// tuples and split offsets; we'll grow into those as the engine needs them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataFileRef {
     /// Object key, full path under the bucket (no scheme, no leading slash).
     pub path: String,
     pub size_bytes: u64,
     pub row_count: u64,
+    /// File-level coalesced column stats (min / max / null-count per
+    /// column, merged across row groups). Empty (the back-compat default)
+    /// means "unknown — must fetch footer to prune". Populated at write
+    /// commit time by the engine from the writer-emitted
+    /// `basin_storage::DataFile::column_stats`.
+    #[serde(default)]
+    pub column_stats: BTreeMap<String, ColumnStats>,
 }
 
 /// Definition of a TimescaleDB-style continuous aggregate ("CV").

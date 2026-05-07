@@ -1,0 +1,31 @@
+{
+  "kind": "viability",
+  "id": "continuous_aggregate",
+  "name": "TimescaleDB-style continuous aggregates",
+  "claim": "Auto-refreshed materialised view over a time-bucketed GROUP BY. The refresher rebuilds the materialisation on each interval tick; the CV appears as a regular table to readers.",
+  "passed": true,
+  "primary": {
+    "label": "cv_buckets",
+    "value": 5.0,
+    "unit": "buckets",
+    "bar": {
+      "op": "equal",
+      "value": 5.0
+    }
+  },
+  "details": {
+    "cv_rows_correct": true,
+    "initial_cv_rows": 5,
+    "post_refresh_counts_sorted": [
+      20,
+      20,
+      20,
+      20,
+      30
+    ],
+    "post_refresh_cv_rows": 5,
+    "refresh_idempotent": true,
+    "refresh_picks_up_new_rows": true
+  },
+  "generated_at": "@1778166976"
+}

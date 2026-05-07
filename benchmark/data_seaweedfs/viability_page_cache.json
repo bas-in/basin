@@ -1,0 +1,53 @@
+{
+  "kind": "viability",
+  "id": "page_cache",
+  "name": "Parquet page cache (real S3)",
+  "claim": "Cold p99 of a random-working-set point-query workload finishes under 2500 ms on a real S3-compatible backend. Cold pass starts with an empty page cache (every working-set id is a miss); warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache.",
+  "passed": true,
+  "primary": {
+    "label": "cold p99 ms",
+    "value": 4.471208,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 2500.0
+    }
+  },
+  "details": {
+    "bar_cold_p99_ms": 2500.0,
+    "batches": 10,
+    "bucket": "basin-test",
+    "cache_budget_bytes": 268435456,
+    "cold_hits": 190,
+    "cold_misses": 1810,
+    "cold_to_warm_p50_ratio": 1.6242526978852054,
+    "endpoint": "http://127.0.0.1:8333",
+    "n_iterations": 200,
+    "rows": [
+      {
+        "max_ms": 9.416458,
+        "mean_ms": 3.1796862949999998,
+        "min_ms": 1.158041,
+        "p50_ms": 3.292292,
+        "p999_ms": 9.416458,
+        "p99_ms": 4.471208,
+        "phase": "cold"
+      },
+      {
+        "max_ms": 7.2353749999999994,
+        "mean_ms": 2.2622099999999987,
+        "min_ms": 1.2069999999999999,
+        "p50_ms": 2.026958,
+        "p999_ms": 7.2353749999999994,
+        "p99_ms": 5.663083,
+        "phase": "warm"
+      }
+    ],
+    "seed": 13425777967503634925,
+    "total_rows": 100000,
+    "warm_hits_total": 2190,
+    "warm_misses_total": 1810,
+    "working_set_size": 1000
+  },
+  "generated_at": "@1778171735"
+}

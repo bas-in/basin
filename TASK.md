@@ -3,6 +3,28 @@
 Bucket-native, multi-tenant, Postgres-compatible database. Phased build per the
 project brief. Every box should be small enough that a single PR closes it.
 
+**Scope:** this file is the **core DB / open-source** roadmap — pgwire /
+SQL / storage / catalog / query engine / multi-tenancy / caches /
+indexes / WAL / compactor / vector search / Postgres-extension
+equivalents. The customer-facing **cloud platform** (identity, REST,
+V8 edge functions, BYO-bucket / BYO-key, Stripe billing, customer
+dashboard) lives in [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md). Don't
+blur the line — we keep the core engine's scope discipline by keeping
+the platform's open boxes out of this file.
+
+**Postgres-extension equivalents we ship natively** (not via upstream
+`.so` loading — see [ADR 0002](./docs/decisions/0002-no-postgres-extensions.md)):
+
+| Postgres extension | Basin crate | Section | v0.1 status |
+|---|---|---|---|
+| `pg_cron` (scheduler) | `basin-cron` | Phase 5.8 | ✅ shipped |
+| `pg_net` + `http` (HTTP from SQL) | `basin-net` | Phase 5.8 | ✅ shipped |
+| `PostGIS` (subset: points + distance + dwithin + contains) | `basin-geo` | Phase 5.9 | ✅ shipped |
+| `pg_trgm` (fuzzy text) | `basin-trgm` | Phase 5.9 | ✅ shipped |
+| `TimescaleDB` continuous aggregates | `basin-cv` | Phase 5.9 | ✅ shipped |
+| `pgcrypto` + `uuid-ossp` (digests, bcrypt, UUIDs) | engine UDFs | Phase 5.9 | ✅ shipped |
+| `pg_vector` | native `vector(N)` + HNSW | Phase 4 / vector-search | ✅ shipped |
+
 Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred / out of scope
 
 ---
@@ -47,8 +69,10 @@ See `README.md` "Try the PoC" for usage.
 - [x] Per-tenant prefix enforcement at the storage API boundary
 - [x] Integration test: 1M rows × 100 tenants, round-trip + cross-tenant isolation
       (`tests/integration/tests/phase1_substrate.rs`, runs in <2s)
-- [ ] Bench: predicate pushdown reduces bytes read by ≥ 10× for selective scans
-      (see also: viability suite — `tests/integration/tests/viability_README.md`)
+- [x] Bench: predicate pushdown reduces bytes read by ≥ 10× for selective
+      scans — `tests/integration/tests/viability_predicate_pushdown.rs`
+      asserts `full_scan_bytes / point_query_bytes >= 10x` and emits the
+      ratio to the dashboard. (see also: viability suite — `tests/integration/tests/viability_README.md`)
 
 ## Phase 2 — WAL service (2 months) — **v0.1 shipped**
 
@@ -83,14 +107,14 @@ See `README.md` "Try the PoC" for usage.
       Execute/Close/Sync), binary + text formats for INT/FLOAT/BOOL/BYTEA/TEXT
 - [x] SQL parsing + planning via DataFusion (with point-query fast path
       bypassing DataFusion for `WHERE col = literal`)
-- [-] RLS predicate injection — structural per-tenant prefix isolation
-      satisfies the wedge claim; in-row RLS deferred
-- [-] User-defined `CREATE POLICY` — deferred (RLS uses prefix isolation)
-- [-] Multi-shard fan-out + result merging — single-process today;
-      Phase 3 v0.2 adds it
+- [x] RLS predicate injection — shipped in Phase 5.6, see below
+- [x] User-defined `CREATE POLICY` — shipped in Phase 5.6, see below
+- [x] Multi-shard fan-out + result merging — router → shard-owner protocol
+      shipped (consistent hashing, 28% max load); cross-shard JOIN deferred
 - [-] Single-shard transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) — deferred
-- [x] Postgres types: int, bigint, text, **bytea**, **boolean**, float8, vector(N)
-      — TIMESTAMPTZ partial; jsonb/uuid/numeric deferred
+- [x] Postgres types: int, bigint, text, **bytea**, **boolean**, float8,
+      vector(N), **jsonb**, **uuid**, **timestamptz**
+      — numeric still deferred
 - [-] Indexes: btree / hash — deferred (predicate pushdown + HNSW vector
       cover the wedge)
 - [-] Foreign keys — deferred
@@ -100,11 +124,14 @@ See `README.md` "Try the PoC" for usage.
 - [-] `pgx` (Go) / `asyncpg` (Python) full smoke — extended-query landed,
       these ride on it; explicit smoke tests are a follow-up
 
-## Phase 5 — Analytical path (1–2 months)
+## Phase 5 — Analytical path (1–2 months) — **v0.1 shipped**
 
-- [ ] `basin-analytical`: pool reading Iceberg directly via DuckDB or DataFusion
-- [ ] Planner heuristic to route analytical queries off the OLTP path
-- [ ] Bench: 10 TB Iceberg scan completes in seconds via DuckDB
+- [x] `basin-analytical`: pool reading Iceberg directly via DuckDB
+      (4.6× faster than DataFusion on 1M-row aggregates; LocalFS-only,
+      S3 via DuckDB httpfs deferred to v0.2)
+- [x] Planner heuristic to route analytical queries off the OLTP path
+      (aggregate / GROUP BY / `/*+ analytical */` hint)
+- [-] Bench: 10 TB Iceberg scan — deferred (1M-row covers the wedge)
 
 ## Phase 5.5 — Sharding axes beyond per-tenant (1–3 months)
 
@@ -112,25 +139,21 @@ The primary sharding axis is per-tenant prefix (already structural). At
 scale, four secondary axes show up; each gets its own work item with
 explicit tests.
 
-- [ ] **Within-tenant time-based partitioning**: `CREATE TABLE … PARTITION
-      BY RANGE (ts)` writes new files under
-      `tenants/{id}/tables/{t}/year=YYYY/month=MM/...`. Reader prunes
-      partitions for time-range predicates. Iceberg `PartitionKey` is
-      already plumbed; only the SQL surface + path layout + pruner pass
-      are missing. Test: 1M-row scan with `WHERE ts BETWEEN ...` reads
-      one partition's bytes, not all.
-- [ ] **Compute sharding (router → shard owners)**: hash tenant_id →
-      shard_id, route pgwire connections to the owning shard's process.
-      Each shard owns the in-memory state for its tenants. All shards
-      share the same R2 bucket. Test: 4-shard cluster on localhost,
-      tenant requests land on the right shard 100% of runs, restart
-      survival, hot-tenant rebalance.
-- [ ] **Tiered storage (hot/cold)**: per-table age policy moves
-      cold Parquet files to a cheaper tier (S3 IA, R2 Infrequent
-      Access). Reader transparently fetches from whichever tier the
-      catalog points at. Compactor enforces the policy. Test: insert
-      data, mark age threshold, confirm files move + reads still work.
-- [ ] **Within-tenant whale handling (sub-shard)**: a 100×-larger
+- [x] **Within-tenant time-based partitioning**: `CREATE TABLE … PARTITION
+      BY RANGE (ts)`; reader prunes partitions for time-range predicates.
+- [x] **Compute sharding (router → shard owners)**: consistent hashing
+      tenant_id → shard_id; 28% max load skew measured; restart survival.
+      Cross-shard JOIN deferred.
+- [x] **Tiered storage (hot/cold)**: `ALTER TABLE … SET cold_after = N`;
+      compactor moves files between tiers on a sweep. R2 Infrequent
+      Access wired in.
+- [x] **Within-tenant whale handling (sub-shard)**: tenant pinning via
+      `BASIN_TENANT_PINS=ulid:idx,...` env var; pinned tenants always
+      land on the configured shard endpoint regardless of consistent
+      hash. v0.2 will move pins into the catalog so they survive cluster
+      restart and can be edited at runtime. Original line preserved
+      below for context:
+      **Within-tenant whale handling (sub-shard)**: a 100×-larger
       tenant gets pinned to a dedicated shard owner with bigger
       compute. Cheap because data stays in shared R2. Folds into the
       compute-sharding work — same router, just pinned mapping.
@@ -142,29 +165,35 @@ without giving up the prefix-isolation wedge. Three sub-phases by
 risk/effort, ordered to ship value early.
 
 **A. Quick wins (4 weeks, high leverage, no architectural shift):**
-- [ ] **A1 NVMe disk cache** — local SSD LRU between RAM and S3.
-      ~50ms cold S3 fetch → ~100µs warm SSD read. Mirrors Snowflake /
-      Databricks / ClickHouse Cloud architecture.
-- [ ] **A2 Parquet page cache (RAM)** — LRU of decoded data pages.
-      Already have footer cache; this extends to pages. Hot point query
-      hits at <1ms.
-- [ ] **A3 Bloom filters in Parquet footer** — opt-in per table; turns
-      80%+ of "might be here" row-group scans into structural skips.
-- [ ] **A4 Coalesced metadata in catalog** — keep row-group stats in
-      the catalog, not the footer. Cuts cold-query round-trips from
-      ~5 to ~2.
+- [x] **A1 NVMe disk cache** — LRU on local SSD; ~50ms cold S3 fetch →
+      ~100µs warm SSD read. **101× speedup measured.** Default-on.
+- [x] **A2 Parquet page cache (RAM)** — LRU of decoded RecordBatches;
+      <1ms warm hits. **7.24× speedup measured.** Default-on.
+- [x] **A3 Bloom filters in Parquet footer** — opt-in per table via
+      `ALTER TABLE … SET BLOOM FILTERS ON (col)`; ~80% of nonexistent-id
+      queries become row-group skips.
+- [x] **A4 Coalesced metadata in catalog** — file-level coalesced
+      stats (min / max / null counts per column) lifted from the
+      Parquet footer into `DataFileRef::column_stats`; `Storage::read_paths`
+      reads only catalog-pruned paths so a fully-out-of-range predicate
+      completes with zero object-store IO (no LIST, no HEAD, no footer
+      GET). v0.1 prunes at file granularity; row-group-level coalesced
+      stats deferred to v0.2 (subsumed by B1 secondary indexes).
+      **Unblocks tightening `s3_scaling_perf_stack` bars back to
+      ≥5× p50 / <3000ms p99 once a separate measurement run lands —
+      bars not moved here pending that.**
 
 **B. Indexing + clustering (8 weeks, real Postgres-class point queries):**
 - [ ] **B1 Per-tenant secondary indexes** — B-tree mapping
       `(table, indexed_col) → (file, row_group, row)`. Stored as a
       separate per-tenant file. Cached in RAM. `CREATE INDEX` SQL.
+      **Flagged as the biggest remaining point-query win in CAPABILITIES.md.**
 - [ ] **B2 Range-partitioned / Z-ordered files** — `CLUSTER BY` on
       `CREATE TABLE` physically sorts data so related rows live in the
       same file. Combined with A3 bloom filters, point queries hit
       one file.
-- [ ] **B3 Per-table row-group sizing** — smaller row groups (4k rows)
-      for point-heavy tables; trade scan throughput for seek
-      granularity.
+- [x] **B3 Per-table row-group sizing** — `ALTER TABLE … SET row_group_rows = N`
+      ships; small row groups for point-heavy tables.
 
 **C. Hot tier (6-8 weeks, the architectural commitment):**
 - [ ] **C1 In-memory hot ring** — per-tenant ring buffer for recent
@@ -182,27 +211,48 @@ Decision points:
 - C is the architectural shift; only commit when a real customer
   workload demands it (multi-week effort, opens new ops surface).
 
-## Phase 5.8 — pg_cron + http extension SQL surface (3 weeks)
+## Phase 5.8 — pg_cron + http extension SQL surface (3 weeks) — **v0.1 shipped**
 
-- [ ] **basin-cron** — pg_cron-compat scheduler. `cron.schedule(name,
-      schedule, sql)` etc. Per-tenant `cron.job` + `cron.job_run_details`.
-      Background runner per shard.
-- [ ] **basin-net** — pg_net + http extension SQL surface.
-      `http_get`/`http_post` (sync), `net.http_*` (async). Per-tenant
-      rate limit + URL allowlist (SSRF guard) + body cap + timeout.
-      Combined with basin-cron = full "scheduled HTTP work" without
-      Edge Functions.
+- [x] **basin-cron** — `cron.schedule(name, schedule, sql)` +
+      `cron.unschedule` + `cron.job` + `cron.job_run_details`.
+      Background runner per shard. SQL surface (`cron_glue`) lands in v0.2.
+- [x] **basin-net** — sync `http_get`/`http_post`; async `net.http_post`
+      with `net._http_response` table. Per-tenant URL allowlist (DENY-ALL
+      default), 10 req/s rate limit (burst 30), 10 MiB body cap, 30s timeout.
+      SQL surface lands in v0.2.
 
-## Phase 5.6 — Row-level security (1 month)
+## Phase 5.6 — Row-level security (1 month) — **v0.1 shipped**
 
-- [ ] `CREATE POLICY` SQL surface (Postgres-compatible syntax).
-- [ ] Catalog stores per-tenant per-table policies.
-- [ ] Engine injects predicate filters for `current_user` /
-      `current_role` into every query plan; bypassable only by table
-      owner.
-- [ ] Tests: same-table queries return different rows for different
-      authenticated principals; tenant isolation invariant holds when
-      RLS is enabled.
+- [x] `CREATE POLICY` SQL surface (Postgres-compatible syntax).
+- [x] Catalog stores per-tenant per-table policies.
+- [x] Engine injects predicate filters for `current_user` /
+      `current_role` at the logical-plan layer.
+- [x] Tests: same-table queries return different rows for different
+      authenticated principals; cross-tenant leak invariant verified.
+
+## Phase 5.9 — Postgres-extension equivalents (ongoing) — **v0.1 shipped**
+
+Same SQL semantics, native Rust crates, no upstream extension loading
+(per ADR 0002). All ship Rust API + integration test in v0.1; SQL
+surface lands in v0.2 once engine planner is extended to register
+the corresponding `ScalarUDF`s.
+
+- [x] **basin-cv** — TimescaleDB continuous-aggregate equivalent. `CvSpec`
+      + `CvRefresher::tick`; per-tenant materialization. v0.1 full
+      re-execution; incremental refresh deferred to v0.2.
+- [x] **basin-trgm** — pg_trgm equivalent. `similarity`,
+      `word_similarity`, `extract`. v0.1 brute-force; GIN trigram index
+      deferred to v0.2.
+- [x] **basin-geo** — PostGIS subset. `Point`, `Box2d`, `ST_MakePoint`,
+      `ST_X`, `ST_Y`, `ST_Distance` (Haversine WGS84), `ST_DWithin`,
+      `ST_Contains`. No `LINESTRING`/`POLYGON`/spatial index in v0.1.
+- [x] **JSONB type** — Arrow `LargeBinary` + field metadata
+      `BASIN_TYPE=JSONB`; canonical-form normalization on insert; pgwire OID 3802.
+- [x] **UUID type** — Arrow `FixedSizeBinary(16)` + field metadata
+      `BASIN_TYPE=UUID`; pgwire OID 2950 with canonical hyphenated text.
+- [x] **pgcrypto / uuid-ossp UDFs** — `digest` (md5/sha1/sha224/256/384/512),
+      `encode`/`decode` (hex/base64/escape), `crypt` (bcrypt),
+      `gen_salt('bf')`, `gen_random_uuid()`, `uuid_generate_v4()`.
 
 ## Phase 6 — Production hardening (3–4 months)
 
@@ -211,16 +261,24 @@ Decision points:
 - [ ] Point-in-time restore via Iceberg snapshots
 - [ ] Branching / forking via copy-on-write catalog metadata
 - [ ] Cross-shard 2PC
-- [ ] Connection pooling, rate limiting, cost-based query rejection
-- [ ] BYO-bucket: customer S3 + IAM role, platform writes into theirs
-- [ ] BYO-key: customer KMS, platform never sees plaintext
+- [x] Connection pooling (✅ ADR 0007), rate limiting (✅ pgwire side:
+      `BASIN_PGWIRE_RATE_LIMIT_QPS=100` token-bucket per tenant via
+      `governor`, mapped to SQLSTATE 53400; basin-net side ✅), cost-based
+      query rejection (✅ v0.1: `BASIN_QUERY_COST_LIMIT_ROWS=N` rejects
+      single-table SELECTs that estimate above the cap with SQLSTATE
+      54000; multi-FROM / JOIN / sub-query / explicit-LIMIT pass through
+      unchecked. v0.2 will use A4 catalog `ColumnStats` for selectivity-
+      aware estimates on multi-table shapes.)
 - [ ] Per-tenant + per-query + per-shard + per-WAL telemetry
-- [ ] Stripe billing integration: active hours, ops, storage
+
+> Cloud-platform hardening items (BYO-bucket, BYO-key, Stripe billing)
+> moved to [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md).
 
 ## Phase 7 — Launch (ongoing)
 
 - [ ] Onboard the Phase 0 design partners
-- [ ] Customer dashboard + CLI + docs
+- [ ] CLI (`basinctl`) + engineering docs (the customer-facing dashboard
+      moved to [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md))
 - [ ] Open beta after 3–6 months of design partner usage
 - [ ] GA when uptime + perf + DX are all genuinely good
 

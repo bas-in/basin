@@ -1,0 +1,41 @@
+{
+  "kind": "viability",
+  "id": "catalog_stats_pruning",
+  "name": "Phase 5.7 A4: catalog-stored file-level stats prune fully-out-of-range queries with zero object-store IO",
+  "claim": "Two parquet files with disjoint id ranges, predicate prunes both via catalog `column_stats`. `Storage::read_paths(empty)` issues zero GETs / HEADs / LISTs; the legacy `Storage::read` path through the same predicate observes non-zero IO (at minimum one footer fetch per file).",
+  "passed": true,
+  "primary": {
+    "label": "fraction of legacy footer IO eliminated by A4 catalog-stats prune",
+    "value": 1.0,
+    "unit": "fraction",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "post_a4_io_when_fully_pruned": {
+      "gets": 0,
+      "heads": 0,
+      "lists": 0,
+      "range_gets": 0
+    },
+    "pre_a4_legacy_io_same_predicate": {
+      "gets": 0,
+      "heads": 2,
+      "lists": 2,
+      "range_gets": 4
+    },
+    "predicates": {
+      "all_out": "id = 1500 (outside both file ranges)",
+      "selective": "id = 750 (only in file-B's range)"
+    },
+    "selective_post_a4_io_one_surviving_file": {
+      "gets": 0,
+      "heads": 0,
+      "lists": 0,
+      "range_gets": 2
+    }
+  },
+  "generated_at": "@1778185418"
+}

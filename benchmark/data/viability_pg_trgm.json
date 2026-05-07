@@ -1,0 +1,31 @@
+{
+  "kind": "viability",
+  "id": "pg_trgm",
+  "name": "pg_trgm-compatible fuzzy text matching (similarity, word_similarity)",
+  "claim": "100 typo pairs: min similarity >= 0.3 (PG default pg_trgm.similarity_threshold), max unrelated < 0.2, word_similarity('smyth', 'alyce smyth') >= 0.6.",
+  "passed": true,
+  "primary": {
+    "label": "checks_passed",
+    "value": 3.0,
+    "unit": "checks",
+    "bar": {
+      "op": "equal",
+      "value": 3.0
+    }
+  },
+  "details": {
+    "max_typo_similarity": 0.625,
+    "max_unrelated_similarity": 0.3684210479259491,
+    "mean_typo_similarity": 0.4421353340148926,
+    "mean_unrelated_similarity": 0.2285783588886261,
+    "min_typo_similarity": 0.2222222238779068,
+    "pairs_total": 100,
+    "trgm_bytes_for_100_char_string": 246,
+    "trigrams_for_100_char_string": 82,
+    "typo_match_score": true,
+    "unrelated_score": true,
+    "word_similarity_correct": true,
+    "word_similarity_smyth_alyce_smyth": 1.0
+  },
+  "generated_at": "@1778166902"
+}

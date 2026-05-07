@@ -151,6 +151,7 @@ async fn s3_viability_tiered_storage() {
                 path: old_file.path.as_ref().to_string(),
                 size_bytes: old_file.size_bytes,
                 row_count: old_file.row_count,
+                column_stats: old_file.column_stats.clone(),
             }],
         )
         .await
@@ -165,6 +166,7 @@ async fn s3_viability_tiered_storage() {
                 path: new_file.path.as_ref().to_string(),
                 size_bytes: new_file.size_bytes,
                 row_count: new_file.row_count,
+                column_stats: new_file.column_stats.clone(),
             }],
         )
         .await

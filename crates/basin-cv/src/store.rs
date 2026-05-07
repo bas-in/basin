@@ -86,6 +86,19 @@ impl CvStore {
         tenant: &TenantId,
         spec: CvSpec,
     ) -> std::result::Result<(), RegisterError> {
+        self.register_cv_at(tenant, spec, Utc::now()).await
+    }
+
+    /// Like [`Self::register_cv`] but accepts an explicit `now` instant —
+    /// used by tests driving a [`crate::TestClock`] so the registration's
+    /// `last_refreshed_at` aligns with the same logical clock the
+    /// refresher's tick reads.
+    pub async fn register_cv_at(
+        &self,
+        tenant: &TenantId,
+        spec: CvSpec,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), RegisterError> {
         let name = TableName::new(spec.name.clone()).map_err(|e| {
             RegisterError::InvalidName(spec.name.clone(), format!("{e}"))
         })?;
@@ -139,13 +152,13 @@ impl CvStore {
                     path: written.path.as_ref().to_string(),
                     size_bytes: written.size_bytes,
                     row_count: written.row_count,
+                    column_stats: written.column_stats.clone(),
                 }],
             )
             .await?;
         let _ = after;
 
         // 5. Stamp the CV definition on the catalog row.
-        let now = Utc::now();
         let def = CvDef {
             source_table: spec.source_table.clone(),
             query_sql: spec.query_sql.clone(),

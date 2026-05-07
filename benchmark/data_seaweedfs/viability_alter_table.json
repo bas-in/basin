@@ -1,0 +1,32 @@
+{
+  "kind": "viability",
+  "id": "alter_table",
+  "name": "ALTER TABLE SQL surface (real S3)",
+  "claim": "Every ALTER form (ADD COLUMN, SET cold_after, SET cold_age_column, SET BLOOM FILTERS ON, ENABLE/DISABLE ROW LEVEL SECURITY, CREATE/DROP POLICY) parses, runs, and persists to the catalog when Storage is backed by a real S3-compatible object store.",
+  "passed": true,
+  "primary": {
+    "label": "alter_variants_passed",
+    "value": 8.0,
+    "unit": "variants",
+    "bar": {
+      "op": "equal",
+      "value": 8.0
+    }
+  },
+  "details": {
+    "bucket": "basin-test",
+    "endpoint": "http://127.0.0.1:8333",
+    "schema_cols_after_add_column": 5,
+    "variants_passed": [
+      "ADD COLUMN",
+      "SET cold_after",
+      "SET cold_age_column",
+      "SET BLOOM FILTERS ON",
+      "ENABLE ROW LEVEL SECURITY",
+      "CREATE POLICY",
+      "DROP POLICY",
+      "DISABLE ROW LEVEL SECURITY"
+    ]
+  },
+  "generated_at": "@1778171664"
+}

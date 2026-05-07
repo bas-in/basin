@@ -35,7 +35,9 @@ use async_trait::async_trait;
 use basin_common::{Result, TableName, TenantId};
 
 pub use in_memory::InMemoryCatalog;
-pub use metadata::{CvDef, DataFileRef, PartitionSpec, Policy, PolicyCommand, TableMetadata};
+pub use metadata::{
+    ColumnStats, CvDef, DataFileRef, PartitionSpec, Policy, PolicyCommand, TableMetadata,
+};
 pub use postgres::PostgresCatalog;
 pub use rest::RestCatalog;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};

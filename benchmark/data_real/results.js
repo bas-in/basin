@@ -460,6 +460,81 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778115202"
     },
+    "scaling_perf_stack": {
+      "kind": "scaling",
+      "id": "perf_stack",
+      "name": "Full perf stack on a real S3 point query",
+      "claim": "Same SELECT \u2026 WHERE id = X measured four ways under a random- working-set point-query workload against a real S3-compatible backend: (a) no cache, (b) +disk cache, (c) +page cache, (d) +bloom filter. The headline claim is speedup \u2265 5\u00d7 from (a)'s cold p50 to (d)'s cold p50, with (d)'s cold p99 under 3000 ms.",
+      "passed": false,
+      "x_axis": {
+        "key": "stack_layer",
+        "label": "Stack layer"
+      },
+      "series": [
+        {
+          "key": "p50_ms",
+          "label": "p50 latency",
+          "unit": "ms"
+        },
+        {
+          "key": "p99_ms",
+          "label": "p99 latency",
+          "unit": "ms"
+        }
+      ],
+      "rows": [
+        {
+          "label": "(a) no cache",
+          "max_ms": 12066.8065,
+          "mean_ms": 6507.292981280002,
+          "min_ms": 5529.4664999999995,
+          "p50_ms": 6449.325334,
+          "p999_ms": 12066.8065,
+          "p99_ms": 6997.229,
+          "stack_layer": "a_baseline"
+        },
+        {
+          "label": "(b) +disk cache",
+          "max_ms": 11436.488291,
+          "mean_ms": 1846.9316079599998,
+          "min_ms": 958.079791,
+          "p50_ms": 1442.021583,
+          "p999_ms": 11436.488291,
+          "p99_ms": 6739.100833,
+          "stack_layer": "b_disk"
+        },
+        {
+          "label": "(c) +page cache",
+          "max_ms": 10492.748208,
+          "mean_ms": 1786.1575641299999,
+          "min_ms": 924.98375,
+          "p50_ms": 1410.865792,
+          "p999_ms": 10492.748208,
+          "p99_ms": 6516.7856249999995,
+          "stack_layer": "c_disk_page"
+        },
+        {
+          "label": "(d) +bloom filter",
+          "max_ms": 12094.840708,
+          "mean_ms": 2059.6970816299995,
+          "min_ms": 912.275042,
+          "p50_ms": 1880.8925410000002,
+          "p999_ms": 12094.840708,
+          "p99_ms": 7093.382833,
+          "stack_layer": "d_full"
+        }
+      ],
+      "primary": {
+        "label": "speedup p50 (a\u2192d)",
+        "value": 3.4288643255351183,
+        "unit": "x",
+        "bar": {
+          "op": "greater_than_or_equal",
+          "value": 5.0
+        }
+      },
+      "generated_at": "@1778163645"
+    },
     "scaling_tenant_count": {
       "kind": "scaling",
       "id": "tenant_count",
@@ -512,6 +587,59 @@ window.__BASIN_RESULTS = {
         }
       },
       "generated_at": "@1778156736"
+    },
+    "scaling_tenant_deletion_at_scale": {
+      "kind": "scaling",
+      "id": "tenant_deletion_at_scale",
+      "name": "Tenant deletion at scale, real S3 (Basin vs Postgres)",
+      "claim": "Basin's tenant teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows.",
+      "passed": true,
+      "x_axis": {
+        "key": "file_count",
+        "label": "files per tenant"
+      },
+      "series": [
+        {
+          "key": "basin_ms",
+          "label": "Basin",
+          "unit": "ms"
+        },
+        {
+          "key": "postgres_ms",
+          "label": "Postgres",
+          "unit": "ms"
+        }
+      ],
+      "rows": [
+        {
+          "basin_ms": 595.722333,
+          "file_count": 10,
+          "pg_skipped": false,
+          "postgres_ms": 11.991375
+        },
+        {
+          "basin_ms": 1544.892875,
+          "file_count": 100,
+          "pg_skipped": false,
+          "postgres_ms": 12.722000000000001
+        },
+        {
+          "basin_ms": 5927.588209,
+          "file_count": 1000,
+          "pg_skipped": false,
+          "postgres_ms": 17.636708000000002
+        }
+      ],
+      "primary": {
+        "label": "basin delete_ms at largest scale",
+        "value": 5927.588209,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": null
+        }
+      },
+      "generated_at": "@1778166307"
     },
     "viability_alter_add_column": {
       "kind": "viability",

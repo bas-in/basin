@@ -19,9 +19,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use basin_catalog::{Catalog, DataFileRef};
 use basin_common::{BasinError, PartitionKey, Result, TableName, TenantId};
 use basin_engine::{Engine, ExecResult};
+use basin_shard::CvRefreshDriver;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Mutex;
 
@@ -179,6 +181,27 @@ impl CvRefresher {
         Ok(outcomes)
     }
 
+    /// Walk every CV under `tenant` once, refreshing those whose interval
+    /// has elapsed. Returns the count of CVs that were re-materialised
+    /// (`NotDue` / `Failed` outcomes don't count).
+    ///
+    /// This is the entry point [`basin_shard::Shard::run_cv_refresh`]
+    /// calls per resident tenant. The shard's tenant-set walk lets us
+    /// avoid a parallel "list of registered tenants" structure inside
+    /// the refresher; the trade-off is that a CV registered for a tenant
+    /// that has no resident shard state never gets a refresh tick from
+    /// the shard's driver. For tests / one-shots, [`Self::tick`] over the
+    /// refresher's own tenant registry remains the standard entry point.
+    pub async fn refresh_tenant_now(&self, tenant: &TenantId) -> Result<usize> {
+        let now = self.inner.clock.now();
+        let outcomes = self.tick_tenant(tenant, now).await?;
+        let refreshed = outcomes
+            .iter()
+            .filter(|o| matches!(o.outcome, CvRefreshOutcome::Refreshed { .. }))
+            .count();
+        Ok(refreshed)
+    }
+
     /// Refresh a single CV. Errors are caught and surfaced as
     /// [`CvRefreshOutcome::Failed`] so one bad CV cannot stall the rest
     /// of the tick.
@@ -276,6 +299,7 @@ impl CvRefresher {
             path: written.path.as_ref().to_string(),
             size_bytes: written.size_bytes,
             row_count: written.row_count,
+            column_stats: written.column_stats.clone(),
         }];
         // `replace_data_files` tolerates `removed_paths` containing every
         // historical file the snapshot chain has seen; the catalog is the
@@ -333,5 +357,15 @@ impl CvRefresher {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         })
+    }
+}
+
+/// Adapter so [`basin_shard::Shard::run_cv_refresh`] can drive the
+/// refresher without `basin-shard` taking a dependency on `basin-cv`.
+/// The trait lives in `basin-shard`; the implementation lives here.
+#[async_trait]
+impl CvRefreshDriver for CvRefresher {
+    async fn refresh_tenant(&self, tenant: &TenantId) -> Result<usize> {
+        self.refresh_tenant_now(tenant).await
     }
 }

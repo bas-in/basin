@@ -170,6 +170,7 @@ async fn viability_analytical_routing() {
                     path: df.path.as_ref().to_string(),
                     size_bytes: df.size_bytes,
                     row_count: df.row_count,
+                    column_stats: df.column_stats.clone(),
                 }],
             )
             .await

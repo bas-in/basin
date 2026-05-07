@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::tier::Tier;
 
+/// Per-column file-level Parquet statistics. Re-exported from
+/// `basin-catalog` so the storage and catalog layers share a single
+/// stats shape — Phase 5.7 A4 lifts these up into the catalog so the
+/// reader can prune at file granularity without a footer fetch.
+pub use basin_catalog::ColumnStats;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataFile {
     /// Object key relative to whatever bucket the configured `ObjectStore`
@@ -40,14 +46,4 @@ mod object_path_str {
         let s = String::deserialize(d)?;
         Ok(ObjectPath::from(s))
     }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ColumnStats {
-    pub null_count: Option<u64>,
-    /// Best-effort min/max as a bytes-or-string blob, encoded by Parquet's
-    /// `Statistics::min_bytes` / `max_bytes`. Higher layers can decode
-    /// according to the Arrow schema.
-    pub min_bytes: Option<Vec<u8>>,
-    pub max_bytes: Option<Vec<u8>>,
 }

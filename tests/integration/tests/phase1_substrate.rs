@@ -126,6 +126,7 @@ async fn phase1_substrate_one_million_rows_one_hundred_tenants() {
                         path: file_path.clone(),
                         size_bytes: bytes,
                         row_count: rows,
+                        column_stats: df.column_stats.clone(),
                     }],
                 )
                 .await
@@ -268,6 +269,7 @@ async fn phase1_substrate_one_million_rows_one_hundred_tenants() {
                 path: "tenants/whatever/x.parquet".into(),
                 size_bytes: 1,
                 row_count: 1,
+                column_stats: Default::default(),
             }],
         )
         .await

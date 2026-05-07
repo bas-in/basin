@@ -138,6 +138,34 @@ impl Shard {
         self.inner.run_tiering_sweep().await
     }
 
+    /// Run one CV refresh sweep across every resident tenant. Returns the
+    /// count of CVs that were re-materialised this pass.
+    ///
+    /// The shard owner is the natural choice of driver because it already
+    /// has the per-tenant residency map; reusing it avoids a parallel
+    /// "list of resident tenants" structure inside `basin-cv`. The actual
+    /// refresh logic lives in [`basin_cv::CvRefresher`] — this method
+    /// just walks the resident tenant set, calls the supplied
+    /// [`CvRefreshDriver`] once per tenant, and sums the resulting
+    /// `refreshed` counts.
+    ///
+    /// `driver` is normally a `&basin_cv::CvRefresher`, which implements
+    /// [`CvRefreshDriver`] in the basin-cv crate. The trait is declared
+    /// here rather than in basin-cv to keep the dependency graph one-way:
+    /// `basin-engine -> basin-shard`, `basin-cv -> basin-engine ->
+    /// basin-shard`, and `basin-shard` itself stays leaf-free.
+    ///
+    /// Mirrors [`Shard::run_tiering_sweep`]'s shape so a future production
+    /// driver that ticks both at the same cadence has a uniform API.
+    pub async fn run_cv_refresh<D: CvRefreshDriver>(&self, driver: &D) -> Result<usize> {
+        let tenants = self.inner.resident_tenants().await;
+        let mut total = 0usize;
+        for t in &tenants {
+            total = total.saturating_add(driver.refresh_tenant(t).await?);
+        }
+        Ok(total)
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -203,6 +231,20 @@ impl ShardBackgroundHandle {
     }
 }
 
+/// Driver the shard hands each resident tenant to during
+/// [`Shard::run_cv_refresh`]. Implementations live in `basin-cv`
+/// (`CvRefresher` is the canonical one); the trait sits in `basin-shard`
+/// purely so `Shard::run_cv_refresh` can call it without taking a
+/// `basin-cv` dependency (which would otherwise close a cycle through
+/// `basin-engine`).
+#[async_trait]
+pub trait CvRefreshDriver: Send + Sync {
+    /// Refresh every CV under `tenant` whose interval has elapsed.
+    /// Returns the count of CVs that were re-materialised on this call;
+    /// `NotDue` / `Failed` outcomes do not count.
+    async fn refresh_tenant(&self, tenant: &TenantId) -> Result<usize>;
+}
+
 #[async_trait]
 pub(crate) trait ShardImpl: Send + Sync {
     async fn get(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<TenantHandle>;
@@ -211,6 +253,14 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
     async fn flush_to_parquet(&self) -> Result<()>;
     async fn run_tiering_sweep(&self) -> Result<()>;
+    /// Tenants the shard has resident state for. Used by the CV
+    /// refresher (which only refreshes CVs whose tenant is currently
+    /// loaded) and any future per-tenant background driver. Default
+    /// impl returns the empty set so a backend that doesn't carry
+    /// per-tenant residency state opts out gracefully.
+    async fn resident_tenants(&self) -> Vec<TenantId> {
+        Vec::new()
+    }
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<in_process::InProcessShard>> {

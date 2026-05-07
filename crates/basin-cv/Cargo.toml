@@ -10,6 +10,7 @@ publish = false
 basin-common.workspace = true
 basin-catalog.workspace = true
 basin-storage.workspace = true
+basin-shard.workspace = true
 basin-engine.workspace = true
 
 tokio.workspace = true

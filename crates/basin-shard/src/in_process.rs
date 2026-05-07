@@ -315,6 +315,13 @@ impl InProcessShard {
                 path: cold_file.path.as_ref().to_string(),
                 size_bytes: cold_file.size_bytes,
                 row_count: f.row_count,
+                // Cold migration is a copy at the byte level; the
+                // file-level column stats survive unchanged. The
+                // listing path (`list_data_files_with_stats`) re-decodes
+                // them at read time anyway, so passing the ones we
+                // already have on `f` keeps the catalog row consistent
+                // with what the reader would observe post-migration.
+                column_stats: f.column_stats.clone(),
             };
             let removed = vec![f.path.as_ref().to_string()];
             match self
@@ -470,6 +477,7 @@ impl InProcessShard {
                 path: data_file.path.as_ref().to_string(),
                 size_bytes: data_file.size_bytes,
                 row_count: data_file.row_count,
+                column_stats: data_file.column_stats.clone(),
             };
 
             self.commit_with_retry(tenant, &table, &merged, file_ref).await?;
@@ -646,6 +654,15 @@ impl ShardImpl for InProcessShard {
 
     async fn run_tiering_sweep(&self) -> Result<()> {
         self.tiering_sweep().await
+    }
+
+    async fn resident_tenants(&self) -> Vec<TenantId> {
+        let map = self.partitions.lock().await;
+        let mut seen: HashSet<TenantId> = HashSet::new();
+        for (t, _) in map.keys() {
+            seen.insert(*t);
+        }
+        seen.into_iter().collect()
     }
 
     #[cfg(test)]

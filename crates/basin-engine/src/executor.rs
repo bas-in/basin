@@ -64,6 +64,25 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     }
     let stmt = stmts.pop().unwrap();
 
+    // Phase 6 cost-based query rejection. Cheap when disabled (one
+    // `OnceLock::get`); when enabled, one catalog round-trip per
+    // simple-shape Query. Multi-FROM / JOIN / sub-query / explicit-LIMIT
+    // shapes pass through unchecked in v0.1 — see `cost_check` module
+    // docs for the deliberate scope.
+    if let Some(limit) = crate::cost_check::cost_limit_rows() {
+        if matches!(stmt, Statement::Query(_)) {
+            let estimate = crate::cost_check::estimate_query_rows(
+                sess.engine.config().catalog.as_ref(),
+                &sess.tenant,
+                &stmt,
+            )
+            .await?;
+            if let Some(rows) = estimate {
+                crate::cost_check::check_cost(rows, limit)?;
+            }
+        }
+    }
+
     // Phase 5.6: intercept RLS-related DDL before the main dispatch. The
     // catch-all in `match_rls_ddl` keeps every other statement falling
     // through to the existing handlers — the no-RLS hot path is an
@@ -242,6 +261,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
                 path: df.path.as_ref().to_string(),
                 size_bytes: df.size_bytes,
                 row_count: df.row_count,
+                column_stats: df.column_stats.clone(),
             });
         }
 
@@ -283,6 +303,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         path: df.path.as_ref().to_string(),
         size_bytes: df.size_bytes,
         row_count: df.row_count,
+        column_stats: df.column_stats.clone(),
     };
 
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;

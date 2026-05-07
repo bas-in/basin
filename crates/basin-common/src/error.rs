@@ -56,6 +56,16 @@ pub enum BasinError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// User's query was rejected at planning time because its estimated
+    /// cost (rows scanned, bytes read, etc.) exceeds the configured
+    /// per-tenant cap. The router maps this to Postgres SQLSTATE 54000
+    /// (`program_limit_exceeded`) so drivers surface a distinct
+    /// retry-with-backoff exception class. Configured via
+    /// `BASIN_QUERY_COST_LIMIT_ROWS` (or future per-tenant overrides);
+    /// unset / `0` disables the check entirely.
+    #[error("query cost exceeded: {0}")]
+    QueryCostExceeded(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),

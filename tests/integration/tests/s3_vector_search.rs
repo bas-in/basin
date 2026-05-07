@@ -148,6 +148,7 @@ async fn s3_vector_search() {
                 path: df.path.as_ref().to_string(),
                 size_bytes: df.size_bytes,
                 row_count: df.row_count,
+                column_stats: df.column_stats.clone(),
             }],
         )
         .await

@@ -17,6 +17,8 @@ members = [
     "crates/basin-rest",
     "crates/basin-net",
     "crates/basin-cv",
+    "crates/basin-geo",
+    "crates/basin-trgm",
     "services/basin-server",
     "tests/integration",
 ]
@@ -46,6 +48,8 @@ basin-auth = { path = "crates/basin-auth" }
 basin-rest = { path = "crates/basin-rest" }
 basin-net = { path = "crates/basin-net" }
 basin-cv = { path = "crates/basin-cv" }
+basin-geo = { path = "crates/basin-geo" }
+basin-trgm = { path = "crates/basin-trgm" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,30 @@
+{
+  "kind": "viability",
+  "id": "postgis",
+  "name": "PostGIS-compatible spatial subset (POINT, BOX2D, ST_Distance, ST_DWithin)",
+  "claim": "100 European points: Haversine within 1% of PostGIS ST_DistanceSphere; ST_DWithin matches truth set; WKB round-trip is byte-exact (21 B/point).",
+  "passed": true,
+  "primary": {
+    "label": "checks_passed",
+    "value": 3.0,
+    "unit": "checks",
+    "bar": {
+      "op": "equal",
+      "value": 3.0
+    }
+  },
+  "details": {
+    "dwithin_correct_count": true,
+    "dwithin_count": 22,
+    "dwithin_truth_count": 22,
+    "eiffel_big_ben_measured_m": 340539.3904442695,
+    "eiffel_big_ben_reference_m": 343556.0,
+    "haversine_relative_error": 0.008780546856205334,
+    "haversine_within_1pct": true,
+    "points_total": 100,
+    "wkb_bytes_per_point": 21,
+    "wkb_roundtrip_correct": true,
+    "wkb_total_bytes": 2100
+  },
+  "generated_at": "@1778164620"
+}

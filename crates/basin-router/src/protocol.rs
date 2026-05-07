@@ -77,6 +77,12 @@ use crate::types::{arrow_to_pg_type, encode_batches, row_description};
 /// implement what they exercise.
 #[async_trait]
 pub(crate) trait Session: Send + Sync {
+    /// Tenant this session belongs to. Stable for the session's lifetime.
+    /// Used by the per-tenant rate limiter (see [`crate::rate_limit`])
+    /// to key the token bucket without re-resolving the tenant on every
+    /// query.
+    fn tenant(&self) -> basin_common::TenantId;
+
     async fn execute(&self, sql: &str) -> Result<ExecResult>;
 
     async fn prepare(
@@ -106,6 +112,10 @@ pub(crate) trait Session: Send + Sync {
 
 #[async_trait]
 impl Session for TenantSession {
+    fn tenant(&self) -> basin_common::TenantId {
+        TenantSession::tenant(self)
+    }
+
     async fn execute(&self, sql: &str) -> Result<ExecResult> {
         TenantSession::execute(self, sql).await
     }
@@ -758,13 +768,20 @@ where
 pub(crate) struct BasinExtendedQueryHandler<S: Session + 'static> {
     session_slot: Arc<Mutex<Option<Arc<S>>>>,
     state: Arc<Mutex<ExtendedState>>,
+    /// See [`BasinSimpleQueryHandlerSlot::rate_limit`]; identical
+    /// semantics — `None` disables, `Some` enforces per-tenant qps.
+    rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
 }
 
 impl<S: Session + 'static> BasinExtendedQueryHandler<S> {
-    pub(crate) fn new(session_slot: Arc<Mutex<Option<Arc<S>>>>) -> Self {
+    pub(crate) fn new(
+        session_slot: Arc<Mutex<Option<Arc<S>>>>,
+        rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
+    ) -> Self {
         Self {
             session_slot,
             state: Arc::new(Mutex::new(ExtendedState::new())),
+            rate_limit,
         }
     }
 
@@ -827,6 +844,21 @@ impl<S: Session + 'static> ExtendedQueryHandler for BasinExtendedQueryHandler<S>
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
         let session = self.require_session().await?;
+        // Per-tenant rate limit. Same shape as the simple-query path:
+        // emit one ErrorResponse + transition back to Idle when the
+        // bucket is dry. We don't emit ReadyForQuery here because the
+        // pgwire extended-query state machine will emit one after Sync.
+        if let Some(rl) = &self.rate_limit {
+            if rl.check(&session.tenant()).is_err() {
+                client
+                    .feed(PgWireBackendMessage::ErrorResponse(
+                        crate::error::rate_limit_exceeded_response(),
+                    ))
+                    .await?;
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                return Ok(());
+            }
+        }
         for m in handle_execute(self.state.as_ref(), session.as_ref(), message).await {
             client.feed(m).await?;
         }
@@ -1086,6 +1118,10 @@ pub(crate) struct PooledSessionWrapper {
 
 #[async_trait]
 impl Session for PooledSessionWrapper {
+    fn tenant(&self) -> basin_common::TenantId {
+        self.pooled.tenant()
+    }
+
     async fn execute(&self, sql: &str) -> Result<ExecResult> {
         self.pooled.session().execute(sql).await
     }
@@ -1176,6 +1212,11 @@ impl<F: SessionFactory + 'static> PgWireServerHandlers for BasinHandlers<F> {
 /// machine should refuse), so we treat it as an internal error.
 pub(crate) struct BasinSimpleQueryHandlerSlot<S: Session + 'static> {
     pub(crate) slot: Arc<Mutex<Option<Arc<S>>>>,
+    /// Optional per-tenant rate limiter shared across every connection
+    /// for the lifetime of the router. `None` (the default) disables
+    /// throttling so existing demos/benches keep their unbounded
+    /// throughput; `Some` is set when `BASIN_PGWIRE_RATE_LIMIT_QPS > 0`.
+    pub(crate) rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
 }
 
 #[async_trait]
@@ -1194,6 +1235,30 @@ impl<S: Session + 'static> SimpleQueryHandler for BasinSimpleQueryHandlerSlot<S>
                 )
             })?
         };
+        // Per-tenant rate limit (Phase 6): when enabled, drop the query
+        // before it touches the engine if the tenant has burned their
+        // budget. Map to SQLSTATE 53400 (configuration_limit_exceeded).
+        if let Some(rl) = &self.rate_limit {
+            if rl.check(&session.tenant()).is_err() {
+                if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+                    return Err(PgWireError::NotReadyForQuery);
+                }
+                client.set_state(PgWireConnectionState::QueryInProgress);
+                client
+                    .feed(PgWireBackendMessage::ErrorResponse(
+                        crate::error::rate_limit_exceeded_response(),
+                    ))
+                    .await?;
+                client
+                    .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                        TransactionStatus::Idle,
+                    )))
+                    .await?;
+                client.flush().await?;
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                return Ok(());
+            }
+        }
         let inner = BasinSimpleQueryHandler::new(session);
         inner.on_query(client, query).await
     }
@@ -1247,6 +1312,10 @@ mod tests {
 
     #[async_trait]
     impl Session for FakeSession {
+        fn tenant(&self) -> basin_common::TenantId {
+            basin_common::TenantId::new()
+        }
+
         async fn execute(&self, _sql: &str) -> Result<ExecResult> {
             let mut g = self.outcome.lock().await;
             let taken = g.take().expect("FakeSession used twice");
@@ -1388,6 +1457,10 @@ mod tests {
 
     #[async_trait]
     impl Session for SubstSession {
+        fn tenant(&self) -> basin_common::TenantId {
+            basin_common::TenantId::new()
+        }
+
         async fn execute(&self, _sql: &str) -> Result<ExecResult> {
             Ok(ExecResult::Empty {
                 tag: "OK".into(),
