@@ -7,6 +7,32 @@ use basin_common::{BasinError, Result};
 use sqlparser::ast::DataType as SqlDataType;
 use sqlparser::ast::TimezoneInfo;
 
+/// Field-metadata key used to mark Basin-specific logical types that don't have
+/// a dedicated Arrow `DataType`. Today the marked types are `JSONB` (rides on
+/// `LargeBinary`; the bytes are canonical-form serialised JSON) and `UUID`
+/// (rides on `FixedSizeBinary(16)`; the bytes are RFC 4122 big-endian raw).
+/// Adding more logical types means a new `BASIN_TYPE_*` constant + a bit of
+/// plumbing in the encoder; the storage layer is type-agnostic and needs no
+/// change.
+pub const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
+pub const BASIN_TYPE_JSONB: &str = "JSONB";
+pub const BASIN_TYPE_UUID: &str = "UUID";
+
+/// Returns `true` if `field` carries the `JSONB` metadata marker. Cheap — just
+/// a hashmap lookup on a small map.
+pub(crate) fn field_is_jsonb(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_JSONB)
+}
+
+/// Returns `true` if `field` carries the `UUID` metadata marker. The
+/// underlying Arrow type is `FixedSizeBinary(16)`; the marker tells the
+/// pgwire encoder to emit Postgres OID 2950 (UUID) and the canonical
+/// hyphenated text form, and tells the REST layer to render the bytes as a
+/// hyphenated string rather than hex.
+pub(crate) fn field_is_uuid(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+}
+
 /// Map a sqlparser column type to an Arrow [`DataType`]. Only the small set
 /// listed in the engine's PoC SQL contract is accepted; anything else is an
 /// `InvalidSchema` error so callers see exactly which type they tripped on.
@@ -33,6 +59,43 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         | SqlDataType::Float(_) => Ok(DataType::Float64),
 
         SqlDataType::Bytea => Ok(DataType::Binary),
+
+        // JSONB / JSON. sqlparser 0.52 surfaces both as dedicated AST
+        // variants. JSONB rides on Arrow `LargeBinary`, with the bytes
+        // being canonical-form serialised JSON (keys sorted, no whitespace
+        // — see `basin_engine::dml::coerce_jsonb`). The `BASIN_TYPE=JSONB`
+        // marker on the `Field` (set in `ddl::schema_from_columns`) tells
+        // the pgwire encoder to emit Postgres OID 3802 and render the
+        // bytes as JSON text rather than `\x...` hex bytea. Plain `JSON`
+        // is treated as a JSONB synonym for v0.1 — Postgres distinguishes
+        // them (JSON keeps the user's whitespace and key order; JSONB
+        // canonicalises) but supporting that distinction would mean a
+        // second logical type, second metadata marker, and a second
+        // INSERT path. v0.2.
+        SqlDataType::JSONB | SqlDataType::JSON => Ok(DataType::LargeBinary),
+        // Forward-compat: unparameterised `JSONB` typed via the `Custom`
+        // catch-all (some sqlparser dialects route there for unrecognised
+        // keywords). Same Arrow type, same JSONB tag downstream.
+        SqlDataType::Custom(name, modifiers)
+            if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("jsonb")
+                && modifiers.is_empty() =>
+        {
+            Ok(DataType::LargeBinary)
+        }
+
+        // UUID. sqlparser 0.52 has a dedicated `Uuid` variant; some
+        // dialects also route a bare `UUID` keyword through `Custom` so we
+        // accept both. The Arrow physical type is `FixedSizeBinary(16)`
+        // — RFC 4122 big-endian. The `BASIN_TYPE=UUID` marker on the field
+        // (set in `ddl::schema_from_columns`) is what the pgwire encoder
+        // and REST layer key off to render the hyphenated canonical form.
+        SqlDataType::Uuid => Ok(DataType::FixedSizeBinary(16)),
+        SqlDataType::Custom(name, modifiers)
+            if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("uuid")
+                && modifiers.is_empty() =>
+        {
+            Ok(DataType::FixedSizeBinary(16))
+        }
 
         // TIMESTAMPTZ / TIMESTAMP WITH TIME ZONE → microsecond UTC. We
         // only support the timezone-aware variant so partition-by-month
@@ -182,5 +245,32 @@ mod tests {
     fn vector_literal_must_be_bracketed() {
         let err = parse_vector_literal("0.1, 0.2").unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
+    }
+
+    /// `JSONB` and `JSON` both round-trip to `LargeBinary` via the dedicated
+    /// sqlparser variants. The metadata marker is added by ddl::schema_from_
+    /// columns, not here — `arrow_data_type` only owns the Arrow datatype.
+    #[test]
+    fn jsonb_keyword_parses_to_large_binary() {
+        let dt = arrow_data_type(&parse_col_type("JSONB")).unwrap();
+        assert_eq!(dt, DataType::LargeBinary);
+    }
+
+    #[test]
+    fn json_keyword_also_parses_to_large_binary() {
+        // Plain `JSON` is treated as JSONB for v0.1 (see the comment in
+        // `arrow_data_type`). When v0.2 splits the two, this test should
+        // flip to `BASIN_TYPE=JSON` (or whatever marker we choose).
+        let dt = arrow_data_type(&parse_col_type("JSON")).unwrap();
+        assert_eq!(dt, DataType::LargeBinary);
+    }
+
+    /// `UUID` parses to `FixedSizeBinary(16)`. The metadata marker is
+    /// added by `ddl::schema_from_columns`; here we only check the
+    /// underlying Arrow physical layout.
+    #[test]
+    fn uuid_keyword_parses_to_fixed_size_binary_16() {
+        let dt = arrow_data_type(&parse_col_type("UUID")).unwrap();
+        assert_eq!(dt, DataType::FixedSizeBinary(16));
     }
 }

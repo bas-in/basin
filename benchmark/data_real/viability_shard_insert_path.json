@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "inserts_per_sec",
-    "value": 16571.75882290797,
+    "value": 22790.204769989858,
     "unit": "inserts/sec",
     "bar": {
       "op": "greater_than_or_equal",
@@ -15,10 +15,10 @@
   },
   "details": {
     "bucket": "baisn-test",
-    "elapsed_ms": 60.343624999999996,
+    "elapsed_ms": 43.8785,
     "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-    "ms_per_insert": 0.060343625,
+    "ms_per_insert": 0.0438785,
     "n_inserts": 1000
   },
-  "generated_at": "@1777924616"
+  "generated_at": "@1778111302"
 }

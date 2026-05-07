@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "per_tenant_kib",
-    "value": 0.512,
+    "value": 0.64,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
@@ -16,9 +16,9 @@
   "details": {
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
-    "rss_after_kib": 13536,
-    "rss_before_kib": 13024,
+    "rss_after_kib": 14176,
+    "rss_before_kib": 13536,
     "tenants": 1000
   },
-  "generated_at": "@1777929752"
+  "generated_at": "@1778115245"
 }

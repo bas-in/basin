@@ -1,0 +1,49 @@
+{
+  "kind": "viability",
+  "id": "disk_cache",
+  "name": "NVMe disk cache (real S3)",
+  "claim": "Cold p99 of a random-working-set point-query workload finishes under 2500 ms when Storage is backed by a real S3-compatible object store. Cold pass starts with empty disk cache + empty metadata cache; warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache.",
+  "passed": true,
+  "primary": {
+    "label": "cold p99 ms",
+    "value": 2195.707209,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 2500.0
+    }
+  },
+  "details": {
+    "bar_cold_p99_ms": 2500.0,
+    "batches": 10,
+    "bucket": "baisn-test",
+    "cache_budget_bytes": 268435456,
+    "cold_to_warm_p50_ratio": 1.028909863033912,
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+    "n_iterations": 200,
+    "rows": [
+      {
+        "max_ms": 7641.250709,
+        "mean_ms": 1158.6784941849994,
+        "min_ms": 950.689667,
+        "p50_ms": 1068.703166,
+        "p999_ms": 7641.250709,
+        "p99_ms": 2195.707209,
+        "phase": "cold"
+      },
+      {
+        "max_ms": 1318.636292,
+        "mean_ms": 1046.8480705850002,
+        "min_ms": 950.385041,
+        "p50_ms": 1038.6752079999999,
+        "p999_ms": 1318.636292,
+        "p99_ms": 1226.228083,
+        "phase": "warm"
+      }
+    ],
+    "seed": 13425777967503634925,
+    "total_rows": 100000,
+    "working_set_size": 1000
+  },
+  "generated_at": "@1778160174"
+}

@@ -96,6 +96,46 @@ pub struct DataFileRef {
     pub row_count: u64,
 }
 
+/// Definition of a TimescaleDB-style continuous aggregate ("CV").
+///
+/// When `TableMetadata::continuous_aggregate` is `Some(_)`, the table is
+/// the *materialised* result of running `query_sql` against `source_table`.
+/// The CV refresher (`basin_cv::CvRefresher`) periodically re-executes
+/// the query and atomically swaps in a fresh Parquet file via
+/// [`crate::Catalog::replace_data_files`]. Reads of the CV go through the
+/// engine's normal `SELECT` path — the CV is structurally a regular table
+/// from the storage layer's point of view.
+///
+/// All fields default-deserialise so older rows that predate this struct
+/// come back as `None` on `TableMetadata::continuous_aggregate`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CvDef {
+    /// The base table the aggregate reads from. The CV refresher does not
+    /// (yet) cross-check that the SQL only references this table; it's
+    /// metadata for v0.2's incremental refresh planner.
+    pub source_table: String,
+    /// Full SQL text the refresher re-executes on each tick. Stored
+    /// verbatim — the engine reparses at refresh time.
+    pub query_sql: String,
+    /// Refresh cadence. Ticks at intervals shorter than this are no-ops.
+    pub refresh_interval_secs: u64,
+    /// Time of the last successful refresh tick. `None` until the first
+    /// refresh completes; used by [`crate::Catalog::set_continuous_aggregate`]
+    /// to compute "is this CV due?". Stored as Unix-epoch milliseconds so
+    /// the catalog row is a single `BIGINT`.
+    #[serde(default)]
+    pub last_refreshed_at_unix_ms: Option<i64>,
+    /// Watermark for the latest source-table bucket the materialised data
+    /// covers. `None` after registration, before the first refresh. v0.2's
+    /// incremental refresh will scan only `source_table` rows above this
+    /// watermark; the v0.1 refresher rebuilds the full materialisation
+    /// every tick and therefore ignores this value, but it still updates
+    /// it so the v0.2 upgrade is a backwards-compatible read of the same
+    /// catalog payload.
+    #[serde(default)]
+    pub last_bucket_max_unix_ms: Option<i64>,
+}
+
 /// Materialized view of a table at one point in time.
 ///
 /// `current_snapshot` is the head of the history; `snapshots` is the full
@@ -153,6 +193,13 @@ pub struct TableMetadata {
     /// [`crate::Catalog::set_row_group_rows`]. See
     /// `tests/integration/tests/viability_row_group_sizing.rs`.
     pub row_group_rows: Option<usize>,
+    /// When `Some(_)`, this table is a TimescaleDB-style continuous
+    /// aggregate (CV) materialised from another table. The `basin-cv`
+    /// crate's refresher consults this on each tick to decide which CVs
+    /// are due. `None` (the default) is a regular table. Configured per-
+    /// table via [`crate::Catalog::set_continuous_aggregate`]. See the
+    /// `basin-cv` crate docs for the refresh / read-path semantics.
+    pub continuous_aggregate: Option<CvDef>,
 }
 
 impl TableMetadata {

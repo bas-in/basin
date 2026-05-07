@@ -18,7 +18,7 @@
     "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "rows_after_restart": 3,
     "rows_inserted": 3,
-    "schema": "basin_s3_durable_catalog_01kqtb5mnrmwdc1ryygvnas2pj"
+    "schema": "basin_s3_durable_catalog_01kqztq6kcwc7qh2892j7z1fgs"
   },
-  "generated_at": "@1777926862"
+  "generated_at": "@1778110936"
 }

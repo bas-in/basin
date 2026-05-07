@@ -1,0 +1,26 @@
+{
+  "kind": "viability",
+  "id": "basin_net",
+  "name": "Outbound HTTP surface (Postgres `http` + Supabase `pg_net`)",
+  "claim": "Sync GET round-trips, allowlist gate denies unknown hosts, async POST persists response row.",
+  "passed": true,
+  "primary": {
+    "label": "checks_passed",
+    "value": 3.0,
+    "unit": "checks",
+    "bar": {
+      "op": "equal",
+      "value": 3.0
+    }
+  },
+  "details": {
+    "allowlist_blocks_unknown_host": true,
+    "async_request_id": "73c33819-0438-4ae1-9621-37af9ccaa4f4",
+    "async_response_recorded": true,
+    "async_status": 200,
+    "roundtrip_passed": true,
+    "sync_body": "ok",
+    "sync_status": 200
+  },
+  "generated_at": "@1778161187"
+}

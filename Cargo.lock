@@ -813,6 +813,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "basin-cv"
+version = "0.0.1"
+dependencies = [
+ "arrow 54.2.1",
+ "arrow-array 54.2.1",
+ "arrow-schema 54.3.1",
+ "arrow-select 54.2.1",
+ "async-trait",
+ "basin-catalog",
+ "basin-common",
+ "basin-engine",
+ "basin-storage",
+ "chrono",
+ "object_store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "basin-engine"
 version = "0.0.1"
 dependencies = [
@@ -821,6 +844,7 @@ dependencies = [
  "arrow-schema 54.3.1",
  "arrow-select 54.2.1",
  "async-trait",
+ "base64",
  "basin-analytical",
  "basin-catalog",
  "basin-common",
@@ -828,14 +852,19 @@ dependencies = [
  "basin-storage",
  "basin-vector",
  "basin-wal",
+ "bcrypt",
  "bytes",
  "chrono",
  "datafusion",
  "futures",
+ "hex",
+ "md-5 0.10.6",
  "object_store",
  "parquet 54.2.1",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2 0.10.9",
  "sqlparser 0.52.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -859,6 +888,7 @@ dependencies = [
  "basin-common",
  "basin-cron",
  "basin-engine",
+ "basin-net",
  "basin-router",
  "basin-shard",
  "basin-storage",
@@ -878,7 +908,34 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "basin-net"
+version = "0.0.1"
+dependencies = [
+ "arrow 54.2.1",
+ "arrow-array 54.2.1",
+ "arrow-schema 54.3.1",
+ "async-trait",
+ "basin-catalog",
+ "basin-common",
+ "basin-engine",
+ "basin-storage",
+ "chrono",
+ "governor",
+ "object_store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1029,6 +1086,7 @@ dependencies = [
  "arrow-schema 54.3.1",
  "arrow-select 54.2.1",
  "async-trait",
+ "basin-catalog",
  "basin-common",
  "basin-vector",
  "bytes",
@@ -2612,6 +2670,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4228,6 +4287,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4537,6 +4597,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

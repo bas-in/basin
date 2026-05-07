@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::instrument;
 
-use crate::metadata::{DataFileRef, PartitionSpec, Policy, TableMetadata};
+use crate::metadata::{CvDef, DataFileRef, PartitionSpec, Policy, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
 
@@ -170,6 +170,15 @@ impl PostgresCatalog {
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS row_group_rows BIGINT"
             ),
+            // Continuous-aggregate definition (basin-cv). NULL means "this
+            // is a regular table" — the default for back-compat. Stored as
+            // JSONB so the v0.2 incremental-refresh extensions to `CvDef`
+            // (watermark column, refresh-policy variants) don't need
+            // another migration.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS continuous_aggregate_json JSONB"
+            ),
         ];
         let client = self.client.lock().await;
         for stmt in stmts {
@@ -307,6 +316,7 @@ impl Catalog for PostgresCatalog {
             cold_age_column: None,
             bloom_filter_columns: Vec::new(),
             row_group_rows: None,
+            continuous_aggregate: None,
         })
     }
 
@@ -322,7 +332,8 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "SELECT schema_json, current_snapshot, format_version, partition_spec_json,
                             rls_enabled, policies_json, cold_after_seconds, cold_age_column,
-                            bloom_filter_columns_json, row_group_rows
+                            bloom_filter_columns_json, row_group_rows,
+                            continuous_aggregate_json
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2"
                 ),
@@ -343,6 +354,7 @@ impl Catalog for PostgresCatalog {
         let cold_age_column: Option<String> = row.get(7);
         let bloom_filter_columns_json: Option<serde_json::Value> = row.get(8);
         let row_group_rows_pg: Option<i64> = row.get(9);
+        let continuous_aggregate_json: Option<serde_json::Value> = row.get(10);
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
         let partition_spec = match partition_spec_json {
@@ -370,6 +382,12 @@ impl Catalog for PostgresCatalog {
         // overflow on 32-bit hosts likewise falls back to "use the default".
         let row_group_rows: Option<usize> = row_group_rows_pg
             .and_then(|v| if v >= 0 { usize::try_from(v).ok() } else { None });
+        let continuous_aggregate: Option<CvDef> = match continuous_aggregate_json {
+            Some(v) => Some(serde_json::from_value(v).map_err(|e| {
+                BasinError::catalog(format!("deserialise continuous_aggregate: {e}"))
+            })?),
+            None => None,
+        };
 
         let snapshots = fetch_snapshots(&client, sch, &tenant_str, &table_str).await?;
         Ok(TableMetadata {
@@ -386,6 +404,7 @@ impl Catalog for PostgresCatalog {
             cold_age_column,
             bloom_filter_columns,
             row_group_rows,
+            continuous_aggregate,
         })
     }
 
@@ -425,6 +444,63 @@ impl Catalog for PostgresCatalog {
             let parsed = TableName::new(name)
                 .map_err(|e| BasinError::catalog(format!("list_tables: bad ident: {e}")))?;
             out.push(parsed);
+        }
+        Ok(out)
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn drop_namespace(&self, tenant: &TenantId) -> Result<()> {
+        // Single transaction: delete all tables (cascades to snapshots via
+        // the FK) and the namespace row. One round-trip vs N from the
+        // default impl. Idempotent: missing rows are not an error.
+        let sch = &self.schema;
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("begin drop_namespace: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.tables WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace tables: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.namespaces WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace namespace: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("commit drop_namespace: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_tenant_data_files(&self, tenant: &TenantId) -> Result<Vec<DataFileRef>> {
+        // Single SELECT that union-flattens every table's snapshot.data_files
+        // for this tenant. Each row is one snapshot's JSONB array of file
+        // refs; we deserialise per-row and concatenate. One round-trip vs
+        // the default impl's (list_tables, then N × load_table → fetch_snapshots).
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT data_files FROM {sch}.snapshots WHERE tenant_id = $1"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("list_tenant_data_files: {e}")))?;
+        let mut out: Vec<DataFileRef> = Vec::new();
+        for row in rows {
+            let files_json: serde_json::Value = row.get(0);
+            let files: Vec<DataFileRef> = serde_json::from_value(files_json).map_err(|e| {
+                BasinError::catalog(format!("deserialise data files: {e}"))
+            })?;
+            out.extend(files);
         }
         Ok(out)
     }
@@ -809,6 +885,37 @@ impl Catalog for PostgresCatalog {
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_row_group_rows: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %tenant, table = %table))]
+    async fn set_continuous_aggregate(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        def: Option<CvDef>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let json: Option<serde_json::Value> = match &def {
+            Some(d) => Some(serde_json::to_value(d).map_err(|e| {
+                BasinError::catalog(format!("serialise continuous_aggregate: {e}"))
+            })?),
+            None => None,
+        };
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET continuous_aggregate_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_continuous_aggregate: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!("{tenant}/{table}")));
         }

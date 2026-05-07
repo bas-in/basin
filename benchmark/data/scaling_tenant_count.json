@@ -1,0 +1,59 @@
+{
+  "kind": "scaling",
+  "id": "tenant_count",
+  "name": "Per-tenant cost vs tenant count",
+  "claim": "RAM and quiet point-query latency per tenant stay near-constant as tenant count grows.",
+  "passed": true,
+  "x_axis": {
+    "key": "tenant_count",
+    "label": "tenants"
+  },
+  "series": [
+    {
+      "key": "per_tenant_ram_kib",
+      "label": "Per-tenant RAM",
+      "unit": "KiB"
+    },
+    {
+      "key": "quiet_p50_ms",
+      "label": "Quiet point query p50",
+      "unit": "ms"
+    }
+  ],
+  "rows": [
+    {
+      "per_tenant_ram_kib": 48.0,
+      "quiet_p50_ms": 0.34058299999999997,
+      "rss_delta_kib": 48,
+      "tenant_count": 1
+    },
+    {
+      "per_tenant_ram_kib": 69.33333333333333,
+      "quiet_p50_ms": 0.305,
+      "rss_delta_kib": 624,
+      "tenant_count": 10
+    },
+    {
+      "per_tenant_ram_kib": 5.511111111111111,
+      "quiet_p50_ms": 0.281166,
+      "rss_delta_kib": 496,
+      "tenant_count": 100
+    },
+    {
+      "per_tenant_ram_kib": 2.862222222222222,
+      "quiet_p50_ms": 0.26870900000000003,
+      "rss_delta_kib": 2576,
+      "tenant_count": 1000
+    }
+  ],
+  "primary": {
+    "label": "quiet_p50_at_max / quiet_p50_at_1",
+    "value": 0.7889677406094845,
+    "unit": "x",
+    "bar": {
+      "op": "less_than",
+      "value": 5.0
+    }
+  },
+  "generated_at": "@1778156116"
+}

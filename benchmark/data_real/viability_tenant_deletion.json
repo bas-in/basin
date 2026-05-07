@@ -2,21 +2,22 @@
   "kind": "viability",
   "id": "tenant_deletion",
   "name": "Tenant deletion latency (real S3)",
-  "claim": "Deleting a tenant of 1000 small files completes in under 60 seconds on real S3.",
+  "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path).",
   "passed": true,
   "primary": {
-    "label": "elapsed_ms",
-    "value": 7992.65625,
+    "label": "deletion_ms",
+    "value": 1421.755,
     "unit": "ms",
     "bar": {
       "op": "less_than",
-      "value": 60000.0
+      "value": 3000.0
     }
   },
   "details": {
     "bucket": "baisn-test",
     "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-    "files": 1000
+    "files": 100,
+    "setup_ms": 13610.615667
   },
-  "generated_at": "@1777924724"
+  "generated_at": "@1778120542"
 }

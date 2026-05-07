@@ -1,11 +1,48 @@
 //! CREATE TABLE: sqlparser AST → Arrow [`Schema`].
 
+use std::collections::HashMap;
+
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::PartitionSpec;
 use basin_common::{BasinError, Result};
 use sqlparser::ast::{ColumnDef, ColumnOption, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
-use crate::types::arrow_data_type;
+use crate::types::{arrow_data_type, BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_UUID};
+
+/// Inspect `sql` to decide whether the user wrote JSONB (or plain JSON;
+/// for v0.1 we treat them as the same logical type — see the comment in
+/// `crate::types::arrow_data_type`). JSONB has no dedicated Arrow
+/// `DataType`, so `schema_from_columns` tags the resulting `Field` with
+/// metadata the rest of the engine reads to recover the logical type.
+fn is_jsonb_sql(sql: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType as SqlDataType;
+    match sql {
+        SqlDataType::JSONB | SqlDataType::JSON => true,
+        SqlDataType::Custom(name, modifiers) => {
+            name.0.len() == 1
+                && name.0[0].value.eq_ignore_ascii_case("jsonb")
+                && modifiers.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Mirror of `is_jsonb_sql` for UUID columns. UUID rides on
+/// `FixedSizeBinary(16)` at the Arrow level; the metadata marker tells the
+/// pgwire encoder + REST layer to render bytes as the canonical hyphenated
+/// text form (and to advertise OID 2950 instead of `bytea`).
+fn is_uuid_sql(sql: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType as SqlDataType;
+    match sql {
+        SqlDataType::Uuid => true,
+        SqlDataType::Custom(name, modifiers) => {
+            name.0.len() == 1
+                && name.0[0].value.eq_ignore_ascii_case("uuid")
+                && modifiers.is_empty()
+        }
+        _ => false,
+    }
+}
 
 /// Build an Arrow [`Schema`] from sqlparser column definitions.
 ///
@@ -34,7 +71,23 @@ pub(crate) fn schema_from_columns(columns: &[ColumnDef]) -> Result<Schema> {
                 }
             }
         }
-        fields.push(Field::new(col.name.value.clone(), dt, nullable));
+        let mut field = Field::new(col.name.value.clone(), dt, nullable);
+        if is_jsonb_sql(&col.data_type) {
+            // Tag the field so downstream layers (INSERT coercion, the
+            // pgwire row encoder) know the bytes are canonical JSON, not
+            // arbitrary `bytea`.
+            let mut md = HashMap::with_capacity(1);
+            md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_JSONB.to_string());
+            field = field.with_metadata(md);
+        } else if is_uuid_sql(&col.data_type) {
+            // UUID rides on `FixedSizeBinary(16)`; the marker lets the
+            // pgwire encoder and REST layer render the canonical
+            // hyphenated form rather than 16 raw bytes.
+            let mut md = HashMap::with_capacity(1);
+            md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_UUID.to_string());
+            field = field.with_metadata(md);
+        }
+        fields.push(field);
     }
     Ok(Schema::new(fields))
 }

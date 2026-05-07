@@ -2,23 +2,47 @@
   "kind": "viability",
   "id": "large_dataset_pointquery",
   "name": "Large-dataset point query (real S3)",
-  "claim": "Point queries on a 10M-row dataset stored on S3 return in under 5 seconds.",
+  "claim": "Cold p99 of a 1000-iteration random-working-set point-query workload on a 10 M-row dataset stored on S3 finishes under 8 seconds. Each query picks a different id from a fixed-seed pool of 1000 hot ids. The bar is on COLD p99 (caches empty at the start of the run); a 'warm' phase is reported alongside.",
   "passed": true,
   "primary": {
-    "label": "point_query_ms",
-    "value": 1727.475792,
+    "label": "cold p99 ms",
+    "value": 3269.939166,
     "unit": "ms",
     "bar": {
       "op": "less_than",
-      "value": 5000.0
+      "value": 8000.0
     }
   },
   "details": {
+    "bar_cold_p99_ms": 8000.0,
     "bucket": "baisn-test",
     "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "files": 10,
-    "rows": 10000000,
-    "seed_elapsed_s": 27.433862458
+    "n_iterations": 1000,
+    "rows": [
+      {
+        "max_ms": 4578.759375,
+        "mean_ms": 1284.6276369450013,
+        "min_ms": 914.559,
+        "p50_ms": 1066.975875,
+        "p999_ms": 3892.972084,
+        "p99_ms": 3269.939166,
+        "phase": "cold"
+      },
+      {
+        "max_ms": 1539.037291,
+        "mean_ms": 1023.5200570550006,
+        "min_ms": 907.873917,
+        "p50_ms": 1009.227125,
+        "p999_ms": 1449.868667,
+        "p99_ms": 1315.193667,
+        "phase": "warm"
+      }
+    ],
+    "seed": 13425777967503634925,
+    "seed_elapsed_s": 22.801816458,
+    "total_rows": 10000000,
+    "working_set_size": 1000
   },
-  "generated_at": "@1777925581"
+  "generated_at": "@1778114326"
 }

@@ -16,18 +16,25 @@
     "partition_pruning",
     "rls_basic",
     "rls_isolation",
-    "tiered_storage"
+    "tiered_storage",
+    "alter_add_column",
+    "basin_cron",
+    "bloom_filter_pruning",
+    "cold_start"
   ],
   "scaling": [
     "idle_tenants",
     "data_size",
     "concurrency",
     "noisy_neighbor",
-    "compute_shards"
+    "compute_shards",
+    "tenant_deletion_at_scale",
+    "tenant_count"
   ],
   "compare": [
     "postgres",
     "server_lifecycle",
-    "lifecycle_ops"
+    "lifecycle_ops",
+    "backup_cost"
   ]
 }

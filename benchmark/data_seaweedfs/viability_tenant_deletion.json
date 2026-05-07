@@ -2,21 +2,22 @@
   "kind": "viability",
   "id": "tenant_deletion",
   "name": "Tenant deletion latency (real S3)",
-  "claim": "Deleting a tenant of 1000 small files completes in under 60 seconds on real S3.",
+  "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path).",
   "passed": true,
   "primary": {
-    "label": "elapsed_ms",
-    "value": 212.017292,
+    "label": "deletion_ms",
+    "value": 19.488625,
     "unit": "ms",
     "bar": {
       "op": "less_than",
-      "value": 60000.0
+      "value": 3000.0
     }
   },
   "details": {
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
-    "files": 1000
+    "files": 100,
+    "setup_ms": 20.036291000000002
   },
-  "generated_at": "@1777929700"
+  "generated_at": "@1778120518"
 }

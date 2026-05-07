@@ -1,0 +1,26 @@
+{
+  "kind": "viability",
+  "id": "jsonb",
+  "name": "JSONB column type",
+  "claim": "JSONB column accepts JSON-string literals on INSERT, stores them canonically (keys sorted, no whitespace) as LargeBinary, and returns them on SELECT as binary bytes that round-trip through serde_json. Different key orders on INSERT produce byte-identical stored payloads.",
+  "passed": true,
+  "primary": {
+    "label": "jsonb_roundtrip_and_canonical",
+    "value": 1.0,
+    "unit": "boolean",
+    "bar": {
+      "op": "equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "alice_bytes": "{\"name\":\"alice\",\"tags\":[\"a\",\"b\"]}",
+    "alice_canonical": "{\"name\":\"alice\",\"tags\":[\"a\",\"b\"]}",
+    "bob_bytes": "{\"name\":\"bob\",\"tags\":[\"c\"]}",
+    "bob_canonical": "{\"name\":\"bob\",\"tags\":[\"c\"]}",
+    "null_accepted": true,
+    "rejected_malformed": true,
+    "rows_returned": 2
+  },
+  "generated_at": "@1778159340"
+}

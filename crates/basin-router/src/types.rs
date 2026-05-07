@@ -24,6 +24,22 @@ use pgwire::messages::data::{DataRow, FieldDescription, RowDescription};
 
 const FORMAT_CODE_TEXT: i16 = 0;
 
+/// Field-metadata key that basin-engine uses to mark logical types not
+/// directly representable in Arrow (today: `JSONB`, `UUID`). Kept in sync
+/// with `basin_engine::types::BASIN_TYPE_KEY` — duplicated here as a `&str`
+/// constant so this crate stays free of an engine dependency cycle.
+const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
+const BASIN_TYPE_JSONB: &str = "JSONB";
+const BASIN_TYPE_UUID: &str = "UUID";
+
+fn field_is_jsonb(f: &Field) -> bool {
+    f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_JSONB)
+}
+
+fn field_is_uuid(f: &Field) -> bool {
+    f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+}
+
 /// Convert an Arrow schema to a pgwire `RowDescription`. Field names are
 /// preserved verbatim. Type OIDs come from `arrow_to_pg_type`.
 pub(crate) fn row_description(schema: &Schema) -> RowDescription {
@@ -36,7 +52,7 @@ pub(crate) fn row_description(schema: &Schema) -> RowDescription {
 }
 
 fn field_description(f: &Field) -> FieldDescription {
-    let ty = arrow_to_pg_type(f.data_type());
+    let ty = arrow_to_pg_type_field(f);
     FieldDescription::new(
         f.name().clone(),
         0, // table OID — unknown at this layer
@@ -46,6 +62,21 @@ fn field_description(f: &Field) -> FieldDescription {
         -1,
         FORMAT_CODE_TEXT,
     )
+}
+
+/// Logical-type-aware variant of `arrow_to_pg_type`. JSONB lives on
+/// `LargeBinary` (canonical-form JSON bytes) and UUID on
+/// `FixedSizeBinary(16)` (RFC 4122 raw bytes); both must surface as their
+/// proper Postgres OIDs (3802 / 2950) so PG-protocol clients see the
+/// expected types rather than `bytea`.
+fn arrow_to_pg_type_field(f: &Field) -> Type {
+    if field_is_jsonb(f) {
+        return Type::JSONB;
+    }
+    if field_is_uuid(f) {
+        return Type::UUID;
+    }
+    arrow_to_pg_type(f.data_type())
 }
 
 /// Map an Arrow type to the closest Postgres type for the PoC. Anything we
@@ -84,13 +115,19 @@ pub(crate) fn encode_batches(
 ) -> Vec<DataRow> {
     let mut rows = Vec::new();
     let n_cols = schema.fields().len();
+    // Pre-compute the `is_jsonb` / `is_uuid` bitmaps so the per-cell hot
+    // loop doesn't redo a metadata lookup per row.
+    let jsonb_cols: Vec<bool> =
+        schema.fields().iter().map(|f| field_is_jsonb(f.as_ref())).collect();
+    let uuid_cols: Vec<bool> =
+        schema.fields().iter().map(|f| field_is_uuid(f.as_ref())).collect();
     for batch in batches {
         let n_rows = batch.num_rows();
         for r in 0..n_rows {
             let mut buf = BytesMut::with_capacity(64);
             for c in 0..n_cols {
                 let col = batch.column(c);
-                encode_value(col.as_ref(), r, &mut buf);
+                encode_value(col.as_ref(), r, &mut buf, jsonb_cols[c], uuid_cols[c]);
             }
             rows.push(DataRow::new(buf, n_cols as i16));
         }
@@ -111,6 +148,10 @@ pub(crate) fn encode_batches_with_formats(
     format_codes: &[i16],
 ) -> Result<Vec<DataRow>> {
     let n_cols = schema.fields().len();
+    let jsonb_cols: Vec<bool> =
+        schema.fields().iter().map(|f| field_is_jsonb(f.as_ref())).collect();
+    let uuid_cols: Vec<bool> =
+        schema.fields().iter().map(|f| field_is_uuid(f.as_ref())).collect();
     let mut rows = Vec::new();
     for batch in batches {
         let n_rows = batch.num_rows();
@@ -124,9 +165,15 @@ pub(crate) fn encode_batches_with_formats(
                     _ => format_codes.get(c).copied().unwrap_or(0) == 1,
                 };
                 if is_binary {
-                    encode_value_binary(col.as_ref(), r, &mut buf)?;
+                    encode_value_binary(
+                        col.as_ref(),
+                        r,
+                        &mut buf,
+                        jsonb_cols[c],
+                        uuid_cols[c],
+                    )?;
                 } else {
-                    encode_value(col.as_ref(), r, &mut buf);
+                    encode_value(col.as_ref(), r, &mut buf, jsonb_cols[c], uuid_cols[c]);
                 }
             }
             rows.push(DataRow::new(buf, n_cols as i16));
@@ -145,10 +192,44 @@ fn encode_value_binary(
     col: &dyn Array,
     idx: usize,
     buf: &mut BytesMut,
+    is_jsonb: bool,
+    is_uuid: bool,
 ) -> Result<()> {
     if col.is_null(idx) {
         buf.put_i32(-1);
         return Ok(());
+    }
+    // JSONB binary format. The Postgres wire format for JSONB is a single
+    // version byte (`0x01`) followed by the JSON text. Drivers that ask for
+    // binary JSONB strip the leading 1 and parse the remainder. Sending it
+    // as plain text would *also* be tolerated by lenient drivers but trips
+    // strict ones (notably `tokio-postgres` 0.7+). We pay one byte to be
+    // correct here.
+    if is_jsonb && matches!(col.data_type(), DataType::LargeBinary | DataType::Binary) {
+        let bytes: &[u8] = match col.data_type() {
+            DataType::LargeBinary => col.as_binary::<i64>().value(idx),
+            DataType::Binary => col.as_binary::<i32>().value(idx),
+            _ => unreachable!(),
+        };
+        buf.put_i32((bytes.len() as i32) + 1);
+        buf.put_u8(1);
+        buf.put_slice(bytes);
+        return Ok(());
+    }
+    // UUID binary format: 16 raw bytes, no length-prefix tweak. The
+    // Arrow column is `FixedSizeBinary(16)`; the bytes already match the
+    // wire format `tokio-postgres` decodes a `Uuid` from.
+    if is_uuid {
+        if let DataType::FixedSizeBinary(16) = col.data_type() {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                .expect("FixedSizeBinaryArray for UUID column");
+            let bytes = arr.value(idx);
+            buf.put_i32(16);
+            buf.put_slice(bytes);
+            return Ok(());
+        }
     }
     match col.data_type() {
         DataType::Boolean => {
@@ -223,7 +304,7 @@ fn encode_value_binary(
                 ?other,
                 "binary format not implemented for type, emitting text"
             );
-            encode_value(col, idx, buf);
+            encode_value(col, idx, buf, is_jsonb, is_uuid);
         }
     }
     Ok(())
@@ -231,16 +312,61 @@ fn encode_value_binary(
 
 /// Encode the value at row `idx` of `col` into `buf` as a length-prefixed
 /// text-format Postgres field. NULLs get a -1 length and no body.
-fn encode_value(col: &dyn Array, idx: usize, buf: &mut BytesMut) {
+fn encode_value(col: &dyn Array, idx: usize, buf: &mut BytesMut, is_jsonb: bool, is_uuid: bool) {
     if col.is_null(idx) {
         buf.put_i32(-1);
         return;
     }
 
+    // JSONB columns are stored as `LargeBinary` with the marker on the
+    // schema's `Field`; their bytes are *already* canonical-form JSON text
+    // (see `basin_engine::dml::coerce_jsonb`). Emit those bytes verbatim
+    // so clients see real JSON, not a `\x...` hex blob.
+    if is_jsonb && matches!(col.data_type(), DataType::LargeBinary | DataType::Binary) {
+        let bytes: &[u8] = match col.data_type() {
+            DataType::LargeBinary => col.as_binary::<i64>().value(idx),
+            DataType::Binary => col.as_binary::<i32>().value(idx),
+            _ => unreachable!(),
+        };
+        buf.put_i32(bytes.len() as i32);
+        buf.put_slice(bytes);
+        return;
+    }
+    // UUID columns are `FixedSizeBinary(16)`; render the canonical
+    // hyphenated lowercase form (8-4-4-4-12). This is what every
+    // PG-protocol client expects, and what `tokio-postgres` decodes
+    // back into a `Uuid` when its column type matches OID 2950.
+    if is_uuid {
+        if let DataType::FixedSizeBinary(16) = col.data_type() {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                .expect("FixedSizeBinaryArray for UUID column");
+            let bytes = arr.value(idx);
+            let s = render_uuid(bytes);
+            buf.put_i32(s.len() as i32);
+            buf.put_slice(s.as_bytes());
+            return;
+        }
+    }
     // Render the cell as a UTF-8 string in `s`, then prefix with length.
     let s = render_cell(col, idx);
     buf.put_i32(s.len() as i32);
     buf.put_slice(s.as_bytes());
+}
+
+/// Format 16 raw bytes as the canonical hyphenated UUID text form
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, lowercase). The `uuid` crate
+/// would do the same job; we call it directly to avoid an `unwrap` and
+/// to keep the conversion explicit.
+fn render_uuid(bytes: &[u8]) -> String {
+    debug_assert_eq!(bytes.len(), 16, "UUID bytes must be exactly 16");
+    if bytes.len() != 16 {
+        return String::new();
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(bytes);
+    uuid::Uuid::from_bytes(arr).hyphenated().to_string()
 }
 
 fn render_cell(col: &dyn Array, idx: usize) -> String {

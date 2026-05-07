@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussion / general question
+    url: https://github.com/exolutionza/basin/discussions
+    about: Open-ended questions, design conversations, "how would Basin handle X?"
+  - name: ADR / decisions
+    url: https://github.com/exolutionza/basin/tree/main/docs/decisions
+    about: Read why we said no to extensions, multi-region 2PC, etc.

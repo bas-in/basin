@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 basin-common.workspace = true
+basin-catalog.workspace = true
 basin-vector.workspace = true
 tokio.workspace = true
 futures.workspace = true

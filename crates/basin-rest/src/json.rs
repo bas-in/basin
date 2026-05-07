@@ -18,16 +18,43 @@ use arrow_schema::{DataType, Schema, TimeUnit};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Map, Value};
 
+/// Field-metadata key the engine sets on JSONB / UUID columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_KEY` (and `basin_router`'s copy of the
+/// same). For JSONB cells we parse the canonical-JSON bytes into a real
+/// `serde_json::Value`; for UUID cells we render the canonical hyphenated
+/// text form so REST clients see structured JSON / readable UUIDs, not a
+/// hex blob.
+const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
+const BASIN_TYPE_JSONB: &str = "JSONB";
+const BASIN_TYPE_UUID: &str = "UUID";
+
 /// Encode a list of `RecordBatch`es as a top-level JSON array of objects.
 /// Each batch row becomes one object keyed by the schema's field names.
 pub(crate) fn batches_to_json(schema: &Arc<Schema>, batches: &[RecordBatch]) -> Value {
     let mut rows: Vec<Value> = Vec::new();
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let jsonb_cols: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_JSONB)
+        })
+        .collect();
+    let uuid_cols: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+        })
+        .collect();
     for batch in batches {
         for r in 0..batch.num_rows() {
             let mut obj = Map::with_capacity(names.len());
             for (i, name) in names.iter().enumerate() {
-                obj.insert(name.clone(), encode_cell(batch.column(i).as_ref(), r));
+                obj.insert(
+                    name.clone(),
+                    encode_cell(batch.column(i).as_ref(), r, jsonb_cols[i], uuid_cols[i]),
+                );
             }
             rows.push(Value::Object(obj));
         }
@@ -35,9 +62,35 @@ pub(crate) fn batches_to_json(schema: &Arc<Schema>, batches: &[RecordBatch]) -> 
     Value::Array(rows)
 }
 
-fn encode_cell(col: &dyn Array, idx: usize) -> Value {
+fn encode_cell(col: &dyn Array, idx: usize, is_jsonb: bool, is_uuid: bool) -> Value {
     if col.is_null(idx) {
         return Value::Null;
+    }
+    if is_jsonb && matches!(col.data_type(), DataType::LargeBinary | DataType::Binary) {
+        let bytes: &[u8] = match col.data_type() {
+            DataType::LargeBinary => col.as_binary::<i64>().value(idx),
+            DataType::Binary => col.as_binary::<i32>().value(idx),
+            _ => unreachable!(),
+        };
+        // Best-effort: if the cell happens to not be valid JSON (shouldn't
+        // happen — INSERT canonicalises via serde_json — but defence in
+        // depth), fall through to the hex bytea rendering rather than
+        // panicking the whole REST response.
+        if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+            return v;
+        }
+    }
+    if is_uuid {
+        if let DataType::FixedSizeBinary(16) = col.data_type() {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                .expect("FixedSizeBinaryArray for UUID column");
+            let bytes = arr.value(idx);
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(bytes);
+            return Value::String(uuid::Uuid::from_bytes(buf).hyphenated().to_string());
+        }
     }
     match col.data_type() {
         DataType::Boolean => Value::Bool(col.as_boolean().value(idx)),

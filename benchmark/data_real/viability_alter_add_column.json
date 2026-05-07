@@ -1,0 +1,24 @@
+{
+  "kind": "viability",
+  "id": "alter_add_column",
+  "name": "ALTER TABLE ... ADD COLUMN end-to-end (real S3)",
+  "claim": "Same shape as the LocalFS card, run against a real S3-compatible backend: CREATE TABLE -> INSERT -> ALTER TABLE ADD COLUMN -> INSERT (wider) -> SELECT shows 10 rows: the 5 pre-ALTER rows project the new column to NULL via Parquet schema evolution; the 5 post-ALTER rows carry their inserted values.",
+  "passed": true,
+  "primary": {
+    "label": "rows_visible_after_alter",
+    "value": 10.0,
+    "unit": "rows",
+    "bar": {
+      "op": "equal",
+      "value": 10.0
+    }
+  },
+  "details": {
+    "bucket": "baisn-test",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+    "post_alter_tags_match": true,
+    "pre_alter_tags_all_null": true,
+    "rows_visible": 10
+  },
+  "generated_at": "@1778156278"
+}

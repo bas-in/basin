@@ -14,7 +14,7 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
-use crate::metadata::{DataFileRef, PartitionSpec, Policy, TableMetadata};
+use crate::metadata::{CvDef, DataFileRef, PartitionSpec, Policy, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
 
@@ -31,6 +31,7 @@ struct TableState {
     cold_age_column: Option<String>,
     bloom_filter_columns: Vec<String>,
     row_group_rows: Option<usize>,
+    continuous_aggregate: Option<CvDef>,
 }
 
 impl TableState {
@@ -60,6 +61,7 @@ impl TableState {
             cold_age_column: None,
             bloom_filter_columns: Vec::new(),
             row_group_rows: None,
+            continuous_aggregate: None,
         }
     }
 }
@@ -124,6 +126,7 @@ impl InMemoryCatalog {
             cold_age_column: state.cold_age_column.clone(),
             bloom_filter_columns: state.bloom_filter_columns.clone(),
             row_group_rows: state.row_group_rows,
+            continuous_aggregate: state.continuous_aggregate.clone(),
         }
     }
 }
@@ -192,6 +195,43 @@ impl Catalog for InMemoryCatalog {
             .map(|(_, name)| name.clone())
             .collect();
         out.sort();
+        Ok(out)
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn drop_namespace(&self, tenant: &TenantId) -> Result<()> {
+        // Single-pass: hold the table-map mutex once, drop every entry whose
+        // tenant matches. Cheaper than the default-impl loop (N small awaits)
+        // and atomic w.r.t. concurrent list_tables on the same in-memory map.
+        let mut tables = self.tables.lock().await;
+        tables.retain(|(t, _), _| t != tenant);
+        let mut namespaces = self.namespaces.lock().await;
+        namespaces.remove(tenant);
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_tenant_data_files(&self, tenant: &TenantId) -> Result<Vec<DataFileRef>> {
+        // Walk every table's full snapshot history under one map-lock-free
+        // pass: clone the per-table Arc<Mutex> handles up front, then drain
+        // each snapshot list while holding only that table's mutex. Avoids
+        // re-acquiring the top-level map mutex per table the way the default
+        // impl (list_tables → load_table loop) would.
+        let handles: Vec<Arc<Mutex<TableState>>> = {
+            let tables = self.tables.lock().await;
+            tables
+                .iter()
+                .filter(|((t, _), _)| t == tenant)
+                .map(|(_, state)| state.clone())
+                .collect()
+        };
+        let mut out: Vec<DataFileRef> = Vec::new();
+        for state in handles {
+            let guard = state.lock().await;
+            for snap in &guard.snapshots {
+                out.extend(snap.data_files.iter().cloned());
+            }
+        }
         Ok(out)
     }
 
@@ -399,6 +439,19 @@ impl Catalog for InMemoryCatalog {
         let state_arc = self.get_table(tenant, table).await?;
         let mut state = state_arc.lock().await;
         state.schema = Arc::new(schema);
+        Ok(())
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %tenant, table = %table))]
+    async fn set_continuous_aggregate(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        def: Option<CvDef>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.continuous_aggregate = def;
         Ok(())
     }
 }

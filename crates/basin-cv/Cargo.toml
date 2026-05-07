@@ -1,0 +1,30 @@
+[package]
+name = "basin-cv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-catalog.workspace = true
+basin-storage.workspace = true
+basin-engine.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+object_store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+object_store.workspace = true
+arrow.workspace = true

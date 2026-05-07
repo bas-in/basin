@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::collections::BTreeMap;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder,
+    LargeBinaryBuilder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Float32Type;
 use arrow_array::{
@@ -20,9 +20,9 @@ use arrow_schema::{DataType, Schema, TimeUnit};
 use basin_catalog::PartitionSpec;
 use basin_common::{BasinError, PartitionKey, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
-use sqlparser::ast::{DataType as SqlDataType, Expr, UnaryOperator, Value};
+use sqlparser::ast::{DataType as SqlDataType, Expr, FunctionArguments, UnaryOperator, Value};
 
-use crate::types::parse_vector_literal;
+use crate::types::{field_is_jsonb, field_is_uuid, parse_vector_literal};
 
 /// Above this row count we try the type-specific bulk paths in [`build_array_bulk`]
 /// before falling back to the per-row builder loop. The threshold is empirical:
@@ -140,6 +140,64 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 for row in rows {
                     match coerce_bytea(&row[col_idx])? {
                         Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::LargeBinary if field_is_jsonb(field) => {
+                // JSONB column. Each row's literal must be a JSON string —
+                // we parse it, re-serialise canonically (BTreeMap sorts
+                // keys, no whitespace) and store the bytes. Anything that
+                // isn't a string literal is a hard error so the user sees
+                // *exactly* which row tripped the check.
+                let mut b =
+                    LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 32);
+                for row in rows {
+                    match coerce_jsonb(&row[col_idx], field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::LargeBinary => {
+                let mut b =
+                    LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match coerce_bytea(&row[col_idx])? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::FixedSizeBinary(16) if field_is_uuid(field) => {
+                // UUID column. Each row's literal must be either a
+                // string literal (parsed via `uuid::Uuid::parse_str`) or
+                // a function call to `gen_random_uuid()` /
+                // `uuid_generate_v4()` which generates a fresh v4 UUID.
+                // Stored as 16 bytes RFC 4122 big-endian.
+                let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+                for row in rows {
+                    match coerce_uuid(&row[col_idx], field.name())? {
+                        Some(bytes) => {
+                            b.append_value(&bytes).map_err(|e| {
+                                BasinError::internal(format!(
+                                    "UUID append for column {}: {e}",
+                                    field.name()
+                                ))
+                            })?;
+                        }
                         None => {
                             check_null_allowed(field)?;
                             b.append_null();
@@ -373,6 +431,153 @@ fn coerce_bytea(expr: &Expr) -> Result<Option<Vec<u8>>> {
         out.push(byte);
     }
     Ok(Some(out))
+}
+
+/// Decode a JSONB literal into canonical-form serialised JSON bytes.
+///
+/// Accepts:
+/// - A SQL string literal (`'{"a":1}'`) — the only form Postgres itself
+///   accepts at INSERT for JSONB without an explicit cast.
+/// - `NULL` (returns `None`).
+///
+/// The string is parsed as JSON and re-serialised with `serde_json::to_vec`
+/// after parsing through `BTreeMap<String, serde_json::Value>` for object
+/// nodes; this gives us **canonical form** (keys sorted alphabetically, no
+/// whitespace) so two rows that wrote the same logical document end up with
+/// byte-identical Parquet payloads. Equality / hashing on JSONB columns then
+/// reduces to a byte compare, which is what the v0.2 `@>` operator will key
+/// off.
+///
+/// Anything else — numeric literal, identifier, function call — is rejected
+/// up front. We deliberately don't accept `Value::Null` *inside* the JSON
+/// literal itself as a problem; that's a valid JSON token.
+fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
+    let s: &str = match expr {
+        Expr::Value(Value::SingleQuotedString(s))
+        | Expr::Value(Value::DoubleQuotedString(s))
+        | Expr::Value(Value::EscapedStringLiteral(s))
+        | Expr::Value(Value::NationalStringLiteral(s)) => s.as_str(),
+        Expr::Value(Value::Null) => return Ok(None),
+        // A bare `Cast` like `'{...}'::jsonb` is friendly to allow even
+        // though our DDL doesn't produce it; peel and recurse.
+        Expr::Cast { expr: inner, .. } => return coerce_jsonb(inner.as_ref(), col),
+        other => {
+            return Err(BasinError::InvalidSchema(format!(
+                "expected JSON string literal for column {col}, got {other}"
+            )));
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+        BasinError::InvalidSchema(format!(
+            "invalid JSON literal for column {col}: {e}"
+        ))
+    })?;
+    let canonical = canonicalize_json(parsed);
+    let bytes = serde_json::to_vec(&canonical).map_err(|e| {
+        BasinError::internal(format!("re-serialising JSON for column {col}: {e}"))
+    })?;
+    Ok(Some(bytes))
+}
+
+/// Decode a UUID literal into its 16-byte RFC 4122 representation.
+///
+/// Accepts:
+/// - A SQL string literal in any UUID-canonical form
+///   (`'550e8400-e29b-41d4-a716-446655440000'`, the same with braces, or
+///    a 32-char hyphen-less hex form). `uuid::Uuid::parse_str` handles all
+///   three. The hyphenated lowercase form is what we emit on the wire.
+/// - A bare function call `gen_random_uuid()` or `uuid_generate_v4()` —
+///   produces a fresh `Uuid::new_v4()`. (The same UDFs are also registered
+///   on the DataFusion side for SELECT contexts; in INSERT we have to
+///   generate the bytes here because the value list is interpreted before
+///   it ever sees DataFusion.)
+/// - A `Cast` wrapper (`'...'::uuid`) — peeled and recursed.
+/// - `NULL`.
+///
+/// Anything else is `InvalidSchema` so a user can't silently insert a
+/// zeroed UUID. Note: we do *not* accept hex-bytea (`'\x...'::bytea`) here
+/// — UUID is a logical type with its own surface form, and the conflation
+/// would surprise readers later.
+fn coerce_uuid(expr: &Expr, col: &str) -> Result<Option<[u8; 16]>> {
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s))
+        | Expr::Value(Value::DoubleQuotedString(s))
+        | Expr::Value(Value::EscapedStringLiteral(s))
+        | Expr::Value(Value::NationalStringLiteral(s)) => {
+            let parsed = uuid::Uuid::parse_str(s).map_err(|e| {
+                BasinError::InvalidSchema(format!(
+                    "invalid UUID literal for column {col}: {e} (got {s:?})"
+                ))
+            })?;
+            Ok(Some(*parsed.as_bytes()))
+        }
+        Expr::Value(Value::Null) => Ok(None),
+        Expr::Cast { expr: inner, .. } => coerce_uuid(inner.as_ref(), col),
+        Expr::Function(f) => {
+            // Match `gen_random_uuid()` (pgcrypto) and
+            // `uuid_generate_v4()` (uuid-ossp). Both take zero args. If
+            // we ever need a v7 sortable UUID it goes here too — same
+            // shape, different `Uuid::now_v7()` body.
+            let fname = f
+                .name
+                .0
+                .last()
+                .map(|i| i.value.to_ascii_lowercase())
+                .unwrap_or_default();
+            let args_empty = match &f.args {
+                FunctionArguments::None => true,
+                FunctionArguments::List(list) => list.args.is_empty(),
+                _ => false,
+            };
+            match (fname.as_str(), args_empty) {
+                ("gen_random_uuid", true) | ("uuid_generate_v4", true) => {
+                    let bytes = *uuid::Uuid::new_v4().as_bytes();
+                    Ok(Some(bytes))
+                }
+                _ => Err(BasinError::InvalidSchema(format!(
+                    "unsupported UUID-producing function for column {col}: {fname}({})",
+                    if args_empty { "" } else { "..." }
+                ))),
+            }
+        }
+        other => Err(BasinError::InvalidSchema(format!(
+            "expected UUID literal or gen_random_uuid()/uuid_generate_v4() for column {col}, got {other}"
+        ))),
+    }
+}
+
+/// Recursively rebuild `v` so every object node iterates its keys in sorted
+/// order. We do it via `BTreeMap<String, Value>` rather than re-implementing
+/// a serializer because (a) `serde_json::Value` already round-trips and
+/// (b) `BTreeMap` serialises in key order, which is what canonical-form
+/// JSON wants.
+fn canonicalize_json(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, Value> = map
+                .into_iter()
+                .map(|(k, val)| (k, canonicalize_json(val)))
+                .collect();
+            // Round-trip through serde_json::Value so the outer container is
+            // a `Value::Object` again (rather than a `Map`-shaped value the
+            // caller's BTreeMap returns directly). serde_json's `Map`
+            // preserves insertion order, so we feed the BTreeMap's already-
+            // sorted iteration into a fresh `Map`.
+            let mut out = serde_json::Map::with_capacity(sorted.len());
+            for (k, vv) in sorted {
+                out.insert(k, vv);
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            // Canonical form preserves array order — only object key order
+            // is normalised. Recurse into elements so nested objects get
+            // their keys sorted.
+            Value::Array(items.into_iter().map(canonicalize_json).collect())
+        }
+        other => other,
+    }
 }
 
 fn check_null_allowed(field: &arrow_schema::Field) -> Result<()> {

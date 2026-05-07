@@ -1,0 +1,41 @@
+[package]
+name = "basin-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-catalog.workspace = true
+basin-engine.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+governor.workspace = true
+arrow-array.workspace = true
+
+# HTTP client. `rustls-tls` keeps us off OpenSSL system libraries, matching
+# `lettre`'s tokio1-rustls-tls choice in basin-auth. `json` enables the
+# `.json::<T>()` helper. `gzip`/`brotli` left off — Basin doesn't decompress
+# user payloads on the way back into SQL.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# URL parsing for allowlist host checks. Already pulled in transitively via
+# reqwest, pinning at a stable major.
+url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true
+basin-storage.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+object_store.workspace = true
+tokio = { workspace = true, features = ["full"] }

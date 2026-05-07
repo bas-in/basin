@@ -17,8 +17,8 @@
     "bucket": "basin-test",
     "cross_tenant_leak": 0,
     "endpoint": "http://127.0.0.1:8333",
-    "tenant_a": "01KQVX7YGG3P0RQPZWBE7W8KBB",
-    "tenant_b": "01KQVX7YGG0EPWBMGT9F5R96WH"
+    "tenant_a": "01KQZYTS3R8N0NK91HXM32DQR8",
+    "tenant_b": "01KQZYTS3RJHHRH4Q0FDH50VCZ"
   },
-  "generated_at": "@1777979358"
+  "generated_at": "@1778115241"
 }

@@ -1,0 +1,42 @@
+{
+  "kind": "viability",
+  "id": "bloom_filter_pruning",
+  "name": "Bloom filter pruning for absent point queries (real S3)",
+  "claim": "On a multi-row-group Parquet file living on real S3 with `bloom_filter_columns = [\"id\"]`, an in-range point query for a non-existent id prunes ≥80% of row groups via the per-group bloom filter, even when min/max stats cannot.",
+  "passed": true,
+  "primary": {
+    "label": "row_groups_pruned_by_bloom / row_groups_considered",
+    "value": 1.0,
+    "unit": "fraction",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 0.8
+    }
+  },
+  "details": {
+    "absent_in_range_target": "550 (outside [500, 600) gap)",
+    "bloom_only_phase": {
+      "groups_considered": 10,
+      "groups_scanned": 0,
+      "pruned_by_bloom": 10,
+      "pruned_by_stats": 0
+    },
+    "bucket": "basin-test",
+    "endpoint": "http://127.0.0.1:8333",
+    "existing_phase": {
+      "groups_considered": 10,
+      "groups_scanned": 1,
+      "pruned_by_bloom": 8,
+      "pruned_by_stats": 1
+    },
+    "out_of_range_absent_phase": {
+      "groups_considered": 10,
+      "groups_scanned": 0,
+      "pruned_by_bloom": 0,
+      "pruned_by_stats": 10
+    },
+    "row_group_size": 100,
+    "rows": 1000
+  },
+  "generated_at": "@1778157142"
+}

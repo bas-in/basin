@@ -13,46 +13,78 @@ window.__BASIN_RESULTS = {
       "partition_pruning",
       "rls_basic",
       "rls_isolation",
-      "tiered_storage"
+      "tiered_storage",
+      "alter_add_column",
+      "basin_cron",
+      "bloom_filter_pruning",
+      "cold_start"
     ],
     "scaling": [
       "data_size",
       "concurrency",
       "noisy_neighbor",
-      "compute_shards"
+      "compute_shards",
+      "tenant_count"
     ],
     "compare": [
       "postgres",
-      "lifecycle_ops"
+      "lifecycle_ops",
+      "backup_cost"
     ]
   },
   "reports": {
+    "compare_backup_cost": {
+      "kind": "compare",
+      "id": "backup_cost",
+      "name": "Backup cost: Basin snapshot (real S3) vs pg_dump (100k rows)",
+      "claim": "Basin's Iceberg-style snapshot is an O(1) manifest copy while pg_dump is O(data).",
+      "available": true,
+      "metrics": [
+        {
+          "label": "Backup wall time",
+          "basin": 0.000231875,
+          "postgres": 0.336476167,
+          "unit": "s",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1451x"
+        },
+        {
+          "label": "Backup byte size",
+          "basin": 455.0,
+          "postgres": 6379236.0,
+          "unit": "bytes",
+          "better": "basin",
+          "ratio_text": "pg / basin = 14020x"
+        }
+      ],
+      "generated_at": "@1778157070"
+    },
     "compare_lifecycle_ops": {
       "kind": "compare",
       "id": "lifecycle_ops",
       "name": "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-      "claim": "Basin makes tenant teardown a list+delete and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+      "claim": "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
       "available": true,
       "metrics": [
         {
           "label": "Tenant deletion (1 tenant, 100K rows in 100 files; basin on S3)",
-          "basin": 2445.0791249999997,
-          "postgres": 6.540667,
+          "basin": 6149.802334,
+          "postgres": 7.10175,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.00x"
         },
         {
-          "label": "ADD COLUMN on 100K rows (Basin: catalog-only simulation; engine doesn't parse ALTER yet)",
-          "basin": 0.021665999999999998,
-          "postgres": 5.346375,
+          "label": "ADD COLUMN on 100K rows",
+          "basin": 0.313167,
+          "postgres": 1.754125,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 246.76x"
+          "ratio_text": "pg / basin = 5.60x"
         }
       ],
-      "generated_at": "@1777926779",
-      "note": "Basin storage on real S3 \u2014 tenant deletion is parallel DELETE round-trips, not unlinked inodes."
+      "generated_at": "@1778145210",
+      "note": "Basin storage on real S3 \u2014 tenant deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."
     },
     "compare_postgres": {
       "kind": "compare",
@@ -71,21 +103,21 @@ window.__BASIN_RESULTS = {
         },
         {
           "label": "Point query p50",
-          "basin": 1760.030916,
-          "postgres": 4.538,
+          "basin": 964.118917,
+          "postgres": 2.689,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.00x"
         },
         {
           "label": "Insert 100K rows",
-          "basin": 409.723291,
-          "postgres": 411.874958,
+          "basin": 264.684125,
+          "postgres": 374.422333,
           "unit": "ms",
           "better": "basin"
         }
       ],
-      "generated_at": "@1777926749",
+      "generated_at": "@1778110825",
       "note": "Basin storage on real S3; PG on local 18. Insert path: WAL + shard with in-RAM WAL store."
     },
     "compare_server_lifecycle": {
@@ -97,37 +129,37 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Connection accept latency p50",
-          "basin": 0.503416,
-          "postgres": 1.845625,
+          "basin": 0.444416,
+          "postgres": 1.389167,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.67x"
+          "ratio_text": "pg / basin = 3.13x"
         },
         {
           "label": "Connections held under 1000-conn flood",
           "basin": 1000.0,
-          "postgres": 100.0,
+          "postgres": 90.0,
           "unit": "conns",
           "better": "basin",
-          "ratio_text": "basin / pg = 10.00x"
+          "ratio_text": "basin / pg = 11.11x"
         },
         {
           "label": "Refused conns under 1000-conn flood",
           "basin": 0.0,
-          "postgres": 900.0,
+          "postgres": 910.0,
           "unit": "conns",
           "better": "basin"
         },
         {
           "label": "RSS per held-open connection",
-          "basin": 174.08,
-          "postgres": 7792.48,
+          "basin": 109.44,
+          "postgres": 7070.08,
           "unit": "KiB",
           "better": "basin",
-          "ratio_text": "pg / basin = 44.76x"
+          "ratio_text": "pg / basin = 64.60x"
         }
       ],
-      "generated_at": "@1777926851"
+      "generated_at": "@1778110926"
     },
     "scaling_compute_shards": {
       "kind": "scaling",
@@ -153,36 +185,36 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "load_pct": 24.0,
-          "shard": 0,
-          "tenants": 6
-        },
-        {
           "load_pct": 20.0,
-          "shard": 1,
+          "shard": 0,
           "tenants": 5
         },
         {
-          "load_pct": 16.0,
-          "shard": 2,
-          "tenants": 4
+          "load_pct": 28.0,
+          "shard": 1,
+          "tenants": 7
         },
         {
-          "load_pct": 40.0,
+          "load_pct": 20.0,
+          "shard": 2,
+          "tenants": 5
+        },
+        {
+          "load_pct": 32.0,
           "shard": 3,
-          "tenants": 10
+          "tenants": 8
         }
       ],
       "primary": {
         "label": "max shard load",
-        "value": 40.0,
+        "value": 32.0,
         "unit": "%",
         "bar": {
           "op": "less_than",
           "value": 50.0
         }
       },
-      "generated_at": "@1777981826"
+      "generated_at": "@1778111589"
     },
     "scaling_concurrency": {
       "kind": "scaling",
@@ -214,39 +246,39 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 4626601.0,
+          "median_latency_us": 4655637.0,
           "per_task_qps": 0.3333333333333333,
           "total_qps": 0.3333333333333333
         },
         {
           "concurrency": 4,
-          "median_latency_us": 2621462.0,
+          "median_latency_us": 3946526.0,
           "per_task_qps": 0.6666666666666666,
           "total_qps": 2.6666666666666665
         },
         {
           "concurrency": 16,
-          "median_latency_us": 1899915.0,
-          "per_task_qps": 0.625,
-          "total_qps": 10.0
+          "median_latency_us": 953397.0,
+          "per_task_qps": 0.8333333333333334,
+          "total_qps": 13.333333333333334
         },
         {
           "concurrency": 64,
-          "median_latency_us": 5894717.0,
-          "per_task_qps": 0.3333333333333333,
-          "total_qps": 21.333333333333332
+          "median_latency_us": 2436460.0,
+          "per_task_qps": 0.3958333333333333,
+          "total_qps": 25.333333333333332
         }
       ],
       "primary": {
         "label": "peak speed-up vs C=1",
-        "value": 64.0,
+        "value": 76.0,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.5
         }
       },
-      "generated_at": "@1777925000"
+      "generated_at": "@1778111637"
     },
     "scaling_data_size": {
       "kind": "scaling",
@@ -284,35 +316,35 @@ window.__BASIN_RESULTS = {
         {
           "bytes_per_row": 9.0222,
           "disk_mib": 0.08604240417480469,
-          "point_ms_p50": 1554.9344170000002,
+          "point_ms_p50": 2078.5984169999997,
           "rows": 10000,
-          "scan_ms_p50": 1072.153166
+          "scan_ms_p50": 1602.5415839999998
         },
         {
           "bytes_per_row": 8.96126,
           "disk_mib": 0.8546123504638672,
-          "point_ms_p50": 1681.0741249999999,
+          "point_ms_p50": 1999.279834,
           "rows": 100000,
-          "scan_ms_p50": 6205.540667
+          "scan_ms_p50": 6474.653375
         },
         {
           "bytes_per_row": 8.952667,
           "disk_mib": 8.537928581237793,
-          "point_ms_p50": 2092.372417,
+          "point_ms_p50": 2623.26025,
           "rows": 1000000,
-          "scan_ms_p50": 55327.181167
+          "scan_ms_p50": 55702.516291
         }
       ],
       "primary": {
         "label": "point query p50 growth (1M / 10K)",
-        "value": 1.3456338699074533,
+        "value": 1.262033218415561,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777926117"
+      "generated_at": "@1778114894"
     },
     "scaling_idle_tenants": {
       "kind": "scaling",
@@ -343,40 +375,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_tenant_kib": 0.16,
-          "provision_ms": 0.081625,
-          "rss_delta_kib": 16,
+          "per_tenant_kib": 0.32,
+          "provision_ms": 0.075208,
+          "rss_delta_kib": 32,
           "tenants": 100
         },
         {
-          "per_tenant_kib": 0.448,
-          "provision_ms": 0.784458,
-          "rss_delta_kib": 448,
+          "per_tenant_kib": 0.656,
+          "provision_ms": 0.5607500000000001,
+          "rss_delta_kib": 656,
           "tenants": 1000
         },
         {
-          "per_tenant_kib": 0.4704,
-          "provision_ms": 3.839291,
-          "rss_delta_kib": 2352,
+          "per_tenant_kib": 0.6112,
+          "provision_ms": 2.846083,
+          "rss_delta_kib": 3056,
           "tenants": 5000
         },
         {
-          "per_tenant_kib": 0.6864,
-          "provision_ms": 8.863667000000001,
-          "rss_delta_kib": 6864,
+          "per_tenant_kib": 0.8576,
+          "provision_ms": 6.084957999999999,
+          "rss_delta_kib": 8576,
           "tenants": 10000
         }
       ],
       "primary": {
         "label": "max per_tenant_kib across scales",
-        "value": 0.6864,
+        "value": 0.8576,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777924761"
+      "generated_at": "@1778111453"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
@@ -402,31 +434,140 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "p50_ms": 1021.1563749999999,
-          "p99_ms": 1300.5408750000001,
+          "p50_ms": 1028.693166,
+          "p99_ms": 1439.255833,
           "scenario": "baseline"
         },
         {
-          "p50_ms": 1000.9192090000001,
-          "p99_ms": 1642.423709,
+          "p50_ms": 1021.0113329999999,
+          "p99_ms": 1595.750416,
           "scenario": "under_load"
         },
         {
-          "p50_ms": 0.9801821087392224,
-          "p99_ms": 1.2628774232105544,
+          "p50_ms": 0.992532435079869,
+          "p99_ms": 1.1087329850689582,
           "scenario": "ratio"
         }
       ],
       "primary": {
         "label": "p99 ratio (under_load / baseline)",
-        "value": 1.2628774232105544,
+        "value": 1.1087329850689582,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1777923749"
+      "generated_at": "@1778115202"
+    },
+    "scaling_tenant_count": {
+      "kind": "scaling",
+      "id": "tenant_count",
+      "name": "Per-tenant cost vs tenant count (real S3)",
+      "claim": "RAM and quiet point-query latency per tenant stay near-constant as tenant count grows on a real S3-compatible backend.",
+      "passed": true,
+      "x_axis": {
+        "key": "tenant_count",
+        "label": "tenants"
+      },
+      "series": [
+        {
+          "key": "per_tenant_ram_kib",
+          "label": "Per-tenant RAM",
+          "unit": "KiB"
+        },
+        {
+          "key": "quiet_p50_ms",
+          "label": "Quiet point query p50",
+          "unit": "ms"
+        }
+      ],
+      "rows": [
+        {
+          "per_tenant_ram_kib": 256.0,
+          "quiet_p50_ms": 1441.300375,
+          "rss_delta_kib": 256,
+          "tenant_count": 1
+        },
+        {
+          "per_tenant_ram_kib": 119.11111111111111,
+          "quiet_p50_ms": 1464.945375,
+          "rss_delta_kib": 1072,
+          "tenant_count": 10
+        },
+        {
+          "per_tenant_ram_kib": 0.0,
+          "quiet_p50_ms": 1434.187292,
+          "rss_delta_kib": -5248,
+          "tenant_count": 100
+        }
+      ],
+      "primary": {
+        "label": "quiet_p50_at_max / quiet_p50_at_1",
+        "value": 0.9950648156877084,
+        "unit": "x",
+        "bar": {
+          "op": "less_than",
+          "value": 5.0
+        }
+      },
+      "generated_at": "@1778156736"
+    },
+    "viability_alter_add_column": {
+      "kind": "viability",
+      "id": "alter_add_column",
+      "name": "ALTER TABLE ... ADD COLUMN end-to-end (real S3)",
+      "claim": "Same shape as the LocalFS card, run against a real S3-compatible backend: CREATE TABLE -> INSERT -> ALTER TABLE ADD COLUMN -> INSERT (wider) -> SELECT shows 10 rows: the 5 pre-ALTER rows project the new column to NULL via Parquet schema evolution; the 5 post-ALTER rows carry their inserted values.",
+      "passed": true,
+      "primary": {
+        "label": "rows_visible_after_alter",
+        "value": 10.0,
+        "unit": "rows",
+        "bar": {
+          "op": "equal",
+          "value": 10.0
+        }
+      },
+      "details": {
+        "bucket": "baisn-test",
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "post_alter_tags_match": true,
+        "pre_alter_tags_all_null": true,
+        "rows_visible": 10
+      },
+      "generated_at": "@1778156278"
+    },
+    "viability_alter_table": {
+      "kind": "viability",
+      "id": "alter_table",
+      "name": "ALTER TABLE SQL surface (real S3)",
+      "claim": "Every ALTER form (ADD COLUMN, SET cold_after, SET cold_age_column, SET BLOOM FILTERS ON, ENABLE/DISABLE ROW LEVEL SECURITY, CREATE/DROP POLICY) parses, runs, and persists to the catalog when Storage is backed by a real S3-compatible object store.",
+      "passed": true,
+      "primary": {
+        "label": "alter_variants_passed",
+        "value": 8.0,
+        "unit": "variants",
+        "bar": {
+          "op": "equal",
+          "value": 8.0
+        }
+      },
+      "details": {
+        "bucket": "baisn-test",
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "schema_cols_after_add_column": 5,
+        "variants_passed": [
+          "ADD COLUMN",
+          "SET cold_after",
+          "SET cold_age_column",
+          "SET BLOOM FILTERS ON",
+          "ENABLE ROW LEVEL SECURITY",
+          "CREATE POLICY",
+          "DROP POLICY",
+          "DISABLE ROW LEVEL SECURITY"
+        ]
+      },
+      "generated_at": "@1778158900"
     },
     "viability_analytical": {
       "kind": "viability",
@@ -447,14 +588,14 @@ window.__BASIN_RESULTS = {
         "analytical_ms": null,
         "bucket": "baisn-test",
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "engine_ms_oltp_on_s3": 13711.041233200001,
+        "engine_ms_oltp_on_s3": 577.0129916,
         "files": 10,
         "groups": 16,
         "rows": 1000000,
         "speedup": 0.0,
         "v01_limitation": "basin-analytical requires local_fs_root; DuckDB httpfs is v0.2"
       },
-      "generated_at": "@1777924733"
+      "generated_at": "@1778110567"
     },
     "viability_analytical_routing": {
       "kind": "viability",
@@ -476,14 +617,104 @@ window.__BASIN_RESULTS = {
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
         "files": 10,
         "groups": 16,
-        "oltp_ms_on_s3": 13720.915691799999,
+        "oltp_ms_on_s3": 580.379175,
         "routed_ms": null,
         "routings": 0,
         "rows": 1000000,
         "speedup": 0.0,
         "v01_limitation": "basin-analytical requires local_fs_root; DuckDB httpfs is v0.2"
       },
-      "generated_at": "@1777924754"
+      "generated_at": "@1778110629"
+    },
+    "viability_basin_cron": {
+      "kind": "viability",
+      "id": "basin_cron",
+      "name": "Cron-style scheduler runs jobs at minute boundaries (real S3)",
+      "claim": "Three +60s ticks fire a `* * * * *` job exactly three times against a real S3-backed Storage; markers and audit log match.",
+      "passed": true,
+      "primary": {
+        "label": "runs_executed",
+        "value": 3.0,
+        "unit": "runs",
+        "bar": {
+          "op": "equal",
+          "value": 3.0
+        }
+      },
+      "details": {
+        "audit_succeeded": 3,
+        "bucket": "baisn-test",
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "marker_rows": 3,
+        "runs_executed": 3,
+        "ticks": 3
+      },
+      "generated_at": "@1778156384"
+    },
+    "viability_bloom_filter_pruning": {
+      "kind": "viability",
+      "id": "bloom_filter_pruning",
+      "name": "Bloom filter pruning for absent point queries (real S3)",
+      "claim": "On a multi-row-group Parquet file living on real S3 with `bloom_filter_columns = [\"id\"]`, an in-range point query for a non-existent id prunes \u226580% of row groups via the per-group bloom filter, even when min/max stats cannot.",
+      "passed": true,
+      "primary": {
+        "label": "row_groups_pruned_by_bloom / row_groups_considered",
+        "value": 1.0,
+        "unit": "fraction",
+        "bar": {
+          "op": "greater_than_or_equal",
+          "value": 0.8
+        }
+      },
+      "details": {
+        "absent_in_range_target": "550 (outside [500, 600) gap)",
+        "bloom_only_phase": {
+          "groups_considered": 10,
+          "groups_scanned": 0,
+          "pruned_by_bloom": 10,
+          "pruned_by_stats": 0
+        },
+        "bucket": "baisn-test",
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "existing_phase": {
+          "groups_considered": 10,
+          "groups_scanned": 1,
+          "pruned_by_bloom": 8,
+          "pruned_by_stats": 1
+        },
+        "out_of_range_absent_phase": {
+          "groups_considered": 10,
+          "groups_scanned": 0,
+          "pruned_by_bloom": 0,
+          "pruned_by_stats": 10
+        },
+        "row_group_size": 100,
+        "rows": 1000
+      },
+      "generated_at": "@1778156417"
+    },
+    "viability_cold_start": {
+      "kind": "viability",
+      "id": "cold_start",
+      "name": "Cold-start latency (real S3)",
+      "claim": "From Storage / Catalog / Engine / Router construction to first `SELECT 1` returning Ok over pgwire is < 5 s with real S3-compatible backend.",
+      "passed": true,
+      "primary": {
+        "label": "cold_start_ms",
+        "value": 14.281917,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 5000.0
+        }
+      },
+      "details": {
+        "bind_addr": "127.0.0.1:51023",
+        "bucket": "baisn-test",
+        "cold_start_ms": 14.281917,
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com"
+      },
+      "generated_at": "@1778156202"
     },
     "viability_compression_ratio": {
       "kind": "viability",
@@ -507,7 +738,56 @@ window.__BASIN_RESULTS = {
         "parquet_bytes": 6256650,
         "rows": 1000000
       },
-      "generated_at": "@1777924970"
+      "generated_at": "@1778111612"
+    },
+    "viability_disk_cache": {
+      "kind": "viability",
+      "id": "disk_cache",
+      "name": "NVMe disk cache (real S3)",
+      "claim": "Cold p99 of a random-working-set point-query workload finishes under 2500 ms when Storage is backed by a real S3-compatible object store. Cold pass starts with empty disk cache + empty metadata cache; warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache.",
+      "passed": true,
+      "primary": {
+        "label": "cold p99 ms",
+        "value": 2195.707209,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 2500.0
+        }
+      },
+      "details": {
+        "bar_cold_p99_ms": 2500.0,
+        "batches": 10,
+        "bucket": "baisn-test",
+        "cache_budget_bytes": 268435456,
+        "cold_to_warm_p50_ratio": 1.028909863033912,
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "n_iterations": 200,
+        "rows": [
+          {
+            "max_ms": 7641.250709,
+            "mean_ms": 1158.6784941849994,
+            "min_ms": 950.689667,
+            "p50_ms": 1068.703166,
+            "p999_ms": 7641.250709,
+            "p99_ms": 2195.707209,
+            "phase": "cold"
+          },
+          {
+            "max_ms": 1318.636292,
+            "mean_ms": 1046.8480705850002,
+            "min_ms": 950.385041,
+            "p50_ms": 1038.6752079999999,
+            "p999_ms": 1318.636292,
+            "p99_ms": 1226.228083,
+            "phase": "warm"
+          }
+        ],
+        "seed": 13425777967503634925,
+        "total_rows": 100000,
+        "working_set_size": 1000
+      },
+      "generated_at": "@1778160174"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -529,9 +809,9 @@ window.__BASIN_RESULTS = {
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
         "rows_after_restart": 3,
         "rows_inserted": 3,
-        "schema": "basin_s3_durable_catalog_01kqtb5mnrmwdc1ryygvnas2pj"
+        "schema": "basin_s3_durable_catalog_01kqztq6kcwc7qh2892j7z1fgs"
       },
-      "generated_at": "@1777926862"
+      "generated_at": "@1778110936"
     },
     "viability_extended_protocol": {
       "kind": "viability",
@@ -555,7 +835,7 @@ window.__BASIN_RESULTS = {
         "passed_queries": 10,
         "total_queries": 10
       },
-      "generated_at": "@1777924750"
+      "generated_at": "@1778110682"
     },
     "viability_idle_tenant_ram": {
       "kind": "viability",
@@ -565,7 +845,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "per_tenant_kib",
-        "value": 0.384,
+        "value": 0.56,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
@@ -575,11 +855,11 @@ window.__BASIN_RESULTS = {
       "details": {
         "bucket": "baisn-test",
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "rss_after_kib": 12720,
-        "rss_before_kib": 12336,
+        "rss_after_kib": 15264,
+        "rss_before_kib": 14704,
         "tenants": 1000
       },
-      "generated_at": "@1777924740"
+      "generated_at": "@1778110636"
     },
     "viability_isolation_under_load": {
       "kind": "viability",
@@ -598,36 +878,60 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bucket": "baisn-test",
-        "elapsed_s": 236.883908417,
+        "elapsed_s": 56.566253542,
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
         "ops": 1000,
         "tenants": 50
       },
-      "generated_at": "@1777925344"
+      "generated_at": "@1778111796"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
       "id": "large_dataset_pointquery",
       "name": "Large-dataset point query (real S3)",
-      "claim": "Point queries on a 10M-row dataset stored on S3 return in under 5 seconds.",
+      "claim": "Cold p99 of a 1000-iteration random-working-set point-query workload on a 10 M-row dataset stored on S3 finishes under 8 seconds. Each query picks a different id from a fixed-seed pool of 1000 hot ids. The bar is on COLD p99 (caches empty at the start of the run); a 'warm' phase is reported alongside.",
       "passed": true,
       "primary": {
-        "label": "point_query_ms",
-        "value": 1727.475792,
+        "label": "cold p99 ms",
+        "value": 3269.939166,
         "unit": "ms",
         "bar": {
           "op": "less_than",
-          "value": 5000.0
+          "value": 8000.0
         }
       },
       "details": {
+        "bar_cold_p99_ms": 8000.0,
         "bucket": "baisn-test",
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
         "files": 10,
-        "rows": 10000000,
-        "seed_elapsed_s": 27.433862458
+        "n_iterations": 1000,
+        "rows": [
+          {
+            "max_ms": 4578.759375,
+            "mean_ms": 1284.6276369450013,
+            "min_ms": 914.559,
+            "p50_ms": 1066.975875,
+            "p999_ms": 3892.972084,
+            "p99_ms": 3269.939166,
+            "phase": "cold"
+          },
+          {
+            "max_ms": 1539.037291,
+            "mean_ms": 1023.5200570550006,
+            "min_ms": 907.873917,
+            "p50_ms": 1009.227125,
+            "p999_ms": 1449.868667,
+            "p99_ms": 1315.193667,
+            "phase": "warm"
+          }
+        ],
+        "seed": 13425777967503634925,
+        "seed_elapsed_s": 22.801816458,
+        "total_rows": 10000000,
+        "working_set_size": 1000
       },
-      "generated_at": "@1777925581"
+      "generated_at": "@1778114326"
     },
     "viability_orm_compat": {
       "kind": "viability",
@@ -702,7 +1006,60 @@ window.__BASIN_RESULTS = {
         ],
         "total": 7
       },
-      "generated_at": "@1777924871"
+      "generated_at": "@1778110805"
+    },
+    "viability_page_cache": {
+      "kind": "viability",
+      "id": "page_cache",
+      "name": "Parquet page cache (real S3)",
+      "claim": "Cold p99 of a random-working-set point-query workload finishes under 2500 ms on a real S3-compatible backend. Cold pass starts with an empty page cache (every working-set id is a miss); warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache.",
+      "passed": true,
+      "primary": {
+        "label": "cold p99 ms",
+        "value": 2212.4967500000002,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 2500.0
+        }
+      },
+      "details": {
+        "bar_cold_p99_ms": 2500.0,
+        "batches": 10,
+        "bucket": "baisn-test",
+        "cache_budget_bytes": 268435456,
+        "cold_hits": 190,
+        "cold_misses": 1810,
+        "cold_to_warm_p50_ratio": 2.0061744042980054,
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "n_iterations": 200,
+        "rows": [
+          {
+            "max_ms": 7654.6765829999995,
+            "mean_ms": 1901.1548902299994,
+            "min_ms": 939.2710840000001,
+            "p50_ms": 1945.527084,
+            "p999_ms": 7654.6765829999995,
+            "p99_ms": 2212.4967500000002,
+            "phase": "cold"
+          },
+          {
+            "max_ms": 1323.212,
+            "mean_ms": 985.6323785500005,
+            "min_ms": 935.832959,
+            "p50_ms": 969.769667,
+            "p999_ms": 1323.212,
+            "p99_ms": 1159.113458,
+            "phase": "warm"
+          }
+        ],
+        "seed": 13425777967503634925,
+        "total_rows": 100000,
+        "warm_hits_total": 2190,
+        "warm_misses_total": 1810,
+        "working_set_size": 1000
+      },
+      "generated_at": "@1778161651"
     },
     "viability_partition_pruning": {
       "kind": "viability",
@@ -712,7 +1069,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "partition_bytes_ratio (range / full)",
-        "value": 0.117088,
+        "value": 0.071456,
         "unit": "ratio",
         "bar": {
           "op": "less_than",
@@ -726,13 +1083,13 @@ window.__BASIN_RESULTS = {
         "full_scan_gets": 12,
         "full_scan_range_gets": 36,
         "months": 12,
-        "range_scan_bytes": 3659,
+        "range_scan_bytes": 2233,
         "range_scan_gets": 1,
-        "range_scan_range_gets": 6,
-        "ratio": 0.117088,
+        "range_scan_range_gets": 2,
+        "ratio": 0.071456,
         "rows_per_month": 100
       },
-      "generated_at": "@1777978570"
+      "generated_at": "@1778004575"
     },
     "viability_predicate_pushdown": {
       "kind": "viability",
@@ -755,7 +1112,7 @@ window.__BASIN_RESULTS = {
         "full_scan_bytes": 5449388,
         "point_query_bytes": 53856
       },
-      "generated_at": "@1777924877"
+      "generated_at": "@1778111236"
     },
     "viability_rls_basic": {
       "kind": "viability",
@@ -781,7 +1138,7 @@ window.__BASIN_RESULTS = {
         "bucket": "baisn-test",
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com"
       },
-      "generated_at": "@1777979089"
+      "generated_at": "@1778110426"
     },
     "viability_rls_isolation": {
       "kind": "viability",
@@ -802,20 +1159,54 @@ window.__BASIN_RESULTS = {
         "bucket": "baisn-test",
         "cross_tenant_leak": 0,
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "tenant_a": "01KQVX15AS8MJNK9E27BW1F9CT",
-        "tenant_b": "01KQVX15AS96TYSAJAD3124ZAA"
+        "tenant_a": "01KQZT83DQNQGW95XCM2EEK0AT",
+        "tenant_b": "01KQZT83DQ9QDDRR8DM6HF75Z6"
       },
-      "generated_at": "@1777979232"
+      "generated_at": "@1778110480"
+    },
+    "viability_row_group_sizing": {
+      "kind": "viability",
+      "id": "row_group_sizing",
+      "name": "Per-table row-group sizing for point queries (real S3)",
+      "claim": "A table with `row_group_rows = 4096` scans strictly fewer than half the rows of an identical table at the default 65,536-row group size when answering a `WHERE id = X` point query, on a real S3-compatible backend.",
+      "passed": true,
+      "primary": {
+        "label": "small_rg_scan_rows / default_rg_scan_rows",
+        "value": 0.0625,
+        "unit": "fraction",
+        "bar": {
+          "op": "less_than",
+          "value": 0.5
+        }
+      },
+      "details": {
+        "bucket": "baisn-test",
+        "default_phase": {
+          "groups_considered": 1,
+          "groups_scanned": 1,
+          "rows_scanned_estimate": 65536
+        },
+        "default_rg_rows": 65536,
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "rows": 16384,
+        "small_phase": {
+          "groups_considered": 4,
+          "groups_scanned": 1,
+          "rows_scanned_estimate": 4096
+        },
+        "small_rg_rows": 4096
+      },
+      "generated_at": "@1778159236"
     },
     "viability_s3_credentials_smoke": {
       "kind": "viability",
       "id": "s3_credentials_smoke",
       "name": "S3 credentials and round-trip",
       "claim": "Real S3-compatible service handles PUT, GET, LIST, DELETE with byte-accurate body round-trip.",
-      "passed": true,
+      "passed": false,
       "primary": {
         "label": "PUT+GET+LIST+DELETE total",
-        "value": 207.0,
+        "value": 4633.0,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -823,16 +1214,16 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "bucket": "basin-test",
-        "delete_ms": 2,
-        "endpoint": "http://127.0.0.1:8333",
-        "get_ms": 1,
-        "list_ms": 0,
+        "bucket": "baisn-test",
+        "delete_ms": 508,
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "get_ms": 998,
+        "list_ms": 478,
         "payload_bytes": 61,
-        "put_ms": 204,
-        "region": "us-east-1"
+        "put_ms": 2649,
+        "region": "auto"
       },
-      "generated_at": "@1777929540"
+      "generated_at": "@1778004500"
     },
     "viability_shard_insert_path": {
       "kind": "viability",
@@ -842,7 +1233,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "inserts_per_sec",
-        "value": 16571.75882290797,
+        "value": 22790.204769989858,
         "unit": "inserts/sec",
         "bar": {
           "op": "greater_than_or_equal",
@@ -851,34 +1242,35 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bucket": "baisn-test",
-        "elapsed_ms": 60.343624999999996,
+        "elapsed_ms": 43.8785,
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "ms_per_insert": 0.060343625,
+        "ms_per_insert": 0.0438785,
         "n_inserts": 1000
       },
-      "generated_at": "@1777924616"
+      "generated_at": "@1778111302"
     },
     "viability_tenant_deletion": {
       "kind": "viability",
       "id": "tenant_deletion",
       "name": "Tenant deletion latency (real S3)",
-      "claim": "Deleting a tenant of 1000 small files completes in under 60 seconds on real S3.",
+      "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path).",
       "passed": true,
       "primary": {
-        "label": "elapsed_ms",
-        "value": 7992.65625,
+        "label": "deletion_ms",
+        "value": 1421.755,
         "unit": "ms",
         "bar": {
           "op": "less_than",
-          "value": 60000.0
+          "value": 3000.0
         }
       },
       "details": {
         "bucket": "baisn-test",
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "files": 1000
+        "files": 100,
+        "setup_ms": 13610.615667
       },
-      "generated_at": "@1777924724"
+      "generated_at": "@1778120542"
     },
     "viability_tiered_storage": {
       "kind": "viability",
@@ -904,7 +1296,7 @@ window.__BASIN_RESULTS = {
         "hot_files_after_sweep": 1,
         "total_rows_visible": 20
       },
-      "generated_at": "@1777980472"
+      "generated_at": "@1778110506"
     },
     "viability_update_delete": {
       "kind": "viability",
@@ -914,7 +1306,7 @@ window.__BASIN_RESULTS = {
       "passed": false,
       "primary": {
         "label": "UPDATE+DELETE elapsed (ms)",
-        "value": 9804.811751000001,
+        "value": 12170.097875,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -923,14 +1315,14 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bucket": "baisn-test",
-        "delete_ms": 4698.283042,
+        "delete_ms": 5158.258333,
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
         "remaining_rows": 9997,
         "rows": 10000,
-        "total_ms": 9804.811751000001,
-        "update_ms": 5106.528709
+        "total_ms": 12170.097875,
+        "update_ms": 7011.839542
       },
-      "generated_at": "@1777924771"
+      "generated_at": "@1778110658"
     },
     "viability_vector_search": {
       "kind": "viability",
@@ -948,18 +1340,18 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "brute_ms": 5388.278625,
+        "brute_ms": 4379.474125,
         "bucket": "baisn-test",
         "dim": 64,
         "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "hnsw_ms": 4504.4055,
-        "hnsw_speedup_x": 1.1962241465605172,
+        "hnsw_ms": 5926.344792,
+        "hnsw_speedup_x": 0.7389840245056062,
         "overlap": 10,
         "rows": 5000,
         "sql_rows": 100,
         "top_k": 10
       },
-      "generated_at": "@1777924637"
+      "generated_at": "@1778111449"
     }
   }
 };

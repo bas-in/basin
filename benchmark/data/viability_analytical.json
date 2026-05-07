@@ -3,10 +3,10 @@
   "id": "analytical",
   "name": "Analytical path speedup vs OLTP engine",
   "claim": "On a 1M-row aggregate (count + avg + sum-of-lengths) with GROUP BY across 10 Parquet files, the DuckDB-backed analytical engine beats the DataFusion-on-listing-table OLTP engine by at least 1.5x on the same dataset.",
-  "passed": true,
+  "passed": false,
   "primary": {
     "label": "analytical_speedup (engine_ms / analytical_ms)",
-    "value": 1.6658158720364091,
+    "value": 1.4166006157234845,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
@@ -14,12 +14,12 @@
     }
   },
   "details": {
-    "analytical_ms": 52.016783399999994,
-    "engine_ms": 86.6503834,
+    "analytical_ms": 34.1377916,
+    "engine_ms": 48.359616599999995,
     "files": 10,
     "groups": 16,
     "rows": 1000000,
-    "speedup": 1.6658158720364091
+    "speedup": 1.4166006157234845
   },
-  "generated_at": "@1777992437"
+  "generated_at": "@1778120402"
 }

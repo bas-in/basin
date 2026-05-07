@@ -23,6 +23,9 @@ serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+# Used to render `FixedSizeBinary(16)` UUID columns as canonical
+# hyphenated text in JSON responses (see `json::encode_cell`).
+uuid.workspace = true
 
 # HTTP stack.
 axum.workspace = true

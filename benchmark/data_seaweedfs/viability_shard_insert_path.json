@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "inserts_per_sec",
-    "value": 12835.26778360365,
+    "value": 18248.855185443223,
     "unit": "inserts/sec",
     "bar": {
       "op": "greater_than_or_equal",
@@ -15,10 +15,10 @@
   },
   "details": {
     "bucket": "basin-test",
-    "elapsed_ms": 77.91033399999999,
+    "elapsed_ms": 54.797958,
     "endpoint": "http://127.0.0.1:8333",
-    "ms_per_insert": 0.077910334,
+    "ms_per_insert": 0.054797958,
     "n_inserts": 1000
   },
-  "generated_at": "@1777929699"
+  "generated_at": "@1778115267"
 }

@@ -1,0 +1,49 @@
+name: Bug report
+description: Something broken or behaving unexpectedly
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Basin version / commit
+      description: "Output of `basin --version` or the git commit you're running"
+      placeholder: "e.g. 0.0.1, commit abc123f"
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Backend
+      description: LocalFS, AWS S3, Cloudflare R2, MinIO, SeaweedFS, etc.
+      placeholder: "Cloudflare R2"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimum SQL or steps to trigger the bug.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include error messages and a relevant slice of `tracing` output if you have it.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Workload shape, tenant count, dataset size, anything contextual
+    validations:
+      required: false

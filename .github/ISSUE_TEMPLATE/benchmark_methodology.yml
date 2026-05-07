@@ -1,0 +1,80 @@
+name: Benchmark methodology
+description: Flag a benchmark as biased, unfair, or methodologically wrong. We want these.
+title: "[bench] "
+labels: ["benchmark", "methodology"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Benchmarks are easy to bend. We've tried to be honest (random working
+        sets, cold-p99 bars, warm/cold separation, real Postgres comparison) —
+        but we want challenges. Be specific; we'll either fix the methodology,
+        soften the headline claim, or explain why we think the test is fair.
+  - type: input
+    id: card
+    attributes:
+      label: Which card / file?
+      description: Card id (e.g. `viability_large_dataset_pointquery`) or test file path
+      placeholder: "tests/integration/tests/viability_large_dataset_pointquery.rs"
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Which backend?
+      description: LocalFS, R2, SeaweedFS, all of them
+      placeholder: "R2 (real cloud)"
+    validations:
+      required: true
+  - type: textarea
+    id: concern
+    attributes:
+      label: What's the methodology concern?
+      description: |
+        Examples that are useful:
+        - "Test loops the same query 10× — caches dominate after run 1; not realistic."
+        - "Bar uses warm p50 instead of cold p99 — passes by leaning on the cache."
+        - "Postgres setup uses no indexes; real apps have 5+. Bias against PG."
+        - "Workload reads 1k rows from 10M-row table — that's not 'random point query', the working set fits in RAM."
+        - "Hardware is single-machine; real production has WAN latency that this misses."
+      placeholder: "The methodology issue you see in the test"
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_fix
+    attributes:
+      label: What would a fairer version look like?
+      description: |
+        Be concrete. "Run the same workload but with caches reset between phases", "use random
+        ids drawn from the full 10M range, not a 1k working set", "give Postgres an index on
+        the queried column", etc.
+      placeholder: "Concrete proposal for a fairer methodology"
+    validations:
+      required: false
+  - type: textarea
+    id: numbers
+    attributes:
+      label: If you've run a fairer version, what numbers did you get?
+      description: |
+        Optional. If you've already implemented your proposed fix locally and have measurements,
+        share them. We'll reproduce.
+      placeholder: "Optional measurements from a re-run with your proposed methodology"
+    validations:
+      required: false
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: What outcome are you asking for?
+      multiple: false
+      options:
+        - Fix the methodology and re-run
+        - Soften the headline claim in README
+        - Add a note to the card explaining the limitation
+        - Explain why you think the current version is fair (and convince me)
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. Whatever the outcome, we'll log it in `docs/decisions/` so the
+        conversation is durable for future readers.

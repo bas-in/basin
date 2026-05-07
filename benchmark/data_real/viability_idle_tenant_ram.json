@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "per_tenant_kib",
-    "value": 0.384,
+    "value": 0.56,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
@@ -16,9 +16,9 @@
   "details": {
     "bucket": "baisn-test",
     "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-    "rss_after_kib": 12720,
-    "rss_before_kib": 12336,
+    "rss_after_kib": 15264,
+    "rss_before_kib": 14704,
     "tenants": 1000
   },
-  "generated_at": "@1777924740"
+  "generated_at": "@1778110636"
 }

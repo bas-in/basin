@@ -73,6 +73,16 @@ def bar_text(bar: dict | None) -> str:
         return "—"
     op = bar.get("op", "")
     val = bar.get("value", 0.0)
+    # f64::INFINITY (and NaN) round-trip from JSON as None — treat that as
+    # "no upper/lower bound" rather than crashing the renderer.
+    if val is None:
+        if op == "greater_than_or_equal":
+            return "≥ -∞"
+        if op == "less_than":
+            return "< ∞"
+        if op == "equal":
+            return "= ∞"
+        return str(bar)
     if op == "greater_than_or_equal":
         return f"≥ {val:g}"
     if op == "less_than":

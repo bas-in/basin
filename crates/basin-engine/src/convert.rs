@@ -46,28 +46,41 @@ fn timeunit_df_to_ws(u: &DfTimeUnit) -> WsTimeUnit {
     }
 }
 
-/// Build a DataFusion-side `Schema` from a workspace-side `Schema`.
+/// Build a DataFusion-side `Schema` from a workspace-side `Schema`. Field
+/// metadata (e.g. the `BASIN_TYPE=JSONB` tag on JSONB columns) is preserved
+/// — DataFusion drops unknown keys silently but keeps round-trippable ones,
+/// and we depend on the JSONB tag surviving the round-trip so the encoder
+/// at the other end can pick it up.
 pub(crate) fn schema_ws_to_df(s: &ws_schema::Schema) -> Result<df_schema::Schema> {
     let mut fields = Vec::with_capacity(s.fields().len());
     for f in s.fields() {
-        fields.push(df_schema::Field::new(
+        let mut field = df_schema::Field::new(
             f.name().clone(),
             data_type_ws_to_df(f.data_type())?,
             f.is_nullable(),
-        ));
+        );
+        if !f.metadata().is_empty() {
+            field = field.with_metadata(f.metadata().clone());
+        }
+        fields.push(field);
     }
     Ok(df_schema::Schema::new(fields))
 }
 
-/// Build a workspace-side `Schema` from a DataFusion-side `Schema`.
+/// Build a workspace-side `Schema` from a DataFusion-side `Schema`. Mirror
+/// of `schema_ws_to_df` — preserves field metadata.
 pub(crate) fn schema_df_to_ws(s: &df_schema::Schema) -> Result<ws_schema::Schema> {
     let mut fields = Vec::with_capacity(s.fields().len());
     for f in s.fields() {
-        fields.push(ws_schema::Field::new(
+        let mut field = ws_schema::Field::new(
             f.name().clone(),
             data_type_df_to_ws(f.data_type())?,
             f.is_nullable(),
-        ));
+        );
+        if !f.metadata().is_empty() {
+            field = field.with_metadata(f.metadata().clone());
+        }
+        fields.push(field);
     }
     Ok(ws_schema::Schema::new(fields))
 }
@@ -80,6 +93,8 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
         ws_schema::DataType::Float64 => df_schema::DataType::Float64,
         ws_schema::DataType::Float32 => df_schema::DataType::Float32,
         ws_schema::DataType::Binary => df_schema::DataType::Binary,
+        ws_schema::DataType::LargeBinary => df_schema::DataType::LargeBinary,
+        ws_schema::DataType::FixedSizeBinary(n) => df_schema::DataType::FixedSizeBinary(*n),
         ws_schema::DataType::Timestamp(unit, tz) => df_schema::DataType::Timestamp(
             timeunit_ws_to_df(unit),
             tz.clone(),
@@ -110,6 +125,8 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         df_schema::DataType::Float64 => ws_schema::DataType::Float64,
         df_schema::DataType::Float32 => ws_schema::DataType::Float32,
         df_schema::DataType::Binary => ws_schema::DataType::Binary,
+        df_schema::DataType::LargeBinary => ws_schema::DataType::LargeBinary,
+        df_schema::DataType::FixedSizeBinary(n) => ws_schema::DataType::FixedSizeBinary(*n),
         df_schema::DataType::Timestamp(unit, tz) => ws_schema::DataType::Timestamp(
             timeunit_df_to_ws(unit),
             tz.clone(),
@@ -193,6 +210,51 @@ pub(crate) fn batch_df_to_ws(
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
                 Arc::new(ws_array::BinaryArray::from(vals))
+            }
+            ws_schema::DataType::LargeBinary => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::LargeBinaryArray>()
+                    .ok_or_else(|| BasinError::internal(format!("expected LargeBinaryArray for {}", field.name())))?;
+                let vals: Vec<Option<&[u8]>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(ws_array::LargeBinaryArray::from(vals))
+            }
+            ws_schema::DataType::FixedSizeBinary(n) => {
+                // UUID columns ride on FixedSizeBinary(16). Walk the
+                // null bitmap and per-row slice; rebuild on the
+                // workspace side with `try_from_sparse_iter_with_size`
+                // so null cells don't need a placeholder buffer.
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::FixedSizeBinaryArray>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected FixedSizeBinaryArray for {}",
+                            field.name()
+                        ))
+                    })?;
+                let size = *n;
+                let mut rows: Vec<Option<Vec<u8>>> = Vec::with_capacity(s.len());
+                for j in 0..s.len() {
+                    if s.is_null(j) {
+                        rows.push(None);
+                    } else {
+                        rows.push(Some(s.value(j).to_vec()));
+                    }
+                }
+                let arr = ws_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    rows.into_iter(),
+                    size,
+                )
+                .map_err(|e| {
+                    BasinError::internal(format!(
+                        "rebuilding FixedSizeBinary({size}) for column {}: {e}",
+                        field.name()
+                    ))
+                })?;
+                Arc::new(arr)
             }
             ws_schema::DataType::Timestamp(unit, tz) => {
                 // Pass through the underlying i64 buffer; both arrow versions

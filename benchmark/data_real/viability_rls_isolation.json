@@ -17,8 +17,8 @@
     "bucket": "baisn-test",
     "cross_tenant_leak": 0,
     "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-    "tenant_a": "01KQVX15AS8MJNK9E27BW1F9CT",
-    "tenant_b": "01KQVX15AS96TYSAJAD3124ZAA"
+    "tenant_a": "01KQZT83DQNQGW95XCM2EEK0AT",
+    "tenant_b": "01KQZT83DQ9QDDRR8DM6HF75Z6"
   },
-  "generated_at": "@1777979232"
+  "generated_at": "@1778110480"
 }

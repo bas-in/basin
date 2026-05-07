@@ -1,0 +1,46 @@
+name: Feature request
+description: Propose a new feature or capability
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: check [`CAPABILITIES.md`](../../CAPABILITIES.md) and
+        [`docs/decisions/`](../../docs/decisions/) — many "missing" things are deliberate
+        scope decisions with documented triggers that would change our mind.
+  - type: textarea
+    id: workload
+    attributes:
+      label: What workload are you trying to run that needs this?
+      description: |
+        Concrete is good. "Multi-tenant audit log SaaS, 5k tenants, retention 90 days, mostly
+        recent reads" beats "I need feature X".
+    validations:
+      required: true
+  - type: textarea
+    id: feature
+    attributes:
+      label: What feature would unblock you?
+      description: |
+        SQL surface, capability, integration, etc. Sketch the API if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What alternatives have you considered?
+      description: |
+        Did you try a sidecar Postgres? A different backend? An external service?
+        Why didn't they work?
+    validations:
+      required: false
+  - type: textarea
+    id: postgres_compat
+    attributes:
+      label: Postgres extension equivalent?
+      description: |
+        If this maps to a known PG extension (PostGIS, pgvector, pg_cron, http, etc.),
+        say so — we have specific posture on each in `CAPABILITIES.md`.
+    validations:
+      required: false

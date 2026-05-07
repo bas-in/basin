@@ -94,6 +94,8 @@ pub(crate) struct EngineInner {
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         crate::cron_glue::install();
+        crate::net_glue::install();
+        crate::cv_glue::install();
         Self {
             inner: Arc::new(EngineInner {
                 cfg,
@@ -301,11 +303,13 @@ mod alter;
 mod analytical_route;
 mod convert;
 mod cron_glue;
+mod cv_glue;
 mod ddl;
 mod dml;
 mod dml_mutate;
 mod executor;
 mod fast_select;
+mod net_glue;
 mod noisy_detector;
 mod prepared;
 mod rls;

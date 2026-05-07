@@ -1,0 +1,25 @@
+{
+  "kind": "viability",
+  "id": "uuid",
+  "name": "UUID column type + uuid-ossp/pgcrypto built-in functions",
+  "claim": "UUID column accepts canonical hyphenated literals and gen_random_uuid()/uuid_generate_v4() function calls on INSERT, stores 16 bytes RFC 4122, returns canonical hyphenated text on SELECT. digest()/encode()/decode() cover md5/sha1/sha224/sha256/sha384/sha512 + hex/base64/escape. crypt()/gen_salt('bf') produce bcrypt-shaped 60-char `$2b$NN$...` hashes that verify cleanly.",
+  "passed": true,
+  "primary": {
+    "label": "uuid_full_surface",
+    "value": 1.0,
+    "unit": "boolean",
+    "bar": {
+      "op": "equal",
+      "value": 1.0
+    }
+  },
+  "details": {
+    "alice_uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "bcrypt_format_correct": true,
+    "bcrypt_sample": "$2b$12$wAcibH.EOSkbEpKbj/13reqYDblZL1PgJDclttS0/2KiOWbaa2fCS",
+    "random_uuid_unique_1000": true,
+    "sha256_hex_correct": true,
+    "uuid_roundtrip": true
+  },
+  "generated_at": "@1778162700"
+}

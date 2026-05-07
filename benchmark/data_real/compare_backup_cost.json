@@ -1,0 +1,26 @@
+{
+  "kind": "compare",
+  "id": "backup_cost",
+  "name": "Backup cost: Basin snapshot (real S3) vs pg_dump (100k rows)",
+  "claim": "Basin's Iceberg-style snapshot is an O(1) manifest copy while pg_dump is O(data).",
+  "available": true,
+  "metrics": [
+    {
+      "label": "Backup wall time",
+      "basin": 0.000231875,
+      "postgres": 0.336476167,
+      "unit": "s",
+      "better": "basin",
+      "ratio_text": "pg / basin = 1451x"
+    },
+    {
+      "label": "Backup byte size",
+      "basin": 455.0,
+      "postgres": 6379236.0,
+      "unit": "bytes",
+      "better": "basin",
+      "ratio_text": "pg / basin = 14020x"
+    }
+  ],
+  "generated_at": "@1778157070"
+}

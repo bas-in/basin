@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "partition_bytes_ratio (range / full)",
-    "value": 0.117088,
+    "value": 0.071456,
     "unit": "ratio",
     "bar": {
       "op": "less_than",
@@ -20,11 +20,11 @@
     "full_scan_gets": 12,
     "full_scan_range_gets": 36,
     "months": 12,
-    "range_scan_bytes": 3659,
+    "range_scan_bytes": 2233,
     "range_scan_gets": 1,
-    "range_scan_range_gets": 6,
-    "ratio": 0.117088,
+    "range_scan_range_gets": 2,
+    "ratio": 0.071456,
     "rows_per_month": 100
   },
-  "generated_at": "@1777978777"
+  "generated_at": "@1778115239"
 }

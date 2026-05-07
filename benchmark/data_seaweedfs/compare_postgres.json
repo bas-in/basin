@@ -15,20 +15,20 @@
     },
     {
       "label": "Point query p50",
-      "basin": 11.196207999999999,
-      "postgres": 2.719,
+      "basin": 0.9705,
+      "postgres": 2.69,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.24x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.77x"
     },
     {
       "label": "Insert 100K rows",
-      "basin": 447.512791,
-      "postgres": 798.4662089999999,
+      "basin": 275.632792,
+      "postgres": 329.085083,
       "unit": "ms",
       "better": "basin"
     }
   ],
-  "generated_at": "@1777929690",
+  "generated_at": "@1778115249",
   "note": "Basin storage on real S3; PG on local 18. Insert path: WAL + shard with in-RAM WAL store."
 }

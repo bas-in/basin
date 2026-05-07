@@ -1,0 +1,53 @@
+{
+  "kind": "scaling",
+  "id": "tenant_count",
+  "name": "Per-tenant cost vs tenant count (real S3)",
+  "claim": "RAM and quiet point-query latency per tenant stay near-constant as tenant count grows on a real S3-compatible backend.",
+  "passed": true,
+  "x_axis": {
+    "key": "tenant_count",
+    "label": "tenants"
+  },
+  "series": [
+    {
+      "key": "per_tenant_ram_kib",
+      "label": "Per-tenant RAM",
+      "unit": "KiB"
+    },
+    {
+      "key": "quiet_p50_ms",
+      "label": "Quiet point query p50",
+      "unit": "ms"
+    }
+  ],
+  "rows": [
+    {
+      "per_tenant_ram_kib": 176.0,
+      "quiet_p50_ms": 1.9432500000000001,
+      "rss_delta_kib": 176,
+      "tenant_count": 1
+    },
+    {
+      "per_tenant_ram_kib": 53.333333333333336,
+      "quiet_p50_ms": 1.813791,
+      "rss_delta_kib": 480,
+      "tenant_count": 10
+    },
+    {
+      "per_tenant_ram_kib": 1.6,
+      "quiet_p50_ms": 1.9250829999999999,
+      "rss_delta_kib": 144,
+      "tenant_count": 100
+    }
+  ],
+  "primary": {
+    "label": "quiet_p50_at_max / quiet_p50_at_1",
+    "value": 0.9906512286118614,
+    "unit": "x",
+    "bar": {
+      "op": "less_than",
+      "value": 5.0
+    }
+  },
+  "generated_at": "@1778157151"
+}

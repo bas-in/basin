@@ -1,0 +1,23 @@
+{
+  "kind": "viability",
+  "id": "cold_start",
+  "name": "Cold-start latency (real S3)",
+  "claim": "From Storage / Catalog / Engine / Router construction to first `SELECT 1` returning Ok over pgwire is < 5 s with real S3-compatible backend.",
+  "passed": true,
+  "primary": {
+    "label": "cold_start_ms",
+    "value": 14.281917,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 5000.0
+    }
+  },
+  "details": {
+    "bind_addr": "127.0.0.1:51023",
+    "bucket": "baisn-test",
+    "cold_start_ms": 14.281917,
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com"
+  },
+  "generated_at": "@1778156202"
+}

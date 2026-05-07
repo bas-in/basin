@@ -17,12 +17,12 @@
     "analytical_ms": null,
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
-    "engine_ms_oltp_on_s3": 157.4649834,
+    "engine_ms_oltp_on_s3": 53.3170084,
     "files": 10,
     "groups": 16,
     "rows": 1000000,
     "speedup": 0.0,
     "v01_limitation": "basin-analytical requires local_fs_root; DuckDB httpfs is v0.2"
   },
-  "generated_at": "@1777929731"
+  "generated_at": "@1778115243"
 }

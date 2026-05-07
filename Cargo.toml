@@ -15,6 +15,8 @@ members = [
     "crates/basin-pool",
     "crates/basin-auth",
     "crates/basin-rest",
+    "crates/basin-net",
+    "crates/basin-cv",
     "services/basin-server",
     "tests/integration",
 ]
@@ -42,6 +44,8 @@ basin-vector = { path = "crates/basin-vector" }
 basin-pool = { path = "crates/basin-pool" }
 basin-auth = { path = "crates/basin-auth" }
 basin-rest = { path = "crates/basin-rest" }
+basin-net = { path = "crates/basin-net" }
+basin-cv = { path = "crates/basin-cv" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -114,6 +118,16 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 http = "1"
 hyper = "1"
+
+# Hashing + encoding for the Postgres `digest()` / `encode()` / `decode()`
+# UDF family (see `basin_engine::udf`). All `digest 0.10`-shaped so they
+# compose through one trait. `hex` and `base64` carry the encode/decode
+# string formats the corresponding pgcrypto functions emit.
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+base64 = "0.22"
 
 # Test
 tempfile = "3"

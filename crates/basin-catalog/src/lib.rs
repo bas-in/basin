@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use basin_common::{Result, TableName, TenantId};
 
 pub use in_memory::InMemoryCatalog;
-pub use metadata::{DataFileRef, PartitionSpec, Policy, PolicyCommand, TableMetadata};
+pub use metadata::{CvDef, DataFileRef, PartitionSpec, Policy, PolicyCommand, TableMetadata};
 pub use postgres::PostgresCatalog;
 pub use rest::RestCatalog;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
@@ -72,6 +72,61 @@ pub trait Catalog: Send + Sync {
     /// Tables visible to `tenant`. By construction this is *only* `tenant`'s
     /// tables — there is no cross-tenant variant in this trait.
     async fn list_tables(&self, tenant: &TenantId) -> Result<Vec<TableName>>;
+
+    /// Drop every catalog row owned by `tenant`: tables, snapshots, and the
+    /// namespace itself. Does **not** delete the underlying object-store
+    /// bytes; that is the storage layer's job. The default implementation
+    /// iterates `list_tables` and calls `drop_table` on each; backends that
+    /// can issue a single statement (Postgres `DELETE … WHERE tenant_id = …`)
+    /// override for one round-trip instead of N.
+    ///
+    /// Idempotent: calling on a tenant with no tables / no namespace row is
+    /// a no-op (returns Ok). The engine's tenant-deletion path calls this
+    /// last, after the storage bytes are gone.
+    async fn drop_namespace(&self, tenant: &TenantId) -> Result<()> {
+        let tables = self.list_tables(tenant).await?;
+        for table in tables {
+            // Drop best-effort: a NotFound from a racing dropper is fine.
+            match self.drop_table(tenant, &table).await {
+                Ok(()) => {}
+                Err(basin_common::BasinError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Enumerate every data file currently catalogued for `tenant`. The
+    /// returned set is the union of `DataFileRef`s recorded across every
+    /// snapshot of every table the tenant owns; in the snapshot-delta model
+    /// this is a *superset* of the live file set (paths swapped out by
+    /// `replace_data_files` may still appear). For deletion that's fine —
+    /// `DeleteObjects` is idempotent on already-deleted keys. Higher-level
+    /// readers should keep using `list_data_files`, which goes through the
+    /// LIST RPC and sees only physically-present files.
+    ///
+    /// Used by `Storage::delete_tenant` to skip the LIST RPC for the bulk
+    /// of the bytes; a follow-up LIST mops up files the catalog doesn't
+    /// know about (HNSW segments, orphans).
+    ///
+    /// Default impl: iterate `list_tables` then `load_table` per table.
+    /// Postgres can do this in a single SELECT joining the snapshots table.
+    async fn list_tenant_data_files(&self, tenant: &TenantId) -> Result<Vec<DataFileRef>> {
+        let tables = self.list_tables(tenant).await?;
+        let mut out: Vec<DataFileRef> = Vec::new();
+        for table in tables {
+            match self.load_table(tenant, &table).await {
+                Ok(meta) => {
+                    for snap in &meta.snapshots {
+                        out.extend(snap.data_files.iter().cloned());
+                    }
+                }
+                Err(basin_common::BasinError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
 
     /// Atomic commit: append `files` to the table, producing a new snapshot.
     ///
@@ -220,6 +275,23 @@ pub trait Catalog: Send + Sync {
         schema: arrow_schema::Schema,
     ) -> Result<()> {
         let _ = (tenant, table, schema);
+        Ok(())
+    }
+
+    /// Replace the continuous-aggregate definition (or clear it with `None`)
+    /// for `(tenant, table)`. The `basin-cv` refresher writes back a fresh
+    /// `CvDef` each tick (with updated `last_refreshed_at_unix_ms` /
+    /// `last_bucket_max_unix_ms`). Default impl is a no-op so the stub
+    /// `RestCatalog` and any future backend stay buildable; the in-memory
+    /// and Postgres backends override this. See the `basin-cv` crate docs
+    /// for the refresh / read-path semantics.
+    async fn set_continuous_aggregate(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        def: Option<metadata::CvDef>,
+    ) -> Result<()> {
+        let _ = (tenant, table, def);
         Ok(())
     }
 }

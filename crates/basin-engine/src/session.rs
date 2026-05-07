@@ -144,6 +144,10 @@ pub(crate) async fn open(
     // and don't depend on per-tenant data; registering on every session is
     // cheap and keeps the UDFs visible to any SQL the session executes.
     crate::udf::register_distance_udfs(&ctx);
+    // pgcrypto + uuid-ossp shaped UDFs (gen_random_uuid, digest, encode,
+    // decode, crypt, gen_salt). Same per-session shape as the distance
+    // UDFs; registration is `Arc<ScalarUDF>::clone` under the hood.
+    crate::udf::register_pg_udfs(&ctx);
 
     let state = Arc::new(SessionState::new());
 

@@ -1,0 +1,22 @@
+{
+  "kind": "viability",
+  "id": "cold_start",
+  "name": "Cold-start latency (LocalFS)",
+  "claim": "From process spawn to first `SELECT 1` over pgwire is < 2 s on LocalFS storage.",
+  "passed": true,
+  "primary": {
+    "label": "cold_start_ms",
+    "value": 158.659333,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 2000.0
+    }
+  },
+  "details": {
+    "bind_addr": "127.0.0.1:51016",
+    "cold_start_ms": 158.659333,
+    "storage": "localfs"
+  },
+  "generated_at": "@1778156180"
+}

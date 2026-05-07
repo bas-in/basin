@@ -5,8 +5,10 @@
 //! so the absolute numbers will diverge. We surface honestly: PG vs Basin-S3
 //! with no fudging, and let the dashboard reader judge.
 //!
-//! ADD COLUMN is a catalog-only operation in Basin; backend doesn't change
-//! it. We include it for parity with the LocalFS test.
+//! ADD COLUMN runs through Basin's real SQL surface
+//! (`crates/basin-engine/src/alter.rs`); no simulation. The backend object
+//! store doesn't change the timing because the path is catalog-only — but
+//! we keep the data files on S3 to match the LocalFS shape.
 //!
 //! Skips cleanly when [s3] or [postgres] is missing.
 
@@ -17,15 +19,13 @@ use std::time::Instant;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_catalog::{Catalog, InMemoryCatalog};
+use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
 use basin_common::{PartitionKey, TableName, TenantId};
+use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_real_postgres_compare, CompareMetric, WhichWins};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{Storage, StorageConfig};
-use futures::stream::StreamExt;
-use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
 use tokio_postgres::{Client, NoTls};
 
 const TEST_NAME: &str = "s3_compare_lifecycle_ops";
@@ -95,14 +95,6 @@ fn basin_schema_v1() -> Arc<Schema> {
     ]))
 }
 
-fn basin_schema_v2() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("body", DataType::Utf8, false),
-        Field::new("tag", DataType::Utf8, true),
-    ]))
-}
-
 fn build_basin_batch(start: i64, len: usize) -> RecordBatch {
     let ids: Int64Array = (start..start + len as i64).collect();
     let bodies: Vec<String> = (0..len).map(|i| format!("body-{}", start + i as i64)).collect();
@@ -127,7 +119,7 @@ async fn s3_compare_lifecycle_ops() {
             report_real_postgres_compare(
                 "lifecycle_ops",
                 "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-                "Basin makes tenant teardown a list+delete and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
+                "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
                 false,
                 vec![],
                 Some("postgres unavailable"),
@@ -143,7 +135,7 @@ async fn s3_compare_lifecycle_ops() {
             report_real_postgres_compare(
                 "lifecycle_ops",
                 "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-                "Basin makes tenant teardown a list+delete and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
+                "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
                 false,
                 vec![],
                 Some("postgres unreachable"),
@@ -187,7 +179,11 @@ async fn s3_compare_lifecycle_ops() {
 
     // ---- Metric A: tenant deletion --------------------------------------
     // Basin on S3: write 100 small Parquet files for one tenant under a
-    // sub-prefix, then time the prefix list+delete.
+    // sub-prefix, register them in an `InMemoryCatalog`, then time
+    // `Storage::delete_tenant` end-to-end. This is the same code path the
+    // engine wires up — catalog-first DELETE + parallel orphan LIST +
+    // drop_namespace — so the dashboard plots the production teardown
+    // latency, not a bypass through the raw object store.
     let del_prefix = format!("{run_prefix}/del");
     let storage = Storage::new(StorageConfig {
         object_store: object_store.clone(),
@@ -195,9 +191,14 @@ async fn s3_compare_lifecycle_ops() {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let tenant = TenantId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
+    catalog
+        .create_table(&tenant, &table, basin_schema_v1().as_ref())
+        .await
+        .unwrap();
     // Fan-out the writes — sequential PUTs on S3 would dominate the test.
     let mut writers = tokio::task::JoinSet::new();
     for i in 0..BASIN_FILES {
@@ -210,24 +211,30 @@ async fn s3_compare_lifecycle_ops() {
             storage
                 .write_batch(&tenant, &table, &part, &batch)
                 .await
-                .unwrap();
+                .unwrap()
         });
     }
+    let mut written: Vec<DataFileRef> = Vec::with_capacity(BASIN_FILES);
     while let Some(r) = writers.join_next().await {
-        r.unwrap();
+        let f = r.unwrap();
+        written.push(DataFileRef {
+            path: f.path.as_ref().to_string(),
+            size_bytes: f.size_bytes,
+            row_count: f.row_count,
+        });
     }
-    let tenant_prefix = ObjectPath::from(format!("{del_prefix}/tenants/{tenant}"));
+    // One catalog append registers every file in a single snapshot — the
+    // deletion path then sees the full set without paying a LIST RTT.
+    catalog
+        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .await
+        .unwrap();
 
     let basin_del_started = Instant::now();
-    let paths_stream = object_store
-        .list(Some(&tenant_prefix))
-        .map_ok(|m| m.location)
-        .boxed();
-    let _deleted: Vec<ObjectPath> = object_store
-        .delete_stream(paths_stream)
-        .try_collect()
+    let _deleted = storage
+        .delete_tenant(catalog.as_ref(), &tenant)
         .await
-        .expect("delete_stream");
+        .expect("delete_tenant");
     let basin_del_ms = basin_del_started.elapsed().as_secs_f64() * 1000.0;
 
     let pg_del_started = Instant::now();
@@ -269,8 +276,8 @@ async fn s3_compare_lifecycle_ops() {
     .expect("pg alter");
     let pg_alter_ms = pg_alter_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Basin: simulate ADD COLUMN by creating a new table with the wider
-    // schema. Catalog-only; no data move. Same approach as LocalFS test.
+    // Basin: real ALTER TABLE through the engine's SQL surface
+    // (`crates/basin-engine/src/alter.rs`). Catalog-only; no data move.
     let alter_prefix = format!("{run_prefix}/alter");
     let storage2 = Storage::new(StorageConfig {
         object_store: object_store.clone(),
@@ -278,16 +285,21 @@ async fn s3_compare_lifecycle_ops() {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let catalog2: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let engine = Engine::new(EngineConfig {
+        storage: storage2.clone(),
+        catalog: catalog2.clone(),
+        shard: None,
+    });
     let tenant2 = TenantId::new();
-    let table_v1 = TableName::new("events").unwrap();
-    let table_v2 = TableName::new("events_v2").unwrap();
-    let part2 = PartitionKey::default_key();
-    catalog.create_namespace(&tenant2).await.unwrap();
-    catalog
-        .create_table(&tenant2, &table_v1, basin_schema_v1().as_ref())
+    let session = engine.open_session(tenant2).await.unwrap();
+    session
+        .execute("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
         .unwrap();
+
+    let table_v1 = TableName::new("events").unwrap();
+    let part2 = PartitionKey::default_key();
     let mut writers = tokio::task::JoinSet::new();
     for i in 0..BASIN_FILES {
         let storage = storage2.clone();
@@ -307,8 +319,8 @@ async fn s3_compare_lifecycle_ops() {
     }
 
     let basin_alter_started = Instant::now();
-    catalog
-        .create_table(&tenant2, &table_v2, basin_schema_v2().as_ref())
+    session
+        .execute("ALTER TABLE events ADD COLUMN tag TEXT")
         .await
         .unwrap();
     let basin_alter_ms = basin_alter_started.elapsed().as_secs_f64() * 1000.0;
@@ -328,7 +340,7 @@ async fn s3_compare_lifecycle_ops() {
     );
     println!(
         "{:>52} {:>12.2}ms {:>12.2}ms {:>22}",
-        "add_column (100K rows; basin = catalog-only sim)",
+        "ADD COLUMN on 100K rows",
         basin_alter_ms,
         pg_alter_ms,
         format!("pg/basin = {:.2}x", alter_ratio)
@@ -349,7 +361,7 @@ async fn s3_compare_lifecycle_ops() {
             ratio_text: Some(format!("pg / basin = {:.2}x", del_ratio)),
         },
         CompareMetric {
-            label: "ADD COLUMN on 100K rows (Basin: catalog-only simulation; engine doesn't parse ALTER yet)".into(),
+            label: "ADD COLUMN on 100K rows".into(),
             basin: basin_alter_ms,
             postgres: pg_alter_ms,
             unit: "ms".into(),
@@ -361,10 +373,10 @@ async fn s3_compare_lifecycle_ops() {
     report_real_postgres_compare(
         "lifecycle_ops",
         "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-        "Basin makes tenant teardown a list+delete and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+        "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
         true,
         metrics,
-        Some("Basin storage on real S3 — tenant deletion is parallel DELETE round-trips, not unlinked inodes."),
+        Some("Basin storage on real S3 — tenant deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."),
     );
 
     drop(_guard2);

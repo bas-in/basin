@@ -1,0 +1,25 @@
+{
+  "kind": "viability",
+  "id": "basin_cron",
+  "name": "Cron-style scheduler runs jobs at minute boundaries (real S3)",
+  "claim": "Three +60s ticks fire a `* * * * *` job exactly three times against a real S3-backed Storage; markers and audit log match.",
+  "passed": true,
+  "primary": {
+    "label": "runs_executed",
+    "value": 3.0,
+    "unit": "runs",
+    "bar": {
+      "op": "equal",
+      "value": 3.0
+    }
+  },
+  "details": {
+    "audit_succeeded": 3,
+    "bucket": "basin-test",
+    "endpoint": "http://127.0.0.1:8333",
+    "marker_rows": 3,
+    "runs_executed": 3,
+    "ticks": 3
+  },
+  "generated_at": "@1778157141"
+}

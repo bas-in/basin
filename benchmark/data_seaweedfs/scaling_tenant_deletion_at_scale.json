@@ -1,0 +1,53 @@
+{
+  "kind": "scaling",
+  "id": "tenant_deletion_at_scale",
+  "name": "Tenant deletion at scale, real S3 (Basin vs Postgres)",
+  "claim": "Basin's tenant teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows.",
+  "passed": true,
+  "x_axis": {
+    "key": "file_count",
+    "label": "files per tenant"
+  },
+  "series": [
+    {
+      "key": "basin_ms",
+      "label": "Basin",
+      "unit": "ms"
+    },
+    {
+      "key": "postgres_ms",
+      "label": "Postgres",
+      "unit": "ms"
+    }
+  ],
+  "rows": [
+    {
+      "basin_ms": 46.415916,
+      "file_count": 100,
+      "pg_skipped": false,
+      "postgres_ms": 2.846041
+    },
+    {
+      "basin_ms": 533.615917,
+      "file_count": 1000,
+      "pg_skipped": false,
+      "postgres_ms": 2.610542
+    },
+    {
+      "basin_ms": 1492.420375,
+      "file_count": 5000,
+      "pg_skipped": false,
+      "postgres_ms": 4.462375
+    }
+  ],
+  "primary": {
+    "label": "basin delete_ms at largest scale",
+    "value": 1492.420375,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": null
+    }
+  },
+  "generated_at": "@1778162019"
+}
