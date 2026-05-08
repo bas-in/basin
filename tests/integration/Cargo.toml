@@ -40,7 +40,10 @@ toml.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
-tokio-postgres.workspace = true
+# `with-uuid-1` + `with-serde_json-1` enable native binary encoding of
+# `Uuid` and `serde_json::Value` so the JSONB/UUID parameter-binding
+# integration test can exercise the binary wire format end-to-end.
+tokio-postgres = { workspace = true, features = ["with-uuid-1", "with-serde_json-1"] }
 walkdir = "2"
 async-trait.workspace = true
 ulid.workspace = true

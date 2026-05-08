@@ -6,11 +6,12 @@ project brief. Every box should be small enough that a single PR closes it.
 **Scope:** this file is the **core DB / open-source** roadmap — pgwire /
 SQL / storage / catalog / query engine / multi-tenancy / caches /
 indexes / WAL / compactor / vector search / Postgres-extension
-equivalents. The customer-facing **cloud platform** (identity, REST,
-V8 edge functions, BYO-bucket / BYO-key, Stripe billing, customer
-dashboard) lives in [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md). Don't
-blur the line — we keep the core engine's scope discipline by keeping
-the platform's open boxes out of this file.
+equivalents / **basin-auth** (identity) / **basin-rest** (PostgREST
+equivalent). The full open-source bundle a self-hoster gets when they
+clone the repo. The cloud platform (V8 edge functions, BYO-bucket /
+BYO-key, Stripe billing, customer dashboard, control plane, plus
+enterprise auth/REST extensions like SAML / OIDC / SCIM, admin audit
+log, signed-URL endpoints) lives in [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md).
 
 **Postgres-extension equivalents we ship natively** (not via upstream
 `.so` loading — see [ADR 0002](./docs/decisions/0002-no-postgres-extensions.md)):
@@ -121,8 +122,14 @@ See `README.md` "Try the PoC" for usage.
 - [x] **Real ORM compat verified**: 7/7 representative ORM patterns pass via
       `tokio-postgres`'s default extended-query API
 - [x] `psql` connects and runs full SQL workload
-- [-] `pgx` (Go) / `asyncpg` (Python) full smoke — extended-query landed,
-      these ride on it; explicit smoke tests are a follow-up
+- [~] `pgx` (Go) / `asyncpg` (Python) full smoke — scaffolding shipped:
+      `tests/integration/python/smoke.py`, `tests/integration/go/smoke.go`,
+      `tests/integration/tests/smoke_pgx.rs`, `smoke_asyncpg.rs`. Go side
+      rides on `pgx/v5`. Python side hits an asyncpg quirk where after a
+      `DataError` on JSONB / UUID encoding, `conn.close()` hangs. v0.2
+      fix: wrap close in `asyncio.wait_for(..., timeout=2)` and catch
+      `DataError` so JSONB / UUID shapes are reported as known
+      limitations instead of stalls.
 
 ## Phase 5 — Analytical path (1–2 months) — **v0.1 shipped**
 
@@ -188,10 +195,19 @@ risk/effort, ordered to ship value early.
       `(table, indexed_col) → (file, row_group, row)`. Stored as a
       separate per-tenant file. Cached in RAM. `CREATE INDEX` SQL.
       **Flagged as the biggest remaining point-query win in CAPABILITIES.md.**
-- [ ] **B2 Range-partitioned / Z-ordered files** — `CLUSTER BY` on
-      `CREATE TABLE` physically sorts data so related rows live in the
-      same file. Combined with A3 bloom filters, point queries hit
-      one file.
+- [x] **B2 Range-partitioned / Z-ordered files** — physically sorts data
+      so related rows live in the same file; combined with A3 bloom
+      filters, point queries hit one file. **v0.1 shipped end-to-end:**
+      catalog `TableMetadata.cluster_columns` + `Catalog::set_cluster_columns`
+      (InMemory + Postgres; fork_table copies it); engine reads the spec
+      from catalog at write time; storage writer's `WriteOptions.cluster_columns`
+      drives `lexsort_to_indices` + `take` so the Parquet file is
+      physically sorted before flush. Empty cluster-column list preserves
+      the pre-B2 path byte-equivalently. SQL surface: `CREATE TABLE …
+      CLUSTER BY (col, …)`, `ALTER TABLE … CLUSTER BY (col, …)`, and
+      `ALTER TABLE … RESET CLUSTER BY` all map to `set_cluster_columns`
+      via the same regex-strip pre-screen the rest of Basin's extension
+      DDL uses.
 - [x] **B3 Per-table row-group sizing** — `ALTER TABLE … SET row_group_rows = N`
       ships; small row groups for point-heavy tables.
 
@@ -254,12 +270,117 @@ the corresponding `ScalarUDF`s.
       `encode`/`decode` (hex/base64/escape), `crypt` (bcrypt),
       `gen_salt('bf')`, `gen_random_uuid()`, `uuid_generate_v4()`.
 
+## Phase 5.10 — Identity + REST (open-source bundle) — **v0.1 shipped**
+
+Auth + REST ship as part of the OSS bundle, the same shape Supabase
+ships open-source. Cloud-only *extensions* (enterprise SSO, BYO-bucket
+signed URLs, admin audit log) live in
+[`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md).
+
+### basin-auth (identity) — ADR 0005
+
+- [x] Postgres-backed user store, bcrypt password hashing, JWT
+      issuance + verification (HS256), role/membership tables,
+      `current_user`-aware tenant resolution.
+- [x] `JwtTenantResolver` auto-mounts on pgwire when
+      `BASIN_AUTH_ENABLED=1` (`services/basin-server/src/main.rs:298-307`);
+      JWT primary, static `BASIN_TENANTS` map as fallback.
+- [x] REST endpoints for issue / verify / refresh.
+- [x] Email-link login — tenant-agnostic `auth_magic_links` table +
+      `AuthService::{request,consume}_email_link`; REST endpoints
+      `POST /auth/v1/magic-link` (204 No Content; never confirms whether
+      the email exists) and `POST /auth/v1/magic-link/consume`. Returns
+      503 / `E_EMAIL_DISABLED` when SMTP is unconfigured.
+- [x] Per-tenant API-key tokens (long-lived, revocable, separate from
+      session JWTs) — `auth_api_keys` table + `AuthService::{issue,
+      validate, revoke, list}_api_key`; `ApiKeyTenantResolver` stacks
+      with the JWT resolver in `basin-server/src/main.rs`; REST
+      endpoints `POST/GET /auth/v1/api-keys` and `DELETE /auth/v1/api-keys/{id}`.
+- [x] Per-user session settings (timezone, language) read by the engine
+      for `current_setting()` — `user_session_settings` table +
+      `AuthService::{set,get}_session_setting{,s}` with hard-coded
+      allowlist (`timezone`, `language`). Engine-side `current_setting()`
+      consumer is a separate work item in basin-engine.
+- [x] Refresh-token rotation + revocation list — refresh tokens are now
+      JWTs (`aud=basin-refresh`, fresh `jti` per issuance). Each rotate
+      records the prior `jti` in `auth_revoked_refresh_tokens`; replay of
+      a rotated token returns 401 / `E_REVOKED_TOKEN`. Reuse-detection
+      path: a presented-already-rotated token *plus* a yet-newer
+      rotation in the same user's history triggers a `BLANKET:<user>`
+      sentinel that invalidates every outstanding refresh JWT for that
+      user. Stale rows are filtered out at lookup (`expires_at > now()`);
+      a periodic GC daemon is deferred.
+
+### basin-rest (PostgREST equivalent) — ADR 0006
+
+Requires `BASIN_AUTH_ENABLED=1` per ADR.
+
+- [x] CRUD endpoints over the JWT-resolved tenant (GET / POST / DELETE)
+- [x] Engine `UPDATE` / `DELETE` (Iceberg copy-on-write) — unblocks the
+      REST `PATCH` codec
+- [x] `PATCH` codec wired to engine `UPDATE` — `build_update_sql`
+      produces the right SQL, hits the engine's Iceberg copy-on-write
+      `UPDATE` path; `patch_round_trip` integration test asserts
+      end-to-end. (lib.rs docstring previously said "501 until engine
+      grows UPDATE" — stale; UPDATE shipped, PATCH lights up.)
+- [x] Pagination cursors instead of `LIMIT`/`OFFSET` —
+      `?cursor=<token>&limit=<n>` ships an opaque base64url JSON
+      `{"after_id": <last_id>}` token; response wraps as
+      `{rows, next_cursor}` when either param is present, bare array
+      otherwise. v0.1 limitation: requires the table's first column to
+      be `id BIGINT` (other shapes ignore the cursor). Asserted by
+      `pagination_cursor_advances`.
+- [x] Streaming responses for large result sets (chunked transfer) —
+      `application/x-ndjson` over `Body::from_stream` when the result
+      exceeds 1 MiB or 10 000 rows, or when `?stream=true`. Cursor token
+      lands as a final `{"_basin_next_cursor":"…"}` NDJSON line.
+      Asserted by `streaming_response_for_large_payload`.
+- [x] OpenAPI / Swagger schema generation from catalog metadata —
+      `GET /rest/v1/_openapi.json` returns a per-tenant OpenAPI 3.0.3
+      spec built from `Catalog::list_tables` + `load_table`. Auth-gated
+      so each tenant only sees its own tables. Type mapping covers
+      every Arrow `DataType` Basin's DDL produces (incl. JSONB / UUID
+      via the `BASIN_TYPE` field metadata, and `VECTOR(N)` via
+      `FixedSizeList<Float32>`).
+
+### pgwire JSONB / UUID parameter-binding wire-format fix
+
+- [x] `StatementSchema` carries parallel `param_is_jsonb` / `param_is_uuid`
+      flag vecs (populated from the source column's `BASIN_TYPE` field
+      metadata at INSERT / UPDATE / SELECT-WHERE inference time). The
+      pgwire layer surfaces OID 3802 / 2950 in `ParameterDescription`,
+      and the Bind decoder strips the JSONB v1 `0x01` version byte and
+      renders 16-byte UUID buffers as canonical hyphenated strings before
+      handing them to the engine's text-substitution path. Asserted by
+      `tests/integration/tests/jsonb_uuid_param_binding.rs` (native
+      `tokio-postgres` `Uuid` + `serde_json::Value` round-trip) and the
+      `decode_param_binary` unit tests. v0.2 follow-up: `WHERE id = $1`
+      against a UUID column still fails inside `basin-storage`'s
+      fast-select predicate evaluator because the pushed-down
+      `ScalarValue::Utf8` is compared against `FixedSizeBinary(16)`;
+      lift that limit and the smoke can re-enable the predicate-side
+      round-trip.
+
 ## Phase 6 — Production hardening (3–4 months)
 
 - [ ] Multi-region: regional WAL + S3 cross-region replication
 - [ ] Catalog replication strategy chosen and implemented
-- [ ] Point-in-time restore via Iceberg snapshots
-- [ ] Branching / forking via copy-on-write catalog metadata
+- [~] Point-in-time restore via Iceberg snapshots — v0.1 catalog-level
+      `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` ships
+      (InMemory + Postgres impls; truncates history to ≤ target,
+      rewinds head pointer). v0.2 follow-up: physical file GC of
+      orphaned post-rollback Parquet files (today the OLTP listing-based
+      reader still sees them until a compactor sweep). Reads on
+      APPEND-only history work after rollback once orphans are removed;
+      crossing UPDATE/DELETE commits is unrecoverable in v0.1 because
+      replaced files are physically deleted at commit (soft-delete is
+      a v0.2 prerequisite for cross-DML rollback).
+- [~] Branching / forking via copy-on-write catalog metadata — v0.1
+      catalog-level `Catalog::fork_table(tenant, src, dst)` ships
+      (InMemory + Postgres impls). New table inherits source's schema /
+      snapshot history / partition spec / RLS / tier / bloom / row-group
+      / CV settings; data files are *shared by reference* (no Parquet
+      copy). v0.2: cross-tenant forking (needs refcount-aware GC).
 - [ ] Cross-shard 2PC
 - [x] Connection pooling (✅ ADR 0007), rate limiting (✅ pgwire side:
       `BASIN_PGWIRE_RATE_LIMIT_QPS=100` token-bucket per tenant via
@@ -269,7 +390,7 @@ the corresponding `ScalarUDF`s.
       54000; multi-FROM / JOIN / sub-query / explicit-LIMIT pass through
       unchecked. v0.2 will use A4 catalog `ColumnStats` for selectivity-
       aware estimates on multi-table shapes.)
-- [ ] Per-tenant + per-query + per-shard + per-WAL telemetry
+- [x] Per-tenant + per-query + per-shard + per-WAL telemetry — `basin_common::TenantCounterRegistry` aggregates ops/bytes_read/bytes_written/errors + ring-window p99 latency per tenant; `Engine::tenant_counters(&TenantId) -> TenantCountersSnapshot` exposes a cheap snapshot. Storage writer/reader and WAL append are wired to bump per-tenant byte counters; engine `TenantSession::execute` bumps op + latency + error.
 
 > Cloud-platform hardening items (BYO-bucket, BYO-key, Stripe billing)
 > moved to [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md).
@@ -277,8 +398,11 @@ the corresponding `ScalarUDF`s.
 ## Phase 7 — Launch (ongoing)
 
 - [ ] Onboard the Phase 0 design partners
-- [ ] CLI (`basinctl`) + engineering docs (the customer-facing dashboard
+- [~] CLI (`basinctl`) + engineering docs (the customer-facing dashboard
       moved to [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md))
+      — CLI ✅ shipped: `services/basinctl/` with `ping`, `tenants`,
+      `tables`, `query`, `version`. Engineering docs continuation:
+      ADRs / architecture overview / operator runbook still open.
 - [ ] Open beta after 3–6 months of design partner usage
 - [ ] GA when uptime + perf + DX are all genuinely good
 
@@ -286,9 +410,10 @@ the corresponding `ScalarUDF`s.
 
 ## Cross-cutting (start now, never finish)
 
-- [ ] Per-tenant metrics from day one (ops/s, p50/p99, RAM, S3 IO, active hours)
-- [ ] OpenTelemetry traces wired through router → shard → WAL
-- [ ] Cross-tenant fuzz tests (find a bug → file a P0)
+- [x] Per-tenant metrics from day one (ops/s, p50/p99, RAM, S3 IO, active hours) — public `Engine::tenant_counters` API surfaces ops/bytes/errors + p99 ms estimate aggregated across engine + storage + WAL; viability test `tests/integration/tests/viability_per_tenant_counters.rs` asserts per-tenant byte isolation.
+- [x] OpenTelemetry traces wired through router → shard → WAL — `#[tracing::instrument]` spans on every layer (router/engine/shard/storage::{read,write_batch,read_paths}/WAL append/flush/read_from/truncate); OTLP export available via `BASIN_OTLP_ENDPOINT`.
+- [x] Cross-tenant fuzz tests (find a bug → file a P0) — `tests/integration/tests/fuzz_cross_tenant_isolation.rs` runs a seed-reproducible (`BASIN_FUZZ_SEED`) StdRng fuzzer of 1000 random query shapes across 8 tenants, asserts every returned row carries the calling tenant's payload prefix, and verifies `TableName::new` rejects path-traversal inputs. No isolation breach found.
+- [x] Feature-coverage + security suite — shipped at `tests/integration/tests/feature_coverage.rs` (one assertion per CAPABILITIES.md ✅ row, with audit comment cross-referencing the test that already covers each row) and `tests/integration/tests/security.rs` (OWASP-shaped pgwire SQL-injection probes through both simple and extended-bind paths, path-injection on `TableName`/`TenantId`/`PartitionKey`, RLS bypass attempts via UNION/CTE, structural cross-tenant fork rejection, and pgwire rate-limit enforcement). **P0 finding:** the security suite's `rls_union_subquery_cannot_bypass` and `rls_cte_cannot_bypass` panic — RLS predicate injection is currently skipped for `SetExpr::SetOperation` and `query.with` shapes because `crates/basin-engine/src/executor.rs::collect_table_refs_from_query` only walks `SetExpr::Select`. Fix is in the table collector, not the rewriter.
 - [ ] Bug bounty program before public beta
 - [ ] Security review at each phase boundary
 

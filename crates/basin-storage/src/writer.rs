@@ -54,6 +54,15 @@ pub struct WriteOptions {
     /// Tests use this to force multiple row groups out of small batches so
     /// the bloom-filter pruning path is observable.
     pub max_row_group_size: Option<usize>,
+    /// Phase 5.7 B2: physically sort the batch by these columns before
+    /// flushing to Parquet. Combined with A3 bloom filters and A4 catalog
+    /// stats, point queries on the cluster columns prune to one file in
+    /// the common case. Empty (the default) preserves the pre-B2 write
+    /// path exactly. Unknown column names are silently ignored — the
+    /// engine validates the column set against the schema before
+    /// constructing `WriteOptions`, so a stray name here means
+    /// schema-evolved-out and isn't worth a hard error on the hot path.
+    pub cluster_columns: Vec<String>,
 }
 
 pub(crate) async fn write_batch(
@@ -85,9 +94,21 @@ pub(crate) async fn write_batch_with_options(
         data_ulid,
     );
 
-    let bytes = encode_parquet(batch, opts)?;
+    // Phase 5.7 B2: physically sort the batch by `cluster_columns` before
+    // flushing so related rows live in the same row group. Skipped when
+    // the cluster spec is empty — the common case. The sorted batch is
+    // local; we don't mutate the caller's input.
+    let sorted_batch_owned;
+    let batch_to_write = if opts.cluster_columns.is_empty() {
+        batch
+    } else {
+        sorted_batch_owned = sort_batch_by_cluster_cols(batch, &opts.cluster_columns)?;
+        &sorted_batch_owned
+    };
+
+    let bytes = encode_parquet(batch_to_write, opts)?;
     let size = bytes.len() as u64;
-    let row_count = batch.num_rows() as u64;
+    let row_count = batch_to_write.num_rows() as u64;
 
     storage
         .tenant_store(tenant)
@@ -95,12 +116,18 @@ pub(crate) async fn write_batch_with_options(
         .await
         .map_err(|e| BasinError::storage(format!("put {key}: {e}")))?;
 
+    // Per-tenant byte counter (Phase 6 telemetry). No-op when no registry is
+    // attached. Bumped after a successful PUT — failed writes don't count.
+    if let Some(tc) = storage.tenant_counters(tenant) {
+        tc.record_bytes_written(size);
+    }
+
     // Build and persist HNSW sidecars for any FixedSizeList<Float32> columns
     // in the batch. One sidecar per Parquet write, mirroring the data-file
     // pattern; merging across writes is deferred to the future compactor.
-    crate::vector_index::build_indexes_for_batch(storage, tenant, table, batch, data_ulid).await?;
+    crate::vector_index::build_indexes_for_batch(storage, tenant, table, batch_to_write, data_ulid).await?;
 
-    let column_stats = extract_column_stats(&bytes, batch)?;
+    let column_stats = extract_column_stats(&bytes, batch_to_write)?;
 
     Ok(DataFile {
         path: key,
@@ -111,6 +138,50 @@ pub(crate) async fn write_batch_with_options(
         // to cold later via `Storage::migrate_to_cold`.
         tier: crate::tier::Tier::Hot,
     })
+}
+
+/// Phase 5.7 B2: physically reorder `batch` so rows with equal-or-close
+/// values on `cluster_columns` end up adjacent (and therefore in the same
+/// Parquet row group). Unknown column names are silently ignored — the
+/// engine's catalog-validated set is the canonical source; a stray here
+/// just means schema-evolved-out and skipping it is the right back-compat.
+fn sort_batch_by_cluster_cols(
+    batch: &RecordBatch,
+    cluster_columns: &[String],
+) -> Result<RecordBatch> {
+    use arrow::compute::{lexsort_to_indices, take, SortColumn};
+    let schema = batch.schema();
+    let sort_cols: Vec<SortColumn> = cluster_columns
+        .iter()
+        .filter_map(|name| {
+            schema
+                .index_of(name.as_str())
+                .ok()
+                .map(|idx| SortColumn {
+                    values: batch.column(idx).clone(),
+                    options: None,
+                })
+        })
+        .collect();
+    if sort_cols.is_empty() {
+        // Every column was unknown — nothing to sort by. Same shape as
+        // empty `cluster_columns`: fall through with a clone so the
+        // caller can still treat the result uniformly.
+        return Ok(batch.clone());
+    }
+    let indices = lexsort_to_indices(&sort_cols, None).map_err(|e| {
+        BasinError::storage(format!("lexsort cluster columns: {e}"))
+    })?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| {
+            take(c.as_ref(), &indices, None)
+                .map_err(|e| BasinError::storage(format!("take cluster-sorted column: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|e| BasinError::storage(format!("rebuild cluster-sorted batch: {e}")))
 }
 
 fn encode_parquet(batch: &RecordBatch, opts: &WriteOptions) -> Result<Vec<u8>> {
@@ -317,5 +388,74 @@ fn decode_le_f64(b: &[u8]) -> Option<f64> {
     let mut a = [0u8; 8];
     a.copy_from_slice(b);
     Some(f64::from_le_bytes(a))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(ids: &[i64], names: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let id_arr: Int64Array = ids.iter().copied().collect();
+        let name_arr: StringArray = names.iter().map(|s| Some(*s)).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(name_arr)]).unwrap()
+    }
+
+    fn ids(b: &RecordBatch) -> Vec<i64> {
+        b.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn sort_orders_by_single_cluster_column() {
+        let b = batch(&[3, 1, 2], &["c", "a", "b"]);
+        let sorted = sort_batch_by_cluster_cols(&b, &["id".into()]).unwrap();
+        assert_eq!(ids(&sorted), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn sort_is_lexicographic_across_columns() {
+        // (id, name) cluster: equal ids tie-break on name.
+        let b = batch(&[2, 1, 2, 1], &["b", "z", "a", "a"]);
+        let sorted = sort_batch_by_cluster_cols(&b, &["id".into(), "name".into()]).unwrap();
+        // Expect rows reordered to (1,"a"), (1,"z"), (2,"a"), (2,"b").
+        let names: Vec<String> = sorted
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+        assert_eq!(ids(&sorted), vec![1, 1, 2, 2]);
+        assert_eq!(names, vec!["a", "z", "a", "b"]);
+    }
+
+    #[test]
+    fn sort_with_unknown_column_falls_through() {
+        // A column name that's not in the schema is silently skipped; if
+        // every name is unknown, the batch passes through unchanged.
+        let b = batch(&[3, 1, 2], &["c", "a", "b"]);
+        let sorted =
+            sort_batch_by_cluster_cols(&b, &["nonexistent".into()]).unwrap();
+        assert_eq!(ids(&sorted), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn sort_empty_batch_is_a_noop() {
+        let b = batch(&[], &[]);
+        let sorted = sort_batch_by_cluster_cols(&b, &["id".into()]).unwrap();
+        assert_eq!(sorted.num_rows(), 0);
+    }
 }
 

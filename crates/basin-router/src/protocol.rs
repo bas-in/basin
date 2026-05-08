@@ -39,7 +39,7 @@ use pgwire::api::auth::{
     finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
     StartupHandler,
 };
-use pgwire::api::copy::NoopCopyHandler;
+use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -53,6 +53,7 @@ use pgwire::api::{
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::{NoData, ParameterDescription};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Describe, Execute, Flush, Parse, ParseComplete,
     Sync as PgSync, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
@@ -262,6 +263,12 @@ struct ExtendedState {
     statements: HashMap<String, StatementEntry>,
     /// portal name → bound statement + cached schema.
     portals: HashMap<String, PortalEntry>,
+    /// Parallel maps for `COPY FROM STDIN` / `COPY TO STDOUT`. Kept
+    /// separate from `statements` / `portals` because COPY has no engine
+    /// handle, no parameters, and no result rows — the regular tables
+    /// don't fit.
+    copy_statements: HashMap<String, crate::copy::CopyCommand>,
+    copy_portals: HashMap<String, crate::copy::CopyCommand>,
 }
 
 #[derive(Clone)]
@@ -292,6 +299,8 @@ impl ExtendedState {
         Self {
             statements: HashMap::new(),
             portals: HashMap::new(),
+            copy_statements: HashMap::new(),
+            copy_portals: HashMap::new(),
         }
     }
 }
@@ -362,6 +371,9 @@ fn decode_param_text(
             };
             Ok(ScalarParam::Bool(b))
         }
+        // JSONB / UUID text format passes through verbatim — the engine's
+        // INSERT path parses string literals back to the canonical Arrow
+        // representation. Same default as every other unmapped type.
         _ => Ok(ScalarParam::Text(s.to_owned())),
     }
 }
@@ -440,6 +452,49 @@ fn decode_param_binary(
             })?;
             Ok(ScalarParam::Text(s.to_owned()))
         }
+        // JSONB binary wire format: leading `0x01` version byte, then JSON
+        // text. Strip it and hand the JSON to the engine as a string literal;
+        // INSERT canonicalises and stores. Future versions would pick a new
+        // byte; reject anything other than `0x01` with `0A000`.
+        Type::JSONB => {
+            if bytes.is_empty() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P03".to_owned(),
+                    "binary JSONB parameter is empty (missing version byte)".into(),
+                ))));
+            }
+            if bytes[0] != 1 {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "0A000".to_owned(), // feature_not_supported
+                    format!(
+                        "unsupported JSONB binary version 0x{:02x}; only v1 is supported",
+                        bytes[0]
+                    ),
+                ))));
+            }
+            let s = std::str::from_utf8(&bytes[1..]).map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P02".to_owned(),
+                    format!("binary JSONB body is not valid UTF-8: {e}"),
+                )))
+            })?;
+            Ok(ScalarParam::Text(s.to_owned()))
+        }
+        // UUID binary wire format: 16 raw RFC 4122 bytes; render canonical
+        // hyphenated form so the engine's text-substitution path (which
+        // accepts string-quoted UUID literals) coerces back to bytes.
+        Type::UUID => {
+            if bytes.len() != 16 {
+                return Err(bad_len(16));
+            }
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(bytes);
+            let s = uuid::Uuid::from_bytes(arr).hyphenated().to_string();
+            Ok(ScalarParam::Text(s))
+        }
         _ => {
             // Unknown binary type: best-effort treat as raw text bytes. The
             // engine's text substitution will then SQL-escape them. If the
@@ -475,9 +530,34 @@ where
     S: Session + ?Sized,
 {
     let name = msg.name.clone().unwrap_or_default();
+    // COPY is intercepted before the engine; the engine's parser would
+    // reject it, but we want it to flow through Bind/Execute so
+    // tokio-postgres' `copy_in` / `copy_out` (which always use the
+    // extended-query path) work.
+    match crate::copy::parse_copy(&msg.query) {
+        Ok(Some(cmd)) => {
+            let mut g = state.lock().await;
+            g.copy_statements.insert(name.clone(), cmd);
+            // Erase any prior engine-side statement under the same name
+            // so Bind/Execute see the COPY entry, not a stale handle.
+            g.statements.remove(&name);
+            return vec![PgWireBackendMessage::ParseComplete(ParseComplete::new())];
+        }
+        Ok(None) => {}
+        Err(msg) => {
+            let info = ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                msg,
+            );
+            return vec![PgWireBackendMessage::ErrorResponse(info.into())];
+        }
+    }
     match session.prepare(&msg.query).await {
         Ok((handle, schema)) => {
-            state.lock().await.statements.insert(
+            let mut g = state.lock().await;
+            g.copy_statements.remove(&name);
+            g.statements.insert(
                 name,
                 StatementEntry {
                     handle,
@@ -504,6 +584,22 @@ where
 {
     let stmt_name = msg.statement_name.clone().unwrap_or_default();
     let portal_name = msg.portal_name.clone().unwrap_or_default();
+
+    // COPY-shape statements have no parameters; skip the param-decoding
+    // path and stash the command on the COPY-portal map. Either way, the
+    // bind for a portal name overwrites whatever was there before — so
+    // clear both maps under that portal name to keep them disjoint.
+    {
+        let mut g = state.lock().await;
+        if let Some(cmd) = g.copy_statements.get(&stmt_name).cloned() {
+            g.portals.remove(&portal_name);
+            g.copy_portals.insert(portal_name, cmd);
+            return vec![PgWireBackendMessage::BindComplete(BindComplete::new())];
+        }
+        // Non-COPY rebind under this portal name: drop any stale COPY
+        // entry so Execute doesn't accidentally route to the COPY path.
+        g.copy_portals.remove(&portal_name);
+    }
 
     let entry = {
         let g = state.lock().await;
@@ -538,7 +634,17 @@ where
     // empty list means text for every slot.
     let mut params: Vec<ScalarParam> = Vec::with_capacity(msg.parameters.len());
     for (i, raw) in msg.parameters.iter().enumerate() {
-        let declared = arrow_to_pg_type(&entry.schema.param_types[i]);
+        // Mirror the OID surfaced in ParameterDescription: JSONB / UUID
+        // flags take precedence so `decode_param` sees the right type and
+        // routes the binary wire format through the proper path (rather
+        // than the BYTEA / TEXT catch-all that would corrupt the bytes).
+        let declared = if entry.schema.param_is_jsonb.get(i).copied().unwrap_or(false) {
+            Type::JSONB
+        } else if entry.schema.param_is_uuid.get(i).copied().unwrap_or(false) {
+            Type::UUID
+        } else {
+            arrow_to_pg_type(&entry.schema.param_types[i])
+        };
         let is_binary = match msg.parameter_format_codes.len() {
             0 => false,
             1 => msg.parameter_format_codes[0] == 1,
@@ -595,6 +701,16 @@ async fn handle_describe(
     let g = state.lock().await;
     match msg.target_type {
         TARGET_TYPE_BYTE_STATEMENT => {
+            // COPY: no parameters, no result rows. ParameterDescription
+            // (empty) + NoData keeps strict drivers like JDBC happy.
+            if g.copy_statements.contains_key(&name) {
+                return vec![
+                    PgWireBackendMessage::ParameterDescription(
+                        ParameterDescription::new(Vec::new()),
+                    ),
+                    PgWireBackendMessage::NoData(NoData::new()),
+                ];
+            }
             let entry = match g.statements.get(&name) {
                 Some(e) => e.clone(),
                 None => {
@@ -609,12 +725,26 @@ async fn handle_describe(
             drop(g);
             let mut out = Vec::with_capacity(2);
             // Always send ParameterDescription for a statement-describe so
-            // drivers that expect it (e.g. JDBC) keep going.
+            // drivers that expect it (e.g. JDBC) keep going. JSONB / UUID
+            // slots take their dedicated OIDs from the parallel flag vecs;
+            // strict drivers like asyncpg + pgx refuse to bind native
+            // `uuid.UUID` / `dict` values into BYTEA / TEXT slots, so we
+            // must advertise OID 3802 / 2950 here, not the Arrow-derived
+            // BYTEA / TEXT.
             let oids: Vec<u32> = entry
                 .schema
                 .param_types
                 .iter()
-                .map(|dt| arrow_to_pg_type(dt).oid())
+                .enumerate()
+                .map(|(i, dt)| {
+                    if entry.schema.param_is_jsonb.get(i).copied().unwrap_or(false) {
+                        Type::JSONB.oid()
+                    } else if entry.schema.param_is_uuid.get(i).copied().unwrap_or(false) {
+                        Type::UUID.oid()
+                    } else {
+                        arrow_to_pg_type(dt).oid()
+                    }
+                })
                 .collect();
             out.push(PgWireBackendMessage::ParameterDescription(
                 ParameterDescription::new(oids),
@@ -628,6 +758,10 @@ async fn handle_describe(
             out
         }
         TARGET_TYPE_BYTE_PORTAL => {
+            // COPY portals have no row description.
+            if g.copy_portals.contains_key(&name) {
+                return vec![PgWireBackendMessage::NoData(NoData::new())];
+            }
             let entry = match g.portals.get(&name) {
                 Some(e) => e.clone(),
                 None => {
@@ -658,15 +792,35 @@ async fn handle_describe(
     }
 }
 
+/// Outcome of an `Execute`. `messages` are fed verbatim. `copy_in_active`
+/// signals the simple-query / extended path to flip into
+/// `CopyInProgress(true)` so subsequent `CopyData` chunks route to the
+/// `CopyHandler`. `copy_in_state`, when present, is the staging state to
+/// hand to the shared per-connection slot.
+pub(crate) struct ExecuteOutcome {
+    pub(crate) messages: Vec<PgWireBackendMessage>,
+    pub(crate) start_copy_in: Option<crate::copy::CopyInState>,
+}
+
 async fn handle_execute<S>(
     state: &Mutex<ExtendedState>,
     session: &S,
     msg: Execute,
-) -> Vec<PgWireBackendMessage>
+) -> ExecuteOutcome
 where
     S: Session + ?Sized,
 {
     let portal_name = msg.name.clone().unwrap_or_default();
+    // COPY portals: route to the dedicated path. We don't talk to the
+    // engine for the "execute" itself — the row work happens later in
+    // CopyHandler::on_copy_data (FROM) or right here, synchronously (TO).
+    let copy_cmd = {
+        let g = state.lock().await;
+        g.copy_portals.get(&portal_name).cloned()
+    };
+    if let Some(cmd) = copy_cmd {
+        return execute_copy(session, cmd).await;
+    }
     let entry = {
         let g = state.lock().await;
         match g.portals.get(&portal_name) {
@@ -677,7 +831,10 @@ where
                     "34000".to_owned(),
                     format!("portal {portal_name:?} not found"),
                 );
-                return vec![PgWireBackendMessage::ErrorResponse(info.into())];
+                return ExecuteOutcome {
+                    messages: vec![PgWireBackendMessage::ErrorResponse(info.into())],
+                    start_copy_in: None,
+                };
             }
         }
     };
@@ -710,7 +867,10 @@ where
                 Err(e) => {
                     tracing::warn!(error = %e, "encode failed");
                     out.push(PgWireBackendMessage::ErrorResponse(error_response(&e)));
-                    return out;
+                    return ExecuteOutcome {
+                        messages: out,
+                        start_copy_in: None,
+                    };
                 }
             };
             let mut emitted = 0usize;
@@ -736,7 +896,71 @@ where
             out.push(PgWireBackendMessage::ErrorResponse(error_response(&e)));
         }
     }
-    out
+    ExecuteOutcome {
+        messages: out,
+        start_copy_in: None,
+    }
+}
+
+/// Execute a COPY portal: COPY FROM seeds the per-connection staging
+/// state and asks the caller to flip into `CopyInProgress(true)`; COPY
+/// TO emits the entire CopyOut sequence inline.
+async fn execute_copy<S>(session: &S, cmd: crate::copy::CopyCommand) -> ExecuteOutcome
+where
+    S: Session + ?Sized,
+{
+    match cmd {
+        crate::copy::CopyCommand::From {
+            table,
+            with_header,
+        } => {
+            let cols = match crate::copy::resolve_table_columns(session, &table).await {
+                Ok(c) if !c.is_empty() => c,
+                Ok(_) => {
+                    let info = ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42P01".to_owned(),
+                        format!("COPY FROM STDIN: cannot resolve schema of {table:?}"),
+                    );
+                    return ExecuteOutcome {
+                        messages: vec![PgWireBackendMessage::ErrorResponse(info.into())],
+                        start_copy_in: None,
+                    };
+                }
+                Err(e) => {
+                    return ExecuteOutcome {
+                        messages: vec![PgWireBackendMessage::ErrorResponse(error_response(
+                            &e,
+                        ))],
+                        start_copy_in: None,
+                    };
+                }
+            };
+            let n = cols.len();
+            let st =
+                crate::copy::CopyInState::new(table.clone(), cols, with_header);
+            ExecuteOutcome {
+                messages: crate::copy::copy_from_stdin_messages(n),
+                start_copy_in: Some(st),
+            }
+        }
+        crate::copy::CopyCommand::To {
+            table,
+            with_header,
+        } => {
+            // Reuse the simple-query path's emitter, but strip the
+            // trailing ReadyForQuery — Sync sends it in extended mode.
+            let mut msgs =
+                crate::copy::copy_to_stdout_messages(session, &table, with_header).await;
+            if matches!(msgs.last(), Some(PgWireBackendMessage::ReadyForQuery(_))) {
+                msgs.pop();
+            }
+            ExecuteOutcome {
+                messages: msgs,
+                start_copy_in: None,
+            }
+        }
+    }
 }
 
 async fn handle_close<S>(
@@ -750,13 +974,18 @@ where
     let name = msg.name.clone().unwrap_or_default();
     match msg.target_type {
         TARGET_TYPE_BYTE_STATEMENT => {
-            let removed = state.lock().await.statements.remove(&name);
+            let mut g = state.lock().await;
+            g.copy_statements.remove(&name);
+            let removed = g.statements.remove(&name);
+            drop(g);
             if let Some(e) = removed {
                 session.close_statement(&e.handle).await;
             }
         }
         TARGET_TYPE_BYTE_PORTAL => {
-            state.lock().await.portals.remove(&name);
+            let mut g = state.lock().await;
+            g.copy_portals.remove(&name);
+            g.portals.remove(&name);
         }
         _ => {}
     }
@@ -771,17 +1000,25 @@ pub(crate) struct BasinExtendedQueryHandler<S: Session + 'static> {
     /// See [`BasinSimpleQueryHandlerSlot::rate_limit`]; identical
     /// semantics — `None` disables, `Some` enforces per-tenant qps.
     rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
+    /// Per-connection in-flight `COPY FROM STDIN` slot. Shared with
+    /// `BasinSimpleQueryHandlerSlot` so the framework's `CopyHandler`
+    /// (the simple-query slot impl) sees the same staging state whether
+    /// COPY came in over simple or extended protocol. `None` always for
+    /// non-COPY statements.
+    pub(crate) copy_state: crate::copy::CopyStateSlot,
 }
 
 impl<S: Session + 'static> BasinExtendedQueryHandler<S> {
     pub(crate) fn new(
         session_slot: Arc<Mutex<Option<Arc<S>>>>,
         rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
+        copy_state: crate::copy::CopyStateSlot,
     ) -> Self {
         Self {
             session_slot,
             state: Arc::new(Mutex::new(ExtendedState::new())),
             rate_limit,
+            copy_state,
         }
     }
 
@@ -859,10 +1096,23 @@ impl<S: Session + 'static> ExtendedQueryHandler for BasinExtendedQueryHandler<S>
                 return Ok(());
             }
         }
-        for m in handle_execute(self.state.as_ref(), session.as_ref(), message).await {
+        let outcome = handle_execute(self.state.as_ref(), session.as_ref(), message).await;
+        for m in outcome.messages {
             client.feed(m).await?;
         }
-        client.set_state(PgWireConnectionState::ReadyForQuery);
+        if let Some(st) = outcome.start_copy_in {
+            // COPY FROM STDIN over the extended path: stash the staging
+            // state on the slot the CopyHandler reads from, then flip
+            // into CopyInProgress(true). The framework will route the
+            // following CopyData / CopyDone through `on_copy_data`
+            // / `on_copy_done`. The trailing Sync is handled later
+            // (after `on_copy_done` resets state to ReadyForQuery).
+            *self.copy_state.lock().await = Some(st);
+            client.flush().await?;
+            client.set_state(PgWireConnectionState::CopyInProgress(true));
+        } else {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+        }
         Ok(())
     }
 
@@ -1182,7 +1432,12 @@ impl<F: SessionFactory + 'static> PgWireServerHandlers for BasinHandlers<F> {
     type StartupHandler = BasinStartupHandler<F>;
     type SimpleQueryHandler = BasinSimpleQueryHandlerSlot<F::Session>;
     type ExtendedQueryHandler = BasinExtendedQueryHandler<F::Session>;
-    type CopyHandler = NoopCopyHandler;
+    // Same struct as the simple-query handler — `BasinSimpleQueryHandlerSlot`
+    // implements both traits so the per-connection COPY-IN staging state
+    // (column types, half-buffered CSV bytes, sticky error) is shared
+    // between `on_query` (which seeds it) and `on_copy_data` /
+    // `on_copy_done` (which drain it).
+    type CopyHandler = BasinSimpleQueryHandlerSlot<F::Session>;
     type ErrorHandler = NoopErrorHandler;
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
@@ -1198,7 +1453,7 @@ impl<F: SessionFactory + 'static> PgWireServerHandlers for BasinHandlers<F> {
     }
 
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {
-        Arc::new(NoopCopyHandler)
+        self.simple.clone()
     }
 
     fn error_handler(&self) -> Arc<Self::ErrorHandler> {
@@ -1210,6 +1465,11 @@ impl<F: SessionFactory + 'static> PgWireServerHandlers for BasinHandlers<F> {
 /// time. The slot is filled in by the startup handler; if a query arrives
 /// before the slot is populated, that's a bug on the pgwire side (state
 /// machine should refuse), so we treat it as an internal error.
+///
+/// Also carries the per-connection `COPY FROM STDIN` staging state
+/// ([`crate::copy::CopyInState`]). The struct is constructed via
+/// [`Self::new`] so the COPY slot stays an implementation detail; lib.rs
+/// hands in `slot` and `rate_limit` only.
 pub(crate) struct BasinSimpleQueryHandlerSlot<S: Session + 'static> {
     pub(crate) slot: Arc<Mutex<Option<Arc<S>>>>,
     /// Optional per-tenant rate limiter shared across every connection
@@ -1217,6 +1477,26 @@ pub(crate) struct BasinSimpleQueryHandlerSlot<S: Session + 'static> {
     /// throttling so existing demos/benches keep their unbounded
     /// throughput; `Some` is set when `BASIN_PGWIRE_RATE_LIMIT_QPS > 0`.
     pub(crate) rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
+    /// Holds an in-flight `COPY FROM STDIN`'s staging state for this
+    /// connection: the resolved column types, the half-buffered CSV input,
+    /// the running row count, and any sticky error captured mid-stream.
+    /// `None` whenever no COPY is active. The same struct is the
+    /// `CopyHandler` impl, so the on_copy_data / on_copy_done callbacks
+    /// reach the same slot.
+    pub(crate) copy_state: crate::copy::CopyStateSlot,
+}
+
+impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
+    pub(crate) fn new(
+        slot: Arc<Mutex<Option<Arc<S>>>>,
+        rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
+    ) -> Self {
+        Self {
+            slot,
+            rate_limit,
+            copy_state: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
 }
 
 #[async_trait]
@@ -1259,6 +1539,36 @@ impl<S: Session + 'static> SimpleQueryHandler for BasinSimpleQueryHandlerSlot<S>
                 return Ok(());
             }
         }
+        // COPY hooks here, before normal routing. `parse_copy` returns
+        // `Ok(None)` for non-COPY SQL so this is zero-cost on the hot path.
+        match crate::copy::parse_copy(&query.query) {
+            Ok(Some(cmd)) => {
+                return self.handle_copy(client, session, cmd).await;
+            }
+            Ok(None) => {}
+            Err(msg) => {
+                if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+                    return Err(PgWireError::NotReadyForQuery);
+                }
+                client.set_state(PgWireConnectionState::QueryInProgress);
+                let info = pgwire::error::ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(), // syntax_error
+                    msg,
+                );
+                client
+                    .feed(PgWireBackendMessage::ErrorResponse(info.into()))
+                    .await?;
+                client
+                    .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                        TransactionStatus::Idle,
+                    )))
+                    .await?;
+                client.flush().await?;
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                return Ok(());
+            }
+        }
         let inner = BasinSimpleQueryHandler::new(session);
         inner.on_query(client, query).await
     }
@@ -1274,6 +1584,233 @@ impl<S: Session + 'static> SimpleQueryHandler for BasinSimpleQueryHandlerSlot<S>
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         unreachable!("on_query is overridden and never delegates to do_query")
+    }
+}
+
+impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
+    /// Drive one COPY exchange end-to-end.
+    ///
+    /// `From` flips the connection into `CopyInProgress`; the rest is
+    /// driven by the framework via the [`CopyHandler`] impl below.
+    /// `To` runs entirely in this method — we synchronously query and
+    /// emit the full message sequence.
+    async fn handle_copy<C>(
+        &self,
+        client: &mut C,
+        session: Arc<S>,
+        cmd: crate::copy::CopyCommand,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        client.set_state(PgWireConnectionState::QueryInProgress);
+
+        match cmd {
+            crate::copy::CopyCommand::From {
+                table,
+                with_header,
+            } => {
+                let cols = match crate::copy::resolve_table_columns(session.as_ref(), &table)
+                    .await
+                {
+                    Ok(c) if !c.is_empty() => c,
+                    Ok(_) => {
+                        // Engine returned no columns — table unknown or
+                        // SELECT * couldn't plan. Surface as a clean
+                        // ErrorResponse so the protocol doesn't enter
+                        // CopyIn state.
+                        let info = pgwire::error::ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "42P01".to_owned(), // undefined_table
+                            format!("COPY FROM STDIN: cannot resolve schema of {table:?}"),
+                        );
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse(info.into()))
+                            .await?;
+                        client
+                            .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                                TransactionStatus::Idle,
+                            )))
+                            .await?;
+                        client.flush().await?;
+                        client.set_state(PgWireConnectionState::ReadyForQuery);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse(
+                                crate::error::error_response(&e),
+                            ))
+                            .await?;
+                        client
+                            .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                                TransactionStatus::Idle,
+                            )))
+                            .await?;
+                        client.flush().await?;
+                        client.set_state(PgWireConnectionState::ReadyForQuery);
+                        return Ok(());
+                    }
+                };
+                let n = cols.len();
+                {
+                    let mut g = self.copy_state.lock().await;
+                    *g = Some(crate::copy::CopyInState::new(
+                        table.clone(),
+                        cols,
+                        with_header,
+                    ));
+                }
+                for m in crate::copy::copy_from_stdin_messages(n) {
+                    client.feed(m).await?;
+                }
+                client.flush().await?;
+                client.set_state(PgWireConnectionState::CopyInProgress(false));
+                Ok(())
+            }
+            crate::copy::CopyCommand::To {
+                table,
+                with_header,
+            } => {
+                for m in
+                    crate::copy::copy_to_stdout_messages(session.as_ref(), &table, with_header)
+                        .await
+                {
+                    client.feed(m).await?;
+                }
+                client.flush().await?;
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl<S: Session + 'static> CopyHandler for BasinSimpleQueryHandlerSlot<S> {
+    async fn on_copy_data<C>(&self, _client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let session = {
+            let g = self.slot.lock().await;
+            g.clone().ok_or_else(|| {
+                PgWireError::ApiError(
+                    "session not bound to connection at CopyData time".into(),
+                )
+            })?
+        };
+        let mut g = self.copy_state.lock().await;
+        let state = match g.as_mut() {
+            Some(s) => s,
+            None => {
+                // Stray CopyData with no active COPY — silently ignore so
+                // we don't desync. Framework will eventually time out or
+                // the client will send CopyDone.
+                return Ok(());
+            }
+        };
+        state.buffer.extend_from_slice(&copy_data.data);
+        crate::copy::process_buffered_rows(state, session.as_ref(), false).await;
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // Capture the original state-machine flag before we touch it. The
+        // framework calls us while still in `CopyInProgress(<flag>)`; for
+        // simple-protocol it transitions out itself afterwards, but for
+        // extended-protocol the comment in pgwire 0.28's server.rs says
+        // "let the on_sync handler send the ReadyForQuery" — which only
+        // works if WE move out of CopyInProgress here, otherwise the
+        // following `Sync` falls into the catch-all `_ => {}` branch and
+        // is silently dropped, deadlocking the client.
+        let is_extended = matches!(
+            client.state(),
+            PgWireConnectionState::CopyInProgress(true)
+        );
+
+        let session = {
+            let g = self.slot.lock().await;
+            g.clone().ok_or_else(|| {
+                PgWireError::ApiError(
+                    "session not bound to connection at CopyDone time".into(),
+                )
+            })?
+        };
+        let state = {
+            let mut g = self.copy_state.lock().await;
+            g.take()
+        };
+        let mut state = match state {
+            Some(s) => s,
+            None => {
+                if is_extended {
+                    client.set_state(PgWireConnectionState::ReadyForQuery);
+                }
+                return Ok(());
+            }
+        };
+        // Flush any final unterminated row.
+        crate::copy::process_buffered_rows(&mut state, session.as_ref(), true).await;
+
+        // For the simple-protocol case: framework appends ReadyForQuery
+        // itself after we return; we just emit the close tag.
+        // For the extended case: caller will send Sync next; we emit the
+        // close tag and transition out of CopyInProgress so Sync routes
+        // to `on_sync`, which sends ReadyForQuery.
+        let msg = if let Some(err) = state.error {
+            PgWireBackendMessage::ErrorResponse(
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    err,
+                )
+                .into(),
+            )
+        } else {
+            PgWireBackendMessage::CommandComplete(
+                pgwire::messages::response::CommandComplete::new(format!(
+                    "COPY {}",
+                    state.row_count
+                )),
+            )
+        };
+        client.feed(msg).await?;
+        client.flush().await?;
+        if is_extended {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+        }
+        Ok(())
+    }
+
+    async fn on_copy_fail<C>(&self, _client: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // Client cancelled COPY mid-stream. Drop any staged state.
+        {
+            let mut g = self.copy_state.lock().await;
+            *g = None;
+        }
+        PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+            "ERROR".to_owned(),
+            "57014".to_owned(), // query_canceled
+            format!("COPY FROM STDIN cancelled by client: {}", fail.message),
+        )))
     }
 }
 
@@ -1482,6 +2019,8 @@ mod tests {
                 h,
                 StatementSchema {
                     param_types: self.param_types.clone(),
+                    param_is_jsonb: vec![false; n],
+                    param_is_uuid: vec![false; n],
                     columns: Vec::new(),
                 },
             ))
@@ -1529,8 +2068,11 @@ mod tests {
             &self,
             _handle: &StatementHandle,
         ) -> Result<StatementSchema> {
+            let n = self.param_types.len();
             Ok(StatementSchema {
                 param_types: self.param_types.clone(),
+                param_is_jsonb: vec![false; n],
+                param_is_uuid: vec![false; n],
                 columns: Vec::new(),
             })
         }
@@ -1578,7 +2120,7 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            exec_msgs.first(),
+            exec_msgs.messages.first(),
             Some(PgWireBackendMessage::CommandComplete(_))
         ));
 
@@ -1723,5 +2265,96 @@ mod tests {
         let stats = pool.stats();
         assert_eq!(stats.misses, 1, "first open is the only miss, got {stats:?}");
         assert!(stats.hits >= 1, "second open should hit, got {stats:?}");
+    }
+
+    /// Binary JSONB wire format = 0x01 version byte + canonical-form JSON
+    /// text. The decoder strips the version byte and lifts the rest to
+    /// `ScalarParam::Text` so the engine's text-substitution path can quote
+    /// it as a SQL literal.
+    #[test]
+    fn decode_param_binary_jsonb_strips_version_byte() {
+        let mut wire = vec![0x01u8];
+        wire.extend_from_slice(br#"{"k":"v"}"#);
+        let p = super::decode_param_binary(&wire, &Type::JSONB).expect("decode");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, r#"{"k":"v"}"#),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_binary_jsonb_rejects_unknown_version() {
+        let wire = vec![0x02u8, b'{', b'}'];
+        let err = super::decode_param_binary(&wire, &Type::JSONB)
+            .expect_err("unknown version must error");
+        match err {
+            PgWireError::UserError(info) => {
+                // SQLSTATE 0A000 = feature_not_supported.
+                assert_eq!(info.code, "0A000");
+            }
+            other => panic!("expected UserError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_binary_jsonb_empty_is_invalid() {
+        let err = super::decode_param_binary(&[], &Type::JSONB)
+            .expect_err("empty JSONB must error");
+        match err {
+            PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
+            other => panic!("expected UserError, got {other:?}"),
+        }
+    }
+
+    /// Binary UUID = 16 raw bytes; we render canonical hyphenated form
+    /// because the engine's INSERT path accepts string-quoted UUID literals.
+    #[test]
+    fn decode_param_binary_uuid_renders_hyphenated() {
+        // Test vector: 8400e29b-41d4-4716-a716-446655440000.
+        let wire: [u8; 16] = [
+            0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0x47, 0x16,
+            0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+        ];
+        let p = super::decode_param_binary(&wire, &Type::UUID).expect("decode");
+        match p {
+            ScalarParam::Text(s) => {
+                assert_eq!(s, "8400e29b-41d4-4716-a716-446655440000");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_binary_uuid_wrong_length_is_22p03() {
+        let err = super::decode_param_binary(&[0u8; 15], &Type::UUID)
+            .expect_err("short UUID must error");
+        match err {
+            PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
+            other => panic!("expected UserError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_text_jsonb_passes_through() {
+        let p = super::decode_param_text(br#"{"k":"v"}"#, &Type::JSONB).expect("decode");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, r#"{"k":"v"}"#),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_text_uuid_passes_through() {
+        let p = super::decode_param_text(
+            b"8400e29b-41d4-4716-a716-446655440000",
+            &Type::UUID,
+        )
+        .expect("decode");
+        match p {
+            ScalarParam::Text(s) => {
+                assert_eq!(s, "8400e29b-41d4-4716-a716-446655440000");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 }

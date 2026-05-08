@@ -179,6 +179,14 @@ impl PostgresCatalog {
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS continuous_aggregate_json JSONB"
             ),
+            // Phase 5.7 B2 forward-compat: cluster-column list for
+            // physical sort-on-write. JSONB array of column names; NULL /
+            // absent means "no cluster columns" — the default for
+            // back-compat. The writer consults this on every put.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS cluster_columns_json JSONB"
+            ),
         ];
         let client = self.client.lock().await;
         for stmt in stmts {
@@ -317,6 +325,7 @@ impl Catalog for PostgresCatalog {
             bloom_filter_columns: Vec::new(),
             row_group_rows: None,
             continuous_aggregate: None,
+            cluster_columns: Vec::new(),
         })
     }
 
@@ -333,7 +342,7 @@ impl Catalog for PostgresCatalog {
                     "SELECT schema_json, current_snapshot, format_version, partition_spec_json,
                             rls_enabled, policies_json, cold_after_seconds, cold_age_column,
                             bloom_filter_columns_json, row_group_rows,
-                            continuous_aggregate_json
+                            continuous_aggregate_json, cluster_columns_json
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2"
                 ),
@@ -355,6 +364,7 @@ impl Catalog for PostgresCatalog {
         let bloom_filter_columns_json: Option<serde_json::Value> = row.get(8);
         let row_group_rows_pg: Option<i64> = row.get(9);
         let continuous_aggregate_json: Option<serde_json::Value> = row.get(10);
+        let cluster_columns_json: Option<serde_json::Value> = row.get(11);
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
         let partition_spec = match partition_spec_json {
@@ -388,6 +398,12 @@ impl Catalog for PostgresCatalog {
             })?),
             None => None,
         };
+        let cluster_columns: Vec<String> = match cluster_columns_json {
+            Some(v) => serde_json::from_value(v).map_err(|e| {
+                BasinError::catalog(format!("deserialise cluster_columns: {e}"))
+            })?,
+            None => Vec::new(),
+        };
 
         let snapshots = fetch_snapshots(&client, sch, &tenant_str, &table_str).await?;
         Ok(TableMetadata {
@@ -405,6 +421,7 @@ impl Catalog for PostgresCatalog {
             bloom_filter_columns,
             row_group_rows,
             continuous_aggregate,
+            cluster_columns,
         })
     }
 
@@ -922,6 +939,42 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    async fn set_cluster_columns(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        // Empty list serialises to a JSONB array [] (not NULL). Either is
+        // valid storage; we keep the array so a follow-up UPDATE that
+        // *clears* the spec ends up with NULL again only if explicitly
+        // chosen — keeps round-tripping deterministic.
+        let json: Option<serde_json::Value> = if columns.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&columns).map_err(|e| {
+                BasinError::catalog(format!("serialise cluster_columns: {e}"))
+            })?)
+        };
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET cluster_columns_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_cluster_columns: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
     async fn set_schema(
         &self,
@@ -974,6 +1027,184 @@ impl Catalog for PostgresCatalog {
             return Err(BasinError::not_found(format!("{tenant}/{table}")));
         }
         fetch_snapshots(&client, sch, &tenant_str, &table_str).await
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, src = %src_table, dst = %dst_table))]
+    async fn fork_table(
+        &self,
+        tenant: &TenantId,
+        src_table: &TableName,
+        dst_table: &TableName,
+    ) -> Result<TableMetadata> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let src_str = src_table.to_string();
+        let dst_str = dst_table.to_string();
+        let mut client = self.client.lock().await;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork txn begin: {e}")))?;
+
+        // 1. Lock & verify source row exists; fail fast if it doesn't.
+        let src_row = txn
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.tables \
+                     WHERE tenant_id = $1 AND table_name = $2 \
+                     FOR UPDATE"
+                ),
+                &[&tenant_str, &src_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork src lookup: {e}")))?;
+        if src_row.is_none() {
+            return Err(BasinError::not_found(format!("{tenant}/{src_table}")));
+        }
+
+        // 2. Copy the table row into the dst row (`INSERT … SELECT …`).
+        // `ON CONFLICT DO NOTHING` lets us detect a pre-existing dst by
+        // counting affected rows.
+        let inserted = txn
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.tables (
+                        tenant_id, table_name, schema_json, current_snapshot,
+                        format_version, partition_spec_json, rls_enabled,
+                        policies_json, cold_after_seconds, cold_age_column,
+                        bloom_filter_columns_json, row_group_rows,
+                        continuous_aggregate_json, cluster_columns_json
+                     )
+                     SELECT tenant_id, $3, schema_json, current_snapshot,
+                            format_version, partition_spec_json, rls_enabled,
+                            policies_json, cold_after_seconds, cold_age_column,
+                            bloom_filter_columns_json, row_group_rows,
+                            continuous_aggregate_json, cluster_columns_json
+                     FROM {sch}.tables
+                     WHERE tenant_id = $1 AND table_name = $2
+                     ON CONFLICT (tenant_id, table_name) DO NOTHING"
+                ),
+                &[&tenant_str, &src_str, &dst_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork insert table: {e}")))?;
+        if inserted == 0 {
+            return Err(BasinError::catalog(format!(
+                "fork_table: {tenant}/{dst_table} already exists",
+            )));
+        }
+
+        // 3. Copy every snapshot row, retargeted at the new table name.
+        // Snapshot ids are preserved verbatim — the fork has identical
+        // history up to its creation point, then diverges.
+        txn.execute(
+            &format!(
+                "INSERT INTO {sch}.snapshots (
+                    tenant_id, table_name, snapshot_id, parent_id,
+                    operation, committed_at, summary_json, data_files
+                 )
+                 SELECT tenant_id, $3, snapshot_id, parent_id,
+                        operation, committed_at, summary_json, data_files
+                 FROM {sch}.snapshots
+                 WHERE tenant_id = $1 AND table_name = $2"
+            ),
+            &[&tenant_str, &src_str, &dst_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("fork copy snapshots: {e}")))?;
+
+        txn.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork commit: {e}")))?;
+
+        // Re-fetch through the public API for a metadata value identical
+        // to what `load_table` produces.
+        drop(client);
+        self.load_table(tenant, dst_table).await
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, snapshot = %snapshot_id))]
+    async fn rollback_to_snapshot(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        snapshot_id: SnapshotId,
+    ) -> Result<TableMetadata> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let table_str = table.to_string();
+        let snap_id_i64 = snapshot_id.0 as i64;
+        let mut client = self.client.lock().await;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("rollback txn begin: {e}")))?;
+
+        // 1. Existence + snapshot-in-history check, with row lock to keep
+        // a concurrent commit from racing the truncate.
+        let row = txn
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.tables \
+                     WHERE tenant_id = $1 AND table_name = $2 \
+                     FOR UPDATE"
+                ),
+                &[&tenant_str, &table_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("rollback table lookup: {e}")))?;
+        if row.is_none() {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        let snap_row = txn
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.snapshots \
+                     WHERE tenant_id = $1 AND table_name = $2 \
+                       AND snapshot_id = $3"
+                ),
+                &[&tenant_str, &table_str, &snap_id_i64],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("rollback snapshot lookup: {e}")))?;
+        if snap_row.is_none() {
+            return Err(BasinError::not_found(format!(
+                "{tenant}/{table}: snapshot {snapshot_id} not in history",
+            )));
+        }
+
+        // 2. Drop snapshots newer than the target.
+        txn.execute(
+            &format!(
+                "DELETE FROM {sch}.snapshots \
+                 WHERE tenant_id = $1 AND table_name = $2 \
+                   AND snapshot_id > $3"
+            ),
+            &[&tenant_str, &table_str, &snap_id_i64],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("rollback snapshot delete: {e}")))?;
+
+        // 3. Move the head pointer back.
+        txn.execute(
+            &format!(
+                "UPDATE {sch}.tables SET current_snapshot = $3 \
+                 WHERE tenant_id = $1 AND table_name = $2"
+            ),
+            &[&tenant_str, &table_str, &snap_id_i64],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("rollback head update: {e}")))?;
+
+        txn.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("rollback commit: {e}")))?;
+
+        // Drop the lock guard before re-entering load_table (which also
+        // grabs the lock). Re-fetch through the public API to keep the
+        // returned metadata identical to what `load_table` would yield.
+        drop(client);
+        self.load_table(tenant, table).await
     }
 }
 

@@ -94,6 +94,12 @@ impl Shard {
         }
     }
 
+    /// Handle to the underlying WAL. Exposed so the engine can plumb its
+    /// per-tenant counter registry into the WAL alongside the storage layer.
+    pub fn wal(&self) -> &basin_wal::Wal {
+        self.inner.wal()
+    }
+
     /// Get a handle to `(tenant, partition)`. Lazy-loads the state from WAL +
     /// Parquet on first access; subsequent calls return a cheap clone.
     pub async fn get(
@@ -251,6 +257,7 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle;
     fn stats(&self) -> ShardStats;
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
+    fn wal(&self) -> &basin_wal::Wal;
     async fn flush_to_parquet(&self) -> Result<()>;
     async fn run_tiering_sweep(&self) -> Result<()>;
     /// Tenants the shard has resident state for. Used by the CV

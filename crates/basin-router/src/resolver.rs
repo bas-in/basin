@@ -84,6 +84,35 @@ impl TenantResolver for JwtTenantResolver {
     }
 }
 
+/// API-key-backed resolver. The pgwire `user` parameter carries an opaque
+/// long-lived API key (optionally `Bearer ...`-prefixed); the resolver
+/// looks it up in the auth DB and returns the owning tenant. Pair with
+/// [`StackedTenantResolver`] in front of [`JwtTenantResolver`] when a
+/// deployment serves both credential types on the same listener.
+#[derive(Clone)]
+pub struct ApiKeyTenantResolver {
+    auth: Arc<basin_auth::AuthService>,
+}
+
+impl ApiKeyTenantResolver {
+    pub fn new(auth: Arc<basin_auth::AuthService>) -> Self {
+        Self { auth }
+    }
+}
+
+#[async_trait]
+impl TenantResolver for ApiKeyTenantResolver {
+    async fn resolve(&self, username: &str) -> Result<TenantId> {
+        let token = username.strip_prefix("Bearer ").unwrap_or(username);
+        let (tenant, _user) = self
+            .auth
+            .validate_api_key(token)
+            .await
+            .map_err(|e| BasinError::not_found(format!("invalid api key: {e}")))?;
+        Ok(tenant)
+    }
+}
+
 /// Resolves tenants by trying each backing resolver in order until one
 /// succeeds. Used by basin-server when both JWT and static credentials
 /// are in play during a transition or demo.
@@ -232,6 +261,7 @@ mod tests {
             bcrypt_cost: 4,
             password_min_len: 10,
             rate_limit_per_ip_per_min: 1000,
+            email_enabled: true,
         }
     }
 

@@ -1,0 +1,26 @@
+{
+  "kind": "viability",
+  "id": "cluster_by_sql",
+  "name": "CLUSTER BY SQL surface (Phase 5.7 B2)",
+  "claim": "Every CLUSTER BY form (CREATE TABLE … CLUSTER BY, ALTER TABLE … CLUSTER BY, ALTER TABLE … RESET CLUSTER BY) parses, persists to the catalog, validates column membership, and the writer physically sorts flushed batches.",
+  "passed": true,
+  "primary": {
+    "label": "cluster_by_variants_passed",
+    "value": 5.0,
+    "unit": "variants",
+    "bar": {
+      "op": "equal",
+      "value": 5.0
+    }
+  },
+  "details": {
+    "variants_passed": [
+      "CREATE TABLE … CLUSTER BY (...)",
+      "ALTER TABLE … CLUSTER BY (...)",
+      "ALTER TABLE … RESET CLUSTER BY",
+      "CLUSTER BY rejects unknown column",
+      "e2e: cluster-by sorts file physically"
+    ]
+  },
+  "generated_at": "@1778204014"
+}

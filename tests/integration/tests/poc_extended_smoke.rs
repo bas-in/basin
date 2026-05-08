@@ -62,6 +62,7 @@ async fn start_server() -> TestServer {
         tenant_resolver: resolver,
         pool: None,
         shard_endpoints: None,
+        tls: None,
     })
     .await
     .expect("server failed to bind");

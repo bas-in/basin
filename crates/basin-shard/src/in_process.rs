@@ -648,6 +648,10 @@ impl ShardImpl for InProcessShard {
         Arc::new(self.share_clone())
     }
 
+    fn wal(&self) -> &basin_wal::Wal {
+        &self.cfg.wal
+    }
+
     async fn flush_to_parquet(&self) -> Result<()> {
         self.compact_all().await
     }

@@ -13,7 +13,7 @@ use sqlparser::parser::Parser;
 
 use crate::analytical_route::is_analytical;
 use crate::convert::{batch_df_to_ws, schema_df_to_ws};
-use crate::ddl::{partition_spec_from_ast, schema_from_columns};
+use crate::ddl::{extract_create_table_cluster_by, partition_spec_from_ast, schema_from_columns};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
 use crate::fast_select::{execute_simple_select, match_simple_select};
 use crate::session::refresh_table;
@@ -46,6 +46,14 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         .await?;
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
+
+    // Phase 5.7 B2: lift trailing `CLUSTER BY (col, …)` out of CREATE TABLE
+    // before sqlparser sees it. PostgreSqlDialect doesn't recognise the
+    // form so we strip it here and apply the columns via `set_cluster_columns`
+    // after the table is created. Returns the original SQL untouched when
+    // the clause isn't present.
+    let (cluster_stripped, cluster_columns) = extract_create_table_cluster_by(sql)?;
+    let sql = cluster_stripped.as_str();
 
     // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
     // matching UDF calls before handing the SQL to sqlparser. See
@@ -92,7 +100,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     }
 
     match stmt {
-        Statement::CreateTable(ct) => exec_create_table(sess, ct).await,
+        Statement::CreateTable(ct) => exec_create_table(sess, ct, cluster_columns).await,
         Statement::Insert(ins) => exec_insert(sess, ins).await,
         Statement::Query(_) => {
             // Analytical routing happens before the point-query fast path so
@@ -181,11 +189,25 @@ fn rows_from_batches(batches: Vec<RecordBatch>) -> ExecResult {
 async fn exec_create_table(
     sess: &TenantSession,
     ct: sqlparser::ast::CreateTable,
+    cluster_columns: Option<Vec<String>>,
 ) -> Result<ExecResult> {
     let name = single_part_name(&ct.name)?;
     let table = TableName::new(name)?;
     let schema = schema_from_columns(&ct.columns)?;
     let spec = partition_spec_from_ast(ct.partition_by.as_deref(), &schema)?;
+
+    // Validate cluster columns are a subset of the table's columns BEFORE
+    // we create the table — bouncing here means we don't leave a half-
+    // created table around when the user typo'd a column name.
+    if let Some(cols) = cluster_columns.as_ref() {
+        for c in cols {
+            if schema.field_with_name(c).is_err() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "CLUSTER BY column {c:?} is not in the table schema"
+                )));
+            }
+        }
+    }
 
     sess.engine
         .config()
@@ -198,6 +220,14 @@ async fn exec_create_table(
             .config()
             .catalog
             .set_partition_spec(&sess.tenant, &table, spec)
+            .await?;
+    }
+
+    if let Some(cols) = cluster_columns {
+        sess.engine
+            .config()
+            .catalog
+            .set_cluster_columns(&sess.tenant, &table, cols)
             .await?;
     }
 
@@ -328,6 +358,7 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
     WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
+        cluster_columns: meta.cluster_columns.clone(),
     }
 }
 
@@ -530,21 +561,179 @@ async fn table_has_rls(sess: &TenantSession, table: &TableName) -> Result<bool> 
     Ok(meta.rls_enabled)
 }
 
+/// Collect every table the query can read from — the input set RLS must
+/// inject predicates against.
+///
+/// Walks every shape that can hide a `TableScan` from the rewriter:
+///
+/// - top-level `SetExpr::Select` → each `from.relation` + every `from.joins[*]`
+/// - `SetExpr::SetOperation` (UNION / INTERSECT / EXCEPT) → both legs
+/// - `query.with` CTEs → each CTE body (a sub-`Query`) recurses
+/// - `TableFactor::Derived` (FROM (SELECT …)) → subquery recurses
+/// - `TableFactor::NestedJoin` → unwrap the inner `TableWithJoins`
+/// - subqueries embedded in expressions (WHERE, HAVING, projection,
+///   `EXISTS`, `IN (SELECT …)`, scalar subqueries) → recurse
+///
+/// **Why this matters (P0):** RLS predicate injection short-circuits when
+/// `referenced.is_empty()`. A naive walker that only handles
+/// `SetExpr::Select` returns an empty list for `SELECT … UNION SELECT …`
+/// and `WITH peek AS (SELECT …) SELECT … FROM peek`, leaving the
+/// underlying `TableScan`s un-rewritten and *silently leaking* rows the
+/// policy would otherwise hide. See
+/// `tests/integration/tests/security.rs::rls_union_subquery_cannot_bypass`
+/// and `rls_cte_cannot_bypass` for the regression repro — those tests
+/// must stay green for this invariant to hold.
 fn collect_table_refs_from_query(query: &sqlparser::ast::Query) -> Vec<TableName> {
-    use sqlparser::ast::{SetExpr, TableFactor};
     let mut out = Vec::new();
-    if let SetExpr::Select(select) = query.body.as_ref() {
-        for from in &select.from {
-            if let TableFactor::Table { name, .. } = &from.relation {
-                if name.0.len() == 1 {
-                    if let Ok(t) = TableName::new(name.0[0].value.clone()) {
-                        out.push(t);
-                    }
+    collect_from_query(query, &mut out);
+    out
+}
+
+fn collect_from_query(query: &sqlparser::ast::Query, out: &mut Vec<TableName>) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_from_query(&cte.query, out);
+        }
+    }
+    collect_from_set_expr(query.body.as_ref(), out);
+}
+
+fn collect_from_set_expr(set_expr: &sqlparser::ast::SetExpr, out: &mut Vec<TableName>) {
+    use sqlparser::ast::SetExpr;
+    match set_expr {
+        SetExpr::Select(select) => {
+            for from in &select.from {
+                collect_from_table_factor(&from.relation, out);
+                for join in &from.joins {
+                    collect_from_table_factor(&join.relation, out);
+                }
+            }
+            if let Some(sel) = &select.selection {
+                collect_from_expr(sel, out);
+            }
+            if let Some(having) = &select.having {
+                collect_from_expr(having, out);
+            }
+            if let Some(qualify) = &select.qualify {
+                collect_from_expr(qualify, out);
+            }
+            for item in &select.projection {
+                collect_from_select_item(item, out);
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_from_set_expr(left, out);
+            collect_from_set_expr(right, out);
+        }
+        SetExpr::Query(q) => collect_from_query(q, out),
+        // VALUES / Insert / Update / Delete / Table — no rewritable
+        // TableScan reachable from a SELECT-shaped RLS path.
+        _ => {}
+    }
+}
+
+fn collect_from_table_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<TableName>) {
+    use sqlparser::ast::TableFactor;
+    match tf {
+        TableFactor::Table { name, .. } => {
+            if name.0.len() == 1 {
+                if let Ok(t) = TableName::new(name.0[0].value.clone()) {
+                    out.push(t);
                 }
             }
         }
+        TableFactor::Derived { subquery, .. } => collect_from_query(subquery, out),
+        TableFactor::NestedJoin { table_with_joins, .. } => {
+            collect_from_table_factor(&table_with_joins.relation, out);
+            for join in &table_with_joins.joins {
+                collect_from_table_factor(&join.relation, out);
+            }
+        }
+        // TableFunction / Pivot / Unpivot / UNNEST etc — function-style
+        // sources don't reference catalog tables in the RLS-relevant way;
+        // any subqueries embedded in their args are walked by the
+        // expression-side traversal.
+        _ => {}
     }
-    out
+}
+
+fn collect_from_select_item(item: &sqlparser::ast::SelectItem, out: &mut Vec<TableName>) {
+    use sqlparser::ast::SelectItem;
+    match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            collect_from_expr(e, out);
+        }
+        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
+    }
+}
+
+fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => collect_from_query(q, out),
+        Expr::InSubquery { subquery: q, expr: e, .. } => {
+            collect_from_query(q, out);
+            collect_from_expr(e, out);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_from_expr(left, out);
+            collect_from_expr(right, out);
+        }
+        Expr::UnaryOp { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::Nested(e)
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsFalse(e)
+        | Expr::IsNotTrue(e)
+        | Expr::IsNotFalse(e)
+        | Expr::IsUnknown(e)
+        | Expr::IsNotUnknown(e) => collect_from_expr(e, out),
+        Expr::Between { expr: e, low, high, .. } => {
+            collect_from_expr(e, out);
+            collect_from_expr(low, out);
+            collect_from_expr(high, out);
+        }
+        Expr::Like { expr: e, pattern, .. }
+        | Expr::ILike { expr: e, pattern, .. }
+        | Expr::SimilarTo { expr: e, pattern, .. } => {
+            collect_from_expr(e, out);
+            collect_from_expr(pattern, out);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_from_expr(e, out);
+            for x in list {
+                collect_from_expr(x, out);
+            }
+        }
+        Expr::Case { operand, conditions, results, else_result } => {
+            if let Some(o) = operand {
+                collect_from_expr(o, out);
+            }
+            for c in conditions {
+                collect_from_expr(c, out);
+            }
+            for r in results {
+                collect_from_expr(r, out);
+            }
+            if let Some(e) = else_result {
+                collect_from_expr(e, out);
+            }
+        }
+        Expr::Function(_)
+        | Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::TypedString { .. }
+        | Expr::Wildcard
+        | Expr::QualifiedWildcard(_) => {}
+        // Anything else (windows, lambdas, MATCH, dialect-specific) —
+        // walking it is best-effort and we're conservative on misses
+        // here: the `_` arm is reachable only on shapes that don't carry
+        // a Query, so RLS coverage is preserved.
+        _ => {}
+    }
 }
 
 /// Apply an RLS DDL statement to the catalog. The mutation reads the current

@@ -14,6 +14,8 @@ records every "no" with the trigger that would change our mind.
 
 Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on roadmap.
 
+Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_coverage.rs`](./tests/integration/tests/feature_coverage.rs) (or its named cross-reference in that file's audit comment). Security invariants verified by [`tests/integration/tests/security.rs`](./tests/integration/tests/security.rs).
+
 ---
 
 ## Wire protocol
@@ -23,9 +25,9 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 | pgwire v3 | ✅ | startup + cleartext-password auth + simple query |
 | Simple query (`Q` message) | ✅ | what `psql` types into the prompt |
 | Extended query (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Sync`) | ✅ | full Parse/Bind/Describe/Execute/Close/Sync; `tokio-postgres::query` works |
-| Binary parameter / result format | ✅ | INT2/4/8, FLOAT4/8, BOOL, BYTEA, TEXT, JSONB, UUID, FixedSizeBinary |
-| `COPY FROM STDIN` / `COPY TO STDOUT` | ◻️ | bulk import / export |
-| TLS | ◻️ | rustls behind a feature flag |
+| Binary parameter / result format | ✅ | INT2/4/8, FLOAT4/8, BOOL, BYTEA, TEXT, JSONB, UUID, FixedSizeBinary. JSONB / UUID parameter binding is native — `ParameterDescription` advertises OID 3802 / 2950 for INSERT / UPDATE / SELECT-WHERE slots whose target column carries `BASIN_TYPE=JSONB` / `BASIN_TYPE=UUID` metadata, and the Bind decoder understands both wire formats (JSONB v1: leading `0x01` version byte + canonical-form JSON; UUID: 16 raw RFC 4122 bytes). asyncpg / pgx / tokio-postgres encode `uuid.UUID` / `dict` / `serde_json::Value` directly without string coercion. |
+| `COPY FROM STDIN` / `COPY TO STDOUT` | ✅ | CSV format only (RFC 4180-ish, comma-delimited; `WITH (FORMAT CSV [, HEADER true])`); BINARY / custom DELIMITER / NULL spec / column-list / file-path variants rejected with SQLSTATE 42601. COPY-IN imports row-by-row INSERTs against the engine; on a mid-stream error we drain to `CopyDone` before responding so the connection stays usable. Drives both simple-query and the extended-query path so `tokio_postgres::copy_in` / `copy_out` and `psql \copy` both work. |
+| TLS | ✅ | rustls (aws-lc-rs) on the pgwire listener; static PEM cert + key via `BASIN_TLS_CERT_PATH` / `BASIN_TLS_KEY_PATH`. SSLRequest answered `'S'`/`'N'` and the socket wrapped before pgwire startup. mTLS / OCSP / cert rotation / ALPN selection deferred to v0.2. |
 | `LISTEN` / `NOTIFY` | 🚫 | no pub/sub today |
 | Replication protocol | 🚫 | not the right shape for object-store storage |
 
@@ -40,7 +42,7 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 | `ORDER BY` / `LIMIT` | ✅ | full DataFusion support |
 | Joins (single-shard) | 🛠 | DataFusion handles them; not yet exercised in tests |
 | `UPDATE` / `DELETE` | ✅ | Copy-on-write Iceberg v2. Single-scan partition; `replace_data_files` with optimistic concurrency on both catalog backends; physical deletion of replaced Parquet files. |
-| `ALTER TABLE` | ✅ | `ADD COLUMN`, `SET cold_after`, `SET cold_age_column`, `SET BLOOM FILTERS ON`, `SET row_group_rows`, `RESET row_group_rows`, `ENABLE/DISABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `DROP POLICY` |
+| `ALTER TABLE` | ✅ | `ADD COLUMN`, `SET cold_after`, `SET cold_age_column`, `SET BLOOM FILTERS ON`, `SET row_group_rows`, `RESET row_group_rows`, `CLUSTER BY (...)`, `RESET CLUSTER BY`, `ENABLE/DISABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `DROP POLICY` |
 | `CREATE MATERIALIZED VIEW … WITH (basin.continuous, …)` | 🛠 | Rust API ships via `basin-cv`; SQL surface is in `cv_glue` stub |
 | `CREATE POLICY` (RLS) | ✅ | predicate injection at logical-plan layer; cross-tenant leak invariant verified |
 | Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ◻️ | single-shard only when shipped |
@@ -77,7 +79,7 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 | BYO-bucket | ◻️ | customer's S3 + IAM role |
 | BYO-key (KMS) | ◻️ | platform never sees plaintext |
 | Tenant deletion (`O(file_count)`) | ✅ | `Storage::delete_tenant` is catalog-first paths + parallel orphan LIST + bulk DeleteObjects + drop_namespace; LocalFS 4ms, R2 ~1.4-2.2s |
-| Tenant branching / fork | ◻️ | catalog metadata copy |
+| Table fork (catalog COW) | ✅ | `Catalog::fork_table(tenant, src, dst)` clones a table's metadata + snapshot history into a new sibling within the same tenant, sharing data files by reference. Diverges on next commit. v0.2 adds cross-tenant fork with refcount-aware GC. |
 | Within-tenant time partitioning | ✅ | `CREATE TABLE … PARTITION BY RANGE (ts)`; partition pruning |
 | Tiered storage (hot/cold) | ✅ | `ALTER TABLE … SET cold_after = N`; compactor moves files between tiers |
 | Whale-tenant pinning | ✅ | `BASIN_TENANT_PINS=ulid:idx,...` pins a tenant to a specific shard endpoint regardless of consistent hash; v0.2 moves pins into the catalog so they survive restart |
@@ -92,12 +94,14 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 | Bloom filters in Parquet footer | ✅ | per-column opt-in via `ALTER TABLE … SET BLOOM FILTERS ON (col)`; turns ~80% of nonexistent-id queries into row-group skips |
 | Coalesced metadata in catalog (Phase 5.7 A4) | ✅ | file-level `column_stats` (min / max / null per column) on every committed `DataFileRef`; `Storage::read_paths` skips LIST + per-file footer fetch when the catalog stats prove the predicate prunes the file. Row-group-level coalesced stats deferred to v0.2 (B1). |
 | Per-table row-group sizing | ✅ | `ALTER TABLE … SET row_group_rows = N`; small row groups for point-heavy tables |
+| Cluster-by physical sort (Phase 5.7 B2) | ✅ | `Catalog::set_cluster_columns` configures per-table cluster columns; the writer `lexsort`s every batch by those columns before Parquet flush so related rows live in the same row group / file. Combined with A3 bloom + A4 catalog stats, point queries on the cluster columns prune to one file in the common case. SQL: `CREATE TABLE … CLUSTER BY (...)` / `ALTER TABLE … CLUSTER BY (...)` / `ALTER TABLE … RESET CLUSTER BY`. |
 | Pluggable `object_store` (S3, R2, GCS, local FS, MinIO, SeaweedFS) | ✅ | the workspace dep handles all |
 | **NVMe disk cache** | ✅ | LRU on local SSD; ~50ms cold S3 fetches → ~100µs warm SSD reads. Default-on. 101× speedup measured. |
 | **Parquet page cache (RAM)** | ✅ | LRU of decoded RecordBatches; <1ms warm hits. Default-on. 7.24× speedup measured. |
 | HTTP/2 toggle for S3 client | ✅ | `S3Config::http2_only`; useful on AWS S3 / R2 over HTTPS |
 | Iceberg-style catalog (in-memory) | ✅ | atomic appends, optimistic concurrency |
 | Iceberg-style catalog (durable) | ✅ | Postgres-backed; survives restart |
+| Point-in-time restore (catalog level) | 🛠 | `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` truncates history to ≤ target and rewinds the head pointer. InMemory + Postgres impls. v0.2 adds physical file GC for orphaned post-rollback files; cross-DML rollback waits on soft-delete (also v0.2). |
 | Per-tenant fair-share scheduler | 🛠 | architectural primitive shipped (cap=16); v0.2 EDF deferred — see [ADR 0008](./docs/decisions/0008-noisy-neighbor-fairness.md) |
 | WAL (Raft-backed, 5ms acks) | ◻️ | Phase 2 — closes the insert-latency gap |
 | Background compactor | 🛠 | merges small files; tier sweep + cold-data move shipped |
@@ -172,7 +176,7 @@ the corresponding `ScalarUDF`s and parse the relevant `WITH (…)` options.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Per-tenant metrics (ops/s, p50/p99, RAM, S3 IO) | 🛠 | tracing spans on every layer; structured aggregation deferred |
+| Per-tenant metrics (ops/s, p50/p99, RAM, S3 IO) | ✅ | `Engine::tenant_counters(&TenantId) -> TenantCountersSnapshot` returns ops/bytes_read/bytes_written/errors + ring-window p99 ms estimate; registry shared across engine + storage + WAL |
 | OpenTelemetry traces | ✅ | wired through router → engine → shard → storage; OTLP export available via `BASIN_OTLP_ENDPOINT` |
 | Structured logs (`tracing` JSON) | ✅ | format selectable at startup |
 | Connection pooling (`basin-pool`) | ✅ | Native `TenantSession` cache; per-tenant cap; LRU eviction. Wired into `basin-server` behind `BASIN_POOL_ENABLED=1`. See [ADR 0007](./docs/decisions/0007-connection-pooling.md). |

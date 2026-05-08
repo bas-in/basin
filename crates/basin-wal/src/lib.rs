@@ -33,11 +33,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basin_common::{PartitionKey, Result, TenantId};
+use basin_common::{PartitionKey, Result, TenantCounterRegistry, TenantId};
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -109,6 +109,10 @@ fn panic_no_default_object_store() -> Arc<dyn ObjectStore> {
 #[derive(Clone)]
 pub struct Wal {
     inner: Arc<dyn WalImpl>,
+    /// Optional per-tenant counter registry (Phase 6 telemetry). Attached by
+    /// the engine so the WAL append path bumps the same per-tenant rollup as
+    /// engine-side ops and storage-side bytes.
+    tenant_counters: Arc<OnceLock<Arc<TenantCounterRegistry>>>,
 }
 
 impl Wal {
@@ -118,7 +122,13 @@ impl Wal {
         let inner = file_wal::FileWal::open(cfg).await?;
         Ok(Self {
             inner: Arc::new(inner),
+            tenant_counters: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Attach a per-tenant counter registry. Idempotent (first attach wins).
+    pub fn attach_tenant_counters(&self, registry: Arc<TenantCounterRegistry>) {
+        let _ = self.tenant_counters.set(registry);
     }
 
     /// Append `payload` for `(tenant, partition)`. Durable when this returns.
@@ -130,7 +140,16 @@ impl Wal {
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn> {
-        self.inner.append(tenant, partition, payload).await
+        let bytes = payload.len() as u64;
+        let lsn = self.inner.append(tenant, partition, payload).await?;
+        // Per-tenant WAL append counters (Phase 6 telemetry). One op per
+        // append; bytes_written grows by payload size. No-op without registry.
+        if let Some(reg) = self.tenant_counters.get() {
+            let tc = reg.for_tenant(tenant);
+            tc.record_op();
+            tc.record_bytes_written(bytes);
+        }
+        Ok(lsn)
     }
 
     /// Force a synchronous flush of any queued segments to object storage.

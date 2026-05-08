@@ -21,17 +21,12 @@ v0.1 with passing benchmark coverage. Workspace tests: **216 / 216 passing,
 documented architectural reason (single-process limit, etc.) and a future
 trigger to revisit.
 
-One core-DB crate landed alongside the wedge by founder direction
-(ADR 0007): `basin-pool`, the per-tenant connection pool that lets one
-process hold idle sessions for many tenants without `O(N)` resident
-state. Wired into `basin-server` behind `BASIN_POOL_ENABLED=1`;
-defaults preserve the original PoC behaviour.
-
-The two cloud-platform crates that landed at the same time
-(`basin-auth`, `basin-rest`, ADRs 0005/0006) are tracked on
-[`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md). They are wired into
-`basin-server` so a single binary can serve both core and platform; the
-roadmap split is purely about scope discipline, not deployment topology.
+Three additional crates landed alongside the wedge by founder direction
+and now ship as part of the open-source bundle (Phase 5.10 in
+[`TASK.md`](./TASK.md)): `basin-auth` (identity, ADR 0005), `basin-rest`
+(PostgREST equivalent, ADR 0006), `basin-pool` (per-tenant connection
+pool, ADR 0007). All three are wired into `basin-server` behind opt-in
+env vars; defaults preserve the original PoC behaviour.
 
 **What's next, in priority order (core DB only — see
 [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md) for the platform side):**

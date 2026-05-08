@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "cold_start_ms",
-    "value": 158.659333,
+    "value": 141.75379199999998,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "bind_addr": "127.0.0.1:51016",
-    "cold_start_ms": 158.659333,
+    "bind_addr": "127.0.0.1:51872",
+    "cold_start_ms": 141.75379199999998,
     "storage": "localfs"
   },
-  "generated_at": "@1778156180"
+  "generated_at": "@1778204015"
 }

@@ -1,140 +1,219 @@
-//! Refresh-token issue, rotation, and sign-out (revocation).
+//! Refresh-token issue, rotation, sign-out, and reuse detection.
 //!
-//! Rotation: every successful `refresh` revokes the presented refresh token
-//! and issues a new one. A second use of the same refresh fails — the
-//! original `revoked_at` is set, so the row is still in the table but won't
-//! verify.
+//! Refresh tokens are JWTs with `aud=basin-refresh` and a fresh `jti` per
+//! issuance. The plaintext token is never stored — verification is by
+//! signature, and revocation is a simple `(jti, user_id, revoked_at,
+//! expires_at)` row in `auth_revoked_refresh_tokens`.
+//!
+//! ## Rotation
+//!
+//! `refresh()` revokes the presented `jti` and returns a fresh access +
+//! refresh pair. A second use of the same refresh JWT therefore lands on
+//! a row in the revocation table → 401 with `E_REVOKED_TOKEN`.
+//!
+//! ## Reuse detection (the security path)
+//!
+//! If the presented JWT *and* the user has had a *newer* refresh issued
+//! since (i.e. there's another revoked-jti row for this user with
+//! `revoked_at > self.revoked_at`), the old refresh being re-presented is
+//! a strong signal the prior token leaked. We respond by writing a
+//! `BLANKET:<user_id>` sentinel row whose `revoked_at = now()`; from then
+//! on, `refresh()` rejects any refresh JWT whose `iat` is before this
+//! sentinel timestamp. Net effect: every outstanding refresh for the user
+//! is invalidated.
+//!
+//! Sign-out (`signout()`) revokes a single jti without writing a sentinel
+//! — there's no peer "newer" jti to imply leak.
 
 use basin_common::{BasinError, Result, TenantId};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::flows::signin::issue_tokens_for;
-use crate::tokens::{generate, hash_token};
 use crate::{Inner, Tokens};
 
-/// Insert a fresh refresh-token row and return `(raw, expires_at)`. The DB
-/// stores only the sha256 hash; the raw goes back to the user.
+/// Token-hash prefix for blanket-revoke sentinels. One row per user.
+fn blanket_key(user_id: Uuid) -> String {
+    format!("BLANKET:{user_id}")
+}
+
+/// Insert a fresh refresh-JWT row and return `(jwt, expires_at)`. The
+/// service stores nothing at issuance — the only DB writes happen on
+/// rotation / signout / blanket-revoke.
 pub(crate) async fn issue_refresh(
     inner: &Inner,
     tenant: &TenantId,
     user_id: Uuid,
+    email: &str,
     now: DateTime<Utc>,
 ) -> Result<(String, DateTime<Utc>)> {
-    let (raw, h) = generate();
-    let expires_at = now + crate::ttl_or_default(inner.cfg.refresh_ttl);
-    let tenant_str = tenant.to_string();
-
-    let client = inner.client.lock().await;
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {sch}.refresh_tokens
-                   (token_hash, user_id, tenant_id, expires_at)
-                 VALUES ($1, $2, $3, $4)",
-                sch = inner.schema()
-            ),
-            &[&h, &user_id, &tenant_str, &expires_at],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("refresh insert: {e}")))?;
-    Ok((raw, expires_at))
+    let (jwt, _jti, expires_at) =
+        inner
+            .jwt
+            .issue_refresh(tenant, user_id, email, now, inner.cfg.refresh_ttl)?;
+    Ok((jwt, expires_at))
 }
 
 pub(crate) async fn refresh(inner: &Inner, raw: &str) -> Result<Tokens> {
-    let h = hash_token(raw);
+    // First, full verify — including the revocation list. A token that's
+    // already on the list is the reuse-detection trigger, not a plain 401.
+    let claims = match inner.jwt.verify_refresh(raw) {
+        Ok(c) => c,
+        Err(_) => return Err(BasinError::InvalidIdent("invalid refresh token".into())),
+    };
 
+    let exp_dt = DateTime::<Utc>::from_timestamp(claims.exp, 0)
+        .ok_or_else(|| BasinError::internal("refresh exp out of range".to_string()))?;
+    if exp_dt < Utc::now() {
+        return Err(BasinError::InvalidIdent("refresh token expired".into()));
+    }
+
+    let blanket = blanket_key(claims.user_id);
     let mut client = inner.client.lock().await;
     let tx = client
         .transaction()
         .await
         .map_err(|e| BasinError::catalog(format!("refresh begin: {e}")))?;
 
-    let row = tx
-        .query_opt(
+    // Pull every revocation row for this user that's still relevant. Two
+    // possible hits: an exact-jti revoke (this token was rotated already →
+    // reuse), or a blanket sentinel (whole-user revoked).
+    let rows = tx
+        .query(
             &format!(
-                "SELECT user_id, tenant_id, expires_at, revoked_at
-                 FROM {sch}.refresh_tokens
-                 WHERE token_hash = $1
-                 FOR UPDATE",
+                "SELECT token_hash, revoked_at, expires_at
+                 FROM {sch}.auth_revoked_refresh_tokens
+                 WHERE user_id = $1 AND expires_at > now()",
                 sch = inner.schema()
             ),
-            &[&h],
+            &[&claims.user_id],
         )
         .await
-        .map_err(|e| BasinError::catalog(format!("refresh select: {e}")))?;
-    let Some(row) = row else {
-        return Err(BasinError::InvalidIdent("invalid refresh token".into()));
-    };
-    let user_id: Uuid = row.get(0);
-    let tenant_str: String = row.get(1);
-    let expires_at: DateTime<Utc> = row.get(2);
-    let revoked_at: Option<DateTime<Utc>> = row.get(3);
+        .map_err(|e| BasinError::catalog(format!("refresh revoke list: {e}")))?;
 
-    if revoked_at.is_some() {
-        return Err(BasinError::InvalidIdent(
-            "refresh token revoked".into(),
-        ));
-    }
-    if expires_at < Utc::now() {
-        return Err(BasinError::InvalidIdent("refresh token expired".into()));
+    let mut self_revoked_at: Option<DateTime<Utc>> = None;
+    let mut blanket_revoked_at: Option<DateTime<Utc>> = None;
+    let mut newest_revoked_at: Option<DateTime<Utc>> = None;
+    for row in &rows {
+        let key: String = row.get(0);
+        let revoked_at: DateTime<Utc> = row.get(1);
+        if key == claims.jti {
+            self_revoked_at = Some(revoked_at);
+        } else if key == blanket {
+            blanket_revoked_at = Some(revoked_at);
+        } else {
+            newest_revoked_at = Some(match newest_revoked_at {
+                Some(prev) if prev > revoked_at => prev,
+                _ => revoked_at,
+            });
+        }
     }
 
-    // Mark this row revoked so a replay is caught even if the new pair is
-    // never used.
+    // Blanket revoke active and post-dates this token → revoked.
+    if let Some(b) = blanket_revoked_at {
+        if claims.iat <= b.timestamp() {
+            return Err(BasinError::InvalidIdent("refresh token revoked".into()));
+        }
+    }
+
+    if let Some(self_ts) = self_revoked_at {
+        // This jti was already rotated. Check for *another* revoked row
+        // newer than this rotation — implies the legit user has rotated
+        // again since, and we're seeing an attacker reuse the leaked old
+        // token. Revoke everything.
+        let is_reuse = newest_revoked_at.is_some_and(|n| n > self_ts);
+        if is_reuse {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {sch}.auth_revoked_refresh_tokens
+                       (token_hash, user_id, revoked_at, expires_at)
+                     VALUES ($1, $2, now(), $3)
+                     ON CONFLICT (token_hash) DO UPDATE
+                       SET revoked_at = now(),
+                           expires_at = EXCLUDED.expires_at",
+                    sch = inner.schema()
+                ),
+                &[&blanket, &claims.user_id, &exp_dt],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("refresh blanket revoke: {e}")))?;
+            tx.commit()
+                .await
+                .map_err(|e| BasinError::catalog(format!("refresh blanket commit: {e}")))?;
+            tracing::warn!(
+                user_id = %claims.user_id,
+                "refresh-token reuse detected; blanket-revoking user"
+            );
+            return Err(BasinError::InvalidIdent("refresh token revoked".into()));
+        }
+        return Err(BasinError::InvalidIdent("refresh token revoked".into()));
+    }
+
+    // Fresh, valid refresh → record this jti as rotated and issue a new pair.
     tx.execute(
         &format!(
-            "UPDATE {sch}.refresh_tokens SET revoked_at = now()
-             WHERE token_hash = $1",
+            "INSERT INTO {sch}.auth_revoked_refresh_tokens
+               (token_hash, user_id, revoked_at, expires_at)
+             VALUES ($1, $2, now(), $3)
+             ON CONFLICT (token_hash) DO NOTHING",
             sch = inner.schema()
         ),
-        &[&h],
+        &[&claims.jti, &claims.user_id, &exp_dt],
     )
     .await
     .map_err(|e| BasinError::catalog(format!("refresh revoke old: {e}")))?;
-
-    // Look up the email for the JWT claims.
-    let email_row = tx
-        .query_one(
-            &format!(
-                "SELECT email FROM {sch}.users WHERE user_id = $1",
-                sch = inner.schema()
-            ),
-            &[&user_id],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("refresh user fetch: {e}")))?;
-    let email: String = email_row.get(0);
 
     tx.commit()
         .await
         .map_err(|e| BasinError::catalog(format!("refresh commit: {e}")))?;
     drop(client);
 
-    let tenant: TenantId = tenant_str
-        .parse()
-        .map_err(|e| BasinError::internal(format!("refresh parse tenant: {e}")))?;
-    issue_tokens_for(inner, &tenant, user_id, &email).await
+    issue_tokens_for(inner, &claims.tenant_id, claims.user_id, &claims.email).await
 }
 
 pub(crate) async fn signout(inner: &Inner, raw: &str) -> Result<()> {
-    let h = hash_token(raw);
+    // Tolerate a malformed token: the user-visible behaviour is the same
+    // either way ("you're signed out"), and we don't want a typo to 500.
+    let Ok(claims) = inner.jwt.verify_refresh(raw) else {
+        return Ok(());
+    };
+    let exp_dt = DateTime::<Utc>::from_timestamp(claims.exp, 0)
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
+
+    let client = inner.client.lock().await;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {sch}.auth_revoked_refresh_tokens
+                   (token_hash, user_id, revoked_at, expires_at)
+                 VALUES ($1, $2, now(), $3)
+                 ON CONFLICT (token_hash) DO UPDATE SET revoked_at = now()",
+                sch = inner.schema()
+            ),
+            &[&claims.jti, &claims.user_id, &exp_dt],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("signout insert: {e}")))?;
+    Ok(())
+}
+
+/// Rarely-needed: a periodic GC daemon would run this in the background to
+/// drop expired-and-no-longer-relevant rows. v0.1 leaves it as a manual
+/// admin verb; runtime correctness is unaffected because every read filters
+/// `expires_at > now()`.
+#[allow(dead_code)]
+pub(crate) async fn purge_expired(inner: &Inner) -> Result<u64> {
     let client = inner.client.lock().await;
     let n = client
         .execute(
             &format!(
-                "UPDATE {sch}.refresh_tokens SET revoked_at = now()
-                 WHERE token_hash = $1 AND revoked_at IS NULL",
+                "DELETE FROM {sch}.auth_revoked_refresh_tokens
+                 WHERE expires_at < now()",
                 sch = inner.schema()
             ),
-            &[&h],
+            &[],
         )
         .await
-        .map_err(|e| BasinError::catalog(format!("signout update: {e}")))?;
-    if n == 0 {
-        // Per-OWASP: don't tell the caller whether the token existed; either
-        // way the user is signed out from this client's perspective.
-        tracing::debug!("signout no-op (already revoked or unknown token)");
-    }
-    Ok(())
+        .map_err(|e| BasinError::catalog(format!("refresh gc: {e}")))?;
+    Ok(n)
 }

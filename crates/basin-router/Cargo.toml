@@ -44,6 +44,12 @@ uuid.workspace = true
 # uses for outbound HTTP throttling, keeping the limiter implementation
 # uniform across both protocols.
 governor.workspace = true
+# pgwire 0.28's `process_socket` already does the SSLRequest peek + 'S'/'N'
+# response when handed a TlsAcceptor; we just need to construct one from
+# PEM material in `tls.rs`. Versions match what pgwire pulls in transitively
+# so we reuse the same compiled rustls / aws-lc-rs.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 tokio-test.workspace = true
@@ -51,3 +57,6 @@ tokio-test.workspace = true
 # deps mirror what basin-auth's own tests use for the per-test schema
 # guard and the test issuer.
 ulid.workspace = true
+# Self-signed cert generation for the TLS handshake test in `src/tls.rs`
+# and `tests/tls_handshake.rs`. Test-only, so no workspace promotion.
+rcgen = "0.13"

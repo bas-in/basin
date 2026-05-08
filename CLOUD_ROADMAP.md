@@ -1,196 +1,383 @@
-# Basin — cloud-platform roadmap
+# Basin Cloud — product roadmap
 
-The customer-facing **platform** that wraps Basin core: identity, REST,
-edge compute, billing, BYO-bucket / BYO-key, the customer dashboard.
+The hosted multi-tenant Postgres-compatible database that lives on
+object storage. Per-tenant isolation, ~$0.10–$0.20 per tenant per
+month all-in, no per-project tier wall.
 
-Core database features live in [`TASK.md`](./TASK.md) (the build plan)
-and [`CAPABILITIES.md`](./CAPABILITIES.md) (the public-facing what-it-does
-page). This file owns everything *above* the SQL/pgwire interface — the
-plumbing that turns Basin from "great DB engine" into "Postgres-as-a-Service
-that actually multi-tenants cheaply."
+This is the **product** roadmap. The engine — pgwire, SQL, storage,
+catalog, vector, auth, REST — lives in the open-source repo and is
+the substrate this product runs on. Everything below is what wraps
+the engine into a thing customers can sign up for.
 
-Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred / out of scope
-
----
-
-## Why a separate roadmap
-
-Basin's architectural moat is the **core DB**: pgwire-on-Parquet-on-object-store,
-multi-tenant by structure, scope-disciplined. The cloud platform is a
-*product layer* on top — the same engine pairs with very different
-cloud-platform shapes (a hosted SaaS, a self-hosted enterprise build, a
-BYO-everything appliance). Mixing them in the same roadmap blurs the
-boundary the team has been deliberate about. This file keeps the
-platform work visible without polluting the core DB build plan.
+> **Repository note:** this file is intended to move to its own
+> public repo (e.g. `basin-cloud/cloud-roadmap`) once the landing
+> page ships. Until then it lives alongside the engine repo so the
+> two roadmaps stay in lock-step.
 
 ---
 
-## Identity (basin-auth) — **v0.1 shipped**
+## Brand & visual identity
 
-Status: shipped 2026-05-01 by founder direction. ADR 0005.
+**Theme: topographic / watershed.** Literal — the product is named
+*Basin*. Sediment layers (Parquet ≈ stratigraphy) and watershed
+boundaries (per-tenant prefix isolation ≈ catchment) are the visual
+metaphors. This avoids the generic SaaS purple-gradient look and gives
+us a defensible aesthetic that extends through docs, dashboard, and
+swag.
 
-- [x] `basin-auth` crate — Postgres-backed user store, bcrypt password
-      hashing, JWT issuance + verification (HS256), role/membership
-      tables, `current_user`-aware tenant resolution.
-- [x] `JwtTenantResolver` auto-mounts on pgwire when `BASIN_AUTH_ENABLED=1`
-      (`services/basin-server/src/main.rs:298-307`); JWT primary, static
-      `BASIN_TENANTS` map as fallback so existing demos keep working.
-- [x] REST endpoints for issue / verify / refresh.
-- [ ] OIDC / Google / GitHub social login providers
-- [ ] SCIM provisioning for enterprise customers
-- [ ] Per-org SAML SSO
-- [ ] Per-tenant secret rotation policy
-- [ ] Audit log of admin actions (who-did-what for the dashboard)
+### Palette
 
-## REST API (basin-rest) — **v0.1 shipped**
+- `#0F1115` — ink (background, text)
+- `#FAF7F0` — paper (light surfaces, off-white)
+- `#3B6F73` — basin teal (primary accent, water)
+- `#C4732B` — sediment ochre (secondary accent, layers)
+- `#5C5C5C` — graphite (dividers, contour lines)
+- `#8FB59B` — moss (success / shipped status)
+- `#B8462E` — clay (error / blocked status)
 
-Status: shipped 2026-05-01 alongside basin-auth. ADR 0006. Requires
-`BASIN_AUTH_ENABLED=1` per ADR.
+No neons, no purple gradients, no glassmorphism. Flat, technical,
+slightly hand-drawn (think USGS topographic maps and 1970s field-
+manual diagrams, not SF tech).
 
-- [x] CRUD endpoints over the JWT-resolved tenant
-- [ ] `PATCH` (currently 501; awaits a richer engine UPDATE shape — note
-      that the underlying engine `UPDATE`/`DELETE` shipped with Iceberg
-      copy-on-write, but the REST `PATCH` codec is not yet wired)
-- [ ] Pagination cursors instead of `LIMIT`/`OFFSET`
-- [ ] Streaming responses for large result sets
-- [ ] OpenAPI / Swagger schema generation
+### Typography
 
-## V8 edge functions — **not started**
+- **Display:** `Söhne Breit` or `Inter Display` (heavy weights only,
+  for hero / section heads)
+- **Body:** `Inter` (regular / medium)
+- **Mono:** `JetBrains Mono` or `IBM Plex Mono` (code samples,
+  contour-line annotations, terminal blocks)
 
-Customer-supplied JavaScript that runs in a sandboxed V8 isolate per
-request, with capability-bounded access to:
-- the calling tenant's tables (read/write through the engine's
-  `TenantSession`, never directly against storage)
-- a small allowlisted HTTP egress (reuse `basin-net`'s URL allowlist +
-  rate limiter)
-- a key-value scratch store keyed by tenant + function name
+All variable fonts; self-hosted (no Google Fonts CDN — privacy +
+performance both win).
 
-The shape mirrors Supabase Edge Functions / Cloudflare Workers but
-isolates per-tenant via the same prefix isolation Basin already enforces
-at the storage layer.
+### Visual motifs (use sparingly, not as decoration)
 
-- [ ] Pick the V8 binding crate (`rusty_v8` vs `deno_core`)
-- [ ] Function manifest schema (entry point, allowed origins, kv keys)
-- [ ] Tenant-scoped runtime: `SessionContext` injected as a JS global
-- [ ] HTTP egress proxy that forwards to `basin-net` (allowlist + rate
-      limit + timeout already enforced; just need the bridge)
-- [ ] CPU + memory caps per invocation (V8 heap limits + isolate
-      timeouts)
-- [ ] Cold-start budget < 50 ms (must beat AWS Lambda's 100-500 ms cold)
-- [ ] Per-function deployment via REST: upload bundle, hot-reload on
-      next invocation
-- [ ] Logs + traces piped into the existing OTEL pipeline
-- [ ] Pricing model integration (CPU-ms metering for Stripe billing)
+- **Contour-line backgrounds** behind hero / section heads. SVG,
+  hand-drawn-feel curves at low opacity. Generated procedurally (a
+  small script seeds them from a hash of the section title — same
+  section always gets the same lines).
+- **Sediment-layer dividers** between sections. Three-to-five
+  horizontal stripes in graphite, with subtle texture. Each layer is
+  labelled in mono with a Basin concept (`row group`, `data file`,
+  `snapshot`, `partition`, `tenant prefix`) — the metaphor is
+  literal: this is what's stacked under each tenant.
+- **Watershed iconography** for the per-tenant isolation diagram.
+  Shows two adjacent basins (catchments) with the ridge between
+  labelled "tenant prefix boundary." The point is visual: *the data
+  cannot flow across the ridge by construction.*
+- **Schematic / blueprint annotations** rather than 3D illustrations.
+  ASCII-art-grade, callouts in mono, dimension lines.
 
-Decision points:
-- This is a **major scope expansion**. Only commit when the wedge
-  customer interviews (Phase 0) confirm 2+ design partners specifically
-  ask for it. Until then it's optional polish.
-- V8 isolate sandboxing is well-trodden ground; the per-tenant
-  capability binding is where the project-specific work lives.
+### Tone of voice
 
-## BYO-bucket — **planned**
+Technical, candid, slightly dry. *"Per-tenant cost: ~$0.10/mo. Yes,
+that includes storage."* Not playful, not aggressive. Closer to
+Stripe's docs voice than Vercel's marketing voice. Numbers,
+benchmarks, trade-offs — not vibes.
 
-Customer's own S3/R2 bucket with an IAM role that grants Basin write +
-read access. Platform never holds the data; the customer can revoke
-access and Basin loses the tenant cleanly.
+---
 
-- [ ] `TenantMetadata.byo_bucket: Option<S3Config>` on the tenant record
+## Phase 0 — Landing page + waitlist (2–3 weeks)
+
+**The gate.** Phase 1+ doesn't start until this is live and pulling
+real signups.
+
+### Goals
+
+1. Convert technical visitors (the buyers / champions) into a waitlist.
+2. Tell the wedge story honestly: per-tenant cost, multi-tenant
+   architecture, drop-in pgwire compatibility.
+3. Set up the brand so the dashboard, docs, and edge-function
+   product all inherit it without rework.
+
+### Stack
+
+- **Astro** for static generation (mirrors the existing benchmark
+  dashboard tech stack — same build muscle memory).
+- **React (JSX, not TSX)** for the few interactive islands (cost
+  calculator, signup form, animated watershed diagram). **No
+  TypeScript on the frontend.** Pure `.jsx` everywhere; the type
+  surface adds nothing for a brochure site and slows iteration on
+  the visual side. PropTypes are fine if a component grows large
+  enough to want them, but the default is plain JSX.
+- **Tailwind** with a *minimal* config: only the topographic palette,
+  the three font stacks, and the spacing scale. No DaisyUI / shadcn
+  defaults — they'd dilute the theme.
+- **Self-hosted**: deploys to Cloudflare Pages (zero egress to match
+  the deployment story Basin sells).
+- **No tracking other than a single self-hosted Plausible** —
+  privacy-conscious developers are the buyer, leaking their visit
+  to GA4 is off-brand.
+
+### Frontend conventions
+
+- Files are `.jsx` (not `.tsx`). `tsconfig.json` is **not** present in
+  the repo. Astro's `astro.config.mjs` enables the React integration
+  *without* the TypeScript checker.
+- Components default to function components + hooks. No class
+  components, no MobX/Redux/Zustand state libraries — `useState` and
+  React Context cover everything Phase 0 needs.
+- Style: Tailwind utility classes for layout + spacing; one
+  `globals.css` for the contour-line / sediment-layer backgrounds and
+  any custom keyframes. No CSS-in-JS.
+- Linting: `eslint` with `eslint-config-react`, no
+  `@typescript-eslint`. Format via Prettier.
+- Imports: bare-specifier paths (no `@/` alias gymnastics until the
+  page tree justifies it).
+
+### Pages
+
+- **`/`** Landing. Hero, wedge proof, code sample, cost calculator,
+  feature grid, quickstart preview, waitlist CTA.
+- **`/why`** The wedge story long-form. Why Postgres-per-project
+  doesn't work for multi-tenant SaaS. Charts (storage cost vs
+  tenant count, Postgres vs Basin).
+- **`/architecture`** Schematic. The watershed diagram, sediment
+  layers, request flow. Each layer cross-links to the open-source
+  repo so technical visitors can verify the claim.
+- **`/pricing`** Cost calculator + a *single* paid tier ("$X / GB-
+  month + $Y / 1M ops"). No "Contact us for Enterprise" until we
+  have an actual enterprise tier worth gating.
+- **`/docs`** Routes to the engine docs (open source) for now.
+  Cloud-specific docs (auth, BYO-bucket, dashboard) land in Phase 2.
+- **`/changelog`** Markdown-driven, RSS-feedable. Every shipped
+  feature gets a dated entry. Establishes credibility.
+
+### Hero (the load-bearing 5 seconds)
+
+Above the fold, on a contour-line background:
+
+```
+      Multi-tenant Postgres
+           on object storage
+─────────────────────────────────
+$0.10 per tenant per month, all-in.
+Same SQL your app already speaks.
+
+  [ Join waitlist ]   [ Read the architecture ]
+
+  $ psql -h db.basin.cloud -U your_app
+  basin=> SELECT count(*) FROM tenants;
+   3,142
+```
+
+The point: *one* benefit (cheap multi-tenant), *one* compatibility
+claim (psql works), *one* CTA (waitlist), *one* technical proof (the
+psql block). Not three columns of "Why Basin?" with smiling avatars.
+
+### Cost calculator (the wedge proof)
+
+Interactive island. Inputs: tenant count, avg storage GB per tenant,
+ops per tenant per month. Outputs: Basin Cloud monthly cost, "what
+this would cost on Postgres-per-project" comparison (Neon / Supabase
+list prices). Code samples for both paths so the comparison is
+honest: *"this is the same workload, here's both."*
+
+The calculator is the page's argument. If a visitor leaves having
+typed their numbers in and seen a 10× delta, the waitlist conversion
+is structural.
+
+### Waitlist
+
+Single field — email. No company / role / use-case form. Those go in
+the follow-up onboarding. The friction at signup is what kills these.
+
+Backed by basin-auth's email-link flow (Phase 5.10 of the engine
+roadmap, just shipped). When Phase 1 (signup) lands, the waitlist
+emails get an "early access" link that consumes their first magic-link.
+
+### Phase 0 checklist
+
+- [ ] Brand kit: palette, typography, motifs, voice — captured in a
+      short `brand.md` so future hires inherit it
+- [ ] Astro + React (JSX) + Tailwind scaffold; deploys to CF Pages
+- [ ] Landing page with the five sections above
+- [ ] Cost calculator (interactive island)
+- [ ] Waitlist form → basin-auth email-link API
+- [ ] `/architecture`, `/why`, `/pricing`, `/changelog` routes
+- [ ] Self-hosted Plausible, no GA / Segment / Facebook Pixel
+- [ ] DNS at `basin.cloud` (or chosen domain), TLS via CF
+- [ ] Open-graph cards for `/`, `/architecture`, `/why` — show the
+      contour-line motif so a Twitter share is on-brand
+- [ ] Lighthouse score ≥ 95 on mobile (any worse and the brand looks
+      like vapor)
+
+---
+
+## Phase 1 — Sign-up + first tenant (3–4 weeks)
+
+**Trigger:** waitlist hits 200 emails OR 10 explicit "I'd pay for this"
+replies.
+
+- [ ] Convert waitlist email → real account (basin-auth signup flow)
+- [ ] First tenant provisioning: pick a region, get a connection string
+- [ ] In-browser SQL console (read-only first, then writable) backed
+      by a websocket bridge to pgwire
+- [ ] Onboarding flow: "create your first table" tutorial walking
+      through the architecture diagram from the landing page
+- [ ] Free tier: 1 tenant, 100 MB, 1M ops / month. Designed to be
+      enough for a side-project demo, not a production SaaS
+
+## Phase 2 — Customer dashboard (4–6 weeks)
+
+The self-serve operations surface. Lives at `app.basin.cloud`. Same
+brand kit as the landing page; the contour motif carries through.
+
+- [ ] Tenant list + per-tenant detail page (storage, ops, latency
+      cards — read straight from the engine's `Engine::tenant_counters`)
+- [ ] User + role management (basin-auth admin endpoints + the new
+      API-key surface from Phase 5.10)
+- [ ] Schema browser (table list, columns, indexes, snapshots)
+- [ ] Snapshot timeline UI (lever for the engine's PITR — pick a
+      snapshot, click "rollback")
+- [ ] Usage charts (storage GB-month, S3 ops, active hours, CPU-ms
+      when V8 lands) — read from the same counters that feed billing
+- [ ] Settings: regions, billing, usage alerts
+- [ ] Empty placeholder dir already exists at `services/dashboard/`
+      in the engine repo (initial workspace scaffolding); the cloud
+      project takes that name
+
+## Phase 3 — BYO-bucket (3–4 weeks)
+
+Customer's own S3/R2 bucket with an IAM role granting Basin write +
+read access. Platform never holds the data; revoking the role
+cleanly evicts the tenant.
+
+- [ ] `TenantMetadata.byo_bucket: Option<S3Config>` on the tenant
+      record (engine catalog change — opens the door for this layer
+      without the cloud product being live yet)
 - [ ] `Storage` accepts a per-tenant override `ObjectStore` (the
-      pluggable `dyn ObjectStore` makes this almost free at the storage
-      layer; the work is the per-tenant resolution + secret handling)
-- [ ] Onboarding flow: customer pastes IAM role ARN, Basin tries a
-      probe write/read/delete, surfaces errors clearly
+      pluggable `dyn ObjectStore` makes this almost free at storage
+      layer; the work is per-tenant resolution + secret handling)
+- [ ] Onboarding flow: customer pastes IAM role ARN, Basin probes
+      write/read/delete, surfaces errors clearly
 - [ ] Cleanup on tenant deletion: leave the customer's bucket intact;
       only delete Basin's prefix tree
 - [ ] Cost telemetry routes to the *customer's* AWS bill, not Basin's
       egress dashboard
 
-## BYO-key (KMS) — **planned**
+## Phase 4 — Stripe billing (3–4 weeks)
+
+Usage-based billing with four meters: storage GB-month, S3 API ops,
+active-hours of a tenant's shard-owner footprint, and (when V8 lands)
+CPU-ms.
+
+- [ ] Per-tenant usage counters in the catalog (storage bytes, ops,
+      active seconds) — engine-side counters from Phase 6 telemetry
+      already exist; cloud-side adds daily roll-up
+- [ ] Daily roll-up job that posts to Stripe metered billing
+- [ ] Customer-portal page reading the same counters for transparency
+- [ ] Free-tier accounting (monthly reset, hard cap then usage cap)
+- [ ] Overage alerts via the engine's `basin-net` HTTP path (so the
+      same rate limiter / allowlist applies)
+- [ ] Stripe webhook receiver: subscription created / cancelled /
+      payment_failed → tenant state transitions
+
+## Phase 5 — BYO-key (KMS) (4–6 weeks)
 
 Customer-managed encryption keys via AWS KMS / GCP KMS / Azure Key
 Vault. Platform never sees plaintext beyond the per-request envelope.
 
-- [ ] Envelope encryption at the storage write boundary: data key per
-      file, wrapped by the customer's KMS CMK
-- [ ] Key cache with explicit TTL (so revoking the CMK at the customer
-      side actually stops decryption within minutes)
+- [ ] Envelope encryption at the storage write boundary: data key
+      per file, wrapped by the customer's KMS CMK
+- [ ] Key cache with explicit TTL (so revoking the CMK at the
+      customer side actually stops decryption within minutes)
 - [ ] Per-tenant choice of cloud KMS (AWS / GCP / Azure)
-- [ ] Hardware-token attestation for the decryption agent (deferred —
-      only needed for FedRAMP-class customers)
+- [ ] Hardware-token attestation for the decryption agent (deferred
+      until a FedRAMP-class customer asks)
 
-## Stripe billing — **planned**
+## Phase 6 — Auth / REST cloud-only extensions (4–6 weeks)
 
-Usage-based billing with the four meters that map to Basin's actual
-costs: storage GB-month, S3 API ops, active-hours of a tenant's
-shard-owner footprint, and (when V8 lands) CPU-ms.
+The OSS bundle (engine repo, Phase 5.10) already ships basin-auth and
+basin-rest. These are the *cloud-tier-only* extensions, gated to paid
+plans:
 
-- [ ] Per-tenant usage counters in the catalog (storage bytes, ops,
-      active seconds)
-- [ ] Daily roll-up job that posts to Stripe metered billing
-- [ ] Customer-portal page reading the same counters for transparency
-- [ ] Free-tier accounting (monthly reset)
-- [ ] Overage alerts via the existing `basin-net` HTTP path (so the
-      same rate limiter / allowlist applies)
+- [ ] OIDC / Google / GitHub social login providers
+- [ ] SCIM provisioning for enterprise customers
+- [ ] Per-org SAML SSO
+- [ ] Per-tenant secret-rotation policy with operator-driven enforcement
+- [ ] Admin-action audit log feeding the customer dashboard
+- [ ] REST API: rate-limit overrides per paid tier
+- [ ] REST API: signed-URL download endpoints backed by BYO-bucket
+- [ ] Org-level workspaces (multiple users, role hierarchy)
 
-## Customer dashboard — **planned**
+## Phase 7 — Control plane (multi-region, 6–8 weeks)
 
-Self-serve dashboard for customers to manage their own tenants, view
-usage, run ad-hoc SQL, manage API keys. An empty placeholder directory
-already exists at `services/dashboard/` (created in the initial
-workspace scaffolding, no code yet).
-
-- [ ] Tech choice: `astro` + `solid` for static pages with islands of
-      interactivity (mirrors the existing benchmark dashboard, which is
-      the *internal* dashboard at `benchmark/` and a different artefact)
-- [ ] Read-only SQL console (talks pgwire over a websocket bridge)
-- [ ] Tenant + user management UI (basin-auth admin endpoints)
-- [ ] Usage charts (read straight from the same counters that feed
-      Stripe)
-
-## Control plane — **planned**
-
-Backplane for the operator that fans tenant lifecycle commands
-(create / suspend / migrate / delete) across the regional clusters,
-talks to Stripe for billing webhooks, and serves the customer-portal
-admin endpoints. An empty placeholder directory exists at
-`services/control-plane/` (created in the initial workspace
-scaffolding, no code yet).
+The backplane that fans tenant lifecycle commands across regional
+clusters. An empty placeholder dir exists at `services/control-plane/`
+in the engine repo.
 
 - [ ] Tenant lifecycle API (idempotent create / suspend / resume /
       migrate / delete; emits events the dashboard consumes)
 - [ ] Region directory: tenant ULID → home region; required before
-      multi-region core-DB work (`TASK.md` Phase 6) can ship without
-      manual DNS gymnastics
-- [ ] Stripe webhook receiver (subscription created / cancelled /
-      payment_failed → tenant state transitions)
+      multi-region engine work can ship without manual DNS gymnastics
 - [ ] Audit log of every control-plane action (who, when, what,
-      reverse-action) — fed to basin-auth's admin audit log
+      reverse-action) — feeds Phase 6's admin audit log
 - [ ] Quotas: per-customer table-count, tenant-count, storage-GB caps
-      that the core engine consults at write time
+      that the engine consults at write time
 - [ ] gRPC + REST surfaces (REST for the dashboard, gRPC for
       service-to-service inside the cluster)
 
-## Cross-cutting platform concerns
+## Phase 8 — V8 edge functions (gated, 8–12 weeks once unblocked)
 
-- [ ] Status page (uptime per region)
-- [ ] Public-facing docs site (separate from the engineering docs in
-      `docs/`)
-- [ ] Marketing site / landing page
-- [ ] Support inbox / on-call rotation
-- [ ] Security review checklist before each platform feature ships
+Customer JavaScript that runs in a sandboxed V8 isolate per request,
+with capability-bounded access to the calling tenant's tables, an
+allowlisted HTTP egress, and a key-value scratch store.
+
+**Decision gate:** only commit when 2+ design partners specifically
+ask for it. Until then this is optional polish; the wedge customer
+(multi-tenant SaaS audit logs) does not run business logic in edge
+functions.
+
+- [ ] Pick the V8 binding crate (`rusty_v8` vs `deno_core`)
+- [ ] Function manifest schema (entry point, allowed origins, kv keys)
+- [ ] Tenant-scoped runtime: `TenantSession` injected as a JS global
+- [ ] HTTP egress proxy via basin-net (allowlist + rate limit +
+      timeout reused unchanged)
+- [ ] CPU + memory caps per invocation (V8 heap limits + isolate
+      timeouts)
+- [ ] Cold-start budget < 50 ms (must beat AWS Lambda's 100–500 ms cold)
+- [ ] Per-function deployment via REST: upload bundle, hot-reload on
+      next invocation
+- [ ] Logs + traces piped into the existing OTEL pipeline
+- [ ] CPU-ms metering for Stripe billing
+
+## Phase 9 — Compliance posture (multi-month, gated on paying customers)
+
+- [ ] SOC 2 Type 2 (≈ 12 months observation period; start as soon as
+      paying customers exist)
+- [ ] GDPR DPA template + sub-processor list
+- [ ] HIPAA readiness assessment (deferred until a healthcare prospect
+      asks; not a default investment)
+- [ ] Penetration test before public beta (independent firm, public
+      executive summary)
+- [ ] Bug bounty program before GA
 
 ---
 
-## What's *not* on this roadmap (and where it lives instead)
+## Cross-cutting
 
-- **Pgwire / SQL surface, types, query planner, vector search, RLS,
-  multi-tenancy primitives, storage tiering, caches, indexes,
-  WAL/Raft, compactor, catalog, analytical engine** → all in
-  [`TASK.md`](./TASK.md) (core DB).
-- **Phase 0 customer interviews** → also `TASK.md`; the wedge validation
-  applies to both core DB and platform shape.
+- [ ] Status page at `status.basin.cloud` (Atlassian Statuspage or
+      a small self-hosted clone matching the brand)
+- [ ] Public-facing docs site separate from the engine docs
+- [ ] Support inbox (`support@`) + on-call rotation
+- [ ] Marketing site changelog + a low-volume newsletter (one issue
+      per shipped phase, no growth-hack tactics)
+- [ ] Security review checklist before each phase ships
 
 ---
 
-*Last updated: 2026-05-07.*
+## What's *not* here (and where it lives instead)
+
+- The engine itself — pgwire, SQL, storage, catalog, query planner,
+  vector search, RLS, multi-tenancy primitives, storage tiering,
+  caches, indexes, WAL, compactor, analytical engine, basin-auth,
+  basin-rest. All in the **engine repo** (`TASK.md`).
+- Per-tenant fairness, rate-limiting, cost-based query rejection.
+  Engine concerns.
+- Phase 0 customer interviews for the wedge — engineering doesn't
+  start until that gate passes; tracked in the engine repo.
+
+---
+
+*Last updated: 2026-05-08.*

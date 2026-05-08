@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Bundle benchmark JSON sidecars into a dashboard-loadable `results.js`
-plus a human-readable Markdown report.
+plus a human-readable Markdown report — and render the matching
+index_<slug>.html from `benchmark/template.html`.
 
-Three flavors of dashboard live side-by-side:
+The dashboard registry lives in `benchmark/dashboards.toml`. Each row is
+keyed on (slug, storage_backend, compute_backend, environment, data_dir,
+title, h1, subtitle, footer) and produces:
 
-  benchmark/data/            LocalFS synthetic dashboard       → index_localfs.html
-  benchmark/data_real/       Real-cloud (R2 / B2 / S3) dash    → index_real.html
-  benchmark/data_seaweedfs/  Self-hosted SeaweedFS dashboard   → index_seaweedfs.html
+  benchmark/<data_dir>/results.js
+  benchmark/RESULTS_<slug>.md
+  benchmark/index_<slug>.html
 
-By default this bundles all three. To bundle a single dashboard, pass
-e.g. `--dir data_real`. The output filenames also shift so each stays
-independent:
+By default this bundles every configured row. To bundle a single
+dashboard, pass `--dir <data_dir>`.
 
-  data/            -> data/results.js,            RESULTS_localfs.md
-  data_real/       -> data_real/results.js,       RESULTS_real.md
-  data_seaweedfs/  -> data_seaweedfs/results.js,  RESULTS_seaweedfs.md
+To add a new dashboard: append a [[dashboard]] block to
+`benchmark/dashboards.toml`, create the matching `benchmark/<data_dir>/`
+folder, run the tests, and re-run this script. No edits to the bundler
+or template are needed.
 
 Browsers block fetch() of local files when index.html is opened via
 file://. The script-tag-loadable `results.js` (window.__BASIN_RESULTS = ...)
@@ -31,11 +34,18 @@ import argparse
 import json
 import sys
 import time
+import tomllib
 from pathlib import Path
 from datetime import datetime, timezone
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+DASHBOARDS_TOML = HERE / "dashboards.toml"
+
+# Storage backends that physically run on the local box vs. cross the
+# network. Used as a sanity check against the per-row `environment` flag.
+LOCAL_STORAGE_BACKENDS = {"localfs", "seaweedfs"}
+CLOUD_STORAGE_BACKENDS = {"r2", "s3", "b2", "r2/s3/b2"}
 
 
 # ---------- helpers ------------------------------------------------------------
@@ -296,18 +306,18 @@ def render_footer() -> str:
 # ---------- main ---------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(valid_dirs: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dir",
         default=None,
-        choices=["data", "data_real", "data_seaweedfs"],
-        help="bundle a single dashboard (default: bundle both)",
+        choices=valid_dirs,
+        help="bundle a single dashboard (default: bundle all configured)",
     )
     return parser.parse_args()
 
 
-def bundle_one(data_dir: Path) -> int:
+def bundle_one(data_dir: Path, slug: str) -> int:
     """Bundle a single data directory. Returns 0 on success, non-zero on error."""
     if not data_dir.is_dir():
         print(f"no data dir: {data_dir}", file=sys.stderr)
@@ -336,13 +346,9 @@ def bundle_one(data_dir: Path) -> int:
         f"window.__BASIN_RESULTS = {json.dumps(bundle, indent=2)};\n"
     )
 
-    # Markdown report file name shifts with the data dir so each dashboard
-    # gets its own file:
-    #   data/            -> RESULTS_localfs.md
-    #   data_real/       -> RESULTS_real.md
-    #   data_seaweedfs/  -> RESULTS_seaweedfs.md
-    md_name = "RESULTS_localfs.md" if data_dir.name == "data" else f"RESULTS_{data_dir.name.removeprefix('data_')}.md"
-    md_path = ROOT / "benchmark" / md_name
+    # Markdown report file name follows the dashboard slug so each row
+    # in dashboards.toml gets its own RESULTS_<slug>.md.
+    md_path = HERE / f"RESULTS_{slug}.md"
 
     md_parts = [
         render_header(reports),
@@ -362,128 +368,165 @@ def bundle_one(data_dir: Path) -> int:
     return 0
 
 
+# ---------- dashboard config -------------------------------------------------
+#
+# The set of dashboards lives in benchmark/dashboards.toml. Each row is
+# (slug, storage_backend, compute_backend, environment, data_dir, title, h1,
+#  subtitle, footer) and renders to one index_<slug>.html. To extend Basin
+# along a new axis (e.g. multi-shard compute), append a row — no edits to
+# the template or the bundler are required.
+
+
+REQUIRED_FIELDS = (
+    "slug",
+    "storage_backend",
+    "compute_backend",
+    "environment",
+    "data_dir",
+    "title",
+    "h1",
+    "subtitle",
+    "footer",
+)
+
+
+def load_dashboards() -> list[dict]:
+    """Parse benchmark/dashboards.toml and validate each row."""
+    if not DASHBOARDS_TOML.exists():
+        print(f"missing config: {DASHBOARDS_TOML}", file=sys.stderr)
+        return []
+    with DASHBOARDS_TOML.open("rb") as fh:
+        data = tomllib.load(fh)
+    rows = data.get("dashboard") or []
+    if not isinstance(rows, list):
+        print(f"bad config: [[dashboard]] must be an array", file=sys.stderr)
+        return []
+    seen_slugs: set[str] = set()
+    seen_dirs: set[str] = set()
+    for row in rows:
+        for field in REQUIRED_FIELDS:
+            if field not in row:
+                raise SystemExit(
+                    f"dashboards.toml row missing field {field!r}: {row}"
+                )
+        if row["environment"] not in ("local", "cloud"):
+            raise SystemExit(
+                f"dashboards.toml: environment must be 'local' or 'cloud', "
+                f"got {row['environment']!r} (slug={row['slug']!r})"
+            )
+        # Sanity: keep environment honest. localfs/seaweedfs must never be
+        # tagged cloud, and r2/s3/b2 must never be tagged local.
+        sb = row["storage_backend"]
+        if sb in LOCAL_STORAGE_BACKENDS and row["environment"] != "local":
+            raise SystemExit(
+                f"dashboards.toml: storage_backend={sb!r} is local-only "
+                f"but environment={row['environment']!r} (slug={row['slug']!r})"
+            )
+        if sb in CLOUD_STORAGE_BACKENDS and row["environment"] != "cloud":
+            raise SystemExit(
+                f"dashboards.toml: storage_backend={sb!r} is cloud-only "
+                f"but environment={row['environment']!r} (slug={row['slug']!r})"
+            )
+        if row["slug"] in seen_slugs:
+            raise SystemExit(f"dashboards.toml: duplicate slug {row['slug']!r}")
+        if row["data_dir"] in seen_dirs:
+            raise SystemExit(
+                f"dashboards.toml: duplicate data_dir {row['data_dir']!r}"
+            )
+        seen_slugs.add(row["slug"])
+        seen_dirs.add(row["data_dir"])
+    return rows
+
+
 # ---------- HTML template rendering ----------------------------------------
 #
-# The three index_*.html files differ only in (a) which data dir they load,
-# (b) header copy, (c) footer copy, (d) cross-nav links. We keep one source
-# of truth — `benchmark/template.html` — and render the three files from it
-# every time we bundle. Editing index_*.html directly is a no-op: the next
-# bundle.py run will overwrite it.
-
-DASHBOARDS = {
-    "data": {
-        "html_name": "index_localfs.html",
-        "title": "Basin — viability and scaling",
-        "h1": "Basin — LocalFS",
-        "subtitle": (
-            "LocalFS-backed synthetic benchmarks. The fastest, most stable "
-            "story — no network, no server-side concurrency limits, just "
-            "the pure architectural numbers."
-        ),
-        "section_suffix": "",
-        "footer": (
-            "LocalFS synthetic dashboard. Reads results from "
-            "<code>benchmark/data/results.js</code>, regenerated by "
-            "<code>benchmark/bundle.py</code> after each "
-            "<code>cargo test -p basin-integration-tests</code> run. Open "
-            "<code>index_localfs.html</code> directly — no server required."
-        ),
-    },
-    "data_real": {
-        "html_name": "index_real.html",
-        "title": "Basin — real-cloud benchmarks",
-        "h1": "Basin — real cloud",
-        "subtitle": (
-            "Same architecture, real S3-compatible backend (AWS S3, "
-            "Cloudflare R2, Backblaze B2, MinIO). These are the numbers your "
-            "customers will actually experience."
-        ),
-        "section_suffix": " — real cloud",
-        "footer": (
-            "Real-cloud dashboard. Reads results from "
-            "<code>benchmark/data_real/results.js</code>, regenerated by "
-            "<code>python3 benchmark/bundle.py --dir data_real</code> after "
-            "each cloud-backed test run. Configure the cloud backend in "
-            "<code>.basin-test.toml</code> at the repo root."
-        ),
-    },
-    "data_seaweedfs": {
-        "html_name": "index_seaweedfs.html",
-        "title": "Basin — SeaweedFS benchmarks",
-        "h1": "Basin — SeaweedFS",
-        "subtitle": (
-            "Same architecture, self-hosted SeaweedFS S3 gateway (multi-volume, "
-            "designed for high concurrent reads — production proxy for "
-            "&quot;S3-like&quot; throughput on local hardware)."
-        ),
-        "section_suffix": " — SeaweedFS",
-        "footer": (
-            "SeaweedFS dashboard. Reads results from "
-            "<code>benchmark/data_seaweedfs/results.js</code>, regenerated by "
-            "<code>python3 benchmark/bundle.py --dir data_seaweedfs</code> "
-            "after each SeaweedFS-backed test run. Configure the SeaweedFS "
-            "gateway in <code>.basin-test.seaweedfs.toml</code> at the repo "
-            "root."
-        ),
-    },
-}
+# Each row in dashboards.toml renders to one index_<slug>.html via
+# benchmark/template.html. Editing index_*.html directly is a no-op: the
+# next bundle.py run will overwrite it.
 
 
-def render_html_dashboards() -> None:
-    """Write the three index_*.html files from benchmark/template.html."""
+def _badge_html(row: dict) -> tuple[str, str, str]:
+    env = row["environment"]
+    storage = row["storage_backend"]
+    compute = row["compute_backend"]
+    env_badge = f'<span class="env-tag {env}">{env}</span>'
+    storage_badge = f'<span class="storage-tag">{storage}</span>'
+    compute_badge = f'<span class="compute-tag">{compute}</span>'
+    return env_badge, storage_badge, compute_badge
+
+
+def _section_suffix(row: dict) -> str:
+    """LocalFS keeps the bare section title (legacy); others append the H1 tail."""
+    if row["slug"] == "localfs":
+        return ""
+    tail = row["h1"].split("—", 1)[-1].strip() if "—" in row["h1"] else row["h1"]
+    return f" — {tail}"
+
+
+def _html_name(row: dict) -> str:
+    return f"index_{row['slug']}.html"
+
+
+def render_html_dashboards(rows: list[dict]) -> None:
     template_path = HERE / "template.html"
     if not template_path.exists():
-        # Template missing → leave the index files untouched. This keeps the
-        # bundle.py behaviour graceful in a fresh checkout where the template
-        # might not be present.
+        # Graceful in a fresh checkout where the template might not be present.
         print("skip html: no template.html")
         return
     template = template_path.read_text()
-    for data_name, cfg in DASHBOARDS.items():
+    for row in rows:
+        env_badge, storage_badge, compute_badge = _badge_html(row)
         nav_links = " · ".join(
-            f"<a href=\"{other['html_name']}\">{other['h1'].replace('Basin — ', '')}</a>"
-            for other_name, other in DASHBOARDS.items()
-            if other_name != data_name
+            f'<a href="{_html_name(other)}">'
+            f"{other['h1'].replace('Basin — ', '')}</a>"
+            for other in rows
+            if other["slug"] != row["slug"]
         )
+        nav_html = f"Other dashboards: {nav_links}" if nav_links else ""
         html = (
             template
-            .replace("{{TITLE}}", cfg["title"])
-            .replace("{{H1}}", cfg["h1"])
-            .replace("{{SUBTITLE}}", cfg["subtitle"])
-            .replace("{{SECTION_SUFFIX}}", cfg["section_suffix"])
-            .replace("{{FOOTER}}", cfg["footer"])
-            .replace("{{DATA_DIR}}", data_name)
-            .replace(
-                "{{NAV_LINKS}}",
-                f"Other dashboards: {nav_links}",
-            )
+            .replace("{{TITLE}}", row["title"])
+            .replace("{{H1}}", row["h1"])
+            .replace("{{SUBTITLE}}", row["subtitle"])
+            .replace("{{SECTION_SUFFIX}}", _section_suffix(row))
+            .replace("{{FOOTER}}", row["footer"])
+            .replace("{{DATA_DIR}}", row["data_dir"])
+            .replace("{{NAV_LINKS}}", nav_html)
+            .replace("{{ENVIRONMENT_BADGE}}", env_badge)
+            .replace("{{STORAGE_BADGE}}", storage_badge)
+            .replace("{{COMPUTE_BADGE}}", compute_badge)
         )
-        out_path = HERE / cfg["html_name"]
+        out_path = HERE / _html_name(row)
         out_path.write_text(html)
         print(f"wrote {out_path.relative_to(ROOT)} ({len(html)} bytes)")
 
 
 def main() -> int:
-    args = parse_args()
-    # Default behaviour is bundle-all-three so the dashboards stay in sync.
-    # Each dir is bundled independently; missing/empty manifests are skipped,
-    # not fatal, so this works even when only one set of tests has been run.
-    targets = [args.dir] if args.dir else ["data", "data_real", "data_seaweedfs"]
+    rows = load_dashboards()
+    if not rows:
+        return 1
+    by_dir = {row["data_dir"]: row for row in rows}
+    args = parse_args(sorted(by_dir.keys()))
+    # Default: bundle every configured dashboard so the rendered files stay
+    # in sync. Missing/empty manifests are skipped, not fatal, so this works
+    # even when only one set of tests has been run.
+    targets = [args.dir] if args.dir else list(by_dir.keys())
     rc = 0
     for name in targets:
+        row = by_dir[name]
         d = HERE / name
         if not (d / "manifest.json").exists():
-            # Allow the missing-dashboard case to skip silently when
-            # bundling all — common for a fresh checkout where only one
-            # set of tests has been run yet.
+            # Allow the missing-dashboard case to skip silently when bundling
+            # all — common for a fresh checkout where only one set of tests
+            # has been run yet.
             if args.dir is None:
                 print(f"skip {name}/: no manifest yet")
                 continue
-        rc |= bundle_one(d)
+        rc |= bundle_one(d, row["slug"])
     # Always re-render the HTML dashboards from the template, regardless of
     # which data dirs we just bundled. The HTML doesn't depend on data so
     # this is cheap.
-    render_html_dashboards()
+    render_html_dashboards(rows)
     return rc
 
 

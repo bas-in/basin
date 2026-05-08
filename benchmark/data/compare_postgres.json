@@ -15,19 +15,19 @@
     },
     {
       "label": "Point query p50",
-      "basin": 0.116583,
-      "postgres": 13.649,
+      "basin": 0.146625,
+      "postgres": 14.211,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 117.08x"
+      "ratio_text": "pg / basin = 96.92x"
     },
     {
       "label": "Insert 1M rows",
-      "basin": 2245.50025,
-      "postgres": 2473.2995,
+      "basin": 2351.598417,
+      "postgres": 2494.092875,
       "unit": "ms",
       "better": "basin"
     }
   ],
-  "generated_at": "@1778120348"
+  "generated_at": "@1778203877"
 }

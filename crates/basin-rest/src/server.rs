@@ -25,7 +25,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::errors::ApiError;
-use crate::routes::{auth as auth_routes, data as data_routes};
+use crate::routes::{auth as auth_routes, data as data_routes, openapi as openapi_routes};
 use crate::RestConfig;
 
 /// Shared inner state. Cheap to wrap in `Arc` and pass around handlers.
@@ -66,6 +66,7 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
     let body_limit = DefaultBodyLimit::max(inner.cfg.max_body_bytes);
 
     Router::new()
+        .route("/rest/v1/_openapi.json", get(openapi_routes::openapi))
         .route(
             "/rest/v1/:table",
             get(data_routes::get_table)
@@ -85,13 +86,24 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/auth/v1/request-password-reset",
             post(auth_routes::request_password_reset),
         )
+        // Tenant-agnostic email-link login. POST /auth/v1/magic-link body
+        // `{email}` → 204; POST /auth/v1/magic-link/consume body `{token}` →
+        // tokens. The legacy per-tenant flow lives in `AuthService` for now.
         .route(
             "/auth/v1/magic-link",
-            post(auth_routes::request_magic_link),
+            post(auth_routes::request_email_link),
         )
         .route(
-            "/auth/v1/magic-link/signin",
-            post(auth_routes::signin_magic_link),
+            "/auth/v1/magic-link/consume",
+            post(auth_routes::consume_email_link),
+        )
+        .route(
+            "/auth/v1/api-keys",
+            post(auth_routes::create_api_key).get(auth_routes::list_api_keys),
+        )
+        .route(
+            "/auth/v1/api-keys/:id",
+            axum::routing::delete(auth_routes::delete_api_key),
         )
         .route("/health", get(health))
         .layer(body_limit)
@@ -143,6 +155,11 @@ fn build_cors(origins: &[String]) -> CorsLayer {
 /// Verify the bearer token, run the per-tenant rate-limit check, and return
 /// the parsed claims. All `/rest/v1/*` handlers call this as the first step;
 /// it owns the auth + limiter stack.
+///
+/// The bearer can be a JWT (preferred path) or a long-lived API key. JWTs
+/// resolve in-memory; API-key validation hits the auth DB. API-key claims
+/// carry an empty roles list and the literal email `<api-key>` so engine
+/// code that reads `claims.roles` doesn't see a stale identity.
 pub(crate) async fn authorize(
     state: &Arc<Inner>,
     headers: &HeaderMap,
@@ -155,16 +172,32 @@ pub(crate) async fn authorize(
     let token = auth
         .strip_prefix("Bearer ")
         .or_else(|| auth.strip_prefix("bearer "))
-        .ok_or_else(|| ApiError::unauthenticated("Authorization must be `Bearer <jwt>`"))?
+        .ok_or_else(|| ApiError::unauthenticated("Authorization must be `Bearer <token>`"))?
         .trim();
     if token.is_empty() {
         return Err(ApiError::unauthenticated("empty bearer token"));
     }
-    let claims = state
-        .cfg
-        .auth
-        .verify_jwt(token)
-        .map_err(|e| ApiError::unauthenticated(format!("invalid jwt: {e}")))?;
+    let claims = match state.cfg.auth.verify_jwt(token) {
+        Ok(c) => c,
+        // JWT verification failed — fall through to API-key lookup. We
+        // don't surface the JWT error here so a caller using an API key
+        // doesn't get a misleading "invalid jwt" message.
+        Err(_) => match state.cfg.auth.validate_api_key(token).await {
+            Ok((tenant, user)) => Claims {
+                tenant_id: tenant,
+                user_id: user,
+                email: "<api-key>".to_string(),
+                roles: Vec::new(),
+                exp: 0,
+                iat: 0,
+            },
+            Err(e) => {
+                return Err(ApiError::unauthenticated(format!(
+                    "invalid bearer token: {e}"
+                )));
+            }
+        },
+    };
 
     // Per-tenant rate limit.
     state

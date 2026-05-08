@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "cold p99 ms",
-    "value": 7.872040999999999,
+    "value": 3417.6837920000003,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -15,34 +15,34 @@
   },
   "details": {
     "bar_cold_p99_ms": 8000.0,
-    "bucket": "basin-test",
-    "endpoint": "http://127.0.0.1:8333",
+    "bucket": "baisn-test",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "files": 10,
     "n_iterations": 1000,
     "rows": [
       {
-        "max_ms": 11.756292,
-        "mean_ms": 3.534460294000002,
-        "min_ms": 0.640875,
-        "p50_ms": 4.358333,
-        "p999_ms": 10.805166999999999,
-        "p99_ms": 7.872040999999999,
+        "max_ms": 5149.798707999999,
+        "mean_ms": 1313.3971472260016,
+        "min_ms": 936.7189999999999,
+        "p50_ms": 1113.9727500000001,
+        "p999_ms": 4544.149291,
+        "p99_ms": 3417.6837920000003,
         "phase": "cold"
       },
       {
-        "max_ms": 2.757584,
-        "mean_ms": 0.824818279,
-        "min_ms": 0.651708,
-        "p50_ms": 0.822083,
-        "p999_ms": 1.302125,
-        "p99_ms": 0.970458,
+        "max_ms": 1925.7214999999999,
+        "mean_ms": 1103.257060251001,
+        "min_ms": 918.752542,
+        "p50_ms": 1094.231708,
+        "p999_ms": 1709.671625,
+        "p99_ms": 1433.4503750000001,
         "phase": "warm"
       }
     ],
     "seed": 13425777967503634925,
-    "seed_elapsed_s": 1.035471667,
+    "seed_elapsed_s": 24.985964625,
     "total_rows": 10000000,
     "working_set_size": 1000
   },
-  "generated_at": "@1778115294"
+  "generated_at": "@1778207122"
 }

@@ -13,3 +13,4 @@ pub mod telemetry;
 
 pub use error::{BasinError, Result};
 pub use ids::{Ident, PartitionKey, TableName, TenantId, MAX_IDENT_LEN};
+pub use telemetry::{TenantCounterRegistry, TenantCounters, TenantCountersSnapshot};

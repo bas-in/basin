@@ -183,10 +183,12 @@ async fn s3_scaling_perf_stack() {
     let no_bloom_opts = WriteOptions {
         bloom_filter_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
+        cluster_columns: vec![],
     };
     let bloom_opts = WriteOptions {
         bloom_filter_columns: vec!["id".to_string()],
         max_row_group_size: Some(ROW_GROUP_SIZE),
+        cluster_columns: vec![],
     };
     for b in 0..BATCHES {
         let batch = make_batch(0xCAFEBABE_DEAD_BEEFu64, b);

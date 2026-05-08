@@ -128,6 +128,7 @@ async fn viability_bloom_filter_pruning() {
     let batch = build_shuffled_batch();
     let opts = WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
+        cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
     };
     let df = storage
@@ -340,6 +341,7 @@ async fn run_bloom_only_phase(
 
     let opts = WriteOptions {
         bloom_filter_columns: vec!["id".to_string()],
+        cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
     };
     storage

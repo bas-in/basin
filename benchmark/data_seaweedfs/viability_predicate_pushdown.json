@@ -14,10 +14,10 @@
     }
   },
   "details": {
-    "bucket": "basin-test",
-    "endpoint": "http://127.0.0.1:8333",
+    "bucket": "baisn-test",
+    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
     "full_scan_bytes": 5449388,
     "point_query_bytes": 53856
   },
-  "generated_at": "@1778115266"
+  "generated_at": "@1778207435"
 }

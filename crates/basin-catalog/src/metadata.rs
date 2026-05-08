@@ -233,6 +233,15 @@ pub struct TableMetadata {
     /// table via [`crate::Catalog::set_continuous_aggregate`]. See the
     /// `basin-cv` crate docs for the refresh / read-path semantics.
     pub continuous_aggregate: Option<CvDef>,
+    /// Phase 5.7 B2: physically sort each newly-written batch by these
+    /// columns before flushing to Parquet, so related rows live in the
+    /// same row group / file. Combined with A3 bloom filters and A4
+    /// catalog stats, point queries on the cluster columns prune to one
+    /// file in the common case. Empty (the default) preserves the
+    /// pre-B2 write path exactly. Configured per-table via
+    /// [`crate::Catalog::set_cluster_columns`] or `CLUSTER BY (...)` on
+    /// `CREATE TABLE`.
+    pub cluster_columns: Vec<String>,
 }
 
 impl TableMetadata {

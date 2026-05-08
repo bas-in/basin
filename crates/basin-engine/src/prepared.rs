@@ -69,7 +69,34 @@ impl Default for StatementHandle {
 #[derive(Clone, Debug)]
 pub struct StatementSchema {
     pub param_types: Vec<DataType>,
+    /// Phase 5.10 wire-protocol fix: parallel to `param_types`, marks slots
+    /// whose source column carries `BASIN_TYPE=JSONB` metadata. The pgwire
+    /// layer surfaces OID 3802 (jsonb) for these slots in ParameterDescription
+    /// and decodes the binary wire format (strip the 0x01 version byte, the
+    /// rest is canonical-form JSON bytes) at Bind time.
+    pub param_is_jsonb: Vec<bool>,
+    /// Same shape, for `BASIN_TYPE=UUID` columns. OID 2950 (uuid). Binary
+    /// wire format is 16 raw RFC 4122 bytes; we render those as a canonical
+    /// hyphenated string for the engine's text-substitution path, which
+    /// already accepts UUID string literals.
+    pub param_is_uuid: Vec<bool>,
     pub columns: Vec<Field>,
+}
+
+/// Mirrors `basin_engine::types::BASIN_TYPE_*`. Duplicated as a `&str` here
+/// so `prepared` doesn't need a back-edge import (these constants live in a
+/// crate-private module, and this file is the only consumer outside it that
+/// reads field metadata directly).
+const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
+const BASIN_TYPE_JSONB: &str = "JSONB";
+const BASIN_TYPE_UUID: &str = "UUID";
+
+fn field_is_jsonb(f: &Field) -> bool {
+    f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_JSONB)
+}
+
+fn field_is_uuid(f: &Field) -> bool {
+    f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
 }
 
 /// One scalar parameter value supplied at bind time. The variants here mirror
@@ -153,8 +180,18 @@ pub(crate) async fn prepare(
     // catalog. Anything we can't classify falls back to TEXT — drivers cope
     // either by sending strings or by coercing.
     let mut param_types = vec![DataType::Utf8; placeholder_count];
+    let mut param_is_jsonb = vec![false; placeholder_count];
+    let mut param_is_uuid = vec![false; placeholder_count];
     if placeholder_count > 0 {
-        if let Err(e) = infer_param_types(sess, sql, &mut param_types).await {
+        if let Err(e) = infer_param_types(
+            sess,
+            sql,
+            &mut param_types,
+            &mut param_is_jsonb,
+            &mut param_is_uuid,
+        )
+        .await
+        {
             tracing::debug!(error = %e, "param type inference fell back to TEXT");
         }
     }
@@ -169,6 +206,8 @@ pub(crate) async fn prepare(
 
     let schema = StatementSchema {
         param_types,
+        param_is_jsonb,
+        param_is_uuid,
         columns,
     };
 
@@ -202,6 +241,8 @@ async fn infer_param_types(
     sess: &TenantSession,
     sql: &str,
     out: &mut [DataType],
+    is_jsonb_out: &mut [bool],
+    is_uuid_out: &mut [bool],
 ) -> Result<()> {
     let dialect = PostgreSqlDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)
@@ -231,19 +272,31 @@ async fn infer_param_types(
                     .collect()
             };
             // Walk the VALUES rows; for each placeholder cell, pick up the
-            // matching column's data type.
+            // matching column's data type and JSONB/UUID metadata flag.
             if let Some(source) = ins.source {
                 if let SetExpr::Values(v) = source.body.as_ref() {
                     for row in &v.rows {
                         for (i, expr) in row.iter().enumerate() {
                             if let Some(n) = placeholder_index(expr) {
-                                if let (Some(col_name), Some(slot)) =
-                                    (col_order.get(i), out.get_mut(n - 1))
-                                {
-                                    if let Some(dt) =
-                                        column_type(meta.schema.as_ref(), col_name)
+                                if let Some(col_name) = col_order.get(i) {
+                                    if let Some(field) =
+                                        column_field(meta.schema.as_ref(), col_name)
                                     {
-                                        *slot = dt;
+                                        if let Some(slot) = out.get_mut(n - 1) {
+                                            *slot = field.data_type().clone();
+                                        }
+                                        if field_is_jsonb(field) {
+                                            if let Some(s) =
+                                                is_jsonb_out.get_mut(n - 1)
+                                            {
+                                                *s = true;
+                                            }
+                                        } else if field_is_uuid(field) {
+                                            if let Some(s) = is_uuid_out.get_mut(n - 1)
+                                            {
+                                                *s = true;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -253,7 +306,7 @@ async fn infer_param_types(
             }
         }
         Statement::Query(q) => {
-            walk_select_for_predicates(sess, &q, out).await?;
+            walk_select_for_predicates(sess, &q, out, is_jsonb_out, is_uuid_out).await?;
         }
         Statement::Update {
             table,
@@ -273,12 +326,20 @@ async fn infer_param_types(
                         .await
                     {
                         let schema = (*meta.schema).clone();
-                        infer_assignments(&assignments, &schema, out);
+                        infer_assignments(
+                            &assignments,
+                            &schema,
+                            out,
+                            is_jsonb_out,
+                            is_uuid_out,
+                        );
                         if let Some(pred) = &selection {
                             walk_pred(
                                 pred,
                                 &[(tn.as_str().to_owned(), schema)],
                                 out,
+                                is_jsonb_out,
+                                is_uuid_out,
                             );
                         }
                     }
@@ -307,6 +368,8 @@ async fn infer_param_types(
                                     pred,
                                     &[(tn.as_str().to_owned(), schema)],
                                     out,
+                                    is_jsonb_out,
+                                    is_uuid_out,
                                 );
                             }
                         }
@@ -320,21 +383,33 @@ async fn infer_param_types(
 }
 
 /// Pin SET-clause placeholder slots to the destination column's data type.
-/// `SET col = $1` → slot 0 takes the type of `col`.
+/// `SET col = $1` → slot 0 takes the type of `col`. JSONB / UUID flags are
+/// also propagated so the wire-protocol layer can advertise the right OIDs.
 fn infer_assignments(
     assignments: &[Assignment],
     schema: &arrow_schema::Schema,
     out: &mut [DataType],
+    is_jsonb_out: &mut [bool],
+    is_uuid_out: &mut [bool],
 ) {
     for a in assignments {
         if let AssignmentTarget::ColumnName(name) = &a.target {
             if name.0.len() == 1 {
                 let col = &name.0[0].value;
                 if let Some(n) = placeholder_index(&a.value) {
-                    if let (Some(slot), Some(dt)) =
-                        (out.get_mut(n - 1), column_type(schema, col))
-                    {
-                        *slot = dt;
+                    if let Some(field) = column_field(schema, col) {
+                        if let Some(slot) = out.get_mut(n - 1) {
+                            *slot = field.data_type().clone();
+                        }
+                        if field_is_jsonb(field) {
+                            if let Some(s) = is_jsonb_out.get_mut(n - 1) {
+                                *s = true;
+                            }
+                        } else if field_is_uuid(field) {
+                            if let Some(s) = is_uuid_out.get_mut(n - 1) {
+                                *s = true;
+                            }
+                        }
                     }
                 }
             }
@@ -360,20 +435,27 @@ fn placeholder_index(e: &Expr) -> Option<usize> {
     }
 }
 
-fn column_type(schema: &arrow_schema::Schema, col: &str) -> Option<DataType> {
+/// Look up a column by name on an Arrow schema. Returns `None` if missing,
+/// otherwise the borrowed `Field` so callers can read both the data type
+/// and the `BASIN_TYPE` metadata (JSONB / UUID).
+fn column_field<'a>(schema: &'a arrow_schema::Schema, col: &str) -> Option<&'a Field> {
     schema
         .fields()
         .iter()
         .find(|f| f.name() == col)
-        .map(|f| f.data_type().clone())
+        .map(|f| f.as_ref())
 }
 
 /// Walk a SELECT looking for `<col> OP $N` and `$N OP <col>` predicates we
-/// can resolve to a column type.
+/// can resolve to a column type. JSONB / UUID metadata flags are propagated
+/// for the SELECT WHERE side so prepared `WHERE id = $1` over a UUID column
+/// surfaces OID 2950 / 3802 instead of the BYTEA / TEXT default.
 async fn walk_select_for_predicates(
     sess: &TenantSession,
     q: &Query,
     out: &mut [DataType],
+    is_jsonb_out: &mut [bool],
+    is_uuid_out: &mut [bool],
 ) -> Result<()> {
     let select = match q.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -402,7 +484,7 @@ async fn walk_select_for_predicates(
     }
 
     if let Some(pred) = &select.selection {
-        walk_pred(pred, &tables, out);
+        walk_pred(pred, &tables, out, is_jsonb_out, is_uuid_out);
     }
 
     // LIMIT $N and OFFSET $N — Postgres types these as int8 (BIGINT). Drivers
@@ -431,12 +513,14 @@ fn walk_pred(
     expr: &Expr,
     tables: &[(String, arrow_schema::Schema)],
     out: &mut [DataType],
+    is_jsonb_out: &mut [bool],
+    is_uuid_out: &mut [bool],
 ) {
     if let Expr::BinaryOp { left, op, right } = expr {
         match op {
             BinaryOperator::And | BinaryOperator::Or => {
-                walk_pred(left, tables, out);
-                walk_pred(right, tables, out);
+                walk_pred(left, tables, out, is_jsonb_out, is_uuid_out);
+                walk_pred(right, tables, out, is_jsonb_out, is_uuid_out);
             }
             BinaryOperator::Eq
             | BinaryOperator::NotEq
@@ -444,8 +528,8 @@ fn walk_pred(
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
             | BinaryOperator::GtEq => {
-                pin_pair(left, right, tables, out);
-                pin_pair(right, left, tables, out);
+                pin_pair(left, right, tables, out, is_jsonb_out, is_uuid_out);
+                pin_pair(right, left, tables, out, is_jsonb_out, is_uuid_out);
             }
             _ => {}
         }
@@ -453,32 +537,51 @@ fn walk_pred(
 }
 
 /// If `placeholder` is a `$N` and `column` resolves to a known column on one
-/// of the tables in scope, copy the column's data type into the output slot.
+/// of the tables in scope, copy the column's data type into the output slot
+/// and (when applicable) set its JSONB / UUID flag.
 fn pin_pair(
     placeholder: &Expr,
     column: &Expr,
     tables: &[(String, arrow_schema::Schema)],
     out: &mut [DataType],
+    is_jsonb_out: &mut [bool],
+    is_uuid_out: &mut [bool],
 ) {
     let n = match placeholder_index(placeholder) {
         Some(n) => n,
         None => return,
     };
-    let slot = match out.get_mut(n - 1) {
-        Some(s) => s,
-        None => return,
-    };
-    if let Some(dt) = resolve_column(column, tables) {
-        *slot = dt;
+    if let Some((dt, is_jsonb, is_uuid)) = resolve_column_meta(column, tables) {
+        if let Some(slot) = out.get_mut(n - 1) {
+            *slot = dt;
+        }
+        if is_jsonb {
+            if let Some(s) = is_jsonb_out.get_mut(n - 1) {
+                *s = true;
+            }
+        } else if is_uuid {
+            if let Some(s) = is_uuid_out.get_mut(n - 1) {
+                *s = true;
+            }
+        }
     }
 }
 
-fn resolve_column(e: &Expr, tables: &[(String, arrow_schema::Schema)]) -> Option<DataType> {
+/// Resolve a column expression against a set of in-scope tables. Returns the
+/// Arrow data type plus the JSONB / UUID flags read off the field metadata.
+fn resolve_column_meta(
+    e: &Expr,
+    tables: &[(String, arrow_schema::Schema)],
+) -> Option<(DataType, bool, bool)> {
     match e {
         Expr::Identifier(id) => {
             for (_, schema) in tables {
-                if let Some(dt) = column_type(schema, &id.value) {
-                    return Some(dt);
+                if let Some(field) = column_field(schema, &id.value) {
+                    return Some((
+                        field.data_type().clone(),
+                        field_is_jsonb(field),
+                        field_is_uuid(field),
+                    ));
                 }
             }
             None
@@ -487,7 +590,9 @@ fn resolve_column(e: &Expr, tables: &[(String, arrow_schema::Schema)]) -> Option
             let (qualifier, col) = (&parts[0].value, &parts[1].value);
             for (label, schema) in tables {
                 if label == qualifier {
-                    return column_type(schema, col);
+                    return column_field(schema, col).map(|f| {
+                        (f.data_type().clone(), field_is_jsonb(f), field_is_uuid(f))
+                    });
                 }
             }
             None

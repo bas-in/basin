@@ -89,7 +89,7 @@ pub(crate) async fn issue_tokens_for(
         inner.cfg.token_ttl,
     )?;
     let (refresh_token, refresh_expires_at) =
-        issue_refresh(inner, tenant, user_id, now).await?;
+        issue_refresh(inner, tenant, user_id, email, now).await?;
     Ok(Tokens {
         access_token,
         refresh_token,

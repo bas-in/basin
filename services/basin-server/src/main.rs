@@ -98,7 +98,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use basin_common::{TenantId, telemetry::{init, LogFormat}};
 use basin_router::{
-    JwtTenantResolver, ServerConfig, StackedTenantResolver, StaticTenantResolver, TenantResolver,
+    ApiKeyTenantResolver, JwtTenantResolver, ServerConfig, StackedTenantResolver,
+    StaticTenantResolver, TenantResolver, TlsConfig,
 };
 use object_store::local::LocalFileSystem;
 
@@ -297,9 +298,12 @@ async fn main() -> Result<()> {
     // is the only path — byte-identical to pre-auth behaviour.
     let tenant_resolver: Arc<dyn TenantResolver> = match auth_service.as_ref() {
         Some(auth) => {
-            tracing::info!("pgwire resolver: JWT (primary) + static (fallback)");
+            tracing::info!(
+                "pgwire resolver: JWT (primary) + API-key + static (fallback)"
+            );
             Arc::new(StackedTenantResolver::new(vec![
                 Arc::new(JwtTenantResolver::new(auth.clone())),
+                Arc::new(ApiKeyTenantResolver::new(auth.clone())),
                 Arc::new(static_resolver),
             ]))
         }
@@ -340,6 +344,14 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Optional TLS. Both env vars must be set together — half-configured TLS
+    // is the kind of footgun that ships a "secure" server with the cert path
+    // typo'd to plaintext. Hard error at startup.
+    let tls = load_tls_from_env()?;
+    if tls.is_some() {
+        tracing::info!("pgwire TLS configured from BASIN_TLS_CERT_PATH/BASIN_TLS_KEY_PATH");
+    }
+
     // Run the router until Ctrl-C, then shut down the shard's background loops
     // and close the WAL. Order matters: stop accepting writes (router exit),
     // then drain compactions (shutdown), then close the WAL — that way no
@@ -351,6 +363,7 @@ async fn main() -> Result<()> {
         tenant_resolver,
         pool,
         shard_endpoints: None,
+        tls,
     };
 
     let router_join = tokio::spawn(async move {
@@ -478,6 +491,26 @@ fn bool_env(name: &str) -> bool {
         std::env::var(name).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE")
     )
+}
+
+/// Reads `BASIN_TLS_CERT_PATH` + `BASIN_TLS_KEY_PATH` and loads the PEM bytes.
+/// Both unset = no TLS; both set = TLS on; exactly one set = hard error.
+fn load_tls_from_env() -> Result<Option<Arc<TlsConfig>>> {
+    let cert_path = std::env::var("BASIN_TLS_CERT_PATH").ok().filter(|s| !s.is_empty());
+    let key_path = std::env::var("BASIN_TLS_KEY_PATH").ok().filter(|s| !s.is_empty());
+    match (cert_path, key_path) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let cert_pem = std::fs::read(&cert)
+                .with_context(|| format!("read BASIN_TLS_CERT_PATH at {cert}"))?;
+            let key_pem = std::fs::read(&key)
+                .with_context(|| format!("read BASIN_TLS_KEY_PATH at {key}"))?;
+            Ok(Some(Arc::new(TlsConfig { cert_pem, key_pem })))
+        }
+        _ => Err(anyhow!(
+            "TLS half-configured: set both BASIN_TLS_CERT_PATH and BASIN_TLS_KEY_PATH, or neither"
+        )),
+    }
 }
 
 fn parse_catalog_env() -> Result<CatalogBackend> {

@@ -20,6 +20,7 @@ members = [
     "crates/basin-geo",
     "crates/basin-trgm",
     "services/basin-server",
+    "services/basinctl",
     "tests/integration",
 ]
 
@@ -138,6 +139,10 @@ tempfile = "3"
 tokio-test = "0.4"
 proptest = "1"
 tokio-postgres = "0.7"
+# CLI argument parsing for `services/basinctl`. `derive` keeps the
+# subcommand surface declarative; default features only — no color crate
+# pulled into release builds we don't need for a small admin tool.
+clap = { version = "4", features = ["derive"] }
 # PRNG for benchmark workloads. Kept at workspace level so every test
 # crate that wants reproducible random ids points at the same major
 # version (0.8.x). Bumping to 0.9 changes `gen_range` semantics, which

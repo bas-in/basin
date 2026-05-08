@@ -52,6 +52,19 @@ pub struct AuthConfig {
     pub bcrypt_cost: u32,
     pub password_min_len: usize,
     pub rate_limit_per_ip_per_min: u32,
+    /// `false` disables every email-driven flow (magic-link, verify, reset).
+    /// Defaults to `true`. Operators with no SMTP relay set this to false
+    /// and the magic-link endpoint returns 503 instead of crashing on send.
+    pub email_enabled: bool,
+}
+
+impl AuthConfig {
+    /// True iff the SMTP block is meaningfully configured. Routes that
+    /// depend on outbound mail (magic-link request) check this and refuse
+    /// with 503 rather than queueing a doomed `lettre` send.
+    pub fn is_email_enabled(&self) -> bool {
+        self.email_enabled && !self.smtp.host.trim().is_empty()
+    }
 }
 
 impl AuthConfig {
@@ -168,6 +181,9 @@ impl AuthConfig {
             bcrypt_cost,
             password_min_len,
             rate_limit_per_ip_per_min,
+            // SMTP host validated above as required, so email is always
+            // enabled for env-built configs.
+            email_enabled: true,
         })
     }
 }

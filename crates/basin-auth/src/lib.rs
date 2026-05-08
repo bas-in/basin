@@ -31,15 +31,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api_keys;
 pub mod config;
 pub mod email;
 pub mod jwt;
 pub mod password;
 pub mod rate_limit;
 pub mod schema;
+pub mod session_settings;
 pub mod tokens;
 
 pub mod flows {
+    pub mod email_link;
     pub mod magic;
     pub mod refresh;
     pub mod reset;
@@ -47,6 +50,7 @@ pub mod flows {
     pub mod signup;
 }
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +62,7 @@ use tokio_postgres::{Client, NoTls};
 use tracing::instrument;
 use uuid::Uuid;
 
+pub use crate::api_keys::{ApiKeyDescriptor, ApiKeySecret, IssuedApiKey};
 pub use crate::config::{AuthConfig, SmtpConfig, SmtpTls};
 pub use crate::email::{Mailer, Outbound, SmtpMailer, StubMailer};
 pub use crate::jwt::Claims;
@@ -214,6 +219,29 @@ impl AuthService {
         flows::magic::request_magic_link(&self.inner, tenant, email).await
     }
 
+    /// True iff outbound mail is wired up. Routes that depend on email
+    /// (the new tenant-agnostic `/auth/v1/magic-link`) check this and
+    /// return 503 with `E_EMAIL_DISABLED` instead of attempting a doomed
+    /// SMTP send.
+    pub fn is_email_enabled(&self) -> bool {
+        self.inner.cfg.is_email_enabled()
+    }
+
+    /// Tenant-agnostic email-link login (request). Body is just an email;
+    /// the user is resolved at consume time. Always returns Ok on a
+    /// well-formed email — a missing user is silently dropped to defeat
+    /// enumeration probes.
+    #[instrument(skip(self), fields(email = %email))]
+    pub async fn request_email_link(&self, email: &str) -> Result<()> {
+        flows::email_link::request(&self.inner, email).await
+    }
+
+    /// Tenant-agnostic email-link login (consume). Single-use.
+    #[instrument(skip(self, token))]
+    pub async fn consume_email_link(&self, token: &str) -> Result<Tokens> {
+        flows::email_link::consume(&self.inner, token).await
+    }
+
     #[instrument(skip(self, token), fields(tenant = %tenant))]
     pub async fn signin_with_magic_link(
         &self,
@@ -226,6 +254,70 @@ impl AuthService {
     /// Decode and verify a JWT issued by this service. Cheap — no DB lookup.
     pub fn verify_jwt(&self, jwt: &str) -> Result<Claims> {
         self.inner.jwt.verify(jwt)
+    }
+
+    // --- API keys -----------------------------------------------------------
+
+    /// Mint a long-lived API key. The plaintext secret is returned exactly
+    /// once — store it client-side or hand it to the user immediately.
+    #[instrument(skip(self), fields(tenant = %tenant, user_id = %user_id))]
+    pub async fn issue_api_key(
+        &self,
+        user_id: UserId,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Result<IssuedApiKey> {
+        api_keys::issue(&self.inner, tenant, user_id, name).await
+    }
+
+    /// Look up an API key by its plaintext secret and return the owning
+    /// `(tenant, user)`. Bumps `last_used_at` on success.
+    #[instrument(skip(self, raw))]
+    pub async fn validate_api_key(&self, raw: &str) -> Result<(TenantId, UserId)> {
+        api_keys::validate(&self.inner, raw).await
+    }
+
+    /// Revoke an API key by id within a tenant. NotFound if the key doesn't
+    /// belong to `tenant`. Idempotent if already revoked.
+    #[instrument(skip(self), fields(tenant = %tenant, key_id))]
+    pub async fn revoke_api_key(&self, key_id: i64, tenant: &TenantId) -> Result<()> {
+        api_keys::revoke(&self.inner, key_id, tenant).await
+    }
+
+    /// List a user's API keys. Never returns the secret.
+    #[instrument(skip(self), fields(tenant = %tenant, user_id = %user_id))]
+    pub async fn list_api_keys(
+        &self,
+        user_id: UserId,
+        tenant: &TenantId,
+    ) -> Result<Vec<ApiKeyDescriptor>> {
+        api_keys::list(&self.inner, tenant, user_id).await
+    }
+
+    // --- session settings ---------------------------------------------------
+
+    /// Upsert a per-user session setting. `key` must be in
+    /// [`session_settings::ALLOWED_KEYS`]; the value is validated per-key.
+    #[instrument(skip(self, value), fields(tenant = %tenant, user_id = %user_id, key))]
+    pub async fn set_session_setting(
+        &self,
+        user_id: UserId,
+        tenant: &TenantId,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        session_settings::set(&self.inner, tenant, user_id, key, value).await
+    }
+
+    /// Read every session setting for a user. Empty map means "no
+    /// overrides; engine defaults apply".
+    #[instrument(skip(self), fields(tenant = %tenant, user_id = %user_id))]
+    pub async fn get_session_settings(
+        &self,
+        user_id: UserId,
+        tenant: &TenantId,
+    ) -> Result<HashMap<String, String>> {
+        session_settings::get_all(&self.inner, tenant, user_id).await
     }
 }
 
@@ -380,6 +472,7 @@ mod tests {
             password_min_len: 10,
             // High enough to never trigger inside a single test run.
             rate_limit_per_ip_per_min: 1000,
+            email_enabled: true,
         }
     }
 
@@ -740,6 +833,183 @@ mod tests {
         assert!(svc.verify_jwt(&tampered).is_err());
     }
 
+    // --- API key tests ------------------------------------------------------
+
+    /// Helper: signup, verify email, and return the verified user_id.
+    async fn make_verified_user(
+        svc: &AuthService,
+        mailer: &StubMailer,
+        tenant: &TenantId,
+        email: &str,
+    ) -> UserId {
+        let user = svc
+            .signup(tenant, email, "longenoughpassword")
+            .await
+            .unwrap();
+        svc.request_email_verification(tenant, user).await.unwrap();
+        let token = last_token(mailer);
+        svc.verify_email(tenant, &token).await.unwrap();
+        user
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_key_round_trip() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "ak@example.com").await;
+        let issued = svc.issue_api_key(user, &t, "ci pipeline").await.unwrap();
+        assert!(!issued.secret.is_empty());
+        assert_eq!(issued.name, "ci pipeline");
+
+        let (got_t, got_u) = svc.validate_api_key(&issued.secret).await.unwrap();
+        assert_eq!(got_t, t);
+        assert_eq!(got_u, user);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_key_revoke_invalidates() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "ak2@example.com").await;
+        let issued = svc.issue_api_key(user, &t, "deploy").await.unwrap();
+        svc.validate_api_key(&issued.secret).await.unwrap();
+
+        svc.revoke_api_key(issued.id, &t).await.unwrap();
+        let err = svc.validate_api_key(&issued.secret).await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("invalid"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_key_unknown_rejected() {
+        let Some((svc, _m, _g)) = try_connect().await else {
+            return;
+        };
+        let err = svc.validate_api_key("nope-not-a-real-key").await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("invalid"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_key_list_returns_descriptors() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "akl@example.com").await;
+        let _ = svc.issue_api_key(user, &t, "one").await.unwrap();
+        let _ = svc.issue_api_key(user, &t, "two").await.unwrap();
+        let list = svc.list_api_keys(user, &t).await.unwrap();
+        assert_eq!(list.len(), 2);
+        let names: Vec<&str> = list.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"one"));
+        assert!(names.contains(&"two"));
+        // Last-used / revoked must be None on a freshly-issued key.
+        for d in &list {
+            assert!(d.revoked_at.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_key_revoke_wrong_tenant_not_found() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let other = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "akw@example.com").await;
+        let issued = svc.issue_api_key(user, &t, "wrong-tenant").await.unwrap();
+        let err = svc.revoke_api_key(issued.id, &other).await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_key_duplicate_name_rejected() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "akd@example.com").await;
+        let _ = svc.issue_api_key(user, &t, "dup").await.unwrap();
+        let err = svc.issue_api_key(user, &t, "dup").await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("exists")
+                || err.to_string().to_lowercase().contains("conflict"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_key_last_used_at_bumped() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "aklu@example.com").await;
+        let issued = svc.issue_api_key(user, &t, "ts").await.unwrap();
+        // Before validation, last_used_at must be NULL.
+        let pre = svc.list_api_keys(user, &t).await.unwrap();
+        assert!(pre.iter().find(|d| d.id == issued.id).unwrap().last_used_at.is_none());
+
+        svc.validate_api_key(&issued.secret).await.unwrap();
+        let post = svc.list_api_keys(user, &t).await.unwrap();
+        assert!(post.iter().find(|d| d.id == issued.id).unwrap().last_used_at.is_some());
+    }
+
+    // --- session-setting tests ----------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_settings_round_trip() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "sess@example.com").await;
+        svc.set_session_setting(user, &t, "timezone", "America/New_York")
+            .await
+            .unwrap();
+        svc.set_session_setting(user, &t, "language", "en-US")
+            .await
+            .unwrap();
+        let got = svc.get_session_settings(user, &t).await.unwrap();
+        assert_eq!(got.get("timezone").map(|s| s.as_str()), Some("America/New_York"));
+        assert_eq!(got.get("language").map(|s| s.as_str()), Some("en-US"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_settings_upsert_replaces_value() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "sess2@example.com").await;
+        svc.set_session_setting(user, &t, "language", "en")
+            .await
+            .unwrap();
+        svc.set_session_setting(user, &t, "language", "fr-FR")
+            .await
+            .unwrap();
+        let got = svc.get_session_settings(user, &t).await.unwrap();
+        assert_eq!(got.get("language").map(|s| s.as_str()), Some("fr-FR"));
+        assert_eq!(got.len(), 1, "upsert must not duplicate");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_settings_reject_unknown_key() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "sess3@example.com").await;
+        let err = svc
+            .set_session_setting(user, &t, "search_path", "public")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::InvalidIdent(_)), "got {err:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn from_env_fatal_on_missing_smtp_host() {
         // This is a pure unit-of-config test (no PG needed). It's also covered
@@ -780,5 +1050,184 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    // --- email-link login (tenant-agnostic) ---------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn email_link_round_trip() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let user = make_verified_user(&svc, &mailer, &t, "el@example.com").await;
+        svc.request_email_link("el@example.com").await.unwrap();
+        let raw = last_token(&mailer);
+        let toks = svc.consume_email_link(&raw).await.unwrap();
+        let claims = svc.verify_jwt(&toks.access_token).unwrap();
+        assert_eq!(claims.user_id, user);
+        assert_eq!(claims.tenant_id, t);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn email_link_single_use() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let _ = make_verified_user(&svc, &mailer, &t, "el2@example.com").await;
+        svc.request_email_link("el2@example.com").await.unwrap();
+        let raw = last_token(&mailer);
+        svc.consume_email_link(&raw).await.unwrap();
+        let err = svc.consume_email_link(&raw).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("invalid"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn email_link_unknown_email_silent() {
+        let Some((svc, _m, _g)) = try_connect().await else {
+            return;
+        };
+        // No user exists for this address; the request must succeed (204
+        // semantics on the wire) and not insert any DB row.
+        svc.request_email_link("ghost@example.com").await.unwrap();
+        let client = svc.inner.client.lock().await;
+        let count: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*)::BIGINT FROM {sch}.auth_magic_links",
+                    sch = svc.inner.schema()
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 0, "no row should be inserted for an unknown email");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn email_link_disabled_returns_error() {
+        // Construct a service whose AuthConfig has `email_enabled = false`
+        // — even though SMTP host is non-empty. The flow check is the
+        // logical OR of both signals.
+        let schema = unique_schema();
+        let mut cfg = base_cfg(&schema);
+        cfg.email_enabled = false;
+        let mailer = StubMailer::new(cfg.smtp.from_email.clone());
+        let svc = match tokio::time::timeout(
+            Duration::from_secs(2),
+            AuthService::connect_with_mailer(cfg, Arc::new(mailer)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => return,
+        };
+        let _g = SchemaGuard { schema };
+        let err = svc.request_email_link("anyone@example.com").await.unwrap_err();
+        assert!(
+            err.to_string().contains("E_EMAIL_DISABLED"),
+            "got {err:?}"
+        );
+        assert!(!svc.is_email_enabled());
+    }
+
+    // --- refresh-token rotation + revocation list ---------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_old_token_after_rotate_returns_revoked() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let _ = make_verified_user(&svc, &mailer, &t, "rt1@example.com").await;
+        let toks = svc
+            .signin(&t, "rt1@example.com", "longenoughpassword")
+            .await
+            .unwrap();
+        let new = svc.refresh(&toks.refresh_token).await.unwrap();
+        assert_ne!(new.refresh_token, toks.refresh_token);
+        // Old must now fail with the "revoked" wording.
+        let err = svc.refresh(&toks.refresh_token).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("revoked"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_reuse_after_double_rotation_revokes_all() {
+        // The reuse-detection security path: A → rotated to B → rotated to
+        // C (current). An attacker presenting A is the trigger; the result
+        // is a blanket revoke that also kills C.
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let _ = make_verified_user(&svc, &mailer, &t, "reuse@example.com").await;
+        let a = svc
+            .signin(&t, "reuse@example.com", "longenoughpassword")
+            .await
+            .unwrap();
+        let b = svc.refresh(&a.refresh_token).await.unwrap();
+        // Sleep briefly so revoked_at on B is strictly after revoked_at on A.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let c = svc.refresh(&b.refresh_token).await.unwrap();
+
+        // Replay A — this is the leak signal.
+        let err = svc.refresh(&a.refresh_token).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("revoked"),
+            "got {err:?}"
+        );
+
+        // C must now also be invalid (blanket sentinel).
+        let err = svc.refresh(&c.refresh_token).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("revoked"),
+            "after reuse-detection, current refresh must also be revoked: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_jwt_audience_required() {
+        // An access token presented to /refresh must fail (different aud).
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let _ = make_verified_user(&svc, &mailer, &t, "aud@example.com").await;
+        let toks = svc
+            .signin(&t, "aud@example.com", "longenoughpassword")
+            .await
+            .unwrap();
+        let err = svc.refresh(&toks.access_token).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("invalid"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_signout_then_use_returns_revoked() {
+        let Some((svc, mailer, _g)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let _ = make_verified_user(&svc, &mailer, &t, "so2@example.com").await;
+        let toks = svc
+            .signin(&t, "so2@example.com", "longenoughpassword")
+            .await
+            .unwrap();
+        svc.signout(&toks.refresh_token).await.unwrap();
+        let err = svc.refresh(&toks.refresh_token).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("revoked"),
+            "got {err:?}"
+        );
     }
 }

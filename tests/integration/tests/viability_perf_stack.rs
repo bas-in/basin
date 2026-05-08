@@ -270,10 +270,12 @@ async fn viability_perf_stack() {
     });
     let no_bloom_opts = WriteOptions {
         bloom_filter_columns: vec![],
+        cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
     };
     let bloom_opts = WriteOptions {
         bloom_filter_columns: vec!["id".to_string()],
+        cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
     };
     for b in 0..BATCHES {

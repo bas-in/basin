@@ -115,6 +115,7 @@ fn auth_cfg(schema: &str) -> AuthConfig {
         bcrypt_cost: 4,
         password_min_len: 10,
         rate_limit_per_ip_per_min: 1000,
+        email_enabled: true,
     }
 }
 
@@ -122,6 +123,19 @@ fn auth_cfg(schema: &str) -> AuthConfig {
 /// unreachable — every test then prints a skip line and exits Ok.
 async fn try_serve() -> Option<(crate::RunningRest, RestService, AuthService, StubMailer, SchemaGuard)>
 {
+    try_serve_with(50).await
+}
+
+async fn try_serve_with(
+    max_page_size: usize,
+) -> Option<(crate::RunningRest, RestService, AuthService, StubMailer, SchemaGuard)> {
+    try_serve_full(max_page_size, 256).await
+}
+
+async fn try_serve_full(
+    max_page_size: usize,
+    max_body_bytes: usize,
+) -> Option<(crate::RunningRest, RestService, AuthService, StubMailer, SchemaGuard)> {
     let schema = unique_schema();
     let cfg = auth_cfg(&schema);
     let mailer = StubMailer::new(cfg.smtp.from_email.clone());
@@ -151,9 +165,9 @@ async fn try_serve() -> Option<(crate::RunningRest, RestService, AuthService, St
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
         auth: Arc::new(auth.clone()),
-        max_body_bytes: 256, // small so body_size_limit_enforced trips easily
+        max_body_bytes,
         default_page_size: 100,
-        max_page_size: 50, // small so select_cap_enforced is observable
+        max_page_size, // small so select_cap_enforced is observable
         cors_origins: vec!["https://app.example.com".into()],
         rate_limit_per_sec: 1000, // generous so other tests don't hit it
     });
@@ -505,8 +519,10 @@ async fn select_cap_enforced() {
     )
     .await;
     assert_eq!(r.status, 200);
-    let arr = r.json();
-    assert_eq!(arr.as_array().unwrap().len(), 50, "limit must be capped to max_page_size");
+    let v = r.json();
+    // `limit` is supplied → response is wrapped {rows, next_cursor}.
+    let arr = v["rows"].as_array().expect("rows array");
+    assert_eq!(arr.len(), 50, "limit must be capped to max_page_size");
 
     let _ = running.shutdown.send(());
 }
@@ -610,8 +626,9 @@ async fn order_and_pagination() {
     )
     .await;
     assert_eq!(r.status, 200);
-    let arr = r.json();
-    let arr = arr.as_array().unwrap();
+    let v = r.json();
+    // `limit` is supplied → response is wrapped {rows, next_cursor}.
+    let arr = v["rows"].as_array().expect("rows array");
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["id"], 4);
     assert_eq!(arr[1]["id"], 3);
@@ -749,6 +766,252 @@ async fn cors_preflight() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openapi_lists_tenant_tables() {
+    let Some((running, svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let tenant_a = TenantId::new();
+    let tenant_b = TenantId::new();
+
+    // Tenant A owns 3 tables.
+    let sa = svc.inner.cfg.engine.open_session(tenant_a).await.unwrap();
+    sa.execute("CREATE TABLE alpha (id BIGINT NOT NULL)").await.unwrap();
+    sa.execute("CREATE TABLE beta  (id BIGINT NOT NULL)").await.unwrap();
+    sa.execute("CREATE TABLE gamma (id BIGINT NOT NULL)").await.unwrap();
+    // Tenant B owns 1.
+    let sb = svc.inner.cfg.engine.open_session(tenant_b).await.unwrap();
+    sb.execute("CREATE TABLE only_b (id BIGINT NOT NULL)").await.unwrap();
+
+    let toks = make_user(&auth, &mailer, &tenant_a, "oa@example.com").await;
+    let bearer = format!("Bearer {}", toks.access_token);
+
+    let r = http_request(
+        addr,
+        "GET",
+        "/rest/v1/_openapi.json",
+        &[("Authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "openapi body: {}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["openapi"], "3.0.3");
+    let paths = v["paths"].as_object().expect("paths object");
+    assert_eq!(paths.len(), 3, "tenant A has exactly 3 tables: {paths:?}");
+    assert!(paths.contains_key("/rest/v1/alpha"));
+    assert!(paths.contains_key("/rest/v1/beta"));
+    assert!(paths.contains_key("/rest/v1/gamma"));
+    assert!(!paths.contains_key("/rest/v1/only_b"));
+
+    // Each path entry has the four CRUD operations.
+    for p in ["/rest/v1/alpha", "/rest/v1/beta", "/rest/v1/gamma"] {
+        let entry = &paths[p];
+        for op in ["get", "post", "patch", "delete"] {
+            assert!(entry.get(op).is_some(), "{p} missing {op}");
+        }
+    }
+
+    // Components must include matching schemas for tenant A only.
+    let schemas = v["components"]["schemas"].as_object().expect("schemas");
+    assert!(schemas.contains_key("alpha"));
+    assert!(schemas.contains_key("beta"));
+    assert!(schemas.contains_key("gamma"));
+    assert!(!schemas.contains_key("only_b"));
+
+    let _ = running.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openapi_includes_column_types() {
+    let Some((running, svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let tenant = TenantId::new();
+
+    // One table that exercises the type mapping: BIGINT, TEXT, BOOLEAN,
+    // DOUBLE, BYTEA, JSONB, UUID, TIMESTAMPTZ, VECTOR(N).
+    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    session
+        .execute(
+            "CREATE TABLE shapes ( \
+                 id BIGINT NOT NULL, \
+                 name TEXT NOT NULL, \
+                 active BOOLEAN NOT NULL, \
+                 score DOUBLE PRECISION NOT NULL, \
+                 raw BYTEA, \
+                 props JSONB, \
+                 oid UUID NOT NULL, \
+                 created_at TIMESTAMPTZ NOT NULL, \
+                 embedding VECTOR(4) \
+             )",
+        )
+        .await
+        .unwrap();
+
+    let toks = make_user(&auth, &mailer, &tenant, "ot@example.com").await;
+    let bearer = format!("Bearer {}", toks.access_token);
+    let r = http_request(
+        addr,
+        "GET",
+        "/rest/v1/_openapi.json",
+        &[("Authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "openapi body: {}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    let comp = &v["components"]["schemas"]["shapes"];
+    assert_eq!(comp["type"], "object");
+    let props = comp["properties"].as_object().expect("properties");
+
+    assert_eq!(props["id"]["type"], "integer");
+    assert_eq!(props["id"]["format"], "int64");
+
+    assert_eq!(props["name"]["type"], "string");
+
+    assert_eq!(props["active"]["type"], "boolean");
+
+    assert_eq!(props["score"]["type"], "number");
+    assert_eq!(props["score"]["format"], "double");
+
+    // BYTEA → Binary (plain) → string/binary.
+    assert_eq!(props["raw"]["type"], "string");
+    assert_eq!(props["raw"]["format"], "binary");
+
+    // JSONB → object with additionalProperties.
+    assert_eq!(props["props"]["type"], "object");
+    assert_eq!(props["props"]["additionalProperties"], true);
+
+    // UUID → string/uuid (FixedSizeBinary(16) + BASIN_TYPE=UUID marker).
+    assert_eq!(props["oid"]["type"], "string");
+    assert_eq!(props["oid"]["format"], "uuid");
+
+    // TIMESTAMPTZ → string/date-time.
+    assert_eq!(props["created_at"]["type"], "string");
+    assert_eq!(props["created_at"]["format"], "date-time");
+
+    // VECTOR(4) → array of numbers.
+    assert_eq!(props["embedding"]["type"], "array");
+    assert_eq!(props["embedding"]["items"]["type"], "number");
+
+    // NOT NULL columns must be in `required`.
+    let required: Vec<&str> = comp["required"]
+        .as_array()
+        .expect("required array")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for col in ["id", "name", "active", "score", "oid", "created_at"] {
+        assert!(required.contains(&col), "missing required: {col}");
+    }
+    // Nullable columns must NOT be in `required`.
+    for col in ["raw", "props", "embedding"] {
+        assert!(!required.contains(&col), "should not be required: {col}");
+    }
+
+    let _ = running.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_bearer_authenticates_rest() {
+    let Some((running, svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let tenant = TenantId::new();
+
+    // Set up a verified user + JWT so we can mint an API key via REST.
+    let toks = make_user(&auth, &mailer, &tenant, "apikey@example.com").await;
+    let bearer_jwt = format!("Bearer {}", toks.access_token);
+
+    // POST /auth/v1/api-keys returns the plaintext secret exactly once.
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/api-keys",
+        &[
+            ("Authorization", &bearer_jwt),
+            ("Content-Type", "application/json"),
+        ],
+        Some(br#"{"name":"ci"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 201, "create body: {}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    let secret = v["secret"].as_str().expect("secret in response").to_owned();
+    let id = v["id"].as_i64().expect("id in response");
+    assert!(!secret.is_empty());
+
+    // GET /auth/v1/api-keys lists keys without leaking secrets.
+    let r = http_request(
+        addr,
+        "GET",
+        "/auth/v1/api-keys",
+        &[("Authorization", &bearer_jwt)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let arr = r.json();
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert!(arr[0].get("secret").is_none() || arr[0]["secret"].is_null());
+
+    // CREATE TABLE so the api-key bearer has something to GET.
+    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    session
+        .execute("CREATE TABLE k (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    session.execute("INSERT INTO k VALUES (1), (2)").await.unwrap();
+
+    // Use the API key (NOT the JWT) as the bearer.
+    let bearer_key = format!("Bearer {}", secret);
+    let r = http_request(
+        addr,
+        "GET",
+        "/rest/v1/k?order=id.asc",
+        &[("Authorization", &bearer_key)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "GET via api key: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let arr = r.json();
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+
+    // DELETE /auth/v1/api-keys/<id> revokes; subsequent use is 401.
+    let r = http_request(
+        addr,
+        "DELETE",
+        &format!("/auth/v1/api-keys/{id}"),
+        &[("Authorization", &bearer_jwt)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
+    let r = http_request(
+        addr,
+        "GET",
+        "/rest/v1/k",
+        &[("Authorization", &bearer_key)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 401, "revoked api key must not authenticate");
+
+    let _ = running.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cors_disallowed_origin() {
     let Some((running, _svc, _a, _m, _g)) = try_serve().await else {
         return;
@@ -772,5 +1035,281 @@ async fn cors_disallowed_origin() {
         "disallowed origin must not be reflected back: {:?}",
         r.headers
     );
+    let _ = running.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pagination_cursor_advances() {
+    let Some((running, svc, auth, mailer, _g)) = try_serve_with(20_000).await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let tenant = TenantId::new();
+
+    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    session
+        .execute("CREATE TABLE pages (id BIGINT NOT NULL, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    let values: Vec<String> = (1..=50)
+        .map(|i| format!("({i}, 'r{i}')"))
+        .collect();
+    session
+        .execute(&format!("INSERT INTO pages VALUES {}", values.join(", ")))
+        .await
+        .unwrap();
+
+    let toks = make_user(&auth, &mailer, &tenant, "cur@example.com").await;
+    let bearer = format!("Bearer {}", toks.access_token);
+
+    let mut seen: Vec<i64> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for page in 0..6 {
+        let path = match &cursor {
+            None => "/rest/v1/pages?limit=10".to_string(),
+            Some(c) => format!("/rest/v1/pages?limit=10&cursor={c}"),
+        };
+        let r = http_request(
+            addr,
+            "GET",
+            &path,
+            &[("Authorization", &bearer)],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200, "page {page} body: {}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        let rows = v["rows"].as_array().expect("rows array");
+        for row in rows {
+            seen.push(row["id"].as_i64().expect("id i64"));
+        }
+        cursor = v["next_cursor"].as_str().map(|s| s.to_string());
+        // After page 5 (50 rows total) the cursor goes null.
+        if page == 5 {
+            assert!(cursor.is_none(), "trailing page should clear cursor");
+        }
+    }
+    seen.sort();
+    let expected: Vec<i64> = (1..=50).collect();
+    assert_eq!(seen, expected);
+
+    let _ = running.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_response_for_large_payload() {
+    let Some((running, svc, auth, mailer, _g)) = try_serve_with(20_000).await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let tenant = TenantId::new();
+
+    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    session
+        .execute("CREATE TABLE bulk (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    // Insert 11k rows in chunks so each INSERT statement stays manageable.
+    for chunk in (1..=11_000).collect::<Vec<i64>>().chunks(1000) {
+        let values: Vec<String> = chunk.iter().map(|i| format!("({i})")).collect();
+        session
+            .execute(&format!("INSERT INTO bulk VALUES {}", values.join(", ")))
+            .await
+            .unwrap();
+    }
+
+    let toks = make_user(&auth, &mailer, &tenant, "stm@example.com").await;
+    let bearer = format!("Bearer {}", toks.access_token);
+
+    let r = http_request(
+        addr,
+        "GET",
+        "/rest/v1/bulk?limit=15000",
+        &[("Authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.header("content-type"),
+        Some("application/x-ndjson"),
+        "headers: {:?}",
+        r.headers,
+    );
+
+    let body = std::str::from_utf8(&r.body).expect("ndjson utf8");
+    let mut row_count = 0usize;
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).expect("each line is JSON");
+        // The trailing cursor line, when present, has the marker key; everything
+        // else is a data row with an `id`.
+        if v.get("_basin_next_cursor").is_some() {
+            continue;
+        }
+        assert!(v.get("id").is_some(), "row missing id: {line}");
+        row_count += 1;
+    }
+    assert_eq!(row_count, 11_000);
+
+    let _ = running.shutdown.send(());
+}
+
+// --- Phase 5.10: email-link login + refresh-token rotation ------------------
+
+/// Happy path: POST email → 204; consume the token from the stub mailer →
+/// access + refresh tokens come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn magic_link_round_trip() {
+    let Some((running, _svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let tenant = TenantId::new();
+
+    // Bootstrap: signup + verify so a user exists for the email.
+    let _ = make_user(&auth, &mailer, &tenant, "ml-rt@example.com").await;
+
+    // Drain the verification email so `last_token` doesn't pick it up later.
+    let _ = mailer.sent();
+
+    // Step 1: POST /auth/v1/magic-link with just `email`.
+    let body = serde_json::json!({"email": "ml-rt@example.com"}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/magic-link",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        204,
+        "magic-link request body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // The stub mailer captured the link; pull the raw token out.
+    let raw = last_token(&mailer);
+
+    // Step 2: POST /auth/v1/magic-link/consume with `token`.
+    let body = serde_json::json!({"token": raw}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/magic-link/consume",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "magic-link consume body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let v = r.json();
+    assert!(v["access_token"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(v["refresh_token"].as_str().is_some_and(|s| !s.is_empty()));
+
+    // The same token is single-use: a second consume must 4xx.
+    let body = serde_json::json!({"token": raw}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/magic-link/consume",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert!(
+        r.status >= 400 && r.status < 500,
+        "second consume must fail: status={} body={}",
+        r.status,
+        String::from_utf8_lossy(&r.body)
+    );
+
+    let _ = running.shutdown.send(());
+}
+
+/// Reuse-detection: A → rotated to B → rotated to C. Replaying A revokes
+/// the user's whole refresh chain — including the active C — and surfaces
+/// `E_REVOKED_TOKEN`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_token_reuse_detected_revokes_all() {
+    // Refresh JWTs are ~700B; the default 256B body cap is too tight.
+    let Some((running, _svc, auth, mailer, _g)) = try_serve_full(50, 4096).await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let tenant = TenantId::new();
+    let toks_a = make_user(&auth, &mailer, &tenant, "rt-r@example.com").await;
+
+    // First rotation A → B.
+    let body = serde_json::json!({"refresh_token": toks_a.refresh_token}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/refresh",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(r.status, 200, "first rotate: {}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    let b_refresh = v["refresh_token"].as_str().unwrap().to_owned();
+
+    // Sleep so revoked_at on B is strictly after A's.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Second rotation B → C.
+    let body = serde_json::json!({"refresh_token": b_refresh}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/refresh",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(r.status, 200, "second rotate: {}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    let c_refresh = v["refresh_token"].as_str().unwrap().to_owned();
+
+    // Replay A — leaked old refresh; should 401 with E_REVOKED_TOKEN AND
+    // trigger the blanket sentinel.
+    let body = serde_json::json!({"refresh_token": toks_a.refresh_token}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/refresh",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(r.status, 401, "leaked-A replay: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["code"], "E_REVOKED_TOKEN");
+
+    // C must now also fail — blanket revoke.
+    let body = serde_json::json!({"refresh_token": c_refresh}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/refresh",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "C must be revoked after reuse-detection: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["code"], "E_REVOKED_TOKEN");
+
     let _ = running.shutdown.send(());
 }

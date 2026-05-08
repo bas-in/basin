@@ -23,6 +23,8 @@ pub enum ErrorCode {
     EngineUnsupported,
     PayloadTooLarge,
     Internal,
+    EmailDisabled,
+    RevokedToken,
 }
 
 impl ErrorCode {
@@ -36,6 +38,8 @@ impl ErrorCode {
             ErrorCode::EngineUnsupported => "E_ENGINE_UNSUPPORTED",
             ErrorCode::PayloadTooLarge => "E_INVALID_REQUEST",
             ErrorCode::Internal => "E_INTERNAL",
+            ErrorCode::EmailDisabled => "E_EMAIL_DISABLED",
+            ErrorCode::RevokedToken => "E_REVOKED_TOKEN",
         }
     }
 
@@ -49,6 +53,8 @@ impl ErrorCode {
             ErrorCode::EngineUnsupported => StatusCode::NOT_IMPLEMENTED,
             ErrorCode::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::EmailDisabled => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::RevokedToken => StatusCode::UNAUTHORIZED,
         }
     }
 }
@@ -92,6 +98,12 @@ impl ApiError {
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, msg)
+    }
+    pub fn email_disabled(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::EmailDisabled, msg)
+    }
+    pub fn revoked_token(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::RevokedToken, msg)
     }
 }
 

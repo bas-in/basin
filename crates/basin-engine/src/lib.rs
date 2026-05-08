@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use basin_common::{Result, TenantId};
+use basin_common::{Result, TenantCounterRegistry, TenantCountersSnapshot, TenantId};
 
 /// Engine configuration.
 ///
@@ -87,6 +87,10 @@ pub(crate) struct EngineInner {
     /// successful `TenantSession::execute`. See `noisy_detector` module
     /// for the full rationale.
     pub(crate) noisy_detector: crate::noisy_detector::NoisyDetector,
+    /// Per-tenant ops/bytes/errors/latency aggregator (Phase 6 telemetry).
+    /// Shared with `Storage` and (when present) `Wal` so byte counters cover
+    /// every layer.
+    pub(crate) tenant_counters: Arc<TenantCounterRegistry>,
     // additional state (DataFusion runtime, per-tenant context cache) lives
     // in the implementation module; intentionally not exposed here.
 }
@@ -98,12 +102,20 @@ impl Engine {
         crate::cv_glue::install();
         crate::geo_glue::install();
         crate::trgm_glue::install();
+        let tenant_counters = Arc::new(TenantCounterRegistry::new());
+        // Share the registry with storage (and the shard's WAL when present)
+        // so per-tenant byte counters cover engine + storage + WAL.
+        cfg.storage.attach_tenant_counters(tenant_counters.clone());
+        if let Some(shard) = cfg.shard.as_ref() {
+            shard.wal().attach_tenant_counters(tenant_counters.clone());
+        }
         Self {
             inner: Arc::new(EngineInner {
                 cfg,
                 analytical: None,
                 analytical_routing_count: AtomicU64::new(0),
                 noisy_detector: crate::noisy_detector::NoisyDetector::new(),
+                tenant_counters,
             }),
         }
     }
@@ -120,12 +132,14 @@ impl Engine {
     /// the heuristic and the fallback contract.
     pub fn with_analytical(self, analytical: basin_analytical::AnalyticalEngine) -> Self {
         let cfg = self.inner.cfg.clone();
+        let tenant_counters = self.inner.tenant_counters.clone();
         Self {
             inner: Arc::new(EngineInner {
                 cfg,
                 analytical: Some(analytical),
                 analytical_routing_count: AtomicU64::new(0),
                 noisy_detector: crate::noisy_detector::NoisyDetector::new(),
+                tenant_counters,
             }),
         }
     }
@@ -148,6 +162,22 @@ impl Engine {
     /// still consumed I/O budget).
     pub(crate) fn record_query(&self, tenant: &TenantId) {
         self.inner.noisy_detector.record_query(tenant);
+    }
+
+    /// Plain-data snapshot of `tenant`'s telemetry counters. Returns
+    /// `Default::default()` for tenants with no recorded activity yet.
+    /// Cheap (one HashMap probe + atomic loads + ≤128-element sort).
+    pub fn tenant_counters(&self, tenant: &TenantId) -> TenantCountersSnapshot {
+        self.inner
+            .tenant_counters
+            .snapshot(tenant)
+            .unwrap_or_default()
+    }
+
+    /// Crate-private shared registry handle so the executor / session can
+    /// bump op + latency counters without re-locking the registry per call.
+    pub(crate) fn tenant_counters_registry(&self) -> &Arc<TenantCounterRegistry> {
+        &self.inner.tenant_counters
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -236,11 +266,23 @@ impl TenantSession {
     /// or a side-effect tag for DML/DDL ([`ExecResult::Empty`]).
     #[tracing::instrument(skip(self, sql), fields(tenant=%self.tenant, sql=%sql.lines().next().unwrap_or("")))]
     pub async fn execute(&self, sql: &str) -> Result<ExecResult> {
+        let started = std::time::Instant::now();
         let result = crate::executor::execute(self, sql).await;
         // Bump the noisy-tenant rate estimator regardless of success: a
         // failed query still consumed I/O permits + planner time, which is
         // exactly what the detector is meant to throttle. O(1).
         self.engine.record_query(&self.tenant);
+        // Per-tenant op + latency + error counters (Phase 6 telemetry).
+        let tc = self
+            .engine
+            .tenant_counters_registry()
+            .for_tenant(&self.tenant);
+        tc.record_op();
+        let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        tc.record_latency_ms(elapsed_ms);
+        if result.is_err() {
+            tc.record_error();
+        }
         result
     }
 

@@ -27,9 +27,9 @@ mod writer;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use basin_common::{Result, TableName, TenantId};
+use basin_common::{Result, TableName, TenantCounterRegistry, TenantId};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -230,6 +230,11 @@ struct Inner {
     /// [`StorageConfig::page_cache`] for the rationale; `None` is the
     /// default (every read decodes from Parquet bytes).
     page_cache: Option<Arc<PageCache>>,
+    /// Optional per-tenant counters registry (Phase 6 telemetry). Attached by
+    /// the engine via [`Storage::attach_tenant_counters`]; first attach wins.
+    /// When present, every successful write/read bumps `bytes_written_total` /
+    /// `bytes_read_total` for the calling tenant.
+    tenant_counters: OnceLock<Arc<TenantCounterRegistry>>,
 }
 
 /// Best-effort counters for the read path. See [`Inner::read_counters`].
@@ -328,8 +333,24 @@ impl Storage {
                 default_tenant_concurrency: DEFAULT_TENANT_CONCURRENCY,
                 read_counters: Arc::new(ReadCounters::default()),
                 page_cache,
+                tenant_counters: OnceLock::new(),
             }),
         }
+    }
+
+    /// Attach a per-tenant counter registry. Idempotent (first attach wins).
+    pub fn attach_tenant_counters(&self, registry: Arc<TenantCounterRegistry>) {
+        let _ = self.inner.tenant_counters.set(registry);
+    }
+
+    pub(crate) fn tenant_counters(
+        &self,
+        tenant: &TenantId,
+    ) -> Option<Arc<basin_common::TenantCounters>> {
+        self.inner
+            .tenant_counters
+            .get()
+            .map(|r| r.for_tenant(tenant))
     }
 
     /// Handle to the in-RAM page cache, or `None` if the cache is not

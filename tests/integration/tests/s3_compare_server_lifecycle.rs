@@ -377,6 +377,7 @@ async fn s3_compare_server_lifecycle() {
         tenant_resolver: resolver,
         pool: None,
         shard_endpoints: None,
+        tls: None,
     })
     .await
     .expect("basin server failed to bind");

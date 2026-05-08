@@ -41,12 +41,34 @@
 //! are thin wrappers over the existing `AuthService` methods so a customer
 //! can stand up auth + REST on a single port.
 //!
+//! ## Pagination + streaming (Phase 5.10 ✅)
+//!
+//! - `GET /rest/v1/<table>?cursor=<token>&limit=<n>` — opaque base64url JSON
+//!   cursor `{"after_id": <last_seen_id>}`, joined with the existing filter
+//!   set as `WHERE id > <after_id> ORDER BY id ASC LIMIT <n>`. Limit clamps
+//!   to `max_page_size`. When `cursor` or `limit` is supplied the response
+//!   wraps as `{"rows":[…],"next_cursor":"…"}`; absent both, the bare-array
+//!   shape ships unchanged for back-compat. **v0.1 caveat:** cursor only
+//!   works for tables whose first column is named `id` and is `BIGINT`.
+//! - `?stream=true` (or > 1 MiB / 10_000 rows) switches the response to
+//!   `application/x-ndjson` chunked transfer; the cursor token (if any) is
+//!   the final NDJSON line keyed `_basin_next_cursor`.
+//!
 //! ## What's not implemented yet
 //!
-//! - **PATCH** returns `501 Not Implemented` with code `E_ENGINE_UNSUPPORTED`
-//!   until `basin-engine` grows `UPDATE` support.
 //! - Embedded resources, stored functions, realtime, GraphQL, and
 //!   aggregates are out of v1 (see ADR 0006).
+//! - OpenAPI: `GET /rest/v1/_openapi.json` ships a per-tenant 3.0.3
+//!   spec generated from the live catalog. Deferred for follow-up:
+//!   security schemes (the bearer-JWT requirement), per-operation
+//!   query / filter parameter docs, request examples, and a multi-
+//!   version `?spec=v0.2` switch.
+//!
+//! ## What's wired now
+//!
+//! - **PATCH** is live: `build_update_sql` produces `UPDATE table SET col=val
+//!   WHERE …` against the engine's Iceberg copy-on-write `UPDATE` path,
+//!   exercised by the `patch_round_trip` integration test.
 //!
 //! ## Hard requirements honored
 //!

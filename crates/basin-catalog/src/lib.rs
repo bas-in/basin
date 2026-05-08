@@ -173,6 +173,82 @@ pub trait Catalog: Send + Sync {
         table: &TableName,
     ) -> Result<Vec<Snapshot>>;
 
+    /// Copy-on-write table fork. Creates `dst_table` for `tenant` as a
+    /// clone of `src_table`'s current state: same schema, same snapshot
+    /// history (same `DataFileRef` paths), same partition / RLS / tier /
+    /// bloom / row-group / CV settings. From this point forward the two
+    /// tables have independent lineages — commits to `src_table` don't
+    /// affect `dst_table` and vice versa.
+    ///
+    /// **Data files are shared, not copied.** Both tables' snapshot
+    /// histories reference the same Parquet files on object storage.
+    /// Reads from either side go to the same bytes; this is the whole
+    /// point of "copy-on-write". Subsequent writes (and copy-on-write
+    /// `replace_data_files`) produce new files referenced by only the
+    /// writing side.
+    ///
+    /// Tenant deletion is the safety boundary: `Storage::delete_tenant`
+    /// scans the catalog's full file list, so deleting a tenant
+    /// correctly removes only files referenced by that tenant. The
+    /// shared-file design assumes both fork and source live under the
+    /// same tenant; cross-tenant forking is a v0.2 extension that needs
+    /// a refcount-aware GC story.
+    ///
+    /// Errors:
+    /// - [`basin_common::BasinError::NotFound`] when `src_table`
+    ///   doesn't exist.
+    /// - [`basin_common::BasinError::Catalog`] when `dst_table` already
+    ///   exists (no implicit overwrite).
+    /// - Default impl returns [`basin_common::BasinError::Internal`]
+    ///   (`"fork_table not implemented"`) so backends opt in
+    ///   explicitly. The in-memory and Postgres backends override.
+    async fn fork_table(
+        &self,
+        tenant: &TenantId,
+        src_table: &TableName,
+        dst_table: &TableName,
+    ) -> Result<TableMetadata> {
+        let _ = (tenant, src_table, dst_table);
+        Err(basin_common::BasinError::Internal(
+            "fork_table not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Point-in-time restore: rewind `(tenant, table)` to `snapshot_id`,
+    /// discarding any snapshots with `id > snapshot_id`. The current
+    /// snapshot pointer becomes `snapshot_id`; subsequent commits chain
+    /// off it. Returns the updated [`TableMetadata`].
+    ///
+    /// **Data files written between `snapshot_id` and the previous head
+    /// are not deleted by this method** — they become catalog-orphans.
+    /// The compactor's orphan sweep (or `Storage::delete_tenant` on
+    /// tenant teardown) is the GC path. Reads after rollback see only
+    /// files referenced by snapshots `≤ snapshot_id`, so the orphans are
+    /// invisible to queries.
+    ///
+    /// v0.1 semantics: this is a destructive *truncate*, not a
+    /// branch-from-snapshot. v0.2 will add a non-destructive variant
+    /// that keeps post-rollback snapshots in a sibling lineage so a
+    /// subsequent rollback can pick either side.
+    ///
+    /// Errors:
+    /// - [`basin_common::BasinError::NotFound`] when `snapshot_id` isn't
+    ///   in the table's history.
+    /// - Default impl returns [`basin_common::BasinError::Internal`]
+    ///   (`"rollback_to_snapshot not implemented"`) so backends opt in
+    ///   explicitly. The in-memory and Postgres backends override.
+    async fn rollback_to_snapshot(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        snapshot_id: SnapshotId,
+    ) -> Result<TableMetadata> {
+        let _ = (tenant, table, snapshot_id);
+        Err(basin_common::BasinError::Internal(
+            "rollback_to_snapshot not implemented for this catalog backend".into(),
+        ))
+    }
+
     /// Set the partitioning declared for `(tenant, table)`. The engine calls
     /// this after a `CREATE TABLE … PARTITION BY …` so subsequent INSERTs
     /// see the spec via [`load_table`](Catalog::load_table).
@@ -294,6 +370,24 @@ pub trait Catalog: Send + Sync {
         def: Option<metadata::CvDef>,
     ) -> Result<()> {
         let _ = (tenant, table, def);
+        Ok(())
+    }
+
+    /// Phase 5.7 B2: replace the cluster-column list for `(tenant, table)`.
+    /// Empty `columns` clears the cluster spec. The writer reads this on
+    /// every put and physically sorts the batch by these columns before
+    /// flushing to Parquet, so combined with A3 bloom filters and A4
+    /// catalog stats, point queries on cluster columns prune to one file
+    /// in the common case. Default impl is a no-op so the stub
+    /// `RestCatalog` and any future backend stay buildable; the in-memory
+    /// and Postgres backends override this.
+    async fn set_cluster_columns(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let _ = (tenant, table, columns);
         Ok(())
     }
 }

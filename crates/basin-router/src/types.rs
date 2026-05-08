@@ -369,6 +369,35 @@ fn render_uuid(bytes: &[u8]) -> String {
     uuid::Uuid::from_bytes(arr).hyphenated().to_string()
 }
 
+/// Render one Arrow cell as a UTF-8 string for the `COPY TO STDOUT` CSV
+/// path. Same shape as the simple-query text encoder, but JSONB / UUID
+/// metadata-driven types take the same logical-type code path so the
+/// CSV cell looks the way a `psql \copy` user expects (raw JSON text,
+/// hyphenated UUID).
+pub(crate) fn render_cell_for_copy(col: &dyn Array, idx: usize, field: &Field) -> String {
+    if field_is_jsonb(field)
+        && matches!(col.data_type(), DataType::LargeBinary | DataType::Binary)
+    {
+        let bytes: &[u8] = match col.data_type() {
+            DataType::LargeBinary => col.as_binary::<i64>().value(idx),
+            DataType::Binary => col.as_binary::<i32>().value(idx),
+            _ => unreachable!(),
+        };
+        // JSONB cells are already canonical-form JSON text bytes.
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    if field_is_uuid(field) {
+        if let DataType::FixedSizeBinary(16) = col.data_type() {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                .expect("FixedSizeBinaryArray for UUID column");
+            return render_uuid(arr.value(idx));
+        }
+    }
+    render_cell(col, idx)
+}
+
 fn render_cell(col: &dyn Array, idx: usize) -> String {
     match col.data_type() {
         DataType::Boolean => {

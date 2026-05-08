@@ -283,6 +283,7 @@ pub async fn start_n_shards_with_storage(
             tenant_resolver: counting,
             pool: None,
             shard_endpoints: None,
+            tls: None,
         })
         .await
         .expect("spawn shard listener");
@@ -310,6 +311,7 @@ pub async fn start_n_shards_with_storage(
         tenant_resolver: resolver_dyn,
         pool: None,
         shard_endpoints: Some(shard_endpoints.clone()),
+        tls: None,
     })
     .await
     .expect("spawn front router");

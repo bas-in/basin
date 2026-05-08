@@ -330,6 +330,7 @@ async fn read_paths_inner(
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
+    let tenant_counters = storage.tenant_counters(tenant);
     let stream = futures::stream::iter(paths)
         .map(move |p| {
             let store = store_for_stream.clone();
@@ -337,7 +338,10 @@ async fn read_paths_inner(
             let cache = cache.clone();
             let counters = counters.clone();
             let page_cache = page_cache.clone();
-            async move { read_one(store, p, opts, cache, counters, page_cache).await }
+            let tenant_counters = tenant_counters.clone();
+            async move {
+                read_one(store, p, opts, cache, counters, page_cache, tenant_counters).await
+            }
         })
         .buffered(4)
         .map(|res: Result<BoxStream<'static, Result<RecordBatch>>>| match res {
@@ -365,7 +369,17 @@ pub(crate) async fn read_file(
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
-    read_one(store, path.clone(), opts, cache, counters, page_cache).await
+    let tenant_counters = storage.tenant_counters(tenant);
+    read_one(
+        store,
+        path.clone(),
+        opts,
+        cache,
+        counters,
+        page_cache,
+        tenant_counters,
+    )
+    .await
 }
 
 async fn read_one(
@@ -375,6 +389,7 @@ async fn read_one(
     meta_cache: Arc<ParquetMetaCache>,
     counters: Arc<ReadCounters>,
     page_cache: Option<Arc<PageCache>>,
+    tenant_counters: Option<Arc<basin_common::TenantCounters>>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     // Page-cache fast path. Composes with everything below: a hit
     // means we skip the parquet decode entirely and yield the cached
@@ -415,18 +430,22 @@ async fn read_one(
     //
     // On miss we do the full HEAD + footer-fetch path and populate the
     // cache for next time.
-    let builder = if let Some(cached) = meta_cache.get(&path) {
+    let (builder, file_size) = if let Some(cached) = meta_cache.get(&path) {
+        let size = cached.size;
         let synthetic = object_store::ObjectMeta {
             location: path.clone(),
             last_modified: chrono::Utc::now(),
-            size: cached.size as usize,
+            size: size as usize,
             e_tag: None,
             version: None,
         };
         let reader = ParquetObjectReader::new(store, synthetic);
         let arrow_meta = ArrowReaderMetadata::try_new(cached.meta, ArrowReaderOptions::default())
             .map_err(|e| BasinError::storage(format!("rehydrate parquet meta {path}: {e}")))?;
-        ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
+        (
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta),
+            size,
+        )
     } else {
         let head = store
             .head(&path)
@@ -447,8 +466,19 @@ async fn read_one(
                 size,
             },
         );
-        ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
+        (
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta),
+            size,
+        )
     };
+
+    // Per-tenant bytes_read counter (Phase 6 telemetry). Bumped by the file
+    // size as an upper bound — the parquet reader prunes row groups so actual
+    // bytes pulled are typically a subset; this is a defensible scaling
+    // signal per tenant without per-range bookkeeping in the object_store.
+    if let Some(tc) = tenant_counters.as_ref() {
+        tc.record_bytes_read(file_size);
+    }
 
     let arrow_schema: SchemaRef = builder.schema().clone();
     let parquet_schema = builder.metadata().file_metadata().schema_descr_ptr();

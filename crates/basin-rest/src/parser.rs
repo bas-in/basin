@@ -49,6 +49,10 @@ pub(crate) struct Query {
     pub limit: Option<u64>,
     /// `?offset=N`.
     pub offset: Option<u64>,
+    /// Cursor `after_id` decoded from `?cursor=…`. Adds `id > <n>` to the
+    /// `WHERE` and forces `ORDER BY id ASC`. v0.1 only supports tables whose
+    /// first column is named `id` and is `BIGINT`.
+    pub after_id: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -245,6 +249,29 @@ fn parse_literal(v: &str) -> Literal {
     }
 }
 
+/// Encode a cursor as base64-url(JSON). v0.1 carries `{"after_id": <i64>}`.
+pub(crate) fn encode_cursor(after_id: i64) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let json = format!("{{\"after_id\":{after_id}}}");
+    URL_SAFE_NO_PAD.encode(json.as_bytes())
+}
+
+/// Decode a cursor previously returned in `next_cursor`. Returns `400` on
+/// malformed input.
+pub(crate) fn decode_cursor(s: &str) -> std::result::Result<i64, ApiError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let bytes = URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
+        .map_err(|e| ApiError::invalid(format!("cursor is not valid base64url: {e}")))?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::invalid(format!("cursor is not valid JSON: {e}")))?;
+    let after = v
+        .get("after_id")
+        .and_then(|n| n.as_i64())
+        .ok_or_else(|| ApiError::invalid("cursor missing integer `after_id`"))?;
+    Ok(after)
+}
+
 /// Validate that `s` is a SQL identifier we'll accept. Wraps
 /// [`basin_common::Ident::new`] to share the identifier rules with the
 /// engine.
@@ -279,8 +306,12 @@ pub(crate) fn build_select_sql(
     }
     sql.push_str(" FROM ");
     sql.push_str(&table);
-    write_where(&mut sql, &query.filters)?;
-    if !query.order.is_empty() {
+    write_where_with_cursor(&mut sql, &query.filters, query.after_id)?;
+    // A cursor pins ORDER BY to `id ASC` so pagination is deterministic; any
+    // user-supplied ordering is ignored when paginating.
+    if query.after_id.is_some() {
+        sql.push_str(" ORDER BY id ASC");
+    } else if !query.order.is_empty() {
         sql.push_str(" ORDER BY ");
         for (i, o) in query.order.iter().enumerate() {
             if i > 0 {
@@ -422,67 +453,85 @@ fn write_where(
     sql: &mut String,
     filters: &[Filter],
 ) -> std::result::Result<(), ApiError> {
-    if filters.is_empty() {
+    write_where_with_cursor(sql, filters, None)
+}
+
+fn write_where_with_cursor(
+    sql: &mut String,
+    filters: &[Filter],
+    after_id: Option<i64>,
+) -> std::result::Result<(), ApiError> {
+    if filters.is_empty() && after_id.is_none() {
         return Ok(());
     }
     sql.push_str(" WHERE ");
-    for (i, f) in filters.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    if let Some(after) = after_id {
+        sql.push_str(&format!("id > {after}"));
+        first = false;
+    }
+    for f in filters.iter() {
+        if !first {
             sql.push_str(" AND ");
         }
-        match &f.op {
-            FilterOp::Eq(v) => {
-                sql.push_str(&f.column);
-                sql.push_str(" = ");
-                sql.push_str(&render_literal(v));
-            }
-            FilterOp::Neq(v) => {
-                sql.push_str(&f.column);
-                sql.push_str(" <> ");
-                sql.push_str(&render_literal(v));
-            }
-            FilterOp::Gt(v) => {
-                sql.push_str(&f.column);
-                sql.push_str(" > ");
-                sql.push_str(&render_literal(v));
-            }
-            FilterOp::Gte(v) => {
-                sql.push_str(&f.column);
-                sql.push_str(" >= ");
-                sql.push_str(&render_literal(v));
-            }
-            FilterOp::Lt(v) => {
-                sql.push_str(&f.column);
-                sql.push_str(" < ");
-                sql.push_str(&render_literal(v));
-            }
-            FilterOp::Lte(v) => {
-                sql.push_str(&f.column);
-                sql.push_str(" <= ");
-                sql.push_str(&render_literal(v));
-            }
-            FilterOp::In(items) => {
-                sql.push_str(&f.column);
-                sql.push_str(" IN (");
-                for (j, it) in items.iter().enumerate() {
-                    if j > 0 {
-                        sql.push_str(", ");
-                    }
-                    sql.push_str(&render_literal(it));
-                }
-                sql.push(')');
-            }
-            FilterOp::IsNull => {
-                sql.push_str(&f.column);
-                sql.push_str(" IS NULL");
-            }
-            FilterOp::IsNotNull => {
-                sql.push_str(&f.column);
-                sql.push_str(" IS NOT NULL");
-            }
-        }
+        first = false;
+        write_filter(sql, f);
     }
     Ok(())
+}
+
+fn write_filter(sql: &mut String, f: &Filter) {
+    match &f.op {
+        FilterOp::Eq(v) => {
+            sql.push_str(&f.column);
+            sql.push_str(" = ");
+            sql.push_str(&render_literal(v));
+        }
+        FilterOp::Neq(v) => {
+            sql.push_str(&f.column);
+            sql.push_str(" <> ");
+            sql.push_str(&render_literal(v));
+        }
+        FilterOp::Gt(v) => {
+            sql.push_str(&f.column);
+            sql.push_str(" > ");
+            sql.push_str(&render_literal(v));
+        }
+        FilterOp::Gte(v) => {
+            sql.push_str(&f.column);
+            sql.push_str(" >= ");
+            sql.push_str(&render_literal(v));
+        }
+        FilterOp::Lt(v) => {
+            sql.push_str(&f.column);
+            sql.push_str(" < ");
+            sql.push_str(&render_literal(v));
+        }
+        FilterOp::Lte(v) => {
+            sql.push_str(&f.column);
+            sql.push_str(" <= ");
+            sql.push_str(&render_literal(v));
+        }
+        FilterOp::In(items) => {
+            sql.push_str(&f.column);
+            sql.push_str(" IN (");
+            for (j, it) in items.iter().enumerate() {
+                if j > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&render_literal(it));
+            }
+            sql.push(')');
+        }
+        FilterOp::IsNull => {
+            sql.push_str(&f.column);
+            sql.push_str(" IS NULL");
+        }
+        FilterOp::IsNotNull => {
+            sql.push_str(&f.column);
+            sql.push_str(" IS NOT NULL");
+        }
+    }
 }
 
 /// Render a [`Literal`] as a SQL value. Strings get single-quoted with

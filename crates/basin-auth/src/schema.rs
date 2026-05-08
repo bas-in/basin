@@ -80,6 +80,74 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
                 created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
             )"
         ),
+        // Long-lived per-tenant API keys. `key_hash` is the sha256 of the
+        // bearer secret (used as a fast-path lookup column); `key_bcrypt` is
+        // the bcrypt of the same secret and is what we actually verify
+        // against, defence-in-depth if the hash column ever leaks alone.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.api_keys (
+                id            BIGSERIAL PRIMARY KEY,
+                tenant_id     TEXT NOT NULL,
+                user_id       UUID NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+                name          TEXT NOT NULL,
+                key_hash      TEXT NOT NULL,
+                key_bcrypt    TEXT NOT NULL,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_used_at  TIMESTAMPTZ,
+                revoked_at    TIMESTAMPTZ,
+                UNIQUE (tenant_id, user_id, name)
+            )"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS api_keys_key_hash
+             ON {schema}.api_keys (key_hash)"
+        ),
+        // Per-user `current_setting()` overrides. Hard-coded allowlist of
+        // keys lives in the service layer; the DB doesn't constrain the
+        // value further beyond TEXT.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.user_session_settings (
+                tenant_id   TEXT NOT NULL,
+                user_id     UUID NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (tenant_id, user_id, key)
+            )"
+        ),
+        // Tenant-agnostic email-link login. Distinct from the existing
+        // `email_tokens` flow (which is per-tenant + bound to a known user
+        // at issue time): the consumer POSTs only an email, and we resolve
+        // the user at consume time. `token_hash` is bcrypt of the raw token.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.auth_magic_links (
+                id           BIGSERIAL PRIMARY KEY,
+                email        TEXT NOT NULL,
+                token_hash   TEXT NOT NULL,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at   TIMESTAMPTZ NOT NULL,
+                consumed_at  TIMESTAMPTZ
+            )"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS auth_magic_links_token_hash
+             ON {schema}.auth_magic_links (token_hash)"
+        ),
+        // Refresh-JWT revocation list. Keyed on the JWT `jti`. Reuse-detection
+        // sentinel rows use the well-known `token_hash` prefix `BLANKET:<uuid>`
+        // — see `flows::refresh` for the protocol.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.auth_revoked_refresh_tokens (
+                token_hash   TEXT PRIMARY KEY,
+                user_id      UUID NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+                revoked_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at   TIMESTAMPTZ NOT NULL
+            )"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS auth_revoked_refresh_tokens_user
+             ON {schema}.auth_revoked_refresh_tokens (user_id)"
+        ),
     ];
 
     for stmt in stmts {

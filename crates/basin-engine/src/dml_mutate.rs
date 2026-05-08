@@ -437,6 +437,7 @@ async fn write_replacement(
     let opts = basin_storage::WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
+        cluster_columns: meta.cluster_columns.clone(),
     };
     let df = sess
         .engine

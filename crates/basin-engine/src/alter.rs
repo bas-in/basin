@@ -18,13 +18,15 @@
 //!    `executor::execute` with a [`Statement::AlterTable`].
 //!
 //! 2. **Custom Basin extensions** that `sqlparser` 0.52 doesn't model —
-//!    `SET cold_after = N`, `SET cold_age_column = 'col'`, and
-//!    `SET BLOOM FILTERS ON (col, …)`. Rather than fork the parser we
-//!    pre-screen the raw SQL with a small textual matcher
-//!    ([`match_basin_alter_extension`]) before handing the statement to
-//!    `sqlparser`. The matcher is conservative: it only triggers on
-//!    `ALTER TABLE … SET <one of three keywords>` and otherwise returns
-//!    `None`, falling through to the standard path.
+//!    `SET cold_after = N`, `SET cold_age_column = 'col'`,
+//!    `SET BLOOM FILTERS ON (col, …)`, `SET row_group_rows = N`,
+//!    `RESET row_group_rows`, `CLUSTER BY (col, …)`, and
+//!    `RESET CLUSTER BY`. Rather than fork the parser we pre-screen the
+//!    raw SQL with a small textual matcher ([`match_basin_alter_extension`])
+//!    before handing the statement to `sqlparser`. The matcher is
+//!    conservative: it only triggers on `ALTER TABLE …
+//!    {SET <keyword> | RESET <keyword> | CLUSTER BY (...)}` and otherwise
+//!    returns `None`, falling through to the standard path.
 //!
 //! Tenant scoping: every catalog mutator is tenant-scoped already; the
 //! engine never sees a non-tenant-qualified `Catalog::set_*` call.
@@ -56,6 +58,16 @@ pub(crate) enum BasinAlterExtension {
     /// `ALTER TABLE <t> RESET row_group_rows`. Clears the per-table
     /// override and falls back to the writer's global default.
     ResetRowGroupRows { table: TableName },
+    /// `ALTER TABLE <t> CLUSTER BY (<c1>, <c2>, ...)`. Sets the cluster
+    /// columns; the writer physically `lexsort`s every batch by these
+    /// columns before Parquet flush.
+    SetClusterColumns {
+        table: TableName,
+        columns: Vec<String>,
+    },
+    /// `ALTER TABLE <t> RESET CLUSTER BY`. Clears the cluster spec; the
+    /// writer reverts to the pre-B2 unsorted byte-equivalent path.
+    ResetClusterColumns { table: TableName },
 }
 
 /// Try to recognise one of the Basin-specific ALTER TABLE forms in the
@@ -90,9 +102,9 @@ pub(crate) fn match_basin_alter_extension(sql: &str) -> Result<Option<BasinAlter
     after_alter_table = rest.trim_start();
     let table = TableName::new(&raw_name)?;
 
-    // The next keyword is either `SET` (most extensions) or `RESET`
-    // (for clearing a per-table override). Anything else falls through
-    // to the standard sqlparser path.
+    // The next keyword is either `SET` (most extensions), `RESET` (for
+    // clearing a per-table override), or `CLUSTER BY` (the bare form).
+    // Anything else falls through to the standard sqlparser path.
     let lower_rest = after_alter_table.to_ascii_lowercase();
     if let Some(after_reset) = strip_keyword(after_alter_table, &lower_rest, "reset") {
         let after_reset = after_reset.trim_start();
@@ -107,8 +119,23 @@ pub(crate) fn match_basin_alter_extension(sql: &str) -> Result<Option<BasinAlter
             }
             return Ok(Some(BasinAlterExtension::ResetRowGroupRows { table }));
         }
+        if let Some(tail) = strip_keyword(after_reset, &after_reset_lower, "cluster by") {
+            let trimmed = tail.trim();
+            if !trimmed.is_empty() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER TABLE … RESET CLUSTER BY: unexpected trailing input {trimmed:?}"
+                )));
+            }
+            return Ok(Some(BasinAlterExtension::ResetClusterColumns { table }));
+        }
         // RESET <something we don't recognise> — fall through.
         return Ok(None);
+    }
+
+    // Bare `CLUSTER BY (...)` — no `SET` prefix.
+    if let Some(rest) = strip_keyword(after_alter_table, &lower_rest, "cluster by") {
+        let columns = parse_paren_ident_list(rest)?;
+        return Ok(Some(BasinAlterExtension::SetClusterColumns { table, columns }));
     }
 
     if !after_alter_table
@@ -173,7 +200,9 @@ impl BasinAlterExtension {
             | BasinAlterExtension::SetColdAgeColumn { table, .. }
             | BasinAlterExtension::SetBloomFilterColumns { table, .. }
             | BasinAlterExtension::SetRowGroupRows { table, .. }
-            | BasinAlterExtension::ResetRowGroupRows { table } => table,
+            | BasinAlterExtension::ResetRowGroupRows { table }
+            | BasinAlterExtension::SetClusterColumns { table, .. }
+            | BasinAlterExtension::ResetClusterColumns { table } => table,
         }
     }
 
@@ -235,6 +264,26 @@ impl BasinAlterExtension {
             BasinAlterExtension::ResetRowGroupRows { table } => {
                 let _ = catalog.load_table(tenant, &table).await?;
                 catalog.set_row_group_rows(tenant, &table, None).await?;
+                Ok("ALTER TABLE")
+            }
+            BasinAlterExtension::SetClusterColumns { table, columns } => {
+                // Validate every cluster column exists in the schema; an
+                // unknown column would silently disable the lexsort on
+                // every future write.
+                let meta = catalog.load_table(tenant, &table).await?;
+                for c in &columns {
+                    if meta.schema.field_with_name(c).is_err() {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "ALTER TABLE {table}: CLUSTER BY column {c:?} not in table schema"
+                        )));
+                    }
+                }
+                catalog.set_cluster_columns(tenant, &table, columns).await?;
+                Ok("ALTER TABLE")
+            }
+            BasinAlterExtension::ResetClusterColumns { table } => {
+                let _ = catalog.load_table(tenant, &table).await?;
+                catalog.set_cluster_columns(tenant, &table, Vec::new()).await?;
                 Ok("ALTER TABLE")
             }
         }
@@ -585,5 +634,45 @@ mod tests {
         let err = match_basin_alter_extension("ALTER TABLE events SET row_group_rows = -7")
             .unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
+    }
+
+    #[test]
+    fn match_set_cluster_by() {
+        let m = match_basin_alter_extension("ALTER TABLE events CLUSTER BY (id, ts)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::SetClusterColumns {
+                table: TableName::new("events").unwrap(),
+                columns: vec!["id".into(), "ts".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn match_reset_cluster_by() {
+        let m = match_basin_alter_extension("ALTER TABLE events RESET CLUSTER BY")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::ResetClusterColumns {
+                table: TableName::new("events").unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn match_set_cluster_by_case_and_semicolon() {
+        let m = match_basin_alter_extension("alter table EVENTS cluster by (id);")
+            .unwrap()
+            .unwrap();
+        match m {
+            BasinAlterExtension::SetClusterColumns { columns, .. } => {
+                assert_eq!(columns, vec!["id".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

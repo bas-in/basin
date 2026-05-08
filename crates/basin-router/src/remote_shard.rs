@@ -140,6 +140,8 @@ impl Session for RemoteShardSession {
                 // `protocol.rs` handles that and produces a `ScalarParam`
                 // we render to a literal here.
                 param_types: vec![DataType::Utf8; placeholder_count],
+                param_is_jsonb: vec![false; placeholder_count],
+                param_is_uuid: vec![false; placeholder_count],
                 columns: Vec::new(),
             },
         ))
@@ -185,6 +187,8 @@ impl Session for RemoteShardSession {
         })?;
         Ok(StatementSchema {
             param_types: vec![DataType::Utf8; entry.placeholder_count],
+            param_is_jsonb: vec![false; entry.placeholder_count],
+            param_is_uuid: vec![false; entry.placeholder_count],
             columns: Vec::new(),
         })
     }

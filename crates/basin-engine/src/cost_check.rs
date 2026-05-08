@@ -40,12 +40,19 @@ use sqlparser::ast::{Statement, TableFactor};
 /// whose estimate exceeds `n` rows. Cached so repeated calls are free.
 pub fn cost_limit_rows() -> Option<u64> {
     static CACHED: OnceLock<Option<u64>> = OnceLock::new();
-    *CACHED.get_or_init(parse_cost_limit_env)
+    *CACHED.get_or_init(|| parse_cost_limit(std::env::var("BASIN_QUERY_COST_LIMIT_ROWS").ok().as_deref()))
 }
 
-fn parse_cost_limit_env() -> Option<u64> {
-    let raw = std::env::var("BASIN_QUERY_COST_LIMIT_ROWS").ok()?;
-    let n: u64 = raw.trim().parse().ok()?;
+/// Pure parse: takes the raw string (or `None` for unset) and produces the
+/// effective cap. Pulled out of `cost_limit_rows` so unit tests pass strings
+/// directly instead of mutating the process env (which races under
+/// `cargo test`'s default thread-parallel runner).
+fn parse_cost_limit(raw: Option<&str>) -> Option<u64> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let n: u64 = raw.parse().ok()?;
     if n == 0 {
         None
     } else {
@@ -162,37 +169,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_zero_means_unset() {
-        // OnceLock makes the public `cost_limit_rows` non-resettable, so
-        // we test the inner parser directly. "0" is a legitimate way for
-        // an operator to disable the check from a config-management tool
-        // that can't easily *unset* a variable.
-        std::env::set_var("BASIN_QUERY_COST_LIMIT_ROWS", "0");
-        assert!(parse_cost_limit_env().is_none());
-        std::env::remove_var("BASIN_QUERY_COST_LIMIT_ROWS");
+    fn parse_zero_means_unset() {
+        // "0" is a legitimate way for an operator to disable the check
+        // from a config-management tool that can't easily *unset* a
+        // variable.
+        assert!(parse_cost_limit(Some("0")).is_none());
     }
 
     #[test]
-    fn parse_env_unset_means_disabled() {
-        std::env::remove_var("BASIN_QUERY_COST_LIMIT_ROWS");
-        assert!(parse_cost_limit_env().is_none());
+    fn parse_unset_means_disabled() {
+        assert!(parse_cost_limit(None).is_none());
     }
 
     #[test]
-    fn parse_env_valid_returns_limit() {
-        std::env::set_var("BASIN_QUERY_COST_LIMIT_ROWS", "12345");
-        assert_eq!(parse_cost_limit_env(), Some(12345));
-        std::env::remove_var("BASIN_QUERY_COST_LIMIT_ROWS");
+    fn parse_empty_means_disabled() {
+        assert!(parse_cost_limit(Some("")).is_none());
+        assert!(parse_cost_limit(Some("   ")).is_none());
     }
 
     #[test]
-    fn parse_env_garbage_means_disabled() {
+    fn parse_valid_returns_limit() {
+        assert_eq!(parse_cost_limit(Some("12345")), Some(12345));
+    }
+
+    #[test]
+    fn parse_trims_whitespace() {
+        assert_eq!(parse_cost_limit(Some("  17  ")), Some(17));
+    }
+
+    #[test]
+    fn parse_garbage_means_disabled() {
         // Permissive: a typo doesn't break the server. The startup log
         // (added by the call site) surfaces the parse failure to the
         // operator while the server keeps running.
-        std::env::set_var("BASIN_QUERY_COST_LIMIT_ROWS", "not-a-number");
-        assert!(parse_cost_limit_env().is_none());
-        std::env::remove_var("BASIN_QUERY_COST_LIMIT_ROWS");
+        assert!(parse_cost_limit(Some("not-a-number")).is_none());
     }
 
     #[test]

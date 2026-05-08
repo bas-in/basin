@@ -37,6 +37,10 @@ sha2 = "0.10"
 subtle = "2"
 hex = "0.4"
 rand = "0.8"
+# Url-safe base64 for the long-lived API-key wire format. Pulled at the
+# workspace level for the engine's `decode()` UDF, so this adds no new
+# transitive surface.
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

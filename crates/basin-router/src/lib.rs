@@ -48,6 +48,7 @@ use basin_common::{BasinError, Result};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 
+mod copy;
 mod error;
 mod protocol;
 mod rate_limit;
@@ -55,11 +56,16 @@ mod remote_shard;
 mod resolver;
 mod sharding;
 pub mod test_cluster;
+mod tls;
 mod types;
 
 pub use rate_limit::{from_env_qps, PgRateLimit, BURST_FACTOR, DEFAULT_SUSTAINED_QPS};
-pub use resolver::{JwtTenantResolver, StackedTenantResolver, StaticTenantResolver, TenantResolver};
+pub use resolver::{
+    ApiKeyTenantResolver, JwtTenantResolver, StackedTenantResolver, StaticTenantResolver,
+    TenantResolver,
+};
 pub use sharding::{parse_pins_env, ShardMap};
+pub use tls::{build_acceptor, TlsConfig};
 
 use crate::protocol::{
     BasinExtendedQueryHandler, BasinHandlers, BasinSimpleQueryHandlerSlot, BasinStartupHandler,
@@ -81,12 +87,18 @@ use crate::remote_shard::RemoteShardSessionFactory;
 /// that endpoint. The local `engine` and `pool` are unused in this mode
 /// but must still be supplied (the field is part of the trait surface).
 /// When `None`, behaviour is byte-identical to single-process Basin.
+///
+/// `tls` is optional. When `Some`, the listener answers `'S'` to a Postgres
+/// `SSLRequest` and wraps the socket with the supplied acceptor before the
+/// regular pgwire startup; `None` answers `'N'` and stays plaintext, which
+/// matches pre-TLS behaviour byte-for-byte. See [`tls`] module docs.
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub engine: basin_engine::Engine,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     pub pool: Option<Arc<basin_pool::SessionPool>>,
     pub shard_endpoints: Option<Vec<String>>,
+    pub tls: Option<Arc<TlsConfig>>,
 }
 
 /// Bind, listen, accept until the process is killed.
@@ -110,6 +122,7 @@ pub async fn run_with_shutdown(cfg: ServerConfig, shutdown: oneshot::Receiver<()
         cfg.tenant_resolver,
         cfg.pool,
         cfg.shard_endpoints,
+        cfg.tls,
         shutdown,
     )
     .await
@@ -130,8 +143,9 @@ pub async fn run_until_bound(cfg: ServerConfig) -> Result<RunningServer> {
     let resolver = cfg.tenant_resolver;
     let pool = cfg.pool;
     let shard_endpoints = cfg.shard_endpoints;
+    let tls = cfg.tls;
     let join = tokio::spawn(async move {
-        accept_loop(listener, engine, resolver, pool, shard_endpoints, rx).await
+        accept_loop(listener, engine, resolver, pool, shard_endpoints, tls, rx).await
     });
     Ok(RunningServer {
         local_addr,
@@ -154,8 +168,20 @@ async fn accept_loop(
     resolver: Arc<dyn TenantResolver>,
     pool: Option<Arc<basin_pool::SessionPool>>,
     shard_endpoints: Option<Vec<String>>,
+    tls: Option<Arc<TlsConfig>>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
+    // Build the TlsAcceptor once at startup so every connection shares one
+    // rustls ServerConfig (cheap clone on accept). Failure here is a hard
+    // startup error so a bad cert is loud, not silently per-connection.
+    let tls_acceptor = match tls.as_deref() {
+        Some(cfg) => {
+            let acceptor = build_acceptor(cfg)?;
+            tracing::info!("pgwire TLS enabled");
+            Some(Arc::new(acceptor))
+        }
+        None => None,
+    };
     // Per-tenant pgwire rate limiter (Phase 6). Read once at startup so
     // the env var doesn't need to be re-parsed on every connection.
     // `0` / unset / empty = disabled. A typo (non-numeric) is a hard
@@ -208,16 +234,16 @@ async fn accept_loop(
             "router running in compute-sharded mode"
         );
         let factory = Arc::new(RemoteShardSessionFactory::new(map));
-        return run_accept_loop(listener, factory, resolver, rate_limit, &mut shutdown).await;
+        return run_accept_loop(listener, factory, resolver, rate_limit, tls_acceptor, &mut shutdown).await;
     }
 
     if let Some(pool) = pool {
         let factory = Arc::new(PooledSessionFactory::new(pool));
-        return run_accept_loop(listener, factory, resolver, rate_limit, &mut shutdown).await;
+        return run_accept_loop(listener, factory, resolver, rate_limit, tls_acceptor, &mut shutdown).await;
     }
 
     let factory = Arc::new(EngineSessionFactory(engine));
-    run_accept_loop(listener, factory, resolver, rate_limit, &mut shutdown).await
+    run_accept_loop(listener, factory, resolver, rate_limit, tls_acceptor, &mut shutdown).await
 }
 
 /// Inner accept loop, parameterised on a single concrete factory type.
@@ -229,6 +255,7 @@ async fn run_accept_loop<F>(
     factory: Arc<F>,
     resolver: Arc<dyn TenantResolver>,
     rate_limit: Option<Arc<PgRateLimit>>,
+    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     shutdown: &mut oneshot::Receiver<()>,
 ) -> Result<()>
 where
@@ -251,8 +278,9 @@ where
                 let factory = factory.clone();
                 let resolver = resolver.clone();
                 let rate_limit = rate_limit.clone();
+                let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(sock, peer, factory, resolver, rate_limit).await {
+                    if let Err(e) = handle_connection(sock, peer, factory, resolver, rate_limit, tls_acceptor).await {
                         tracing::warn!(error = %e, %peer, "connection ended with error");
                     }
                 });
@@ -268,24 +296,29 @@ async fn handle_connection<F>(
     factory: Arc<F>,
     resolver: Arc<dyn TenantResolver>,
     rate_limit: Option<Arc<PgRateLimit>>,
+    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 ) -> Result<()>
 where
     F: SessionFactory + 'static,
 {
     let slot = Arc::new(Mutex::new(None::<Arc<F::Session>>));
+    let simple = Arc::new(BasinSimpleQueryHandlerSlot::new(
+        slot.clone(),
+        rate_limit.clone(),
+    ));
+    let copy_state = simple.copy_state.clone();
     let handlers = BasinHandlers {
         startup: Arc::new(BasinStartupHandler::new(
             factory,
             resolver,
             slot.clone(),
         )),
-        simple: Arc::new(BasinSimpleQueryHandlerSlot {
-            slot: slot.clone(),
-            rate_limit: rate_limit.clone(),
-        }),
-        extended: Arc::new(BasinExtendedQueryHandler::new(slot, rate_limit)),
+        simple,
+        extended: Arc::new(BasinExtendedQueryHandler::new(slot, rate_limit, copy_state)),
     };
-    pgwire::tokio::process_socket(sock, None, handlers)
+    // pgwire 0.28 owns the SSLRequest peek + 'S'/'N' response + TLS wrap when
+    // a TlsAcceptor is supplied; `None` keeps the pre-TLS plaintext path.
+    pgwire::tokio::process_socket(sock, tls_acceptor, handlers)
         .await
         .map_err(|e| BasinError::Internal(format!("pgwire: {e}")))
 }
