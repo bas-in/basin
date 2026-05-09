@@ -100,7 +100,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | **Parquet page cache (RAM)** | ✅ | LRU of decoded RecordBatches; <1ms warm hits. Default-on. 7.24× speedup measured. |
 | HTTP/2 toggle for S3 client | ✅ | `S3Config::http2_only`; useful on AWS S3 / R2 over HTTPS |
 | Iceberg-style catalog (in-memory) | ✅ | atomic appends, optimistic concurrency |
-| Iceberg-style catalog (durable) | ✅ | Postgres-backed; survives restart |
+| Iceberg-style catalog (durable) | ✅ | Postgres-backed; survives restart. Multi-region replication direction: single-writer global PG with regional read replicas via PG logical replication — see [ADR 0010](./docs/decisions/0010-catalog-replication.md). |
 | Point-in-time restore (catalog level) | 🛠 | `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` truncates history to ≤ target and rewinds the head pointer. InMemory + Postgres impls. v0.2 adds physical file GC for orphaned post-rollback files; cross-DML rollback waits on soft-delete (also v0.2). |
 | Per-tenant fair-share scheduler | 🛠 | architectural primitive shipped (cap=16); v0.2 EDF deferred — see [ADR 0008](./docs/decisions/0008-noisy-neighbor-fairness.md) |
 | WAL (Raft-backed, 5ms acks) | ◻️ | Phase 2 — closes the insert-latency gap |

@@ -36,7 +36,8 @@ use basin_common::{Result, TableName, TenantId};
 
 pub use in_memory::InMemoryCatalog;
 pub use metadata::{
-    ColumnStats, CvDef, DataFileRef, PartitionSpec, Policy, PolicyCommand, TableMetadata,
+    ColumnStats, CvDef, DataFileRef, PartitionSpec, Policy, PolicyCommand, SecondaryIndex,
+    TableMetadata,
 };
 pub use postgres::PostgresCatalog;
 pub use rest::RestCatalog;
@@ -389,5 +390,59 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         let _ = (tenant, table, columns);
         Ok(())
+    }
+
+    /// Phase 6 multi-region scaffolding (ADR 0009). Pin `(tenant, table)`
+    /// to a home region (or clear the pin with `None`). v0.1 only
+    /// *records* the value; the cross-region routing / replication that
+    /// will eventually consume it is future work per ADR 0009. Default
+    /// impl is a no-op so the stub `RestCatalog` and any future backend
+    /// stay buildable; the in-memory and Postgres backends override.
+    async fn set_home_region(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        region: Option<String>,
+    ) -> Result<()> {
+        let _ = (tenant, table, region);
+        Ok(())
+    }
+
+    /// Phase 5.7 B1: declare a per-tenant secondary index on `(table, column)`.
+    /// The catalog records the declaration; the storage reader materialises
+    /// the physical (value → file/row_group/row) map lazily on first query.
+    /// Returns [`basin_common::BasinError::InvalidSchema`] if `column` is not
+    /// in the table's schema, or [`basin_common::BasinError::Catalog`] if
+    /// `name` collides with an existing index on the same table.
+    /// Default impl returns `Internal("not implemented")` so the stub
+    /// `RestCatalog` stays buildable; in-memory and Postgres backends
+    /// override.
+    async fn create_index(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+        column: &str,
+    ) -> Result<()> {
+        let _ = (tenant, table, name, column);
+        Err(basin_common::BasinError::Internal(
+            "create_index not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Phase 5.7 B1: drop a previously-declared secondary index by name.
+    /// Returns [`basin_common::BasinError::NotFound`] if no index with that
+    /// name exists on the table. Default impl returns `Internal("not
+    /// implemented")` so the stub `RestCatalog` stays buildable.
+    async fn drop_index(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+    ) -> Result<()> {
+        let _ = (tenant, table, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_index not implemented for this catalog backend".into(),
+        ))
     }
 }

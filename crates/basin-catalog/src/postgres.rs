@@ -25,7 +25,9 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::instrument;
 
-use crate::metadata::{CvDef, DataFileRef, PartitionSpec, Policy, TableMetadata};
+use crate::metadata::{
+    CvDef, DataFileRef, PartitionSpec, Policy, SecondaryIndex, TableMetadata,
+};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
 
@@ -187,6 +189,16 @@ impl PostgresCatalog {
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS cluster_columns_json JSONB"
             ),
+            // Phase 6 forward-compat (ADR 0009): per-table home region
+            // for the multi-region scaffolding. NULL / absent means "not
+            // pinned" — the default for back-compat. v0.1 records the
+            // value but does not yet route on it; the cross-region
+            // forwarding / replication that will consume it is future
+            // work, see ADR 0009.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS home_region TEXT"
+            ),
         ];
         let client = self.client.lock().await;
         for stmt in stmts {
@@ -326,6 +338,12 @@ impl Catalog for PostgresCatalog {
             row_group_rows: None,
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
+            // Phase 6 multi-region scaffolding (ADR 0009). New tables are
+            // not pinned by default; `set_home_region` is the only mutator.
+            home_region: None,
+            // Phase 5.7 B1 (parallel agent) — indexes placeholder so the
+            // metadata struct stays buildable; B1 wires real reads.
+            indexes: Vec::new(),
         })
     }
 
@@ -342,7 +360,8 @@ impl Catalog for PostgresCatalog {
                     "SELECT schema_json, current_snapshot, format_version, partition_spec_json,
                             rls_enabled, policies_json, cold_after_seconds, cold_age_column,
                             bloom_filter_columns_json, row_group_rows,
-                            continuous_aggregate_json, cluster_columns_json
+                            continuous_aggregate_json, cluster_columns_json,
+                            home_region
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2"
                 ),
@@ -404,6 +423,7 @@ impl Catalog for PostgresCatalog {
             })?,
             None => Vec::new(),
         };
+        let home_region: Option<String> = row.get(12);
 
         let snapshots = fetch_snapshots(&client, sch, &tenant_str, &table_str).await?;
         Ok(TableMetadata {
@@ -422,6 +442,10 @@ impl Catalog for PostgresCatalog {
             row_group_rows,
             continuous_aggregate,
             cluster_columns,
+            home_region,
+            // Phase 5.7 B1 (parallel agent) — indexes placeholder so the
+            // metadata struct stays buildable; B1 wires real reads.
+            indexes: Vec::new(),
         })
     }
 
@@ -975,6 +999,31 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    async fn set_home_region(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        region: Option<String>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET home_region = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &region],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_home_region: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
     async fn set_schema(
         &self,
@@ -1073,13 +1122,15 @@ impl Catalog for PostgresCatalog {
                         format_version, partition_spec_json, rls_enabled,
                         policies_json, cold_after_seconds, cold_age_column,
                         bloom_filter_columns_json, row_group_rows,
-                        continuous_aggregate_json, cluster_columns_json
+                        continuous_aggregate_json, cluster_columns_json,
+                        home_region
                      )
                      SELECT tenant_id, $3, schema_json, current_snapshot,
                             format_version, partition_spec_json, rls_enabled,
                             policies_json, cold_after_seconds, cold_age_column,
                             bloom_filter_columns_json, row_group_rows,
-                            continuous_aggregate_json, cluster_columns_json
+                            continuous_aggregate_json, cluster_columns_json,
+                            home_region
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2
                      ON CONFLICT (tenant_id, table_name) DO NOTHING"

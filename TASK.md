@@ -364,7 +364,11 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
 ## Phase 6 — Production hardening (3–4 months)
 
 - [ ] Multi-region: regional WAL + S3 cross-region replication
-- [ ] Catalog replication strategy chosen and implemented
+- [~] Catalog replication strategy chosen and implemented — strategy
+      chosen in [ADR 0010](./docs/decisions/0010-catalog-replication.md)
+      (single-writer global Postgres + regional read replicas via PG
+      logical replication); implementation phases tracked there. v0.1
+      implementation deferred per the ADR's own milestone gating.
 - [~] Point-in-time restore via Iceberg snapshots — v0.1 catalog-level
       `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` ships
       (InMemory + Postgres impls; truncates history to ≤ target,

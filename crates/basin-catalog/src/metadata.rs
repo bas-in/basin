@@ -52,6 +52,19 @@ pub struct Policy {
     pub with_check_expr: Option<String>,
 }
 
+/// Phase 5.7 B1: secondary index declaration. Records `(name, column)` for a
+/// per-tenant per-table B-tree-shaped index. The physical map (value-bytes →
+/// (file, row_group, row)) is materialised lazily on first SELECT after a
+/// write; this struct is purely the catalog declaration.
+///
+/// v0.1 supports single-column indexes only. v0.2 adds persistence to a
+/// per-tenant index file in object storage and (optionally) multi-column.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryIndex {
+    pub name: String,
+    pub column: String,
+}
+
 /// Within-tenant partitioning declared via `CREATE TABLE … PARTITION BY …`.
 ///
 /// Catalog-side this is metadata only; the engine consults it at INSERT to
@@ -242,6 +255,20 @@ pub struct TableMetadata {
     /// [`crate::Catalog::set_cluster_columns`] or `CLUSTER BY (...)` on
     /// `CREATE TABLE`.
     pub cluster_columns: Vec<String>,
+    /// Phase 6 multi-region scaffolding (ADR 0009). The region a tenant's
+    /// writes for this table are *pinned* to — i.e. the home region for
+    /// all writes; reads can come from any region (with the freshness
+    /// bound from ADR 0004). `None` (the default) means "no pinning";
+    /// every existing catalog row deserialises to `None` so back-compat
+    /// is preserved. v0.1 *records* the value but does not yet route on
+    /// it — the actual cross-region replication / forwarding is Phase 6
+    /// work, see ADR 0009 for the locked-in shape.
+    pub home_region: Option<String>,
+    /// Phase 5.7 B1: secondary indexes declared on this table. Each entry
+    /// records (index_name, column_name). The index is physically
+    /// materialised lazily by the storage reader on first query; this
+    /// catalog row is the authoritative declaration.
+    pub indexes: Vec<SecondaryIndex>,
 }
 
 impl TableMetadata {

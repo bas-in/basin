@@ -14,7 +14,7 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
-use crate::metadata::{CvDef, DataFileRef, PartitionSpec, Policy, TableMetadata};
+use crate::metadata::{CvDef, DataFileRef, PartitionSpec, Policy, SecondaryIndex, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
 
@@ -33,6 +33,8 @@ struct TableState {
     row_group_rows: Option<usize>,
     continuous_aggregate: Option<CvDef>,
     cluster_columns: Vec<String>,
+    home_region: Option<String>,
+    indexes: Vec<SecondaryIndex>,
 }
 
 impl TableState {
@@ -64,6 +66,8 @@ impl TableState {
             row_group_rows: None,
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
+            home_region: None,
+            indexes: Vec::new(),
         }
     }
 }
@@ -130,6 +134,8 @@ impl InMemoryCatalog {
             row_group_rows: state.row_group_rows,
             continuous_aggregate: state.continuous_aggregate.clone(),
             cluster_columns: state.cluster_columns.clone(),
+            home_region: state.home_region.clone(),
+            indexes: state.indexes.clone(),
         }
     }
 }
@@ -388,6 +394,8 @@ impl Catalog for InMemoryCatalog {
                 row_group_rows: src.row_group_rows,
                 continuous_aggregate: src.continuous_aggregate.clone(),
                 cluster_columns: src.cluster_columns.clone(),
+                home_region: src.home_region.clone(),
+                indexes: src.indexes.clone(),
             }
         };
 
@@ -535,6 +543,67 @@ impl Catalog for InMemoryCatalog {
         let state_arc = self.get_table(tenant, table).await?;
         let mut state = state_arc.lock().await;
         state.cluster_columns = columns;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    async fn set_home_region(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        region: Option<String>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.home_region = region;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name, column = %column))]
+    async fn create_index(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+        column: &str,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        // Reject indexes on unknown columns up front: a lookup against a
+        // missing column would silently always return empty results.
+        if state.schema.field_with_name(column).is_err() {
+            return Err(BasinError::InvalidSchema(format!(
+                "create_index: column {column:?} not in table {tenant}/{table} schema"
+            )));
+        }
+        if state.indexes.iter().any(|i| i.name == name) {
+            return Err(BasinError::catalog(format!(
+                "create_index: {tenant}/{table}: index {name:?} already exists"
+            )));
+        }
+        state.indexes.push(SecondaryIndex {
+            name: name.to_string(),
+            column: column.to_string(),
+        });
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
+    async fn drop_index(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        let before = state.indexes.len();
+        state.indexes.retain(|i| i.name != name);
+        if state.indexes.len() == before {
+            return Err(BasinError::not_found(format!(
+                "{tenant}/{table}: index {name:?}"
+            )));
+        }
         Ok(())
     }
 }
@@ -1116,5 +1185,52 @@ mod tests {
             .unwrap();
         assert_eq!(rolled.current_snapshot, pre.current_snapshot);
         assert_eq!(rolled.snapshots.len(), pre.snapshots.len());
+    }
+
+    /// Phase 5.7 B1: secondary index round-trip through create + load + drop.
+    #[tokio::test]
+    async fn create_drop_secondary_index() {
+        let cat = InMemoryCatalog::new();
+        let t = TenantId::new();
+        let tbl = TableName::new("idx_tbl").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+
+        // Default: no indexes.
+        let pre = cat.load_table(&t, &tbl).await.unwrap();
+        assert!(pre.indexes.is_empty());
+
+        cat.create_index(&t, &tbl, "ix_id", "id").await.unwrap();
+        let after = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(after.indexes.len(), 1);
+        assert_eq!(after.indexes[0].name, "ix_id");
+        assert_eq!(after.indexes[0].column, "id");
+
+        // Duplicate name on the same table is rejected.
+        let err = cat.create_index(&t, &tbl, "ix_id", "name").await.unwrap_err();
+        assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
+
+        // Unknown column is rejected with InvalidSchema.
+        let err = cat
+            .create_index(&t, &tbl, "ix_bogus", "ghost_col")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BasinError::InvalidSchema(_)),
+            "got {err:?}"
+        );
+
+        // Fork carries the index forward.
+        let dst = TableName::new("idx_forked").unwrap();
+        let forked = cat.fork_table(&t, &tbl, &dst).await.unwrap();
+        assert_eq!(forked.indexes.len(), 1);
+        assert_eq!(forked.indexes[0].name, "ix_id");
+
+        cat.drop_index(&t, &tbl, "ix_id").await.unwrap();
+        let dropped = cat.load_table(&t, &tbl).await.unwrap();
+        assert!(dropped.indexes.is_empty());
+
+        // Drop a nonexistent index → NotFound.
+        let err = cat.drop_index(&t, &tbl, "ghost").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
 }
