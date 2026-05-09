@@ -28,15 +28,18 @@ and now ship as part of the open-source bundle (Phase 5.10 in
 pool, ADR 0007). All three are wired into `basin-server` behind opt-in
 env vars; defaults preserve the original PoC behaviour.
 
-**What's next, in priority order (core DB only — see
-[`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md) for the platform side):**
+**What's next, in priority order (engine / open-source repo only;
+hosted-cloud product lives in a separate repo):**
 
 1. **Phase 0 customer interviews** — strategic, not engineering. Architecture is done; what's missing is paying customers.
 2. ~~Engine `UPDATE` / `DELETE` support~~ — **shipped** (Iceberg copy-on-write).
 3. ~~A4 coalesced metadata in catalog~~ — **shipped** (file-level `column_stats` + `Storage::read_paths`).
-4. **B1 per-tenant secondary indexes** — biggest remaining point-query win.
-5. **B2 range-partitioned / Z-ordered files** — `CLUSTER BY` on `CREATE TABLE`.
-6. **Phase 6 — production hardening** (multi-region read replicas, cross-shard 2PC, point-in-time restore, branching/forking) — multi-month.
+4. **Phase 5.11.A — expanded built-in function catalogue** — date/time, string, math, coalesce, aggregate. Gates triggers + PL/pgSQL. ~3 weeks. The smaller "drop in your existing PG schema" win and a hard prerequisite for everything else in 5.11.
+5. **Phase 5.11.D — `CREATE MATERIALIZED VIEW` SQL surface** — drop the `cv_glue` stub. ~1 week, lands once 5.11.A is in.
+6. **B1 per-tenant secondary indexes** — biggest remaining point-query win. ~8 weeks.
+7. **Phase 5.11.B — triggers** — `CREATE TRIGGER`, row + statement, `NEW`/`OLD`/`TG_OP`, recursive guard. ~2 months. **High priority but an explicit wedge expansion** — re-confirm with Phase 0 customer signal before committing.
+8. **Phase 5.11.C — PL/pgSQL stored procedures (subset)** — `CREATE FUNCTION` + tree-walker interpreter. ~2 months. Ships alongside 5.11.B because triggers consume the same interpreter.
+9. **Phase 6 — production hardening** (multi-region read replicas, cross-shard 2PC, point-in-time restore extensions, branching/forking GC) — multi-month. Cloud-platform items (BYO-bucket, BYO-key, Stripe billing) live in the separate hosted-cloud repo.
 
 ---
 

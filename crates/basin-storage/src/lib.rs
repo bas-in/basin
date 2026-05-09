@@ -15,6 +15,7 @@
 mod concurrency;
 mod data_file;
 mod disk_cache;
+pub mod encryption;
 mod metadata_cache;
 mod page_cache;
 mod paths;
@@ -37,6 +38,7 @@ use tokio::sync::Semaphore;
 
 pub use data_file::{ColumnStats, DataFile};
 pub use disk_cache::{DiskCacheConfig, DiskCacheCounters, DiskCachedStore};
+pub use encryption::{EncryptionProvider, WrappedKey};
 pub use page_cache::{PageCache, PageCacheConfig, PageCacheCounters, PageCacheCountersSnapshot};
 pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
@@ -235,6 +237,12 @@ struct Inner {
     /// When present, every successful write/read bumps `bytes_written_total` /
     /// `bytes_read_total` for the calling tenant.
     tenant_counters: OnceLock<Arc<TenantCounterRegistry>>,
+    /// Optional BYO-key envelope-encryption provider (Phase 6). Attached by
+    /// the cloud layer via [`Storage::attach_encryption_provider`]; first
+    /// attach wins. When `None` the write/read path is byte-for-byte the
+    /// plaintext path. When `Some`, every PUT envelope-encrypts with a
+    /// fresh per-file data key and every GET unwraps before decoding.
+    encryption: OnceLock<Arc<dyn encryption::EncryptionProvider>>,
 }
 
 /// Best-effort counters for the read path. See [`Inner::read_counters`].
@@ -334,6 +342,7 @@ impl Storage {
                 read_counters: Arc::new(ReadCounters::default()),
                 page_cache,
                 tenant_counters: OnceLock::new(),
+                encryption: OnceLock::new(),
             }),
         }
     }
@@ -341,6 +350,27 @@ impl Storage {
     /// Attach a per-tenant counter registry. Idempotent (first attach wins).
     pub fn attach_tenant_counters(&self, registry: Arc<TenantCounterRegistry>) {
         let _ = self.inner.tenant_counters.set(registry);
+    }
+
+    /// Attach a BYO-key envelope-encryption provider. Idempotent (first
+    /// attach wins). Once attached, subsequent writes envelope-encrypt the
+    /// Parquet body with a fresh per-file data key and persist the wrapped
+    /// key as a `<path>.wrapped` sidecar; reads transparently unwrap.
+    /// Files written before the attach remain readable as plaintext (no
+    /// sidecar present means no decryption attempt).
+    pub fn attach_encryption_provider(
+        &self,
+        provider: Arc<dyn encryption::EncryptionProvider>,
+    ) {
+        let _ = self.inner.encryption.set(provider);
+    }
+
+    /// Crate-private accessor: clone of the attached provider (if any).
+    /// Used by the writer / reader modules to gate the envelope path.
+    pub(crate) fn encryption_provider(
+        &self,
+    ) -> Option<Arc<dyn encryption::EncryptionProvider>> {
+        self.inner.encryption.get().cloned()
     }
 
     pub(crate) fn tenant_counters(

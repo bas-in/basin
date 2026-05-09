@@ -23,6 +23,55 @@ use crate::data_file::{ColumnStats, DataFile};
 use crate::paths::data_file_key;
 use crate::Storage;
 
+/// Suffix appended to a data-file key to derive its envelope-encryption
+/// sidecar (the wrapped data key). Single source of truth so the reader
+/// can probe for the same suffix on GET.
+pub(crate) const WRAPPED_SIDECAR_SUFFIX: &str = ".wrapped";
+
+/// AES-GCM nonce size: 96 bits, the only size the spec recommends for
+/// random nonces. Prefixed to the ciphertext on disk so the reader can
+/// recover it without an additional sidecar.
+pub(crate) const AES_GCM_NONCE_LEN: usize = 12;
+
+/// Build the sidecar key for an envelope-encrypted data file. The format
+/// is `<data-file-path>.wrapped`; tenant-prefix enforcement is implicit
+/// because the input key already lives under the tenant prefix.
+pub(crate) fn wrapped_sidecar_key(
+    data_key: &object_store::path::Path,
+) -> object_store::path::Path {
+    object_store::path::Path::from(format!("{}{}", data_key.as_ref(), WRAPPED_SIDECAR_SUFFIX))
+}
+
+/// AES-GCM encrypt `plaintext` with `data_key`. The on-disk layout is
+/// `nonce(12) || ciphertext_with_tag` so a reader needs only the file
+/// body and the wrapped key sidecar to round-trip. A fresh random nonce
+/// per file is safe with a fresh per-file data key — nonce reuse risk is
+/// confined to within-key, and we never reuse the data key.
+pub(crate) fn encrypt_envelope(data_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use rand::RngCore;
+
+    if data_key.len() != 32 {
+        return Err(BasinError::storage(format!(
+            "envelope encrypt: data key is {} bytes, expected 32",
+            data_key.len()
+        )));
+    }
+    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(data_key);
+    let cipher = Aes256Gcm::new(key);
+    let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| BasinError::storage(format!("aes-gcm encrypt: {e}")))?;
+    let mut out = Vec::with_capacity(AES_GCM_NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
 /// Row groups of 65_536 rows. Big enough that per-group metadata overhead is
 /// small relative to the data, small enough that statistics pruning still
 /// drops most of a file on selective queries. Production tuning will move to
@@ -107,14 +156,46 @@ pub(crate) async fn write_batch_with_options(
     };
 
     let bytes = encode_parquet(batch_to_write, opts)?;
-    let size = bytes.len() as u64;
     let row_count = batch_to_write.num_rows() as u64;
+
+    // Stats are extracted from the *plaintext* parquet bytes regardless of
+    // whether envelope encryption is on — the catalog's per-file
+    // ColumnStats need to round-trip the typed min/max, and we don't want
+    // to re-decrypt at commit time.
+    let column_stats = extract_column_stats(&bytes, batch_to_write)?;
+
+    // Envelope-encrypt the body if a provider is attached. The on-disk
+    // layout in that case is `nonce(12) || ciphertext_with_tag` and a
+    // `<key>.wrapped` sidecar carrying the wrapped data key. With no
+    // provider attached, the file is the plaintext Parquet bytes —
+    // byte-for-byte the legacy path.
+    let (body_to_put, wrapped_for_sidecar) = match storage.encryption_provider() {
+        Some(provider) => {
+            let (data_key, wrapped) = provider.wrap_key(tenant).await?;
+            let envelope = encrypt_envelope(&data_key, &bytes)?;
+            (envelope, Some(wrapped))
+        }
+        None => (bytes, None),
+    };
+    let size = body_to_put.len() as u64;
 
     storage
         .tenant_store(tenant)
-        .put(&key, PutPayload::from_bytes(Bytes::from(bytes.clone())))
+        .put(&key, PutPayload::from_bytes(Bytes::from(body_to_put)))
         .await
         .map_err(|e| BasinError::storage(format!("put {key}: {e}")))?;
+
+    if let Some(wrapped) = wrapped_for_sidecar {
+        let sidecar_key = wrapped_sidecar_key(&key);
+        storage
+            .tenant_store(tenant)
+            .put(
+                &sidecar_key,
+                PutPayload::from_bytes(Bytes::from(wrapped.0)),
+            )
+            .await
+            .map_err(|e| BasinError::storage(format!("put sidecar {sidecar_key}: {e}")))?;
+    }
 
     // Per-tenant byte counter (Phase 6 telemetry). No-op when no registry is
     // attached. Bumped after a successful PUT — failed writes don't count.
@@ -126,8 +207,6 @@ pub(crate) async fn write_batch_with_options(
     // in the batch. One sidecar per Parquet write, mirroring the data-file
     // pattern; merging across writes is deferred to the future compactor.
     crate::vector_index::build_indexes_for_batch(storage, tenant, table, batch_to_write, data_ulid).await?;
-
-    let column_stats = extract_column_stats(&bytes, batch_to_write)?;
 
     Ok(DataFile {
         path: key,

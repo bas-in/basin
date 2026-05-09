@@ -29,7 +29,7 @@ use crate::metadata::{
     CvDef, DataFileRef, PartitionSpec, Policy, SecondaryIndex, TableMetadata,
 };
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
-use crate::Catalog;
+use crate::{Catalog, ProjectSnapshotEntry};
 
 const DEFAULT_SCHEMA: &str = "basin_catalog";
 
@@ -1078,6 +1078,56 @@ impl Catalog for PostgresCatalog {
         fetch_snapshots(&client, sch, &tenant_str, &table_str).await
     }
 
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_snapshots_project_wide(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<ProjectSnapshotEntry>> {
+        // Single-pass JOIN: fan-in every snapshot for this tenant in commit
+        // order. The outer ORDER BY mirrors the default impl's tie-breakers
+        // so InMemory and Postgres produce byte-identical timelines.
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT t.table_name, s.snapshot_id, s.parent_id, s.committed_at,
+                            s.operation, s.summary_json
+                     FROM {sch}.tables t
+                     JOIN {sch}.snapshots s
+                       ON s.tenant_id = t.tenant_id AND s.table_name = t.table_name
+                     WHERE t.tenant_id = $1
+                     ORDER BY s.committed_at ASC, t.table_name ASC, s.snapshot_id ASC"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("list_snapshots_project_wide: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let table_name: String = row.get(0);
+            let snap_id: i64 = row.get(1);
+            let parent: Option<i64> = row.get(2);
+            let committed_at: chrono::DateTime<Utc> = row.get(3);
+            let _operation_text: String = row.get(4);
+            let summary_json: serde_json::Value = row.get(5);
+            let summary: SnapshotSummary = serde_json::from_value(summary_json)
+                .map_err(|e| BasinError::catalog(format!("deserialise summary: {e}")))?;
+            let table = TableName::new(table_name).map_err(|e| {
+                BasinError::catalog(format!("list_snapshots_project_wide bad ident: {e}"))
+            })?;
+            out.push(ProjectSnapshotEntry {
+                table,
+                snapshot_id: SnapshotId(snap_id as u64),
+                parent_id: parent.map(|p| SnapshotId(p as u64)),
+                committed_at,
+                operation: summary.operation,
+                summary,
+            });
+        }
+        Ok(out)
+    }
+
     #[instrument(skip(self), fields(tenant = %tenant, src = %src_table, dst = %dst_table))]
     async fn fork_table(
         &self,
@@ -1768,5 +1818,72 @@ mod tests {
         let snap = head.current().unwrap();
         assert_eq!(snap.summary.operation, SnapshotOperation::Replace);
         assert_eq!(snap.summary.removed_files, 1);
+    }
+
+    /// Migration Manager v0.2: the Postgres single-query path returns the
+    /// same logical shape as the InMemory default impl. This test runs end-
+    /// to-end against the live database; it pg_alive-skips if Postgres is
+    /// unreachable.
+    #[tokio::test]
+    async fn list_snapshots_project_wide_postgres_one_query() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let alpha = TableName::new("alpha").unwrap();
+        let beta = TableName::new("beta").unwrap();
+        cat.create_table(&t, &alpha, &schema()).await.unwrap();
+        cat.create_table(&t, &beta, &schema()).await.unwrap();
+        cat.append_data_files(&t, &alpha, SnapshotId::GENESIS, vec![file("a1.parquet", 1, 10)])
+            .await
+            .unwrap();
+        cat.append_data_files(&t, &beta, SnapshotId::GENESIS, vec![file("b1.parquet", 1, 10)])
+            .await
+            .unwrap();
+        cat.append_data_files(&t, &alpha, SnapshotId(1), vec![file("a2.parquet", 1, 10)])
+            .await
+            .unwrap();
+
+        let entries = cat.list_snapshots_project_wide(&t).await.unwrap();
+        // 2 tables × 1 genesis + (2 + 1) appends = 5 rows.
+        assert_eq!(entries.len(), 5, "got {entries:?}");
+        // Strictly non-decreasing by committed_at — the SQL ORDER BY makes
+        // this a primary correctness assertion.
+        for w in entries.windows(2) {
+            assert!(w[0].committed_at <= w[1].committed_at);
+        }
+        let alpha_count = entries.iter().filter(|e| e.table == alpha).count();
+        let beta_count = entries.iter().filter(|e| e.table == beta).count();
+        assert_eq!(alpha_count, 3, "alpha rows = {alpha_count}");
+        assert_eq!(beta_count, 2, "beta rows = {beta_count}");
+        // Genesis rows have no parent and snapshot_id 0.
+        let genesis_count = entries
+            .iter()
+            .filter(|e| e.parent_id.is_none() && e.snapshot_id == SnapshotId::GENESIS)
+            .count();
+        assert_eq!(genesis_count, 2);
+
+        // Cross-check: project-wide rollback to a cutoff after the first
+        // round-of-appends rewinds both tables to id 1.
+        // Re-fetch each table's first-append committed_at as the cutoff.
+        let alpha_first_append = entries
+            .iter()
+            .find(|e| e.table == alpha && e.snapshot_id == SnapshotId(1))
+            .unwrap()
+            .committed_at;
+        let beta_first_append = entries
+            .iter()
+            .find(|e| e.table == beta && e.snapshot_id == SnapshotId(1))
+            .unwrap()
+            .committed_at;
+        let cutoff = alpha_first_append.max(beta_first_append);
+        let pairs = cat
+            .rollback_to_snapshot_project_wide(&t, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(pairs.len(), 2, "{pairs:?}");
+        for (_table, head) in pairs {
+            assert_eq!(head, SnapshotId(1));
+        }
     }
 }

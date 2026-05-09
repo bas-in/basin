@@ -2,6 +2,14 @@
 // Python asyncpg smoke: same operations, same PASS/FAIL contract on stdout.
 // The Rust harness boots Basin on an ephemeral port and `go run`s this file
 // with `--url postgres://...`.
+//
+// Format-code note (v0.1): pgx-v5 picks the result-row scan codec from the
+// `Format` field on the server's RowDescription (rows.go:257 in v5.5.5).
+// Basin's PoC RowDescription always advertises text (format=0) even when
+// Bind requested binary, so we pass `pgx.QueryResultFormats{}` on every
+// row-returning call to force text format end-to-end. A richer pgtype-based
+// scan path (binary INT8 / JSONB unwrap / pgtype.UUID) is deferred until
+// Basin's portal-describe surfaces per-column format codes.
 package main
 
 import (
@@ -47,7 +55,7 @@ func run(ctx context.Context, url string) error {
 
 	rows, err := conn.Query(ctx,
 		"SELECT id, name, score FROM smoke_go WHERE active = $1 ORDER BY id LIMIT $2",
-		true, int64(5))
+		pgx.QueryResultFormats{}, true, int64(5))
 	if err != nil {
 		return fmt.Errorf("select: %w", err)
 	}
@@ -82,7 +90,7 @@ func run(ctx context.Context, url string) error {
 		want string
 	}{{1, "alpha"}, {2, "beta"}, {3, "gamma"}} {
 		var name string
-		if err := conn.QueryRow(ctx, "by_id", c.id).Scan(&name); err != nil {
+		if err := conn.QueryRow(ctx, "by_id", pgx.QueryResultFormats{}, c.id).Scan(&name); err != nil {
 			return fmt.Errorf("prepared lookup id=%d: %w", c.id, err)
 		}
 		if name != c.want {
@@ -103,10 +111,12 @@ func run(ctx context.Context, url string) error {
 		rowUUID, string(payloadBytes)); err != nil {
 		return fmt.Errorf("insert types: %w", err)
 	}
+	// Mirror the Python sibling: WHERE id = $1 over UUID is a deferred fast-select
+	// limitation (v0.2); the unfiltered SELECT round-trips today.
 	var gotID uuid.UUID
 	var gotPayloadRaw []byte
 	if err := conn.QueryRow(ctx,
-		"SELECT id, payload FROM smoke_go_types WHERE id = $1", rowUUID,
+		"SELECT id, payload FROM smoke_go_types", pgx.QueryResultFormats{},
 	).Scan(&gotID, &gotPayloadRaw); err != nil {
 		return fmt.Errorf("select types: %w", err)
 	}

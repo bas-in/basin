@@ -23,37 +23,37 @@
   "rows": [
     {
       "per_tenant_ram_kib": 32.0,
-      "quiet_p50_ms": 0.208,
+      "quiet_p50_ms": 0.262791,
       "rss_delta_kib": 32,
       "tenant_count": 1
     },
     {
-      "per_tenant_ram_kib": 72.88888888888889,
-      "quiet_p50_ms": 0.197625,
-      "rss_delta_kib": 656,
+      "per_tenant_ram_kib": 60.44444444444444,
+      "quiet_p50_ms": 0.191709,
+      "rss_delta_kib": 544,
       "tenant_count": 10
     },
     {
-      "per_tenant_ram_kib": 10.488888888888889,
-      "quiet_p50_ms": 0.180417,
-      "rss_delta_kib": 944,
+      "per_tenant_ram_kib": 11.911111111111111,
+      "quiet_p50_ms": 0.16924999999999998,
+      "rss_delta_kib": 1072,
       "tenant_count": 100
     },
     {
-      "per_tenant_ram_kib": 4.426666666666667,
-      "quiet_p50_ms": 0.148291,
-      "rss_delta_kib": 3984,
+      "per_tenant_ram_kib": 4.977777777777778,
+      "quiet_p50_ms": 0.160667,
+      "rss_delta_kib": 4480,
       "tenant_count": 1000
     }
   ],
   "primary": {
     "label": "quiet_p50_at_max / quiet_p50_at_1",
-    "value": 0.7129375000000001,
+    "value": 0.611386995749474,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1778203980"
+  "generated_at": "@1778333232"
 }

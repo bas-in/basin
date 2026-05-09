@@ -33,6 +33,15 @@ lru.workspace = true
 # dep via basin-auth, so this costs no extra build time.
 sha2 = "0.10"
 hex = "0.4"
+# AES-256-GCM for envelope encryption of Parquet bodies (Phase 6 BYO-key
+# hooks). 0.10.x is the audited, allocation-light line; the wrapping
+# `EncryptionProvider` trait is what real KMS adapters plug into, this
+# crate just orchestrates the symmetric leg.
+aes-gcm = "0.10"
+# Random nonces for AES-GCM. `rand` is already a workspace test dep; we
+# pull it as a runtime dep here so production builds get a real CSPRNG
+# (`OsRng` via `thread_rng`) without per-callsite plumbing.
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

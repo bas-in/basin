@@ -27,29 +27,29 @@
       "tenants": 27
     },
     {
-      "load_pct": 29.0,
+      "load_pct": 28.0,
       "shard": 1,
-      "tenants": 29
+      "tenants": 28
     },
     {
-      "load_pct": 22.0,
+      "load_pct": 15.0,
       "shard": 2,
-      "tenants": 22
+      "tenants": 15
     },
     {
-      "load_pct": 22.0,
+      "load_pct": 30.0,
       "shard": 3,
-      "tenants": 22
+      "tenants": 30
     }
   ],
   "primary": {
     "label": "max shard load",
-    "value": 29.0,
+    "value": 30.0,
     "unit": "%",
     "bar": {
       "op": "less_than",
       "value": 50.0
     }
   },
-  "generated_at": "@1778203955"
+  "generated_at": "@1778333206"
 }

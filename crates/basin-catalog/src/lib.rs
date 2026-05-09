@@ -43,6 +43,33 @@ pub use postgres::PostgresCatalog;
 pub use rest::RestCatalog;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 
+/// One row in the project-wide snapshot timeline returned by
+/// [`Catalog::list_snapshots_project_wide`]. Carries enough context (table,
+/// snapshot id, parent, commit time, summary) to render a unified
+/// migration-history view across every table a tenant owns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSnapshotEntry {
+    pub table: TableName,
+    pub snapshot_id: SnapshotId,
+    pub parent_id: Option<SnapshotId>,
+    pub committed_at: chrono::DateTime<chrono::Utc>,
+    pub operation: SnapshotOperation,
+    pub summary: SnapshotSummary,
+}
+
+/// Structured delta for [`Catalog::diff_snapshots`]. `per_table` groups every
+/// snapshot committed in the requested window by its table; `created_in_window`
+/// flags tables whose Genesis snapshot itself falls inside the window so the UI
+/// can highlight "new tables" separately from "new commits to existing tables".
+#[derive(Clone, Debug)]
+pub struct ProjectSnapshotDiff {
+    /// New snapshots in [from, to] grouped by table.
+    pub per_table: std::collections::BTreeMap<TableName, Vec<ProjectSnapshotEntry>>,
+    /// Tables that gained their first snapshot in the window
+    /// (i.e. `created_at` falls in [from, to]).
+    pub created_in_window: Vec<TableName>,
+}
+
 /// Iceberg-style catalog client. Every operation is tenant-scoped.
 ///
 /// Implementations must be `Send + Sync` so a single instance can be cloned
@@ -248,6 +275,131 @@ pub trait Catalog: Send + Sync {
         Err(basin_common::BasinError::Internal(
             "rollback_to_snapshot not implemented for this catalog backend".into(),
         ))
+    }
+
+    /// Project-wide snapshot listing: every (table, snapshot_id, committed_at,
+    /// summary) row across all tables this tenant owns, sorted by
+    /// `committed_at` ascending. Used by the migration UI / `basinctl
+    /// migrations list` to show one timeline for the whole project.
+    ///
+    /// Default impl iterates `list_tables` then `list_snapshots` per table —
+    /// preserves existing semantics and keeps `RestCatalog` (stub) buildable.
+    /// Postgres backend overrides to a single `SELECT … ORDER BY committed_at`.
+    async fn list_snapshots_project_wide(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<ProjectSnapshotEntry>> {
+        let tables = self.list_tables(tenant).await?;
+        let mut out: Vec<ProjectSnapshotEntry> = Vec::new();
+        for table in tables {
+            // Skip tables that vanished mid-iteration; tenant-scoped racing
+            // drops shouldn't poison the listing.
+            match self.list_snapshots(tenant, &table).await {
+                Ok(snaps) => {
+                    for s in snaps {
+                        out.push(ProjectSnapshotEntry {
+                            table: table.clone(),
+                            snapshot_id: s.id,
+                            parent_id: s.parent,
+                            committed_at: s.committed_at,
+                            operation: s.summary.operation,
+                            summary: s.summary,
+                        });
+                    }
+                }
+                Err(basin_common::BasinError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Tie-breakers keep the order stable so UI diffs are deterministic.
+        out.sort_by(|a, b| {
+            a.committed_at
+                .cmp(&b.committed_at)
+                .then_with(|| a.table.cmp(&b.table))
+                .then_with(|| a.snapshot_id.cmp(&b.snapshot_id))
+        });
+        Ok(out)
+    }
+
+    /// Diff two project-wide checkpoints by `committed_at`. Returns the
+    /// per-table delta: which tables gained snapshots, which were created /
+    /// dropped, in commit order. Used by the migration UI's "what changed
+    /// between yesterday and now" view.
+    ///
+    /// Default impl: collect every snapshot in [from, to] via
+    /// `list_snapshots_project_wide`, group by table, return a structured
+    /// diff.
+    async fn diff_snapshots(
+        &self,
+        tenant: &TenantId,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ProjectSnapshotDiff> {
+        let all = self.list_snapshots_project_wide(tenant).await?;
+        let mut per_table: std::collections::BTreeMap<TableName, Vec<ProjectSnapshotEntry>> =
+            std::collections::BTreeMap::new();
+        let mut created_in_window: Vec<TableName> = Vec::new();
+        let mut seen_genesis_in_window: std::collections::BTreeSet<TableName> =
+            std::collections::BTreeSet::new();
+        for entry in all.into_iter() {
+            if entry.committed_at < from || entry.committed_at > to {
+                continue;
+            }
+            // Genesis-in-window flags a brand-new table; SnapshotId::GENESIS
+            // is the only snapshot with no parent, by construction.
+            if entry.parent_id.is_none() && entry.snapshot_id == SnapshotId::GENESIS
+                && !seen_genesis_in_window.contains(&entry.table)
+            {
+                created_in_window.push(entry.table.clone());
+                seen_genesis_in_window.insert(entry.table.clone());
+            }
+            per_table
+                .entry(entry.table.clone())
+                .or_default()
+                .push(entry);
+        }
+        Ok(ProjectSnapshotDiff {
+            per_table,
+            created_in_window,
+        })
+    }
+
+    /// Project-wide PITR: rewind every table to the snapshot whose
+    /// `committed_at <= as_of`. Tables created after `as_of` are left alone
+    /// (they have no pre-`as_of` state to rewind to; an explicit drop is the
+    /// caller's responsibility). Returns the list of (table, new_head)
+    /// pairs.
+    ///
+    /// Default impl: list every table; for each, find the latest snapshot
+    /// with `committed_at <= as_of` via `list_snapshots`; call the existing
+    /// `rollback_to_snapshot`. Best-effort — if one table fails, the others
+    /// keep their rolled-back state and the caller gets the per-table
+    /// error list.
+    async fn rollback_to_snapshot_project_wide(
+        &self,
+        tenant: &TenantId,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(TableName, SnapshotId)>> {
+        let tables = self.list_tables(tenant).await?;
+        let mut out: Vec<(TableName, SnapshotId)> = Vec::new();
+        for table in tables {
+            let snaps = match self.list_snapshots(tenant, &table).await {
+                Ok(s) => s,
+                Err(basin_common::BasinError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            // Latest snapshot at-or-before as_of; tables with no qualifying
+            // snapshot were created after the cutoff and are skipped.
+            let target = snaps
+                .iter()
+                .filter(|s| s.committed_at <= as_of)
+                .max_by_key(|s| s.committed_at);
+            let Some(target) = target else { continue };
+            let target_id = target.id;
+            let meta = self.rollback_to_snapshot(tenant, &table, target_id).await?;
+            out.push((table, meta.current_snapshot));
+        }
+        Ok(out)
     }
 
     /// Set the partitioning declared for `(tenant, table)`. The engine calls

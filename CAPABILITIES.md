@@ -43,12 +43,14 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Joins (single-shard) | 🛠 | DataFusion handles them; not yet exercised in tests |
 | `UPDATE` / `DELETE` | ✅ | Copy-on-write Iceberg v2. Single-scan partition; `replace_data_files` with optimistic concurrency on both catalog backends; physical deletion of replaced Parquet files. |
 | `ALTER TABLE` | ✅ | `ADD COLUMN`, `SET cold_after`, `SET cold_age_column`, `SET BLOOM FILTERS ON`, `SET row_group_rows`, `RESET row_group_rows`, `CLUSTER BY (...)`, `RESET CLUSTER BY`, `ENABLE/DISABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `DROP POLICY` |
-| `CREATE MATERIALIZED VIEW … WITH (basin.continuous, …)` | 🛠 | Rust API ships via `basin-cv`; SQL surface is in `cv_glue` stub |
+| `CREATE MATERIALIZED VIEW … WITH (basin.continuous, …)` | 🛠 | Rust API ships via `basin-cv`; SQL surface is in `cv_glue` stub. Drop the stub when the engine planner registers the `basin.continuous` storage option, then `CREATE MATERIALIZED VIEW` becomes a `cv_glue::install` follow-on commit. |
 | `CREATE POLICY` (RLS) | ✅ | predicate injection at logical-plan layer; cross-tenant leak invariant verified |
 | Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ◻️ | single-shard only when shipped |
 | Prepared statements with parameter bind | ✅ | shipped with extended-query protocol |
 | Foreign keys | ◻️ | single-shard only when shipped |
-| Stored procedures / triggers | 🚫 | rebuild-Aurora trajectory |
+| Triggers (`CREATE TRIGGER`, statement + row, `NEW`/`OLD`/`TG_OP`) | ◻️ | **on roadmap (high priority)** — every multi-tenant SaaS migration story leans on `audit_*` triggers and `created_at`/`updated_at` row-level triggers. Tracked in TASK.md Phase 5.11. Multi-quarter scope (PL/pgSQL parser + interpreter + trigger context + recursive-trigger guard); not on the wedge's first delivery but blocking the "drop in your existing PG schema" claim. |
+| Stored procedures (`CREATE FUNCTION`, PL/pgSQL) | ◻️ | **on roadmap (high priority)** — same Phase 5.11. Subset of PL/pgSQL is the realistic v0.1: variable assignment, `IF`/`LOOP`/`FOR`, `RETURN QUERY`, parameter binding. Anonymous `DO` blocks fall out of the same interpreter. Out of scope: SQL/PSM, `EXCEPTION` blocks beyond a top-level catch, cursor-driven loops. |
+| PG built-in functions (string, date/time, math) | 🛠 | **expanding (high priority)** — `digest`, `encode`/`decode`, `crypt`, `gen_random_uuid`, `gen_salt`, vector ops shipped via `basin-engine`'s ScalarUDF registry. Phase 5.11 expands to `now`, `current_timestamp`, `date_trunc`, `age`, `extract`, `to_char`, `to_timestamp`, `lower`/`upper`/`substring`/`trim`/`length`, `coalesce`/`nullif`, `||`. Tracked alongside triggers because the trigger interpreter consumes them. |
 
 ## Types
 
@@ -77,7 +79,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Per-tenant fairness (Semaphore) | ✅ | cap=16; default-on |
 | Row-Level Security | ✅ | `ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` with `current_user`-aware predicates injected at logical-plan layer; cross-tenant leak invariant tested |
 | BYO-bucket | ◻️ | customer's S3 + IAM role |
-| BYO-key (KMS) | ◻️ | platform never sees plaintext |
+| BYO-key (KMS) | 🛠 | Trait + wiring shipped (`EncryptionProvider`); cloud-side AWS KMS / GCP KMS / Azure Key Vault adapters live in basin-cloud. |
 | Tenant deletion (`O(file_count)`) | ✅ | `Storage::delete_tenant` is catalog-first paths + parallel orphan LIST + bulk DeleteObjects + drop_namespace; LocalFS 4ms, R2 ~1.4-2.2s |
 | Table fork (catalog COW) | ✅ | `Catalog::fork_table(tenant, src, dst)` clones a table's metadata + snapshot history into a new sibling within the same tenant, sharing data files by reference. Diverges on next commit. v0.2 adds cross-tenant fork with refcount-aware GC. |
 | Within-tenant time partitioning | ✅ | `CREATE TABLE … PARTITION BY RANGE (ts)`; partition pruning |
@@ -101,7 +103,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | HTTP/2 toggle for S3 client | ✅ | `S3Config::http2_only`; useful on AWS S3 / R2 over HTTPS |
 | Iceberg-style catalog (in-memory) | ✅ | atomic appends, optimistic concurrency |
 | Iceberg-style catalog (durable) | ✅ | Postgres-backed; survives restart. Multi-region replication direction: single-writer global PG with regional read replicas via PG logical replication — see [ADR 0010](./docs/decisions/0010-catalog-replication.md). |
-| Point-in-time restore (catalog level) | 🛠 | `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` truncates history to ≤ target and rewinds the head pointer. InMemory + Postgres impls. v0.2 adds physical file GC for orphaned post-rollback files; cross-DML rollback waits on soft-delete (also v0.2). |
+| Point-in-time restore (catalog level) | 🛠 | `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` truncates history to ≤ target and rewinds the head pointer. InMemory + Postgres impls. v0.2 adds physical file GC for orphaned post-rollback files; cross-DML rollback waits on soft-delete (also v0.2). Project-wide variants (`list_snapshots_project_wide`, `diff_snapshots`, `rollback_to_snapshot_project_wide`) shipped for Migration Manager v0.2. |
 | Per-tenant fair-share scheduler | 🛠 | architectural primitive shipped (cap=16); v0.2 EDF deferred — see [ADR 0008](./docs/decisions/0008-noisy-neighbor-fairness.md) |
 | WAL (Raft-backed, 5ms acks) | ◻️ | Phase 2 — closes the insert-latency gap |
 | Background compactor | 🛠 | merges small files; tier sweep + cold-data move shipped |
@@ -221,7 +223,7 @@ If your workload requires …
 - **Geospatial primary store with full PostGIS** (LINESTRING, POLYGON, R-tree) → use real PostGIS or sidecar PG.
 - **Embeddings as the *only* workload** → use a dedicated vector DB (Qdrant, Pinecone, Weaviate, pg_vector on Postgres).
 - **Embedded SQLite-class library** → use SQLite.
-- **Stored procedures / triggers / pl/* languages** → use Postgres.
+- **PL/Python, PL/Perl, or other alt-language stored procedures** → use Postgres. Basin's PL/pgSQL subset (Phase 5.11) covers the trigger / audit-row use case, not the embedded-Python data-science use case.
 
 Basin's wedge is multi-tenant SaaS with audit-log workloads where storage
 cost and per-tenant isolation dominate. If your shape doesn't match, the

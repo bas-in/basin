@@ -17,11 +17,13 @@ use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 
 use crate::data_file::{ColumnStats, DataFile};
+use crate::encryption::{decrypt_envelope, BytesFileReader, EncryptionProvider, WrappedKey};
 use crate::metadata_cache::{CachedParquetMeta, ParquetMetaCache};
 use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache};
 use crate::paths::table_tier_prefix;
 use crate::predicate::{self, Predicate, ScalarValue};
 use crate::tier::Tier;
+use crate::writer::wrapped_sidecar_key;
 use crate::{ReadCounters, ReadOptions, Storage};
 
 pub(crate) async fn list_data_files(
@@ -331,6 +333,8 @@ async fn read_paths_inner(
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
     let tenant_counters = storage.tenant_counters(tenant);
+    let encryption = storage.encryption_provider();
+    let tenant_owned = *tenant;
     let stream = futures::stream::iter(paths)
         .map(move |p| {
             let store = store_for_stream.clone();
@@ -339,8 +343,20 @@ async fn read_paths_inner(
             let counters = counters.clone();
             let page_cache = page_cache.clone();
             let tenant_counters = tenant_counters.clone();
+            let encryption = encryption.clone();
             async move {
-                read_one(store, p, opts, cache, counters, page_cache, tenant_counters).await
+                read_one(
+                    store,
+                    p,
+                    opts,
+                    cache,
+                    counters,
+                    page_cache,
+                    tenant_counters,
+                    encryption,
+                    tenant_owned,
+                )
+                .await
             }
         })
         .buffered(4)
@@ -370,6 +386,7 @@ pub(crate) async fn read_file(
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
     let tenant_counters = storage.tenant_counters(tenant);
+    let encryption = storage.encryption_provider();
     read_one(
         store,
         path.clone(),
@@ -378,10 +395,13 @@ pub(crate) async fn read_file(
         counters,
         page_cache,
         tenant_counters,
+        encryption,
+        *tenant,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_one(
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
@@ -390,6 +410,8 @@ async fn read_one(
     counters: Arc<ReadCounters>,
     page_cache: Option<Arc<PageCache>>,
     tenant_counters: Option<Arc<basin_common::TenantCounters>>,
+    encryption: Option<Arc<dyn EncryptionProvider>>,
+    tenant: TenantId,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     // Page-cache fast path. Composes with everything below: a hit
     // means we skip the parquet decode entirely and yield the cached
@@ -409,11 +431,6 @@ async fn read_one(
     });
     if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key.as_ref()) {
         if let Some(batches) = pc.get(key) {
-            // Hit: yield the cached batches as a stream. Each entry
-            // is an `Arc<RecordBatch>`; we clone the Arc and unwrap
-            // it into an owned `RecordBatch` because the public stream
-            // contract is `Result<RecordBatch>`. The clone is cheap
-            // (Arrow buffers are themselves Arc'd).
             let owned: Vec<RecordBatch> =
                 batches.iter().map(|b| (**b).clone()).collect();
             let s = futures::stream::iter(owned.into_iter().map(Ok));
@@ -421,6 +438,27 @@ async fn read_one(
         }
     }
 
+    // Envelope-encryption probe. When a provider is attached AND a
+    // `<path>.wrapped` sidecar exists, fetch the body, unwrap the data
+    // key, decrypt, and run the parquet pipeline against an in-memory
+    // `BytesFileReader`. Files written before the provider was attached
+    // have no sidecar — they take the plaintext path below (back-compat).
+    if let Some(provider) = encryption.as_ref() {
+        if let Some(plaintext) =
+            try_load_encrypted(&store, &path, provider.as_ref(), &tenant).await?
+        {
+            return finalize_encrypted_stream(
+                plaintext,
+                path,
+                opts,
+                counters,
+                page_cache,
+                cache_key,
+                tenant_counters,
+            )
+            .await;
+        }
+    }
 
     // Cache lookup. On hit we skip BOTH the footer fetch and the HEAD
     // round-trip — we have the file size in cache, so we can synthesise
@@ -456,9 +494,6 @@ async fn read_one(
         let arrow_meta = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
             .await
             .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
-        // Insert the parsed metadata into the cache for next time. Cloning
-        // is cheap — `ArrowReaderMetadata` carries an `Arc<ParquetMetaData>`
-        // internally, so we extract that arc and share it.
         meta_cache.insert(
             path.clone(),
             CachedParquetMeta {
@@ -480,132 +515,7 @@ async fn read_one(
         tc.record_bytes_read(file_size);
     }
 
-    let arrow_schema: SchemaRef = builder.schema().clone();
-    let parquet_schema = builder.metadata().file_metadata().schema_descr_ptr();
-
-    // Projection.
-    let projection_mask = match &opts.projection {
-        Some(cols) => {
-            let mut idxs = Vec::with_capacity(cols.len());
-            for c in cols {
-                let i = arrow_schema
-                    .index_of(c)
-                    .map_err(|_| BasinError::storage(format!("unknown column {c}")))?;
-                idxs.push(i);
-            }
-            // Use roots() with column indexes — this works for flat schemas;
-            // for nested schemas we'd descend, but Phase 1 is flat-only.
-            ProjectionMask::roots(&parquet_schema, idxs)
-        }
-        None => ProjectionMask::all(),
-    };
-
-    // Row-group pruning by stats. Tracks per-group `considered` and
-    // counts the stats-driven prunes; bloom-filter pruning is layered on
-    // afterwards because it needs an extra (async) byte-range read of the
-    // bloom-filter section in the Parquet footer.
-    let kept_after_stats: Vec<usize> = {
-        let row_groups = builder.metadata().row_groups();
-        let total = row_groups.len() as u64;
-        counters
-            .row_groups_considered
-            .fetch_add(total, Ordering::Relaxed);
-        let mut kept = Vec::with_capacity(row_groups.len());
-        let mut pruned = 0u64;
-        for (i, rg) in row_groups.iter().enumerate() {
-            if row_group_pruned(rg, &arrow_schema, &opts.filters) {
-                pruned += 1;
-            } else {
-                kept.push(i);
-            }
-        }
-        counters
-            .row_groups_pruned_by_stats
-            .fetch_add(pruned, Ordering::Relaxed);
-        kept
-    };
-
-    // Bloom-filter pruning. For every `Eq` predicate on a column whose
-    // bloom filter is present in the Parquet footer, ask the filter
-    // whether the value is `definitely-not-present` and drop the row
-    // group if so. We probe filters per-column lazily and short-circuit
-    // on the first proof of absence — so a single `Eq` filter against a
-    // bloomed column requires at most one byte-range fetch per row
-    // group, only for groups that survived stats pruning.
-    let mut builder = builder.with_projection(projection_mask.clone());
-    let kept = prune_with_bloom_filters(
-        &mut builder,
-        &arrow_schema,
-        kept_after_stats,
-        &opts.filters,
-        &counters,
-    )
-    .await?;
-    counters
-        .row_groups_scanned
-        .fetch_add(kept.len() as u64, Ordering::Relaxed);
-    let mut builder = builder.with_row_groups(kept);
-
-    // Per-row filtering as a fallback. Pushed in via RowFilter so the parquet
-    // reader can also use it for page index pruning where available.
-    if !opts.filters.is_empty() {
-        let predicates = build_row_filter(
-            &opts.filters,
-            &arrow_schema,
-            &parquet_schema,
-        )?;
-        builder = builder.with_row_filter(predicates);
-    }
-
-    let stream = builder
-        .build()
-        .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
-
-    let mapped = stream.map(|res| res.map_err(|e| BasinError::storage(format!("parquet read: {e}"))));
-
-    // Page-cache write-through. We tee every successful batch into a
-    // `Mutex<Option<Vec<...>>>` and, when the underlying stream ends
-    // *successfully*, swap that buffer into the cache. On any error
-    // we drop the buffer so we don't cache partial reads.
-    if let (Some(pc), Some(key)) = (page_cache, cache_key) {
-        let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
-            Arc::new(std::sync::Mutex::new(Some(Vec::new())));
-        let buf_for_each = buf.clone();
-        let buf_for_end = buf.clone();
-        let pc_for_end = pc.clone();
-        let key_for_end = key;
-        let collected = mapped.inspect(move |item| {
-            if let Ok(batch) = item {
-                if let Some(slot) = buf_for_each.lock().expect("page-cache buf").as_mut() {
-                    slot.push(Arc::new(batch.clone()));
-                }
-            } else {
-                // Error path: drop the buffer so we don't cache a
-                // partial result. Subsequent items are no-ops.
-                *buf_for_each.lock().expect("page-cache buf") = None;
-            }
-        });
-        // `chain` a single-element terminator stream that, when
-        // polled, performs the final insert. It yields nothing
-        // visible to the caller (filtered out by `flat_map` below).
-        let terminator = futures::stream::once(async move {
-            let final_buf = buf_for_end
-                .lock()
-                .expect("page-cache buf")
-                .take();
-            if let Some(batches) = final_buf {
-                pc_for_end.insert(key_for_end, batches);
-            }
-            None::<Result<RecordBatch>>
-        });
-        let with_terminator = collected
-            .map(Some)
-            .chain(terminator)
-            .filter_map(|x| async move { x });
-        return Ok(with_terminator.boxed());
-    }
-
-    Ok(mapped.boxed())
+    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key).await
 }
 
 fn build_row_filter(
@@ -806,5 +716,196 @@ fn filter_value(filter: &Predicate) -> Option<ScalarValue> {
     match filter {
         Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => Some(v.clone()),
     }
+}
+
+/// Probe for the wrapped-key sidecar; if present, fetch the body, unwrap,
+/// and decrypt. Returns `None` when no sidecar exists (the file is
+/// plaintext — back-compat with files written before the provider was
+/// attached). Sidecar absence is detected via HEAD: cheaper than a failed
+/// GET on most backends.
+async fn try_load_encrypted(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    provider: &dyn EncryptionProvider,
+    tenant: &TenantId,
+) -> Result<Option<Vec<u8>>> {
+    let sidecar = wrapped_sidecar_key(path);
+    let head_res = store.head(&sidecar).await;
+    let sidecar_exists = match head_res {
+        Ok(_) => true,
+        Err(object_store::Error::NotFound { .. }) => false,
+        Err(e) => {
+            return Err(BasinError::storage(format!(
+                "head sidecar {sidecar}: {e}"
+            )))
+        }
+    };
+    if !sidecar_exists {
+        return Ok(None);
+    }
+    let wrapped_bytes = store
+        .get(&sidecar)
+        .await
+        .map_err(|e| BasinError::storage(format!("get sidecar {sidecar}: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| BasinError::storage(format!("read sidecar {sidecar}: {e}")))?;
+    let data_key = provider
+        .unwrap_key(tenant, &WrappedKey(wrapped_bytes.to_vec()))
+        .await?;
+    let envelope = store
+        .get(path)
+        .await
+        .map_err(|e| BasinError::storage(format!("get encrypted {path}: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| BasinError::storage(format!("read encrypted {path}: {e}")))?;
+    let plaintext = decrypt_envelope(&data_key, &envelope)?;
+    Ok(Some(plaintext))
+}
+
+/// Run the read pipeline against a decrypted in-memory plaintext blob.
+/// Mirrors the plaintext path's projection / row-group pruning / row
+/// filter / page-cache write-through, just with `BytesFileReader`
+/// instead of `ParquetObjectReader`. We don't insert into the parquet
+/// meta cache because that cache is keyed by ObjectPath — a re-entry on
+/// the same path on the plaintext side would short-circuit decryption.
+async fn finalize_encrypted_stream(
+    plaintext: Vec<u8>,
+    path: ObjectPath,
+    opts: Arc<ReadOptions>,
+    counters: Arc<ReadCounters>,
+    page_cache: Option<Arc<PageCache>>,
+    cache_key: Option<CacheKey>,
+    tenant_counters: Option<Arc<basin_common::TenantCounters>>,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    let file_size = plaintext.len() as u64;
+    if let Some(tc) = tenant_counters.as_ref() {
+        tc.record_bytes_read(file_size);
+    }
+
+    let mut bytes_reader = BytesFileReader {
+        bytes: bytes::Bytes::from(plaintext),
+    };
+    let arrow_meta = ArrowReaderMetadata::load_async(
+        &mut bytes_reader,
+        ArrowReaderOptions::default(),
+    )
+    .await
+    .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
+
+    let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(bytes_reader, arrow_meta);
+    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key).await
+}
+
+/// Shared post-builder pipeline: projection mask, row-group stats
+/// pruning, bloom-filter pruning, row filter, and page-cache
+/// write-through. Generic over the underlying file reader so the
+/// plaintext (`ParquetObjectReader`) and encrypted (`BytesFileReader`)
+/// paths share one implementation.
+async fn finalize_pipeline<T>(
+    builder: ParquetRecordBatchStreamBuilder<T>,
+    path: ObjectPath,
+    opts: Arc<ReadOptions>,
+    counters: Arc<ReadCounters>,
+    page_cache: Option<Arc<PageCache>>,
+    cache_key: Option<CacheKey>,
+) -> Result<BoxStream<'static, Result<RecordBatch>>>
+where
+    T: parquet::arrow::async_reader::AsyncFileReader + Send + Unpin + 'static,
+{
+    let arrow_schema: SchemaRef = builder.schema().clone();
+    let parquet_schema = builder.metadata().file_metadata().schema_descr_ptr();
+
+    let projection_mask = match &opts.projection {
+        Some(cols) => {
+            let mut idxs = Vec::with_capacity(cols.len());
+            for c in cols {
+                let i = arrow_schema
+                    .index_of(c)
+                    .map_err(|_| BasinError::storage(format!("unknown column {c}")))?;
+                idxs.push(i);
+            }
+            ProjectionMask::roots(&parquet_schema, idxs)
+        }
+        None => ProjectionMask::all(),
+    };
+
+    let kept_after_stats: Vec<usize> = {
+        let row_groups = builder.metadata().row_groups();
+        let total = row_groups.len() as u64;
+        counters
+            .row_groups_considered
+            .fetch_add(total, Ordering::Relaxed);
+        let mut kept = Vec::with_capacity(row_groups.len());
+        let mut pruned = 0u64;
+        for (i, rg) in row_groups.iter().enumerate() {
+            if row_group_pruned(rg, &arrow_schema, &opts.filters) {
+                pruned += 1;
+            } else {
+                kept.push(i);
+            }
+        }
+        counters
+            .row_groups_pruned_by_stats
+            .fetch_add(pruned, Ordering::Relaxed);
+        kept
+    };
+
+    let mut builder = builder.with_projection(projection_mask.clone());
+    let kept = prune_with_bloom_filters(
+        &mut builder,
+        &arrow_schema,
+        kept_after_stats,
+        &opts.filters,
+        &counters,
+    )
+    .await?;
+    counters
+        .row_groups_scanned
+        .fetch_add(kept.len() as u64, Ordering::Relaxed);
+    let mut builder = builder.with_row_groups(kept);
+
+    if !opts.filters.is_empty() {
+        let predicates = build_row_filter(&opts.filters, &arrow_schema, &parquet_schema)?;
+        builder = builder.with_row_filter(predicates);
+    }
+
+    let stream = builder
+        .build()
+        .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
+    let mapped = stream.map(|res| res.map_err(|e| BasinError::storage(format!("parquet read: {e}"))));
+
+    if let (Some(pc), Some(key)) = (page_cache, cache_key) {
+        let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
+            Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let buf_for_each = buf.clone();
+        let buf_for_end = buf.clone();
+        let pc_for_end = pc.clone();
+        let key_for_end = key;
+        let collected = mapped.inspect(move |item| {
+            if let Ok(batch) = item {
+                if let Some(slot) = buf_for_each.lock().expect("page-cache buf").as_mut() {
+                    slot.push(Arc::new(batch.clone()));
+                }
+            } else {
+                *buf_for_each.lock().expect("page-cache buf") = None;
+            }
+        });
+        let terminator = futures::stream::once(async move {
+            let final_buf = buf_for_end.lock().expect("page-cache buf").take();
+            if let Some(batches) = final_buf {
+                pc_for_end.insert(key_for_end, batches);
+            }
+            None::<Result<RecordBatch>>
+        });
+        let with_terminator = collected
+            .map(Some)
+            .chain(terminator)
+            .filter_map(|x| async move { x });
+        return Ok(with_terminator.boxed());
+    }
+
+    Ok(mapped.boxed())
 }
 

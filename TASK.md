@@ -376,6 +376,370 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
       lift that limit and the smoke can re-enable the predicate-side
       round-trip.
 
+## Phase 5.11 — Modern SaaS toolkit: SQL functions, declarative lifecycle, sink trait (~12-15 weeks committed)
+
+**Wedge call: new SaaS only.** See [ADR 0012](./docs/decisions/0012-change-event-primitive.md).
+Basin is the database new SaaS apps get *built on*, not where legacy PG
+schemas migrate. This phase ships user-defined functions, declarative
+lifecycle columns, expanded built-ins, enums, and a forward-compatible
+**`ChangeEventSink` trait** that future triggers / webhooks / realtime
+all plug into — without committing to any of those consumer features
+upfront.
+
+What this phase **does NOT** do: PL/pgSQL parser, PL/pgSQL interpreter,
+`CREATE TRIGGER … EXECUTE FUNCTION` with a PL/pgSQL body, full PG
+`LISTEN`/`NOTIFY` wire-protocol compat, WebSocket realtime, presence
+channels. Those are explicit non-goals per ADR 0012; reactors and
+webhooks ship in Tier 2 only when Phase 0 customer signal demands them;
+WebSocket realtime stays deferred (same workspace, separate crate when
+shipped — `crates/basin-realtime/`).
+
+Tiered to keep the committed engineering scope honest:
+
+- **Tier 0** (~3-5 days): `ChangeEventSink` trait + capture point. Zero
+  consumers; engine byte-identical to today when no sinks attached.
+- **Tier 1** (~12-15 weeks honest): function catalogue + JSONB ops +
+  `LANGUAGE sql` scalar functions + declarative lifecycle + enums +
+  `CREATE MATERIALIZED VIEW` SQL surface. The committed minimum.
+- **Tier 2** (~14-18 weeks, customer-signal-driven): reactors,
+  constraint reactors, webhooks (built-in sinks), `RETURNS TABLE`
+  functions, `CALL` procedures, generated columns, sequences. Each
+  ships independently as Phase 0 interviews show real pull.
+- **Tier 3** (~9-12 weeks, larger asks): `information_schema` +
+  `pg_catalog` views, WASM UDFs.
+- **Deferred** (placeholder): `crates/basin-realtime` — WebSocket
+  subscriptions as a `ChangeEventSink` impl; gated on ≥2 design
+  partners explicitly asking and unable to bridge an existing realtime
+  provider via webhooks.
+
+Phase 0 customer interviews should run **in parallel with Tier 1** so
+Tier 2 priorities are customer-driven, not imagined.
+
+### Tier 0 — `ChangeEventSink` trait + capture point (~3-5 days, no deps)
+
+Forward-compat substrate. Tier 1 phases don't depend on this; Tier 2
+phases (reactors + webhooks) do. Cheap to ship now so the executor
+commit path doesn't get re-touched repeatedly.
+
+- [ ] `ChangeEvent { tenant, table, op, before, after, committed_at,
+      seq, causation_user }` in `basin-common::events`. Stable public
+      contract — adding fields fine, renaming breaking.
+- [ ] `ChangeEventSink` trait (async `publish(&ChangeEvent) -> Result<()>`)
+      in `basin-common::events`.
+- [ ] `EventSinkRegistry` per-engine: separate `pre_commit:
+      Vec<Arc<dyn ChangeEventSink>>` + `post_commit:
+      Vec<Arc<dyn ChangeEventSink>>` lists. Pre-commit sinks run
+      synchronously and abort the mutation on `Err`; post-commit sinks
+      run fire-and-forget after the catalog commit succeeds.
+- [ ] `Engine::attach_pre_commit_sink` + `Engine::attach_post_commit_sink`.
+- [ ] Capture point in executor's INSERT/UPDATE/DELETE path — exactly
+      once per committed mutation; serialized by the existing
+      per-`(tenant, table)` snapshot ID ordering.
+- [ ] One trivial `TracingSink` (logs each event via `tracing::info!`)
+      for debug demos; opt-in via env var, default off.
+- [ ] Test: zero-sink path is byte-identical to today (no allocation,
+      no spawn); attached `TracingSink` records every committed event;
+      a pre-commit sink that returns `Err` rolls back the mutation;
+      a post-commit sink that returns `Err` does NOT roll back.
+
+### Tier 1 — Ship now (~12-15 weeks honest)
+
+Committed engineering. Independent of Tier 0; ships in parallel.
+Customer-visible PG-compat upgrade with zero novel infrastructure.
+
+#### 5.11.A — Built-in function catalogue + JSONB operators + recursive-CTE/window verification (~3-4 weeks)
+
+The single biggest customer-visible PG-compat win. JSONB operators
+folded in because every modern SaaS schema uses them constantly.
+
+- [ ] Date/time: `now()`, `current_timestamp`, `current_date`,
+      `date_trunc(unit, ts)`, `age(ts1, ts2)`, `extract(field FROM ts)`,
+      `to_timestamp(text, fmt)`, `to_char(ts, fmt)`.
+- [ ] String: `lower`, `upper`, `substring(s FROM n FOR m)`, `trim`,
+      `length`, `position`, `replace`, `regexp_replace`, `||` operator.
+- [ ] Math: `abs`, `ceil`, `floor`, `round`, `power`, `sqrt`, `mod`,
+      `%` operator.
+- [ ] Coalesce / null-handling: `coalesce`, `nullif`, `greatest`,
+      `least`, `is distinct from`.
+- [ ] Aggregate: `string_agg`, `array_agg`, `bit_and`/`bit_or`,
+      `every`/`bool_and`/`bool_or`.
+- [ ] **JSONB operators**: `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`,
+      `?|`, `?&` — wired through DataFusion's existing JSON support.
+- [ ] **Recursive-CTE + window-function verification pass**: DataFusion
+      supports both; add an integration test row-by-row covering
+      `WITH RECURSIVE` (employee-hierarchy classic), `ROW_NUMBER`,
+      `RANK`, `DENSE_RANK`, `LAG`/`LEAD`, `SUM() OVER (PARTITION BY)`.
+- [ ] Test: a single integration test that exercises every function
+      above against `tokio-postgres`'s default extended-query path; no
+      panic, results match a real PG reference run committed alongside.
+
+#### 5.11.D — `LANGUAGE sql` scalar functions (~3 weeks, depends on A)
+
+The function primitive — body is a single SELECT, inlined at planning
+time. Covers ~50% of all real-world function use cases. No interpreter,
+no frame management, no security sandbox.
+
+- [ ] `CREATE FUNCTION name(args) RETURNS scalar LANGUAGE sql AS $$
+      SELECT … $$` parser + catalog persistence (`functions` table).
+- [ ] Planning-time inlining: function call becomes a sub-query in the
+      logical plan, with arguments substituted into the body.
+- [ ] Recursive function detection — reject (PG also rejects for
+      `LANGUAGE sql`); recursion needs PL/pgSQL which is out of scope.
+- [ ] `DROP FUNCTION`, `ALTER FUNCTION` (rename only).
+- [ ] Test: `display_name(users)` round-trips; functions composing
+      built-ins from 5.11.A work; recursive function rejected.
+
+#### 5.11.B — Declarative lifecycle (`AUTO_UPDATE`, `AUDIT TO`, `SOFT DELETE`) (~2 weeks)
+
+Covers ~75% of "trigger" use cases without parsing or interpreting
+anything. Pure engine-native column behaviour. **Implements the writes
+inline in the executor — does NOT depend on Tier 0.**
+
+- [ ] `CREATE TABLE foo (..., updated_at TIMESTAMPTZ AUTO_UPDATE)` —
+      engine sets the column on every UPDATE row (DEFAULT-now semantics
+      for INSERT already work).
+- [ ] `CREATE TABLE foo (..., AUDIT TO foo_audit)` — every committed
+      mutation appends `(op, NEW or OLD, ts, causation_user)` to the
+      audit table. Auto-creates the audit table on first reference.
+- [ ] `CREATE TABLE foo (..., deleted_at TIMESTAMPTZ SOFT DELETE)` —
+      `DELETE FROM foo WHERE …` rewrites to `UPDATE foo SET deleted_at
+      = now() WHERE …`; `SELECT` filters out non-NULL `deleted_at` by
+      default unless caller opts in via `INCLUDE DELETED`.
+- [ ] Test: each declarative mode round-trips, independent of the
+      others; AUDIT mode emits one row per mutation; SOFT DELETE
+      round-trips via REST + pgwire.
+
+#### 5.11.K2 — `CREATE TYPE … AS ENUM` + `CREATE DOMAIN` (~2 weeks)
+
+Reusable typed constraints. Every modern PG schema uses enums for
+status columns; domains for reusable validations.
+
+- [ ] `CREATE TYPE order_status AS ENUM ('pending', 'paid', ...)` parser
+      + catalog (`enum_types` table; one row per `(tenant, name,
+      ordered_labels)`).
+- [ ] `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)` parser +
+      catalog.
+- [ ] Type-resolution path: catalog lookup before falling back to
+      built-in PG types.
+- [ ] `ALTER TYPE … ADD VALUE` (append-only — PG enums are
+      append-only too).
+- [ ] `DROP TYPE`, `DROP DOMAIN` (cascade required if any column uses
+      the type).
+- [ ] Test: enum round-trip via REST + pgwire; comparison ordering
+      matches declaration order; rejecting unknown enum value;
+      domain `CHECK` enforced on INSERT.
+
+#### 5.11.D2 — `CREATE MATERIALIZED VIEW` SQL surface (~1 week)
+
+Drop the existing `cv_glue` stub. Independent of the other 5.11 work;
+the engine plumbing already exists in `basin-cv`.
+
+- [ ] `CREATE MATERIALIZED VIEW name AS query WITH (basin.continuous,
+      refresh_interval = '5m', ...)` SQL surface → existing
+      `Catalog::set_continuous_aggregate`.
+- [ ] `REFRESH MATERIALIZED VIEW name` SQL form → `CvRefresher::tick`
+      one-shot.
+- [ ] `DROP MATERIALIZED VIEW`.
+- [ ] Test: SQL round-trip (CREATE → refresh → SELECT → DROP) against
+      the engine; refresh-on-schedule wire-up survives a process restart.
+
+### Tier 2 — Customer-signal-driven (~14-18 weeks, ship as Phase 0 demands)
+
+Each independent. Each plugs into the Tier 0 trait. Order below is
+suggested-priority; real order is whatever Phase 0 surfaces.
+
+#### 5.11.C — SQL-bodied reactors (`REACT ON … EXECUTE`) (~2 weeks, depends on Tier 0 + 5.11.A)
+
+The trigger primitive. `ReactorSink` implements `ChangeEventSink`,
+attached as **pre-commit** so reactor failures abort the mutation.
+
+- [ ] `ALTER TABLE … REACT ON {INSERT|UPDATE|DELETE} [WHEN (predicate)]
+      EXECUTE <sql_statement>` parser surface.
+- [ ] Reactor registry in catalog (`reactors` table; one row per
+      `(tenant, table, name, ops, when_predicate, body)`).
+- [ ] `ReactorSink` impl: on event, evaluate `WHEN` predicate, run body
+      via existing engine path with `NEW` / `OLD` / `TG_OP` /
+      `TG_TABLE_NAME` substituted.
+- [ ] `DROP REACTOR`, `ALTER REACTOR` (rename only for v0.1).
+- [ ] Test: counter-denormalization reactor (parent.child_count++);
+      audit-side reactor; reactor fails → mutation rolls back; reactor
+      respects RLS (sees full row, downstream SELECT applies filter).
+
+#### 5.11.C2 — Constraint-shaped reactors (`REACT … CONSTRAINT`) (~1 week, depends on 5.11.C)
+
+Tenant-scoped invariant enforcement without a body. Covers "max 100
+rows per tenant", "free-tier caps", "hierarchical depth limit".
+
+- [ ] `ALTER TABLE … REACT ON INSERT CONSTRAINT (predicate)` —
+      predicate evaluated against NEW + the current table state; if
+      false, mutation aborts with SQLSTATE `23514 check_violation`.
+- [ ] Test: cap-at-N rejection works; cap-at-N allows under the cap;
+      constraint with subquery against a sibling table works.
+
+#### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0)
+
+Replaces "trigger fires HTTP" with a retryable, idempotency-keyed
+fanout. `WebhookSink` implements `ChangeEventSink`, attached as
+**post-commit** with its own disk-backed retry queue. Lives in a new
+`crates/basin-webhooks` workspace member; reuses `basin-net` for
+the actual HTTP path.
+
+- [ ] `ALTER TABLE … SUBSCRIBE WEBHOOK TO '<url>' ON {INSERT|UPDATE|
+      DELETE} [WHERE …]` parser + catalog persistence.
+- [ ] Disk-backed retry queue (`basin-wal` sidecar; idempotency-keyed
+      so dupes don't double-process); worker drains the queue with
+      exponential backoff to the configured URL via `basin-net`.
+- [ ] Dead-letter after `max_retries` (configurable, default 16);
+      surface dead letters via a `webhook_dead_letters` table.
+- [ ] Reuses basin-net's URL allowlist + per-tenant rate limit + body
+      cap + timeout — already tested.
+- [ ] Stale-subscription cleanup: customer endpoint down for > 24h →
+      auto-pause subscription + audit log entry; resume requires
+      explicit `RESUME WEBHOOK`.
+- [ ] Test: webhook fires on matching event; retries on transient HTTP
+      failure; idempotency key dedupes after retry; dead-letter row
+      created after max_retries; webhook does NOT fire when WHERE
+      predicate is false; auto-pause kicks in after sustained failures.
+
+#### 5.11.E — `LANGUAGE sql RETURNS TABLE` functions (~2 weeks, depends on 5.11.D)
+
+Multi-row return — function call becomes a derived table at planning
+time. Same inlining trick as scalar functions.
+
+- [ ] `CREATE FUNCTION name(args) RETURNS TABLE(col1 type, ...)
+      LANGUAGE sql AS $$ SELECT … $$` parser + catalog.
+- [ ] Planning-time inlining as a derived table.
+- [ ] Test: `recent_orders(uid)` round-trips; `SELECT * FROM
+      recent_orders(...)` planning works alongside JOINs.
+
+#### 5.11.F — Multi-statement `CALL` procedures (~2 weeks, depends on 5.11.D)
+
+Multi-statement workflows for onboarding, archive, periodic tasks.
+Sequence of SQL statements with parameter binding, no control flow.
+
+- [ ] `CREATE PROCEDURE name(args) LANGUAGE sql AS $$ stmt1; stmt2;
+      … $$` parser + catalog.
+- [ ] `CALL name(args)` — runs each statement in order with arguments
+      substituted; transactional once Phase 5 single-shard transactions
+      ship; until then, best-effort sequential.
+- [ ] Test: `CALL archive_tenant(t)` round-trip; multi-tenant isolation
+      preserved through the call; failure mid-procedure leaves earlier
+      statements applied (until single-shard transactions ship).
+
+#### 5.11.K — Generated columns (`GENERATED ALWAYS AS … STORED`) (~2 weeks)
+
+Modern PG syntax for computed columns persisted at write time. Cleaner
+than `LANGUAGE sql` functions for the simplest case.
+
+- [ ] `CREATE TABLE foo (..., full_name TEXT GENERATED ALWAYS AS
+      (first_name || ' ' || last_name) STORED)` parser + catalog.
+- [ ] Engine evaluates the expression on every INSERT/UPDATE row;
+      reads return the stored value.
+- [ ] Reject `INSERT`/`UPDATE` writing directly to a generated column
+      with SQLSTATE `42601 syntax_error`.
+- [ ] `VIRTUAL` (computed-on-read) variant explicitly out of scope for
+      v0.1 — STORED only.
+- [ ] Test: generated column round-trip; expression composing built-ins
+      from 5.11.A; rejection of direct write.
+
+#### 5.11.K3 — Sequences (`CREATE SEQUENCE`, `nextval`, `currval`) (~2 weeks)
+
+Custom auto-increment, gap-tolerant counters. Most new SaaS uses ULID/
+UUID, but a real slice still wants sequences for human-readable IDs.
+
+- [ ] `CREATE SEQUENCE name [START n] [INCREMENT n]` parser + catalog
+      (`sequences` table; per-tenant; persisted current value).
+- [ ] `nextval(name)`, `currval(name)`, `setval(name, n)` functions.
+- [ ] `DEFAULT nextval('seq_name')` column default integration.
+- [ ] Concurrent-safety: per-`(tenant, sequence)` mutex around the
+      increment; cached blocks of N for high-rate sequences (cache
+      size from `WITH CACHE n` clause).
+- [ ] `DROP SEQUENCE` (cascade if columns reference it).
+- [ ] Test: 10 concurrent `nextval` calls produce 10 distinct values;
+      cache flushed on engine restart (gap is acceptable, duplicate
+      is not); cross-tenant isolation (tenant A's `nextval` doesn't
+      touch tenant B's sequence).
+
+### Tier 3 — Larger asks
+
+#### 5.11.M — `information_schema` + `pg_catalog` read-only views (~6-8 weeks honest)
+
+The gate for proper PG-ecosystem tooling. Every introspecting tool
+(PostgREST, pgAdmin, DataGrip, schema-migration tools, every ORM that
+introspects) queries these. Without them, the "PG-compatible" claim
+fails at first contact with real tooling. **PostgREST alone runs ~200
+catalog queries on startup.**
+
+- [ ] `information_schema.tables`, `.columns`, `.key_column_usage`,
+      `.table_constraints`, `.referential_constraints`, `.routines`,
+      `.parameters`, `.views`, `.schemata`.
+- [ ] `pg_catalog.pg_class`, `.pg_attribute`, `.pg_namespace`,
+      `.pg_index`, `.pg_constraint`, `.pg_type`, `.pg_proc`, `.pg_am`.
+- [ ] Tenant-scoped: each tenant sees only its own objects in catalog
+      views (RLS-style filter built into the view definition).
+- [ ] Tooling integration tests: PostgREST startup against Basin
+      succeeds; pgAdmin schema-browser populates correctly; a
+      mainstream ORM (Sequelize? Prisma?) introspects without error.
+- [ ] Documented compat matrix: which PG-specific oid columns return
+      stable values, which return NULL, which raise.
+
+#### 5.11.J — WASM UDFs (~3-4 weeks, customer-gated)
+
+Custom imperative computation as WebAssembly. Escape hatch for the
+~5% of cases `LANGUAGE sql` can't express. Gated on Phase 0 customer
+demand per ADR 0012's revisit clause — if customers haven't asked,
+don't build.
+
+- [ ] `CREATE FUNCTION name(args) RETURNS type LANGUAGE wasm AS '<base64
+      bytes>'` parser + catalog persistence.
+- [ ] `wasmtime` runtime per-call; sandboxed by construction.
+- [ ] CPU + memory caps per invocation (deterministic shutdown on
+      overrun).
+- [ ] Test deferred — implement when shipped.
+
+### Deferred — `crates/basin-realtime` (placeholder, same workspace)
+
+WebSocket realtime + presence channels as `ChangeEventSink`
+implementations. Lives in `crates/basin-realtime/` when it ships —
+same shape as `crates/basin-cron/`, `crates/basin-net/`. The Tier 0
+trait is the public seam; engine doesn't change.
+
+**Gated on:** ≥2 design partners (Phase 0) explicitly asking for
+server-pushed realtime updates that webhooks can't satisfy AND unable
+to bridge an existing realtime provider (Pusher / Ably / Supabase
+Realtime / their own WebSocket layer) to Basin's webhook fanout. See
+ADR 0012's "Trigger to revisit" section.
+
+If a separate repo later makes more sense (independent release cadence,
+ecosystem signal), the workspace member becomes a separate repo via a
+one-day `git mv` + new `Cargo.toml`. Both paths stay open; same-repo
+default is just lower-friction at current scale.
+
+### Decision trade-off (read before reopening this scope)
+
+This phase **commits Basin to "new SaaS only"** as the trigger /
+function / realtime story. Legacy PG migrations that depend on
+hand-written PL/pgSQL can't drop in their existing schema unchanged
+— they translate trigger bodies (mechanical for ~95% of real-world
+cases per the schema audit; the other ~5% is a real porting cost the
+customer bears).
+
+The trade-offs:
+
+- **Lose:** the "drop in any PG schema unchanged" claim. Customers
+  with deeply legacy enterprise PG schemas are not Basin's wedge.
+- **Win:** wedge clarity ("the multi-tenant DB designed for new
+  SaaS"), bounded engineering scope, no permanent PL/pgSQL maintenance
+  load, clean trait-shaped extensibility for future sinks, no novel
+  realtime infrastructure shipped speculatively.
+
+Tier 1 (~12-15 weeks honest) is a clear win regardless of Phase 0
+signal. Tier 2 phases each ship independently as customers ask. Tier 3
+is the bigger commitment — `information_schema` (5.11.M) is the
+unblocker for proper PG-ecosystem tooling and worth the 6-8 weeks once
+Tier 1 customers are in production. Reopen ADR 0012 only if both gating
+conditions in its "Trigger to revisit" section are met.
+
 ## Phase 6 — Production hardening (3–4 months)
 
 - [ ] Multi-region: regional WAL + S3 cross-region replication
@@ -400,6 +764,9 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
       snapshot history / partition spec / RLS / tier / bloom / row-group
       / CV settings; data files are *shared by reference* (no Parquet
       copy). v0.2: cross-tenant forking (needs refcount-aware GC).
+- [x] Migration Manager v0.2 catalog ops shipped (project-wide list /
+      diff / rollback; default fan-out + Postgres single-query
+      optimisation).
 - [ ] Cross-shard 2PC
 - [x] Connection pooling (✅ ADR 0007), rate limiting (✅ pgwire side:
       `BASIN_PGWIRE_RATE_LIMIT_QPS=100` token-bucket per tenant via
@@ -410,9 +777,12 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
       unchecked. v0.2 will use A4 catalog `ColumnStats` for selectivity-
       aware estimates on multi-table shapes.)
 - [x] Per-tenant + per-query + per-shard + per-WAL telemetry — `basin_common::TenantCounterRegistry` aggregates ops/bytes_read/bytes_written/errors + ring-window p99 latency per tenant; `Engine::tenant_counters(&TenantId) -> TenantCountersSnapshot` exposes a cheap snapshot. Storage writer/reader and WAL append are wired to bump per-tenant byte counters; engine `TenantSession::execute` bumps op + latency + error.
+- [~] BYO-key envelope-encryption hooks (basin-storage trait + wiring; cloud adapters separate) — `EncryptionProvider` trait shipped in `basin-storage::encryption`; `Storage::attach_encryption_provider` is the additive opt-in (default `None` = byte-for-byte plaintext path). Writer envelope-encrypts the Parquet body with a fresh per-file AES-256-GCM data key and persists the wrapped key as a `<path>.wrapped` sidecar; reader transparently unwraps. Real KMS adapters (AWS KMS, GCP KMS, Azure Key Vault) plug into the trait without trait changes — they live in basin-cloud.
 
-> Cloud-platform hardening items (BYO-bucket, BYO-key, Stripe billing)
-> moved to [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md).
+> Cloud-platform hardening items (BYO-bucket, Stripe billing) moved to
+> [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md). BYO-key trait surface lives
+> in basin-storage (this repo) per the line above; the KMS-side
+> adapters are cloud-only.
 
 ## Phase 7 — Launch (ongoing)
 

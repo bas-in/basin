@@ -7,21 +7,21 @@
   "metrics": [
     {
       "label": "Tenant deletion (1 tenant, 100K rows in 100 files; basin on S3)",
-      "basin": 1955.4495410000002,
-      "postgres": 5.739375,
+      "basin": 1682.821208,
+      "postgres": 13.694125,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.00x"
+      "ratio_text": "pg / basin = 0.01x"
     },
     {
       "label": "ADD COLUMN on 100K rows",
-      "basin": 3.24475,
-      "postgres": 4.1837089999999995,
+      "basin": 0.542458,
+      "postgres": 21.816458,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.29x"
+      "ratio_text": "pg / basin = 40.22x"
     }
   ],
-  "generated_at": "@1778204556",
+  "generated_at": "@1778331906",
   "note": "Basin storage on real S3 — tenant deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."
 }

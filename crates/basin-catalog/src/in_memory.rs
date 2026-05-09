@@ -1233,4 +1233,205 @@ mod tests {
         let err = cat.drop_index(&t, &tbl, "ghost").await.unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
+
+    /// Migration Manager v0.2: project-wide list returns every table's
+    /// every snapshot, sorted by committed_at.
+    #[tokio::test]
+    async fn list_snapshots_project_wide_returns_all_tables() {
+        let cat = InMemoryCatalog::new();
+        let t = TenantId::new();
+        let tbls = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|n| TableName::new(*n).unwrap())
+            .collect::<Vec<_>>();
+        for tbl in &tbls {
+            cat.create_table(&t, tbl, &schema()).await.unwrap();
+        }
+        // Two appends per table — interleaved so commit timestamps cross
+        // table boundaries and sort order is non-trivial.
+        for round in 0..2 {
+            for tbl in &tbls {
+                let parent = if round == 0 { SnapshotId::GENESIS } else { SnapshotId(1) };
+                cat.append_data_files(
+                    &t,
+                    tbl,
+                    parent,
+                    vec![file(&format!("{tbl}/r{round}.parquet"), 1, 10)],
+                )
+                .await
+                .unwrap();
+                // Bias commit_at ordering between consecutive commits so the
+                // sort is deterministic on platforms with coarse clocks.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        let entries = cat.list_snapshots_project_wide(&t).await.unwrap();
+        // Genesis (3) + 2 appends × 3 tables = 9 rows.
+        assert_eq!(entries.len(), 9, "got {entries:?}");
+        // Sorted ascending by committed_at — strictly non-decreasing.
+        for w in entries.windows(2) {
+            assert!(w[0].committed_at <= w[1].committed_at);
+        }
+        // Every table appears, and each appears exactly thrice.
+        for tbl in &tbls {
+            let n = entries.iter().filter(|e| &e.table == tbl).count();
+            assert_eq!(n, 3, "table {tbl} count = {n}");
+        }
+    }
+
+    /// Diff window between two captured wall times groups per-table.
+    #[tokio::test]
+    async fn diff_snapshots_window() {
+        let cat = InMemoryCatalog::new();
+        let t = TenantId::new();
+        let a = TableName::new("a").unwrap();
+        let b = TableName::new("b").unwrap();
+        cat.create_table(&t, &a, &schema()).await.unwrap();
+        cat.create_table(&t, &b, &schema()).await.unwrap();
+
+        // First batch — pre-window.
+        cat.append_data_files(&t, &a, SnapshotId::GENESIS, vec![file("a1.parquet", 1, 10)])
+            .await
+            .unwrap();
+        cat.append_data_files(&t, &b, SnapshotId::GENESIS, vec![file("b1.parquet", 1, 10)])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let t1 = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // In-window appends: 2 on a, 1 on b.
+        cat.append_data_files(&t, &a, SnapshotId(1), vec![file("a2.parquet", 1, 10)])
+            .await
+            .unwrap();
+        cat.append_data_files(&t, &a, SnapshotId(2), vec![file("a3.parquet", 1, 10)])
+            .await
+            .unwrap();
+        cat.append_data_files(&t, &b, SnapshotId(1), vec![file("b2.parquet", 1, 10)])
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let t2 = chrono::Utc::now();
+
+        let diff = cat.diff_snapshots(&t, t1, t2).await.unwrap();
+        let a_entries = diff.per_table.get(&a).expect("a in diff");
+        let b_entries = diff.per_table.get(&b).expect("b in diff");
+        assert_eq!(a_entries.len(), 2, "expected 2 a-snapshots: {a_entries:?}");
+        assert_eq!(b_entries.len(), 1, "expected 1 b-snapshot: {b_entries:?}");
+        // Genesis was pre-window, so neither table is flagged as created.
+        assert!(diff.created_in_window.is_empty(), "{diff:?}");
+    }
+
+    /// Project-wide rollback rewinds every table to its latest pre-cutoff
+    /// snapshot.
+    #[tokio::test]
+    async fn rollback_to_snapshot_project_wide_rewinds_all() {
+        let cat = InMemoryCatalog::new();
+        let t = TenantId::new();
+        let tbls: Vec<TableName> = ["x", "y", "z"]
+            .iter()
+            .map(|n| TableName::new(*n).unwrap())
+            .collect();
+        for tbl in &tbls {
+            cat.create_table(&t, tbl, &schema()).await.unwrap();
+            cat.append_data_files(
+                &t,
+                tbl,
+                SnapshotId::GENESIS,
+                vec![file(&format!("{tbl}/first.parquet"), 1, 10)],
+            )
+            .await
+            .unwrap();
+        }
+        // Snapshot the wall time after the first round of commits.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let cutoff = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Second round of appends — these must be rewound by the rollback.
+        for tbl in &tbls {
+            cat.append_data_files(
+                &t,
+                tbl,
+                SnapshotId(1),
+                vec![file(&format!("{tbl}/second.parquet"), 1, 10)],
+            )
+            .await
+            .unwrap();
+        }
+
+        let pairs = cat
+            .rollback_to_snapshot_project_wide(&t, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(pairs.len(), 3, "{pairs:?}");
+        for (_table, head) in &pairs {
+            // Each table's head should be the post-first-append snapshot
+            // (id 1), not the post-second-append snapshot (id 2).
+            assert_eq!(*head, SnapshotId(1));
+        }
+        for tbl in &tbls {
+            let meta = cat.load_table(&t, tbl).await.unwrap();
+            assert_eq!(meta.current_snapshot, SnapshotId(1));
+            // Second-round file is gone from history.
+            let paths: Vec<&str> = meta
+                .snapshots
+                .iter()
+                .flat_map(|s| s.data_files.iter().map(|f| f.path.as_str()))
+                .collect();
+            assert!(
+                !paths.iter().any(|p| p.contains("second.parquet")),
+                "post-cutoff file still present: {paths:?}"
+            );
+        }
+    }
+
+    /// Tables created strictly after `as_of` have no eligible target and
+    /// must be left untouched.
+    #[tokio::test]
+    async fn rollback_to_snapshot_project_wide_skips_tables_created_after() {
+        let cat = InMemoryCatalog::new();
+        let t = TenantId::new();
+        let early = TableName::new("early").unwrap();
+        cat.create_table(&t, &early, &schema()).await.unwrap();
+        cat.append_data_files(
+            &t,
+            &early,
+            SnapshotId::GENESIS,
+            vec![file("early.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let cutoff = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Created strictly after the cutoff.
+        let late = TableName::new("late").unwrap();
+        cat.create_table(&t, &late, &schema()).await.unwrap();
+        cat.append_data_files(
+            &t,
+            &late,
+            SnapshotId::GENESIS,
+            vec![file("late.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+
+        let pairs = cat
+            .rollback_to_snapshot_project_wide(&t, cutoff)
+            .await
+            .unwrap();
+        // Only `early` is rolled back; `late` was created after the cutoff
+        // and is skipped, not failed.
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert_eq!(pairs[0].0, early);
+
+        // `late` is still at its post-create head — no truncation happened.
+        let late_meta = cat.load_table(&t, &late).await.unwrap();
+        assert_eq!(late_meta.current_snapshot, SnapshotId(1));
+        assert_eq!(late_meta.snapshots.len(), 2);
+    }
 }

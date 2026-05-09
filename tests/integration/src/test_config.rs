@@ -213,8 +213,16 @@ impl S3Config {
         // HTTP/2 multiplexes many concurrent requests over a single TCP
         // socket — eliminates HTTP/1.1 head-of-line blocking that would
         // otherwise let a single tenant's bulk transfer tie up the pool.
-        // See `S3Config::http2_only`.
-        if self.http2_only {
+        // See `S3Config::http2_only`. Auto-enable h2 over HTTPS endpoints
+        // (ALPN negotiates safely; h2-over-TLS is the universal mode for
+        // AWS S3 / R2 / GCS). Only h2c (cleartext h2) over plain HTTP is
+        // the risky one, and that's gated by `allow_http=true`.
+        let endpoint_is_https = self
+            .endpoint
+            .as_deref()
+            .map(|e| e.starts_with("https://"))
+            .unwrap_or(!self.allow_http);
+        if self.http2_only || endpoint_is_https {
             client_opts = client_opts.with_http2_only();
         }
         if self.accept_invalid_certs {
