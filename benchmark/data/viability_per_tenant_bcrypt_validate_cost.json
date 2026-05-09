@@ -1,0 +1,25 @@
+{
+  "kind": "viability",
+  "id": "per_tenant_bcrypt_validate_cost",
+  "name": "bcrypt validation cost on pgwire connect",
+  "claim": "Every cold pgwire connection pays one bcrypt-verify on the way in. At test bcrypt-cost (4) p99 stays under 300 ms across 50 validations. Production cost-12 will run ~50× higher; the connection pool keeps this off the hot path for warm reuse. The number we publish here tracks regressions in the validation path itself, not in bcrypt's CPU envelope.",
+  "passed": true,
+  "primary": {
+    "label": "p99 validate latency",
+    "value": 2.305667,
+    "unit": "ms",
+    "bar": {
+      "op": "less_than",
+      "value": 300.0
+    }
+  },
+  "details": {
+    "bar_p99_ms": 300.0,
+    "bcrypt_cost": 4,
+    "mean_ms": 1.8852799600000003,
+    "n_samples": 50,
+    "p50_ms": 1.840541,
+    "p99_ms": 2.305667
+  },
+  "generated_at": "@1778330640"
+}

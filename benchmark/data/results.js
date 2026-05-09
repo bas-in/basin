@@ -947,7 +947,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cluster_mean / no_cluster_mean ratio",
-        "value": 0.9759858749628625,
+        "value": 0.8080482570243379,
         "unit": "x",
         "bar": {
           "op": "less_than",
@@ -956,13 +956,13 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bar_ratio_x": 2.0,
-        "cluster_mean_ms": 2.8744004000000003,
+        "cluster_mean_ms": 3.898375,
         "n_iterations": 5,
-        "no_cluster_mean_ms": 2.945125,
-        "ratio_x": 0.9759858749628625,
+        "no_cluster_mean_ms": 4.824433399999999,
+        "ratio_x": 0.8080482570243379,
         "rows_per_batch": 10000
       },
-      "generated_at": "@1778329204"
+      "generated_at": "@1778330640"
     },
     "viability_cluster_by_sql": {
       "kind": "viability",
@@ -1426,6 +1426,56 @@ window.__BASIN_RESULTS = {
         "rows_range_query": 100
       },
       "generated_at": "@1778204033"
+    },
+    "viability_per_tenant_bcrypt_validate_cost": {
+      "kind": "viability",
+      "id": "per_tenant_bcrypt_validate_cost",
+      "name": "bcrypt validation cost on pgwire connect",
+      "claim": "Every cold pgwire connection pays one bcrypt-verify on the way in. At test bcrypt-cost (4) p99 stays under 300 ms across 50 validations. Production cost-12 will run ~50\u00d7 higher; the connection pool keeps this off the hot path for warm reuse. The number we publish here tracks regressions in the validation path itself, not in bcrypt's CPU envelope.",
+      "passed": true,
+      "primary": {
+        "label": "p99 validate latency",
+        "value": 2.305667,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 300.0
+        }
+      },
+      "details": {
+        "bar_p99_ms": 300.0,
+        "bcrypt_cost": 4,
+        "mean_ms": 1.8852799600000003,
+        "n_samples": 50,
+        "p50_ms": 1.840541,
+        "p99_ms": 2.305667
+      },
+      "generated_at": "@1778330640"
+    },
+    "viability_per_tenant_provision_throughput": {
+      "kind": "viability",
+      "id": "per_tenant_provision_throughput",
+      "name": "Per-tenant connection-URL provision latency",
+      "claim": "Issuing a fresh pgwire (user, password) row + bcrypt hash + URL finishes within p99 < 50 ms at test bcrypt-cost (4). Production cost-12 is documented inline; this card tracks the test-cost number so a regression in the SQL / random-byte / URL-build path is caught. The bar is expressed against p99 across 100 provisions; mean / p50 are reported as distribution context.",
+      "passed": true,
+      "primary": {
+        "label": "p99 provision latency",
+        "value": 4.056167,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 50.0
+        }
+      },
+      "details": {
+        "bar_p99_ms": 50.0,
+        "bcrypt_cost": 4,
+        "mean_ms": 2.0693979199999992,
+        "n_samples": 100,
+        "p50_ms": 1.987417,
+        "p99_ms": 4.056167
+      },
+      "generated_at": "@1778330640"
     },
     "viability_pg_trgm": {
       "kind": "viability",

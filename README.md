@@ -174,14 +174,16 @@ The full architecture document is in [`docs/architecture.md`](./docs/architectur
 
 ## What you can do today
 
-- **Multi-tenant Postgres-compatible SQL** — pgwire v3, simple + extended query protocol. Works with `psql`, `tokio-postgres`, `asyncpg`, Diesel, SeaORM, every ORM that speaks Postgres.
-- **CRUD** — `CREATE TABLE`, `INSERT`, `SELECT` with `WHERE` / `ORDER BY` / `LIMIT`, `SHOW TABLES`. Prepared statements with parameter bind.
-- **Native vector search** — `vector(N)` column type, `<->` / `<#>` / `<=>` operators, HNSW index per Parquet segment. No `pg_vector` extension required.
-- **Per-tenant isolation** — bucket prefix is the IAM boundary; tested under concurrent load with zero cross-tenant leaks.
-- **Durable catalog** — Postgres-backed; tables and snapshots survive process restart.
-- **Cheap retention** — ZSTD-1 compression on Parquet, 12.5× smaller than Postgres heap on audit-log data.
-- **Fast inserts** — Raft-batched WAL, ~0.056 ms per single-row INSERT through the full pipeline.
-- **Cheap idle tenants** — 1.2 KiB of RAM per provisioned tenant in the catalog.
+- **Multi-tenant Postgres-compatible SQL** — pgwire v3, simple + extended query protocol, **TLS** (rustls), **`COPY FROM STDIN`/`COPY TO STDOUT`** (CSV). Works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, any Postgres ORM.
+- **CRUD + DDL** — `CREATE TABLE`, multi-row `INSERT`, `SELECT`, `UPDATE`, `DELETE` (Iceberg copy-on-write), `ALTER TABLE … CLUSTER BY (…) / SET BLOOM FILTERS ON / SET row_group_rows / SET cold_after / ENABLE ROW LEVEL SECURITY / CREATE POLICY`, `SHOW TABLES`. Prepared statements with parameter bind (text + binary, including native JSONB / UUID).
+- **Native vector search** — `vector(N)` + `<->` / `<#>` / `<=>` operators, HNSW per Parquet segment. No `pg_vector`.
+- **Postgres-extension equivalents** — `pg_cron` (basin-cron), `pg_net` + `http` (basin-net), `pg_trgm` (basin-trgm), `PostGIS` subset (basin-geo), `TimescaleDB` continuous aggregates (basin-cv), `pgcrypto` + `uuid-ossp` UDFs.
+- **Per-tenant isolation** — bucket prefix is the IAM boundary; 1,000-iter cross-tenant fuzz × 4 attack shapes finds zero leaks. RLS works through UNION + CTE shapes (P0 bypass found and fixed by the security suite this cycle).
+- **Per-tenant connection URLs (managed-Postgres feel)** — `POST /admin/v1/tenants` returns `postgres://<tenant_user>:<password>@host:5433/<db>`. Password is bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/tenants/{user}/rotate`. Cross-tenant isolation under per-tenant URLs is integration-tested; within-tenant RLS still applies.
+- **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation with reuse-detection blanket-revoke, email-link login, per-tenant API keys, per-user session settings) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`).
+- **Durable catalog** — Postgres-backed; tables, snapshots, tenant credentials all survive process restart. Catalog-level PITR (`rollback_to_snapshot`) and table fork (`fork_table`) shipped.
+- **Cheap retention** — ZSTD-1 Parquet, 12.5× smaller than Postgres heap on audit-log data; A4 catalog `column_stats` skips footer fetches when the predicate prunes the file.
+- **Operations** — connection pooling, per-tenant pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-tenant counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
 
 The full capability matrix (with what's planned and what's deferred): [`CAPABILITIES.md`](./CAPABILITIES.md).
 
@@ -191,16 +193,22 @@ The full capability matrix (with what's planned and what's deferred): [`CAPABILI
 
 | Phase | Description | Status |
 |---|---|---|
-| **0** | Validate the wedge — customer interviews, design partners | open |
-| **1** | Storage substrate — Parquet on object_store, Iceberg-style catalog | shipped |
-| **2** | WAL service — Raft-backed, sub-5 ms write acks | v0.1 shipped (single-node; Raft is v0.2) |
-| **3** | Shard owners — per-tenant state, eviction, compactor | v0.1 shipped (in-process; placement service is v0.2) |
-| **4** | Routers + SQL — pgwire, RLS, multi-shard fan-out | extended-query shipped; RLS pending |
-| **5** | Analytical path — DuckDB / DataFusion direct on Iceberg | open |
-| **6** | Production hardening — multi-region, BYO-bucket, BYO-key, billing | scoped (ADRs 0001, 0004) |
-| **7** | Launch | open |
+| **0** | Validate the wedge — customer interviews, design partners | **open** (the gate; engineering is mature enough to need customer signal next) |
+| **1** | Storage substrate — Parquet on object_store, Iceberg-style catalog | **shipped** |
+| **2** | WAL service — sub-5 ms write acks | **v0.1 shipped** (single-node; Raft is v0.2) |
+| **3** | Shard owners — per-tenant state, eviction, compactor | **v0.1 shipped** (in-process; placement service is v0.2) |
+| **4** | Routers + SQL — pgwire v3, extended query, TLS, COPY, native JSONB / UUID binding | **mostly shipped** — single-shard transactions deferred |
+| **5** | Analytical path — DuckDB on Iceberg | **v0.1 shipped** (4.6× faster than DataFusion on 1M-row aggregates) |
+| **5.5** | Sharding axes — partitioning, compute sharding, tiered storage, whale pinning | **shipped** |
+| **5.6** | RLS with `CREATE POLICY` (UNION / CTE coverage) | **shipped** |
+| **5.7** | Caches + bloom + A4 catalog stats + B2 cluster-by + B3 row-group sizing | **shipped**; B1 secondary indexes is the biggest open perf win (~8 weeks) |
+| **5.8** | `pg_cron` + `pg_net` SQL surfaces | **shipped** |
+| **5.9** | Postgres-extension equivalents (basin-geo / -trgm / -cv, JSONB, UUID, pgcrypto) | **shipped** |
+| **5.10** | Identity + REST (basin-auth, basin-rest, OpenAPI, pagination, streaming, API keys, refresh rotation, **per-tenant connection URLs**) | **shipped** |
+| **6** | Production hardening | **partial** — telemetry / pooling / rate-limit / cost-rejection / catalog-PITR / fork shipped; multi-region (ADR 0009), catalog replication (ADR 0010), cross-shard 2PC (ADR 0011) all locked architecturally and gated on customer demand |
+| **7** | Launch | gated on Phase 0 |
 
-Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.md).
+Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.md). Decision log: [`docs/decisions/`](./docs/decisions/).
 
 ---
 

@@ -449,7 +449,12 @@ def _badge_html(row: dict) -> tuple[str, str, str]:
     env = row["environment"]
     storage = row["storage_backend"]
     compute = row["compute_backend"]
-    env_badge = f'<span class="env-tag {env}">{env}</span>'
+    # Display the env tag with a friendlier label so a reader doesn't
+    # confuse "local" (the environment) with "localfs" (one of two local
+    # storage backends). The CSS class still keys on the raw value so
+    # the colour scheme is unchanged.
+    env_label = {"local": "self-hosted", "cloud": "cloud"}.get(env, env)
+    env_badge = f'<span class="env-tag {env}">{env_label}</span>'
     storage_badge = f'<span class="storage-tag">{storage}</span>'
     compute_badge = f'<span class="compute-tag">{compute}</span>'
     return env_badge, storage_badge, compute_badge

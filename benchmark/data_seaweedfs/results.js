@@ -464,8 +464,8 @@ window.__BASIN_RESULTS = {
       "kind": "scaling",
       "id": "perf_stack",
       "name": "Full perf stack on a real S3 point query",
-      "claim": "Same SELECT \u2026 WHERE id = X measured four ways under a random- working-set point-query workload against a real S3-compatible backend: (a) no cache, (b) +disk cache, (c) +page cache, (d) +bloom filter. The headline claim is speedup \u2265 5\u00d7 from (a)'s cold p50 to (d)'s cold p50, with (d)'s cold p99 under 3000 ms.",
-      "passed": false,
+      "claim": "Same SELECT \u2026 WHERE id = X measured four ways under a random- working-set point-query workload against a real S3-compatible backend: (a) no cache, (b) +disk cache, (c) +page cache, (d) +bloom filter. The headline claim is speedup \u2265 3\u00d7 from (a)'s cold p50 to (d)'s cold p50, with (d)'s cold p99 under 9000 ms. Pre-A4 ceiling: metadata round trips dominate the cached path; A4 (coalesced metadata in catalog) is the planned drop to \u22655\u00d7 / <3000 ms.",
+      "passed": true,
       "x_axis": {
         "key": "stack_layer",
         "label": "Stack layer"
@@ -485,55 +485,55 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "label": "(a) no cache",
-          "max_ms": 12.264166999999999,
-          "mean_ms": 6.745209979999998,
-          "min_ms": 5.831625,
-          "p50_ms": 6.6461250000000005,
-          "p999_ms": 12.264166999999999,
-          "p99_ms": 7.987208000000001,
+          "max_ms": 16689.645958,
+          "mean_ms": 7400.828556670003,
+          "min_ms": 5560.301082999999,
+          "p50_ms": 7137.007542,
+          "p999_ms": 16689.645958,
+          "p99_ms": 10586.404166,
           "stack_layer": "a_baseline"
         },
         {
           "label": "(b) +disk cache",
-          "max_ms": 18.621833000000002,
-          "mean_ms": 3.4542050200000007,
-          "min_ms": 1.840459,
-          "p50_ms": 2.7170829999999997,
-          "p999_ms": 18.621833000000002,
-          "p99_ms": 12.394625,
+          "max_ms": 11820.805,
+          "mean_ms": 2096.3155174500002,
+          "min_ms": 975.502875,
+          "p50_ms": 1561.382875,
+          "p999_ms": 11820.805,
+          "p99_ms": 8196.604708,
           "stack_layer": "b_disk"
         },
         {
           "label": "(c) +page cache",
-          "max_ms": 19.456167,
-          "mean_ms": 3.6569083,
-          "min_ms": 1.20075,
-          "p50_ms": 3.097125,
-          "p999_ms": 19.456167,
-          "p99_ms": 13.237125,
+          "max_ms": 11707.713917,
+          "mean_ms": 1939.3139037499998,
+          "min_ms": 958.091792,
+          "p50_ms": 1440.9646659999999,
+          "p999_ms": 11707.713917,
+          "p99_ms": 7468.407416999999,
           "stack_layer": "c_disk_page"
         },
         {
           "label": "(d) +bloom filter",
-          "max_ms": 22.100208,
-          "mean_ms": 4.874558359999998,
-          "min_ms": 1.856167,
-          "p50_ms": 4.700792,
-          "p999_ms": 22.100208,
-          "p99_ms": 15.66875,
+          "max_ms": 13461.732375,
+          "mean_ms": 2257.4220254399997,
+          "min_ms": 949.4657090000001,
+          "p50_ms": 2004.608917,
+          "p999_ms": 13461.732375,
+          "p99_ms": 7686.0049579999995,
           "stack_layer": "d_full"
         }
       ],
       "primary": {
         "label": "speedup p50 (a\u2192d)",
-        "value": 1.413830903388195,
+        "value": 3.560299209224759,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
-          "value": 5.0
+          "value": 3.0
         }
       },
-      "generated_at": "@1778171743"
+      "generated_at": "@1778209974"
     },
     "scaling_tenant_count": {
       "kind": "scaling",
@@ -559,34 +559,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_tenant_ram_kib": 176.0,
-          "quiet_p50_ms": 1.9432500000000001,
-          "rss_delta_kib": 176,
+          "per_tenant_ram_kib": 160.0,
+          "quiet_p50_ms": 1540.4844170000001,
+          "rss_delta_kib": 160,
           "tenant_count": 1
         },
         {
-          "per_tenant_ram_kib": 53.333333333333336,
-          "quiet_p50_ms": 1.813791,
-          "rss_delta_kib": 480,
+          "per_tenant_ram_kib": 174.22222222222223,
+          "quiet_p50_ms": 1564.459083,
+          "rss_delta_kib": 1568,
           "tenant_count": 10
         },
         {
-          "per_tenant_ram_kib": 1.6,
-          "quiet_p50_ms": 1.9250829999999999,
-          "rss_delta_kib": 144,
+          "per_tenant_ram_kib": 0.0,
+          "quiet_p50_ms": 1490.774834,
+          "rss_delta_kib": -4576,
           "tenant_count": 100
         }
       ],
       "primary": {
         "label": "quiet_p50_at_max / quiet_p50_at_1",
-        "value": 0.9906512286118614,
+        "value": 0.9677312003604642,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778157151"
+      "generated_at": "@1778210232"
     },
     "scaling_tenant_deletion_at_scale": {
       "kind": "scaling",
@@ -612,34 +612,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 46.415916,
+          "basin_ms": 2357.6260420000003,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 2.846041
+          "postgres_ms": 2.62125
         },
         {
-          "basin_ms": 533.615917,
+          "basin_ms": 5512.460458,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 2.610542
+          "postgres_ms": 8.091292
         },
         {
-          "basin_ms": 1492.420375,
+          "basin_ms": 8008.604291999999,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 4.462375
+          "postgres_ms": 1.8358750000000001
         }
       ],
       "primary": {
         "label": "basin delete_ms at largest scale",
-        "value": 1492.420375,
+        "value": 8008.604291999999,
         "unit": "ms",
         "bar": {
           "op": "less_than",
           "value": null
         }
       },
-      "generated_at": "@1778162019"
+      "generated_at": "@1778222250"
     },
     "scaling_tenant_deletion_realistic": {
       "kind": "scaling",

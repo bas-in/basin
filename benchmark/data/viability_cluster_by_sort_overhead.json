@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "cluster_mean / no_cluster_mean ratio",
-    "value": 0.9759858749628625,
+    "value": 0.8080482570243379,
     "unit": "x",
     "bar": {
       "op": "less_than",
@@ -15,11 +15,11 @@
   },
   "details": {
     "bar_ratio_x": 2.0,
-    "cluster_mean_ms": 2.8744004000000003,
+    "cluster_mean_ms": 3.898375,
     "n_iterations": 5,
-    "no_cluster_mean_ms": 2.945125,
-    "ratio_x": 0.9759858749628625,
+    "no_cluster_mean_ms": 4.824433399999999,
+    "ratio_x": 0.8080482570243379,
     "rows_per_batch": 10000
   },
-  "generated_at": "@1778329204"
+  "generated_at": "@1778330640"
 }
