@@ -33,6 +33,9 @@
 
 pub mod api_keys;
 pub mod config;
+pub mod tenant_credentials;
+
+pub use tenant_credentials::{ConnectionInfo, TenantCredentialDescriptor};
 pub mod email;
 pub mod jwt;
 pub mod password;
@@ -294,6 +297,54 @@ impl AuthService {
         api_keys::list(&self.inner, tenant, user_id).await
     }
 
+    // --- per-tenant pgwire credentials -------------------------------------
+
+    /// Provision a fresh `(pgwire_user, password)` pair for a tenant.
+    /// Returns the connection URL; the plaintext password is part of this
+    /// response and **not stored anywhere**.
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    pub async fn provision_tenant_db(
+        &self,
+        tenant: &TenantId,
+        dbname: Option<&str>,
+    ) -> Result<tenant_credentials::ConnectionInfo> {
+        tenant_credentials::provision(&self.inner, tenant, dbname).await
+    }
+
+    /// Validate a `(pgwire_user, password)` pair from a pgwire startup
+    /// handshake. Returns the resolved `TenantId` on success;
+    /// `BasinError::InvalidIdent("invalid pgwire credentials")` on any
+    /// failure (uniform — no user-existence leak).
+    #[instrument(skip(self, password), fields(user))]
+    pub async fn validate_pgwire_credentials(
+        &self,
+        user: &str,
+        password: &str,
+    ) -> Result<TenantId> {
+        tenant_credentials::validate(&self.inner, user, password).await
+    }
+
+    /// Rotate the password for an existing pgwire credential row. Returns
+    /// the new connection URL (with the new plaintext password). Old
+    /// password validates as `28P01` after this call.
+    #[instrument(skip(self), fields(pgwire_user))]
+    pub async fn rotate_pgwire_password(
+        &self,
+        pgwire_user: &str,
+    ) -> Result<tenant_credentials::ConnectionInfo> {
+        tenant_credentials::rotate(&self.inner, pgwire_user).await
+    }
+
+    /// Public-facing descriptors for every credential row a tenant owns.
+    /// Never includes the bcrypt hash or the plaintext password.
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    pub async fn list_tenant_credentials(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<tenant_credentials::TenantCredentialDescriptor>> {
+        tenant_credentials::list(&self.inner, tenant).await
+    }
+
     // --- session settings ---------------------------------------------------
 
     /// Upsert a per-user session setting. `key` must be in
@@ -473,6 +524,7 @@ mod tests {
             // High enough to never trigger inside a single test run.
             rate_limit_per_ip_per_min: 1000,
             email_enabled: true,
+            pgwire_public_host: "127.0.0.1:5433".into(),
         }
     }
 

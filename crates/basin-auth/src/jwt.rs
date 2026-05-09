@@ -24,6 +24,12 @@ pub struct Claims {
     pub roles: Vec<String>,
     pub exp: i64,
     pub iat: i64,
+    /// True for operator-grade tokens that gate `/admin/v1/*` endpoints.
+    /// Defaults to `false` (i.e. the wire claim is omitted by `issue` and
+    /// `WireClaims` decodes a missing field as `false`). The wedge customer's
+    /// control plane mints one admin-true token at deploy time and uses it to
+    /// provision tenants.
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +40,8 @@ struct WireClaims {
     roles: Vec<String>,
     exp: i64,
     iat: i64,
+    #[serde(default)]
+    is_admin: bool,
 }
 
 /// Refresh-token claims. Distinct `aud` keeps a stolen access token from
@@ -99,6 +107,23 @@ impl JwtKeys {
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<(String, DateTime<Utc>)> {
+        self.issue_with_admin(tenant, user, email, roles, false, now, ttl)
+    }
+
+    /// Issue an access token with the `is_admin` claim set explicitly. Tokens
+    /// with `is_admin = true` gate the `/admin/v1/*` operator endpoints.
+    /// Most callers should use [`Self::issue`]; this is the single
+    /// admin-grade entry point.
+    pub fn issue_with_admin(
+        &self,
+        tenant: &TenantId,
+        user: Uuid,
+        email: &str,
+        roles: &[String],
+        is_admin: bool,
+        now: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<(String, DateTime<Utc>)> {
         let exp_dt = now + chrono::Duration::from_std(ttl).map_err(|e| {
             BasinError::internal(format!("token_ttl out of range for chrono: {e}"))
         })?;
@@ -109,6 +134,7 @@ impl JwtKeys {
             roles: roles.to_vec(),
             exp: exp_dt.timestamp(),
             iat: now.timestamp(),
+            is_admin,
         };
         let token = encode(&Header::new(Algorithm::HS256), &wire, &self.encoding)
             .map_err(|e| BasinError::internal(format!("jwt encode: {e}")))?;
@@ -135,6 +161,7 @@ impl JwtKeys {
             roles: w.roles,
             exp: w.exp,
             iat: w.iat,
+            is_admin: w.is_admin,
         })
     }
 

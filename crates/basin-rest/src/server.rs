@@ -25,7 +25,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::errors::ApiError;
-use crate::routes::{auth as auth_routes, data as data_routes, openapi as openapi_routes};
+use crate::routes::{
+    admin as admin_routes, auth as auth_routes, data as data_routes, openapi as openapi_routes,
+};
 use crate::RestConfig;
 
 /// Shared inner state. Cheap to wrap in `Arc` and pass around handlers.
@@ -104,6 +106,18 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/auth/v1/api-keys/:id",
             axum::routing::delete(auth_routes::delete_api_key),
+        )
+        // Operator-grade endpoints: provision per-tenant pgwire credentials
+        // and rotate them. All gated on `claims.is_admin == true` (see
+        // `admin_routes::*`).
+        .route("/admin/v1/tenants", post(admin_routes::provision_tenant))
+        .route(
+            "/admin/v1/tenants/:pgwire_user/rotate",
+            post(admin_routes::rotate_tenant),
+        )
+        .route(
+            "/admin/v1/tenants/:tenant_id/credentials",
+            get(admin_routes::list_tenant_credentials),
         )
         .route("/health", get(health))
         .layer(body_limit)
@@ -190,6 +204,7 @@ pub(crate) async fn authorize(
                 roles: Vec::new(),
                 exp: 0,
                 iat: 0,
+                is_admin: false,
             },
             Err(e) => {
                 return Err(ApiError::unauthenticated(format!(

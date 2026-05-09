@@ -21,6 +21,21 @@ use basin_common::{BasinError, Result, TenantId};
 #[async_trait]
 pub trait TenantResolver: Send + Sync {
     async fn resolve(&self, username: &str) -> Result<TenantId>;
+
+    /// Variant that also receives the cleartext-password from the pgwire
+    /// startup handshake. Default impl drops the password and falls
+    /// through to `resolve(username)` — so existing JWT / API-key /
+    /// static resolvers don't need to change. The
+    /// [`TenantCredentialsResolver`] overrides this to bcrypt-validate
+    /// the `(user, password)` pair against the per-tenant credential row
+    /// and resolve the tenant from there.
+    async fn resolve_credentials(
+        &self,
+        username: &str,
+        _password: &str,
+    ) -> Result<TenantId> {
+        self.resolve(username).await
+    }
 }
 
 /// In-memory resolver keyed on username -> tenant id. Useful for the PoC and
@@ -113,9 +128,50 @@ impl TenantResolver for ApiKeyTenantResolver {
     }
 }
 
+/// Resolves tenants by `(pgwire_user, password)` pair against the
+/// `auth_tenant_credentials` table. Built atop `basin_auth::AuthService`
+/// so revocation, rotation, and bcrypt validation all live in one place.
+///
+/// The customer-facing surface is the connection URL `provision_tenant_db`
+/// hands back: `postgres://<pgwire_user>:<password>@<host>/<dbname>`.
+/// When pgwire startup arrives with that URL's `(user, password)`, this
+/// resolver bcrypt-verifies and returns the tenant id; failure surfaces
+/// as a uniform `BasinError::InvalidIdent("invalid pgwire credentials")`
+/// — never leaks user existence vs. wrong password.
+#[derive(Clone)]
+pub struct TenantCredentialsResolver {
+    auth: Arc<basin_auth::AuthService>,
+}
+
+impl TenantCredentialsResolver {
+    pub fn new(auth: Arc<basin_auth::AuthService>) -> Self {
+        Self { auth }
+    }
+}
+
+#[async_trait]
+impl TenantResolver for TenantCredentialsResolver {
+    async fn resolve(&self, _username: &str) -> Result<TenantId> {
+        // The credentials path requires the password slot. Without it we
+        // can't bcrypt-verify; refuse loudly so a misconfigured stack
+        // doesn't silently accept any password.
+        Err(BasinError::InvalidIdent(
+            "invalid pgwire credentials".into(),
+        ))
+    }
+
+    async fn resolve_credentials(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<TenantId> {
+        self.auth.validate_pgwire_credentials(username, password).await
+    }
+}
+
 /// Resolves tenants by trying each backing resolver in order until one
-/// succeeds. Used by basin-server when both JWT and static credentials
-/// are in play during a transition or demo.
+/// succeeds. Used by basin-server when JWT, API-key, per-tenant credentials,
+/// and static fallback are in play on the same listener.
 #[derive(Clone)]
 pub struct StackedTenantResolver {
     resolvers: Vec<Arc<dyn TenantResolver>>,
@@ -133,6 +189,23 @@ impl TenantResolver for StackedTenantResolver {
         let mut last_err = None;
         for r in &self.resolvers {
             match r.resolve(username).await {
+                Ok(tid) => return Ok(tid),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            BasinError::not_found(format!("no resolver matched {username:?}"))
+        }))
+    }
+
+    async fn resolve_credentials(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<TenantId> {
+        let mut last_err = None;
+        for r in &self.resolvers {
+            match r.resolve_credentials(username, password).await {
                 Ok(tid) => return Ok(tid),
                 Err(e) => last_err = Some(e),
             }
@@ -262,6 +335,7 @@ mod tests {
             password_min_len: 10,
             rate_limit_per_ip_per_min: 1000,
             email_enabled: true,
+            pgwire_public_host: "127.0.0.1:5433".into(),
         }
     }
 

@@ -62,7 +62,7 @@ mod types;
 pub use rate_limit::{from_env_qps, PgRateLimit, BURST_FACTOR, DEFAULT_SUSTAINED_QPS};
 pub use resolver::{
     ApiKeyTenantResolver, JwtTenantResolver, StackedTenantResolver, StaticTenantResolver,
-    TenantResolver,
+    TenantCredentialsResolver, TenantResolver,
 };
 pub use sharding::{parse_pins_env, ShardMap};
 pub use tls::{build_acceptor, TlsConfig};

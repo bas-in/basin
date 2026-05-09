@@ -116,6 +116,7 @@ fn auth_cfg(schema: &str) -> AuthConfig {
         password_min_len: 10,
         rate_limit_per_ip_per_min: 1000,
         email_enabled: true,
+        pgwire_public_host: "127.0.0.1:5433".into(),
     }
 }
 

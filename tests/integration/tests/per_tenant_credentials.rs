@@ -547,3 +547,237 @@ async fn rotate_rejects_invalid_pgwire_user_format() {
         "expected invalid-ident error, got {err:?}"
     );
 }
+
+/// Cross-tenant isolation when each tenant has their own URL. The wedge
+/// claim: hand customer A their URL, customer B theirs; B's URL must never
+/// reach A's data — not via direct SELECT, not via UNION, not via CTE.
+///
+/// Per-tenant prefix isolation makes this *structural*: the engine session
+/// is bound to a `TenantId` at startup, and every `TableScan` resolves
+/// inside that tenant's namespace. This test proves the structural claim
+/// end-to-end through the credential-validated pgwire path so a future
+/// regression that accidentally shared session state across pgwire
+/// connections would be caught.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_tenant_credentials_isolate_cross_tenant_data() {
+    let Some(s) = boot().await else {
+        return;
+    };
+
+    // Provision two tenants. Both POSTs hit the same admin endpoint with
+    // the same admin JWT, but each issues a fresh `tenant_id` + URL.
+    let provision = |name: &'static str| {
+        let s_addr = s.rest_addr;
+        let admin = s.admin_jwt.clone();
+        async move {
+            let r = http_request(
+                s_addr,
+                "POST",
+                "/admin/v1/tenants",
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Authorization", &format!("Bearer {admin}")),
+                ],
+                Some(b"{}"),
+            )
+            .await;
+            assert_eq!(r.status, 201, "{name}: {}", String::from_utf8_lossy(&r.body));
+            let v = r.json();
+            (
+                v["connection_url"].as_str().unwrap().to_owned(),
+                v["tenant_id"].as_str().unwrap().to_owned(),
+            )
+        }
+    };
+    let (url_a, tid_a) = provision("tenant_a").await;
+    let (url_b, tid_b) = provision("tenant_b").await;
+    assert_ne!(tid_a, tid_b, "two tenants must have distinct ids");
+    assert_ne!(url_a, url_b, "two tenants must have distinct URLs");
+
+    // Helper: connect via a URL, drive simple-query operations, return
+    // the row count from a SELECT * style query.
+    let connect_and_setup = |url: String, payload: &'static str| async move {
+        let (client, conn) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("pgwire connect");
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .simple_query("CREATE TABLE secrets (id BIGINT NOT NULL, body TEXT NOT NULL)")
+            .await
+            .expect("create");
+        let stmt = format!("INSERT INTO secrets VALUES (1, '{payload}')");
+        client.simple_query(&stmt).await.expect("insert");
+        (client, driver)
+    };
+
+    let (client_a, driver_a) = connect_and_setup(url_a.clone(), "tenant_a_secret").await;
+    let (client_b, driver_b) = connect_and_setup(url_b.clone(), "tenant_b_secret").await;
+
+    // From tenant A's URL: see only A's row.
+    let collect_bodies = |msgs: &[tokio_postgres::SimpleQueryMessage]| -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => {
+                    r.get("body").map(|s| s.to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    let rows = client_a
+        .simple_query("SELECT * FROM secrets")
+        .await
+        .expect("a select");
+    let bodies = collect_bodies(&rows);
+    assert_eq!(bodies, vec!["tenant_a_secret".to_string()]);
+
+    let rows = client_b
+        .simple_query("SELECT * FROM secrets")
+        .await
+        .expect("b select");
+    let bodies = collect_bodies(&rows);
+    assert_eq!(bodies, vec!["tenant_b_secret".to_string()]);
+
+    // Cross-tenant attack via UNION ALL: tenant B's session can only
+    // resolve `secrets` in *its own* tenant namespace. UNION just unions
+    // tenant B's row twice; tenant A's row is structurally unreachable.
+    let rows = client_b
+        .simple_query("SELECT body FROM secrets UNION ALL SELECT body FROM secrets")
+        .await
+        .expect("b union");
+    let bodies = collect_bodies(&rows);
+    assert_eq!(
+        bodies,
+        vec!["tenant_b_secret".to_string(), "tenant_b_secret".to_string()],
+        "UNION must not cross tenants"
+    );
+    for body in &bodies {
+        assert_ne!(body, "tenant_a_secret", "tenant A data leaked via UNION");
+    }
+
+    // Cross-tenant attack via CTE: same structural guarantee.
+    let rows = client_b
+        .simple_query("WITH peek AS (SELECT body FROM secrets) SELECT body FROM peek")
+        .await
+        .expect("b cte");
+    let bodies = collect_bodies(&rows);
+    for body in &bodies {
+        assert_ne!(body, "tenant_a_secret", "tenant A data leaked via CTE");
+    }
+
+    drop(client_a);
+    drop(client_b);
+    let _ = driver_a.await;
+    let _ = driver_b.await;
+}
+
+/// Within a single tenant, RLS still works after credential-based pgwire
+/// auth. Provisioning two URLs for the same tenant is the v0.2 follow-up;
+/// for v0.1 we prove RLS is unaffected by the new credential validator
+/// path by enabling RLS on a tenant's table and confirming the policy
+/// filter fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_tenant_credentials_keep_rls_within_tenant() {
+    let Some(s) = boot().await else {
+        return;
+    };
+
+    let r = http_request(
+        s.rest_addr,
+        "POST",
+        "/admin/v1/tenants",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {}", s.admin_jwt)),
+        ],
+        Some(b"{}"),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    let url = v["connection_url"].as_str().unwrap().to_owned();
+
+    let (client, conn) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("pgwire connect");
+    let driver = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Insert two rows with different "owner" values, then enable RLS with
+    // a policy that always filters to id=1. With RLS active, `SELECT *`
+    // must return only the matching row even though both rows are in the
+    // same tenant's table.
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT NOT NULL, owner TEXT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .simple_query("INSERT INTO orders VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .expect("insert");
+
+    // Sanity: without RLS, both rows visible.
+    let rows = client
+        .simple_query("SELECT id FROM orders ORDER BY id")
+        .await
+        .expect("pre-rls select");
+    let ids: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get("id").map(|s| s.to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);
+
+    // Enable RLS + add a policy that pins to id=1. Basin's RLS predicate
+    // injection runs on the logical-plan layer, so any `SELECT … FROM
+    // orders` (and any UNION / CTE wrapping it) sees only id=1.
+    client
+        .simple_query("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable rls");
+    client
+        .simple_query("CREATE POLICY only_one ON orders USING (id = 1)")
+        .await
+        .expect("create policy");
+
+    // Direct SELECT — only id=1 survives.
+    let rows = client
+        .simple_query("SELECT id FROM orders")
+        .await
+        .expect("rls select");
+    let ids: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get("id").map(|s| s.to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec!["1".to_string()], "RLS policy must filter rows");
+
+    // UNION can't bypass RLS (the same security regression we fixed earlier
+    // this cycle for the engine — re-verified through the credential-auth
+    // path here).
+    let rows = client
+        .simple_query("SELECT id FROM orders UNION ALL SELECT id FROM orders")
+        .await
+        .expect("rls union");
+    let ids: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get("id").map(|s| s.to_owned()),
+            _ => None,
+        })
+        .collect();
+    for id in &ids {
+        assert_ne!(id, "2", "RLS bypass via UNION: id=2 leaked");
+    }
+
+    drop(client);
+    let _ = driver.await;
+}

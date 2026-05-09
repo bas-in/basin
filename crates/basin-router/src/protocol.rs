@@ -1265,22 +1265,34 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
                     ))
                     .await?;
             }
-            PgWireFrontendMessage::PasswordMessageFamily(_pwd) => {
-                // PoC: passwords are accepted unconditionally. Documented in
-                // the crate doc.
+            PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
                 let user = client
                     .metadata()
                     .get(METADATA_USER)
                     .cloned()
                     .ok_or(PgWireError::UserNameRequired)?;
 
-                let tenant = self.resolver.resolve(&user).await.map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        "28000".to_owned(), // invalid_authorization_specification
-                        format!("tenant resolution failed: {e}"),
-                    )))
-                })?;
+                // Decode the cleartext password from the message and hand
+                // it to the resolver. Resolvers that don't care about
+                // passwords (JWT, API-key, static) ignore it via the
+                // default `resolve_credentials` impl. The
+                // `TenantCredentialsResolver` consults it to bcrypt-verify.
+                let password = pwd.into_password().map(|p| p.password).unwrap_or_default();
+                let tenant = self
+                    .resolver
+                    .resolve_credentials(&user, &password)
+                    .await
+                    .map_err(|_| {
+                        // Uniform error — never leak whether the user
+                        // existed but the password was wrong vs the user
+                        // didn't exist. SQLSTATE 28P01 (`invalid_password`)
+                        // is the canonical Postgres code.
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_owned(),
+                            "28P01".to_owned(),
+                            "invalid pgwire credentials".to_owned(),
+                        )))
+                    })?;
 
                 let session = self.factory.open(tenant, &user).await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(

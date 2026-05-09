@@ -296,6 +296,21 @@ signed URLs, admin audit log) live in
       validate, revoke, list}_api_key`; `ApiKeyTenantResolver` stacks
       with the JWT resolver in `basin-server/src/main.rs`; REST
       endpoints `POST/GET /auth/v1/api-keys` and `DELETE /auth/v1/api-keys/{id}`.
+- [x] Per-tenant pgwire connection URLs (the managed-Postgres feel) —
+      `auth_tenant_credentials` table + `AuthService::{provision,
+      validate, rotate, list}_tenant_credentials` (public methods on
+      `AuthService`); `TenantCredentialsResolver` extends the resolver
+      trait with `resolve_credentials(user, password)` so the pgwire
+      startup handler bcrypt-validates and rejects with SQLSTATE
+      `28P01` on mismatch (uniform error — no user-existence leak).
+      `Claims::is_admin` gates three new REST endpoints under
+      `/admin/v1/tenants/*`: provision returns `postgres://...`, rotate
+      invalidates the old password, list emits descriptors only.
+      Cross-tenant isolation under per-tenant URLs is integration-tested
+      (UNION + CTE bypass blocked); within-tenant RLS still applies.
+      `BASIN_TENANTS=alice=*` static-resolver back-compat preserved.
+      `BASIN_AUTH_PGWIRE_PUBLIC_HOST` env var configures the host:port
+      embedded in the URL.
 - [x] Per-user session settings (timezone, language) read by the engine
       for `current_setting()` — `user_session_settings` table +
       `AuthService::{set,get}_session_setting{,s}` with hard-coded

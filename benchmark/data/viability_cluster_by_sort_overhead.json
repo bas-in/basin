@@ -1,0 +1,25 @@
+{
+  "kind": "viability",
+  "id": "cluster_by_sort_overhead",
+  "name": "Cluster-by physical sort overhead on insert",
+  "claim": "Phase 5.7 B2 lexsorts every batch by the configured cluster columns before Parquet flush. The bar is < 2× slowdown vs an identical write with no cluster columns. Anything worse means the sort path got accidentally serialised or is paying per-row overhead instead of per-batch.",
+  "passed": true,
+  "primary": {
+    "label": "cluster_mean / no_cluster_mean ratio",
+    "value": 0.9759858749628625,
+    "unit": "x",
+    "bar": {
+      "op": "less_than",
+      "value": 2.0
+    }
+  },
+  "details": {
+    "bar_ratio_x": 2.0,
+    "cluster_mean_ms": 2.8744004000000003,
+    "n_iterations": 5,
+    "no_cluster_mean_ms": 2.945125,
+    "ratio_x": 0.9759858749628625,
+    "rows_per_batch": 10000
+  },
+  "generated_at": "@1778329204"
+}

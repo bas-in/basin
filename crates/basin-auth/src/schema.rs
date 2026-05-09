@@ -148,6 +148,25 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
             "CREATE INDEX IF NOT EXISTS auth_revoked_refresh_tokens_user
              ON {schema}.auth_revoked_refresh_tokens (user_id)"
         ),
+        // Per-tenant pgwire credentials — one row maps a public
+        // `pgwire_user` (e.g. `tenant_a1b2c3d4`) to the tenant id, a
+        // bcrypt'd password, and a `dbname`. `validate_pgwire_credentials`
+        // bcrypt-verifies; `rotate_pgwire_password` rolls the row.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.auth_tenant_credentials (
+                id            BIGSERIAL PRIMARY KEY,
+                tenant_id     TEXT NOT NULL,
+                pgwire_user   TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                dbname        TEXT NOT NULL DEFAULT 'basin',
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                rotated_at    TIMESTAMPTZ
+            )"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS auth_tenant_credentials_user_idx
+             ON {schema}.auth_tenant_credentials (pgwire_user)"
+        ),
     ];
 
     for stmt in stmts {

@@ -56,6 +56,11 @@ pub struct AuthConfig {
     /// Defaults to `true`. Operators with no SMTP relay set this to false
     /// and the magic-link endpoint returns 503 instead of crashing on send.
     pub email_enabled: bool,
+    /// Host:port that goes into the per-tenant `postgres://...` connection
+    /// URL handed back from `AuthService::provision_tenant_db`. Set to the
+    /// public-facing pgwire endpoint (e.g. `db.basin.cloud:5432`). For
+    /// local development the default is `127.0.0.1:5433`.
+    pub pgwire_public_host: String,
 }
 
 impl AuthConfig {
@@ -184,6 +189,8 @@ impl AuthConfig {
             // SMTP host validated above as required, so email is always
             // enabled for env-built configs.
             email_enabled: true,
+            pgwire_public_host: std::env::var("BASIN_AUTH_PGWIRE_PUBLIC_HOST")
+                .unwrap_or_else(|_| "127.0.0.1:5433".to_owned()),
         })
     }
 }

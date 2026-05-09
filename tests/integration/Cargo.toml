@@ -21,6 +21,8 @@ basin-vector.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
 basin-analytical.workspace = true
+basin-auth.workspace = true
+basin-rest.workspace = true
 
 tokio.workspace = true
 futures.workspace = true
