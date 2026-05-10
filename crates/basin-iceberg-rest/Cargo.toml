@@ -1,0 +1,32 @@
+[package]
+name = "basin-iceberg-rest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-catalog.workspace = true
+
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid = { workspace = true, features = ["v5"] }
+chrono.workspace = true
+arrow-schema.workspace = true
+
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+tower = { workspace = true, features = ["util"] }
+hyper.workspace = true
+http-body-util = "0.1"

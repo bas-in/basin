@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "UPDATE+DELETE elapsed (ms)",
-    "value": 7.973708,
+    "value": 60.248791,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "delete_ms": 3.3309580000000003,
+    "delete_ms": 28.466333,
     "remaining_rows": 9997,
     "rows": 10000,
-    "total_ms": 7.973708,
-    "update_ms": 4.64275
+    "total_ms": 60.248791,
+    "update_ms": 31.782458
   },
-  "generated_at": "@1778204195"
+  "generated_at": "@1778393644"
 }

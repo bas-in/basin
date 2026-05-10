@@ -8,9 +8,11 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod events;
 pub mod ids;
 pub mod telemetry;
 
 pub use error::{BasinError, Result};
+pub use events::{ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry};
 pub use ids::{Ident, PartitionKey, TableName, TenantId, MAX_IDENT_LEN};
 pub use telemetry::{TenantCounterRegistry, TenantCounters, TenantCountersSnapshot};

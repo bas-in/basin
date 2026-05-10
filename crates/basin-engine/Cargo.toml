@@ -44,7 +44,21 @@ md-5 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 bcrypt = { workspace = true }
+# `WebhookOps` (5.11.I) is a bitflags struct stored on the engine-local
+# `webhook_registry` module after the cycle-fix moved registry types out
+# of basin-webhooks.
+bitflags = "2"
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# 5.11.I integration tests in `tests/alter_table_dml_surfaces.rs` exercise
+# the HTTP delivery side of webhook subscriptions (RetryQueue / WebhookSink
+# / WebhookConfig) and need `basin-webhooks` with its default `delivery`
+# feature. The registry + DDL-matcher types live in `basin-engine` directly
+# (see `webhook_registry.rs` / `webhook_ddl.rs`), so this dev-dep is not a
+# cycle: the prod graph here is engine -> {registry, ddl}; webhooks ->
+# basin-net -> engine; webhooks is only seen as a dev-dep at test time.
+basin-webhooks.workspace = true
+chrono.workspace = true
+serde_json.workspace = true

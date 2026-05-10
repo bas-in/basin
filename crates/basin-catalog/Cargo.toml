@@ -11,6 +11,7 @@ basin-common.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+arrow-array.workspace = true
 arrow-schema.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -21,6 +22,12 @@ chrono.workspace = true
 # Postgres-backed durable catalog. NoTls only for now; production deployments
 # will need to swap in rustls or native-tls at the connect call site.
 tokio-postgres = { workspace = true, features = ["with-serde_json-1", "with-chrono-0_4"] }
+# Reactor body / predicate validation at registration time. Same version
+# the engine pins; already in the lock file.
+sqlparser.workspace = true
+# Bitflags for `ReactorOps`. Already in the lock file via several
+# transitive deps.
+bitflags = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -59,11 +59,13 @@ use pgwire::messages::extendedquery::{
     Sync as PgSync, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
 use pgwire::messages::response::{
-    CommandComplete, ReadyForQuery, TransactionStatus,
+    CommandComplete, EmptyQueryResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use tokio::sync::Mutex;
 
 use crate::error::error_response;
@@ -152,12 +154,107 @@ impl Session for TenantSession {
     }
 }
 
+/// Split a simple-query message body into individual statement texts.
+///
+/// PG's pgwire spec allows a single `Q` message to carry multiple
+/// semicolon-separated statements (`tokio_postgres::batch_execute`,
+/// `psql -f setup.sql`). The engine accepts one statement per call, so the
+/// router splits on top-level `;` here.
+///
+/// Splits using sqlparser's tokenizer so dollar-quoted bodies, single-/
+/// double-quoted literals, and `--` / `/* ... */` comments don't fool the
+/// separator search. Each returned string is the raw substring of the
+/// original SQL between separators (whitespace trimmed); empty fragments
+/// (e.g. trailing `;`, comment-only) are skipped so they don't trigger
+/// engine pre-screens.
+///
+/// On a tokenizer error we fall back to returning the full SQL as a single
+/// statement; the engine will re-tokenize and surface a properly-shaped
+/// parse error.
+pub(crate) fn split_simple_query(sql: &str) -> Vec<String> {
+    let dialect = PostgreSqlDialect {};
+    let tokens = match Tokenizer::new(&dialect, sql).tokenize_with_location() {
+        Ok(t) => t,
+        Err(_) => {
+            let trimmed = sql.trim();
+            return if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![sql.to_string()]
+            };
+        }
+    };
+
+    // Pre-compute byte offsets for every line start. sqlparser locations
+    // are 1-indexed line / 1-indexed column on chars (NOT bytes).
+    let mut line_starts = vec![0usize];
+    for (i, b) in sql.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let to_byte_offset = |line: u64, column: u64| -> usize {
+        let li = (line as usize)
+            .saturating_sub(1)
+            .min(line_starts.len().saturating_sub(1));
+        let line_start = line_starts[li];
+        let col = (column as usize).saturating_sub(1);
+        // Walk `col` chars from `line_start`. If we run off the end of the
+        // string, return its length (one-past-the-end is a valid Rust slice
+        // index and matches "EOF column").
+        sql[line_start..]
+            .char_indices()
+            .nth(col)
+            .map(|(byte_in_line, _)| line_start + byte_in_line)
+            .unwrap_or(sql.len())
+    };
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    // Tracks whether any "real" token (not whitespace, not comment) has been
+    // seen in the current segment. Comment-only / whitespace-only segments
+    // are dropped so the engine's textual pre-screens never see them.
+    let mut has_real_token = false;
+    for twl in &tokens {
+        match &twl.token {
+            Token::SemiColon => {
+                let off = to_byte_offset(twl.location.line, twl.location.column);
+                if has_real_token {
+                    let segment = sql[start..off].trim();
+                    if !segment.is_empty() {
+                        out.push(segment.to_string());
+                    }
+                }
+                start = off + 1;
+                has_real_token = false;
+            }
+            Token::Whitespace(_) => {}
+            _ => has_real_token = true,
+        }
+    }
+    if has_real_token {
+        let tail = sql[start..].trim();
+        if !tail.is_empty() {
+            out.push(tail.to_string());
+        }
+    }
+    out
+}
+
 /// Produce the full backend-message sequence for one simple-query exchange.
 ///
 /// This is the pure-data heart of the simple-query protocol; the pgwire
 /// integration just feeds these bytes to the wire. Splitting it out lets us
 /// unit-test against a `FakeSession` without standing up a TCP socket or a
 /// real `Engine`.
+///
+/// Multi-statement messages are split into individual statements before
+/// dispatch; each statement produces its own response group
+/// (`RowDescription` + `DataRow`s + `CommandComplete`, or `CommandComplete`
+/// for non-row results). Exactly one trailing `ReadyForQuery` closes the
+/// exchange. On the first failing statement we emit `ErrorResponse` and
+/// stop processing further statements (PG's non-transactional semicolon
+/// batch behaviour).
 pub(crate) async fn simple_query_messages<S>(
     session: &S,
     sql: &str,
@@ -166,28 +263,47 @@ where
     S: Session + ?Sized,
 {
     let mut out = Vec::new();
-    match session.execute(sql).await {
-        Ok(ExecResult::Empty { tag }) => {
-            out.push(PgWireBackendMessage::CommandComplete(
-                pgwire::messages::response::CommandComplete::new(tag),
-            ));
-        }
-        Ok(ExecResult::Rows { schema, batches }) => {
-            let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-            let rd = row_description(schema.as_ref());
-            out.push(PgWireBackendMessage::RowDescription(rd));
-            for row in encode_batches(&schema, &batches) {
-                out.push(PgWireBackendMessage::DataRow(row));
+    let stmts = split_simple_query(sql);
+
+    if stmts.is_empty() {
+        out.push(PgWireBackendMessage::EmptyQueryResponse(
+            EmptyQueryResponse::new(),
+        ));
+        out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+            TransactionStatus::Idle,
+        )));
+        return out;
+    }
+
+    for stmt_sql in &stmts {
+        match session.execute(stmt_sql).await {
+            Ok(ExecResult::Empty { tag }) => {
+                out.push(PgWireBackendMessage::CommandComplete(
+                    CommandComplete::new(tag),
+                ));
             }
-            out.push(PgWireBackendMessage::CommandComplete(
-                pgwire::messages::response::CommandComplete::new(format!("SELECT {row_count}")),
-            ));
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "query failed");
-            out.push(PgWireBackendMessage::ErrorResponse(error_response(&e)));
+            Ok(ExecResult::Rows { schema, batches }) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                let rd = row_description(schema.as_ref());
+                out.push(PgWireBackendMessage::RowDescription(rd));
+                for row in encode_batches(&schema, &batches) {
+                    out.push(PgWireBackendMessage::DataRow(row));
+                }
+                out.push(PgWireBackendMessage::CommandComplete(
+                    CommandComplete::new(format!("SELECT {row_count}")),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "query failed");
+                out.push(PgWireBackendMessage::ErrorResponse(error_response(&e)));
+                // PG stops dispatching the rest of a simple-query batch after
+                // the first failure (non-transactional semicolon-separated
+                // statements; each succeeds independently up to the failure).
+                break;
+            }
         }
     }
+
     out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
         TransactionStatus::Idle,
     )));
@@ -1978,6 +2094,189 @@ mod tests {
             other => panic!("expected ErrorResponse, got {other:?}"),
         }
         assert_ready_for_query(&msgs[1]);
+    }
+
+    #[test]
+    fn split_basic_two_statements() {
+        let parts = split_simple_query("CREATE TABLE t (id BIGINT); CREATE TABLE s (val TEXT);");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "CREATE TABLE t (id BIGINT)");
+        assert_eq!(parts[1], "CREATE TABLE s (val TEXT)");
+    }
+
+    #[test]
+    fn split_single_statement_no_trailing_semicolon() {
+        let parts = split_simple_query("SELECT 1");
+        assert_eq!(parts, vec!["SELECT 1".to_string()]);
+    }
+
+    #[test]
+    fn split_trailing_semicolon_dropped() {
+        let parts = split_simple_query("SELECT 1;");
+        assert_eq!(parts, vec!["SELECT 1".to_string()]);
+    }
+
+    #[test]
+    fn split_empty_input() {
+        assert!(split_simple_query("").is_empty());
+        assert!(split_simple_query("   \n\t  ").is_empty());
+        assert!(split_simple_query(";;").is_empty());
+    }
+
+    #[test]
+    fn split_preserves_dollar_quoted_bodies() {
+        // `;` inside the dollar-quoted body must NOT split.
+        let sql = "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS $$ SELECT 1; SELECT 2 $$; SELECT 3";
+        let parts = split_simple_query(sql);
+        assert_eq!(parts.len(), 2, "got {parts:?}");
+        assert!(parts[0].contains("$$ SELECT 1; SELECT 2 $$"));
+        assert_eq!(parts[1], "SELECT 3");
+    }
+
+    #[test]
+    fn split_preserves_single_quoted_strings() {
+        let parts = split_simple_query("SELECT 'a;b'; SELECT 'c'");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "SELECT 'a;b'");
+        assert_eq!(parts[1], "SELECT 'c'");
+    }
+
+    #[test]
+    fn split_skips_comment_only_segments() {
+        let parts = split_simple_query("-- just a comment\n;SELECT 1");
+        assert_eq!(parts, vec!["SELECT 1".to_string()]);
+    }
+
+    #[test]
+    fn split_handles_newline_separated_statements() {
+        let parts = split_simple_query("CREATE TABLE a (id BIGINT);\nCREATE TABLE b (id BIGINT);\n");
+        assert_eq!(parts.len(), 2, "got {parts:?}");
+        assert_eq!(parts[0], "CREATE TABLE a (id BIGINT)");
+        assert_eq!(parts[1], "CREATE TABLE b (id BIGINT)");
+    }
+
+    #[test]
+    fn split_handles_leading_semicolon() {
+        let parts = split_simple_query(";SELECT 1");
+        assert_eq!(parts, vec!["SELECT 1".to_string()]);
+    }
+
+    /// Session shim that returns a queue of pre-canned outcomes, one per
+    /// `execute()`. Enables multi-statement protocol assertions.
+    struct ScriptedSession {
+        outcomes: tokio::sync::Mutex<std::collections::VecDeque<FakeOutcome>>,
+        executed: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedSession {
+        fn new(outcomes: Vec<FakeOutcome>) -> Self {
+            Self {
+                outcomes: tokio::sync::Mutex::new(outcomes.into_iter().collect()),
+                executed: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Session for ScriptedSession {
+        fn tenant(&self) -> basin_common::TenantId {
+            basin_common::TenantId::new()
+        }
+        async fn execute(&self, sql: &str) -> Result<ExecResult> {
+            self.executed.lock().await.push(sql.to_string());
+            let mut g = self.outcomes.lock().await;
+            let taken = g.pop_front().expect("ScriptedSession exhausted");
+            match taken {
+                FakeOutcome::Empty(tag) => Ok(ExecResult::Empty { tag }),
+                FakeOutcome::Rows { schema, batches } => Ok(ExecResult::Rows { schema, batches }),
+                FakeOutcome::Err(e) => Err(e),
+            }
+        }
+        async fn prepare(&self, _sql: &str) -> Result<(StatementHandle, StatementSchema)> {
+            unimplemented!()
+        }
+        async fn bind(
+            &self,
+            _h: &StatementHandle,
+            _p: Vec<ScalarParam>,
+        ) -> Result<BoundStatement> {
+            unimplemented!()
+        }
+        async fn execute_bound(&self, _b: BoundStatement) -> Result<ExecResult> {
+            unimplemented!()
+        }
+        async fn describe_statement(&self, _h: &StatementHandle) -> Result<StatementSchema> {
+            unimplemented!()
+        }
+        async fn close_statement(&self, _h: &StatementHandle) {}
+    }
+
+    #[tokio::test]
+    async fn protocol_handles_multi_statement_two_empties() {
+        let s = ScriptedSession::new(vec![
+            FakeOutcome::Empty("CREATE TABLE".into()),
+            FakeOutcome::Empty("CREATE TABLE".into()),
+        ]);
+        let msgs = simple_query_messages(
+            &s,
+            "CREATE TABLE t (id BIGINT); CREATE TABLE s (val TEXT)",
+        )
+        .await;
+        // Expect: CommandComplete, CommandComplete, ReadyForQuery.
+        assert_eq!(msgs.len(), 3, "got {msgs:?}");
+        assert_command_complete(&msgs[0], "CREATE TABLE");
+        assert_command_complete(&msgs[1], "CREATE TABLE");
+        assert_ready_for_query(&msgs[2]);
+
+        let executed = s.executed.lock().await.clone();
+        assert_eq!(executed.len(), 2);
+        assert_eq!(executed[0], "CREATE TABLE t (id BIGINT)");
+        assert_eq!(executed[1], "CREATE TABLE s (val TEXT)");
+    }
+
+    #[tokio::test]
+    async fn protocol_handles_multi_statement_error_stops_dispatch() {
+        // Three statements but the second errors. The third must NOT be
+        // dispatched; the first's success stands (no rollback in
+        // simple-query batches).
+        let s = ScriptedSession::new(vec![
+            FakeOutcome::Empty("CREATE TABLE".into()),
+            FakeOutcome::Err(BasinError::Internal("dup".into())),
+            // Third outcome is a sentinel — if the dispatcher reaches it,
+            // it'll show up in `executed` and the assertion below catches
+            // it. We still need an entry so `execute` doesn't panic if the
+            // bug exists.
+            FakeOutcome::Empty("UNREACHABLE".into()),
+        ]);
+        let msgs = simple_query_messages(
+            &s,
+            "CREATE TABLE t (id BIGINT); CREATE TABLE t (val TEXT); SELECT 1",
+        )
+        .await;
+        // Expect: CommandComplete, ErrorResponse, ReadyForQuery.
+        assert_eq!(msgs.len(), 3, "got {msgs:?}");
+        assert_command_complete(&msgs[0], "CREATE TABLE");
+        match &msgs[1] {
+            PgWireBackendMessage::ErrorResponse(_) => {}
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+        assert_ready_for_query(&msgs[2]);
+
+        let executed = s.executed.lock().await.clone();
+        assert_eq!(executed.len(), 2, "third statement must not be dispatched: {executed:?}");
+    }
+
+    #[tokio::test]
+    async fn protocol_handles_empty_input() {
+        let s = ScriptedSession::new(vec![]);
+        let msgs = simple_query_messages(&s, "").await;
+        assert_eq!(msgs.len(), 2);
+        match &msgs[0] {
+            PgWireBackendMessage::EmptyQueryResponse(_) => {}
+            other => panic!("expected EmptyQueryResponse, got {other:?}"),
+        }
+        assert_ready_for_query(&msgs[1]);
+        assert!(s.executed.lock().await.is_empty());
     }
 
     /// `Session` shim that performs real `$N` substitution at bind time but

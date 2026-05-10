@@ -19,13 +19,16 @@ use basin_common::{BasinError, Result};
 
 // Workspace-side (v54) imports.
 use arrow_array as ws_array;
+use arrow_array::Array as _;
 use arrow_schema as ws_schema;
+use arrow_schema::IntervalUnit as WsIntervalUnit;
 use arrow_schema::TimeUnit as WsTimeUnit;
 
 // DataFusion-side (v53) imports.
 use datafusion::arrow::array as df_array;
 use datafusion::arrow::array::Array as _;
 use datafusion::arrow::datatypes as df_schema;
+use datafusion::arrow::datatypes::IntervalUnit as DfIntervalUnit;
 use datafusion::arrow::datatypes::TimeUnit as DfTimeUnit;
 
 fn timeunit_ws_to_df(u: &WsTimeUnit) -> DfTimeUnit {
@@ -87,6 +90,9 @@ pub(crate) fn schema_df_to_ws(s: &df_schema::Schema) -> Result<ws_schema::Schema
 
 fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
     Ok(match dt {
+        ws_schema::DataType::Null => df_schema::DataType::Null,
+        ws_schema::DataType::Int16 => df_schema::DataType::Int16,
+        ws_schema::DataType::Int32 => df_schema::DataType::Int32,
         ws_schema::DataType::Int64 => df_schema::DataType::Int64,
         ws_schema::DataType::Utf8 => df_schema::DataType::Utf8,
         ws_schema::DataType::Boolean => df_schema::DataType::Boolean,
@@ -95,10 +101,14 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
         ws_schema::DataType::Binary => df_schema::DataType::Binary,
         ws_schema::DataType::LargeBinary => df_schema::DataType::LargeBinary,
         ws_schema::DataType::FixedSizeBinary(n) => df_schema::DataType::FixedSizeBinary(*n),
+        ws_schema::DataType::Date32 => df_schema::DataType::Date32,
         ws_schema::DataType::Timestamp(unit, tz) => df_schema::DataType::Timestamp(
             timeunit_ws_to_df(unit),
             tz.clone(),
         ),
+        ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano) => {
+            df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano)
+        }
         ws_schema::DataType::FixedSizeList(child, n) => {
             df_schema::DataType::FixedSizeList(
                 Arc::new(df_schema::Field::new(
@@ -119,6 +129,9 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
 
 fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
     Ok(match dt {
+        df_schema::DataType::Null => ws_schema::DataType::Null,
+        df_schema::DataType::Int16 => ws_schema::DataType::Int16,
+        df_schema::DataType::Int32 => ws_schema::DataType::Int32,
         df_schema::DataType::Int64 => ws_schema::DataType::Int64,
         df_schema::DataType::Utf8 => ws_schema::DataType::Utf8,
         df_schema::DataType::Boolean => ws_schema::DataType::Boolean,
@@ -127,10 +140,14 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         df_schema::DataType::Binary => ws_schema::DataType::Binary,
         df_schema::DataType::LargeBinary => ws_schema::DataType::LargeBinary,
         df_schema::DataType::FixedSizeBinary(n) => ws_schema::DataType::FixedSizeBinary(*n),
+        df_schema::DataType::Date32 => ws_schema::DataType::Date32,
         df_schema::DataType::Timestamp(unit, tz) => ws_schema::DataType::Timestamp(
             timeunit_df_to_ws(unit),
             tz.clone(),
         ),
+        df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano) => {
+            ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano)
+        }
         df_schema::DataType::FixedSizeList(child, n) => {
             ws_schema::DataType::FixedSizeList(
                 Arc::new(ws_schema::Field::new(
@@ -149,6 +166,253 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
     })
 }
 
+/// Translate one workspace-side `RecordBatch` into a DataFusion-side
+/// `RecordBatch`. The mirror of [`batch_df_to_ws`]; same per-column rebuild
+/// strategy, opposite arrow versions. Used when the engine needs to feed
+/// a workspace-arrow batch into DataFusion (e.g. registering a one-row
+/// `MemTable` for generated-column expression evaluation).
+pub(crate) fn batch_ws_to_df(
+    batch: &ws_array::RecordBatch,
+) -> Result<df_array::RecordBatch> {
+    let target_schema = Arc::new(schema_ws_to_df(batch.schema().as_ref())?);
+    let mut columns: Vec<Arc<dyn df_array::Array>> = Vec::with_capacity(batch.num_columns());
+    for (i, field) in target_schema.fields().iter().enumerate() {
+        let src = batch.column(i);
+        let dst: Arc<dyn df_array::Array> = match field.data_type() {
+            df_schema::DataType::Null => {
+                Arc::new(df_array::NullArray::new(src.len()))
+            }
+            df_schema::DataType::Int16 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::Int16Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Int16Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<i16>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::Int16Array::from(vals))
+            }
+            df_schema::DataType::Int32 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::Int32Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Int32Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<i32>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::Int32Array::from(vals))
+            }
+            df_schema::DataType::Int64 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::Int64Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Int64Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<i64>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::Int64Array::from(vals))
+            }
+            df_schema::DataType::Date32 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::Date32Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Date32Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<i32>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::Date32Array::from(vals))
+            }
+            df_schema::DataType::Utf8 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::StringArray>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected StringArray for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<String>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j).to_string()) })
+                    .collect();
+                Arc::new(df_array::StringArray::from(vals))
+            }
+            df_schema::DataType::Boolean => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::BooleanArray>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected BooleanArray for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<bool>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::BooleanArray::from(vals))
+            }
+            df_schema::DataType::Float32 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::Float32Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Float32Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<f32>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::Float32Array::from(vals))
+            }
+            df_schema::DataType::Float64 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::Float64Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Float64Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<f64>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::Float64Array::from(vals))
+            }
+            df_schema::DataType::Binary => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::BinaryArray>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected BinaryArray for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<&[u8]>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::BinaryArray::from(vals))
+            }
+            df_schema::DataType::LargeBinary => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::LargeBinaryArray>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected LargeBinaryArray for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<&[u8]>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::LargeBinaryArray::from(vals))
+            }
+            df_schema::DataType::FixedSizeBinary(n) => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::FixedSizeBinaryArray>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected FixedSizeBinaryArray for {}", field.name()
+                    )))?;
+                let size = *n;
+                let mut rows: Vec<Option<Vec<u8>>> = Vec::with_capacity(s.len());
+                for j in 0..s.len() {
+                    if s.is_null(j) {
+                        rows.push(None);
+                    } else {
+                        rows.push(Some(s.value(j).to_vec()));
+                    }
+                }
+                let arr = df_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    rows.into_iter(),
+                    size,
+                )
+                .map_err(|e| {
+                    BasinError::internal(format!(
+                        "rebuilding FixedSizeBinary({size}) for column {}: {e}",
+                        field.name()
+                    ))
+                })?;
+                Arc::new(arr)
+            }
+            df_schema::DataType::Timestamp(unit, tz) => {
+                use datafusion::arrow::array::types::{
+                    TimestampMicrosecondType as DfMicros,
+                    TimestampMillisecondType as DfMilli,
+                    TimestampNanosecondType as DfNanos,
+                    TimestampSecondType as DfSec,
+                };
+                let vals: Vec<Option<i64>> = match unit {
+                    DfTimeUnit::Microsecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::TimestampMicrosecondArray>()
+                            .ok_or_else(|| BasinError::internal(format!(
+                                "expected TimestampMicrosecondArray for {}", field.name()
+                            )))?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    DfTimeUnit::Millisecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::TimestampMillisecondArray>()
+                            .ok_or_else(|| BasinError::internal(format!(
+                                "expected TimestampMillisecondArray for {}", field.name()
+                            )))?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    DfTimeUnit::Nanosecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::TimestampNanosecondArray>()
+                            .ok_or_else(|| BasinError::internal(format!(
+                                "expected TimestampNanosecondArray for {}", field.name()
+                            )))?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    DfTimeUnit::Second => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::TimestampSecondArray>()
+                            .ok_or_else(|| BasinError::internal(format!(
+                                "expected TimestampSecondArray for {}", field.name()
+                            )))?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                };
+                let dt = df_schema::DataType::Timestamp(unit.clone(), tz.clone());
+                let arr: Arc<dyn df_array::Array> = match unit {
+                    DfTimeUnit::Microsecond => Arc::new(
+                        df_array::PrimitiveArray::<DfMicros>::from(vals).with_data_type(dt),
+                    ),
+                    DfTimeUnit::Millisecond => Arc::new(
+                        df_array::PrimitiveArray::<DfMilli>::from(vals).with_data_type(dt),
+                    ),
+                    DfTimeUnit::Nanosecond => Arc::new(
+                        df_array::PrimitiveArray::<DfNanos>::from(vals).with_data_type(dt),
+                    ),
+                    DfTimeUnit::Second => Arc::new(
+                        df_array::PrimitiveArray::<DfSec>::from(vals).with_data_type(dt),
+                    ),
+                };
+                arr
+            }
+            other => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "cannot translate ws column {} of type {other:?}",
+                    field.name()
+                )));
+            }
+        };
+        columns.push(dst);
+    }
+    df_array::RecordBatch::try_new(target_schema, columns)
+        .map_err(|e| BasinError::internal(format!("rebuild df batch: {e}")))
+}
+
 /// Translate one DataFusion-side `RecordBatch` into a workspace-side
 /// `RecordBatch`. Since both arrow crates store the same physical layouts and
 /// the PoC only exercises a handful of scalar types, we walk arrays
@@ -161,6 +425,55 @@ pub(crate) fn batch_df_to_ws(
     for (i, field) in target_schema.fields().iter().enumerate() {
         let src = batch.column(i);
         let dst: Arc<dyn ws_array::Array> = match field.data_type() {
+            ws_schema::DataType::Null => {
+                Arc::new(ws_array::NullArray::new(src.len()))
+            }
+            ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano) => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected IntervalMonthDayNanoArray for {}",
+                            field.name()
+                        ))
+                    })?;
+                let vals: Vec<Option<arrow_array::types::IntervalMonthDayNano>> = (0..s.len())
+                    .map(|j| {
+                        if s.is_null(j) {
+                            None
+                        } else {
+                            let v = s.value(j);
+                            Some(arrow_array::types::IntervalMonthDayNano::new(
+                                v.months,
+                                v.days,
+                                v.nanoseconds,
+                            ))
+                        }
+                    })
+                    .collect();
+                Arc::new(ws_array::IntervalMonthDayNanoArray::from(vals))
+            }
+            ws_schema::DataType::Int16 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::Int16Array>()
+                    .ok_or_else(|| BasinError::internal(format!("expected Int16Array for {}", field.name())))?;
+                let vals: Vec<Option<i16>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(ws_array::Int16Array::from(vals))
+            }
+            ws_schema::DataType::Int32 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::Int32Array>()
+                    .ok_or_else(|| BasinError::internal(format!("expected Int32Array for {}", field.name())))?;
+                let vals: Vec<Option<i32>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(ws_array::Int32Array::from(vals))
+            }
             ws_schema::DataType::Int64 => {
                 let s = src
                     .as_any()
@@ -170,6 +483,16 @@ pub(crate) fn batch_df_to_ws(
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
                 Arc::new(ws_array::Int64Array::from(vals))
+            }
+            ws_schema::DataType::Date32 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::Date32Array>()
+                    .ok_or_else(|| BasinError::internal(format!("expected Date32Array for {}", field.name())))?;
+                let vals: Vec<Option<i32>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(ws_array::Date32Array::from(vals))
             }
             ws_schema::DataType::Utf8 => {
                 let s = src
@@ -200,6 +523,19 @@ pub(crate) fn batch_df_to_ws(
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
                 Arc::new(ws_array::Float64Array::from(vals))
+            }
+            ws_schema::DataType::Float32 => {
+                // pg_catalog.pg_class.reltuples surfaces as Float32 — needed
+                // so the info_schema_provider's RecordBatch round-trips
+                // through the executor's df→ws bridge cleanly.
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::Float32Array>()
+                    .ok_or_else(|| BasinError::internal(format!("expected Float32Array for {}", field.name())))?;
+                let vals: Vec<Option<f32>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(ws_array::Float32Array::from(vals))
             }
             ws_schema::DataType::Binary => {
                 let s = src

@@ -842,13 +842,16 @@ dependencies = [
 name = "basin-catalog"
 version = "0.0.1"
 dependencies = [
+ "arrow-array 54.2.1",
  "arrow-schema 54.3.1",
  "async-trait",
  "basin-common",
+ "bitflags 2.11.1",
  "chrono",
  "futures",
  "serde",
  "serde_json",
+ "sqlparser 0.52.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -861,6 +864,7 @@ dependencies = [
 name = "basin-common"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "chrono",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -939,7 +943,9 @@ dependencies = [
  "basin-storage",
  "basin-vector",
  "basin-wal",
+ "basin-webhooks",
  "bcrypt",
+ "bitflags 2.11.1",
  "bytes",
  "chrono",
  "datafusion",
@@ -970,6 +976,30 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "basin-iceberg-rest"
+version = "0.0.1"
+dependencies = [
+ "arrow-schema 54.3.1",
+ "async-trait",
+ "axum",
+ "basin-catalog",
+ "basin-common",
+ "chrono",
+ "http",
+ "http-body-util",
+ "hyper",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1123,6 +1153,7 @@ dependencies = [
  "pgwire",
  "rcgen",
  "rustls-pemfile",
+ "sqlparser 0.52.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1261,6 +1292,36 @@ dependencies = [
  "tokio-test",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "basin-webhooks"
+version = "0.0.1"
+dependencies = [
+ "arrow 54.2.1",
+ "arrow-schema 54.3.1",
+ "async-trait",
+ "axum",
+ "basin-catalog",
+ "basin-common",
+ "basin-engine",
+ "basin-net",
+ "basin-storage",
+ "bitflags 2.11.1",
+ "chrono",
+ "hex",
+ "hyper",
+ "object_store",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlparser 0.52.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4848,6 +4909,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5781,6 +5848,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

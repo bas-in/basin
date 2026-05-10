@@ -66,6 +66,13 @@ pub enum BasinError {
     #[error("query cost exceeded: {0}")]
     QueryCostExceeded(String),
 
+    /// User asked for a feature that's known but not yet implemented (e.g.
+    /// `GENERATED ALWAYS AS ... VIRTUAL`). The router maps this to
+    /// Postgres SQLSTATE `0A000` (`feature_not_supported`) so drivers can
+    /// distinguish "we don't ship it" from a parse / schema error.
+    #[error("feature not supported: {0}")]
+    FeatureNotSupported(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),
@@ -86,6 +93,9 @@ impl BasinError {
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
+    }
+    pub fn feature_not_supported(msg: impl Into<String>) -> Self {
+        Self::FeatureNotSupported(msg.into())
     }
 
     /// Convenience for the load-bearing safety check. The router and shard

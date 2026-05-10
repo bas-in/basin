@@ -169,9 +169,20 @@ pub(crate) async fn write_batch_with_options(
     // `<key>.wrapped` sidecar carrying the wrapped data key. With no
     // provider attached, the file is the plaintext Parquet bytes —
     // byte-for-byte the legacy path.
+    //
+    // When a catalog is also attached and the tenant has a
+    // [`TenantStorageConfig`] persisted, we route through
+    // `wrap_key_with_config` so the provider can resolve a per-tenant
+    // CMK; otherwise we fall back to plain `wrap_key`. The cache means
+    // the catalog round-trip happens at most once per tenant per
+    // process (until invalidated by `set_tenant_storage_config`).
     let (body_to_put, wrapped_for_sidecar) = match storage.encryption_provider() {
         Some(provider) => {
-            let (data_key, wrapped) = provider.wrap_key(tenant).await?;
+            let cfg = storage.tenant_storage_config_cached(tenant).await?;
+            let (data_key, wrapped) = match cfg {
+                Some(cfg) => provider.wrap_key_with_config(tenant, &cfg).await?,
+                None => provider.wrap_key(tenant).await?,
+            };
             let envelope = encrypt_envelope(&data_key, &bytes)?;
             (envelope, Some(wrapped))
         }

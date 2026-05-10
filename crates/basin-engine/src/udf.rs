@@ -25,11 +25,15 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use basin_vector::{cosine_distance as v_cosine, dot_product as v_dot, l2_distance as v_l2};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array,
-    Float64Array, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
+    FixedSizeListArray, Float32Array, Float64Array, Int64Array, IntervalMonthDayNanoArray,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::array::types::IntervalMonthDayNano;
+use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
@@ -106,6 +110,139 @@ pub(crate) fn register_pg_udfs(ctx: &SessionContext) {
             Volatility::Volatile,
         ),
     }));
+}
+
+/// Register the PG-compat scalar function set (Phase 5.11.A): `mod`, `age`,
+/// and PG-format-aware overrides for `to_char` / `to_timestamp`.
+///
+/// `to_char` and `to_timestamp` here *replace* DataFusion's same-named
+/// builtins: DataFusion's versions accept chrono `%Y-%m-%d`-style format
+/// strings, but every PG-targeted ORM emits the PG style (`YYYY-MM-DD`).
+/// We translate PG → chrono inside the UDF and dispatch from there. The
+/// chrono-style format still works through the same UDFs (`%`-prefixed
+/// directives are kept verbatim), so SQL written against the previous
+/// behaviour does not break.
+///
+/// `mod(a, b)` is a thin alias for the `%` operator. `age(ts1, ts2)` returns
+/// a native `Interval(MonthDayNano)` matching PG's `interval` type, so that
+/// arithmetic like `age(...) + interval '1 day'` type-checks against
+/// downstream consumers.
+pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(ModUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32]),
+                TypeSignature::Exact(vec![DataType::Float64, DataType::Float64]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(AgeUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    DataType::Timestamp(TimeUnit::Second, None),
+                ]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(ToCharPgUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![DataType::Date32, DataType::Utf8]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(ToTimestampPgUdf {
+        signature: Signature::exact(
+            vec![DataType::Utf8, DataType::Utf8],
+            Volatility::Immutable,
+        ),
+    }));
+    // PG-shape `power(x, y)` — always returns Float64. Overrides
+    // DataFusion's default `power`, which returns Int64 for two integer
+    // inputs and trips up downstream callers expecting `double precision`
+    // (the PG return type). Inputs are coerced to Float64 by DataFusion's
+    // signature machinery.
+    ctx.register_udf(ScalarUDF::from(PowerFloat64Udf {
+        signature: Signature::exact(
+            vec![DataType::Float64, DataType::Float64],
+            Volatility::Immutable,
+        ),
+    }));
+    // PG-shape `extract(second FROM ts)` — always returns Float64 with
+    // sub-second precision. The SQL-string rewriter routes the parser-level
+    // `EXTRACT(SECOND FROM x)` form to a function call against this UDF
+    // before sqlparser runs; non-second EXTRACTs fall through to
+    // DataFusion's default `date_part` (Int32 / Int64-shaped). See
+    // `rewrite_extract_second` for the rewrite rule.
+    ctx.register_udf(ScalarUDF::from(ExtractSecondPgUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Timestamp(TimeUnit::Nanosecond, None)]),
+                TypeSignature::Exact(vec![DataType::Timestamp(TimeUnit::Microsecond, None)]),
+                TypeSignature::Exact(vec![DataType::Timestamp(TimeUnit::Millisecond, None)]),
+                TypeSignature::Exact(vec![DataType::Timestamp(TimeUnit::Second, None)]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+    // C2 constraint reactor assertion: returns 1 when predicate is true,
+    // raises an Err carrying the supplied message when predicate is false.
+    // Used by `reactor_ddl::exec_react_constraint` to encode `CHECK
+    // (<predicate>)`-shaped constraint reactors as a SQL probe whose body
+    // is `SELECT __basin_assert(<predicate>, '<msg>')`. The CASE/CAST shape
+    // we used previously evaluated the cast eagerly during type-checking,
+    // tripping even when the predicate would have been TRUE at runtime.
+    ctx.register_udf(ScalarUDF::from(BasinAssertUdf {
+        signature: Signature::exact(
+            vec![DataType::Boolean, DataType::Utf8],
+            Volatility::Volatile,
+        ),
+    }));
+    // Sequence UDFs — `nextval(text) / currval(text) / setval(text, bigint
+    // [, bool])`. The actual catalog interaction happens at the SQL-string
+    // rewrite layer (see `seq_udf::rewrite_sequence_calls`) which runs
+    // before sqlparser sees the SQL. The UDFs registered here are
+    // tombstones: if a query somehow reaches them (the rewrite missed the
+    // call site, the call has dynamic arguments, etc.) they raise an
+    // execution-time error rather than silently mis-evaluating. Volatile
+    // so the planner doesn't fold their results across rows.
+    ctx.register_udf(ScalarUDF::from(crate::seq_udf::NextvalUdf::default()));
+    ctx.register_udf(ScalarUDF::from(crate::seq_udf::CurrvalUdf::default()));
+    ctx.register_udf(ScalarUDF::from(crate::seq_udf::SetvalUdf::default()));
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1174,6 +1311,501 @@ fn getrandom_fill(buf: &mut [u8]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5.11.A: PG-compat scalar functions.
+//
+// These four UDFs cover the gaps left by DataFusion's builtins:
+//
+//  * `mod(a, b)` — present as the `%` operator but missing as a function.
+//  * `age(ts1, ts2)` — not implemented in DataFusion at all.
+//  * `to_char(ts, fmt)` and `to_timestamp(text, fmt)` — DataFusion ships them
+//    using chrono `%Y-%m-%d` style format strings; PG and every PG-emitting
+//    ORM use `YYYY-MM-DD HH24:MI:SS`. We register Basin-side UDFs of the
+//    same name (DataFusion's registry overwrites by name) that translate
+//    PG → chrono before dispatching.
+//
+// The translation table is intentionally minimal — it covers the directives
+// every modern SaaS schema actually emits. Anything outside that set is left
+// untouched, which means a chrono-style template (with `%`-prefixed
+// directives) round-trips byte-identical so the override is transparent to
+// existing chrono-shaped queries.
+// ---------------------------------------------------------------------------
+
+/// Translate PG-style date/time format directives to chrono's strftime form.
+///
+/// Recognised PG directives: `YYYY`, `YY`, `MM`, `DD`, `HH24`, `HH12`, `HH`,
+/// `MI`, `SS`, `AM`, `PM`, `Day`, `Mon`, `MS`, `US`. Anything else is passed
+/// through verbatim. Chrono `%X` directives are passed through verbatim too,
+/// which keeps callers using chrono syntax working unchanged.
+fn pg_format_to_chrono(fmt: &str) -> String {
+    // Order matters: longest match first so `YYYY` wins over `YY`, and
+    // `HH24` over `HH`.
+    const REPL: &[(&str, &str)] = &[
+        ("YYYY", "%Y"),
+        ("YY", "%y"),
+        ("Mon", "%b"),
+        ("MON", "%b"),
+        ("Day", "%A"),
+        ("DAY", "%A"),
+        ("MM", "%m"),
+        ("DD", "%d"),
+        ("HH24", "%H"),
+        ("HH12", "%I"),
+        ("HH", "%I"),
+        ("MI", "%M"),
+        ("SS", "%S"),
+        ("MS", "%3f"),
+        ("US", "%6f"),
+        ("AM", "%p"),
+        ("PM", "%p"),
+        ("am", "%P"),
+        ("pm", "%P"),
+    ];
+    let mut out = String::with_capacity(fmt.len());
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Pass through chrono `%X` directives unchanged so chrono-style
+        // callers remain bit-identical.
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            out.push('%');
+            out.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
+        let mut matched = false;
+        for (pg, chrono) in REPL {
+            let pg_bytes = pg.as_bytes();
+            if i + pg_bytes.len() <= bytes.len() && &bytes[i..i + pg_bytes.len()] == pg_bytes {
+                out.push_str(chrono);
+                i += pg_bytes.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[derive(Debug)]
+struct ModUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ModUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "mod"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(arg_types[0].clone())
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("mod expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let a = args[0].clone().into_array(n)?;
+        let b = args[1].clone().into_array(n)?;
+        match (a.data_type(), b.data_type()) {
+            (DataType::Int64, DataType::Int64) => {
+                let a = a.as_any().downcast_ref::<Int64Array>().unwrap();
+                let b = b.as_any().downcast_ref::<Int64Array>().unwrap();
+                let mut out = Int64Array::builder(n);
+                for i in 0..n {
+                    if a.is_null(i) || b.is_null(i) {
+                        out.append_null();
+                        continue;
+                    }
+                    let bv = b.value(i);
+                    if bv == 0 {
+                        return Err(DataFusionError::Execution(
+                            "mod: division by zero".into(),
+                        ));
+                    }
+                    out.append_value(a.value(i) % bv);
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
+            }
+            (DataType::Int32, DataType::Int32) => {
+                use datafusion::arrow::array::Int32Array;
+                let a = a.as_any().downcast_ref::<Int32Array>().unwrap();
+                let b = b.as_any().downcast_ref::<Int32Array>().unwrap();
+                let mut out = Int32Array::builder(n);
+                for i in 0..n {
+                    if a.is_null(i) || b.is_null(i) {
+                        out.append_null();
+                        continue;
+                    }
+                    let bv = b.value(i);
+                    if bv == 0 {
+                        return Err(DataFusionError::Execution(
+                            "mod: division by zero".into(),
+                        ));
+                    }
+                    out.append_value(a.value(i) % bv);
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
+            }
+            (DataType::Float64, DataType::Float64) => {
+                let a = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                let b = b.as_any().downcast_ref::<Float64Array>().unwrap();
+                let mut out = Float64Array::builder(n);
+                for i in 0..n {
+                    if a.is_null(i) || b.is_null(i) {
+                        out.append_null();
+                    } else {
+                        out.append_value(a.value(i) % b.value(i));
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
+            }
+            (l, r) => exec_err!("mod: unsupported argument types {l:?} % {r:?}"),
+        }
+    }
+}
+
+/// `age(ts1, ts2)` — returns the PG-text rendering of the interval between
+/// two timestamps. Format: `"N years M mons D days HH:MM:SS"`, with zero
+/// components elided and a sign on the last one if the interval is negative.
+/// This matches the default psql output for the `interval` type, which is
+/// the rendering ORMs see when they `cast(age(...) AS text)`.
+#[derive(Debug)]
+struct AgeUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for AgeUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "age"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Interval(IntervalUnit::MonthDayNano))
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("age expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let lhs = args[0].clone().into_array(n)?;
+        let rhs = args[1].clone().into_array(n)?;
+        let mut out: Vec<Option<IntervalMonthDayNano>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = ts_array_to_naive(&lhs, i)?;
+            let b = ts_array_to_naive(&rhs, i)?;
+            match (a, b) {
+                (Some(a), Some(b)) => out.push(Some(pg_age_interval(a, b))),
+                _ => out.push(None),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(IntervalMonthDayNanoArray::from(out))))
+    }
+}
+
+fn ts_array_to_naive(arr: &ArrayRef, i: usize) -> DFResult<Option<NaiveDateTime>> {
+    match arr.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let a = arr.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            let v = a.value(i);
+            let secs = v.div_euclid(1_000_000_000);
+            let ns = v.rem_euclid(1_000_000_000) as u32;
+            Ok(Utc.timestamp_opt(secs, ns).single().map(|d| d.naive_utc()))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let a = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            let v = a.value(i);
+            let secs = v.div_euclid(1_000_000);
+            let us = v.rem_euclid(1_000_000) as u32;
+            Ok(Utc.timestamp_opt(secs, us * 1000).single().map(|d| d.naive_utc()))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let a = arr.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            let v = a.value(i);
+            let secs = v.div_euclid(1_000);
+            let ms = v.rem_euclid(1_000) as u32;
+            Ok(Utc.timestamp_opt(secs, ms * 1_000_000).single().map(|d| d.naive_utc()))
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            Ok(Utc.timestamp_opt(a.value(i), 0).single().map(|d| d.naive_utc()))
+        }
+        DataType::Date32 => {
+            let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            // Date32 stores days since UNIX epoch.
+            let days = a.value(i) as i64;
+            Ok(Utc.timestamp_opt(days * 86_400, 0).single().map(|d| d.naive_utc()))
+        }
+        other => exec_err!("age: unsupported timestamp type {other:?}"),
+    }
+}
+
+/// PG `age(ts1, ts2)` calendar walk. Mirrors `timestamp_age` in
+/// `src/backend/utils/adt/timestamp.c`: subtract each (y, m, d, hh, mm, ss,
+/// us) component, then propagate negatives upward, borrowing days from the
+/// **earlier** timestamp's month (so e.g. `age('2024-03-01','2024-01-31')`
+/// borrows 31 days from January, yielding 1 month + 1 day, not 1 day + some
+/// other figure).
+fn pg_age_interval(ts1: NaiveDateTime, ts2: NaiveDateTime) -> IntervalMonthDayNano {
+    if ts1 == ts2 {
+        return IntervalMonthDayNano::new(0, 0, 0);
+    }
+    let neg = ts1 < ts2;
+
+    let mut years = ts1.year() - ts2.year();
+    let mut months = ts1.month() as i32 - ts2.month() as i32;
+    let mut days = ts1.day() as i32 - ts2.day() as i32;
+    let mut hours = ts1.hour() as i32 - ts2.hour() as i32;
+    let mut mins = ts1.minute() as i32 - ts2.minute() as i32;
+    let mut secs = ts1.second() as i32 - ts2.second() as i32;
+    // chrono `nanosecond()` is 0..1_000_000_000; PG age preserves
+    // microsecond precision but Arrow's MonthDayNano keeps nanoseconds, so
+    // carry the full nanosecond residual.
+    let mut nanos = ts1.nanosecond() as i64 - ts2.nanosecond() as i64;
+
+    // Flip sign if ts1 < ts2: we walk on absolute components, then re-flip.
+    if neg {
+        years = -years;
+        months = -months;
+        days = -days;
+        hours = -hours;
+        mins = -mins;
+        secs = -secs;
+        nanos = -nanos;
+    }
+
+    // Propagate negatives upward, mirroring PG's `while`-loops.
+    while nanos < 0 {
+        nanos += 1_000_000_000;
+        secs -= 1;
+    }
+    while secs < 0 {
+        secs += 60;
+        mins -= 1;
+    }
+    while mins < 0 {
+        mins += 60;
+        hours -= 1;
+    }
+    while hours < 0 {
+        hours += 24;
+        days -= 1;
+    }
+    // PG borrows day-count from the earlier timestamp's month when ts1 >=
+    // ts2, otherwise from the later timestamp's month. After the sign-flip
+    // above, "earlier" is whichever input had the smaller calendar value.
+    while days < 0 {
+        let (borrow_year, borrow_month) = if neg {
+            (ts1.year(), ts1.month())
+        } else {
+            (ts2.year(), ts2.month())
+        };
+        days += days_in_month(borrow_year, borrow_month) as i32;
+        months -= 1;
+    }
+    while months < 0 {
+        months += 12;
+        years -= 1;
+    }
+
+    let total_months = years * 12 + months;
+    let total_nanos = (hours as i64) * 3_600_000_000_000
+        + (mins as i64) * 60_000_000_000
+        + (secs as i64) * 1_000_000_000
+        + nanos;
+
+    if neg {
+        IntervalMonthDayNano::new(-total_months, -days, -total_nanos)
+    } else {
+        IntervalMonthDayNano::new(total_months, days, total_nanos)
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 30, // unreachable; guard against bad input.
+    }
+}
+
+/// PG-format-aware `to_char(timestamp, format)`. Translates PG directives
+/// to chrono and renders via `chrono::DateTime::format`.
+#[derive(Debug)]
+struct ToCharPgUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ToCharPgUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_char"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("to_char expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let ts = args[0].clone().into_array(n)?;
+        let fmt = args[1].clone().into_array(n)?;
+        let fmt = fmt
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_char: arg 2 must be Utf8".into()))?;
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if fmt.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let chrono_fmt = pg_format_to_chrono(fmt.value(i));
+            let dt = ts_array_to_naive(&ts, i)?;
+            match dt {
+                Some(dt) => out.push(Some(dt.format(&chrono_fmt).to_string())),
+                None => out.push(None),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+    }
+}
+
+/// PG-format-aware `to_timestamp(text, format)`. Translates PG directives to
+/// chrono and parses via `chrono::NaiveDateTime::parse_from_str`. Returns
+/// `Timestamp(Nanosecond, None)` to match DataFusion's default `to_timestamp`
+/// shape.
+#[derive(Debug)]
+struct ToTimestampPgUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ToTimestampPgUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_timestamp"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("to_timestamp expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let txt = args[0].clone().into_array(n)?;
+        let fmt = args[1].clone().into_array(n)?;
+        let txt = txt
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_timestamp: arg 1 must be Utf8".into()))?;
+        let fmt = fmt
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_timestamp: arg 2 must be Utf8".into()))?;
+        let mut out: Vec<Option<i64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if txt.is_null(i) || fmt.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let chrono_fmt = pg_format_to_chrono(fmt.value(i));
+            // Try parsing as a full datetime; fall back to date-only.
+            let parsed = NaiveDateTime::parse_from_str(txt.value(i), &chrono_fmt)
+                .or_else(|_| {
+                    chrono::NaiveDate::parse_from_str(txt.value(i), &chrono_fmt)
+                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                });
+            let parsed = parsed.map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "to_timestamp: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
+                    txt.value(i), fmt.value(i), chrono_fmt
+                ))
+            })?;
+            let dt: DateTime<Utc> = Utc.from_utc_datetime(&parsed);
+            out.push(dt.timestamp_nanos_opt());
+        }
+        let arr = TimestampNanosecondArray::from(out);
+        Ok(ColumnarValue::Array(Arc::new(arr)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,4 +1836,375 @@ mod tests {
         let r = rewrite_vector_operators("SELECT (a + b) <-> c FROM t");
         assert_eq!(r, "SELECT l2_distance((a + b), c) FROM t");
     }
+}
+
+/// PG-shape `power(x, y)` — always returns `double precision` (Float64).
+/// Replaces DataFusion's default `power`, which returns Int64 when both
+/// inputs are integer-typed. PG's `power` is the float-only variant; the
+/// integer-keeping form is the `^` operator. Callers that downcast
+/// `power`'s result to `numeric` or use it in float arithmetic break on
+/// the Int64 shape; widening to Float64 unconditionally is the practical
+/// fix.
+#[derive(Debug)]
+struct PowerFloat64Udf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for PowerFloat64Udf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "power"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("power expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let base = args[0].clone().into_array(n)?;
+        let exp = args[1].clone().into_array(n)?;
+        let base = base
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("power: base did not coerce to Float64".into())
+            })?;
+        let exp = exp
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "power: exponent did not coerce to Float64".into(),
+                )
+            })?;
+        let mut out = Float64Array::builder(n);
+        for i in 0..n {
+            if base.is_null(i) || exp.is_null(i) {
+                out.append_null();
+            } else {
+                out.append_value(base.value(i).powf(exp.value(i)));
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// PG-shape `extract(second FROM ts)` — returns `double precision` with
+/// sub-second precision. DataFusion's `date_part('second', ...)` returns
+/// Int32 (whole seconds only); PG returns `numeric` with the fractional
+/// part included. Float64 captures microsecond precision losslessly for
+/// any realistic timestamp; we don't model PG's `numeric` directly because
+/// the workspace arrow bridge has no `numeric` type yet.
+///
+/// Wired in via `rewrite_extract_second` at the SQL-string layer rather
+/// than via DataFusion's `ExprPlanner`. The default planner list has
+/// `UserDefinedFunctionPlanner` returning `Planned` for `EXTRACT` before
+/// any session-registered planner is consulted, so the string rewrite
+/// sidesteps that ordering problem and matches the existing pg_vector
+/// operator-rewrite pattern.
+#[derive(Debug)]
+struct ExtractSecondPgUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ExtractSecondPgUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "__basin_extract_second"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 1 {
+            return exec_err!(
+                "__basin_extract_second expects 1 argument, got {}",
+                args.len()
+            );
+        }
+        let n = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            _ => 1,
+        };
+        let arr = args[0].clone().into_array(n)?;
+        let mut out = Float64Array::builder(n);
+        for i in 0..n {
+            match ts_array_to_seconds_f64(&arr, i)? {
+                Some(v) => out.append_value(v),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// `__basin_assert(predicate BOOL, error_text TEXT) -> Int64`. Used by
+/// constraint-shaped reactors (5.11.C2) as a planner-friendly stand-in
+/// for `CHECK (<predicate>)`. Returns 1 for every row in which the
+/// predicate is true; raises `DataFusionError::Execution(error_text)`
+/// when any row's predicate is false. The error string is expected to
+/// carry the literal `SQLSTATE 23514 check_violation` token so router-
+/// side error mapping classifies the failure as a check violation.
+///
+/// Volatility is `Volatile` to keep the planner from constant-folding a
+/// constant-true predicate into the literal `1` (the side-effect of
+/// raising on false is the whole point of the UDF).
+#[derive(Debug)]
+struct BasinAssertUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for BasinAssertUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "__basin_assert"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("__basin_assert expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let pred = args[0].clone().into_array(n)?;
+        let msg = args[1].clone().into_array(n)?;
+        let pred = pred.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+            DataFusionError::Execution(
+                "__basin_assert: first argument did not coerce to Boolean".into(),
+            )
+        })?;
+        let msg = msg.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            DataFusionError::Execution(
+                "__basin_assert: second argument did not coerce to Utf8".into(),
+            )
+        })?;
+        // A NULL predicate is treated as a check violation, matching PG's
+        // `CHECK` semantics where `NULL` is not "satisfied".
+        let mut out = Int64Array::builder(n);
+        for i in 0..n {
+            let ok = !pred.is_null(i) && pred.value(i);
+            if !ok {
+                let m = if msg.is_null(i) {
+                    "SQLSTATE 23514 check_violation".to_string()
+                } else {
+                    msg.value(i).to_string()
+                };
+                return exec_err!("{}", m);
+            }
+            out.append_value(1);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// Compute the PG-style `extract(second FROM ts)` value for row `i` of an
+/// arrow timestamp array: the integer second-of-minute (0..=59) plus the
+/// sub-second fraction expressed in the array's native unit.
+fn ts_array_to_seconds_f64(arr: &ArrayRef, i: usize) -> DFResult<Option<f64>> {
+    match arr.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            let v = a.value(i);
+            let sub_ns = v.rem_euclid(60 * 1_000_000_000);
+            Ok(Some(sub_ns as f64 / 1_000_000_000.0))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            let v = a.value(i);
+            let sub_us = v.rem_euclid(60 * 1_000_000);
+            Ok(Some(sub_us as f64 / 1_000_000.0))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            let v = a.value(i);
+            let sub_ms = v.rem_euclid(60 * 1_000);
+            Ok(Some(sub_ms as f64 / 1_000.0))
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            Ok(Some((a.value(i).rem_euclid(60)) as f64))
+        }
+        other => exec_err!("__basin_extract_second: unsupported timestamp type {other:?}"),
+    }
+}
+
+/// SQL-string rewrite for `EXTRACT(SECOND FROM <expr>)` ->
+/// `__basin_extract_second(<expr>)`.
+///
+/// Mirrors the design of [`rewrite_vector_operators`]: a textual rewrite
+/// applied before sqlparser sees the SQL. We deliberately don't rewrite
+/// other EXTRACT fields — DataFusion's default `date_part` returns Int32
+/// for them, which matches PG's textual rendering for whole-number fields
+/// and is what existing call sites expect.
+///
+/// LIMITATIONS — same as the operator rewriter:
+///   * does not understand quoted strings (an EXTRACT inside `'...'` will
+///     still be rewritten);
+///   * matches `SECOND` only, not `SECONDS` / `SEC` synonyms;
+///   * matches one EXTRACT(...) per pass; iterates until no match remains.
+pub(crate) fn rewrite_extract_second(sql: &str) -> String {
+    let mut s = sql.to_string();
+    loop {
+        let Some(start) = find_extract_second(&s) else {
+            break;
+        };
+        let Some(from_end) = find_extract_second_from_end(&s, start) else {
+            break;
+        };
+        let bytes = s.as_bytes();
+        let mut i = from_end;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let expr_start = i;
+        let mut depth = 1i32;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            break;
+        }
+        let expr_end = i;
+        let close_paren = i;
+        let expr = s[expr_start..expr_end].trim().to_string();
+        let replacement = format!("__basin_extract_second({})", expr);
+        s.replace_range(start..close_paren + 1, &replacement);
+    }
+    s
+}
+
+/// Locate the next `EXTRACT(SECOND FROM` occurrence (case-insensitive,
+/// flexible whitespace). Returns the byte offset of the leading `E`.
+fn find_extract_second(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let lower = s.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut idx = 0usize;
+    while idx + 7 <= lb.len() {
+        if &lb[idx..idx + 7] == b"extract" {
+            let pre_ok = idx == 0 || {
+                let c = bytes[idx - 1];
+                !(c.is_ascii_alphanumeric() || c == b'_')
+            };
+            if pre_ok && find_extract_second_from_end(s, idx).is_some() {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Given that `start` points at an `EXTRACT` keyword, verify the rest of
+/// the prefix is `(SECOND FROM` and return the byte offset just past `FROM`.
+/// Returns `None` if the surrounding tokens don't match.
+fn find_extract_second_from_end(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let lower = s.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut j = start + 7;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'(' {
+        return None;
+    }
+    let mut k = j + 1;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k + 6 > lb.len() || &lb[k..k + 6] != b"second" {
+        return None;
+    }
+    let after_field = k + 6;
+    let post_ok = after_field >= bytes.len() || {
+        let c = bytes[after_field];
+        !(c.is_ascii_alphanumeric() || c == b'_')
+    };
+    if !post_ok {
+        return None;
+    }
+    let mut m = after_field;
+    while m < bytes.len() && bytes[m].is_ascii_whitespace() {
+        m += 1;
+    }
+    if m + 4 > lb.len() || &lb[m..m + 4] != b"from" {
+        return None;
+    }
+    let after_from = m + 4;
+    let from_post_ok = after_from >= bytes.len() || {
+        let c = bytes[after_from];
+        !(c.is_ascii_alphanumeric() || c == b'_')
+    };
+    if !from_post_ok {
+        return None;
+    }
+    Some(after_from)
 }

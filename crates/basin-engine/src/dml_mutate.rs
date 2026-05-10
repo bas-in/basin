@@ -36,14 +36,15 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
+    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Schema, TimeUnit};
 use basin_catalog::DataFileRef;
-use basin_common::{BasinError, PartitionKey, Result, TableName};
+use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName};
 use basin_storage::{
     evaluate_compound, evaluate_compound_for_pruning, vector_index_segment_key_for_data_file,
     CompoundPredicate, DataFile, Predicate, PruneOutcome, ScalarValue, Storage,
@@ -54,6 +55,10 @@ use sqlparser::ast::{
     TableFactor, TableWithJoins, UnaryOperator, Value,
 };
 
+use crate::events::{
+    build_row_json, dispatch_post_commit, dispatch_pre_commit, make_event, registry_has_any,
+};
+use crate::lifecycle::AuditRecord;
 use crate::session::refresh_table;
 use crate::{ExecResult, TenantSession};
 
@@ -92,6 +97,17 @@ pub(crate) async fn exec_delete(
         .load_table(&sess.tenant, &table)
         .await?;
     let schema = meta.schema.clone();
+
+    // SOFT DELETE rewrite: when the table has a SOFT DELETE column the
+    // physical operation is an UPDATE that stamps that column with
+    // `now()` and skips already-soft-deleted rows. The audit op (when
+    // AUDIT TO is also configured) stays `'delete'` even though the
+    // underlying write is an UPDATE — the user's intent matters here,
+    // not the storage shape.
+    if let Some(sd_col) = crate::types::soft_delete_column(schema.as_ref()) {
+        return exec_soft_delete(sess, table, schema, predicate_expr, sd_col).await;
+    }
+
     let storage = sess.engine.config().storage.clone();
 
     let data_files = storage.list_data_files_with_stats(&sess.tenant, &table).await?;
@@ -106,11 +122,17 @@ pub(crate) async fn exec_delete(
         Some(e) => Some(parse_compound_predicate(e, schema.as_ref())?),
     };
 
+    let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
+    let capture_events = sinks_attached(sess) || audit_table.is_some();
+
     // Walk files: deletes can shortcut on AllMatch (drop the file outright).
     let mut deleted: usize = 0;
     let mut replaced_paths: Vec<String> = Vec::new();
     let mut replacement_batches: Vec<RecordBatch> = Vec::new();
     let mut dropped_paths: Vec<String> = Vec::new();
+    // Only allocated when sinks are attached. Holds (before_row, after=None)
+    // pairs for every actually-deleted row.
+    let mut event_payloads: Vec<RowChange> = Vec::new();
 
     for f in &data_files {
         let outcome = file_outcome(pred.as_ref(), f, schema.as_ref());
@@ -120,12 +142,28 @@ pub(crate) async fn exec_delete(
             (PruneOutcome::AllMatch, Some(_)) | (_, None) => {
                 deleted += f.row_count as usize;
                 dropped_paths.push(f.path.as_ref().to_string());
+                if capture_events {
+                    capture_dropped_file(&storage, &sess.tenant, &f.path, &mut event_payloads)
+                        .await?;
+                }
             }
             (PruneOutcome::NoMatch, Some(_)) => {
                 // Pass-through: file appears unchanged in the new snapshot.
             }
             (PruneOutcome::Mixed, Some(p)) => {
-                let kept = evaluate_and_partition_delete(&storage, &sess.tenant, &f.path, p).await?;
+                let (kept, deleted_rows) = if capture_events {
+                    evaluate_and_partition_delete_capturing(
+                        &storage,
+                        &sess.tenant,
+                        &f.path,
+                        p,
+                    )
+                    .await?
+                } else {
+                    let kept =
+                        evaluate_and_partition_delete(&storage, &sess.tenant, &f.path, p).await?;
+                    (kept, Vec::new())
+                };
                 let kept_rows: usize = kept.iter().map(|b| b.num_rows()).sum();
                 let removed = (f.row_count as usize).saturating_sub(kept_rows);
                 if removed == 0 {
@@ -136,6 +174,14 @@ pub(crate) async fn exec_delete(
                 deleted += removed;
                 replaced_paths.push(f.path.as_ref().to_string());
                 replacement_batches.extend(kept);
+                if capture_events {
+                    for (b, row) in deleted_rows {
+                        event_payloads.push(RowChange {
+                            before: Some(build_row_json(&b, row)?),
+                            after: None,
+                        });
+                    }
+                }
             }
         }
     }
@@ -146,8 +192,17 @@ pub(crate) async fn exec_delete(
         });
     }
 
+    let audit_rows: Vec<RowChange> = if audit_table.is_some() {
+        event_payloads.iter().map(|r| r.clone()).collect()
+    } else {
+        Vec::new()
+    };
+    let events = build_events(sess, &table, ChangeOp::Delete, event_payloads);
     let mut removed_paths = replaced_paths.clone();
     removed_paths.extend(dropped_paths.iter().cloned());
+    // Pre-commit before writing the replacement file so a rejecting
+    // sink leaves no orphan parquet on disk.
+    dispatch_pre_commit(&sess.engine, &events).await?;
     let added_files = write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
     commit_replace(
         sess,
@@ -157,8 +212,13 @@ pub(crate) async fn exec_delete(
         added_files,
     )
     .await?;
+    dispatch_post_commit(&sess.engine, events);
     delete_objects(sess, &table, schema.as_ref(), &removed_paths).await?;
     refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+
+    if let Some(audit) = audit_table.as_ref() {
+        write_audit_rows(sess, audit, ChangeOp::Delete, audit_rows).await?;
+    }
 
     Ok(ExecResult::Empty {
         tag: format!("DELETE {deleted}"),
@@ -219,7 +279,10 @@ pub(crate) async fn exec_update(
     // Resolve assignments to (column_index, scalar). Reject anything that
     // isn't a single-column = literal pair: UPDATE ... SET col = col + 1
     // requires expression evaluation we don't ship in v0.1.
-    let assignments = parse_assignments(&assignments, schema.as_ref())?;
+    let mut assignments = parse_assignments(&assignments, schema.as_ref())?;
+    // AUTO_UPDATE injection: any column flagged on the schema that the
+    // user didn't explicitly set gets a fresh `now()` micros value.
+    inject_auto_update_assignments(schema.as_ref(), &mut assignments);
 
     let data_files = storage.list_data_files_with_stats(&sess.tenant, &table).await?;
     if data_files.is_empty() {
@@ -233,11 +296,23 @@ pub(crate) async fn exec_update(
         Some(e) => Some(parse_compound_predicate(e, schema.as_ref())?),
     };
 
+    let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
+    // Generated columns force the same per-batch traversal as the
+    // capture-events path: each batch must be re-evaluated with the
+    // matched-row mask in hand so the expression is recomputed exactly
+    // for the rows the user's UPDATE just changed.
+    let has_generated_cols = schema
+        .fields()
+        .iter()
+        .any(|f| crate::types::field_is_generated(f).is_some());
+    let capture_events = sinks_attached(sess) || audit_table.is_some() || has_generated_cols;
+
     // Walk files. Unlike DELETE, an AllMatch UPDATE still has to read the
     // file to apply SET to every row.
     let mut updated_total: usize = 0;
     let mut replaced_paths: Vec<String> = Vec::new();
     let mut replacement_batches: Vec<RecordBatch> = Vec::new();
+    let mut event_payloads: Vec<RowChange> = Vec::new();
 
     for f in &data_files {
         let outcome = file_outcome(pred.as_ref(), f, schema.as_ref());
@@ -248,28 +323,108 @@ pub(crate) async fn exec_update(
             // AllMatch with predicate, or no predicate at all: every row is
             // matched. We still need the file's contents to apply SET.
             (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
-                let new_batches = read_and_apply_assignments(
-                    &storage,
-                    &sess.tenant,
-                    &f.path,
-                    None,
-                    &assignments,
-                )
-                .await?;
+                let (mut new_batches, before_batches) = if capture_events {
+                    let befores =
+                        read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                    let news = apply_assignments_all(&befores, &assignments)?;
+                    (news, befores)
+                } else {
+                    let news = read_and_apply_assignments(
+                        &storage,
+                        &sess.tenant,
+                        &f.path,
+                        None,
+                        &assignments,
+                    )
+                    .await?;
+                    (news, Vec::new())
+                };
+                if has_generated_cols {
+                    let mut rebuilt = Vec::with_capacity(new_batches.len());
+                    for b in new_batches {
+                        rebuilt.push(
+                            crate::generated_cols::materialise_generated_columns(
+                                &sess.engine.config().catalog,
+                                &sess.tenant,
+                                b,
+                            )
+                            .await?,
+                        );
+                    }
+                    new_batches = rebuilt;
+                }
                 updated_total += f.row_count as usize;
                 replaced_paths.push(f.path.as_ref().to_string());
+                if capture_events {
+                    capture_update_events(
+                        &before_batches,
+                        &new_batches,
+                        None,
+                        &mut event_payloads,
+                    )?;
+                }
                 replacement_batches.extend(new_batches);
             }
             (PruneOutcome::Mixed, Some(p)) => {
-                let (rows_matched, new_batches) =
-                    read_and_apply_assignments_mixed(&storage, &sess.tenant, &f.path, p, &assignments).await?;
+                let (rows_matched, mut new_batches, before_batches, mask_per_batch) =
+                    if capture_events {
+                        let befores =
+                            read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                        let mut masks = Vec::with_capacity(befores.len());
+                        let mut news = Vec::with_capacity(befores.len());
+                        let mut matched = 0usize;
+                        for b in &befores {
+                            let mask = evaluate_compound(b, p).map_err(|e| {
+                                BasinError::internal(format!("update predicate eval: {e}"))
+                            })?;
+                            matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
+                            news.push(apply_assignments(b, &mask, &assignments)?);
+                            masks.push(mask);
+                        }
+                        (matched, news, befores, masks)
+                    } else {
+                        let (matched, news) = read_and_apply_assignments_mixed(
+                            &storage,
+                            &sess.tenant,
+                            &f.path,
+                            p,
+                            &assignments,
+                        )
+                        .await?;
+                        (matched, news, Vec::new(), Vec::new())
+                    };
                 if rows_matched == 0 {
                     // Stats said maybe-match but no rows actually matched —
                     // pass through instead of pointlessly rewriting.
                     continue;
                 }
+                if has_generated_cols {
+                    // We took the capture_events branch above, so masks
+                    // are populated 1:1 with new_batches.
+                    let mut rebuilt = Vec::with_capacity(new_batches.len());
+                    for (b, m) in new_batches.into_iter().zip(mask_per_batch.iter()) {
+                        rebuilt.push(
+                            crate::generated_cols::materialise_generated_columns_masked(
+                                &sess.engine.config().catalog,
+                                &sess.tenant,
+                                b,
+                                m,
+                            )
+                            .await?,
+                        );
+                    }
+                    new_batches = rebuilt;
+                }
                 updated_total += rows_matched;
                 replaced_paths.push(f.path.as_ref().to_string());
+                if capture_events {
+                    capture_update_events(
+                        &before_batches,
+                        &new_batches,
+                        Some(&mask_per_batch),
+                        &mut event_payloads,
+                    )?;
+                }
                 replacement_batches.extend(new_batches);
             }
             // AllMatch + None handled above; this branch is unreachable in
@@ -284,6 +439,17 @@ pub(crate) async fn exec_update(
         });
     }
 
+    // Materialise audit rows from the same captured before/after pairs
+    // before they're consumed by the event-builder.
+    let audit_rows: Vec<RowChange> = if audit_table.is_some() {
+        event_payloads.iter().map(|r| r.clone()).collect()
+    } else {
+        Vec::new()
+    };
+    let events = build_events(sess, &table, ChangeOp::Update, event_payloads);
+    // Pre-commit before writing the replacement file so a rejecting
+    // sink leaves no orphan parquet on disk.
+    dispatch_pre_commit(&sess.engine, &events).await?;
     let added_files =
         write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
     commit_replace(
@@ -294,12 +460,176 @@ pub(crate) async fn exec_update(
         added_files,
     )
     .await?;
+    dispatch_post_commit(&sess.engine, events);
     delete_objects(sess, &table, schema.as_ref(), &replaced_paths).await?;
     refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+
+    if let Some(audit) = audit_table.as_ref() {
+        write_audit_rows(sess, audit, ChangeOp::Update, audit_rows).await?;
+    }
 
     Ok(ExecResult::Empty {
         tag: format!("UPDATE {updated_total}"),
     })
+}
+
+/// One captured row-level change, lazily materialised only when at
+/// least one [`ChangeEventSink`] is attached or `AUDIT TO` is configured.
+#[derive(Clone)]
+struct RowChange {
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+}
+
+/// Hot-path probe: are any sinks attached on either side? When false,
+/// the rest of the mutation path is byte-identical to the no-event
+/// baseline.
+fn sinks_attached(sess: &TenantSession) -> bool {
+    let guard = sess
+        .engine
+        .event_sinks()
+        .read()
+        .expect("event_sinks lock poisoned");
+    registry_has_any(&guard)
+}
+
+fn build_events(
+    sess: &TenantSession,
+    table: &TableName,
+    op: ChangeOp,
+    rows: Vec<RowChange>,
+) -> Vec<ChangeEvent> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let user = if sess.current_user == crate::ANONYMOUS_USER {
+        None
+    } else {
+        Some(sess.current_user.clone())
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for RowChange { before, after } in rows {
+        let seq = sess.engine.next_event_seq(&sess.tenant, table);
+        out.push(make_event(
+            &sess.tenant,
+            table,
+            op,
+            before,
+            after,
+            seq,
+            user.clone(),
+        ));
+    }
+    out
+}
+
+/// DELETE / AllMatch path: read the file (which the no-sink path skips
+/// entirely) and emit one `before` per row. `after` is `None` for
+/// DELETE.
+async fn capture_dropped_file(
+    storage: &Storage,
+    tenant: &basin_common::TenantId,
+    path: &object_store::path::Path,
+    out: &mut Vec<RowChange>,
+) -> Result<()> {
+    let mut stream = storage.read_file(tenant, path).await?;
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        for row in 0..batch.num_rows() {
+            out.push(RowChange {
+                before: Some(build_row_json(&batch, row)?),
+                after: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Like [`evaluate_and_partition_delete`] but also returns the matched
+/// rows (the ones being deleted). Each entry is `(batch, row_idx)` —
+/// the caller materialises JSON lazily.
+async fn evaluate_and_partition_delete_capturing(
+    storage: &Storage,
+    tenant: &basin_common::TenantId,
+    path: &object_store::path::Path,
+    pred: &CompoundPredicate,
+) -> Result<(Vec<RecordBatch>, Vec<(RecordBatch, usize)>)> {
+    let mut stream = storage.read_file(tenant, path).await?;
+    let mut kept = Vec::new();
+    let mut deleted = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let mask = evaluate_compound(&batch, pred)
+            .map_err(|e| BasinError::internal(format!("delete predicate eval: {e}")))?;
+        for i in 0..batch.num_rows() {
+            if !mask.is_null(i) && mask.value(i) {
+                deleted.push((batch.clone(), i));
+            }
+        }
+        let inverse = invert_mask(&mask);
+        let kb = arrow_select::filter::filter_record_batch(&batch, &inverse)
+            .map_err(|e| BasinError::internal(format!("delete filter batch: {e}")))?;
+        if kb.num_rows() > 0 {
+            kept.push(kb);
+        }
+    }
+    Ok((kept, deleted))
+}
+
+/// Read a file into in-memory batches. Used by the event-capturing
+/// UPDATE path so we can pair before/after row-by-row without re-reading.
+async fn read_file_to_batches(
+    storage: &Storage,
+    tenant: &basin_common::TenantId,
+    path: &object_store::path::Path,
+) -> Result<Vec<RecordBatch>> {
+    let mut stream = storage.read_file(tenant, path).await?;
+    let mut out = Vec::new();
+    while let Some(batch) = stream.next().await {
+        out.push(batch?);
+    }
+    Ok(out)
+}
+
+/// AllMatch UPDATE: every row in `befores` is matched. Returns the
+/// post-SET batches.
+fn apply_assignments_all(
+    befores: &[RecordBatch],
+    assignments: &[(usize, ScalarValue)],
+) -> Result<Vec<RecordBatch>> {
+    let mut out = Vec::with_capacity(befores.len());
+    for b in befores {
+        let mask = BooleanArray::from(vec![true; b.num_rows()]);
+        out.push(apply_assignments(b, &mask, assignments)?);
+    }
+    Ok(out)
+}
+
+/// Pair before/after rows into [`RowChange`] entries. When `masks` is
+/// `Some`, only matched rows produce events (the Mixed branch); when
+/// `None`, every row produces one (the AllMatch / no-predicate branch).
+fn capture_update_events(
+    befores: &[RecordBatch],
+    afters: &[RecordBatch],
+    masks: Option<&[BooleanArray]>,
+    out: &mut Vec<RowChange>,
+) -> Result<()> {
+    debug_assert_eq!(befores.len(), afters.len());
+    for (i, (b, a)) in befores.iter().zip(afters.iter()).enumerate() {
+        let mask = masks.map(|m| &m[i]);
+        for row in 0..b.num_rows() {
+            let matched =
+                mask.map_or(true, |m| !m.is_null(row) && m.value(row));
+            if !matched {
+                continue;
+            }
+            out.push(RowChange {
+                before: Some(build_row_json(b, row)?),
+                after: Some(build_row_json(a, row)?),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Wrap the pruning evaluator: returns `Mixed` if the predicate is `None`
@@ -694,6 +1024,27 @@ fn build_assigned_column(
             }
             Ok(Arc::new(b.finish()))
         }
+        // TIMESTAMPTZ assignment, used by AUTO_UPDATE / SOFT DELETE
+        // injection. The scalar is i64 microseconds since epoch.
+        (DataType::Timestamp(TimeUnit::Microsecond, _), ScalarValue::Int64(v)) => {
+            let arr = original
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    BasinError::internal("expected TimestampMicrosecondArray for SET")
+                })?;
+            let mut b = TimestampMicrosecondBuilder::with_capacity(n).with_data_type(dt.clone());
+            for i in 0..n {
+                if matched(i) {
+                    b.append_value(*v);
+                } else if arr.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(arr.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         // Cross-type assignments (e.g. SET id = '5') aren't supported in
         // v0.1. Mention both sides in the error so debugging is easy.
         (col_type, scalar) => Err(BasinError::InvalidSchema(format!(
@@ -719,6 +1070,15 @@ fn parse_assignments(
         let idx = schema
             .index_of(&col_name)
             .map_err(|_| BasinError::InvalidSchema(format!("unknown column {col_name}")))?;
+        // Direct writes to a generated column are forbidden — match PG's
+        // SQLSTATE 42601 wording so ORM clients that key off that string
+        // detect Basin generated columns identically.
+        if crate::types::field_is_generated(schema.field(idx)).is_some() {
+            return Err(BasinError::InvalidSchema(format!(
+                "cannot insert into generated column {:?}",
+                schema.field(idx).name()
+            )));
+        }
         let dt = schema.field(idx).data_type().clone();
         let scalar = literal_to_scalar(&a.value, &dt, &col_name)?;
         out.push((idx, scalar));
@@ -765,6 +1125,31 @@ fn literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<ScalarValu
             } else {
                 Ok(ScalarValue::Boolean(*b))
             }
+        }
+        (DataType::Timestamp(TimeUnit::Microsecond, _), _) => {
+            let micros = match inner {
+                Expr::Value(Value::Number(s, _)) => s.parse::<i64>().map_err(|e| {
+                    BasinError::InvalidSchema(format!("bad timestamp literal {s:?}: {e}"))
+                })?,
+                Expr::Value(Value::SingleQuotedString(s))
+                | Expr::Value(Value::DoubleQuotedString(s))
+                | Expr::Value(Value::EscapedStringLiteral(s))
+                | Expr::Value(Value::NationalStringLiteral(s)) => {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_micros())
+                        .map_err(|e| {
+                            BasinError::InvalidSchema(format!(
+                                "bad RFC3339 timestamp {s:?} in SET {col}: {e}"
+                            ))
+                        })?
+                }
+                other => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "UPDATE SET {col}: expected timestamp literal, got {other}"
+                    )));
+                }
+            };
+            Ok(ScalarValue::Int64(if negated { -micros } else { micros }))
         }
         (col_type, other) => Err(BasinError::InvalidSchema(format!(
             "UPDATE SET {col}: expected literal of type {col_type:?}, got {other}"
@@ -1018,4 +1403,191 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
         )));
     }
     Ok(&name.0[0].value)
+}
+
+/// Append `(idx, ScalarValue::Int64(now_micros))` to `assignments` for any
+/// AUTO_UPDATE column on `schema` the user didn't already explicitly set.
+/// `now_micros` is captured once per UPDATE so every AUTO_UPDATE column
+/// stamped in the same statement gets the same timestamp.
+fn inject_auto_update_assignments(
+    schema: &Schema,
+    assignments: &mut Vec<(usize, ScalarValue)>,
+) {
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if !crate::types::field_is_auto_update(field) {
+            continue;
+        }
+        if assignments.iter().any(|(i, _)| *i == idx) {
+            continue;
+        }
+        assignments.push((idx, ScalarValue::Int64(now_micros)));
+    }
+}
+
+/// Translate `RowChange` (engine-internal pair) into the lifecycle
+/// crate's [`AuditRecord`] so `lifecycle::write_audit_rows` is the
+/// single place that knows the audit-table physical schema.
+async fn write_audit_rows(
+    sess: &TenantSession,
+    audit_table: &str,
+    op: ChangeOp,
+    rows: Vec<RowChange>,
+) -> Result<()> {
+    let records: Vec<AuditRecord> = rows
+        .into_iter()
+        .map(|r| AuditRecord {
+            before: r.before,
+            after: r.after,
+        })
+        .collect();
+    crate::lifecycle::write_audit_rows(sess, audit_table, op, records).await
+}
+
+/// Soft-delete rewrite. Behaves like `UPDATE foo SET <sd_col> = now()
+/// WHERE <user-pred> AND <sd_col> IS NULL`. The audit op (when
+/// configured) is `'delete'` because that's what the user asked for —
+/// the underlying write being an UPDATE is an implementation detail.
+async fn exec_soft_delete(
+    sess: &TenantSession,
+    table: TableName,
+    schema: Arc<Schema>,
+    predicate_expr: Option<&Expr>,
+    sd_col: String,
+) -> Result<ExecResult> {
+    let storage = sess.engine.config().storage.clone();
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, &table)
+        .await?;
+
+    // Build the assignments: just `<sd_col> = now()`. AUTO_UPDATE stamps
+    // are skipped — soft-delete is a single-purpose stamp.
+    let sd_idx = schema.index_of(&sd_col).map_err(|_| {
+        BasinError::internal(format!("soft-delete column {sd_col:?} missing from schema"))
+    })?;
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let assignments = vec![(sd_idx, ScalarValue::Int64(now_micros))];
+
+    // Compose the effective predicate: `<user-pred> AND <sd_col> IS NULL`.
+    // Without the IS NULL guard a re-DELETE on already-soft-deleted rows
+    // would re-stamp the column and re-emit an audit row.
+    let mut pred = match predicate_expr {
+        None => CompoundPredicate::IsNull(sd_col.clone()),
+        Some(e) => {
+            let user_pred = parse_compound_predicate(e, schema.as_ref())?;
+            CompoundPredicate::And(vec![
+                user_pred,
+                CompoundPredicate::IsNull(sd_col.clone()),
+            ])
+        }
+    };
+    // Strip the trivial single-leg AND so pruning sees the same shape.
+    if let CompoundPredicate::And(ref mut legs) = pred {
+        if legs.len() == 1 {
+            pred = legs.remove(0);
+        }
+    }
+
+    let data_files = storage.list_data_files_with_stats(&sess.tenant, &table).await?;
+    if data_files.is_empty() {
+        return Ok(ExecResult::Empty {
+            tag: "DELETE 0".into(),
+        });
+    }
+
+    let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
+    let capture_events = sinks_attached(sess) || audit_table.is_some();
+
+    let mut updated_total: usize = 0;
+    let mut replaced_paths: Vec<String> = Vec::new();
+    let mut replacement_batches: Vec<RecordBatch> = Vec::new();
+    let mut event_payloads: Vec<RowChange> = Vec::new();
+
+    for f in &data_files {
+        let outcome = file_outcome(Some(&pred), f, schema.as_ref());
+        match outcome {
+            PruneOutcome::NoMatch => {}
+            PruneOutcome::AllMatch => {
+                let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                let news = apply_assignments_all(&befores, &assignments)?;
+                updated_total += f.row_count as usize;
+                replaced_paths.push(f.path.as_ref().to_string());
+                if capture_events {
+                    capture_update_events(&befores, &news, None, &mut event_payloads)?;
+                }
+                replacement_batches.extend(news);
+            }
+            PruneOutcome::Mixed => {
+                let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                let mut masks = Vec::with_capacity(befores.len());
+                let mut news = Vec::with_capacity(befores.len());
+                let mut matched = 0usize;
+                for b in &befores {
+                    let mask = evaluate_compound(b, &pred).map_err(|e| {
+                        BasinError::internal(format!("soft-delete predicate eval: {e}"))
+                    })?;
+                    matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
+                    news.push(apply_assignments(b, &mask, &assignments)?);
+                    masks.push(mask);
+                }
+                if matched == 0 {
+                    continue;
+                }
+                updated_total += matched;
+                replaced_paths.push(f.path.as_ref().to_string());
+                if capture_events {
+                    capture_update_events(&befores, &news, Some(&masks), &mut event_payloads)?;
+                }
+                replacement_batches.extend(news);
+            }
+        }
+    }
+
+    if updated_total == 0 {
+        return Ok(ExecResult::Empty {
+            tag: "DELETE 0".into(),
+        });
+    }
+
+    // Audit row payloads need to look like a DELETE (before=row,
+    // after=None) per the task contract, even though the underlying
+    // write was an UPDATE.
+    let audit_rows: Vec<RowChange> = if audit_table.is_some() {
+        event_payloads
+            .iter()
+            .map(|r| RowChange {
+                before: r.before.clone(),
+                after: None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let events = build_events(sess, &table, ChangeOp::Delete, event_payloads);
+    dispatch_pre_commit(&sess.engine, &events).await?;
+    let added_files =
+        write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
+    commit_replace(
+        sess,
+        &table,
+        meta.current_snapshot,
+        replaced_paths.clone(),
+        added_files,
+    )
+    .await?;
+    dispatch_post_commit(&sess.engine, events);
+    delete_objects(sess, &table, schema.as_ref(), &replaced_paths).await?;
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+
+    if let Some(audit) = audit_table.as_ref() {
+        write_audit_rows(sess, audit, ChangeOp::Delete, audit_rows).await?;
+    }
+
+    Ok(ExecResult::Empty {
+        tag: format!("DELETE {updated_total}"),
+    })
 }

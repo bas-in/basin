@@ -76,12 +76,16 @@
 
 mod client;
 mod guards;
+#[cfg(feature = "engine-store")]
 mod queue;
+#[cfg(feature = "engine-store")]
 mod store;
 mod types;
 
 pub use client::HttpClient;
 pub use guards::{AllowList, GuardConfig, RateLimit};
+#[cfg(feature = "engine-store")]
 pub use queue::{RequestQueue, RequestQueueHandle};
+#[cfg(feature = "engine-store")]
 pub use store::ResponseStore;
 pub use types::{HttpError, HttpRequest, HttpResponse, RequestId, ResponseRow};

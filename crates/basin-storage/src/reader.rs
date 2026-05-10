@@ -18,6 +18,7 @@ use parquet::file::statistics::Statistics;
 
 use crate::data_file::{ColumnStats, DataFile};
 use crate::encryption::{decrypt_envelope, BytesFileReader, EncryptionProvider, WrappedKey};
+use basin_catalog::TenantStorageConfig;
 use crate::metadata_cache::{CachedParquetMeta, ParquetMetaCache};
 use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache};
 use crate::paths::table_tier_prefix;
@@ -334,6 +335,15 @@ async fn read_paths_inner(
     let page_cache = storage.page_cache_handle().cloned();
     let tenant_counters = storage.tenant_counters(tenant);
     let encryption = storage.encryption_provider();
+    // Resolve the per-tenant storage config once for the whole batch of
+    // paths (cache hit on every path after the first); threaded through
+    // `read_one` so envelope-decrypt can use `unwrap_key_with_config`
+    // when present.
+    let tenant_config = if encryption.is_some() {
+        storage.tenant_storage_config_cached(tenant).await?
+    } else {
+        None
+    };
     let tenant_owned = *tenant;
     let stream = futures::stream::iter(paths)
         .map(move |p| {
@@ -344,6 +354,7 @@ async fn read_paths_inner(
             let page_cache = page_cache.clone();
             let tenant_counters = tenant_counters.clone();
             let encryption = encryption.clone();
+            let tenant_config = tenant_config.clone();
             async move {
                 read_one(
                     store,
@@ -354,6 +365,7 @@ async fn read_paths_inner(
                     page_cache,
                     tenant_counters,
                     encryption,
+                    tenant_config,
                     tenant_owned,
                 )
                 .await
@@ -387,6 +399,11 @@ pub(crate) async fn read_file(
     let page_cache = storage.page_cache_handle().cloned();
     let tenant_counters = storage.tenant_counters(tenant);
     let encryption = storage.encryption_provider();
+    let tenant_config = if encryption.is_some() {
+        storage.tenant_storage_config_cached(tenant).await?
+    } else {
+        None
+    };
     read_one(
         store,
         path.clone(),
@@ -396,6 +413,7 @@ pub(crate) async fn read_file(
         page_cache,
         tenant_counters,
         encryption,
+        tenant_config,
         *tenant,
     )
     .await
@@ -411,6 +429,7 @@ async fn read_one(
     page_cache: Option<Arc<PageCache>>,
     tenant_counters: Option<Arc<basin_common::TenantCounters>>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
+    tenant_config: Option<TenantStorageConfig>,
     tenant: TenantId,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     // Page-cache fast path. Composes with everything below: a hit
@@ -444,8 +463,14 @@ async fn read_one(
     // `BytesFileReader`. Files written before the provider was attached
     // have no sidecar — they take the plaintext path below (back-compat).
     if let Some(provider) = encryption.as_ref() {
-        if let Some(plaintext) =
-            try_load_encrypted(&store, &path, provider.as_ref(), &tenant).await?
+        if let Some(plaintext) = try_load_encrypted(
+            &store,
+            &path,
+            provider.as_ref(),
+            tenant_config.as_ref(),
+            &tenant,
+        )
+        .await?
         {
             return finalize_encrypted_stream(
                 plaintext,
@@ -727,6 +752,7 @@ async fn try_load_encrypted(
     store: &Arc<dyn ObjectStore>,
     path: &ObjectPath,
     provider: &dyn EncryptionProvider,
+    tenant_config: Option<&TenantStorageConfig>,
     tenant: &TenantId,
 ) -> Result<Option<Vec<u8>>> {
     let sidecar = wrapped_sidecar_key(path);
@@ -750,9 +776,15 @@ async fn try_load_encrypted(
         .bytes()
         .await
         .map_err(|e| BasinError::storage(format!("read sidecar {sidecar}: {e}")))?;
-    let data_key = provider
-        .unwrap_key(tenant, &WrappedKey(wrapped_bytes.to_vec()))
-        .await?;
+    let wrapped = WrappedKey(wrapped_bytes.to_vec());
+    let data_key = match tenant_config {
+        Some(cfg) => {
+            provider
+                .unwrap_key_with_config(tenant, &wrapped, cfg)
+                .await?
+        }
+        None => provider.unwrap_key(tenant, &wrapped).await?,
+    };
     let envelope = store
         .get(path)
         .await

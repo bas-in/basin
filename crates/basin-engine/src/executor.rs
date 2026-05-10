@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{DataFileRef, TableMetadata};
-use basin_common::{BasinError, PartitionKey, Result, TableName};
+use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName};
 use basin_storage::WriteOptions;
 use sqlparser::ast::{ObjectName, SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -13,8 +13,16 @@ use sqlparser::parser::Parser;
 
 use crate::analytical_route::is_analytical;
 use crate::convert::{batch_df_to_ws, schema_df_to_ws};
-use crate::ddl::{extract_create_table_cluster_by, partition_spec_from_ast, schema_from_columns};
+use crate::ddl::{
+    extract_create_table_cluster_by, partition_spec_from_ast, schema_from_columns_with_lifecycle,
+};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
+use crate::lifecycle::{
+    extract_create_table_lifecycle, extract_select_include_deleted, CreateTableLifecycle,
+};
+use crate::events::{
+    build_row_json, dispatch_post_commit, dispatch_pre_commit, make_event, registry_has_any,
+};
 use crate::fast_select::{execute_simple_select, match_simple_select};
 use crate::session::refresh_table;
 use crate::{ExecResult, TenantSession};
@@ -47,23 +55,227 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
 
+    // REFRESH MATERIALIZED VIEW <name> — sqlparser has no AST node for
+    // REFRESH, so we recognise the full statement textually and dispatch.
+    if let Some(name) = crate::cv_ddl::match_refresh_materialized_view(sql)? {
+        return crate::cv_ddl::exec_refresh_materialized_view(sess, &name).await;
+    }
+
+    // ALTER FUNCTION <name>(<args>) RENAME TO <new>: sqlparser 0.52 has no
+    // AlterFunction AST node, so we recognise the full statement textually
+    // and dispatch to the catalog rename helper.
+    if let Some((old, new)) = crate::function_ddl::match_alter_function_rename(sql)? {
+        return crate::function_ddl::exec_alter_function_rename(sess, &old, &new).await;
+    }
+
+    // ALTER TYPE <name> ADD VALUE 'label': sqlparser 0.52 has no
+    // AlterType AST node either; textual pre-screen + dispatch.
+    if let Some((name, value)) = crate::type_ddl::match_alter_type_add_value(sql)? {
+        return crate::type_ddl::exec_alter_type_add_value(sess, &name, &value).await;
+    }
+
+    // CREATE DOMAIN: sqlparser 0.52's CREATE parser rejects `DOMAIN`.
+    if let Some((name, base, check)) = crate::type_ddl::match_create_domain(sql)? {
+        return crate::type_ddl::exec_create_domain(sess, &name, base, check).await;
+    }
+
+    // DROP DOMAIN: sqlparser 0.52's DROP parser rejects `DOMAIN`.
+    if let Some((name, if_exists)) = crate::type_ddl::match_drop_domain(sql)? {
+        return crate::type_ddl::exec_drop_domain(sess, &name, if_exists).await;
+    }
+
+    // CREATE PROCEDURE … LANGUAGE sql AS $$ … $$: sqlparser 0.52 only
+    // parses the T-SQL `AS BEGIN … END` shape natively, so the
+    // PG-style form is recognised textually before sqlparser sees it.
+    // See `procedure_ddl::match_create_procedure` for the shape.
+    if let Some((name, args, body)) = crate::procedure_ddl::match_create_procedure(sql)? {
+        return crate::procedure_ddl::exec_create_procedure(sess, &name, args, &body).await;
+    }
+
+    // 5.11.I — `ALTER TABLE … SUBSCRIBE WEBHOOK …`. sqlparser 0.52's
+    // ALTER TABLE AST has no SUBSCRIBE arm; the matcher in
+    // `crate::webhook_ddl` recognises the full shape textually.
+    if let Some(intent) = crate::webhook_ddl::match_alter_table_subscribe_webhook(sql)? {
+        crate::webhook_ddl::exec_subscribe_webhook(
+            intent,
+            &sess.tenant,
+            sess.engine.webhook_registry(),
+        )
+        .await?;
+        return Ok(ExecResult::Empty {
+            tag: "ALTER TABLE".into(),
+        });
+    }
+
+    // 5.11.I — `ALTER TABLE … UNSUBSCRIBE WEBHOOK <name>`. Same rationale
+    // as the SUBSCRIBE arm above.
+    if let Some(intent) = crate::webhook_ddl::match_alter_table_unsubscribe_webhook(sql)? {
+        crate::webhook_ddl::exec_unsubscribe_webhook(
+            intent,
+            &sess.tenant,
+            sess.engine.webhook_registry(),
+        )
+        .await?;
+        return Ok(ExecResult::Empty {
+            tag: "ALTER TABLE".into(),
+        });
+    }
+
+    // 5.11.C — `ALTER TABLE … REACT ON … EXECUTE <body>`. The body matcher
+    // returns `None` when the statement is the C2 constraint-shaped form
+    // (which the next arm handles), so the dispatch order is:
+    //   body matcher first → `None` for constraint shape →
+    //   constraint matcher → DROP REACTOR.
+    if let Some(intent) = crate::reactor_ddl::match_alter_table_react_on(sql)? {
+        crate::reactor_ddl::exec_react_on(intent, &sess.tenant, &sess.engine.config().catalog)
+            .await?;
+        return Ok(ExecResult::Empty {
+            tag: "ALTER TABLE".into(),
+        });
+    }
+
+    // 5.11.C2 — `ALTER TABLE … REACT ON … CONSTRAINT (<predicate>)`.
+    if let Some(intent) = crate::reactor_ddl::match_alter_table_react_constraint(sql)? {
+        crate::reactor_ddl::exec_react_constraint(
+            intent,
+            &sess.tenant,
+            &sess.engine.config().catalog,
+        )
+        .await?;
+        return Ok(ExecResult::Empty {
+            tag: "ALTER TABLE".into(),
+        });
+    }
+
+    // 5.11.C — `DROP REACTOR <name> ON <table>`. sqlparser has no
+    // `DROP REACTOR` AST node.
+    if let Some(intent) = crate::reactor_ddl::match_drop_reactor(sql)? {
+        crate::reactor_ddl::exec_drop_reactor(intent, &sess.tenant, &sess.engine.config().catalog)
+            .await?;
+        return Ok(ExecResult::Empty {
+            tag: "DROP REACTOR".into(),
+        });
+    }
+
+    // DROP MATERIALIZED VIEW [IF EXISTS] <name> — sqlparser's DROP parser
+    // does not recognise MATERIALIZED VIEW, so we handle the full
+    // statement before sqlparser sees it. DROP TABLE / DROP VIEW return
+    // None and fall through to sqlparser's standard path.
+    if let Some((name, if_exists)) = crate::cv_ddl::match_drop_materialized_view(sql)? {
+        return crate::cv_ddl::exec_drop_materialized_view(sess, &name, if_exists).await;
+    }
+
+    // CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] <name> [opt …] —
+    // sqlparser 0.52 only parses one option per CREATE SEQUENCE
+    // statement, so the full PG grammar (`START 100 INCREMENT 5 MINVALUE
+    // 1 MAXVALUE 1000 CACHE 1 NO CYCLE`) fails at the second option.
+    // The textual matcher claims any CREATE SEQUENCE shape; the
+    // single-option AST-driven path remains as a fallback for SQL we
+    // somehow miss here.
+    if let Some(intent) = crate::seq_ddl::match_create_sequence(sql)? {
+        return crate::seq_ddl::exec_create_sequence_pre_screen(sess, intent).await;
+    }
+
+    // CREATE MATERIALIZED VIEW ... WITH (basin.continuous, refresh_interval =
+    // '...'): sqlparser's WITH-clause parser cannot ingest a dotted-key
+    // option like `basin.continuous`, so we lift the entire WITH (...) body
+    // before sqlparser sees the SQL. The options live in `cv_options`; the
+    // remainder is a vanilla CREATE MATERIALIZED VIEW the standard parser
+    // accepts.
+    let (cv_stripped, cv_options) = crate::cv_ddl::extract_basin_cv_options(sql)?;
+    let cv_stripped_owned = cv_stripped;
+    let sql = cv_stripped_owned.as_str();
+
     // Phase 5.7 B2: lift trailing `CLUSTER BY (col, …)` out of CREATE TABLE
     // before sqlparser sees it. PostgreSqlDialect doesn't recognise the
     // form so we strip it here and apply the columns via `set_cluster_columns`
     // after the table is created. Returns the original SQL untouched when
     // the clause isn't present.
     let (cluster_stripped, cluster_columns) = extract_create_table_cluster_by(sql)?;
-    let sql = cluster_stripped.as_str();
+    // Lift declarative lifecycle markers (AUTO_UPDATE / SOFT DELETE column
+    // attributes, trailing AUDIT TO clause). Same pre-screen strategy as
+    // CLUSTER BY: sqlparser doesn't recognise these forms.
+    let (lifecycle_stripped, lifecycle) =
+        extract_create_table_lifecycle(cluster_stripped.as_str())?;
+    let sql_owned = lifecycle_stripped;
+    let sql = sql_owned.as_str();
+
+    // INCLUDE DELETED on SELECT is the soft-delete opt-out.
+    let (select_stripped, include_deleted) = extract_select_include_deleted(sql);
+    let sql = select_stripped.as_str();
 
     // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
     let rewritten = crate::udf::rewrite_vector_operators(sql);
-    let sql = rewritten.as_str();
+    // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
+    // Float64 with sub-second precision (PG's `extract(second ...)` shape).
+    // Other EXTRACT fields fall through to DataFusion's `date_part`.
+    let rewritten = crate::udf::rewrite_extract_second(&rewritten);
+    // User-defined `LANGUAGE sql` function inlining. The rewriter is a
+    // no-op for tenants with no registered functions and for statements
+    // that contain no function calls at all (the cheap pre-gate runs
+    // before any catalog hop). Anything else gets rewritten so DataFusion
+    // sees the body inlined into the call site.
+    let inlined = crate::sql_functions::rewrite_sql_inlining_functions(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        &rewritten,
+    )
+    .await?;
+    // Rewrite sequence calls (`nextval('seq')` / `currval('seq')` /
+    // `setval('seq', n[, advance])`) to BIGINT literals before sqlparser
+    // sees the SQL. Each call dispatches to the catalog (advancing
+    // sequence state for `nextval` / `setval`); the per-session
+    // `currval` cache is updated as part of the dispatch. No-op for
+    // SQL with no sequence call sites.
+    let seq_ctx = crate::seq_udf::SequenceContext {
+        catalog: &sess.engine.config().catalog,
+        tenant: sess.tenant,
+        session_cache: &sess.state.sequence_cache,
+    };
+    let seq_rewritten =
+        crate::seq_udf::rewrite_sequence_calls(&inlined, &seq_ctx).await?;
+    // Phase 5.11.K2 follow-up: enum columns referenced in ORDER BY or
+    // ordering comparisons (`<`, `>`, `<=`, `>=`, BETWEEN) need to be
+    // sorted/compared by declaration-order ordinal, not by Arrow's
+    // lexicographic Utf8 compare. We swap the column reference for a
+    // `CASE WHEN col = 'lbl0' THEN 0 ... END` expression so the planner
+    // sees integer ordinals at sort/range time. Best-effort: queries
+    // with joins / derived tables / ambiguous column refs silently
+    // skip the rewrite and fall back to label-string compare.
+    let enum_rewritten = crate::enum_ordinal::rewrite_enum_ordering(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        &seq_rewritten,
+    )
+    .await?;
+    let sql = enum_rewritten.as_str();
     let dialect = PostgreSqlDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| BasinError::internal(format!("parse error: {e}")))?;
+    let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
+        // sqlparser's PostgreSqlDialect requires `STORED` after a
+        // `GENERATED ALWAYS AS (...)` block. Map both the `VIRTUAL`
+        // alternative and the bare-paren omit-`STORED` form to PG's
+        // SQLSTATE 0A000 (feature_not_supported), matching what the
+        // engine produces when `VIRTUAL` slips through to the AST
+        // walker. Keeps every "no STORED" surface consistent.
+        let msg = format!("{e}");
+        if msg.contains("Expected: STORED") {
+            BasinError::FeatureNotSupported(
+                "VIRTUAL generated columns deferred to v0.2; use STORED".to_string(),
+            )
+        } else {
+            BasinError::internal(format!("parse error: {e}"))
+        }
+    })?;
 
+    // Each call to `execute` handles exactly one statement. Multi-statement
+    // simple-query messages (`tokio_postgres::batch_execute`, `psql -f
+    // setup.sql`) are split into individual statements by the router-side
+    // pgwire handler before they reach the engine — see
+    // `basin_router::protocol::split_simple_query`. This guard is the
+    // safety net for callers that bypass the router (and a defensive
+    // assertion against future regressions in the splitter).
     if stmts.len() != 1 {
         return Err(BasinError::internal(format!(
             "expected exactly one statement, got {}",
@@ -100,7 +312,135 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     }
 
     match stmt {
-        Statement::CreateTable(ct) => exec_create_table(sess, ct, cluster_columns).await,
+        Statement::CreateTable(ct) => exec_create_table(sess, ct, cluster_columns, lifecycle).await,
+        Statement::CreateView {
+            name,
+            query,
+            materialized,
+            ..
+        } => {
+            if !materialized {
+                return Err(BasinError::internal(
+                    "CREATE VIEW (non-materialised) is not supported in v0.1; \
+                     use CREATE MATERIALIZED VIEW ... WITH (basin.continuous, ...)",
+                ));
+            }
+            let view_name = single_part_name(&name)?.to_string();
+            let opts = cv_options.unwrap_or_default();
+            if !opts.continuous {
+                return Err(BasinError::InvalidSchema(
+                    "CREATE MATERIALIZED VIEW requires WITH (basin.continuous, \
+                     refresh_interval = '<duration>')"
+                        .into(),
+                ));
+            }
+            let interval = opts.refresh_interval_secs.ok_or_else(|| {
+                BasinError::InvalidSchema(
+                    "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
+                     requires refresh_interval = '<duration>'"
+                        .into(),
+                )
+            })?;
+            let source_sql = query.to_string();
+            crate::cv_ddl::exec_create_materialized_view(sess, &view_name, &source_sql, interval)
+                .await
+        }
+        Statement::CreateFunction {
+            or_replace,
+            temporary,
+            name,
+            args,
+            return_type,
+            function_body,
+            language,
+            behavior: _,
+            called_on_null: _,
+            parallel: _,
+            using: _,
+            if_not_exists: _,
+            determinism_specifier: _,
+            options: _,
+            remote_connection: _,
+        } => {
+            crate::function_ddl::exec_create_function(
+                sess,
+                or_replace,
+                temporary,
+                name,
+                args,
+                return_type,
+                function_body,
+                language,
+            )
+            .await
+        }
+        Statement::DropFunction {
+            if_exists,
+            func_desc,
+            option: _,
+        } => {
+            let names = func_desc.into_iter().map(|d| d.name).collect();
+            crate::function_ddl::exec_drop_function(sess, if_exists, names).await
+        }
+        Statement::DropProcedure {
+            if_exists,
+            proc_desc,
+            option: _,
+        } => crate::procedure_ddl::exec_drop_procedure(sess, if_exists, proc_desc).await,
+        Statement::Call(call) => crate::procedure_ddl::exec_call(sess, call).await,
+        Statement::CreateType { name, representation } => {
+            use sqlparser::ast::UserDefinedTypeRepresentation;
+            match representation {
+                UserDefinedTypeRepresentation::Enum { labels } => {
+                    crate::type_ddl::exec_create_type_enum(sess, name, labels).await
+                }
+                UserDefinedTypeRepresentation::Composite { .. } => Err(
+                    BasinError::FeatureNotSupported(
+                        "CREATE TYPE … AS (composite) is out of scope for v0.1; \
+                         only AS ENUM is supported".into(),
+                    ),
+                ),
+            }
+        }
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Type,
+            if_exists,
+            names,
+            cascade: _,
+            restrict: _,
+            purge: _,
+            temporary: _,
+        } => crate::type_ddl::exec_drop_type(sess, if_exists, &names).await,
+        Statement::CreateSequence {
+            temporary,
+            if_not_exists,
+            name,
+            data_type: _,
+            sequence_options,
+            owned_by: _,
+        } => {
+            // sqlparser 0.52 parses `CREATE SEQUENCE` natively. The
+            // `data_type` / `owned_by` fields are accepted but ignored
+            // in v0.1 — the catalog stores `i64` sequences and has no
+            // notion of column-attached ownership yet.
+            crate::seq_ddl::exec_create_sequence(
+                sess,
+                temporary,
+                if_not_exists,
+                name,
+                sequence_options,
+            )
+            .await
+        }
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Sequence,
+            if_exists,
+            names,
+            cascade: _,
+            restrict: _,
+            purge: _,
+            temporary: _,
+        } => crate::seq_ddl::exec_drop_sequence(sess, if_exists, &names).await,
         Statement::Insert(ins) => exec_insert(sess, ins).await,
         Statement::Query(_) => {
             // Analytical routing happens before the point-query fast path so
@@ -140,11 +480,13 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             // RLS off see the fast path exactly as before — same one-`bool`
             // catalog read the existing path already pays.
             if let Some(plan) = match_simple_select(&stmt) {
-                if !table_has_rls(sess, &plan.table).await? {
+                if !table_has_rls(sess, &plan.table).await?
+                    && !table_has_soft_delete(sess, &plan.table).await?
+                {
                     return execute_simple_select(sess, plan).await;
                 }
             }
-            exec_select(sess, sql).await
+            exec_select(sess, sql, include_deleted).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
         Statement::AlterTable {
@@ -188,12 +530,28 @@ fn rows_from_batches(batches: Vec<RecordBatch>) -> ExecResult {
 
 async fn exec_create_table(
     sess: &TenantSession,
-    ct: sqlparser::ast::CreateTable,
+    mut ct: sqlparser::ast::CreateTable,
     cluster_columns: Option<Vec<String>>,
+    lifecycle: CreateTableLifecycle,
 ) -> Result<ExecResult> {
     let name = single_part_name(&ct.name)?;
     let table = TableName::new(name)?;
-    let schema = schema_from_columns(&ct.columns)?;
+
+    // Phase 5.11.K2: resolve column types that reference a user-defined
+    // enum or domain. Each match rewrites the column's data_type to the
+    // underlying Arrow-mappable shape and stamps a `BASIN_ENUM_TYPE` /
+    // `BASIN_DOMAIN` field-metadata marker so the INSERT path can
+    // validate values + the catalog can refcount.
+    let bindings = crate::type_ddl::resolve_user_type_columns(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        &ct.columns,
+    )
+    .await?;
+    let extra_md = crate::type_ddl::rewrite_user_type_columns(&mut ct.columns, &bindings)?;
+
+    let schema = schema_from_columns_with_lifecycle(&ct.columns, &lifecycle)?;
+    let schema = crate::type_ddl::apply_user_type_metadata(schema, &extra_md);
     let spec = partition_spec_from_ast(ct.partition_by.as_deref(), &schema)?;
 
     // Validate cluster columns are a subset of the table's columns BEFORE
@@ -243,17 +601,22 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     let table = TableName::new(name)?;
 
     // Pull literal rows out of `INSERT ... VALUES (...)`. Subquery inserts
-    // (`INSERT ... SELECT ...`) are deliberately rejected here for the PoC.
+    // (`INSERT ... SELECT ...`) are routed through `exec_insert_select`
+    // below; the body is materialised into VALUES-shaped rows.
     let source = ins.source.as_ref().ok_or_else(|| {
         BasinError::internal("INSERT without VALUES is not supported in PoC")
     })?;
-    let rows = match source.body.as_ref() {
+    if !matches!(source.body.as_ref(), SetExpr::Values(_)) {
+        // INSERT INTO <t> SELECT ... — materialise the SELECT into a
+        // RecordBatch via the session's DataFusion context (which already
+        // sees inlined user-defined functions, RLS policies, etc.) and
+        // hand the resulting rows to the standard INSERT path as if they
+        // had been written as VALUES literals.
+        return exec_insert_select(sess, &table, &ins, source.as_ref()).await;
+    }
+    let rows_raw = match source.body.as_ref() {
         SetExpr::Values(v) => &v.rows,
-        _ => {
-            return Err(BasinError::internal(
-                "only INSERT INTO ... VALUES (...) is supported in PoC",
-            ));
-        }
+        _ => unreachable!("checked above"),
     };
 
     let meta = sess
@@ -263,7 +626,23 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         .load_table(&sess.tenant, &table)
         .await?;
     let schema = meta.schema.clone();
-    let row_count = rows.len();
+    let row_count = rows_raw.len();
+
+    // Reject direct writes to generated columns + expand `INSERT INTO t
+    // (col_subset) VALUES ...` into full schema-width rows with NULL in
+    // unmentioned columns. Generated columns are NULL'd here too;
+    // `materialise_generated_columns` overwrites them once the per-row
+    // batch is built.
+    let mut rows_expanded =
+        expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
+    // Substitute column-level DEFAULT expressions for omitted columns.
+    // For columns with `BASIN_COLUMN_DEFAULT` metadata that the user did
+    // not explicitly write, evaluate the default text (which routes any
+    // `nextval(...)` calls through `Catalog::nextval` so each row gets a
+    // distinct value) and overwrite the NULL placeholder produced by
+    // `expand_insert_rows`. User-written NULL is preserved.
+    apply_column_defaults(sess, schema.as_ref(), &ins.columns, &mut rows_expanded).await?;
+    let rows: &[Vec<sqlparser::ast::Expr>] = &rows_expanded;
 
     // Partitioned path. We must compute each row's partition key from its
     // partition-column value before producing any RecordBatch — multi-row
@@ -278,14 +657,46 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         // through compaction yet. Fall through to the synchronous Parquet
         // write path below.
         let opts = write_options_for(&meta);
-        let mut file_refs: Vec<DataFileRef> = Vec::with_capacity(groups.len());
+        let mut materialised_groups: Vec<(PartitionKey, RecordBatch)> =
+            Vec::with_capacity(groups.len());
         for (pkey, group_rows) in groups {
             let batch = batch_from_rows(schema.clone(), &group_rows)?;
+            let batch = crate::generated_cols::materialise_generated_columns(
+                &sess.engine.config().catalog,
+                &sess.tenant,
+                batch,
+            )
+            .await?;
+            crate::type_ddl::enforce_enum_labels(
+                &sess.engine.config().catalog,
+                &sess.tenant,
+                &batch,
+            )
+            .await?;
+            crate::type_ddl::enforce_domain_checks(
+                &sess.engine.config().catalog,
+                &sess.tenant,
+                &batch,
+            )
+            .await?;
+            materialised_groups.push((pkey, batch));
+        }
+
+        // Pre-commit before any Parquet IO so a rejecting sink leaves the
+        // object store untouched. Sinks see the in-memory `after` payload;
+        // they don't need the on-disk file.
+        let preview_batches: Vec<RecordBatch> =
+            materialised_groups.iter().map(|(_, b)| b.clone()).collect();
+        let events = build_insert_events(sess, &table, &preview_batches)?;
+        dispatch_pre_commit(&sess.engine, &events).await?;
+
+        let mut file_refs: Vec<DataFileRef> = Vec::with_capacity(materialised_groups.len());
+        for (pkey, batch) in &materialised_groups {
             let df = sess
                 .engine
                 .config()
                 .storage
-                .write_batch_with_options(&sess.tenant, &table, &pkey, &batch, &opts)
+                .write_batch_with_options(&sess.tenant, &table, pkey, batch, &opts)
                 .await?;
             file_refs.push(DataFileRef {
                 path: df.path.as_ref().to_string(),
@@ -296,13 +707,33 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         }
 
         commit_with_retry(sess, &table, meta.current_snapshot, file_refs).await?;
+        dispatch_post_commit(&sess.engine, events);
         refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+        write_insert_audit_rows(sess, meta.schema.as_ref(), &preview_batches).await?;
         return Ok(ExecResult::Empty {
             tag: format!("INSERT 0 {row_count}"),
         });
     }
 
     let batch = batch_from_rows(schema, rows)?;
+    let batch = crate::generated_cols::materialise_generated_columns(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        batch,
+    )
+    .await?;
+    crate::type_ddl::enforce_enum_labels(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        &batch,
+    )
+    .await?;
+    crate::type_ddl::enforce_domain_checks(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        &batch,
+    )
+    .await?;
     let row_count = batch.num_rows();
     let part = PartitionKey::default_key();
 
@@ -321,6 +752,15 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     }
 
     // Legacy synchronous path (no shard configured).
+    //
+    // Order: write parquet → refresh listing table → dispatch pre-commit
+    // → commit catalog. This lets pre-commit reactors (5.11.C2 constraint
+    // reactors in particular) see the in-flight row when they evaluate
+    // their predicates against the table. If a reactor rejects, we delete
+    // the orphan parquet file and re-refresh so the failure is invisible
+    // to subsequent queries.
+    let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
+
     let opts = write_options_for(&meta);
     let df = sess
         .engine
@@ -336,13 +776,485 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         column_stats: df.column_stats.clone(),
     };
 
+    // Refresh the listing table now so reactor-bodied SELECTs see the
+    // new row. Then dispatch pre-commit; on error, roll back by deleting
+    // the orphan file (the catalog snapshot is unchanged at this point,
+    // so cleanup is just removing the orphan parquet).
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
+        let _ = sess
+            .engine
+            .config()
+            .storage
+            .delete_file(&sess.tenant, &df.path)
+            .await;
+        let _ =
+            refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await;
+        return Err(e);
+    }
+
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
+    dispatch_post_commit(&sess.engine, events);
 
     refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 
     Ok(ExecResult::Empty {
         tag: format!("INSERT 0 {row_count}"),
     })
+}
+
+/// `INSERT INTO <table> [(<cols>)] <SELECT ...>` (or any non-VALUES
+/// query body). Materialises the source query through the session's
+/// DataFusion context — which already sees inlined user-defined
+/// functions, RLS predicates, and partition pruning — and writes the
+/// resulting batch using the same legacy synchronous path that the
+/// VALUES form uses. Partitioned tables, generated columns, and the
+/// shard-write path are out of scope for v0.1 INSERT-SELECT.
+async fn exec_insert_select(
+    sess: &TenantSession,
+    table: &TableName,
+    ins: &sqlparser::ast::Insert,
+    source: &sqlparser::ast::Query,
+) -> Result<ExecResult> {
+    use crate::convert::batch_df_to_ws;
+    use arrow_array::{ArrayRef, RecordBatch};
+
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, table)
+        .await?;
+    let schema = meta.schema.clone();
+
+    if matches!(meta.partition_spec, PartitionSpec::RangeMonthly { .. }) {
+        return Err(BasinError::internal(
+            "INSERT INTO ... SELECT is not supported on partitioned tables in v0.1",
+        ));
+    }
+    if schema
+        .fields()
+        .iter()
+        .any(|f| crate::types::field_is_generated(f).is_some())
+    {
+        return Err(BasinError::internal(
+            "INSERT INTO ... SELECT is not supported on tables with generated columns in v0.1",
+        ));
+    }
+
+    // Run the source SELECT through the session context. The full
+    // pre-screen pipeline (function inlining, vector-operator rewrite,
+    // RLS via `apply_rls_to_select`-equivalents) ran on the parent
+    // statement; the source query inherits that. We do *not* re-run
+    // the inliner here because it already mutated the AST in
+    // `executor::execute`'s SQL-string pass.
+    let source_sql = source.to_string();
+    let df = sess
+        .ctx
+        .sql(&source_sql)
+        .await
+        .map_err(|e| BasinError::internal(format!("INSERT INTO ... SELECT plan: {e}")))?;
+    let df_batches = df
+        .collect()
+        .await
+        .map_err(|e| BasinError::internal(format!("INSERT INTO ... SELECT execute: {e}")))?;
+
+    // Concatenate batches and convert to workspace arrow.
+    let combined_df = if df_batches.is_empty() {
+        // Empty result — produce an empty batch with the source schema
+        // for the column-mapping step below; the write path is a no-op
+        // when there are no rows.
+        let plan_schema = sess
+            .ctx
+            .sql(&source_sql)
+            .await
+            .map_err(|e| BasinError::internal(format!("INSERT INTO ... SELECT replan: {e}")))?
+            .schema()
+            .as_arrow()
+            .clone();
+        datafusion::arrow::record_batch::RecordBatch::new_empty(Arc::new(plan_schema))
+    } else if df_batches.len() == 1 {
+        df_batches.into_iter().next().unwrap()
+    } else {
+        let s = df_batches[0].schema();
+        datafusion::arrow::compute::concat_batches(&s, &df_batches)
+            .map_err(|e| BasinError::internal(format!("concat INSERT-SELECT batches: {e}")))?
+    };
+    let source_batch = batch_df_to_ws(&combined_df)?;
+    let row_count = source_batch.num_rows();
+
+    // Map source columns to the target schema: when `INSERT INTO t (a, b)
+    // SELECT ...` is given, the source's i-th column lands in column `a`,
+    // etc. When `(a, b)` is omitted, we insist the source's column count
+    // matches the target schema width and use the target's column order.
+    let target_cols: Vec<usize> = if ins.columns.is_empty() {
+        if source_batch.num_columns() != schema.fields().len() {
+            return Err(BasinError::InvalidSchema(format!(
+                "INSERT INTO {}: source has {} columns, target has {}",
+                table.as_str(),
+                source_batch.num_columns(),
+                schema.fields().len()
+            )));
+        }
+        (0..schema.fields().len()).collect()
+    } else {
+        if source_batch.num_columns() != ins.columns.len() {
+            return Err(BasinError::InvalidSchema(format!(
+                "INSERT INTO {}: source has {} columns, target column list has {}",
+                table.as_str(),
+                source_batch.num_columns(),
+                ins.columns.len()
+            )));
+        }
+        let mut by_name = std::collections::HashMap::with_capacity(schema.fields().len());
+        for (i, f) in schema.fields().iter().enumerate() {
+            by_name.insert(f.name().to_ascii_lowercase(), i);
+        }
+        let mut out = Vec::with_capacity(ins.columns.len());
+        for c in &ins.columns {
+            let key = c.value.to_ascii_lowercase();
+            let idx = *by_name.get(&key).ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "INSERT references unknown column {:?}",
+                    c.value
+                ))
+            })?;
+            out.push(idx);
+        }
+        out
+    };
+
+    // Build a target-schema-shaped batch by placing each source column at
+    // the matching target index; unmentioned target columns get NULL
+    // arrays of the right type. The per-cell types must already match —
+    // we don't re-coerce here (DataFusion's type coercion already ran).
+    let n_cols = schema.fields().len();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(n_cols);
+    for (target_idx, target_field) in schema.fields().iter().enumerate() {
+        if let Some(source_pos) = target_cols.iter().position(|&i| i == target_idx) {
+            let arr = source_batch.column(source_pos).clone();
+            if arr.data_type() != target_field.data_type() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "INSERT INTO {} column {:?}: source type {:?} does not match target type {:?}",
+                    table.as_str(),
+                    target_field.name(),
+                    arr.data_type(),
+                    target_field.data_type()
+                )));
+            }
+            columns.push(arr);
+        } else {
+            columns.push(arrow_array::new_null_array(
+                target_field.data_type(),
+                row_count,
+            ));
+        }
+    }
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| BasinError::internal(format!("build INSERT-SELECT batch: {e}")))?;
+
+    // Enum / domain check enforcement matches the VALUES path so
+    // constraint violations surface identically regardless of source.
+    crate::type_ddl::enforce_enum_labels(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        &batch,
+    )
+    .await?;
+    crate::type_ddl::enforce_domain_checks(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        &batch,
+    )
+    .await?;
+
+    let part = PartitionKey::default_key();
+    let events = build_insert_events(sess, table, std::slice::from_ref(&batch))?;
+
+    let opts = write_options_for(&meta);
+    let written = sess
+        .engine
+        .config()
+        .storage
+        .write_batch_with_options(&sess.tenant, table, &part, &batch, &opts)
+        .await?;
+
+    let file_ref = DataFileRef {
+        path: written.path.as_ref().to_string(),
+        size_bytes: written.size_bytes,
+        row_count: written.row_count,
+        column_stats: written.column_stats.clone(),
+    };
+
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+    if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
+        let _ = sess
+            .engine
+            .config()
+            .storage
+            .delete_file(&sess.tenant, &written.path)
+            .await;
+        let _ = refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await;
+        return Err(e);
+    }
+
+    commit_with_retry(sess, table, meta.current_snapshot, vec![file_ref]).await?;
+    dispatch_post_commit(&sess.engine, events);
+
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+    write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
+
+    Ok(ExecResult::Empty {
+        tag: format!("INSERT 0 {row_count}"),
+    })
+}
+
+/// Translate `INSERT INTO t (col_subset) VALUES (...)` into a list of
+/// schema-width rows by reordering the user's values to match the
+/// table's column order and inserting `NULL` placeholders in unmentioned
+/// positions. When `col_subset` is empty the rows pass through with one
+/// transform: any generated column gets a `NULL` slot inserted, leaving
+/// the user-supplied values right-shifted across the non-generated columns
+/// so the per-cell coercion sees a value where it expects one. This keeps
+/// the no-generated-column path byte-identical (rows pass through), while
+/// the generated-column path produces a NULL placeholder that the
+/// expression evaluator overwrites later.
+///
+/// Direct writes to a generated column are rejected here with the
+/// SQLSTATE-42601-shaped error PG ORMs key off.
+fn expand_insert_rows(
+    schema: &Schema,
+    insert_columns: &[sqlparser::ast::Ident],
+    rows: &[Vec<sqlparser::ast::Expr>],
+) -> Result<Vec<Vec<sqlparser::ast::Expr>>> {
+    use sqlparser::ast::{Expr, Value};
+    let n_cols = schema.fields().len();
+
+    // Build a quick `name -> index` lookup with case-folding.
+    let mut by_name = std::collections::HashMap::with_capacity(n_cols);
+    for (i, f) in schema.fields().iter().enumerate() {
+        by_name.insert(f.name().to_ascii_lowercase(), i);
+    }
+
+    // Reject direct writes to a generated column.
+    for c in insert_columns {
+        let key = c.value.to_ascii_lowercase();
+        let idx = *by_name.get(&key).ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "INSERT references unknown column {:?}",
+                c.value
+            ))
+        })?;
+        if crate::types::field_is_generated(schema.field(idx)).is_some() {
+            return Err(BasinError::InvalidSchema(format!(
+                "cannot insert into generated column {:?}",
+                schema.field(idx).name()
+            )));
+        }
+    }
+
+    // The user can omit `(col_subset)`; the engine still needs to land a
+    // schema-width row. Two possibilities:
+    //   1. Table has no generated columns. The legacy contract — every
+    //      column listed in declaration order — applies. Pass through.
+    //   2. Table has generated columns. The user supplies values for
+    //      every NON-generated column, and we insert NULL slots at the
+    //      generated positions.
+    if insert_columns.is_empty() {
+        let has_gen = schema
+            .fields()
+            .iter()
+            .any(|f| crate::types::field_is_generated(f).is_some());
+        if !has_gen {
+            return Ok(rows.to_vec());
+        }
+        let n_user = schema
+            .fields()
+            .iter()
+            .filter(|f| crate::types::field_is_generated(f).is_none())
+            .count();
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != n_user {
+                return Err(BasinError::InvalidSchema(format!(
+                    "row {i} has {} values, expected {n_user} (one per non-generated column)",
+                    row.len()
+                )));
+            }
+            let mut full: Vec<Expr> = Vec::with_capacity(n_cols);
+            let mut user_iter = row.iter();
+            for f in schema.fields() {
+                if crate::types::field_is_generated(f).is_some() {
+                    full.push(Expr::Value(Value::Null));
+                } else {
+                    full.push(user_iter.next().expect("count check above").clone());
+                }
+            }
+            out.push(full);
+        }
+        return Ok(out);
+    }
+
+    // `INSERT INTO t (col_subset) VALUES (...)` — build a name->position
+    // map, validate the user's row width, and place each value at its
+    // schema-side index.
+    let mut user_positions: Vec<usize> = Vec::with_capacity(insert_columns.len());
+    for c in insert_columns {
+        let idx = by_name[&c.value.to_ascii_lowercase()];
+        user_positions.push(idx);
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        if row.len() != insert_columns.len() {
+            return Err(BasinError::InvalidSchema(format!(
+                "row {i} has {} values, expected {} (one per listed column)",
+                row.len(),
+                insert_columns.len()
+            )));
+        }
+        let mut full: Vec<Expr> = vec![Expr::Value(Value::Null); n_cols];
+        for (val_idx, &col_idx) in user_positions.iter().enumerate() {
+            full[col_idx] = row[val_idx].clone();
+        }
+        out.push(full);
+    }
+    Ok(out)
+}
+
+/// For each column with a stored `BASIN_COLUMN_DEFAULT` metadata entry
+/// that the user did not explicitly mention in the INSERT, evaluate the
+/// DEFAULT expression once per row and overwrite the corresponding
+/// position. Generated columns are skipped (they're owned by
+/// `materialise_generated_columns`). User-written NULL is preserved by
+/// definition: this function only fires on positions the user *omitted*,
+/// inferred from the original `insert_columns` list.
+///
+/// `nextval('seq')` defaults are the load-bearing case: the rewriter
+/// dispatches to `Catalog::nextval` on each evaluation, so each row
+/// receives a distinct sequence value. See
+/// [`crate::seq_ddl::evaluate_default_expression`] for the per-call
+/// rewrite + parse hop.
+async fn apply_column_defaults(
+    sess: &TenantSession,
+    schema: &Schema,
+    insert_columns: &[sqlparser::ast::Ident],
+    rows: &mut [Vec<sqlparser::ast::Expr>],
+) -> Result<()> {
+    // Determine which columns the user explicitly mentioned. When
+    // `insert_columns` is empty, the user wrote `INSERT INTO t VALUES
+    // (...)` — every non-generated column is "mentioned" (the user
+    // supplied a value for each in declaration order); generated
+    // positions were filled with NULL by `expand_insert_rows` and
+    // `materialise_generated_columns` will overwrite them. So in the
+    // empty-`insert_columns` case there's nothing for DEFAULTs to do.
+    if insert_columns.is_empty() {
+        return Ok(());
+    }
+    let mut mentioned = vec![false; schema.fields().len()];
+    let mut by_name = std::collections::HashMap::with_capacity(schema.fields().len());
+    for (i, f) in schema.fields().iter().enumerate() {
+        by_name.insert(f.name().to_ascii_lowercase(), i);
+    }
+    for c in insert_columns {
+        if let Some(&idx) = by_name.get(&c.value.to_ascii_lowercase()) {
+            mentioned[idx] = true;
+        }
+    }
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        if mentioned[col_idx] {
+            continue;
+        }
+        if crate::types::field_is_generated(field).is_some() {
+            continue;
+        }
+        let Some(default_text) = crate::types::field_default_text(field) else {
+            continue;
+        };
+        // Evaluate the DEFAULT once per row so `nextval('seq')` hands
+        // out a fresh value per row.
+        for row in rows.iter_mut() {
+            let expr = crate::seq_ddl::evaluate_default_expression(sess, default_text).await?;
+            row[col_idx] = expr;
+        }
+    }
+    Ok(())
+}
+
+/// AUDIT TO emission for INSERT. The mutation has already committed by
+/// the time we get here; we materialise the after-row payloads from the
+/// in-memory batches and append them to the configured audit table.
+/// Tenant scoping is enforced by `lifecycle::write_audit_rows` resolving
+/// the audit table within the calling session's tenant prefix.
+async fn write_insert_audit_rows(
+    sess: &TenantSession,
+    schema: &Schema,
+    batches: &[RecordBatch],
+) -> Result<()> {
+    let Some(audit_table) = crate::types::audit_table_name(schema) else {
+        return Ok(());
+    };
+    use crate::events::build_row_json;
+    use crate::lifecycle::AuditRecord;
+    let mut records: Vec<AuditRecord> = Vec::new();
+    for b in batches {
+        for row in 0..b.num_rows() {
+            records.push(AuditRecord {
+                before: None,
+                after: Some(build_row_json(b, row)?),
+            });
+        }
+    }
+    crate::lifecycle::write_audit_rows(sess, audit_table, ChangeOp::Insert, records).await
+}
+
+/// Build one [`ChangeEvent`] per row across `batches`, allocating a
+/// fresh per-`(tenant, table)` seq for each. Returns an empty vec when
+/// no sinks are attached so callers pay only the registry-empty check.
+fn build_insert_events(
+    sess: &TenantSession,
+    table: &TableName,
+    batches: &[RecordBatch],
+) -> Result<Vec<ChangeEvent>> {
+    {
+        let guard = sess
+            .engine
+            .event_sinks()
+            .read()
+            .expect("event_sinks lock poisoned");
+        if !registry_has_any(&guard) {
+            return Ok(Vec::new());
+        }
+    }
+    let user = causation_user(sess);
+    let mut out = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let after = build_row_json(batch, row)?;
+            let seq = sess.engine.next_event_seq(&sess.tenant, table);
+            out.push(make_event(
+                &sess.tenant,
+                table,
+                ChangeOp::Insert,
+                None,
+                Some(after),
+                seq,
+                user.clone(),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Map session principal to the event's `causation_user`. The
+/// anonymous-session sentinel becomes `None` so sinks needn't special-
+/// case it.
+fn causation_user(sess: &TenantSession) -> Option<String> {
+    if sess.current_user == crate::ANONYMOUS_USER {
+        None
+    } else {
+        Some(sess.current_user.clone())
+    }
 }
 
 /// Build the per-write `WriteOptions` from the table's catalog metadata.
@@ -400,7 +1312,11 @@ async fn commit_with_retry(
     }
 }
 
-async fn exec_select(sess: &TenantSession, sql: &str) -> Result<ExecResult> {
+async fn exec_select(
+    sess: &TenantSession,
+    sql: &str,
+    include_deleted: bool,
+) -> Result<ExecResult> {
     // Option A for tail-visibility: when the shard is wired in, the in-RAM
     // tail produced by INSERTs hasn't yet landed in Parquet. Force a synchronous
     // flush + catalog commit before planning so DataFusion's ListingTable scan
@@ -463,6 +1379,9 @@ async fn exec_select(sess: &TenantSession, sql: &str) -> Result<ExecResult> {
     // downstream optimisation (predicate pushdown, projection pruning)
     // sees the RLS filter as a first-class predicate.
     df = apply_rls_to_select(sess, sql, df).await?;
+    if !include_deleted {
+        df = apply_soft_delete_to_select(sess, sql, df).await?;
+    }
     let df_schema = df.schema().inner().clone();
     let ws_schema = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
 
@@ -559,6 +1478,67 @@ async fn table_has_rls(sess: &TenantSession, table: &TableName) -> Result<bool> 
         .load_table(&sess.tenant, table)
         .await?;
     Ok(meta.rls_enabled)
+}
+
+/// Companion of [`table_has_rls`] for the soft-delete predicate-injection
+/// gate. Tables without a SOFT DELETE column take the simple-select fast
+/// path unchanged.
+async fn table_has_soft_delete(sess: &TenantSession, table: &TableName) -> Result<bool> {
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, table)
+        .await?;
+    Ok(crate::types::soft_delete_column(meta.schema.as_ref()).is_some())
+}
+
+/// AND-merge an `<soft_delete_col> IS NULL` predicate into `df`'s logical
+/// plan for every TableScan against a table that has a SOFT DELETE column.
+/// Mirrors `apply_rls_to_select` — same TreeNode rewrite shape, different
+/// predicate source. When `INCLUDE DELETED` was specified the caller skips
+/// this step entirely.
+async fn apply_soft_delete_to_select(
+    sess: &TenantSession,
+    sql: &str,
+    df: datafusion::prelude::DataFrame,
+) -> Result<datafusion::prelude::DataFrame> {
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(df),
+    };
+    if stmts.len() != 1 {
+        return Ok(df);
+    }
+    let Statement::Query(query) = &stmts[0] else {
+        return Ok(df);
+    };
+    let referenced = collect_table_refs_from_query(query);
+    if referenced.is_empty() {
+        return Ok(df);
+    }
+    let mut soft_cols: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for table in &referenced {
+        let meta = match sess
+            .engine
+            .config()
+            .catalog
+            .load_table(&sess.tenant, table)
+            .await
+        {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if let Some(col) = crate::types::soft_delete_column(meta.schema.as_ref()) {
+            soft_cols.insert(table.to_string(), col);
+        }
+    }
+    if soft_cols.is_empty() {
+        return Ok(df);
+    }
+    crate::lifecycle::inject_soft_delete_predicates(&sess.ctx, df, &soft_cols).await
 }
 
 /// Collect every table the query can read from — the input set RLS must

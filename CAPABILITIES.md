@@ -6,10 +6,8 @@ workload, this is the right page to read first.
 
 Cross-references: [`TASK.md`](./TASK.md) is the full Phase 0–7 core-DB
 build plan, [`WEDGE.md`](./WEDGE.md) is the prioritized next-six-months
-slice, [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md) is the customer-facing
-cloud-platform roadmap (identity, REST, V8 edge functions, BYO-bucket /
-BYO-key, Stripe billing, dashboard), [`docs/deployment.md`](./docs/deployment.md)
-is the production cloud architecture guide, [`docs/decisions/`](./docs/decisions/)
+slice, [`docs/deployment.md`](./docs/deployment.md) is the production
+deployment architecture guide, [`docs/decisions/`](./docs/decisions/)
 records every "no" with the trigger that would change our mind.
 
 Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on roadmap.
@@ -23,7 +21,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Capability | Status | Notes |
 |---|---|---|
 | pgwire v3 | ✅ | startup + cleartext-password auth + simple query |
-| Simple query (`Q` message) | ✅ | what `psql` types into the prompt |
+| Simple query (`Q` message) | ✅ | what `psql` types into the prompt; multi-statement bodies (semicolon-separated DDLs / SELECTs) are split at the router and dispatched in order, one `RowDescription`/`DataRow`/`CommandComplete` group per statement and one trailing `ReadyForQuery`. Powers `tokio_postgres::batch_execute` and `psql -f setup.sql`. Mid-batch failure stops dispatch (PG's non-transactional semicolon-batch behaviour); earlier successes stand. |
 | Extended query (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Sync`) | ✅ | full Parse/Bind/Describe/Execute/Close/Sync; `tokio-postgres::query` works |
 | Binary parameter / result format | ✅ | INT2/4/8, FLOAT4/8, BOOL, BYTEA, TEXT, JSONB, UUID, FixedSizeBinary. JSONB / UUID parameter binding is native — `ParameterDescription` advertises OID 3802 / 2950 for INSERT / UPDATE / SELECT-WHERE slots whose target column carries `BASIN_TYPE=JSONB` / `BASIN_TYPE=UUID` metadata, and the Bind decoder understands both wire formats (JSONB v1: leading `0x01` version byte + canonical-form JSON; UUID: 16 raw RFC 4122 bytes). asyncpg / pgx / tokio-postgres encode `uuid.UUID` / `dict` / `serde_json::Value` directly without string coercion. |
 | `COPY FROM STDIN` / `COPY TO STDOUT` | ✅ | CSV format only (RFC 4180-ish, comma-delimited; `WITH (FORMAT CSV [, HEADER true])`); BINARY / custom DELIMITER / NULL spec / column-list / file-path variants rejected with SQLSTATE 42601. COPY-IN imports row-by-row INSERTs against the engine; on a mid-stream error we drain to `CopyDone` before responding so the connection stays usable. Drives both simple-query and the extended-query path so `tokio_postgres::copy_in` / `copy_out` and `psql \copy` both work. |
@@ -43,14 +41,19 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Joins (single-shard) | 🛠 | DataFusion handles them; not yet exercised in tests |
 | `UPDATE` / `DELETE` | ✅ | Copy-on-write Iceberg v2. Single-scan partition; `replace_data_files` with optimistic concurrency on both catalog backends; physical deletion of replaced Parquet files. |
 | `ALTER TABLE` | ✅ | `ADD COLUMN`, `SET cold_after`, `SET cold_age_column`, `SET BLOOM FILTERS ON`, `SET row_group_rows`, `RESET row_group_rows`, `CLUSTER BY (...)`, `RESET CLUSTER BY`, `ENABLE/DISABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `DROP POLICY` |
-| `CREATE MATERIALIZED VIEW … WITH (basin.continuous, …)` | 🛠 | Rust API ships via `basin-cv`; SQL surface is in `cv_glue` stub. Drop the stub when the engine planner registers the `basin.continuous` storage option, then `CREATE MATERIALIZED VIEW` becomes a `cv_glue::install` follow-on commit. |
+| `GENERATED ALWAYS AS (expr) STORED` columns | ✅ | Phase 5.11.K. Expression evaluated on INSERT and re-evaluated on every UPDATE row. Direct writes rejected with SQLSTATE 42601. VIRTUAL deferred to v0.2. Self-reference rejected at registration. |
+| `CREATE MATERIALIZED VIEW … WITH (basin.continuous, …)` | ✅ | Rust API ships via `basin-cv`; SQL surface lives in `basin-engine`'s `cv_ddl` module. Pre-screen lifts `WITH (basin.continuous, refresh_interval = '<duration>')` out before sqlparser, then dispatches to `Catalog::set_continuous_aggregate`. `REFRESH MATERIALIZED VIEW <name>` and `DROP MATERIALIZED VIEW <name>` round out the surface. |
+| `CREATE TYPE … AS ENUM`, `CREATE DOMAIN` | ✅ | Phase 5.11.K2. Enums stored as `Utf8` + `BASIN_ENUM_TYPE` metadata; domains as base type + `BASIN_DOMAIN` metadata + CHECK enforced at write. `ALTER TYPE … ADD VALUE` append-only (matches PG). DROP cascade rejected if column references the type. `ORDER BY` / range comparisons on enum columns now follow PG declaration-order (planner rewrites the column reference to a `CASE`-on-ordinal expression at plan time). |
+| `SELECT … AS OF SNAPSHOT n` / `AS OF TIMESTAMP ts` (time-travel) | ◻️ | Routing design lives in [`docs/architecture.md`](./docs/architecture.md) §7 — any `AS OF` clause forces the analytical path because shard owners only hold the current state. Parser support deferred to `basin-analytical` v0.2. |
 | `CREATE POLICY` (RLS) | ✅ | predicate injection at logical-plan layer; cross-tenant leak invariant verified |
+| `information_schema.tables`/`columns`/`routines` + `pg_catalog.pg_class`/`pg_attribute`/`pg_namespace`/`pg_proc`/`pg_type`/`pg_depend`/`pg_authid` | 🛠 | Phase 5.11.M (starter + 3 expansion views + Tier 3 routine and type introspection + pg_depend / pg_authid tail — 17 views total). PostgREST / pgAdmin startup-query compatibility verified by `tests/integration/tests/postgrest_pgadmin_compat.rs` — every catalog probe those tools issue on connect lands a successful row set, including pgAdmin's `pg_attribute` JOIN `pg_type` column-detail query. `pg_depend` surfaces continuous-matview → source-table edges (the pg_dump-style `pg_class JOIN pg_depend JOIN pg_class` ordering query resolves matview → source end-to-end) and function → arg/return type edges (other dependency edges queued); `pg_authid` surfaces the calling tenant as a single role (admin scripts that JOIN against `pg_authid` to render an "owner" column resolve; per-object owner tracking is queued, so pgAdmin-style "list relations + owner" patterns degrade to a CROSS JOIN). Remaining for full PG-ecosystem-tooling unblock: `pg_index` row-population (schema ships, always empty), `pg_constraint` row-population (schema ships, always empty), `information_schema.key_column_usage` row-population. |
 | Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ◻️ | single-shard only when shipped |
 | Prepared statements with parameter bind | ✅ | shipped with extended-query protocol |
 | Foreign keys | ◻️ | single-shard only when shipped |
-| Triggers (`CREATE TRIGGER`, statement + row, `NEW`/`OLD`/`TG_OP`) | ◻️ | **on roadmap (high priority)** — every multi-tenant SaaS migration story leans on `audit_*` triggers and `created_at`/`updated_at` row-level triggers. Tracked in TASK.md Phase 5.11. Multi-quarter scope (PL/pgSQL parser + interpreter + trigger context + recursive-trigger guard); not on the wedge's first delivery but blocking the "drop in your existing PG schema" claim. |
-| Stored procedures (`CREATE FUNCTION`, PL/pgSQL) | ◻️ | **on roadmap (high priority)** — same Phase 5.11. Subset of PL/pgSQL is the realistic v0.1: variable assignment, `IF`/`LOOP`/`FOR`, `RETURN QUERY`, parameter binding. Anonymous `DO` blocks fall out of the same interpreter. Out of scope: SQL/PSM, `EXCEPTION` blocks beyond a top-level catch, cursor-driven loops. |
-| PG built-in functions (string, date/time, math) | 🛠 | **expanding (high priority)** — `digest`, `encode`/`decode`, `crypt`, `gen_random_uuid`, `gen_salt`, vector ops shipped via `basin-engine`'s ScalarUDF registry. Phase 5.11 expands to `now`, `current_timestamp`, `date_trunc`, `age`, `extract`, `to_char`, `to_timestamp`, `lower`/`upper`/`substring`/`trim`/`length`, `coalesce`/`nullif`, `||`. Tracked alongside triggers because the trigger interpreter consumes them. |
+| Triggers (declarative lifecycle + SQL-bodied reactors) | 🛠 | **Reframed away from PL/pgSQL per [ADR 0012](./docs/decisions/0012-change-event-primitive.md).** Declarative lifecycle ✅ shipped (Phase 5.11.B): `AUTO_UPDATE` columns, `AUDIT TO <table>` table option, `SOFT DELETE` columns with `INCLUDE DELETED` opt-out — covers ~75% of `audit_*` and `updated_at` trigger use cases. SQL-bodied reactors (`REACT ON … EXECUTE`) — Tier 0 sink trait + capture point ✅ shipped (`crates/basin-common::events`); reactor SQL surface queued (Phase 5.11.C / C2). PL/pgSQL parser / interpreter explicitly out of scope. |
+| User-defined functions (`CREATE FUNCTION … LANGUAGE sql`) | 🛠 | **Reframed away from PL/pgSQL per [ADR 0012](./docs/decisions/0012-change-event-primitive.md).** Basin's path is `LANGUAGE sql` functions, planning-time inlined into the call site (same trick PG uses for `LANGUAGE sql`). Catalog API (`Catalog::register_sql_function`) + planner inliner ✅ shipped (Phase 5.11.D foundations); `CREATE FUNCTION` SQL surface ✅ shipped (5.11.D). `RETURNS TABLE(col1 type1, …)` ✅ shipped (5.11.E) — table-position calls are inlined as derived sub-queries with `LATERAL` emitted when call-site args reference outer columns. `CALL` procedures (5.11.F) extend the same machinery. Out of scope: PL/pgSQL with `IF`/`LOOP`/variables, `EXCEPTION` blocks, cursor-driven loops; PG `RETURNS SETOF type` (single-column SRF; deferred to v0.2 if it surfaces). |
+| `CREATE PROCEDURE` / `CALL` / `DROP PROCEDURE` | ✅ | Phase 5.11.F. `LANGUAGE sql` only (`LANGUAGE plpgsql` rejected with SQLSTATE 0A000 per ADR 0012). Multi-statement body — body statements drawn from `INSERT` / `UPDATE` / `DELETE` / `SELECT` / `CREATE TABLE` / `DROP TABLE`; nested `CALL` rejected at registration in v0.1. Call-site arguments substituted into the body before each statement runs through the standard engine pipeline (RLS rewrites, sequence rewrite, function inliner all apply). Sequential best-effort execution: a mid-procedure failure leaves prior statements committed — single-shard transactions land in Phase 5 and will tighten this. `CREATE PROCEDURE` recognised via textual pre-screen (sqlparser 0.52's native `Statement::CreateProcedure` parses only T-SQL `AS BEGIN … END`); `CALL` and `DROP PROCEDURE` use sqlparser's native AST nodes. |
+| PG built-in functions (string, date/time, math, JSONB) | ✅ | Phase 5.11.A shipped via `basin-engine`'s ScalarUDF registry. Pre-existing: `digest`, `encode`/`decode`, `crypt`, `gen_random_uuid`, `gen_salt`, vector ops. New in 5.11.A: `now`, `current_timestamp`, `current_date`, `date_trunc`, `age` (returns native `interval`), `extract` (sub-second precision for `second` via Float64), `to_char` / `to_timestamp` (PG format strings, not chrono), `lower`/`upper`/`substring`/`trim`/`length`/`position`/`replace`/`regexp_replace`/`||`, `abs`/`ceil`/`floor`/`round`/`power` (always Float8)/`sqrt`/`mod`/`%`, `coalesce`/`nullif`/`greatest`/`least`/`is distinct from`. JSONB operators (`->`/`->>`/`#>`/`@>` etc) via DataFusion's JSON support. 6 PG-divergence cases reconciled; one residual flagged: Float64 vs PG `numeric` for sub-ULP `extract(second)` (closes when the Decimal128 arrow-bridge ships). |
 
 ## Types
 
@@ -66,6 +69,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `UUID` | ✅ | Arrow `FixedSizeBinary(16)` + field metadata `BASIN_TYPE=UUID`; pgwire OID 2950 with canonical hyphenated text + 16-byte binary |
 | `POINT` (geospatial) | 🛠 | `basin-geo` crate ships Rust API; SQL surface (column type `POINT`) deferred to v0.2 via `geo_glue` stub |
 | `TIMESTAMPTZ` | ✅ | Arrow `Timestamp(Microsecond, "UTC")` |
+| `TIMESTAMP` (without time zone) | ✅ | Arrow `Timestamp(Microsecond, None)`; pgwire OID 1114; surfaces in `information_schema.columns.data_type` as `"timestamp without time zone"` |
 | `NUMERIC` (arbitrary precision) | ◻️ | |
 | `INTERVAL`, `MONEY`, `XML`, geometric (LINESTRING/POLYGON) | 🚫 | |
 
@@ -79,7 +83,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Per-tenant fairness (Semaphore) | ✅ | cap=16; default-on |
 | Row-Level Security | ✅ | `ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` with `current_user`-aware predicates injected at logical-plan layer; cross-tenant leak invariant tested |
 | BYO-bucket | ◻️ | customer's S3 + IAM role |
-| BYO-key (KMS) | 🛠 | Trait + wiring shipped (`EncryptionProvider`); cloud-side AWS KMS / GCP KMS / Azure Key Vault adapters live in basin-cloud. |
+| BYO-key (KMS) | 🛠 | Trait + wiring shipped (`EncryptionProvider` in `basin-storage::encryption`; `Storage::attach_encryption_provider` is the opt-in seam, default `None` = byte-for-byte plaintext). External callers plug in their own KMS adapter — the OSS engine ships only the trait + envelope-encryption hooks. |
 | Tenant deletion (`O(file_count)`) | ✅ | `Storage::delete_tenant` is catalog-first paths + parallel orphan LIST + bulk DeleteObjects + drop_namespace; LocalFS 4ms, R2 ~1.4-2.2s |
 | Table fork (catalog COW) | ✅ | `Catalog::fork_table(tenant, src, dst)` clones a table's metadata + snapshot history into a new sibling within the same tenant, sharing data files by reference. Diverges on next commit. v0.2 adds cross-tenant fork with refcount-aware GC. |
 | Within-tenant time partitioning | ✅ | `CREATE TABLE … PARTITION BY RANGE (ts)`; partition pruning |
@@ -107,7 +111,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Per-tenant fair-share scheduler | 🛠 | architectural primitive shipped (cap=16); v0.2 EDF deferred — see [ADR 0008](./docs/decisions/0008-noisy-neighbor-fairness.md) |
 | WAL (Raft-backed, 5ms acks) | ◻️ | Phase 2 — closes the insert-latency gap |
 | Background compactor | 🛠 | merges small files; tier sweep + cold-data move shipped |
-| Iceberg REST catalog (Lakekeeper compatibility) | ◻️ | trait shape locked, server impl deferred |
+| Iceberg REST catalog (Lakekeeper compatibility) | 🛠 | `basin-iceberg-rest` crate ships GET-only endpoints (namespaces, list-tables, load-table) plus DELETE table. Drop into `basin-server` to expose. POST commit/create flows deferred to follow-up. |
 | Per-tenant secondary indexes (B-tree) | ◻️ | Phase 5.7 B1 — biggest remaining point-query win for true random ids |
 
 ## Query execution
@@ -147,7 +151,7 @@ covered natively, as Basin-flavored crates with the same SQL semantics:
 | `uuid-ossp` | native UDFs + `UUID` type | ✅ | `gen_random_uuid()`, `uuid_generate_v4()`, canonical hyphenated text + 16-byte binary on the wire |
 | `PostGIS` (subset) | **`basin-geo`** | ✅ | `Point`, `Box2d`, `ST_MakePoint`, `ST_X`, `ST_Y`, `ST_Distance` (Haversine WGS84), `ST_DWithin`, `ST_Contains`. No `LINESTRING`/`POLYGON`/spatial index in v0.1 — see crate. |
 | `pg_trgm` | **`basin-trgm`** | ✅ | `similarity`, `word_similarity`, `extract` (trigram set). v0.1 brute-force; GIN trigram index deferred to v0.2. |
-| `TimescaleDB` continuous aggregates | **`basin-cv`** | ✅ | `CvSpec` + `CvRefresher::tick`; refresh_interval enforced; per-tenant materialization. v0.1 full re-execution; incremental refresh deferred. |
+| `TimescaleDB` continuous aggregates | **`basin-cv`** | ✅ | `CvSpec` + `CvRefresher::tick`; refresh_interval enforced; per-tenant materialization. v0.1 full re-execution; incremental refresh deferred. The SQL surface (`CREATE MATERIALIZED VIEW … WITH (basin.continuous, refresh_interval = '...')`, `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`) ships in `basin-engine::cv_ddl`. |
 | `TimescaleDB` hypertables | within-tenant time partitioning | ✅ | `CREATE TABLE … PARTITION BY RANGE (ts)` |
 | `pg_stat_statements` | OTEL traces | ✅ | per-query spans exported via `BASIN_OTLP_ENDPOINT` |
 | `Citus` (sharding) | basin-router consistent-hash | ✅ | sharding is structural via per-tenant prefix |
@@ -184,9 +188,9 @@ the corresponding `ScalarUDF`s and parse the relevant `WITH (…)` options.
 | Connection pooling (`basin-pool`) | ✅ | Native `TenantSession` cache; per-tenant cap; LRU eviction. Wired into `basin-server` behind `BASIN_POOL_ENABLED=1`. See [ADR 0007](./docs/decisions/0007-connection-pooling.md). |
 | Rate limiting (basin-net side) | ✅ | per-tenant 10 req/s sustained, burst 30; URL allowlist; body cap; timeout |
 | Rate limiting (pgwire side) | ✅ | per-tenant token-bucket via `governor` (same crate as basin-net). Default off; `BASIN_PGWIRE_RATE_LIMIT_QPS=100` enables 100 qps sustained / 300 burst with bucket-empty mapped to Postgres SQLSTATE `53400` (`configuration_limit_exceeded`). Per-tenant overrides + catalog-driven config deferred to v0.2. |
-| Bring-your-own-bucket | ◻️ | Phase 6 |
-| Bring-your-own-key (KMS) | ◻️ | Phase 6 |
-| Stripe billing integration | ◻️ | Phase 6 |
+| Bring-your-own-bucket | 🚫 | hosted-product concern; out of scope for this OSS workspace |
+| Bring-your-own-key (KMS) | 🛠 | trait shipped in `basin-storage::encryption` (`EncryptionProvider`); external callers wire their own KMS adapter |
+| Billing integration | 🚫 | hosted-product concern; out of scope for this OSS workspace |
 
 ## Auth and REST API
 

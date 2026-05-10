@@ -18,6 +18,43 @@ pub const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 pub const BASIN_TYPE_JSONB: &str = "JSONB";
 pub const BASIN_TYPE_UUID: &str = "UUID";
 
+/// Per-column markers for declarative lifecycle behaviours. Stored as
+/// Arrow `Field` metadata so they round-trip through the catalog's
+/// schema serde without a `TableMetadata` field per behaviour.
+pub const BASIN_AUTO_UPDATE_KEY: &str = "BASIN_AUTO_UPDATE";
+pub const BASIN_SOFT_DELETE_KEY: &str = "BASIN_SOFT_DELETE";
+
+/// Schema-level marker for `AUDIT TO <table>`. Stored on the source
+/// table's `Schema::metadata`; the value is the audit table's bare name.
+pub const BASIN_AUDIT_TABLE_KEY: &str = "BASIN_AUDIT_TABLE";
+
+/// Per-column marker for `GENERATED ALWAYS AS (<expr>) STORED`. Value is
+/// the parenthesised expression source text (without the surrounding
+/// parens). Engine reads it on every INSERT/UPDATE row to materialise
+/// the persisted column value.
+pub const BASIN_GENERATED_AS: &str = "BASIN_GENERATED_AS";
+
+/// Per-column marker for `DEFAULT <expr>`. Value is the source text
+/// of the DEFAULT expression as the user wrote it (e.g.
+/// `nextval('my_seq')`, `0`, `'pending'`). The INSERT path reads this
+/// on every omitted column and substitutes the evaluated expression
+/// before row coercion. `nextval(...)` calls inside the text are
+/// routed through [`crate::seq_udf::rewrite_sequence_calls`] at
+/// evaluation time so each insertion handed out a distinct value.
+pub const BASIN_COLUMN_DEFAULT: &str = "BASIN_COLUMN_DEFAULT";
+
+/// Per-column marker for `CREATE TYPE … AS ENUM` columns. Value is
+/// the unqualified enum type name. The Arrow physical type is
+/// `Utf8` (storing the label string); the engine validates the label
+/// against the catalog row at INSERT time.
+pub const BASIN_ENUM_TYPE_KEY: &str = basin_catalog::BASIN_ENUM_TYPE_KEY;
+
+/// Per-column marker for `CREATE DOMAIN` columns. Value is the
+/// unqualified domain name. The Arrow physical type is the domain's
+/// underlying base type; the engine evaluates the domain's CHECK
+/// predicate against each row at INSERT time.
+pub const BASIN_DOMAIN_KEY: &str = basin_catalog::BASIN_DOMAIN_KEY;
+
 /// Returns `true` if `field` carries the `JSONB` metadata marker. Cheap — just
 /// a hashmap lookup on a small map.
 pub(crate) fn field_is_jsonb(field: &arrow_schema::Field) -> bool {
@@ -33,6 +70,46 @@ pub(crate) fn field_is_uuid(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
 }
 
+pub(crate) fn field_is_auto_update(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_AUTO_UPDATE_KEY).map(|s| s.as_str()) == Some("1")
+}
+
+pub(crate) fn field_is_soft_delete(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_SOFT_DELETE_KEY).map(|s| s.as_str()) == Some("1")
+}
+
+/// Return the stored expression text for a `GENERATED ALWAYS AS (...)
+/// STORED` column, or `None` for ordinary columns. The text is the
+/// parenthesised expression with the outer parens stripped.
+pub(crate) fn field_is_generated(field: &arrow_schema::Field) -> Option<&str> {
+    field.metadata().get(BASIN_GENERATED_AS).map(|s| s.as_str())
+}
+
+/// Return the stored DEFAULT expression text for a column declared with
+/// `DEFAULT <expr>`, or `None` for columns without an explicit default.
+/// The text is the user's expression source (e.g. `nextval('s')`,
+/// `'pending'`).
+pub(crate) fn field_default_text(field: &arrow_schema::Field) -> Option<&str> {
+    field.metadata().get(BASIN_COLUMN_DEFAULT).map(|s| s.as_str())
+}
+
+/// Locate the unique soft-delete column on `schema`, if any. Returns the
+/// column's name. There is at most one (enforced at CREATE TABLE).
+pub(crate) fn soft_delete_column(schema: &arrow_schema::Schema) -> Option<String> {
+    for f in schema.fields() {
+        if field_is_soft_delete(f) {
+            return Some(f.name().clone());
+        }
+    }
+    None
+}
+
+/// Bare audit-table name when the source table was declared with
+/// `AUDIT TO <name>`.
+pub(crate) fn audit_table_name(schema: &arrow_schema::Schema) -> Option<&str> {
+    schema.metadata().get(BASIN_AUDIT_TABLE_KEY).map(|s| s.as_str())
+}
+
 /// Map a sqlparser column type to an Arrow [`DataType`]. Only the small set
 /// listed in the engine's PoC SQL contract is accepted; anything else is an
 /// `InvalidSchema` error so callers see exactly which type they tripped on.
@@ -43,6 +120,8 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         | SqlDataType::Int4(_)
         | SqlDataType::BigInt(_)
         | SqlDataType::Int8(_) => Ok(DataType::Int64),
+
+        SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Ok(DataType::Int16),
 
         SqlDataType::Text
         | SqlDataType::Varchar(_)
@@ -97,22 +176,18 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             Ok(DataType::FixedSizeBinary(16))
         }
 
-        // TIMESTAMPTZ / TIMESTAMP WITH TIME ZONE → microsecond UTC. We
-        // only support the timezone-aware variant so partition-by-month
-        // arithmetic is unambiguous (and so the Phase 5.5 partition pruner
-        // can reason about wall-clock vs UTC without a coercion table).
-        // Naive `TIMESTAMP` (no zone) remains rejected — same policy as the
-        // previous PoC behaviour the regression test asserts.
-        SqlDataType::Timestamp(_, tz_info) => {
-            match tz_info {
-                TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => {
-                    Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
-                }
-                _ => Err(BasinError::InvalidSchema(
-                    "TIMESTAMP without time zone is not supported in PoC; use TIMESTAMPTZ".into(),
-                )),
+        // TIMESTAMPTZ / TIMESTAMP WITH TIME ZONE → microsecond UTC.
+        // Bare TIMESTAMP (no zone) → microsecond, no zone string. Both ride
+        // on the same Arrow physical type; the timezone string is the only
+        // distinguishing bit, and downstream layers (router OID, info_schema,
+        // pgwire encoding, convert.rs bridge) already key off `Some(_)` vs
+        // `None` to advertise OID 1184 vs 1114.
+        SqlDataType::Timestamp(_, tz_info) => match tz_info {
+            TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => {
+                Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
             }
-        }
+            _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        },
 
         // sqlparser's Postgres dialect parses unknown parameterised types
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form

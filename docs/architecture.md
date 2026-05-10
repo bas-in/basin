@@ -345,8 +345,11 @@ dispatch:
    ~10 M rows or ~1 GB) the query goes analytical.
 2. **Aggregation shape.** Wide group-bys and unindexed full scans go
    analytical regardless of size.
-3. **Time-travel hints.** Any `AS OF SNAPSHOT` / `AS OF TIMESTAMP` clause
-   forces analytical, since shard owners only hold the current state.
+3. **Time-travel hints.** *(planned, v0.2 — see `basin-analytical`'s
+   v0.2 note.)* Once shipped, any `AS OF SNAPSHOT` / `AS OF TIMESTAMP`
+   clause will force analytical, since shard owners only hold the
+   current state. Today the parser does not accept these clauses; the
+   routing rule is documented here so the design intent is on record.
 4. **Explicit hint.** Customers can pin a query with `/*+ analytical */`
    or `/*+ transactional */`. If the hint is incompatible (e.g.
    `transactional` on a 1 TB scan) the router rejects it rather than

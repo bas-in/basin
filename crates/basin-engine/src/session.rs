@@ -64,6 +64,12 @@ pub(crate) struct SessionState {
     /// flipped to `true` by `refresh_table` when it sees a partitioned
     /// table.
     pub(crate) has_partitioned_table: std::sync::atomic::AtomicBool,
+    /// Per-session sequence "last nextval" cache. PG's `currval`
+    /// semantics require this to be per-session: every session has its
+    /// own view of "what value was most recently handed out for each
+    /// sequence". Empty until the session's first `nextval`; consulted
+    /// by the SQL-string sequence rewriter on every `currval` call.
+    pub(crate) sequence_cache: Arc<crate::seq_udf::SessionSequenceCache>,
 }
 
 impl SessionState {
@@ -72,6 +78,7 @@ impl SessionState {
             snapshots: Mutex::new(HashMap::new()),
             prepared: crate::prepared::PreparedRegistry::new(),
             has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
+            sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
         }
     }
 }
@@ -148,6 +155,22 @@ pub(crate) async fn open(
     // decode, crypt, gen_salt). Same per-session shape as the distance
     // UDFs; registration is `Arc<ScalarUDF>::clone` under the hood.
     crate::udf::register_pg_udfs(&ctx);
+    // Phase 5.11.A: PG-compat scalar functions — `mod`, `age`, plus
+    // `to_char`/`to_timestamp` overrides that accept PG-style format strings
+    // (`YYYY-MM-DD HH24:MI:SS`) on top of chrono syntax.
+    crate::udf::register_pg_compat_udfs(&ctx);
+
+    // Phase 5.11.M: route `information_schema.tables` and
+    // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
+    // snapshot. The providers hold `Arc<dyn Catalog>` + `TenantId` only;
+    // the heavy resource (the catalog handle) is shared across every
+    // session, so per-tenant cost is O(bytes).
+    crate::info_schema_provider::register_info_schema_providers(
+        &ctx,
+        engine.config().catalog.clone(),
+        tenant,
+    )
+    .map_err(|e| BasinError::internal(format!("info_schema providers: {e}")))?;
 
     let state = Arc::new(SessionState::new());
 

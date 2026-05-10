@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "HNSW speed-up vs brute-force",
-    "value": 2.1314087979766985,
+    "value": 1.9207060163211553,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
@@ -26,7 +26,7 @@
       3148,
       1402
     ],
-    "brute_ms": 25.177000000000003,
+    "brute_ms": 200.394542,
     "dim": 64,
     "hnsw_ids": [
       3764,
@@ -40,11 +40,11 @@
       3148,
       1402
     ],
-    "hnsw_ms": 11.812375,
+    "hnsw_ms": 104.33379199999999,
     "overlap": 10,
     "rows": 5000,
     "sql_rows": 100,
     "top_k": 10
   },
-  "generated_at": "@1778204001"
+  "generated_at": "@1778393286"
 }

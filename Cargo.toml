@@ -16,9 +16,11 @@ members = [
     "crates/basin-auth",
     "crates/basin-rest",
     "crates/basin-net",
+    "crates/basin-webhooks",
     "crates/basin-cv",
     "crates/basin-geo",
     "crates/basin-trgm",
+    "crates/basin-iceberg-rest",
     "services/basin-server",
     "services/basinctl",
     "tests/integration",
@@ -48,9 +50,11 @@ basin-pool = { path = "crates/basin-pool" }
 basin-auth = { path = "crates/basin-auth" }
 basin-rest = { path = "crates/basin-rest" }
 basin-net = { path = "crates/basin-net" }
+basin-webhooks = { path = "crates/basin-webhooks" }
 basin-cv = { path = "crates/basin-cv" }
 basin-geo = { path = "crates/basin-geo" }
 basin-trgm = { path = "crates/basin-trgm" }
+basin-iceberg-rest = { path = "crates/basin-iceberg-rest" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

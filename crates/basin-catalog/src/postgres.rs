@@ -19,16 +19,23 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, ChangeOp, Result, TableName, TenantId};
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::instrument;
 
+use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
+use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
+use crate::functions::SqlFunctionDef;
+use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::metadata::{
-    CvDef, DataFileRef, PartitionSpec, Policy, SecondaryIndex, TableMetadata,
+    CvDef, DataFileRef, PartitionSpec, Policy, TableMetadata,
 };
+use crate::reactors::{self, ReactorDef, ReactorError, ReactorOps};
+use crate::sequences::{compute_next, SequenceDef, SequenceError};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
+use crate::tenant_storage_config::TenantStorageConfig;
 use crate::{Catalog, ProjectSnapshotEntry};
 
 const DEFAULT_SCHEMA: &str = "basin_catalog";
@@ -198,6 +205,123 @@ impl PostgresCatalog {
             format!(
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS home_region TEXT"
+            ),
+            // Per-tenant SQL function definitions. One row per
+            // (tenant, name); body is stored as raw SQL, args/return as
+            // JSONB so future scalar / argument-type extensions don't
+            // need another migration.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.sql_functions (
+                    tenant_id    TEXT NOT NULL,
+                    name         TEXT NOT NULL,
+                    args_json    JSONB NOT NULL,
+                    return_json  JSONB NOT NULL,
+                    body         TEXT NOT NULL,
+                    language     TEXT NOT NULL,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (tenant_id, name)
+                )"
+            ),
+            // Per-tenant sequences. The persisted state is the row-locked
+            // `current_value` field; `nextval` does an UPDATE … RETURNING
+            // inside a row lock so concurrent callers always see distinct
+            // values without an ad-hoc mutex layer. `started` distinguishes
+            // "the next nextval should return start" from "the next nextval
+            // should return current_value + increment", matching the
+            // in-memory `SequenceState::started` flag.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.sequences (
+                    tenant_id      TEXT NOT NULL,
+                    name           TEXT NOT NULL,
+                    start_value    BIGINT NOT NULL,
+                    increment      BIGINT NOT NULL,
+                    min_value      BIGINT NOT NULL,
+                    max_value      BIGINT NOT NULL,
+                    cache_size     BIGINT NOT NULL,
+                    cycle          BOOLEAN NOT NULL,
+                    current_value  BIGINT NOT NULL,
+                    started        BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (tenant_id, name)
+                )"
+            ),
+            // Per-tenant reactors. Composite-key shape mirrors
+            // [`crate::in_memory`]: name is unique per `(tenant, table)`,
+            // not per tenant. `seq` is a per-row monotonic counter so
+            // `lookup_reactors_for` can replay reactors in registration
+            // order. The bitset for ops is stored as a SMALLINT (`u8` is
+            // the underlying repr).
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.reactors (
+                    tenant_id        TEXT NOT NULL,
+                    table_name       TEXT NOT NULL,
+                    name             TEXT NOT NULL,
+                    ops_bits         SMALLINT NOT NULL,
+                    when_predicate   TEXT,
+                    body             TEXT NOT NULL,
+                    seq              BIGINT NOT NULL,
+                    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (tenant_id, table_name, name)
+                )"
+            ),
+            // Sequence used to assign reactor `seq` registration indices.
+            // One global sequence keeps assignment monotonic across all
+            // tenants without a per-tenant counter row; lookup orders by
+            // the value, so cross-tenant interleaving is fine.
+            format!(
+                "CREATE SEQUENCE IF NOT EXISTS {schema}.reactor_seq START 1"
+            ),
+            // Per-tenant `CREATE TYPE … AS ENUM` rows. `labels` is the
+            // ordered JSONB array of label strings; `ALTER TYPE … ADD
+            // VALUE` appends to it inside a row-locked transaction.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.enum_types (
+                    tenant_id  TEXT NOT NULL,
+                    name       TEXT NOT NULL,
+                    labels     JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (tenant_id, name)
+                )"
+            ),
+            // Per-tenant `CREATE DOMAIN` rows. `base_type_json` is the
+            // serialised `SqlArgType` so future variants don't require a
+            // migration; `check_predicate` is nullable for "pure type
+            // alias, no constraint".
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.domains (
+                    tenant_id        TEXT NOT NULL,
+                    name             TEXT NOT NULL,
+                    base_type_json   JSONB NOT NULL,
+                    check_predicate  TEXT,
+                    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (tenant_id, name)
+                )"
+            ),
+            // Per-tenant `CREATE PROCEDURE … LANGUAGE sql` rows. `args_json`
+            // is the serialised `Vec<SqlFunctionArg>`; `body` is stored
+            // verbatim so the engine reparses on each `CALL`.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.procedures (
+                    tenant_id  TEXT NOT NULL,
+                    name       TEXT NOT NULL,
+                    body       TEXT NOT NULL,
+                    args_json  JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (tenant_id, name)
+                )"
+            ),
+            // Per-tenant storage config (KMS routing + provider extras).
+            // One row per tenant; `config_json` carries the full
+            // `TenantStorageConfig` shape so future fields don't need
+            // another migration. `INSERT … ON CONFLICT DO UPDATE` for
+            // `set_tenant_storage_config` matches the existing
+            // `register_sql_function` upsert pattern.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.tenant_storage_config (
+                    tenant_id   TEXT PRIMARY KEY,
+                    config_json JSONB NOT NULL,
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                )"
             ),
         ];
         let client = self.client.lock().await;
@@ -506,6 +630,48 @@ impl Catalog for PostgresCatalog {
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace tables: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.sql_functions WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace sql_functions: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.sequences WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace sequences: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.reactors WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace reactors: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.enum_types WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace enum_types: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.domains WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace domains: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.procedures WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace procedures: {e}")))?;
+        tx.execute(
+            &format!("DELETE FROM {sch}.tenant_storage_config WHERE tenant_id = $1"),
+            &[&tenant.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace tenant_storage_config: {e}")))?;
         tx.execute(
             &format!("DELETE FROM {sch}.namespaces WHERE tenant_id = $1"),
             &[&tenant.to_string()],
@@ -1307,6 +1473,1245 @@ impl Catalog for PostgresCatalog {
         drop(client);
         self.load_table(tenant, table).await
     }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_sql_function(&self, def: SqlFunctionDef) -> Result<()> {
+        let sch = &self.schema;
+        let tenant_str = def.tenant.to_string();
+        let args_json = serde_json::to_value(&def.args)
+            .map_err(|e| BasinError::catalog(format!("serialise fn args: {e}")))?;
+        let return_json = serde_json::to_value(&def.return_type)
+            .map_err(|e| BasinError::catalog(format!("serialise fn return: {e}")))?;
+        let language = serde_json::to_value(&def.language)
+            .map_err(|e| BasinError::catalog(format!("serialise fn language: {e}")))?
+            .as_str()
+            .unwrap_or("sql")
+            .to_string();
+        let client = self.client.lock().await;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.sql_functions \
+                     (tenant_id, name, args_json, return_json, body, language) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (tenant_id, name) DO UPDATE \
+                     SET args_json = EXCLUDED.args_json, \
+                         return_json = EXCLUDED.return_json, \
+                         body = EXCLUDED.body, \
+                         language = EXCLUDED.language"
+                ),
+                &[
+                    &tenant_str,
+                    &def.name,
+                    &args_json,
+                    &return_json,
+                    &def.body,
+                    &language,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_sql_function: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_sql_function(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.sql_functions \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant_str, &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_sql_function: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sql function {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_sql_function(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Option<SqlFunctionDef> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT args_json, return_json, body, language \
+                     FROM {sch}.sql_functions \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant_str, &name],
+            )
+            .await
+            .ok()
+            .flatten()?;
+        let args_json: serde_json::Value = row.get(0);
+        let return_json: serde_json::Value = row.get(1);
+        let body: String = row.get(2);
+        let language_str: String = row.get(3);
+        let args = serde_json::from_value(args_json).ok()?;
+        let return_type = serde_json::from_value(return_json).ok()?;
+        let language = serde_json::from_value(serde_json::Value::String(language_str)).ok()?;
+        Some(SqlFunctionDef {
+            tenant: *tenant,
+            name: name.to_string(),
+            args,
+            return_type,
+            body,
+            language,
+        })
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_sql_functions(&self, tenant: &TenantId) -> Vec<SqlFunctionDef> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let client = self.client.lock().await;
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT name, args_json, return_json, body, language \
+                     FROM {sch}.sql_functions \
+                     WHERE tenant_id = $1"
+                ),
+                &[&tenant_str],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let name: String = row.get(0);
+                let args_json: serde_json::Value = row.get(1);
+                let return_json: serde_json::Value = row.get(2);
+                let body: String = row.get(3);
+                let language_str: String = row.get(4);
+                let args = serde_json::from_value(args_json).ok()?;
+                let return_type = serde_json::from_value(return_json).ok()?;
+                let language =
+                    serde_json::from_value(serde_json::Value::String(language_str)).ok()?;
+                Some(SqlFunctionDef {
+                    tenant: *tenant,
+                    name,
+                    args,
+                    return_type,
+                    body,
+                    language,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn create_sequence(&self, def: SequenceDef) -> Result<()> {
+        if def.increment == 0 {
+            return Err(BasinError::InvalidSchema(
+                "sequence increment must be non-zero".into(),
+            ));
+        }
+        let sch = &self.schema;
+        let tenant_str = def.tenant.to_string();
+        // Genesis stored value mirrors `SequenceState::genesis`: the
+        // first hand-out lands on `start` after the standard advance.
+        let stored = def.start.wrapping_sub(def.increment);
+        let cache_size_pg: i64 = def.cache_size as i64;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.sequences \
+                     (tenant_id, name, start_value, increment, min_value, max_value, \
+                      cache_size, cycle, current_value, started) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE) \
+                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                ),
+                &[
+                    &tenant_str,
+                    &def.name,
+                    &def.start,
+                    &def.increment,
+                    &def.min_value,
+                    &def.max_value,
+                    &cache_size_pg,
+                    &def.cycle,
+                    &stored,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("create_sequence: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::catalog(format!(
+                "sequence {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_sequence(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.sequences \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_sequence: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sequence {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_sequence(&self, tenant: &TenantId, name: &str) -> Option<SequenceDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT start_value, increment, min_value, max_value, cache_size, cycle \
+                     FROM {sch}.sequences \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .ok()
+            .flatten()?;
+        let start: i64 = row.get(0);
+        let increment: i64 = row.get(1);
+        let min_value: i64 = row.get(2);
+        let max_value: i64 = row.get(3);
+        let cache_size_pg: i64 = row.get(4);
+        let cycle: bool = row.get(5);
+        Some(SequenceDef {
+            tenant: *tenant,
+            name: name.to_string(),
+            start,
+            increment,
+            min_value,
+            max_value,
+            cache_size: cache_size_pg.max(0) as u64,
+            cycle,
+        })
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn nextval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let mut client = self.client.lock().await;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("nextval txn: {e}")))?;
+
+        // FOR UPDATE serializes concurrent nextval calls on the same
+        // (tenant, name) without ad-hoc locks — the row lock is the
+        // serialisation primitive. Two sequences (or two tenants) never
+        // block each other beyond their respective row locks.
+        let row = txn
+            .query_opt(
+                &format!(
+                    "SELECT start_value, increment, min_value, max_value, cache_size, \
+                            cycle, current_value, started \
+                     FROM {sch}.sequences \
+                     WHERE tenant_id = $1 AND name = $2 \
+                     FOR UPDATE"
+                ),
+                &[&tenant_str, &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("nextval lookup: {e}")))?;
+        let Some(row) = row else {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sequence {name:?}"
+            )));
+        };
+        let def = SequenceDef {
+            tenant: *tenant,
+            name: name.to_string(),
+            start: row.get(0),
+            increment: row.get(1),
+            min_value: row.get(2),
+            max_value: row.get(3),
+            cache_size: (row.get::<_, i64>(4)).max(0) as u64,
+            cycle: row.get(5),
+        };
+        let last: i64 = row.get(6);
+        let started: bool = row.get(7);
+        let v = match compute_next(&def, last, started) {
+            Ok(v) => v,
+            Err(SequenceError::Exhausted) => {
+                return Err(BasinError::catalog(format!(
+                    "{tenant}: sequence {name:?} exhausted"
+                )));
+            }
+            Err(SequenceError::InvalidIncrement) => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "{tenant}: sequence {name:?} has zero increment"
+                )));
+            }
+        };
+        txn.execute(
+            &format!(
+                "UPDATE {sch}.sequences \
+                 SET current_value = $3, started = TRUE \
+                 WHERE tenant_id = $1 AND name = $2"
+            ),
+            &[&tenant_str, &name, &v],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("nextval update: {e}")))?;
+        txn.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("nextval commit: {e}")))?;
+        Ok(v)
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn currval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let row_opt = client
+            .query_opt(
+                &format!(
+                    "SELECT current_value, started FROM {sch}.sequences \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("currval: {e}")))?;
+        let Some(row) = row_opt else {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sequence {name:?}"
+            )));
+        };
+        let started: bool = row.get(1);
+        if !started {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sequence {name:?} has not been advanced"
+            )));
+        }
+        Ok(row.get(0))
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = value, advance = advance))]
+    async fn setval(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        value: i64,
+        advance: bool,
+    ) -> Result<i64> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let mut client = self.client.lock().await;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("setval txn: {e}")))?;
+        let row = txn
+            .query_opt(
+                &format!(
+                    "SELECT increment FROM {sch}.sequences \
+                     WHERE tenant_id = $1 AND name = $2 \
+                     FOR UPDATE"
+                ),
+                &[&tenant_str, &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("setval lookup: {e}")))?;
+        let Some(row) = row else {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sequence {name:?}"
+            )));
+        };
+        let increment: i64 = row.get(0);
+        // Same trick as the in-memory backend: `advance == false` stores
+        // `value - increment` so the next started-state advance lands on
+        // exactly `value`.
+        let stored = if advance {
+            value
+        } else {
+            value.wrapping_sub(increment)
+        };
+        txn.execute(
+            &format!(
+                "UPDATE {sch}.sequences \
+                 SET current_value = $3, started = TRUE \
+                 WHERE tenant_id = $1 AND name = $2"
+            ),
+            &[&tenant_str, &name, &stored],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("setval update: {e}")))?;
+        txn.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("setval commit: {e}")))?;
+        Ok(value)
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, table = %def.table, name = %def.name))]
+    async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
+        if def.ops.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "reactor ops bitset is empty".into(),
+            ));
+        }
+        reactors::validate_body(&def.body).map_err(reactor_err_to_basin)?;
+        if let Some(p) = &def.when_predicate {
+            reactors::validate_predicate(p).map_err(reactor_err_to_basin)?;
+        }
+        let sch = &self.schema;
+        let tenant_str = def.tenant.to_string();
+        let table_str = def.table.to_string();
+        let ops_bits: i16 = def.ops.bits() as i16;
+        let mut client = self.client.lock().await;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_reactor txn: {e}")))?;
+        // Allocate a registration index from the shared sequence; this is
+        // monotonic across all tenants which is sufficient for ordering
+        // within any single (tenant, table). Done before the INSERT so we
+        // can roll the txn back cleanly on conflict.
+        let seq_row = txn
+            .query_one(
+                &format!("SELECT nextval('{sch}.reactor_seq')"),
+                &[],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("reactor seq nextval: {e}")))?;
+        let seq: i64 = seq_row.get(0);
+        let n = txn
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.reactors \
+                     (tenant_id, table_name, name, ops_bits, when_predicate, body, seq) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     ON CONFLICT (tenant_id, table_name, name) DO NOTHING"
+                ),
+                &[
+                    &tenant_str,
+                    &table_str,
+                    &def.name,
+                    &ops_bits,
+                    &def.when_predicate,
+                    &def.body,
+                    &seq,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_reactor: {e}")))?;
+        if n == 0 {
+            txn.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "reactor {:?} on {}/{} already exists",
+                def.name, def.tenant, def.table
+            )));
+        }
+        txn.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_reactor commit: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
+    async fn drop_reactor(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.reactors \
+                     WHERE tenant_id = $1 AND table_name = $2 AND name = $3"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_reactor: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "{tenant}/{table}: reactor {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, op = ?op))]
+    async fn lookup_reactors_for(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        op: ChangeOp,
+    ) -> Vec<ReactorDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT name, ops_bits, when_predicate, body \
+                     FROM {sch}.reactors \
+                     WHERE tenant_id = $1 AND table_name = $2 \
+                     ORDER BY seq ASC"
+                ),
+                &[&tenant.to_string(), &table.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let name: String = row.get(0);
+                let ops_bits: i16 = row.get(1);
+                let when_predicate: Option<String> = row.get(2);
+                let body: String = row.get(3);
+                let ops = ReactorOps::from_bits(ops_bits as u8)?;
+                if !ops.matches(op) {
+                    return None;
+                }
+                Some(ReactorDef {
+                    tenant: *tenant,
+                    table: table.clone(),
+                    name,
+                    ops,
+                    when_predicate,
+                    body,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_reactors(&self, tenant: &TenantId) -> Vec<ReactorDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT table_name, name, ops_bits, when_predicate, body \
+                     FROM {sch}.reactors \
+                     WHERE tenant_id = $1 \
+                     ORDER BY seq ASC"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let table_str: String = row.get(0);
+                let name: String = row.get(1);
+                let ops_bits: i16 = row.get(2);
+                let when_predicate: Option<String> = row.get(3);
+                let body: String = row.get(4);
+                let table = TableName::new(table_str).ok()?;
+                let ops = ReactorOps::from_bits(ops_bits as u8)?;
+                Some(ReactorDef {
+                    tenant: *tenant,
+                    table,
+                    name,
+                    ops,
+                    when_predicate,
+                    body,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_enum_type(&self, def: EnumTypeDef) -> Result<()> {
+        // Validate first so duplicate-label / empty-list errors take
+        // precedence over the SQL-level uniqueness check, matching the
+        // in-memory ordering.
+        enums::validate_new(&def).map_err(enum_err_to_basin)?;
+        let labels_json = serde_json::to_value(&def.labels)
+            .map_err(|e| BasinError::catalog(format!("serialise enum labels: {e}")))?;
+        let sch = &self.schema;
+        let tenant_str = def.tenant.to_string();
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_enum_type txn: {e}")))?;
+        // Cross-namespace collision: a domain with the same name on the
+        // same tenant is rejected so column resolution stays unambiguous.
+        let dom_row = tx
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.domains \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant_str, &def.name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_enum_type collision: {e}")))?;
+        if dom_row.is_some() {
+            tx.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "type {}/{} collides with an existing domain",
+                def.tenant, def.name,
+            )));
+        }
+        let n = tx
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.enum_types (tenant_id, name, labels) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                ),
+                &[&tenant_str, &def.name, &labels_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_enum_type: {e}")))?;
+        if n == 0 {
+            tx.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "enum type {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_enum_type commit: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_enum_type(&self, tenant: &TenantId, name: &str) -> Option<EnumTypeDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT labels FROM {sch}.enum_types \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .ok()
+            .flatten()?;
+        let labels_json: serde_json::Value = row.get(0);
+        let labels: Vec<String> = serde_json::from_value(labels_json).ok()?;
+        Some(EnumTypeDef {
+            tenant: *tenant,
+            name: name.to_string(),
+            labels,
+        })
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = %value))]
+    async fn add_enum_value(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        if value.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "ALTER TYPE ADD VALUE: label cannot be empty".into(),
+            ));
+        }
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("add_enum_value txn: {e}")))?;
+        // FOR UPDATE row-locks the enum row so a concurrent
+        // add_enum_value waits for our commit. The read-then-append
+        // dance is the same primitive as `nextval`'s row-locked update.
+        let row = tx
+            .query_opt(
+                &format!(
+                    "SELECT labels FROM {sch}.enum_types \
+                     WHERE tenant_id = $1 AND name = $2 \
+                     FOR UPDATE"
+                ),
+                &[&tenant_str, &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("add_enum_value lookup: {e}")))?;
+        let Some(row) = row else {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: enum type {name:?}"
+            )));
+        };
+        let labels_json: serde_json::Value = row.get(0);
+        let labels: Vec<String> = serde_json::from_value(labels_json)
+            .map_err(|e| BasinError::catalog(format!("deserialise enum labels: {e}")))?;
+        if labels.iter().any(|l| l == value) {
+            return Err(BasinError::catalog(format!(
+                "enum {name:?} already contains value {value:?}"
+            )));
+        }
+        // Append via JSONB concat. Equivalent to `labels.push(value)` in
+        // the in-memory backend; the row lock ensures the read above
+        // sees the same array we mutate here.
+        let value_arr = serde_json::Value::Array(vec![serde_json::Value::String(
+            value.to_string(),
+        )]);
+        tx.execute(
+            &format!(
+                "UPDATE {sch}.enum_types \
+                 SET labels = labels || $3::jsonb \
+                 WHERE tenant_id = $1 AND name = $2"
+            ),
+            &[&tenant_str, &name, &value_arr],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("add_enum_value update: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("add_enum_value commit: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_enum_type(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        // Refcount enforcement: load every table's Arrow schema and
+        // reject the drop if any column carries `BASIN_ENUM_TYPE=<name>`.
+        // Mirrors the in-memory backend's `tables_referencing_type`
+        // approach exactly — same metadata key, same lazy scan.
+        let referencing = self
+            .tables_referencing_type(tenant, name, true)
+            .await?;
+        if !referencing.is_empty() {
+            return Err(BasinError::catalog(format!(
+                "cannot drop enum {name:?}: still referenced by table column(s) {referencing:?}; \
+                 drop the column(s) first (v0.1 has no CASCADE)"
+            )));
+        }
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.enum_types \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_enum_type: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: enum type {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_enum_types(&self, tenant: &TenantId) -> Vec<EnumTypeDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT name, labels FROM {sch}.enum_types \
+                     WHERE tenant_id = $1"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let name: String = row.get(0);
+                let labels_json: serde_json::Value = row.get(1);
+                let labels: Vec<String> = serde_json::from_value(labels_json).ok()?;
+                Some(EnumTypeDef {
+                    tenant: *tenant,
+                    name,
+                    labels,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_domain(&self, def: DomainDef) -> Result<()> {
+        domains::validate_new(&def).map_err(domain_err_to_basin)?;
+        let base_type_json = serde_json::to_value(&def.base_type)
+            .map_err(|e| BasinError::catalog(format!("serialise domain base_type: {e}")))?;
+        let sch = &self.schema;
+        let tenant_str = def.tenant.to_string();
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_domain txn: {e}")))?;
+        // Cross-namespace collision: an enum with the same name on the
+        // same tenant is rejected — same rule as register_enum_type, in
+        // the opposite direction.
+        let enum_row = tx
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.enum_types \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant_str, &def.name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_domain collision: {e}")))?;
+        if enum_row.is_some() {
+            tx.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "domain {}/{} collides with an existing enum type",
+                def.tenant, def.name,
+            )));
+        }
+        let n = tx
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.domains (tenant_id, name, base_type_json, check_predicate) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                ),
+                &[
+                    &tenant_str,
+                    &def.name,
+                    &base_type_json,
+                    &def.check_predicate,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_domain: {e}")))?;
+        if n == 0 {
+            tx.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "domain {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_domain commit: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_domain(&self, tenant: &TenantId, name: &str) -> Option<DomainDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT base_type_json, check_predicate FROM {sch}.domains \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .ok()
+            .flatten()?;
+        let base_type_json: serde_json::Value = row.get(0);
+        let base_type = serde_json::from_value(base_type_json).ok()?;
+        let check_predicate: Option<String> = row.get(1);
+        Some(DomainDef {
+            tenant: *tenant,
+            name: name.to_string(),
+            base_type,
+            check_predicate,
+        })
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_domain(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let referencing = self
+            .tables_referencing_type(tenant, name, false)
+            .await?;
+        if !referencing.is_empty() {
+            return Err(BasinError::catalog(format!(
+                "cannot drop domain {name:?}: still referenced by table column(s) {referencing:?}; \
+                 drop the column(s) first (v0.1 has no CASCADE)"
+            )));
+        }
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.domains \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_domain: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: domain {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_domains(&self, tenant: &TenantId) -> Vec<DomainDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT name, base_type_json, check_predicate FROM {sch}.domains \
+                     WHERE tenant_id = $1"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let name: String = row.get(0);
+                let base_type_json: serde_json::Value = row.get(1);
+                let base_type = serde_json::from_value(base_type_json).ok()?;
+                let check_predicate: Option<String> = row.get(2);
+                Some(DomainDef {
+                    tenant: *tenant,
+                    name,
+                    base_type,
+                    check_predicate,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
+        procedures::validate_new(&def).map_err(procedure_err_to_basin)?;
+        let args_json = serde_json::to_value(&def.args)
+            .map_err(|e| BasinError::catalog(format!("serialise procedure args: {e}")))?;
+        let sch = &self.schema;
+        let tenant_str = def.tenant.to_string();
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.procedures (tenant_id, name, body, args_json) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                ),
+                &[&tenant_str, &def.name, &def.body, &args_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_procedure: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::catalog(format!(
+                "procedure {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_procedure(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.procedures \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_procedure: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: procedure {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_procedure(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Option<SqlProcedureDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT body, args_json FROM {sch}.procedures \
+                     WHERE tenant_id = $1 AND name = $2"
+                ),
+                &[&tenant.to_string(), &name],
+            )
+            .await
+            .ok()
+            .flatten()?;
+        let body: String = row.get(0);
+        let args_json: serde_json::Value = row.get(1);
+        let args = serde_json::from_value(args_json).ok()?;
+        Some(SqlProcedureDef {
+            tenant: *tenant,
+            name: name.to_string(),
+            args,
+            body,
+        })
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_procedures(&self, tenant: &TenantId) -> Vec<SqlProcedureDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT name, body, args_json FROM {sch}.procedures \
+                     WHERE tenant_id = $1"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let name: String = row.get(0);
+                let body: String = row.get(1);
+                let args_json: serde_json::Value = row.get(2);
+                let args = serde_json::from_value(args_json).ok()?;
+                Some(SqlProcedureDef {
+                    tenant: *tenant,
+                    name,
+                    args,
+                    body,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self, config), fields(tenant = %tenant))]
+    async fn set_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+        config: TenantStorageConfig,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let config_json = serde_json::to_value(&config).map_err(|e| {
+            BasinError::catalog(format!("serialise tenant_storage_config: {e}"))
+        })?;
+        let client = self.client.lock().await;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.tenant_storage_config \
+                     (tenant_id, config_json, updated_at) \
+                     VALUES ($1, $2, now()) \
+                     ON CONFLICT (tenant_id) DO UPDATE \
+                     SET config_json = EXCLUDED.config_json, \
+                         updated_at = now()"
+                ),
+                &[&tenant_str, &config_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_tenant_storage_config: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn get_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<TenantStorageConfig>> {
+        let sch = &self.schema;
+        let tenant_str = tenant.to_string();
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT config_json FROM {sch}.tenant_storage_config \
+                     WHERE tenant_id = $1"
+                ),
+                &[&tenant_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("get_tenant_storage_config: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let config_json: serde_json::Value = row.get(0);
+        let config: TenantStorageConfig = serde_json::from_value(config_json).map_err(|e| {
+            BasinError::catalog(format!("deserialise tenant_storage_config: {e}"))
+        })?;
+        Ok(Some(config))
+    }
+}
+
+impl PostgresCatalog {
+    /// Walk every table owned by `tenant`, returning `<table>.<column>`
+    /// labels for every column whose Arrow `Field` carries the requested
+    /// type metadata. `is_enum == true` checks the `BASIN_ENUM_TYPE`
+    /// key; `false` checks `BASIN_DOMAIN`. Mirrors
+    /// `InMemoryCatalog::tables_referencing_type`.
+    async fn tables_referencing_type(
+        &self,
+        tenant: &TenantId,
+        type_name: &str,
+        is_enum: bool,
+    ) -> Result<Vec<String>> {
+        let key = if is_enum {
+            BASIN_ENUM_TYPE_KEY
+        } else {
+            BASIN_DOMAIN_KEY
+        };
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT table_name, schema_json FROM {sch}.tables \
+                     WHERE tenant_id = $1"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("tables_referencing_type: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let table_str: String = row.get(0);
+            let schema_json: serde_json::Value = row.get(1);
+            let arrow_schema: Schema = match serde_json::from_value(schema_json) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for f in arrow_schema.fields() {
+                if f.metadata().get(key).map(|s| s.as_str()) == Some(type_name) {
+                    out.push(format!("{table_str}.{}", f.name()));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Map [`EnumError`] into the cross-crate [`BasinError`] surface.
+/// Mirrors `crate::in_memory::enum_err_to_basin`.
+fn enum_err_to_basin(e: EnumError) -> BasinError {
+    match e {
+        EnumError::DuplicateLabel(l) => {
+            BasinError::InvalidSchema(format!("enum label {l:?} listed more than once"))
+        }
+        EnumError::EmptyLabelList => {
+            BasinError::InvalidSchema("enum type must have at least one label".into())
+        }
+        EnumError::EmptyLabel => {
+            BasinError::InvalidSchema("enum label must be a non-empty string".into())
+        }
+        EnumError::Duplicate => BasinError::Catalog("enum type already exists".into()),
+        EnumError::NotFound => BasinError::NotFound("enum type not found".into()),
+        EnumError::LabelAlreadyExists(l) => {
+            BasinError::Catalog(format!("enum already contains value {l:?}"))
+        }
+    }
+}
+
+/// Map [`DomainError`] into the cross-crate [`BasinError`] surface.
+/// Mirrors `crate::in_memory::domain_err_to_basin`.
+fn domain_err_to_basin(e: DomainError) -> BasinError {
+    match e {
+        DomainError::Duplicate => BasinError::Catalog("domain already exists".into()),
+        DomainError::NotFound => BasinError::NotFound("domain not found".into()),
+        DomainError::InvalidPredicate(msg) => {
+            BasinError::InvalidSchema(format!("domain CHECK predicate: {msg}"))
+        }
+    }
+}
+
+/// Map [`ProcedureError`] into the cross-crate [`BasinError`] surface.
+/// Mirrors `crate::in_memory::procedure_err_to_basin`.
+fn procedure_err_to_basin(e: ProcedureError) -> BasinError {
+    match e {
+        ProcedureError::InvalidBody(msg) => {
+            BasinError::InvalidSchema(format!("procedure body: {msg}"))
+        }
+        ProcedureError::DisallowedStatement(msg) => BasinError::InvalidSchema(msg),
+        ProcedureError::DuplicateArgName(name) => {
+            BasinError::InvalidSchema(format!("duplicate procedure argument name {name:?}"))
+        }
+        ProcedureError::InvalidName(msg) => BasinError::InvalidIdent(msg),
+    }
+}
+
+/// Map [`ReactorError`] into the cross-crate [`BasinError`] surface.
+/// Mirrors `crate::in_memory::reactor_err_to_basin` but lives here to
+/// avoid a cross-module dependency from `postgres.rs` into the in-memory
+/// implementation.
+fn reactor_err_to_basin(e: ReactorError) -> BasinError {
+    match e {
+        ReactorError::Duplicate => {
+            BasinError::catalog("reactor already registered for this (tenant, table)")
+        }
+        ReactorError::InvalidBody(msg) => {
+            BasinError::InvalidSchema(format!("reactor body: {msg}"))
+        }
+        ReactorError::InvalidPredicate(msg) => {
+            BasinError::InvalidSchema(format!("reactor predicate: {msg}"))
+        }
+        ReactorError::NoOps => {
+            BasinError::InvalidSchema("reactor ops bitset is empty".into())
+        }
+        ReactorError::MultiStatementBody => BasinError::InvalidSchema(
+            "reactor body must be a single SQL statement".into(),
+        ),
+        ReactorError::NotFound => {
+            BasinError::not_found("reactor not found")
+        }
+    }
 }
 
 async fn fetch_snapshots(
@@ -1885,5 +3290,799 @@ mod tests {
         for (_table, head) in pairs {
             assert_eq!(head, SnapshotId(1));
         }
+    }
+
+    // -------------------- SQL function round-trip --------------------
+
+    #[tokio::test]
+    async fn sql_function_round_trip() {
+        use crate::functions::{
+            SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage,
+            SqlReturnType,
+        };
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        let def = SqlFunctionDef {
+            tenant: t,
+            name: "double_it".into(),
+            args: vec![SqlFunctionArg {
+                name: "x".into(),
+                data_type: SqlArgType::BigInt,
+            }],
+            return_type: SqlReturnType::Scalar(SqlArgType::BigInt),
+            body: "SELECT x * 2".into(),
+            language: SqlFunctionLanguage::Sql,
+        };
+        cat.register_sql_function(def.clone()).await.unwrap();
+        let got = cat.lookup_sql_function(&t, "double_it").await.unwrap();
+        assert_eq!(got, def);
+        let listed = cat.list_sql_functions(&t).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], def);
+
+        cat.drop_sql_function(&t, "double_it").await.unwrap();
+        assert!(cat.lookup_sql_function(&t, "double_it").await.is_none());
+
+        let err = cat.drop_sql_function(&t, "double_it").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    // -------------------- Sequence round-trip --------------------
+
+    fn seq_def(tenant: TenantId, name: &str, start: i64, increment: i64) -> SequenceDef {
+        SequenceDef {
+            tenant,
+            name: name.into(),
+            start,
+            increment,
+            min_value: if increment > 0 { 1 } else { i64::MIN + 1 },
+            max_value: if increment > 0 { i64::MAX } else { -1 },
+            cache_size: 1,
+            cycle: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_create_lookup_drop() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        let def = seq_def(t, "s", 1, 1);
+        cat.create_sequence(def.clone()).await.unwrap();
+        let looked_up = cat.lookup_sequence(&t, "s").await.unwrap();
+        assert_eq!(looked_up, def);
+
+        // Duplicate create rejected with Catalog error.
+        let err = cat
+            .create_sequence(seq_def(t, "s", 100, 2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::Catalog(_)));
+
+        cat.drop_sequence(&t, "s").await.unwrap();
+        assert!(cat.lookup_sequence(&t, "s").await.is_none());
+        let err = cat.drop_sequence(&t, "s").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn sequence_nextval_currval_setval() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.create_sequence(seq_def(t, "s", 1, 1)).await.unwrap();
+
+        // currval before any nextval is NotFound.
+        let err = cat.currval(&t, "s").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+
+        assert_eq!(cat.nextval(&t, "s").await.unwrap(), 1);
+        assert_eq!(cat.nextval(&t, "s").await.unwrap(), 2);
+        assert_eq!(cat.nextval(&t, "s").await.unwrap(), 3);
+        assert_eq!(cat.currval(&t, "s").await.unwrap(), 3);
+
+        // setval(advance=true) — next nextval returns 100+1.
+        assert_eq!(cat.setval(&t, "s", 100, true).await.unwrap(), 100);
+        assert_eq!(cat.nextval(&t, "s").await.unwrap(), 101);
+
+        // setval(advance=false) — next nextval returns exactly 200.
+        assert_eq!(cat.setval(&t, "s", 200, false).await.unwrap(), 200);
+        assert_eq!(cat.nextval(&t, "s").await.unwrap(), 200);
+    }
+
+    /// The load-bearing durability test: persisted state must survive a
+    /// catalog-handle drop and reconnect without handing out duplicate
+    /// values.
+    #[tokio::test]
+    async fn sequence_survives_simulated_restart() {
+        let schema_name = unique_schema();
+        let _guard = SchemaGuard {
+            schema: schema_name.clone(),
+        };
+        let cat1 = match tokio::time::timeout(
+            Duration::from_secs(2),
+            PostgresCatalog::connect_with_schema(PG_URL, &schema_name),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("postgres unreachable, skipping sequence_survives_simulated_restart");
+                return;
+            }
+        };
+        let t = TenantId::new();
+        cat1.create_namespace(&t).await.unwrap();
+        cat1.create_sequence(seq_def(t, "s", 1, 1)).await.unwrap();
+        let mut pre = Vec::new();
+        for _ in 0..5 {
+            pre.push(cat1.nextval(&t, "s").await.unwrap());
+        }
+        assert_eq!(pre, vec![1, 2, 3, 4, 5]);
+        drop(cat1);
+
+        let cat2 = PostgresCatalog::connect_with_schema(PG_URL, &schema_name)
+            .await
+            .expect("reconnect");
+        // 6th nextval continues the sequence; no duplicates.
+        let n6 = cat2.nextval(&t, "s").await.unwrap();
+        assert!(
+            n6 > 5,
+            "post-restart nextval {n6} must not duplicate any pre-restart value"
+        );
+        // For cache_size = 1 the next value is exactly 6 (no gap).
+        assert_eq!(n6, 6);
+    }
+
+    #[tokio::test]
+    async fn sequence_cross_tenant_isolation() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let a = TenantId::new();
+        let b = TenantId::new();
+        cat.create_namespace(&a).await.unwrap();
+        cat.create_namespace(&b).await.unwrap();
+        cat.create_sequence(seq_def(a, "shared", 1, 1)).await.unwrap();
+
+        // Tenant B can't see tenant A's sequence.
+        let err = cat.nextval(&b, "shared").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+        assert!(cat.lookup_sequence(&b, "shared").await.is_none());
+
+        // Independent advance.
+        assert_eq!(cat.nextval(&a, "shared").await.unwrap(), 1);
+        cat.create_sequence(seq_def(b, "shared", 100, 1))
+            .await
+            .unwrap();
+        assert_eq!(cat.nextval(&b, "shared").await.unwrap(), 100);
+        assert_eq!(cat.nextval(&a, "shared").await.unwrap(), 2);
+    }
+
+    /// Concurrent `nextval` calls must always return distinct values —
+    /// row-level `FOR UPDATE` is the serialisation primitive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sequence_nextval_concurrent_no_duplicates() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let cat = Arc::new(cat);
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.create_sequence(seq_def(t, "s", 1, 1)).await.unwrap();
+
+        let mut handles = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let cat = cat.clone();
+            handles.push(tokio::spawn(async move { cat.nextval(&t, "s").await }));
+        }
+        let mut values: Vec<i64> = Vec::new();
+        for h in handles {
+            values.push(h.await.unwrap().unwrap());
+        }
+        let unique: std::collections::HashSet<i64> = values.iter().copied().collect();
+        assert_eq!(unique.len(), 10, "concurrent nextvals: {values:?}");
+        let mut sorted = values.clone();
+        sorted.sort();
+        assert_eq!(sorted, (1..=10).collect::<Vec<_>>());
+    }
+
+    // -------------------- Reactor round-trip --------------------
+
+    #[tokio::test]
+    async fn reactor_register_lookup_drop() {
+        use basin_common::ChangeOp;
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let tbl = TableName::new("orders").unwrap();
+        cat.create_namespace(&t).await.unwrap();
+        let def = ReactorDef {
+            tenant: t,
+            table: tbl.clone(),
+            name: "after_paid".into(),
+            ops: ReactorOps::INSERT | ReactorOps::UPDATE,
+            when_predicate: Some("NEW.status = 'paid'".into()),
+            body: "INSERT INTO billing_events (order_id) VALUES (NEW.id)".into(),
+        };
+        cat.register_reactor(def.clone()).await.unwrap();
+
+        let dup = cat.register_reactor(def.clone()).await.unwrap_err();
+        assert!(matches!(dup, BasinError::Catalog(_)));
+
+        let hits = cat.lookup_reactors_for(&t, &tbl, ChangeOp::Update).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0], def);
+
+        // DELETE op doesn't match — the bitset only enables INSERT|UPDATE.
+        let no_hits = cat.lookup_reactors_for(&t, &tbl, ChangeOp::Delete).await;
+        assert!(no_hits.is_empty());
+
+        let listed = cat.list_reactors(&t).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], def);
+
+        cat.drop_reactor(&t, &tbl, "after_paid").await.unwrap();
+        let err = cat
+            .drop_reactor(&t, &tbl, "after_paid")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+        assert!(cat.list_reactors(&t).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactor_registration_order_preserved() {
+        use basin_common::ChangeOp;
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let tbl = TableName::new("t").unwrap();
+        cat.create_namespace(&t).await.unwrap();
+        for n in ["one", "two", "three"] {
+            let def = ReactorDef {
+                tenant: t,
+                table: tbl.clone(),
+                name: n.into(),
+                ops: ReactorOps::INSERT,
+                when_predicate: None,
+                body: "SELECT 1".into(),
+            };
+            cat.register_reactor(def).await.unwrap();
+        }
+        let hits = cat.lookup_reactors_for(&t, &tbl, ChangeOp::Insert).await;
+        let names: Vec<&str> = hits.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["one", "two", "three"]);
+    }
+
+    #[tokio::test]
+    async fn reactor_cross_tenant_isolation() {
+        use basin_common::ChangeOp;
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let a = TenantId::new();
+        let b = TenantId::new();
+        let tbl = TableName::new("t").unwrap();
+        cat.create_namespace(&a).await.unwrap();
+        cat.create_namespace(&b).await.unwrap();
+        let def = ReactorDef {
+            tenant: a,
+            table: tbl.clone(),
+            name: "r".into(),
+            ops: ReactorOps::INSERT,
+            when_predicate: None,
+            body: "SELECT 1".into(),
+        };
+        cat.register_reactor(def).await.unwrap();
+        // Tenant B sees nothing.
+        assert!(cat
+            .lookup_reactors_for(&b, &tbl, ChangeOp::Insert)
+            .await
+            .is_empty());
+        assert!(cat.list_reactors(&b).await.is_empty());
+        // Tenant B can register its own reactor with the same (table, name).
+        let def_b = ReactorDef {
+            tenant: b,
+            table: tbl.clone(),
+            name: "r".into(),
+            ops: ReactorOps::INSERT,
+            when_predicate: None,
+            body: "SELECT 2".into(),
+        };
+        cat.register_reactor(def_b).await.unwrap();
+        let a_hits = cat.lookup_reactors_for(&a, &tbl, ChangeOp::Insert).await;
+        let b_hits = cat.lookup_reactors_for(&b, &tbl, ChangeOp::Insert).await;
+        assert_eq!(a_hits.len(), 1);
+        assert_eq!(b_hits.len(), 1);
+        assert_ne!(a_hits[0].body, b_hits[0].body);
+    }
+
+    /// Reactors must survive a catalog handle drop.
+    #[tokio::test]
+    async fn reactor_survives_simulated_restart() {
+        use basin_common::ChangeOp;
+        let schema_name = unique_schema();
+        let _guard = SchemaGuard {
+            schema: schema_name.clone(),
+        };
+        let cat1 = match tokio::time::timeout(
+            Duration::from_secs(2),
+            PostgresCatalog::connect_with_schema(PG_URL, &schema_name),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("postgres unreachable, skipping reactor_survives_simulated_restart");
+                return;
+            }
+        };
+        let t = TenantId::new();
+        let tbl = TableName::new("t").unwrap();
+        cat1.create_namespace(&t).await.unwrap();
+        let def = ReactorDef {
+            tenant: t,
+            table: tbl.clone(),
+            name: "r".into(),
+            ops: ReactorOps::INSERT,
+            when_predicate: None,
+            body: "SELECT 1".into(),
+        };
+        cat1.register_reactor(def.clone()).await.unwrap();
+        drop(cat1);
+
+        let cat2 = PostgresCatalog::connect_with_schema(PG_URL, &schema_name)
+            .await
+            .expect("reconnect");
+        let hits = cat2.lookup_reactors_for(&t, &tbl, ChangeOp::Insert).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0], def);
+    }
+
+    // -------------------- Enum / domain round-trip --------------------
+
+    fn enum_def(t: TenantId, name: &str, labels: &[&str]) -> EnumTypeDef {
+        EnumTypeDef {
+            tenant: t,
+            name: name.into(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn domain_def(
+        t: TenantId,
+        name: &str,
+        base: crate::functions::SqlArgType,
+        check: Option<&str>,
+    ) -> DomainDef {
+        DomainDef {
+            tenant: t,
+            name: name.into(),
+            base_type: base,
+            check_predicate: check.map(|s| s.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn enum_type_round_trip() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.register_enum_type(enum_def(t, "color", &["red", "green", "blue"]))
+            .await
+            .unwrap();
+        let looked_up = cat.lookup_enum_type(&t, "color").await.unwrap();
+        assert_eq!(looked_up.labels, vec!["red", "green", "blue"]);
+
+        cat.add_enum_value(&t, "color", "yellow").await.unwrap();
+        let after = cat.lookup_enum_type(&t, "color").await.unwrap();
+        assert_eq!(after.labels, vec!["red", "green", "blue", "yellow"]);
+
+        let listed = cat.list_enum_types(&t).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "color");
+
+        cat.drop_enum_type(&t, "color").await.unwrap();
+        assert!(cat.lookup_enum_type(&t, "color").await.is_none());
+
+        let err = cat.drop_enum_type(&t, "color").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn enum_value_uniqueness_enforced() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+
+        // Duplicate label at registration time is rejected before persisting.
+        let err = cat
+            .register_enum_type(enum_def(t, "x", &["a", "b", "a"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::InvalidSchema(_)), "got {err:?}");
+        assert!(cat.lookup_enum_type(&t, "x").await.is_none());
+
+        // Duplicate add-value is rejected with a Catalog error.
+        cat.register_enum_type(enum_def(t, "y", &["a", "b"]))
+            .await
+            .unwrap();
+        let err = cat.add_enum_value(&t, "y", "a").await.unwrap_err();
+        assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
+        let after = cat.lookup_enum_type(&t, "y").await.unwrap();
+        assert_eq!(after.labels, vec!["a", "b"]);
+    }
+
+    /// Concurrent `add_enum_value` calls must serialise via the row lock —
+    /// final label list contains both new values exactly once and ordering
+    /// is deterministic (append order matches commit order).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enum_add_value_atomic() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let cat = Arc::new(cat);
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.register_enum_type(enum_def(t, "e", &["base"]))
+            .await
+            .unwrap();
+
+        let mut handles = Vec::with_capacity(8);
+        for i in 0..8 {
+            let cat = cat.clone();
+            let label = format!("v{i}");
+            handles.push(tokio::spawn(async move {
+                cat.add_enum_value(&t, "e", &label).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        let after = cat.lookup_enum_type(&t, "e").await.unwrap();
+        // Exactly the original label plus all 8 additions, no dupes lost
+        // and no value missing.
+        assert_eq!(after.labels.len(), 9);
+        assert_eq!(after.labels[0], "base");
+        let mut tail = after.labels[1..].to_vec();
+        tail.sort();
+        let mut expected: Vec<String> = (0..8).map(|i| format!("v{i}")).collect();
+        expected.sort();
+        assert_eq!(tail, expected);
+    }
+
+    #[tokio::test]
+    async fn domain_round_trip() {
+        use crate::functions::SqlArgType;
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.register_domain(domain_def(
+            t,
+            "positive_int",
+            SqlArgType::Int,
+            Some("VALUE > 0"),
+        ))
+        .await
+        .unwrap();
+        let looked_up = cat.lookup_domain(&t, "positive_int").await.unwrap();
+        assert_eq!(looked_up.base_type, SqlArgType::Int);
+        assert_eq!(looked_up.check_predicate.as_deref(), Some("VALUE > 0"));
+
+        let listed = cat.list_domains(&t).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "positive_int");
+
+        cat.drop_domain(&t, "positive_int").await.unwrap();
+        assert!(cat.lookup_domain(&t, "positive_int").await.is_none());
+
+        let err = cat.drop_domain(&t, "positive_int").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    /// The load-bearing durability test: persisted enum state must
+    /// survive a catalog-handle drop and reconnect.
+    #[tokio::test]
+    async fn enum_survives_simulated_restart() {
+        let schema_name = unique_schema();
+        let _guard = SchemaGuard {
+            schema: schema_name.clone(),
+        };
+        let cat1 = match tokio::time::timeout(
+            Duration::from_secs(2),
+            PostgresCatalog::connect_with_schema(PG_URL, &schema_name),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("postgres unreachable, skipping enum_survives_simulated_restart");
+                return;
+            }
+        };
+        let t = TenantId::new();
+        cat1.create_namespace(&t).await.unwrap();
+        cat1.register_enum_type(enum_def(t, "color", &["red", "green"]))
+            .await
+            .unwrap();
+        cat1.add_enum_value(&t, "color", "blue").await.unwrap();
+        drop(cat1);
+
+        let cat2 = PostgresCatalog::connect_with_schema(PG_URL, &schema_name)
+            .await
+            .expect("reconnect");
+        let after = cat2.lookup_enum_type(&t, "color").await.unwrap();
+        assert_eq!(after.labels, vec!["red", "green", "blue"]);
+    }
+
+    #[tokio::test]
+    async fn enum_cross_tenant_isolation() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let a = TenantId::new();
+        let b = TenantId::new();
+        cat.create_namespace(&a).await.unwrap();
+        cat.create_namespace(&b).await.unwrap();
+        cat.register_enum_type(enum_def(a, "shared", &["x", "y"]))
+            .await
+            .unwrap();
+        // Tenant B sees nothing.
+        assert!(cat.lookup_enum_type(&b, "shared").await.is_none());
+        assert!(cat.list_enum_types(&b).await.is_empty());
+        // Tenant B can register the same name independently.
+        cat.register_enum_type(enum_def(b, "shared", &["one"]))
+            .await
+            .unwrap();
+        let a_def = cat.lookup_enum_type(&a, "shared").await.unwrap();
+        let b_def = cat.lookup_enum_type(&b, "shared").await.unwrap();
+        assert_eq!(a_def.labels, vec!["x", "y"]);
+        assert_eq!(b_def.labels, vec!["one"]);
+    }
+
+    #[tokio::test]
+    async fn domain_cross_tenant_isolation() {
+        use crate::functions::SqlArgType;
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let a = TenantId::new();
+        let b = TenantId::new();
+        cat.create_namespace(&a).await.unwrap();
+        cat.create_namespace(&b).await.unwrap();
+        cat.register_domain(domain_def(a, "d", SqlArgType::Int, Some("VALUE > 0")))
+            .await
+            .unwrap();
+        assert!(cat.lookup_domain(&b, "d").await.is_none());
+        assert!(cat.list_domains(&b).await.is_empty());
+
+        cat.register_domain(domain_def(b, "d", SqlArgType::Text, None))
+            .await
+            .unwrap();
+        let a_def = cat.lookup_domain(&a, "d").await.unwrap();
+        let b_def = cat.lookup_domain(&b, "d").await.unwrap();
+        assert_eq!(a_def.base_type, SqlArgType::Int);
+        assert_eq!(b_def.base_type, SqlArgType::Text);
+    }
+
+    #[tokio::test]
+    async fn drop_blocked_when_referenced() {
+        use std::collections::HashMap;
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.register_enum_type(enum_def(t, "status", &["a", "b"]))
+            .await
+            .unwrap();
+
+        // Build a table whose `status` column carries the
+        // `BASIN_ENUM_TYPE` metadata marker so the catalog refcount sees
+        // it as a referencer.
+        let mut md = HashMap::new();
+        md.insert(BASIN_ENUM_TYPE_KEY.to_string(), "status".to_string());
+        let f1 = Field::new("id", DataType::Int64, false);
+        let f2 = Field::new("status", DataType::Utf8, false).with_metadata(md);
+        let referencing_schema = Schema::new(vec![f1, f2]);
+        let tbl = TableName::new("orders").unwrap();
+        cat.create_table(&t, &tbl, &referencing_schema)
+            .await
+            .unwrap();
+
+        let err = cat.drop_enum_type(&t, "status").await.unwrap_err();
+        assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("orders.status") || msg.contains("references"),
+            "error should mention the column, got: {err}"
+        );
+
+        // After we drop the table the type can be removed.
+        cat.drop_table(&t, &tbl).await.unwrap();
+        cat.drop_enum_type(&t, "status").await.unwrap();
+    }
+
+    // -------------------- Procedure round-trip --------------------
+
+    fn proc_def(t: TenantId, name: &str, body: &str) -> SqlProcedureDef {
+        SqlProcedureDef {
+            tenant: t,
+            name: name.into(),
+            args: Vec::new(),
+            body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn procedure_round_trip() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        let def = proc_def(t, "p", "INSERT INTO log VALUES ('hi')");
+        cat.register_procedure(def.clone()).await.unwrap();
+        let got = cat.lookup_procedure(&t, "p").await.unwrap();
+        assert_eq!(got, def);
+        let listed = cat.list_procedures(&t).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], def);
+
+        // Re-registering the same (tenant, name) is rejected.
+        let dup = cat.register_procedure(def.clone()).await.unwrap_err();
+        assert!(matches!(dup, BasinError::Catalog(_)), "got {dup:?}");
+
+        cat.drop_procedure(&t, "p").await.unwrap();
+        assert!(cat.lookup_procedure(&t, "p").await.is_none());
+
+        let err = cat.drop_procedure(&t, "p").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn procedure_args_json_round_trips() {
+        use crate::functions::{SqlArgType, SqlFunctionArg};
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        let def = SqlProcedureDef {
+            tenant: t,
+            name: "archive".into(),
+            args: vec![
+                SqlFunctionArg {
+                    name: "tid".into(),
+                    data_type: SqlArgType::Text,
+                },
+                SqlFunctionArg {
+                    name: "cutoff".into(),
+                    data_type: SqlArgType::TimestampTz,
+                },
+                SqlFunctionArg {
+                    name: "n".into(),
+                    data_type: SqlArgType::BigInt,
+                },
+                SqlFunctionArg {
+                    name: "active".into(),
+                    data_type: SqlArgType::Boolean,
+                },
+            ],
+            body: "INSERT INTO archive SELECT * FROM events WHERE id = n; \
+                   DELETE FROM events WHERE id = n"
+                .into(),
+        };
+        cat.register_procedure(def.clone()).await.unwrap();
+        let got = cat.lookup_procedure(&t, "archive").await.unwrap();
+        assert_eq!(got, def);
+        assert_eq!(got.args.len(), 4);
+        assert_eq!(got.args[0].data_type, SqlArgType::Text);
+        assert_eq!(got.args[1].data_type, SqlArgType::TimestampTz);
+        assert_eq!(got.args[2].data_type, SqlArgType::BigInt);
+        assert_eq!(got.args[3].data_type, SqlArgType::Boolean);
+    }
+
+    /// The load-bearing durability test: persisted procedure state must
+    /// survive a catalog-handle drop and reconnect.
+    #[tokio::test]
+    async fn procedure_survives_simulated_restart() {
+        let schema_name = unique_schema();
+        let _guard = SchemaGuard {
+            schema: schema_name.clone(),
+        };
+        let cat1 = match tokio::time::timeout(
+            Duration::from_secs(2),
+            PostgresCatalog::connect_with_schema(PG_URL, &schema_name),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("postgres unreachable, skipping procedure_survives_simulated_restart");
+                return;
+            }
+        };
+        let t = TenantId::new();
+        cat1.create_namespace(&t).await.unwrap();
+        let def = proc_def(
+            t,
+            "rotate",
+            "INSERT INTO archive SELECT * FROM events; DELETE FROM events",
+        );
+        cat1.register_procedure(def.clone()).await.unwrap();
+        drop(cat1);
+
+        let cat2 = PostgresCatalog::connect_with_schema(PG_URL, &schema_name)
+            .await
+            .expect("reconnect");
+        let after = cat2.lookup_procedure(&t, "rotate").await.unwrap();
+        assert_eq!(after, def);
+    }
+
+    #[tokio::test]
+    async fn procedure_cross_tenant_isolation() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let a = TenantId::new();
+        let b = TenantId::new();
+        cat.create_namespace(&a).await.unwrap();
+        cat.create_namespace(&b).await.unwrap();
+        cat.register_procedure(proc_def(a, "shared", "INSERT INTO log VALUES ('a')"))
+            .await
+            .unwrap();
+        // Tenant B sees nothing.
+        assert!(cat.lookup_procedure(&b, "shared").await.is_none());
+        assert!(cat.list_procedures(&b).await.is_empty());
+        // Tenant B can register the same name independently.
+        cat.register_procedure(proc_def(b, "shared", "INSERT INTO log VALUES ('b')"))
+            .await
+            .unwrap();
+        let a_def = cat.lookup_procedure(&a, "shared").await.unwrap();
+        let b_def = cat.lookup_procedure(&b, "shared").await.unwrap();
+        assert_eq!(a_def.body, "INSERT INTO log VALUES ('a')");
+        assert_eq!(b_def.body, "INSERT INTO log VALUES ('b')");
+        // A's listing only shows A's row.
+        let listed_a = cat.list_procedures(&a).await;
+        assert_eq!(listed_a.len(), 1);
+        assert_eq!(listed_a[0].tenant, a);
+    }
+
+    #[tokio::test]
+    async fn procedure_drop_namespace_cleans_table() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.register_procedure(proc_def(t, "p1", "INSERT INTO log VALUES ('x')"))
+            .await
+            .unwrap();
+        cat.register_procedure(proc_def(t, "p2", "DELETE FROM log"))
+            .await
+            .unwrap();
+        assert_eq!(cat.list_procedures(&t).await.len(), 2);
+
+        cat.drop_namespace(&t).await.unwrap();
+        assert!(cat.list_procedures(&t).await.is_empty());
+        assert!(cat.lookup_procedure(&t, "p1").await.is_none());
+        assert!(cat.lookup_procedure(&t, "p2").await.is_none());
     }
 }

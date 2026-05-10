@@ -6,6 +6,7 @@
 //! to the underlying KMS — basin-storage only orchestrates.
 
 use async_trait::async_trait;
+use basin_catalog::TenantStorageConfig;
 use basin_common::{BasinError, Result, TenantId};
 use bytes::Bytes;
 use futures::future::FutureExt;
@@ -35,6 +36,30 @@ pub trait EncryptionProvider: Send + Sync {
         tenant: &TenantId,
         wrapped: &WrappedKey,
     ) -> Result<Vec<u8>>;
+
+    /// Optional: when the engine has a [`TenantStorageConfig`] for this
+    /// tenant, it threads it through here so the impl can route to the
+    /// per-tenant CMK instead of its default. Default impl ignores the
+    /// config and falls back to plain `wrap_key`, preserving backwards
+    /// compatibility for impls written against the original two-method
+    /// trait.
+    async fn wrap_key_with_config(
+        &self,
+        tenant: &TenantId,
+        _config: &TenantStorageConfig,
+    ) -> Result<(Vec<u8>, WrappedKey)> {
+        self.wrap_key(tenant).await
+    }
+
+    /// Symmetric for unwrap. Default impl forwards to plain `unwrap_key`.
+    async fn unwrap_key_with_config(
+        &self,
+        tenant: &TenantId,
+        wrapped: &WrappedKey,
+        _config: &TenantStorageConfig,
+    ) -> Result<Vec<u8>> {
+        self.unwrap_key(tenant, wrapped).await
+    }
 }
 
 /// AES-GCM decrypt an envelope produced by the writer. The on-disk layout

@@ -25,23 +25,40 @@
 
 #![forbid(unsafe_code)]
 
+mod domains;
+mod enums;
+mod functions;
 mod in_memory;
+pub mod info_schema;
 mod metadata;
 mod postgres;
+mod procedures;
+mod reactors;
 mod rest;
+mod sequences;
 mod snapshot;
+mod tenant_storage_config;
 
 use async_trait::async_trait;
-use basin_common::{Result, TableName, TenantId};
+use basin_common::{ChangeOp, Result, TableName, TenantId};
 
+pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
+pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
+pub use functions::{
+    SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
+};
 pub use in_memory::InMemoryCatalog;
 pub use metadata::{
     ColumnStats, CvDef, DataFileRef, PartitionSpec, Policy, PolicyCommand, SecondaryIndex,
     TableMetadata,
 };
 pub use postgres::PostgresCatalog;
+pub use procedures::{ProcedureError, SqlProcedureDef};
+pub use reactors::{ReactorDef, ReactorError, ReactorOps};
 pub use rest::RestCatalog;
+pub use sequences::SequenceDef;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
+pub use tenant_storage_config::TenantStorageConfig;
 
 /// One row in the project-wide snapshot timeline returned by
 /// [`Catalog::list_snapshots_project_wide`]. Carries enough context (table,
@@ -596,5 +613,371 @@ pub trait Catalog: Send + Sync {
         Err(basin_common::BasinError::Internal(
             "drop_index not implemented for this catalog backend".into(),
         ))
+    }
+
+    /// Register a `LANGUAGE sql` user-defined scalar function. The catalog
+    /// stores the definition verbatim; the engine's inliner reparses the
+    /// body on each call site. Idempotent in the sense that re-registering
+    /// the same `(tenant, name)` replaces the prior definition (matches
+    /// `CREATE OR REPLACE FUNCTION` semantics).
+    ///
+    /// Default impl returns `Internal("not implemented")`. The in-memory
+    /// and Postgres backends override.
+    async fn register_sql_function(&self, def: SqlFunctionDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_sql_function not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a previously-registered SQL function. Returns
+    /// [`basin_common::BasinError::NotFound`] if no function with the
+    /// given `(tenant, name)` exists.
+    async fn drop_sql_function(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let _ = (tenant, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_sql_function not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a registered SQL function by `(tenant, name)`. Returns
+    /// `None` for both "tenant has no functions" and "name is unknown" —
+    /// callers can't distinguish, mirroring the lookup semantics of
+    /// `load_table` for tables. Default impl returns `None`.
+    async fn lookup_sql_function(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Option<SqlFunctionDef> {
+        let _ = (tenant, name);
+        None
+    }
+
+    /// List every SQL function registered for `tenant`. Order is
+    /// unspecified; callers that need a stable order should sort by
+    /// `name`. Default impl returns an empty list.
+    async fn list_sql_functions(&self, tenant: &TenantId) -> Vec<SqlFunctionDef> {
+        let _ = tenant;
+        Vec::new()
+    }
+
+    /// Register a sequence under `(def.tenant, def.name)`. Returns
+    /// [`basin_common::BasinError::Catalog`] if a sequence with the same
+    /// `(tenant, name)` already exists; PG semantics treat
+    /// `CREATE SEQUENCE` as non-idempotent (use `CREATE SEQUENCE IF
+    /// NOT EXISTS` at the SQL surface to opt into idempotency once
+    /// that path lands). Returns [`basin_common::BasinError::InvalidSchema`]
+    /// when `def.increment == 0`. Default impl returns
+    /// `Internal("not implemented")` so the stub `RestCatalog` stays
+    /// buildable.
+    async fn create_sequence(&self, def: SequenceDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "create_sequence not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a previously-created sequence. Returns
+    /// [`basin_common::BasinError::NotFound`] if no sequence with that
+    /// `(tenant, name)` exists. Default impl: not-implemented.
+    async fn drop_sequence(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let _ = (tenant, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_sequence not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a registered sequence by `(tenant, name)`. Returns
+    /// `None` when the sequence does not exist (mirrors the lookup
+    /// shape of [`Catalog::lookup_sql_function`] and [`Catalog::load_table`]
+    /// for the no-entry case). Default impl: `None`.
+    async fn lookup_sequence(&self, tenant: &TenantId, name: &str) -> Option<SequenceDef> {
+        let _ = (tenant, name);
+        None
+    }
+
+    /// Allocate and return the next value of `(tenant, name)`. The first
+    /// call after `create_sequence` returns `def.start`; subsequent calls
+    /// step by `def.increment`. Concurrent callers always see distinct
+    /// values — the per-sequence mutex serialises the increment.
+    /// Returns [`basin_common::BasinError::NotFound`] if no sequence is
+    /// registered under that name; [`basin_common::BasinError::Catalog`]
+    /// when the sequence is exhausted (no-cycle and would cross
+    /// `max_value` / `min_value`). Default impl: not-implemented.
+    async fn nextval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+        let _ = (tenant, name);
+        Err(basin_common::BasinError::Internal(
+            "nextval not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Return the most recent value handed out by
+    /// [`Catalog::nextval`] across all sessions. PG models `currval` as
+    /// per-session: the engine layer overlays a session-bound cache so
+    /// the SQL-visible `currval` reflects only the calling session's
+    /// last `nextval`. This catalog-level method is the underlying
+    /// "value most recently advanced to" — useful for diagnostics and
+    /// the `setval(advance=false)` path. Returns
+    /// [`basin_common::BasinError::NotFound`] when the sequence does
+    /// not exist or has never been advanced. Default impl:
+    /// not-implemented.
+    async fn currval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+        let _ = (tenant, name);
+        Err(basin_common::BasinError::Internal(
+            "currval not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Reset the sequence's value. With `advance == true` (PG's default
+    /// for `setval(seq, n)`), the next `nextval` returns `n + increment`;
+    /// with `advance == false` (PG's `setval(seq, n, false)`), the next
+    /// `nextval` returns exactly `n`. Returns the value of `n` (matches
+    /// PG's return-the-just-set-value behaviour). Default impl:
+    /// not-implemented.
+    async fn setval(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        value: i64,
+        advance: bool,
+    ) -> Result<i64> {
+        let _ = (tenant, name, value, advance);
+        Err(basin_common::BasinError::Internal(
+            "setval not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Register a SQL-bodied reactor. The catalog stores the definition
+    /// verbatim; the engine's `ReactorSink` reparses the body / predicate
+    /// on each fire. Re-registering the same `(tenant, table, name)` is
+    /// rejected — the SQL surface routes that case through `DROP REACTOR`
+    /// + a fresh `register_reactor`.
+    ///
+    /// Validates: body parses as a single SQL statement, optional `WHEN`
+    /// predicate parses as a SQL expression, `ops` is non-empty, name is
+    /// unique per `(tenant, table)`. Default impl returns
+    /// `Internal("not implemented")`. The in-memory backend overrides;
+    /// the Postgres backend will override when the durable reactor row
+    /// lands (the SQL surface is held back per the 5.11.C scope split).
+    async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_reactor not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a previously-registered reactor. Returns
+    /// [`basin_common::BasinError::NotFound`] if no reactor with that
+    /// `(tenant, table, name)` exists.
+    async fn drop_reactor(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+    ) -> Result<()> {
+        let _ = (tenant, table, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_reactor not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up every reactor that should fire for `(tenant, table, op)`.
+    /// Order is registration order — `ReactorSink` invokes them in this
+    /// sequence and short-circuits on the first error. Default impl
+    /// returns an empty vec, so backends that haven't opted in see no
+    /// reactor activity.
+    async fn lookup_reactors_for(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        op: ChangeOp,
+    ) -> Vec<ReactorDef> {
+        let _ = (tenant, table, op);
+        Vec::new()
+    }
+
+    /// List every reactor registered for `tenant` across all tables.
+    /// Order is unspecified; callers that need a stable order should
+    /// sort by `(table, name)`. Default impl returns an empty list.
+    async fn list_reactors(&self, tenant: &TenantId) -> Vec<ReactorDef> {
+        let _ = tenant;
+        Vec::new()
+    }
+
+    /// Register a `CREATE TYPE … AS ENUM` declaration. Returns
+    /// [`basin_common::BasinError::Catalog`] when the name collides
+    /// with an existing enum / domain for the same tenant, and
+    /// [`basin_common::BasinError::InvalidSchema`] when the label
+    /// list fails [`enums::validate_new`]. Default impl returns
+    /// `Internal("not implemented")` so non-default backends opt in
+    /// explicitly.
+    async fn register_enum_type(&self, def: EnumTypeDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_enum_type not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a registered enum by `(tenant, name)`. Returns `None`
+    /// when the name does not resolve. Default impl: `None`.
+    async fn lookup_enum_type(&self, tenant: &TenantId, name: &str) -> Option<EnumTypeDef> {
+        let _ = (tenant, name);
+        None
+    }
+
+    /// Append `value` to an existing enum's label list. PG's
+    /// `ALTER TYPE … ADD VALUE` is append-only; insert-before /
+    /// remove are explicitly out of scope. Returns
+    /// [`basin_common::BasinError::NotFound`] when no enum is
+    /// registered under that name, and
+    /// [`basin_common::BasinError::Catalog`] when `value` already
+    /// exists in the label list. Default impl: not-implemented.
+    async fn add_enum_value(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        let _ = (tenant, name, value);
+        Err(basin_common::BasinError::Internal(
+            "add_enum_value not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a previously-registered enum. Returns
+    /// [`basin_common::BasinError::NotFound`] if no enum with that
+    /// name exists, and [`basin_common::BasinError::Catalog`] when at
+    /// least one table column still references the type — v0.1 has no
+    /// CASCADE; the caller must drop the column(s) first. Default
+    /// impl: not-implemented.
+    async fn drop_enum_type(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let _ = (tenant, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_enum_type not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// List every enum registered for `tenant`. Order is unspecified;
+    /// callers that need a stable order should sort by `name`. Default
+    /// impl returns an empty list.
+    async fn list_enum_types(&self, tenant: &TenantId) -> Vec<EnumTypeDef> {
+        let _ = tenant;
+        Vec::new()
+    }
+
+    /// Register a `CREATE DOMAIN` declaration. Returns
+    /// [`basin_common::BasinError::Catalog`] when the name collides
+    /// with an existing enum / domain for the same tenant, and
+    /// [`basin_common::BasinError::InvalidSchema`] when the predicate
+    /// fails to parse. Default impl: not-implemented.
+    async fn register_domain(&self, def: DomainDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_domain not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a registered domain by `(tenant, name)`. Default impl:
+    /// `None`.
+    async fn lookup_domain(&self, tenant: &TenantId, name: &str) -> Option<DomainDef> {
+        let _ = (tenant, name);
+        None
+    }
+
+    /// Drop a previously-registered domain. Returns
+    /// [`basin_common::BasinError::NotFound`] when missing,
+    /// [`basin_common::BasinError::Catalog`] when at least one table
+    /// column still references the domain.
+    async fn drop_domain(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let _ = (tenant, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_domain not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// List every domain registered for `tenant`. Default impl: empty.
+    async fn list_domains(&self, tenant: &TenantId) -> Vec<DomainDef> {
+        let _ = tenant;
+        Vec::new()
+    }
+
+    /// Register a `LANGUAGE sql` user-defined procedure. The catalog
+    /// stores the definition verbatim; the engine reparses the body
+    /// (and re-substitutes call-site arguments into each statement) on
+    /// every `CALL`. Re-registering the same `(tenant, name)` is
+    /// rejected — the SQL surface routes that case through `DROP
+    /// PROCEDURE` + a fresh `register_procedure`.
+    ///
+    /// Default impl returns `Internal("not implemented")` so non-default
+    /// backends opt in explicitly.
+    async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_procedure not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a previously-registered procedure. Returns
+    /// [`basin_common::BasinError::NotFound`] if no procedure with that
+    /// `(tenant, name)` exists. Default impl: not-implemented.
+    async fn drop_procedure(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let _ = (tenant, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_procedure not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a registered procedure by `(tenant, name)`. Returns
+    /// `None` for both "tenant has no procedures" and "name is
+    /// unknown" — same lookup semantics as
+    /// [`Catalog::lookup_sql_function`]. Default impl returns `None`.
+    async fn lookup_procedure(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Option<SqlProcedureDef> {
+        let _ = (tenant, name);
+        None
+    }
+
+    /// List every procedure registered for `tenant`. Order is
+    /// unspecified; callers that need a stable order should sort by
+    /// `name`. Default impl returns an empty list.
+    async fn list_procedures(&self, tenant: &TenantId) -> Vec<SqlProcedureDef> {
+        let _ = tenant;
+        Vec::new()
+    }
+
+    /// Persist `config` for `tenant`. Idempotent: a second call with the
+    /// same tenant replaces the prior config (mirrors the
+    /// `INSERT … ON CONFLICT DO UPDATE` shape of the durable backends).
+    /// Read by the storage layer's encryption call path via
+    /// [`Catalog::get_tenant_storage_config`]; threaded into the
+    /// `EncryptionProvider` so external KMS adapters can route per-tenant
+    /// CMK lookups without owning a registry of their own. Default impl
+    /// returns `Internal("not implemented")` so non-default backends opt
+    /// in explicitly.
+    async fn set_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+        config: TenantStorageConfig,
+    ) -> Result<()> {
+        let _ = (tenant, config);
+        Err(basin_common::BasinError::Internal(
+            "set_tenant_storage_config not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up the persisted [`TenantStorageConfig`] for `tenant`.
+    /// Returns `None` when no config has been set — callers (the
+    /// encryption call path) interpret that as "no per-tenant routing,
+    /// fall back to the provider's default behaviour". Default impl:
+    /// `None`.
+    async fn get_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<TenantStorageConfig>> {
+        let _ = tenant;
+        Ok(None)
     }
 }

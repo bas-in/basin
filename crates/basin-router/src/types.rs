@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    IntervalMonthDayNanoType, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use basin_common::Result;
 use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -23,6 +23,15 @@ use pgwire::api::Type;
 use pgwire::messages::data::{DataRow, FieldDescription, RowDescription};
 
 const FORMAT_CODE_TEXT: i16 = 0;
+
+/// Number of days between Arrow's Date32 epoch (1970-01-01) and Postgres's
+/// DATE epoch (2000-01-01). Used by the binary DATE wire encoding.
+const PG_EPOCH_DAYS_FROM_UNIX: i32 = 10957;
+
+/// Microseconds between Arrow's TIMESTAMP epoch (1970-01-01 UTC) and Postgres's
+/// TIMESTAMPTZ epoch (2000-01-01 UTC). Used by the binary TIMESTAMP[TZ] wire
+/// encoding.
+const PG_EPOCH_MICROS_FROM_UNIX: i64 = (PG_EPOCH_DAYS_FROM_UNIX as i64) * 86_400_000_000;
 
 /// Field-metadata key that basin-engine uses to mark logical types not
 /// directly representable in Arrow (today: `JSONB`, `UUID`). Kept in sync
@@ -92,6 +101,10 @@ pub(crate) fn arrow_to_pg_type(dt: &DataType) -> Type {
         DataType::Float32 => Type::FLOAT4,
         DataType::Utf8 | DataType::LargeUtf8 => Type::TEXT,
         DataType::Binary | DataType::LargeBinary => Type::BYTEA,
+        DataType::Date32 => Type::DATE,
+        DataType::Interval(IntervalUnit::MonthDayNano) => Type::INTERVAL,
+        DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
+        DataType::Timestamp(_, None) => Type::TIMESTAMP,
         // Everything else gets formatted as text.
         _ => Type::TEXT,
     }
@@ -99,10 +112,11 @@ pub(crate) fn arrow_to_pg_type(dt: &DataType) -> Type {
 
 fn type_size(ty: &Type) -> i16 {
     match *ty {
-        Type::INT8 | Type::FLOAT8 => 8,
-        Type::INT4 | Type::FLOAT4 => 4,
+        Type::INT8 | Type::FLOAT8 | Type::TIMESTAMPTZ | Type::TIMESTAMP => 8,
+        Type::INT4 | Type::FLOAT4 | Type::DATE => 4,
         Type::INT2 => 2,
         Type::BOOL => 1,
+        Type::INTERVAL => 16,
         _ => -1,
     }
 }
@@ -293,6 +307,50 @@ fn encode_value_binary(
             buf.put_i32(bytes.len() as i32);
             buf.put_slice(bytes);
         }
+        DataType::Date32 => {
+            // PG DATE binary: i32 days since 2000-01-01. Arrow Date32 counts
+            // from 1970-01-01; rebase by the 10957-day offset.
+            let days = col.as_primitive::<Date32Type>().value(idx);
+            buf.put_i32(4);
+            buf.put_i32(days - PG_EPOCH_DAYS_FROM_UNIX);
+        }
+        DataType::Timestamp(unit, _tz) => {
+            // PG TIMESTAMP[TZ] binary: 8-byte i64 microseconds since
+            // 2000-01-01 00:00:00 UTC. Arrow's epoch is 1970-01-01; rebase
+            // after normalizing the granularity to microseconds.
+            let raw: i64 = match unit {
+                TimeUnit::Second => col.as_primitive::<TimestampSecondType>().value(idx),
+                TimeUnit::Millisecond => {
+                    col.as_primitive::<TimestampMillisecondType>().value(idx)
+                }
+                TimeUnit::Microsecond => {
+                    col.as_primitive::<TimestampMicrosecondType>().value(idx)
+                }
+                TimeUnit::Nanosecond => {
+                    col.as_primitive::<TimestampNanosecondType>().value(idx)
+                }
+            };
+            let unix_micros: i64 = match unit {
+                TimeUnit::Second => raw.saturating_mul(1_000_000),
+                TimeUnit::Millisecond => raw.saturating_mul(1_000),
+                TimeUnit::Microsecond => raw,
+                TimeUnit::Nanosecond => raw / 1_000,
+            };
+            buf.put_i32(8);
+            buf.put_i64(unix_micros - PG_EPOCH_MICROS_FROM_UNIX);
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            // PG INTERVAL binary: i64 microseconds, i32 days, i32 months
+            // (16 bytes total, big-endian). Arrow's MonthDayNano is i128
+            // packed; `to_parts` returns signed components.
+            let v = col.as_primitive::<IntervalMonthDayNanoType>().value(idx);
+            let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(v);
+            let micros = nanos / 1_000;
+            buf.put_i32(16);
+            buf.put_i64(micros);
+            buf.put_i32(days);
+            buf.put_i32(months);
+        }
         // For types we don't have a binary representation for yet, fall back
         // to text. This is a deliberate v1 trade-off: drivers requesting
         // binary for an exotic type get the text form, which is a violation
@@ -423,6 +481,15 @@ fn render_cell(col: &dyn Array, idx: usize) -> String {
         DataType::Binary => render_bytea(col.as_binary::<i32>().value(idx)),
         DataType::LargeBinary => render_bytea(col.as_binary::<i64>().value(idx)),
         DataType::Timestamp(unit, tz) => render_timestamp(col, idx, unit, tz.as_deref()),
+        DataType::Date32 => {
+            let days = col.as_primitive::<Date32Type>().value(idx);
+            Date32Type::to_naive_date(days).format("%Y-%m-%d").to_string()
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let v = col.as_primitive::<IntervalMonthDayNanoType>().value(idx);
+            let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(v);
+            render_interval(months, days, nanos)
+        }
         // Fallback: best-effort Debug rendering.
         other => format!("{other:?}@{idx}"),
     }
@@ -435,6 +502,44 @@ fn render_bytea(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Render a Postgres-style interval text from `(months, days, nanos)`. Empty
+/// (zero) intervals render as `00:00:00`, matching `psql` output. The time
+/// component is suppressed when zero unless months/days are also zero.
+fn render_interval(months: i32, days: i32, nanos: i64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let years = months / 12;
+    let mons = months % 12;
+    if years != 0 {
+        parts.push(format!("{years} year{}", if years.abs() == 1 { "" } else { "s" }));
+    }
+    if mons != 0 {
+        parts.push(format!("{mons} mon{}", if mons.abs() == 1 { "" } else { "s" }));
+    }
+    if days != 0 {
+        parts.push(format!("{days} day{}", if days.abs() == 1 { "" } else { "s" }));
+    }
+    if nanos != 0 || parts.is_empty() {
+        let neg = nanos < 0;
+        let abs_nanos = nanos.unsigned_abs();
+        let total_secs = abs_nanos / 1_000_000_000;
+        let frac_nanos = abs_nanos % 1_000_000_000;
+        let hh = total_secs / 3600;
+        let mm = (total_secs % 3600) / 60;
+        let ss = total_secs % 60;
+        let sign = if neg { "-" } else { "" };
+        if frac_nanos == 0 {
+            parts.push(format!("{sign}{hh:02}:{mm:02}:{ss:02}"));
+        } else {
+            // PG renders microseconds (6 digits), trimming trailing zeros only
+            // up to the microsecond boundary. Match that by using %.6f-style
+            // microseconds.
+            let micros = frac_nanos / 1_000;
+            parts.push(format!("{sign}{hh:02}:{mm:02}:{ss:02}.{micros:06}"));
+        }
+    }
+    parts.join(" ")
 }
 
 fn render_timestamp(col: &dyn Array, idx: usize, unit: &TimeUnit, _tz: Option<&str>) -> String {
@@ -481,6 +586,75 @@ mod tests {
     }
 
     #[test]
+    fn maps_date_and_interval() {
+        // Date32 must surface as PG OID 1082 (DATE), not the TEXT fallback —
+        // pgwire clients rely on this for `current_date` and friends.
+        assert_eq!(arrow_to_pg_type(&DataType::Date32), Type::DATE);
+        assert_eq!(Type::DATE.oid(), 1082);
+        // MonthDayNano interval is what `age()` will return once the engine
+        // arrow-bridge gains it; map it to PG OID 1186 (INTERVAL).
+        assert_eq!(
+            arrow_to_pg_type(&DataType::Interval(IntervalUnit::MonthDayNano)),
+            Type::INTERVAL,
+        );
+        assert_eq!(Type::INTERVAL.oid(), 1186);
+    }
+
+    #[test]
+    fn row_description_advertises_date_and_interval_oids() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("i", DataType::Interval(IntervalUnit::MonthDayNano), true),
+        ]);
+        let rd = row_description(&schema);
+        assert_eq!(rd.fields.len(), 2);
+        assert_eq!(rd.fields[0].name, "d");
+        assert_eq!(rd.fields[0].type_id, 1082);
+        assert_eq!(rd.fields[0].type_size, 4);
+        assert_eq!(rd.fields[1].name, "i");
+        assert_eq!(rd.fields[1].type_id, 1186);
+        assert_eq!(rd.fields[1].type_size, 16);
+    }
+
+    #[test]
+    fn renders_date_text() {
+        use arrow_array::Date32Array;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "d",
+            DataType::Date32,
+            false,
+        )]));
+        // 2024-03-14 = 19796 days since 1970-01-01.
+        let days = Date32Type::from_naive_date(
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 14).unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Date32Array::from(vec![days]))],
+        )
+        .unwrap();
+        let rows = encode_batches(&schema, &[batch]);
+        // i32 length prefix = 10, then "2024-03-14".
+        assert_eq!(&rows[0].data[0..4], &10i32.to_be_bytes());
+        assert_eq!(&rows[0].data[4..14], b"2024-03-14");
+    }
+
+    #[test]
+    fn renders_interval_text() {
+        // Direct unit-test of the text formatter; building an
+        // IntervalMonthDayNanoArray here would just round-trip through
+        // `to_parts`. Cover the cases pgwire clients care about.
+        assert_eq!(render_interval(0, 0, 0), "00:00:00");
+        assert_eq!(render_interval(11, 30, 0), "11 mons 30 days");
+        assert_eq!(render_interval(12, 0, 0), "1 year");
+        assert_eq!(render_interval(0, 0, 9_296_000_000_000), "02:34:56");
+        assert_eq!(
+            render_interval(13, 1, 9_296_000_000_000),
+            "1 year 1 mon 1 day 02:34:56",
+        );
+    }
+
+    #[test]
     fn encodes_three_rows() {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -524,6 +698,178 @@ mod tests {
         // length 1, byte 't' / 'f'.
         assert_eq!(rows[0].data[4], b't');
         assert_eq!(rows[1].data[4], b'f');
+    }
+
+    #[test]
+    fn maps_timestamp_oids() {
+        // Tz-bearing timestamp → TIMESTAMPTZ regardless of granularity.
+        assert_eq!(
+            arrow_to_pg_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            Type::TIMESTAMPTZ,
+        );
+        assert_eq!(
+            arrow_to_pg_type(&DataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into()),
+            )),
+            Type::TIMESTAMPTZ,
+        );
+        assert_eq!(Type::TIMESTAMPTZ.oid(), 1184);
+        // Tz-less timestamp → TIMESTAMP.
+        assert_eq!(
+            arrow_to_pg_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+            Type::TIMESTAMP,
+        );
+        assert_eq!(Type::TIMESTAMP.oid(), 1114);
+    }
+
+    #[test]
+    fn row_description_advertises_timestamp_oids() {
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "tz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "naive",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]);
+        let rd = row_description(&schema);
+        assert_eq!(rd.fields.len(), 2);
+        assert_eq!(rd.fields[0].type_id, 1184);
+        assert_eq!(rd.fields[0].type_size, 8);
+        assert_eq!(rd.fields[1].type_id, 1114);
+        assert_eq!(rd.fields[1].type_size, 8);
+    }
+
+    #[test]
+    fn renders_timestamp_text() {
+        use arrow_array::TimestampMicrosecondArray;
+        // 2024-03-14 12:34:56 UTC = 1710419696 unix-seconds.
+        let unix_micros: i64 = 1_710_419_696_000_000;
+        let arr = TimestampMicrosecondArray::from(vec![unix_micros])
+            .with_timezone("UTC");
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let rows = encode_batches(&schema, &[batch]);
+        let len = i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap()) as usize;
+        let body = std::str::from_utf8(&rows[0].data[4..4 + len]).unwrap();
+        // Existing render path emits RFC3339; just confirm the date/time
+        // components round-trip — the UTC tz is what matters for clients.
+        assert!(body.starts_with("2024-03-14"), "body = {body:?}");
+        assert!(body.contains("12:34:56"), "body = {body:?}");
+    }
+
+    #[test]
+    fn renders_timestamp_binary() {
+        use arrow_array::TimestampMicrosecondArray;
+        let unix_micros: i64 = 1_710_419_696_000_000;
+        let arr = TimestampMicrosecondArray::from(vec![unix_micros])
+            .with_timezone("UTC");
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let len = i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap());
+        assert_eq!(len, 8);
+        let got = i64::from_be_bytes(rows[0].data[4..12].try_into().unwrap());
+        assert_eq!(got, unix_micros - PG_EPOCH_MICROS_FROM_UNIX);
+    }
+
+    #[test]
+    fn renders_interval_binary() {
+        use arrow_array::IntervalMonthDayNanoArray;
+        // months=1, days=2, nanos=3_000_000 (= 3000 micros).
+        let v = IntervalMonthDayNanoType::make_value(1, 2, 3_000_000);
+        let arr = IntervalMonthDayNanoArray::from(vec![v]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let len = i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap());
+        assert_eq!(len, 16);
+        let micros = i64::from_be_bytes(rows[0].data[4..12].try_into().unwrap());
+        let days = i32::from_be_bytes(rows[0].data[12..16].try_into().unwrap());
+        let months = i32::from_be_bytes(rows[0].data[16..20].try_into().unwrap());
+        assert_eq!(micros, 3_000);
+        assert_eq!(days, 2);
+        assert_eq!(months, 1);
+    }
+
+    #[test]
+    fn renders_interval_binary_negative() {
+        // age() can produce negative intervals; verify signed propagation
+        // through `to_parts` and into the wire bytes (i64 micros, i32 days,
+        // i32 months are all signed).
+        use arrow_array::IntervalMonthDayNanoArray;
+        let v = IntervalMonthDayNanoType::make_value(-1, -2, -3_000_000);
+        let arr = IntervalMonthDayNanoArray::from(vec![v]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let len = i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap());
+        assert_eq!(len, 16);
+        let micros = i64::from_be_bytes(rows[0].data[4..12].try_into().unwrap());
+        let days = i32::from_be_bytes(rows[0].data[12..16].try_into().unwrap());
+        let months = i32::from_be_bytes(rows[0].data[16..20].try_into().unwrap());
+        assert_eq!(micros, -3_000);
+        assert_eq!(days, -2);
+        assert_eq!(months, -1);
+    }
+
+    #[test]
+    fn renders_interval_binary_round_trip_through_row_description() {
+        // End-to-end check: a single Interval(MonthDayNano) column should
+        // surface in row_description with type_size=16 (matching the binary
+        // body length) and the binary body should match the (micros, days,
+        // months) tuple emitted by the explicit binary arm.
+        use arrow_array::IntervalMonthDayNanoArray;
+        let v = IntervalMonthDayNanoType::make_value(7, 13, 1_000_000_000);
+        let arr = IntervalMonthDayNanoArray::from(vec![v]);
+        let arrow_schema = ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            false,
+        )]);
+        let rd = row_description(&arrow_schema);
+        assert_eq!(rd.fields.len(), 1);
+        assert_eq!(rd.fields[0].type_id, 1186);
+        assert_eq!(rd.fields[0].type_size, 16);
+
+        let schema = Arc::new(arrow_schema);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let len = i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap());
+        // type_size from row_description (16) must equal the binary body
+        // length the encoder emits.
+        assert_eq!(len as i16, rd.fields[0].type_size);
+        let micros = i64::from_be_bytes(rows[0].data[4..12].try_into().unwrap());
+        let days = i32::from_be_bytes(rows[0].data[12..16].try_into().unwrap());
+        let months = i32::from_be_bytes(rows[0].data[16..20].try_into().unwrap());
+        // 1_000_000_000 nanos = 1_000_000 micros = 1 second.
+        assert_eq!(micros, 1_000_000);
+        assert_eq!(days, 13);
+        assert_eq!(months, 7);
     }
 
     #[test]

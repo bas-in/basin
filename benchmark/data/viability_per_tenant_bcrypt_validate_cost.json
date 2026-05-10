@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "p99 validate latency",
-    "value": 2.305667,
+    "value": 3.795875,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -16,10 +16,10 @@
   "details": {
     "bar_p99_ms": 300.0,
     "bcrypt_cost": 4,
-    "mean_ms": 1.8852799600000003,
+    "mean_ms": 3.6543041599999992,
     "n_samples": 50,
-    "p50_ms": 1.840541,
-    "p99_ms": 2.305667
+    "p50_ms": 3.672209,
+    "p99_ms": 3.795875
   },
-  "generated_at": "@1778330640"
+  "generated_at": "@1778393447"
 }

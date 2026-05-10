@@ -7,20 +7,20 @@
   "metrics": [
     {
       "label": "Tenant deletion (1 tenant, 100K rows)",
-      "basin": 4.8807089999999995,
-      "postgres": 7.011667,
+      "basin": 4.241,
+      "postgres": 3.2705,
       "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 1.44x"
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.77x"
     },
     {
       "label": "ADD COLUMN on 100K rows",
-      "basin": 0.203667,
-      "postgres": 7.367083,
+      "basin": 0.404708,
+      "postgres": 10.726667,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 36.17x"
+      "ratio_text": "pg / basin = 26.50x"
     }
   ],
-  "generated_at": "@1778333111"
+  "generated_at": "@1778397778"
 }

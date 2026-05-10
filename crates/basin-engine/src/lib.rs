@@ -38,12 +38,17 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use basin_common::{Result, TenantCounterRegistry, TenantCountersSnapshot, TenantId};
+use basin_common::{
+    ChangeEventSink, EventSinkRegistry, Result, TableName, TenantCounterRegistry,
+    TenantCountersSnapshot, TenantId,
+};
 
 /// Engine configuration.
 ///
@@ -91,6 +96,20 @@ pub(crate) struct EngineInner {
     /// Shared with `Storage` and (when present) `Wal` so byte counters cover
     /// every layer.
     pub(crate) tenant_counters: Arc<TenantCounterRegistry>,
+    /// Pluggable change-event sinks (pre/post-commit). With both lists
+    /// empty the executor's mutation path is a single `is_empty()` check
+    /// past the no-op branch — see `dml_events`.
+    pub(crate) event_sinks: RwLock<EventSinkRegistry>,
+    /// Monotonic per-`(tenant, table)` event sequence numbers. Bumped
+    /// under this mutex once per emitted event, just before the
+    /// pre-commit fan-out, so all sinks observe the same seq for one
+    /// committed mutation.
+    pub(crate) event_seq: Mutex<HashMap<(TenantId, TableName), u64>>,
+    /// Process-wide webhook subscription registry. Cheap to clone
+    /// (`Arc` inside). The post-commit `WebhookSink` (in
+    /// `basin-webhooks`) reads this same registry; the engine's
+    /// `ALTER TABLE … SUBSCRIBE WEBHOOK …` SQL surface mutates it.
+    pub(crate) webhook_registry: crate::webhook_registry::WebhookRegistry,
     // additional state (DataFusion runtime, per-tenant context cache) lives
     // in the implementation module; intentionally not exposed here.
 }
@@ -99,25 +118,65 @@ impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         crate::cron_glue::install();
         crate::net_glue::install();
-        crate::cv_glue::install();
         crate::geo_glue::install();
         crate::trgm_glue::install();
         let tenant_counters = Arc::new(TenantCounterRegistry::new());
         // Share the registry with storage (and the shard's WAL when present)
         // so per-tenant byte counters cover engine + storage + WAL.
         cfg.storage.attach_tenant_counters(tenant_counters.clone());
+        // Hand storage the catalog handle so the encryption call path can
+        // look up per-tenant `TenantStorageConfig` and route to the
+        // tenant's CMK without owning a registry of its own.
+        cfg.storage.attach_catalog(cfg.catalog.clone());
         if let Some(shard) = cfg.shard.as_ref() {
             shard.wal().attach_tenant_counters(tenant_counters.clone());
         }
-        Self {
-            inner: Arc::new(EngineInner {
-                cfg,
-                analytical: None,
-                analytical_routing_count: AtomicU64::new(0),
-                noisy_detector: crate::noisy_detector::NoisyDetector::new(),
-                tenant_counters,
-            }),
+        let mut registry = EventSinkRegistry::new();
+        // Opt-in debug helper: with `BASIN_TRACE_CHANGE_EVENTS=1` every
+        // committed mutation logs a structured `tracing::info!` line. Default
+        // off; nothing is attached unless the env var is set at engine-build
+        // time.
+        if std::env::var("BASIN_TRACE_CHANGE_EVENTS").as_deref() == Ok("1") {
+            registry.register_post_commit(Arc::new(crate::events::TracingSink));
         }
+        let catalog = cfg.catalog.clone();
+        let inner = Arc::new(EngineInner {
+            cfg,
+            analytical: None,
+            analytical_routing_count: AtomicU64::new(0),
+            noisy_detector: crate::noisy_detector::NoisyDetector::new(),
+            tenant_counters,
+            event_sinks: RwLock::new(registry),
+            event_seq: Mutex::new(HashMap::new()),
+            webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
+        });
+        attach_reactor_sink(&inner, catalog);
+        Self { inner }
+    }
+
+    /// Persist a per-tenant storage config (KMS routing + provider
+    /// extras). Passthrough to [`basin_storage::Storage::set_tenant_storage_config`];
+    /// invalidates the in-process cache so the next encryption call
+    /// picks up the new config.
+    pub async fn set_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+        config: basin_storage::TenantStorageConfig,
+    ) -> Result<(), basin_common::BasinError> {
+        self.inner
+            .cfg
+            .storage
+            .set_tenant_storage_config(tenant, config)
+            .await
+    }
+
+    /// Look up a tenant's persisted storage config. Passthrough to
+    /// [`basin_storage::Storage::get_tenant_storage_config`].
+    pub async fn get_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<basin_storage::TenantStorageConfig>, basin_common::BasinError> {
+        self.inner.cfg.storage.get_tenant_storage_config(tenant).await
     }
 
     /// Attach an [`AnalyticalEngine`](basin_analytical::AnalyticalEngine) to
@@ -133,15 +192,62 @@ impl Engine {
     pub fn with_analytical(self, analytical: basin_analytical::AnalyticalEngine) -> Self {
         let cfg = self.inner.cfg.clone();
         let tenant_counters = self.inner.tenant_counters.clone();
-        Self {
-            inner: Arc::new(EngineInner {
-                cfg,
-                analytical: Some(analytical),
-                analytical_routing_count: AtomicU64::new(0),
-                noisy_detector: crate::noisy_detector::NoisyDetector::new(),
-                tenant_counters,
-            }),
+        let mut registry = EventSinkRegistry::new();
+        if std::env::var("BASIN_TRACE_CHANGE_EVENTS").as_deref() == Ok("1") {
+            registry.register_post_commit(Arc::new(crate::events::TracingSink));
         }
+        let catalog = cfg.catalog.clone();
+        let inner = Arc::new(EngineInner {
+            cfg,
+            analytical: Some(analytical),
+            analytical_routing_count: AtomicU64::new(0),
+            noisy_detector: crate::noisy_detector::NoisyDetector::new(),
+            tenant_counters,
+            event_sinks: RwLock::new(registry),
+            event_seq: Mutex::new(HashMap::new()),
+            webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
+        });
+        attach_reactor_sink(&inner, catalog);
+        Self { inner }
+    }
+
+    /// Attach a [`ChangeEventSink`] that runs synchronously *before* the
+    /// catalog commit. An `Err` from any pre-commit sink aborts the
+    /// mutation; the row is never visible. See ADR 0012.
+    pub fn attach_pre_commit_sink(&self, sink: Arc<dyn ChangeEventSink>) {
+        self.inner
+            .event_sinks
+            .write()
+            .expect("event_sinks lock poisoned")
+            .register_pre_commit(sink);
+    }
+
+    /// Attach a [`ChangeEventSink`] that runs *after* the catalog commit
+    /// succeeds. Each post-commit sink is dispatched on its own
+    /// `tokio::spawn`; errors are logged but do not roll back.
+    pub fn attach_post_commit_sink(&self, sink: Arc<dyn ChangeEventSink>) {
+        self.inner
+            .event_sinks
+            .write()
+            .expect("event_sinks lock poisoned")
+            .register_post_commit(sink);
+    }
+
+    pub(crate) fn event_sinks(&self) -> &RwLock<EventSinkRegistry> {
+        &self.inner.event_sinks
+    }
+
+    /// Allocate the next per-`(tenant, table)` sequence number. Crate-
+    /// private; used by the mutation path right before pre-commit fan-out.
+    pub(crate) fn next_event_seq(&self, tenant: &TenantId, table: &TableName) -> u64 {
+        let mut map = self
+            .inner
+            .event_seq
+            .lock()
+            .expect("event_seq lock poisoned");
+        let entry = map.entry((*tenant, table.clone())).or_insert(0);
+        *entry += 1;
+        *entry
     }
 
     /// O(1) lookup: is `tenant`'s recent query rate above the noisy
@@ -182,6 +288,14 @@ impl Engine {
 
     pub fn config(&self) -> &EngineConfig {
         &self.inner.cfg
+    }
+
+    /// Process-wide webhook subscription registry. Shared with the
+    /// `WebhookSink` post-commit sink (in `basin-webhooks`) so the
+    /// `ALTER TABLE … SUBSCRIBE WEBHOOK …` SQL surface and HTTP
+    /// delivery talk to the same map. Cheap to clone (`Arc` inside).
+    pub fn webhook_registry(&self) -> &crate::webhook_registry::WebhookRegistry {
+        &self.inner.webhook_registry
     }
 
     /// Optional analytical engine attached via [`Engine::with_analytical`].
@@ -228,6 +342,18 @@ impl Engine {
     ) -> Result<TenantSession> {
         crate::session::open(self.clone(), tenant, current_user.into()).await
     }
+}
+
+/// Build the reactor sink and register it with the freshly-built
+/// engine. Holds a `Weak<EngineInner>` so reactor bodies can re-enter
+/// the engine without keeping it alive past user drop.
+fn attach_reactor_sink(inner: &Arc<EngineInner>, catalog: Arc<dyn basin_catalog::Catalog>) {
+    let sink = crate::reactor_sink::ReactorSink::new(catalog, Arc::downgrade(inner));
+    inner
+        .event_sinks
+        .write()
+        .expect("event_sinks lock poisoned")
+        .register_pre_commit(Arc::new(sink));
 }
 
 /// Default principal stamped on a session opened without explicit auth. RLS
@@ -348,22 +474,45 @@ mod analytical_route;
 mod convert;
 mod cost_check;
 mod cron_glue;
-mod cv_glue;
+mod cv_ddl;
 mod ddl;
 mod dml;
 mod dml_mutate;
+mod enum_ordinal;
+mod events;
 mod executor;
 mod fast_select;
+mod function_ddl;
+mod generated_cols;
 mod geo_glue;
+mod info_schema_provider;
+mod lifecycle;
 mod net_glue;
 mod noisy_detector;
 mod prepared;
+mod procedure_ddl;
+pub mod reactor_ddl;
+mod reactor_sink;
 mod rls;
+mod seq_ddl;
+mod seq_udf;
 mod session;
+mod sql_functions;
 mod trgm_glue;
+mod type_ddl;
 mod types;
 mod udf;
 mod vector_search;
+pub mod webhook_ddl;
+pub mod webhook_registry;
+
+pub use webhook_ddl::{
+    exec_subscribe_webhook, exec_unsubscribe_webhook, match_alter_table_subscribe_webhook,
+    match_alter_table_unsubscribe_webhook, SubscribeIntent, UnsubscribeIntent,
+};
+pub use webhook_registry::{
+    SubscriptionError, WebhookOps, WebhookRegistry, WebhookSubscription, WebhookSubscriptionId,
+};
 
 #[cfg(test)]
 mod tests {
@@ -701,8 +850,11 @@ mod tests {
         let eng = engine_in(&dir);
         let sess = eng.open_session(TenantId::new()).await.unwrap();
 
+        // INTERVAL is still unsupported in v0.1 (no Arrow physical mapping
+        // wired). Bare TIMESTAMP used to live here — it's now accepted (see
+        // tests/timestamp_no_tz.rs).
         let err = sess
-            .execute("CREATE TABLE bad (ts TIMESTAMP)")
+            .execute("CREATE TABLE bad (i INTERVAL)")
             .await
             .unwrap_err();
         assert!(
@@ -1284,5 +1436,289 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         };
         assert_eq!(total, (FILE_COUNT * ROWS_PER_FILE - 1) as usize);
+    }
+
+    // --- Phase 5.11.B declarative lifecycle ---
+
+    use arrow_array::TimestampMicrosecondArray;
+
+    fn col_ts_micros(batches: &[RecordBatch], name: &str) -> Vec<i64> {
+        let mut out = Vec::new();
+        for b in batches {
+            let arr = b
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            for i in 0..arr.len() {
+                out.push(arr.value(i));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn auto_update_advances_on_update() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+
+        sess.execute(
+            "CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL, \
+             updated_at TIMESTAMPTZ AUTO_UPDATE)",
+        )
+        .await
+        .unwrap();
+        sess.execute(
+            "INSERT INTO t VALUES (1, 'a', '2026-01-01T00:00:00Z')",
+        )
+        .await
+        .unwrap();
+        let res = sess
+            .execute("SELECT updated_at FROM t WHERE id = 1")
+            .await
+            .unwrap();
+        let before = match res {
+            ExecResult::Rows { batches, .. } => col_ts_micros(&batches, "updated_at")[0],
+            other => panic!("{other:?}"),
+        };
+
+        // Update only `name`; AUTO_UPDATE must stamp `updated_at`.
+        sess.execute("UPDATE t SET name = 'b' WHERE id = 1").await.unwrap();
+
+        let res = sess
+            .execute("SELECT updated_at FROM t WHERE id = 1")
+            .await
+            .unwrap();
+        let after = match res {
+            ExecResult::Rows { batches, .. } => col_ts_micros(&batches, "updated_at")[0],
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            after > before,
+            "auto-update should advance (before={before}, after={after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_update_does_not_override_explicit_set() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        sess.execute(
+            "CREATE TABLE t (id BIGINT NOT NULL, updated_at TIMESTAMPTZ AUTO_UPDATE)",
+        )
+        .await
+        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, '2026-01-01T00:00:00Z')")
+            .await
+            .unwrap();
+        // Explicit SET wins over AUTO_UPDATE.
+        sess.execute(
+            "UPDATE t SET updated_at = '2025-06-15T00:00:00Z' WHERE id = 1",
+        )
+        .await
+        .unwrap();
+        let res = sess
+            .execute("SELECT updated_at FROM t WHERE id = 1")
+            .await
+            .unwrap();
+        let micros = match res {
+            ExecResult::Rows { batches, .. } => col_ts_micros(&batches, "updated_at")[0],
+            other => panic!("{other:?}"),
+        };
+        // 2025-06-15T00:00:00Z is well before 2026-01-01.
+        let cutoff: i64 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .timestamp_micros();
+        assert!(micros < cutoff, "explicit SET should win, got {micros}");
+    }
+
+    #[tokio::test]
+    async fn soft_delete_rewrites_to_update_and_filters_select() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        sess.execute(
+            "CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL, \
+             deleted_at TIMESTAMPTZ SOFT DELETE)",
+        )
+        .await
+        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 'a', NULL), (2, 'b', NULL), (3, 'c', NULL)")
+            .await
+            .unwrap();
+
+        // DELETE rewrite: tag returns DELETE 1.
+        let res = sess.execute("DELETE FROM t WHERE id = 2").await.unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 1"),
+            other => panic!("{other:?}"),
+        }
+
+        // SELECT default: id=2 is hidden.
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1, 3]);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // INCLUDE DELETED opt-out shows it.
+        let res = sess
+            .execute("SELECT id FROM t ORDER BY id INCLUDE DELETED")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn second_soft_delete_column_rejected() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let err = sess
+            .execute(
+                "CREATE TABLE t (id BIGINT, a TIMESTAMPTZ SOFT DELETE, \
+                 b TIMESTAMPTZ SOFT DELETE)",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, basin_common::BasinError::InvalidSchema(_)));
+    }
+
+    #[tokio::test]
+    async fn audit_to_logs_one_row_per_mutation() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        sess.execute("CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL) AUDIT TO foo_audit")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO foo VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap();
+        sess.execute("UPDATE foo SET name = 'B' WHERE id = 2")
+            .await
+            .unwrap();
+        sess.execute("DELETE FROM foo WHERE id = 1").await.unwrap();
+
+        let res = sess
+            .execute("SELECT op FROM foo_audit ORDER BY audit_id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let ops = col_string(&batches, "op");
+                assert_eq!(
+                    ops,
+                    vec![
+                        "insert".to_string(),
+                        "insert".to_string(),
+                        "update".to_string(),
+                        "delete".to_string(),
+                    ]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_isolation_per_tenant() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let a = TenantId::new();
+        let b = TenantId::new();
+        let sa = eng.open_session(a).await.unwrap();
+        let sb = eng.open_session(b).await.unwrap();
+        for s in [&sa, &sb] {
+            s.execute("CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL) AUDIT TO foo_audit")
+                .await
+                .unwrap();
+        }
+        sa.execute("INSERT INTO foo VALUES (1, 'A1')").await.unwrap();
+        sb.execute("INSERT INTO foo VALUES (1, 'B1'), (2, 'B2')")
+            .await
+            .unwrap();
+
+        let res_a = sa.execute("SELECT op FROM foo_audit").await.unwrap();
+        let res_b = sb.execute("SELECT op FROM foo_audit").await.unwrap();
+        match (res_a, res_b) {
+            (
+                ExecResult::Rows { batches: ba, .. },
+                ExecResult::Rows { batches: bb, .. },
+            ) => {
+                assert_eq!(total_rows(&ba), 1);
+                assert_eq!(total_rows(&bb), 2);
+            }
+            _ => panic!("expected rows on both"),
+        }
+    }
+
+    #[tokio::test]
+    async fn composition_auto_update_audit_soft_delete() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        sess.execute(
+            "CREATE TABLE foo (\
+             id BIGINT NOT NULL,\
+             name TEXT NOT NULL,\
+             updated_at TIMESTAMPTZ AUTO_UPDATE,\
+             deleted_at TIMESTAMPTZ SOFT DELETE\
+             ) AUDIT TO foo_audit",
+        )
+        .await
+        .unwrap();
+        sess.execute(
+            "INSERT INTO foo VALUES (1, 'a', '2026-01-01T00:00:00Z', NULL)",
+        )
+        .await
+        .unwrap();
+        sess.execute("UPDATE foo SET name = 'b' WHERE id = 1")
+            .await
+            .unwrap();
+        sess.execute("DELETE FROM foo WHERE id = 1").await.unwrap();
+
+        // Audit table: insert + update + delete. The soft-delete row
+        // must be op='delete' even though the underlying write was an
+        // UPDATE.
+        let res = sess
+            .execute("SELECT op FROM foo_audit ORDER BY audit_id")
+            .await
+            .unwrap();
+        let ops = match res {
+            ExecResult::Rows { batches, .. } => col_string(&batches, "op"),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(ops, vec!["insert", "update", "delete"]);
+
+        // Soft-delete hides id=1 by default.
+        let res = sess.execute("SELECT id FROM foo").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        // INCLUDE DELETED reveals it.
+        let res = sess
+            .execute("SELECT id FROM foo INCLUDE DELETED")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

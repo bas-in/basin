@@ -9,9 +9,8 @@
 //! compatibility on plaintext files.
 //!
 //! This is the load-bearing integration test for the
-//! `EncryptionProvider` trait shipped in basin-storage. Real KMS
-//! adapters (AWS / GCP / Azure) live in basin-cloud and plug into this
-//! same trait without trait changes.
+//! `EncryptionProvider` trait shipped in basin-storage. External KMS
+//! adapters plug into this same trait without trait changes.
 
 #![allow(clippy::print_stdout)]
 

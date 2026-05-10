@@ -1,0 +1,72 @@
+[package]
+name = "basin-webhooks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Default: full webhook crate (registry + matchers + worker/sink that
+# perform HTTP delivery via basin-net).
+default = ["delivery"]
+# Enables the worker/sink/queue + basin-net dep. Disable from
+# `basin-engine` to break the dep cycle
+# (basin-engine -> basin-webhooks -> basin-net -> basin-engine) while
+# keeping the registry + DDL matchers callable.
+delivery = ["dep:basin-net", "basin-net/engine-store"]
+
+[dependencies]
+basin-common.workspace = true
+# After the cycle-fix, registry types + DDL matchers live in `basin-engine`
+# (`webhook_registry.rs` / `webhook_ddl.rs`); this crate's `WebhookSink` /
+# `WebhookWorker` consume them directly. Required dep — no longer routed
+# through basin-net's `engine-store` feature.
+basin-engine.workspace = true
+# Optional so test-time builds without the delivery worker can avoid
+# pulling in basin-net's HTTP stack. Production binaries enable the
+# `delivery` feature (default).
+basin-net = { workspace = true, optional = true }
+
+tokio.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+# Stable per-(subscription, event) idempotency key. SHA-256 over the
+# canonical (subscription_id, tenant, table, seq) tuple — same crate the
+# engine already pulls in for `digest()` UDFs, no new build cost.
+sha2.workspace = true
+hex.workspace = true
+
+# Bitflags for `WebhookOps` (INSERT|UPDATE|DELETE). Already in the lock
+# file via several transitive deps; declaring it here makes the public
+# type's definition self-contained.
+bitflags = "2"
+
+# Cheap structural URL validation in `WebhookRegistry::add` — the
+# per-tenant allowlist gate at delivery time is in `basin-net`. Same
+# version basin-net pins.
+url = "2"
+
+# Used by `WebhookSink` to evaluate the optional `WHERE (predicate)` on
+# each subscription against the change event's JSON payload. Same
+# version basin-engine pins so AST shapes line up across crates.
+sqlparser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+basin-storage.workspace = true
+basin-catalog.workspace = true
+basin-engine.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+object_store.workspace = true
+tokio = { workspace = true, features = ["full"] }
+# Test HTTP server (axum is already pinned at the workspace level).
+axum.workspace = true
+hyper.workspace = true

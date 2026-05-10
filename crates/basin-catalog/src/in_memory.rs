@@ -14,8 +14,17 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
+use basin_common::ChangeOp;
+
+use crate::domains::{self, DomainDef, DomainError};
+use crate::enums::{self, EnumError, EnumTypeDef};
+use crate::functions::SqlFunctionDef;
 use crate::metadata::{CvDef, DataFileRef, PartitionSpec, Policy, SecondaryIndex, TableMetadata};
+use crate::procedures::{self, ProcedureError, SqlProcedureDef};
+use crate::reactors::{self, ReactorDef, ReactorError};
+use crate::sequences::{advance_one, SequenceDef, SequenceError, SequenceState};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
+use crate::tenant_storage_config::TenantStorageConfig;
 use crate::Catalog;
 
 /// One table's mutable state. The per-table mutex serializes commits so
@@ -90,6 +99,67 @@ type TableMap = HashMap<(TenantId, TableName), Arc<Mutex<TableState>>>;
 pub struct InMemoryCatalog {
     tables: Mutex<TableMap>,
     namespaces: Mutex<HashSet<TenantId>>,
+    /// Per-tenant registered SQL functions. One shared `HashMap` keyed by
+    /// `(TenantId, name)` so per-tenant cost stays `O(bytes)` — no
+    /// per-tenant heavy resource.
+    sql_functions: Mutex<HashMap<(TenantId, String), SqlFunctionDef>>,
+    /// Per-tenant registered sequences. Same shape rule as `sql_functions`:
+    /// one shared `HashMap` keyed by `(TenantId, name)`. Each value is a
+    /// pair of (immutable definition, per-sequence Mutex around the
+    /// counter state). The outer mutex is held only long enough to look
+    /// up (or insert) the per-sequence handle; concurrent `nextval` calls
+    /// on different sequences never block each other.
+    sequences: Mutex<HashMap<(TenantId, String), Arc<SequenceEntry>>>,
+    /// Per-tenant registered reactors. Same shape rule as
+    /// `sql_functions`: one shared `HashMap` keyed by `(TenantId,
+    /// composite)` where `composite = "<table>:<reactor_name>"` —
+    /// reactor names are unique per `(tenant, table)`, not per tenant.
+    /// Per-tenant cost stays `O(bytes)` with no per-tenant heavy
+    /// resource. Each value carries a monotonic `seq` so
+    /// `lookup_reactors_for` can replay reactors in registration order.
+    reactors: Mutex<ReactorState>,
+    /// Per-tenant `CREATE TYPE … AS ENUM` declarations. Same shape
+    /// rule as `sql_functions`.
+    enum_types: Mutex<HashMap<(TenantId, String), EnumTypeDef>>,
+    /// Per-tenant `CREATE DOMAIN` declarations.
+    domains: Mutex<HashMap<(TenantId, String), DomainDef>>,
+    /// Per-tenant `CREATE PROCEDURE … LANGUAGE sql` declarations.
+    /// Same shape rule as `sql_functions`: one shared `HashMap` keyed
+    /// by `(TenantId, name)` so per-tenant cost stays `O(bytes)` with
+    /// no per-tenant heavy resource.
+    procedures: Mutex<HashMap<(TenantId, String), SqlProcedureDef>>,
+    /// Per-tenant storage config (KMS routing + provider extras).
+    /// Single shared `HashMap` keyed by `TenantId`; lazy entry creation;
+    /// per-tenant cost stays `O(bytes)` with no per-tenant heavy
+    /// resource. Cleared in `drop_namespace`.
+    tenant_storage_config: Mutex<HashMap<TenantId, TenantStorageConfig>>,
+}
+
+/// Aggregate reactor state. The seq counter assigns each newly-
+/// registered reactor a strictly-increasing index; `lookup_reactors_for`
+/// sorts matching reactors by it so callers see PG-shaped registration
+/// order.
+#[derive(Default)]
+struct ReactorState {
+    /// Composite key = `(tenant, "<table>:<name>")`.
+    map: HashMap<(TenantId, String), ReactorEntry>,
+    next_seq: u64,
+}
+
+/// One reactor catalog row plus its registration index.
+#[derive(Clone)]
+struct ReactorEntry {
+    def: ReactorDef,
+    seq: u64,
+}
+
+/// One sequence's catalog row plus its per-sequence Mutex-guarded state.
+/// The fields are independently locked — definitions are immutable after
+/// `create_sequence`, so we don't need to synchronise reads of `def`
+/// against writes of `state`.
+struct SequenceEntry {
+    def: SequenceDef,
+    state: Mutex<SequenceState>,
 }
 
 impl InMemoryCatalog {
@@ -97,6 +167,13 @@ impl InMemoryCatalog {
         Self {
             tables: Mutex::new(HashMap::new()),
             namespaces: Mutex::new(HashSet::new()),
+            sql_functions: Mutex::new(HashMap::new()),
+            sequences: Mutex::new(HashMap::new()),
+            reactors: Mutex::new(ReactorState::default()),
+            enum_types: Mutex::new(HashMap::new()),
+            domains: Mutex::new(HashMap::new()),
+            procedures: Mutex::new(HashMap::new()),
+            tenant_storage_config: Mutex::new(HashMap::new()),
         }
     }
 
@@ -216,6 +293,20 @@ impl Catalog for InMemoryCatalog {
         tables.retain(|(t, _), _| t != tenant);
         let mut namespaces = self.namespaces.lock().await;
         namespaces.remove(tenant);
+        let mut funcs = self.sql_functions.lock().await;
+        funcs.retain(|(t, _), _| t != tenant);
+        let mut seqs = self.sequences.lock().await;
+        seqs.retain(|(t, _), _| t != tenant);
+        let mut reactors = self.reactors.lock().await;
+        reactors.map.retain(|(t, _), _| t != tenant);
+        let mut enums = self.enum_types.lock().await;
+        enums.retain(|(t, _), _| t != tenant);
+        let mut doms = self.domains.lock().await;
+        doms.retain(|(t, _), _| t != tenant);
+        let mut procs = self.procedures.lock().await;
+        procs.retain(|(t, _), _| t != tenant);
+        let mut storage_cfg = self.tenant_storage_config.lock().await;
+        storage_cfg.remove(tenant);
         Ok(())
     }
 
@@ -605,6 +696,564 @@ impl Catalog for InMemoryCatalog {
             )));
         }
         Ok(())
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_sql_function(&self, def: SqlFunctionDef) -> Result<()> {
+        let key = (def.tenant, def.name.clone());
+        let mut map = self.sql_functions.lock().await;
+        map.insert(key, def);
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_sql_function(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let key = (*tenant, name.to_string());
+        let mut map = self.sql_functions.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sql function {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_sql_function(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Option<SqlFunctionDef> {
+        let key = (*tenant, name.to_string());
+        let map = self.sql_functions.lock().await;
+        map.get(&key).cloned()
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_sql_functions(&self, tenant: &TenantId) -> Vec<SqlFunctionDef> {
+        let map = self.sql_functions.lock().await;
+        map.iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, def)| def.clone())
+            .collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn create_sequence(&self, def: SequenceDef) -> Result<()> {
+        if def.increment == 0 {
+            return Err(BasinError::InvalidSchema(
+                "sequence increment must be non-zero".into(),
+            ));
+        }
+        let key = (def.tenant, def.name.clone());
+        let mut map = self.sequences.lock().await;
+        if map.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "sequence {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        let state = SequenceState::genesis(&def);
+        let entry = SequenceEntry {
+            def,
+            state: Mutex::new(state),
+        };
+        map.insert(key, Arc::new(entry));
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_sequence(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let key = (*tenant, name.to_string());
+        let mut map = self.sequences.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sequence {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_sequence(&self, tenant: &TenantId, name: &str) -> Option<SequenceDef> {
+        let key = (*tenant, name.to_string());
+        let map = self.sequences.lock().await;
+        map.get(&key).map(|e| e.def.clone())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn nextval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+        let entry = {
+            let key = (*tenant, name.to_string());
+            let map = self.sequences.lock().await;
+            map.get(&key).cloned().ok_or_else(|| {
+                BasinError::not_found(format!("{tenant}: sequence {name:?}"))
+            })?
+        };
+        // Per-sequence mutex serialises increments; concurrent callers
+        // see distinct values, but two sequences (or two tenants) never
+        // block each other beyond the top-level HashMap probe above.
+        let mut state = entry.state.lock().await;
+        match advance_one(&entry.def, &mut state) {
+            Ok(v) => Ok(v),
+            Err(SequenceError::Exhausted) => Err(BasinError::catalog(format!(
+                "{tenant}: sequence {name:?} exhausted"
+            ))),
+            Err(SequenceError::InvalidIncrement) => Err(BasinError::InvalidSchema(format!(
+                "{tenant}: sequence {name:?} has zero increment"
+            ))),
+        }
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn currval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+        let entry = {
+            let key = (*tenant, name.to_string());
+            let map = self.sequences.lock().await;
+            map.get(&key).cloned().ok_or_else(|| {
+                BasinError::not_found(format!("{tenant}: sequence {name:?}"))
+            })?
+        };
+        let state = entry.state.lock().await;
+        if !state.started {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: sequence {name:?} has not been advanced"
+            )));
+        }
+        Ok(state.current.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = value, advance = advance))]
+    async fn setval(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        value: i64,
+        advance: bool,
+    ) -> Result<i64> {
+        let entry = {
+            let key = (*tenant, name.to_string());
+            let map = self.sequences.lock().await;
+            map.get(&key).cloned().ok_or_else(|| {
+                BasinError::not_found(format!("{tenant}: sequence {name:?}"))
+            })?
+        };
+        let mut state = entry.state.lock().await;
+        // PG's `setval(seq, n, true)` (the default) makes `n` the most
+        // recently handed-out value, so the next `nextval` returns
+        // `n + increment`. `setval(seq, n, false)` arms the sequence so
+        // the next `nextval` returns `n` directly. We model the latter
+        // by storing `n - increment` so the started-state advance step
+        // (`current + increment`) lands on `n`. Either way `started`
+        // becomes true — both forms imply the sequence has been
+        // touched, so a subsequent `currval` is well-defined.
+        let stored = if advance {
+            value
+        } else {
+            value.wrapping_sub(entry.def.increment)
+        };
+        state.current.store(stored, std::sync::atomic::Ordering::Relaxed);
+        state.block_end.store(stored, std::sync::atomic::Ordering::Relaxed);
+        state.started = true;
+        Ok(value)
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, table = %def.table, name = %def.name))]
+    async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
+        if def.ops.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "reactor ops bitset is empty".into(),
+            ));
+        }
+        reactors::validate_body(&def.body).map_err(reactor_err_to_basin)?;
+        if let Some(p) = &def.when_predicate {
+            reactors::validate_predicate(p).map_err(reactor_err_to_basin)?;
+        }
+
+        let key = (def.tenant, format!("{}:{}", def.table, def.name));
+        let mut state = self.reactors.lock().await;
+        if state.map.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "reactor {:?} on {}/{} already exists",
+                def.name, def.tenant, def.table
+            )));
+        }
+        state.next_seq += 1;
+        let seq = state.next_seq;
+        state.map.insert(key, ReactorEntry { def, seq });
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
+    async fn drop_reactor(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+    ) -> Result<()> {
+        let key = (*tenant, format!("{table}:{name}"));
+        let mut state = self.reactors.lock().await;
+        if state.map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "{tenant}/{table}: reactor {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, op = ?op))]
+    async fn lookup_reactors_for(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        op: ChangeOp,
+    ) -> Vec<ReactorDef> {
+        let state = self.reactors.lock().await;
+        let mut hits: Vec<&ReactorEntry> = state
+            .map
+            .iter()
+            .filter(|((t, _), entry)| {
+                t == tenant && &entry.def.table == table && entry.def.ops.matches(op)
+            })
+            .map(|(_, entry)| entry)
+            .collect();
+        hits.sort_by_key(|e| e.seq);
+        hits.into_iter().map(|e| e.def.clone()).collect()
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_reactors(&self, tenant: &TenantId) -> Vec<ReactorDef> {
+        let state = self.reactors.lock().await;
+        let mut hits: Vec<&ReactorEntry> = state
+            .map
+            .iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, entry)| entry)
+            .collect();
+        hits.sort_by_key(|e| e.seq);
+        hits.into_iter().map(|e| e.def.clone()).collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_enum_type(&self, def: EnumTypeDef) -> Result<()> {
+        enums::validate_new(&def).map_err(enum_err_to_basin)?;
+        let key = (def.tenant, def.name.clone());
+        let mut enums_map = self.enum_types.lock().await;
+        if enums_map.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "enum type {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        // Cross-namespace collision: a domain with the same name on the
+        // same tenant is rejected so column resolution stays
+        // unambiguous.
+        let doms = self.domains.lock().await;
+        if doms.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "type {}/{} collides with an existing domain",
+                def.tenant, def.name,
+            )));
+        }
+        drop(doms);
+        enums_map.insert(key, def);
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_enum_type(&self, tenant: &TenantId, name: &str) -> Option<EnumTypeDef> {
+        let key = (*tenant, name.to_string());
+        let map = self.enum_types.lock().await;
+        map.get(&key).cloned()
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = %value))]
+    async fn add_enum_value(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        if value.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "ALTER TYPE ADD VALUE: label cannot be empty".into(),
+            ));
+        }
+        let key = (*tenant, name.to_string());
+        let mut map = self.enum_types.lock().await;
+        let def = map
+            .get_mut(&key)
+            .ok_or_else(|| BasinError::not_found(format!("{tenant}: enum type {name:?}")))?;
+        if def.labels.iter().any(|l| l == value) {
+            return Err(BasinError::catalog(format!(
+                "enum {name:?} already contains value {value:?}"
+            )));
+        }
+        def.labels.push(value.to_string());
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_enum_type(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        // Refcount: scan every table the tenant owns and reject the
+        // drop when any column carries `BASIN_ENUM_TYPE=<name>`. v0.1
+        // has no CASCADE; the message tells the caller to drop the
+        // columns first.
+        let referencing = self.tables_referencing_type(tenant, name, true).await;
+        if !referencing.is_empty() {
+            return Err(BasinError::catalog(format!(
+                "cannot drop enum {name:?}: still referenced by table column(s) {referencing:?}; \
+                 drop the column(s) first (v0.1 has no CASCADE)"
+            )));
+        }
+        let key = (*tenant, name.to_string());
+        let mut map = self.enum_types.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: enum type {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_enum_types(&self, tenant: &TenantId) -> Vec<EnumTypeDef> {
+        let map = self.enum_types.lock().await;
+        map.iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, def)| def.clone())
+            .collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_domain(&self, def: DomainDef) -> Result<()> {
+        domains::validate_new(&def).map_err(domain_err_to_basin)?;
+        let key = (def.tenant, def.name.clone());
+        let mut doms = self.domains.lock().await;
+        if doms.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "domain {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        let enums_map = self.enum_types.lock().await;
+        if enums_map.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "domain {}/{} collides with an existing enum type",
+                def.tenant, def.name,
+            )));
+        }
+        drop(enums_map);
+        doms.insert(key, def);
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_domain(&self, tenant: &TenantId, name: &str) -> Option<DomainDef> {
+        let key = (*tenant, name.to_string());
+        let map = self.domains.lock().await;
+        map.get(&key).cloned()
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_domain(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let referencing = self.tables_referencing_type(tenant, name, false).await;
+        if !referencing.is_empty() {
+            return Err(BasinError::catalog(format!(
+                "cannot drop domain {name:?}: still referenced by table column(s) {referencing:?}; \
+                 drop the column(s) first (v0.1 has no CASCADE)"
+            )));
+        }
+        let key = (*tenant, name.to_string());
+        let mut map = self.domains.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: domain {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_domains(&self, tenant: &TenantId) -> Vec<DomainDef> {
+        let map = self.domains.lock().await;
+        map.iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, def)| def.clone())
+            .collect()
+    }
+
+    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
+        procedures::validate_new(&def).map_err(procedure_err_to_basin)?;
+        let key = (def.tenant, def.name.clone());
+        let mut map = self.procedures.lock().await;
+        if map.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "procedure {}/{} already exists",
+                def.tenant, def.name,
+            )));
+        }
+        map.insert(key, def);
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn drop_procedure(&self, tenant: &TenantId, name: &str) -> Result<()> {
+        let key = (*tenant, name.to_string());
+        let mut map = self.procedures.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "{tenant}: procedure {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
+    async fn lookup_procedure(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Option<SqlProcedureDef> {
+        let key = (*tenant, name.to_string());
+        let map = self.procedures.lock().await;
+        map.get(&key).cloned()
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_procedures(&self, tenant: &TenantId) -> Vec<SqlProcedureDef> {
+        let map = self.procedures.lock().await;
+        map.iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, def)| def.clone())
+            .collect()
+    }
+
+    #[instrument(skip(self, config), fields(tenant = %tenant))]
+    async fn set_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+        config: TenantStorageConfig,
+    ) -> Result<()> {
+        let mut map = self.tenant_storage_config.lock().await;
+        map.insert(*tenant, config);
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn get_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<TenantStorageConfig>> {
+        let map = self.tenant_storage_config.lock().await;
+        Ok(map.get(tenant).cloned())
+    }
+}
+
+impl InMemoryCatalog {
+    /// Walk every table owned by `tenant`, returning `<table>.<column>`
+    /// labels for every column whose Arrow `Field` carries the
+    /// requested type metadata. `is_enum == true` checks the
+    /// `BASIN_ENUM_TYPE` key; `false` checks `BASIN_DOMAIN`. Used by
+    /// `drop_enum_type` / `drop_domain` to reject drops that would
+    /// orphan a column type.
+    async fn tables_referencing_type(
+        &self,
+        tenant: &TenantId,
+        type_name: &str,
+        is_enum: bool,
+    ) -> Vec<String> {
+        let key = if is_enum {
+            crate::enums::BASIN_ENUM_TYPE_KEY
+        } else {
+            crate::domains::BASIN_DOMAIN_KEY
+        };
+        // Snapshot the per-table handles so we don't hold the
+        // top-level table-map lock while inspecting each one's schema.
+        let handles: Vec<(TableName, Arc<Mutex<TableState>>)> = {
+            let tables = self.tables.lock().await;
+            tables
+                .iter()
+                .filter(|((t, _), _)| t == tenant)
+                .map(|((_, name), state)| (name.clone(), state.clone()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (table, state) in handles {
+            let guard = state.lock().await;
+            for f in guard.schema.fields() {
+                if f.metadata().get(key).map(|s| s.as_str()) == Some(type_name) {
+                    out.push(format!("{table}.{}", f.name()));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Map [`EnumError`] into the cross-crate [`BasinError`] surface.
+fn enum_err_to_basin(e: EnumError) -> BasinError {
+    match e {
+        EnumError::DuplicateLabel(l) => {
+            BasinError::InvalidSchema(format!("enum label {l:?} listed more than once"))
+        }
+        EnumError::EmptyLabelList => {
+            BasinError::InvalidSchema("enum type must have at least one label".into())
+        }
+        EnumError::EmptyLabel => {
+            BasinError::InvalidSchema("enum label must be a non-empty string".into())
+        }
+        EnumError::Duplicate => BasinError::Catalog("enum type already exists".into()),
+        EnumError::NotFound => BasinError::NotFound("enum type not found".into()),
+        EnumError::LabelAlreadyExists(l) => {
+            BasinError::Catalog(format!("enum already contains value {l:?}"))
+        }
+    }
+}
+
+/// Map [`DomainError`] into the cross-crate [`BasinError`] surface.
+fn domain_err_to_basin(e: DomainError) -> BasinError {
+    match e {
+        DomainError::Duplicate => BasinError::Catalog("domain already exists".into()),
+        DomainError::NotFound => BasinError::NotFound("domain not found".into()),
+        DomainError::InvalidPredicate(msg) => {
+            BasinError::InvalidSchema(format!("domain CHECK predicate: {msg}"))
+        }
+    }
+}
+
+/// Map [`ProcedureError`] into the cross-crate [`BasinError`] surface.
+fn procedure_err_to_basin(e: ProcedureError) -> BasinError {
+    match e {
+        ProcedureError::InvalidBody(msg) => {
+            BasinError::InvalidSchema(format!("procedure body: {msg}"))
+        }
+        ProcedureError::DisallowedStatement(msg) => BasinError::InvalidSchema(msg),
+        ProcedureError::DuplicateArgName(name) => {
+            BasinError::InvalidSchema(format!("duplicate procedure argument name {name:?}"))
+        }
+        ProcedureError::InvalidName(msg) => BasinError::InvalidIdent(msg),
+    }
+}
+
+/// Map [`ReactorError`] into the cross-crate [`BasinError`] surface.
+fn reactor_err_to_basin(e: ReactorError) -> BasinError {
+    match e {
+        ReactorError::Duplicate => {
+            BasinError::Catalog("reactor with the same name already exists".into())
+        }
+        ReactorError::InvalidBody(msg) => {
+            BasinError::InvalidSchema(format!("reactor body: {msg}"))
+        }
+        ReactorError::InvalidPredicate(msg) => {
+            BasinError::InvalidSchema(format!("reactor when-predicate: {msg}"))
+        }
+        ReactorError::NoOps => BasinError::InvalidSchema("reactor ops bitset is empty".into()),
+        ReactorError::MultiStatementBody => {
+            BasinError::InvalidSchema("reactor body must be a single SQL statement".into())
+        }
+        ReactorError::NotFound => BasinError::NotFound("reactor not found".into()),
     }
 }
 

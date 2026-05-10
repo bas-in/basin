@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "data_file_path": "tenants/01KR6JKRWRGCBT83FY3849GMAD/tables/events/data/_default/2026/05/09/01KR6JKRX1EWEJH5APPQJJF6WR.parquet",
+    "data_file_path": "tenants/01KR8836QCQ8J587QYFX4TSGXV/tables/events/data/_default/2026/05/10/01KR8836QR4JGP1H7G8SN129SZ.parquet",
     "encrypted_body_bytes": 1153,
     "plaintext_body_bytes": 1125,
     "rows_round_tripped": 100,
     "sidecar_bytes": 33
   },
-  "generated_at": "@1778337309"
+  "generated_at": "@1778393389"
 }

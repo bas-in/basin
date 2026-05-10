@@ -8,10 +8,8 @@ SQL / storage / catalog / query engine / multi-tenancy / caches /
 indexes / WAL / compactor / vector search / Postgres-extension
 equivalents / **basin-auth** (identity) / **basin-rest** (PostgREST
 equivalent). The full open-source bundle a self-hoster gets when they
-clone the repo. The cloud platform (V8 edge functions, BYO-bucket /
-BYO-key, Stripe billing, customer dashboard, control plane, plus
-enterprise auth/REST extensions like SAML / OIDC / SCIM, admin audit
-log, signed-URL endpoints) lives in [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md).
+clone the repo. Hosted-product / control-plane / enterprise-auth
+extensions are out of scope for this OSS roadmap.
 
 **Postgres-extension equivalents we ship natively** (not via upstream
 `.so` loading — see [ADR 0002](./docs/decisions/0002-no-postgres-extensions.md)):
@@ -273,9 +271,9 @@ the corresponding `ScalarUDF`s.
 ## Phase 5.10 — Identity + REST (open-source bundle) — **v0.1 shipped**
 
 Auth + REST ship as part of the OSS bundle, the same shape Supabase
-ships open-source. Cloud-only *extensions* (enterprise SSO, BYO-bucket
-signed URLs, admin audit log) live in
-[`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md).
+ships open-source. Hosted-product extensions (enterprise SSO,
+BYO-bucket signed URLs, admin audit log, etc) are out of scope for
+this OSS roadmap.
 
 ### basin-auth (identity) — ADR 0005
 
@@ -415,7 +413,7 @@ Tiered to keep the committed engineering scope honest:
 Phase 0 customer interviews should run **in parallel with Tier 1** so
 Tier 2 priorities are customer-driven, not imagined.
 
-### Tier 0 — `ChangeEventSink` trait + capture point (~3-5 days, no deps)
+### Tier 0 — `ChangeEventSink` trait + capture point (~3-5 days, no deps) ✅ shipped
 
 Forward-compat substrate. Tier 1 phases don't depend on this; Tier 2
 phases (reactors + webhooks) do. Cheap to ship now so the executor
@@ -447,7 +445,7 @@ commit path doesn't get re-touched repeatedly.
 Committed engineering. Independent of Tier 0; ships in parallel.
 Customer-visible PG-compat upgrade with zero novel infrastructure.
 
-#### 5.11.A — Built-in function catalogue + JSONB operators + recursive-CTE/window verification (~3-4 weeks)
+#### 5.11.A — Built-in function catalogue + JSONB operators + recursive-CTE/window verification (~3-4 weeks) ✅ shipped
 
 The single biggest customer-visible PG-compat win. JSONB operators
 folded in because every modern SaaS schema uses them constantly.
@@ -473,7 +471,7 @@ folded in because every modern SaaS schema uses them constantly.
       above against `tokio-postgres`'s default extended-query path; no
       panic, results match a real PG reference run committed alongside.
 
-#### 5.11.D — `LANGUAGE sql` scalar functions (~3 weeks, depends on A)
+#### 5.11.D — `LANGUAGE sql` scalar functions (~3 weeks, depends on A) 🛠 (catalog API + planner inliner ✅; `CREATE FUNCTION` SQL surface queued)
 
 The function primitive — body is a single SELECT, inlined at planning
 time. Covers ~50% of all real-world function use cases. No interpreter,
@@ -489,7 +487,7 @@ no frame management, no security sandbox.
 - [ ] Test: `display_name(users)` round-trips; functions composing
       built-ins from 5.11.A work; recursive function rejected.
 
-#### 5.11.B — Declarative lifecycle (`AUTO_UPDATE`, `AUDIT TO`, `SOFT DELETE`) (~2 weeks)
+#### 5.11.B — Declarative lifecycle (`AUTO_UPDATE`, `AUDIT TO`, `SOFT DELETE`) (~2 weeks) ✅ shipped
 
 Covers ~75% of "trigger" use cases without parsing or interpreting
 anything. Pure engine-native column behaviour. **Implements the writes
@@ -509,7 +507,7 @@ inline in the executor — does NOT depend on Tier 0.**
       others; AUDIT mode emits one row per mutation; SOFT DELETE
       round-trips via REST + pgwire.
 
-#### 5.11.K2 — `CREATE TYPE … AS ENUM` + `CREATE DOMAIN` (~2 weeks)
+#### 5.11.K2 — `CREATE TYPE … AS ENUM` + `CREATE DOMAIN` (~2 weeks) ✅ shipped
 
 Reusable typed constraints. Every modern PG schema uses enums for
 status columns; domains for reusable validations.
@@ -529,7 +527,7 @@ status columns; domains for reusable validations.
       matches declaration order; rejecting unknown enum value;
       domain `CHECK` enforced on INSERT.
 
-#### 5.11.D2 — `CREATE MATERIALIZED VIEW` SQL surface (~1 week)
+#### 5.11.D2 — `CREATE MATERIALIZED VIEW` SQL surface (~1 week) ✅ shipped
 
 Drop the existing `cv_glue` stub. Independent of the other 5.11 work;
 the engine plumbing already exists in `basin-cv`.
@@ -548,7 +546,7 @@ the engine plumbing already exists in `basin-cv`.
 Each independent. Each plugs into the Tier 0 trait. Order below is
 suggested-priority; real order is whatever Phase 0 surfaces.
 
-#### 5.11.C — SQL-bodied reactors (`REACT ON … EXECUTE`) (~2 weeks, depends on Tier 0 + 5.11.A)
+#### 5.11.C — SQL-bodied reactors (`REACT ON … EXECUTE`) (~2 weeks, depends on Tier 0 + 5.11.A) 🛠 (machinery ✅: `ReactorSink` pre-commit + `register_reactor` catalog API + AST-level NEW/OLD/TG_OP substitution; ALTER TABLE SQL surface in flight)
 
 The trigger primitive. `ReactorSink` implements `ChangeEventSink`,
 attached as **pre-commit** so reactor failures abort the mutation.
@@ -576,7 +574,7 @@ rows per tenant", "free-tier caps", "hierarchical depth limit".
 - [ ] Test: cap-at-N rejection works; cap-at-N allows under the cap;
       constraint with subquery against a sibling table works.
 
-#### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0)
+#### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0) 🛠 (machinery ✅: `crates/basin-webhooks` ships `WebhookSink` + retry queue + dead-letter; `ALTER TABLE … SUBSCRIBE WEBHOOK` SQL surface queued)
 
 Replaces "trigger fires HTTP" with a retryable, idempotency-keyed
 fanout. `WebhookSink` implements `ChangeEventSink`, attached as
@@ -601,7 +599,7 @@ the actual HTTP path.
       created after max_retries; webhook does NOT fire when WHERE
       predicate is false; auto-pause kicks in after sustained failures.
 
-#### 5.11.E — `LANGUAGE sql RETURNS TABLE` functions (~2 weeks, depends on 5.11.D)
+#### 5.11.E — `LANGUAGE sql RETURNS TABLE` functions (~2 weeks, depends on 5.11.D) ✅ shipped
 
 Multi-row return — function call becomes a derived table at planning
 time. Same inlining trick as scalar functions.
@@ -626,7 +624,7 @@ Sequence of SQL statements with parameter binding, no control flow.
       preserved through the call; failure mid-procedure leaves earlier
       statements applied (until single-shard transactions ship).
 
-#### 5.11.K — Generated columns (`GENERATED ALWAYS AS … STORED`) (~2 weeks)
+#### 5.11.K — Generated columns (`GENERATED ALWAYS AS … STORED`) (~2 weeks) ✅ shipped
 
 Modern PG syntax for computed columns persisted at write time. Cleaner
 than `LANGUAGE sql` functions for the simplest case.
@@ -642,7 +640,7 @@ than `LANGUAGE sql` functions for the simplest case.
 - [ ] Test: generated column round-trip; expression composing built-ins
       from 5.11.A; rejection of direct write.
 
-#### 5.11.K3 — Sequences (`CREATE SEQUENCE`, `nextval`, `currval`) (~2 weeks)
+#### 5.11.K3 — Sequences (`CREATE SEQUENCE`, `nextval`, `currval`) (~2 weeks) 🛠 (catalog API + scalar UDFs ✅; `CREATE SEQUENCE` SQL surface + `DEFAULT nextval` integration queued)
 
 Custom auto-increment, gap-tolerant counters. Most new SaaS uses ULID/
 UUID, but a real slice still wants sequences for human-readable IDs.
@@ -662,7 +660,7 @@ UUID, but a real slice still wants sequences for human-readable IDs.
 
 ### Tier 3 — Larger asks
 
-#### 5.11.M — `information_schema` + `pg_catalog` read-only views (~6-8 weeks honest)
+#### 5.11.M — `information_schema` + `pg_catalog` read-only views (~6-8 weeks honest) 🛠 (starter ✅, engine-routing ✅, expansion ✅: `tables` + `columns` + `pg_class` + `pg_attribute` + `pg_namespace` all routed through pgwire with PostgREST predicate compatibility verified; remaining for full PG-ecosystem-tooling unblock: `pg_index`, `pg_constraint`, `pg_proc`, `information_schema.routines`, `key_column_usage`, `table_constraints`, `referential_constraints`)
 
 The gate for proper PG-ecosystem tooling. Every introspecting tool
 (PostgREST, pgAdmin, DataGrip, schema-migration tools, every ORM that
@@ -777,21 +775,20 @@ conditions in its "Trigger to revisit" section are met.
       unchecked. v0.2 will use A4 catalog `ColumnStats` for selectivity-
       aware estimates on multi-table shapes.)
 - [x] Per-tenant + per-query + per-shard + per-WAL telemetry — `basin_common::TenantCounterRegistry` aggregates ops/bytes_read/bytes_written/errors + ring-window p99 latency per tenant; `Engine::tenant_counters(&TenantId) -> TenantCountersSnapshot` exposes a cheap snapshot. Storage writer/reader and WAL append are wired to bump per-tenant byte counters; engine `TenantSession::execute` bumps op + latency + error.
-- [~] BYO-key envelope-encryption hooks (basin-storage trait + wiring; cloud adapters separate) — `EncryptionProvider` trait shipped in `basin-storage::encryption`; `Storage::attach_encryption_provider` is the additive opt-in (default `None` = byte-for-byte plaintext path). Writer envelope-encrypts the Parquet body with a fresh per-file AES-256-GCM data key and persists the wrapped key as a `<path>.wrapped` sidecar; reader transparently unwraps. Real KMS adapters (AWS KMS, GCP KMS, Azure Key Vault) plug into the trait without trait changes — they live in basin-cloud.
+- [~] BYO-key envelope-encryption hooks — `EncryptionProvider` trait shipped in `basin-storage::encryption`; `Storage::attach_encryption_provider` is the additive opt-in (default `None` = byte-for-byte plaintext path). Writer envelope-encrypts the Parquet body with a fresh per-file AES-256-GCM data key and persists the wrapped key as a `<path>.wrapped` sidecar; reader transparently unwraps. External callers plug their own KMS adapter into the trait — the OSS engine ships only the trait + envelope hooks.
 
-> Cloud-platform hardening items (BYO-bucket, Stripe billing) moved to
-> [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md). BYO-key trait surface lives
-> in basin-storage (this repo) per the line above; the KMS-side
-> adapters are cloud-only.
+> Hosted-product hardening items (BYO-bucket, Stripe billing,
+> enterprise auth/REST extensions) are out of scope for this OSS
+> roadmap. The trait + envelope-hook surface for BYO-key lives in
+> basin-storage per the line above.
 
 ## Phase 7 — Launch (ongoing)
 
 - [ ] Onboard the Phase 0 design partners
-- [~] CLI (`basinctl`) + engineering docs (the customer-facing dashboard
-      moved to [`CLOUD_ROADMAP.md`](./CLOUD_ROADMAP.md))
-      — CLI ✅ shipped: `services/basinctl/` with `ping`, `tenants`,
-      `tables`, `query`, `version`. Engineering docs continuation:
-      ADRs / architecture overview / operator runbook still open.
+- [~] CLI (`basinctl`) + engineering docs — CLI ✅ shipped:
+      `services/basinctl/` with `ping`, `tenants`, `tables`, `query`,
+      `version`. Engineering docs continuation: ADRs / architecture
+      overview / operator runbook still open.
 - [ ] Open beta after 3–6 months of design partner usage
 - [ ] GA when uptime + perf + DX are all genuinely good
 

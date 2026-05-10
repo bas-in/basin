@@ -37,6 +37,7 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::NotFound(_) => ("ERROR", "42704"), // undefined_object
         BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
         BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
+        BasinError::FeatureNotSupported(_) => ("ERROR", "0A000"), // feature_not_supported
         BasinError::IsolationViolation(_) => ("FATAL", "XX000"),
         // Coarse-grained internal categories all collapse to XX000.
         BasinError::Storage(_)

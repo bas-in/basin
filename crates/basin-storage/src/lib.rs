@@ -28,14 +28,16 @@ mod writer;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+use basin_catalog::Catalog;
 use basin_common::{Result, TableName, TenantCounterRegistry, TenantId};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use tokio::sync::Semaphore;
 
+pub use basin_catalog::TenantStorageConfig;
 pub use data_file::{ColumnStats, DataFile};
 pub use disk_cache::{DiskCacheConfig, DiskCacheCounters, DiskCachedStore};
 pub use encryption::{EncryptionProvider, WrappedKey};
@@ -243,6 +245,23 @@ struct Inner {
     /// plaintext path. When `Some`, every PUT envelope-encrypts with a
     /// fresh per-file data key and every GET unwraps before decoding.
     encryption: OnceLock<Arc<dyn encryption::EncryptionProvider>>,
+    /// Optional `Catalog` handle. When attached, the encryption call path
+    /// looks up the per-tenant [`TenantStorageConfig`] (cached below) on
+    /// each wrap / unwrap so the provider can route to the per-tenant
+    /// CMK. When `None`, the encryption path falls back to the legacy
+    /// `wrap_key` / `unwrap_key` shape — back-compat for callers that
+    /// haven't yet wired a catalog handle into Storage.
+    catalog: OnceLock<Arc<dyn Catalog>>,
+    /// Process-local cache of [`TenantStorageConfig`] keyed by tenant.
+    /// Populated lazily on first lookup; invalidated by
+    /// [`Storage::set_tenant_storage_config`]. The outer `RwLock` lets
+    /// concurrent readers fan in cheaply; writes (cache fill or
+    /// invalidation) are rare. Per-tenant cost discipline: one shared
+    /// HashMap, no per-tenant heavy resource. Each entry stores
+    /// `Option<TenantStorageConfig>` so a known-empty result (tenant has
+    /// no config) is also cached and avoids re-querying the catalog on
+    /// the hot write path.
+    tenant_config_cache: RwLock<HashMap<TenantId, Option<TenantStorageConfig>>>,
 }
 
 /// Best-effort counters for the read path. See [`Inner::read_counters`].
@@ -343,6 +362,8 @@ impl Storage {
                 page_cache,
                 tenant_counters: OnceLock::new(),
                 encryption: OnceLock::new(),
+                catalog: OnceLock::new(),
+                tenant_config_cache: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -371,6 +392,91 @@ impl Storage {
         &self,
     ) -> Option<Arc<dyn encryption::EncryptionProvider>> {
         self.inner.encryption.get().cloned()
+    }
+
+    /// Attach a [`Catalog`] handle. Idempotent (first attach wins). When
+    /// attached, [`Storage::set_tenant_storage_config`] /
+    /// [`Storage::get_tenant_storage_config`] become available and the
+    /// encryption call path looks up each tenant's config to route the
+    /// `EncryptionProvider`. Without a catalog the storage layer falls
+    /// back to the legacy `wrap_key` / `unwrap_key` path — fully
+    /// backwards compatible.
+    pub fn attach_catalog(&self, catalog: Arc<dyn Catalog>) {
+        let _ = self.inner.catalog.set(catalog);
+    }
+
+    /// Persist a per-tenant storage config. Delegates to the attached
+    /// [`Catalog`]; returns an error if no catalog has been attached.
+    /// Invalidates the in-process cache for `tenant` so the next wrap /
+    /// unwrap call picks up the new config — production deployments
+    /// rotating CMK config rely on this.
+    pub async fn set_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+        config: TenantStorageConfig,
+    ) -> Result<()> {
+        let catalog = self.inner.catalog.get().ok_or_else(|| {
+            basin_common::BasinError::Internal(
+                "set_tenant_storage_config: no catalog attached to Storage".into(),
+            )
+        })?;
+        catalog
+            .set_tenant_storage_config(tenant, config)
+            .await?;
+        // Invalidate cache so the next read re-fetches the freshly
+        // persisted config. Holding the write lock briefly is fine; the
+        // path is rare (admin / setup, not hot write).
+        self.inner
+            .tenant_config_cache
+            .write()
+            .expect("tenant_config_cache poisoned")
+            .remove(tenant);
+        Ok(())
+    }
+
+    /// Look up a tenant's persisted storage config. Goes through the
+    /// in-process cache; populates it on miss. Returns an error if no
+    /// catalog has been attached.
+    pub async fn get_tenant_storage_config(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<TenantStorageConfig>> {
+        if let Some(cached) = self
+            .inner
+            .tenant_config_cache
+            .read()
+            .expect("tenant_config_cache poisoned")
+            .get(tenant)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let catalog = self.inner.catalog.get().ok_or_else(|| {
+            basin_common::BasinError::Internal(
+                "get_tenant_storage_config: no catalog attached to Storage".into(),
+            )
+        })?;
+        let cfg = catalog.get_tenant_storage_config(tenant).await?;
+        self.inner
+            .tenant_config_cache
+            .write()
+            .expect("tenant_config_cache poisoned")
+            .insert(*tenant, cfg.clone());
+        Ok(cfg)
+    }
+
+    /// Crate-private cache-aware accessor used by the encryption call
+    /// path. Returns `Ok(None)` (and skips the catalog round-trip) when
+    /// no catalog is attached so the writer / reader can degrade
+    /// gracefully to the legacy `wrap_key` / `unwrap_key` shape.
+    pub(crate) async fn tenant_storage_config_cached(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<TenantStorageConfig>> {
+        if self.inner.catalog.get().is_none() {
+            return Ok(None);
+        }
+        self.get_tenant_storage_config(tenant).await
     }
 
     pub(crate) fn tenant_counters(

@@ -12,6 +12,13 @@ basin-engine.workspace = true
 basin-pool.workspace = true
 basin-auth.workspace = true
 
+# Multi-statement simple-query messages (`tokio_postgres::batch_execute`,
+# `psql -f setup.sql`) need to be split into individual statements before
+# dispatch to the engine, which accepts one statement per call. We use
+# sqlparser's tokenizer to find top-level `;` separators correctly across
+# dollar-quoted bodies, single-/double-quoted literals, and SQL comments.
+sqlparser.workspace = true
+
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true

@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "p99 provision latency",
-    "value": 4.056167,
+    "value": 4.641042,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -16,10 +16,10 @@
   "details": {
     "bar_p99_ms": 50.0,
     "bcrypt_cost": 4,
-    "mean_ms": 2.0693979199999992,
+    "mean_ms": 3.797671620000001,
     "n_samples": 100,
-    "p50_ms": 1.987417,
-    "p99_ms": 4.056167
+    "p50_ms": 3.764458,
+    "p99_ms": 4.641042
   },
-  "generated_at": "@1778330640"
+  "generated_at": "@1778393447"
 }

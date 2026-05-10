@@ -6,10 +6,23 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Default: full HTTP layer + Basin-table-backed `ResponseStore`. Toggle
+# off (`default-features = false`) from upstream consumers that only
+# need `HttpClient`, to avoid pulling `basin-engine` into the dep graph.
+# basin-webhooks enables this when its `delivery` feature is on.
+default = ["engine-store"]
+# When enabled, exposes `ResponseStore` (which keeps response rows in
+# Basin tables via `basin-engine`) and the request queue. Disable to
+# break basin-net -> basin-engine and prevent the
+# basin-engine -> basin-webhooks -> basin-net -> basin-engine cycle
+# in compile slices that don't need the response store.
+engine-store = ["dep:basin-engine"]
+
 [dependencies]
 basin-common.workspace = true
 basin-catalog.workspace = true
-basin-engine.workspace = true
+basin-engine = { workspace = true, optional = true }
 
 tokio.workspace = true
 async-trait.workspace = true
