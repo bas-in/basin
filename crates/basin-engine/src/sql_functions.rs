@@ -32,9 +32,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use basin_catalog::{
-    Catalog, SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
-};
+use basin_catalog::{Catalog, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType};
 use basin_common::{BasinError, Result, TenantId};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, Select, SelectItem,
@@ -487,7 +485,12 @@ fn rewrite_table_factor(
 ) -> Result<()> {
     use sqlparser::ast::TableFactor;
     match tf {
-        TableFactor::Table { name, args: Some(table_args), alias, .. } => {
+        TableFactor::Table {
+            name,
+            args: Some(table_args),
+            alias,
+            ..
+        } => {
             let fname = match object_name_unqualified(name) {
                 Some(n) => n,
                 None => return Ok(()),
@@ -518,7 +521,9 @@ fn rewrite_table_factor(
             Ok(())
         }
         TableFactor::Derived { subquery, .. } => rewrite_query(subquery, by_name, depth),
-        TableFactor::NestedJoin { table_with_joins, .. } => {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
             rewrite_table_factor(&mut table_with_joins.relation, by_name, depth)?;
             for join in table_with_joins.joins.iter_mut() {
                 rewrite_table_factor(&mut join.relation, by_name, depth)?;
@@ -535,7 +540,10 @@ fn rewrite_table_factor(
 fn arg_references_outer(arg: &FunctionArg) -> bool {
     match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-        | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => expr_is_non_literal(e),
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => expr_is_non_literal(e),
         _ => false,
     }
 }
@@ -670,7 +678,9 @@ fn walk_expr_children_mut(
             }
             Ok(())
         }
-        Expr::InSubquery { expr: e, subquery, .. } => {
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
             rewrite_expr(e, by_name, depth)?;
             rewrite_query(subquery, by_name, depth)
         }
@@ -681,9 +691,15 @@ fn walk_expr_children_mut(
             rewrite_expr(low, by_name, depth)?;
             rewrite_expr(high, by_name, depth)
         }
-        Expr::Like { expr: e, pattern, .. }
-        | Expr::ILike { expr: e, pattern, .. }
-        | Expr::SimilarTo { expr: e, pattern, .. } => {
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        }
+        | Expr::SimilarTo {
+            expr: e, pattern, ..
+        } => {
             rewrite_expr(e, by_name, depth)?;
             rewrite_expr(pattern, by_name, depth)
         }
@@ -792,8 +808,12 @@ fn inline_one_call(
 /// identifier into a position that expected an opaque token.
 fn wrap_paren(e: Expr) -> Expr {
     match e {
-        Expr::Nested(_) | Expr::Subquery(_) | Expr::Identifier(_) | Expr::CompoundIdentifier(_)
-        | Expr::Value(_) | Expr::Function(_) => e,
+        Expr::Nested(_)
+        | Expr::Subquery(_)
+        | Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::Function(_) => e,
         other => Expr::Nested(Box::new(other)),
     }
 }
@@ -813,7 +833,10 @@ fn is_bare_select(sel: &Select) -> bool {
 fn function_arg_to_expr(arg: &FunctionArg, fn_name: &str) -> Result<Expr> {
     match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e.clone()),
-        FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => Ok(e.clone()),
+        FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => Ok(e.clone()),
         _ => Err(BasinError::InvalidSchema(format!(
             "function {fn_name}: wildcard / qualified-wildcard arg form not supported"
         ))),
@@ -896,7 +919,9 @@ fn walk_expr_children_substitute(expr: &mut Expr, subs: &HashMap<String, Expr>) 
             }
             Ok(())
         }
-        Expr::InSubquery { expr: e, subquery, .. } => {
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
             substitute_args_in_expr(e, subs)?;
             substitute_args_in_query(subquery, subs)
         }
@@ -907,9 +932,15 @@ fn walk_expr_children_substitute(expr: &mut Expr, subs: &HashMap<String, Expr>) 
             substitute_args_in_expr(low, subs)?;
             substitute_args_in_expr(high, subs)
         }
-        Expr::Like { expr: e, pattern, .. }
-        | Expr::ILike { expr: e, pattern, .. }
-        | Expr::SimilarTo { expr: e, pattern, .. } => {
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        }
+        | Expr::SimilarTo {
+            expr: e, pattern, ..
+        } => {
             substitute_args_in_expr(e, subs)?;
             substitute_args_in_expr(pattern, subs)
         }
@@ -1025,13 +1056,20 @@ fn collect_select(sel: &Select, out: &mut Vec<String>) {
 fn collect_table_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>) {
     use sqlparser::ast::TableFactor;
     match tf {
-        TableFactor::Table { name, args: Some(table_args), .. } => {
+        TableFactor::Table {
+            name,
+            args: Some(table_args),
+            ..
+        } => {
             if let Some(n) = object_name_unqualified(name) {
                 out.push(n);
             }
             for arg in table_args.args.iter() {
                 if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } = arg
+                | FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(e),
+                    ..
+                } = arg
                 {
                     collect_expr(e, out);
                 }
@@ -1040,7 +1078,9 @@ fn collect_table_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>)
         TableFactor::Derived { subquery, .. } => {
             out.extend(collect_function_calls_in_query(subquery));
         }
-        TableFactor::NestedJoin { table_with_joins, .. } => {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
             collect_table_factor(&table_with_joins.relation, out);
             for join in table_with_joins.joins.iter() {
                 collect_table_factor(&join.relation, out);
@@ -1098,7 +1138,9 @@ fn walk_expr_children_collect(expr: &Expr, out: &mut Vec<String>) {
                 collect_expr(item, out);
             }
         }
-        Expr::InSubquery { expr: e, subquery, .. } => {
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
             collect_expr(e, out);
             out.extend(collect_function_calls_in_query(subquery));
         }
@@ -1109,9 +1151,15 @@ fn walk_expr_children_collect(expr: &Expr, out: &mut Vec<String>) {
             collect_expr(low, out);
             collect_expr(high, out);
         }
-        Expr::Like { expr: e, pattern, .. }
-        | Expr::ILike { expr: e, pattern, .. }
-        | Expr::SimilarTo { expr: e, pattern, .. } => {
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        }
+        | Expr::SimilarTo {
+            expr: e, pattern, ..
+        } => {
             collect_expr(e, out);
             collect_expr(pattern, out);
         }
@@ -1219,14 +1267,13 @@ fn is_reserved_function_name(name: &str) -> bool {
         "current_date",
         "current_time",
     ];
-    RESERVED
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(name))
+    RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use basin_catalog::{SqlArgType, SqlFunctionArg};
 
     fn dummy_def(name: &str, args: Vec<(&str, SqlArgType)>, body: &str) -> SqlFunctionDef {
         SqlFunctionDef {
@@ -1268,11 +1315,7 @@ mod tests {
 
     #[test]
     fn rejects_multi_statement_body() {
-        let def = dummy_def(
-            "f",
-            vec![("x", SqlArgType::BigInt)],
-            "SELECT 1; SELECT 2",
-        );
+        let def = dummy_def("f", vec![("x", SqlArgType::BigInt)], "SELECT 1; SELECT 2");
         let err = validate_for_registration(def).unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)), "got {err:?}");
     }
@@ -1290,11 +1333,7 @@ mod tests {
 
     #[test]
     fn validates_simple_function() {
-        let def = dummy_def(
-            "add_one",
-            vec![("x", SqlArgType::BigInt)],
-            "SELECT x + 1",
-        );
+        let def = dummy_def("add_one", vec![("x", SqlArgType::BigInt)], "SELECT x + 1");
         let v = validate_for_registration(def).unwrap();
         assert_eq!(v.name, "add_one");
     }

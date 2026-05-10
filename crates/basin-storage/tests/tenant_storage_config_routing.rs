@@ -35,7 +35,12 @@ struct RecordingProvider {
 impl RecordingProvider {
     fn new() -> (Self, Arc<CallCounters>) {
         let c = Arc::new(CallCounters::default());
-        (Self { counters: c.clone() }, c)
+        (
+            Self {
+                counters: c.clone(),
+            },
+            c,
+        )
     }
 
     /// Derive a deterministic 32-byte data key from the optional config
@@ -67,11 +72,7 @@ impl EncryptionProvider for RecordingProvider {
         Ok((key, WrappedKey(sidecar)))
     }
 
-    async fn unwrap_key(
-        &self,
-        _tenant: &TenantId,
-        wrapped: &WrappedKey,
-    ) -> Result<Vec<u8>> {
+    async fn unwrap_key(&self, _tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
         self.counters.unwrap_plain.fetch_add(1, Ordering::Relaxed);
         Ok(wrapped.0[1..].to_vec())
     }
@@ -95,7 +96,9 @@ impl EncryptionProvider for RecordingProvider {
         wrapped: &WrappedKey,
         _config: &TenantStorageConfig,
     ) -> Result<Vec<u8>> {
-        self.counters.unwrap_with_cfg.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .unwrap_with_cfg
+            .fetch_add(1, Ordering::Relaxed);
         Ok(wrapped.0[1..].to_vec())
     }
 }
@@ -237,10 +240,7 @@ async fn unwrap_path_threads_config() {
         .await
         .unwrap();
     let batches: Vec<_> = stream.collect().await;
-    let total: usize = batches
-        .iter()
-        .map(|b| b.as_ref().unwrap().num_rows())
-        .sum();
+    let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
     assert_eq!(total, 16);
 
     assert_eq!(counters.wrap_with_cfg.load(Ordering::Relaxed), 1);
@@ -259,11 +259,7 @@ impl EncryptionProvider for LegacyProvider {
     async fn wrap_key(&self, _tenant: &TenantId) -> Result<(Vec<u8>, WrappedKey)> {
         Ok((vec![7u8; 32], WrappedKey(vec![0xAA; 8])))
     }
-    async fn unwrap_key(
-        &self,
-        _tenant: &TenantId,
-        _wrapped: &WrappedKey,
-    ) -> Result<Vec<u8>> {
+    async fn unwrap_key(&self, _tenant: &TenantId, _wrapped: &WrappedKey) -> Result<Vec<u8>> {
         Ok(vec![7u8; 32])
     }
 }

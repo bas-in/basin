@@ -168,9 +168,7 @@ async fn viability_cold_start() {
         match measure_cold_start_local(&bin, data_dir.path(), wal_dir.path()).await {
             Some(v) => v,
             None => {
-                panic!(
-                    "[VIABILITY cold_start] basin-server failed to come up within 10s"
-                )
+                panic!("[VIABILITY cold_start] basin-server failed to come up within 10s")
             }
         };
 

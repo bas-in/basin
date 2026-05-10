@@ -57,11 +57,9 @@ async fn create_refresh_select_drop_round_trip() {
     sess.execute("CREATE TABLE events (bucket BIGINT NOT NULL, n BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute(
-        "INSERT INTO events VALUES (1, 10), (1, 20), (2, 30), (2, 40), (3, 5)",
-    )
-    .await
-    .unwrap();
+    sess.execute("INSERT INTO events VALUES (1, 10), (1, 20), (2, 30), (2, 40), (3, 5)")
+        .await
+        .unwrap();
 
     // 2. CREATE MATERIALIZED VIEW with the Basin continuous-aggregate
     //    options. The WITH clause uses a dotted-key flag (`basin.continuous`)
@@ -112,10 +110,7 @@ async fn create_refresh_select_drop_round_trip() {
     );
 
     // 5. REFRESH MATERIALIZED VIEW re-materialises the source query.
-    let res = sess
-        .execute("REFRESH MATERIALIZED VIEW mv")
-        .await
-        .unwrap();
+    let res = sess.execute("REFRESH MATERIALIZED VIEW mv").await.unwrap();
     match res {
         ExecResult::Empty { tag } => assert_eq!(tag, "REFRESH MATERIALIZED VIEW"),
         other => panic!("unexpected: {other:?}"),

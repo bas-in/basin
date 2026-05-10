@@ -44,17 +44,12 @@ use sqlparser::parser::Parser;
 /// against `event`. Returns the boolean result (NULL collapses to
 /// `false`, matching PG's `WHERE` semantics on NULL). Parse / unsupported
 /// shapes surface as `Err`.
-pub(crate) fn eval(
-    predicate_sql: &str,
-    event: &ChangeEvent,
-) -> std::result::Result<bool, String> {
+pub(crate) fn eval(predicate_sql: &str, event: &ChangeEvent) -> std::result::Result<bool, String> {
     let dialect = PostgreSqlDialect {};
     let mut parser = Parser::new(&dialect)
         .try_with_sql(predicate_sql)
         .map_err(|e| format!("parse: {e}"))?;
-    let expr = parser
-        .parse_expr()
-        .map_err(|e| format!("parse: {e}"))?;
+    let expr = parser.parse_expr().map_err(|e| format!("parse: {e}"))?;
     let v = eval_expr(&expr, event)?;
     Ok(matches!(v, Lit::Bool(true)))
 }
@@ -113,9 +108,7 @@ fn eval_expr(expr: &Expr, event: &ChangeEvent) -> std::result::Result<Lit, Strin
             eval_binary(op, &l, &r)
         }
         Expr::IsNull(inner) => Ok(Lit::Bool(matches!(eval_expr(inner, event)?, Lit::Null))),
-        Expr::IsNotNull(inner) => {
-            Ok(Lit::Bool(!matches!(eval_expr(inner, event)?, Lit::Null)))
-        }
+        Expr::IsNotNull(inner) => Ok(Lit::Bool(!matches!(eval_expr(inner, event)?, Lit::Null))),
         Expr::IsTrue(inner) => Ok(Lit::Bool(truthy(&eval_expr(inner, event)?))),
         Expr::IsFalse(inner) => Ok(Lit::Bool(!truthy(&eval_expr(inner, event)?))),
         other => Err(format!("unsupported expression: {other}")),
@@ -158,13 +151,9 @@ fn cmp_eq(l: &Lit, r: &Lit) -> bool {
 
 fn cmp_ord(l: &Lit, r: &Lit) -> std::result::Result<std::cmp::Ordering, String> {
     match (l, r) {
-        (Lit::Null, _) | (_, Lit::Null) => {
-            Err("ordering comparison against NULL".into())
-        }
+        (Lit::Null, _) | (_, Lit::Null) => Err("ordering comparison against NULL".into()),
         (Lit::Int(a), Lit::Int(b)) => Ok(a.cmp(b)),
-        (Lit::Float(a), Lit::Float(b)) => {
-            a.partial_cmp(b).ok_or_else(|| "NaN compare".into())
-        }
+        (Lit::Float(a), Lit::Float(b)) => a.partial_cmp(b).ok_or_else(|| "NaN compare".into()),
         (Lit::Int(a), Lit::Float(b)) => (*a as f64)
             .partial_cmp(b)
             .ok_or_else(|| "NaN compare".into()),
@@ -278,12 +267,8 @@ mod tests {
     #[test]
     fn and_or_compose() {
         let e = ev(json!({"status": "paid", "amount": 100}));
-        assert!(
-            eval("NEW.status = 'paid' AND NEW.amount > 50", &e).unwrap()
-        );
-        assert!(
-            !eval("NEW.status = 'failed' OR NEW.amount < 50", &e).unwrap()
-        );
+        assert!(eval("NEW.status = 'paid' AND NEW.amount > 50", &e).unwrap());
+        assert!(!eval("NEW.status = 'failed' OR NEW.amount < 50", &e).unwrap());
     }
 
     #[test]

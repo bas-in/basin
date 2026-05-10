@@ -48,9 +48,7 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_common::{PartitionKey, TableName, TenantId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
-use basin_storage::{
-    PageCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig,
-};
+use basin_storage::{PageCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use futures::stream::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
@@ -206,15 +204,11 @@ async fn viability_page_cache() {
     );
     println!(
         "[VIABILITY page_cache] cold counters: hits={}, misses={}, evictions={}",
-        counters_after_cold.hits,
-        counters_after_cold.misses,
-        counters_after_cold.evictions,
+        counters_after_cold.hits, counters_after_cold.misses, counters_after_cold.evictions,
     );
     println!(
         "[VIABILITY page_cache] warm counters: hits={}, misses={}, evictions={}",
-        counters_after_warm.hits,
-        counters_after_warm.misses,
-        counters_after_warm.evictions,
+        counters_after_warm.hits, counters_after_warm.misses, counters_after_warm.evictions,
     );
 
     let rows = vec![

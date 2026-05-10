@@ -96,7 +96,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use basin_common::{TenantId, telemetry::{init, LogFormat}};
+use basin_common::{
+    telemetry::{init, LogFormat},
+    TenantId,
+};
 use basin_router::{
     ApiKeyTenantResolver, JwtTenantResolver, ServerConfig, StackedTenantResolver,
     StaticTenantResolver, TenantResolver, TlsConfig,
@@ -143,7 +146,11 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from)
-                .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".cache")))
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| PathBuf::from(h).join(".cache"))
+                })
                 .unwrap_or_else(|| PathBuf::from("/tmp"));
             base.join("basin").join("disk-cache")
         });
@@ -304,9 +311,7 @@ async fn main() -> Result<()> {
     // is the only path — byte-identical to pre-auth behaviour.
     let tenant_resolver: Arc<dyn TenantResolver> = match auth_service.as_ref() {
         Some(auth) => {
-            tracing::info!(
-                "pgwire resolver: JWT (primary) + API-key + static (fallback)"
-            );
+            tracing::info!("pgwire resolver: JWT (primary) + API-key + static (fallback)");
             Arc::new(StackedTenantResolver::new(vec![
                 Arc::new(JwtTenantResolver::new(auth.clone())),
                 Arc::new(ApiKeyTenantResolver::new(auth.clone())),
@@ -372,9 +377,8 @@ async fn main() -> Result<()> {
         tls,
     };
 
-    let router_join = tokio::spawn(async move {
-        basin_router::run_with_shutdown(server_cfg, router_rx).await
-    });
+    let router_join =
+        tokio::spawn(async move { basin_router::run_with_shutdown(server_cfg, router_rx).await });
 
     // Wait for Ctrl-C, then signal the router to stop.
     let _ = tokio::signal::ctrl_c().await;
@@ -432,7 +436,10 @@ enum CatalogBackend {
     Memory,
     /// `url` is passed verbatim to `tokio_postgres::connect`. NoTls only;
     /// production deployments need to wrap the connector in rustls/native-tls.
-    Postgres { url: String, schema: String },
+    Postgres {
+        url: String,
+        schema: String,
+    },
 }
 
 impl Cfg {
@@ -502,15 +509,19 @@ fn bool_env(name: &str) -> bool {
 /// Reads `BASIN_TLS_CERT_PATH` + `BASIN_TLS_KEY_PATH` and loads the PEM bytes.
 /// Both unset = no TLS; both set = TLS on; exactly one set = hard error.
 fn load_tls_from_env() -> Result<Option<Arc<TlsConfig>>> {
-    let cert_path = std::env::var("BASIN_TLS_CERT_PATH").ok().filter(|s| !s.is_empty());
-    let key_path = std::env::var("BASIN_TLS_KEY_PATH").ok().filter(|s| !s.is_empty());
+    let cert_path = std::env::var("BASIN_TLS_CERT_PATH")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let key_path = std::env::var("BASIN_TLS_KEY_PATH")
+        .ok()
+        .filter(|s| !s.is_empty());
     match (cert_path, key_path) {
         (None, None) => Ok(None),
         (Some(cert), Some(key)) => {
             let cert_pem = std::fs::read(&cert)
                 .with_context(|| format!("read BASIN_TLS_CERT_PATH at {cert}"))?;
-            let key_pem = std::fs::read(&key)
-                .with_context(|| format!("read BASIN_TLS_KEY_PATH at {key}"))?;
+            let key_pem =
+                std::fs::read(&key).with_context(|| format!("read BASIN_TLS_KEY_PATH at {key}"))?;
             Ok(Some(Arc::new(TlsConfig { cert_pem, key_pem })))
         }
         _ => Err(anyhow!(
@@ -527,12 +538,9 @@ fn parse_catalog_env() -> Result<CatalogBackend> {
     // `tokio_postgres::connect` accepts both `postgres://...` URL form and
     // libpq keyword form (`host=... user=...`). We accept either as the
     // postgres backend marker.
-    if raw.starts_with("postgres://")
-        || raw.starts_with("postgresql://")
-        || raw.contains('=')
-    {
-        let schema = std::env::var("BASIN_CATALOG_SCHEMA")
-            .unwrap_or_else(|_| "basin_catalog".to_string());
+    if raw.starts_with("postgres://") || raw.starts_with("postgresql://") || raw.contains('=') {
+        let schema =
+            std::env::var("BASIN_CATALOG_SCHEMA").unwrap_or_else(|_| "basin_catalog".to_string());
         return Ok(CatalogBackend::Postgres { url: raw, schema });
     }
     Err(anyhow!(

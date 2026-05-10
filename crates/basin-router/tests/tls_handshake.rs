@@ -28,7 +28,9 @@ fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-async fn spawn_router(tls: Option<Arc<TlsConfig>>) -> (std::net::SocketAddr, TempDir, basin_router::RunningServer) {
+async fn spawn_router(
+    tls: Option<Arc<TlsConfig>>,
+) -> (std::net::SocketAddr, TempDir, basin_router::RunningServer) {
     let dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
@@ -73,8 +75,14 @@ async fn ssl_request_with_tls_configured_returns_s() {
     sock.flush().await.unwrap();
 
     let mut byte = [0u8; 1];
-    sock.read_exact(&mut byte).await.expect("read SSL response byte");
-    assert_eq!(byte[0], b'S', "expected 'S' (TLS accepted), got {:?}", byte[0] as char);
+    sock.read_exact(&mut byte)
+        .await
+        .expect("read SSL response byte");
+    assert_eq!(
+        byte[0], b'S',
+        "expected 'S' (TLS accepted), got {:?}",
+        byte[0] as char
+    );
 
     drop(sock);
     let _ = running.shutdown.send(());
@@ -90,8 +98,14 @@ async fn ssl_request_without_tls_returns_n() {
     sock.flush().await.unwrap();
 
     let mut byte = [0u8; 1];
-    sock.read_exact(&mut byte).await.expect("read SSL response byte");
-    assert_eq!(byte[0], b'N', "expected 'N' (TLS refused), got {:?}", byte[0] as char);
+    sock.read_exact(&mut byte)
+        .await
+        .expect("read SSL response byte");
+    assert_eq!(
+        byte[0], b'N',
+        "expected 'N' (TLS refused), got {:?}",
+        byte[0] as char
+    );
 
     drop(sock);
     let _ = running.shutdown.send(());

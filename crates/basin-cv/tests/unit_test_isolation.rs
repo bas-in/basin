@@ -116,7 +116,10 @@ async fn cv_refresh_respects_tenant_isolation() {
 
     // A's CV reflects A's 3 rows.
     let a_count = count(&eng, a, "SELECT c FROM event_count").await.unwrap();
-    assert_eq!(a_count, 3, "A's CV should reflect A's 3 rows, got {a_count}");
+    assert_eq!(
+        a_count, 3,
+        "A's CV should reflect A's 3 rows, got {a_count}"
+    );
 
     // B does NOT have an `event_count` table — A's CV must not have leaked
     // into B's namespace.

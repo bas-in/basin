@@ -134,8 +134,7 @@ pub fn match_alter_table_react_on(sql: &str) -> Result<Option<ReactIntent>> {
     };
     if !starts_with_kw(tail, "EXECUTE") {
         return Err(BasinError::InvalidSchema(
-            "ALTER TABLE REACT ON: expected EXECUTE <body> or CONSTRAINT (<predicate>)"
-                .into(),
+            "ALTER TABLE REACT ON: expected EXECUTE <body> or CONSTRAINT (<predicate>)".into(),
         ));
     }
     let body = skip_word(tail).trim_start().trim().to_string();
@@ -158,9 +157,7 @@ pub fn match_alter_table_react_on(sql: &str) -> Result<Option<ReactIntent>> {
 /// Recognise `ALTER TABLE <table> REACT ON ... CONSTRAINT (<predicate>)
 /// [WITH (name = '...')]`. Returns `None` when the statement is
 /// something else.
-pub fn match_alter_table_react_constraint(
-    sql: &str,
-) -> Result<Option<ConstraintReactIntent>> {
+pub fn match_alter_table_react_constraint(sql: &str) -> Result<Option<ConstraintReactIntent>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let head = match peek_react_head(trimmed)? {
         Some(h) => h,
@@ -174,8 +171,7 @@ pub fn match_alter_table_react_constraint(
     // would matter. Reject DELETE in the OPS bitset.
     if head.ops.contains(ReactorOps::DELETE) {
         return Err(BasinError::InvalidSchema(
-            "REACT ON ... CONSTRAINT: DELETE is not supported (constraints check NEW row)"
-                .into(),
+            "REACT ON ... CONSTRAINT: DELETE is not supported (constraints check NEW row)".into(),
         ));
     }
     let after_constraint = skip_word(head.tail).trim_start();
@@ -433,14 +429,10 @@ fn validate_predicate(pred: &str) -> Result<()> {
     let dialect = PostgreSqlDialect {};
     let mut parser = Parser::new(&dialect)
         .try_with_sql(pred)
-        .map_err(|e| {
-            BasinError::InvalidSchema(format!(
-                "REACT predicate parse error: {e}"
-            ))
-        })?;
-    parser.parse_expr().map_err(|e| {
-        BasinError::InvalidSchema(format!("REACT predicate parse error: {e}"))
-    })?;
+        .map_err(|e| BasinError::InvalidSchema(format!("REACT predicate parse error: {e}")))?;
+    parser
+        .parse_expr()
+        .map_err(|e| BasinError::InvalidSchema(format!("REACT predicate parse error: {e}")))?;
     Ok(())
 }
 
@@ -638,7 +630,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(intent.when_predicate.as_deref(), Some("NEW.status = 'paid'"));
+        assert_eq!(
+            intent.when_predicate.as_deref(),
+            Some("NEW.status = 'paid'")
+        );
     }
 
     #[test]
@@ -687,7 +682,9 @@ mod tests {
 
     #[test]
     fn match_drop_reactor_basic() {
-        let intent = match_drop_reactor("DROP REACTOR cap ON orders;").unwrap().unwrap();
+        let intent = match_drop_reactor("DROP REACTOR cap ON orders;")
+            .unwrap()
+            .unwrap();
         assert_eq!(intent.table, "orders");
         assert_eq!(intent.name, "cap");
     }
@@ -701,6 +698,8 @@ mod tests {
     #[test]
     fn match_react_non_match_returns_none() {
         assert!(match_alter_table_react_on("SELECT 1").unwrap().is_none());
-        assert!(match_alter_table_react_constraint("SELECT 1").unwrap().is_none());
+        assert!(match_alter_table_react_constraint("SELECT 1")
+            .unwrap()
+            .is_none());
     }
 }

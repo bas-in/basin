@@ -78,11 +78,7 @@ async fn shard_for_tenant(cluster: &Cluster, tenant: &TenantId) -> Option<usize>
 }
 
 /// Snapshot the per-tenant counter on shard `idx` for `tenant`.
-async fn shard_count_for_tenant(
-    cluster: &Cluster,
-    idx: usize,
-    tenant: &TenantId,
-) -> u64 {
+async fn shard_count_for_tenant(cluster: &Cluster, idx: usize, tenant: &TenantId) -> u64 {
     cluster.shards[idx]
         .stats
         .snapshot_per_tenant()
@@ -120,9 +116,7 @@ async fn scaling_compute_shards() {
     for (user, tenant) in &tenants {
         let client = connect(router_addr, user).await;
         client
-            .simple_query(
-                "CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)",
-            )
+            .simple_query("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
             .await
             .unwrap_or_else(|e| panic!("CREATE for {user}: {e}"));
         client
@@ -179,12 +173,11 @@ async fn scaling_compute_shards() {
         }
     }
 
-    let consistent_routing_pct =
-        100.0 * consistent_hits as f64 / total_reconnects.max(1) as f64;
+    let consistent_routing_pct = 100.0 * consistent_hits as f64 / total_reconnects.max(1) as f64;
 
     // Load distribution: how many tenants ended up on each shard?
     let mut load_per_shard: Vec<usize> = vec![0; N_SHARDS];
-    for (_, idx) in &placement {
+    for idx in placement.values() {
         load_per_shard[*idx] += 1;
     }
     let max_load: usize = *load_per_shard.iter().max().unwrap();

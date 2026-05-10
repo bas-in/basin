@@ -35,7 +35,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
+use arrow_array::{
+    Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
+};
 use arrow_schema::{DataType, TimeUnit};
 use async_trait::async_trait;
 use basin_catalog::{Catalog, DataFileRef};
@@ -91,7 +94,7 @@ impl TestClock {
 impl Clock for TestClock {
     fn now(&self) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp_millis(self.ms.load(Ordering::Relaxed))
-            .unwrap_or_else(|| Utc::now())
+            .unwrap_or_else(Utc::now)
     }
 }
 
@@ -327,9 +330,8 @@ impl CvRefresher {
         let engine = self.inner.store.engine();
         let catalog: Arc<dyn Catalog> = engine.config().catalog.clone();
         let storage = engine.config().storage.clone();
-        let table = TableName::new(spec.name.clone()).map_err(|e| {
-            BasinError::internal(format!("CV name {} invalid: {e}", spec.name))
-        })?;
+        let table = TableName::new(spec.name.clone())
+            .map_err(|e| BasinError::internal(format!("CV name {} invalid: {e}", spec.name)))?;
 
         let sess = engine.open_session(*tenant).await?;
         self.notify_spy(&spec.name, RefreshMode::Full, &spec.query_sql)
@@ -351,9 +353,10 @@ impl CvRefresher {
         // cheap (one aggregate row) and resilient to projections that
         // strip the timestamp column.
         let new_watermark = match &bucket {
-            Some(info) => self
-                .compute_watermark(&sess, &spec.source_table, info)
-                .await?,
+            Some(info) => {
+                self.compute_watermark(&sess, &spec.source_table, info)
+                    .await?
+            }
             None => spec.last_bucket_max,
         };
 
@@ -431,22 +434,20 @@ impl CvRefresher {
         let engine = self.inner.store.engine();
         let catalog: Arc<dyn Catalog> = engine.config().catalog.clone();
         let storage = engine.config().storage.clone();
-        let table = TableName::new(spec.name.clone()).map_err(|e| {
-            BasinError::internal(format!("CV name {} invalid: {e}", spec.name))
-        })?;
+        let table = TableName::new(spec.name.clone())
+            .map_err(|e| BasinError::internal(format!("CV name {} invalid: {e}", spec.name)))?;
 
         // Build the rewritten SELECT. If rewrite fails (multi-table FROM,
         // weird shape) we fall back to a full refresh.
-        let rewritten = match rewrite_for_watermark(
-            &spec.query_sql,
-            &bucket.bucket_column,
-            watermark,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                return self.refresh_full(tenant, spec, Some(bucket.clone()), now).await;
-            }
-        };
+        let rewritten =
+            match rewrite_for_watermark(&spec.query_sql, &bucket.bucket_column, watermark) {
+                Ok(s) => s,
+                Err(_) => {
+                    return self
+                        .refresh_full(tenant, spec, Some(bucket.clone()), now)
+                        .await;
+                }
+            };
 
         let sess = engine.open_session(*tenant).await?;
         self.notify_spy(&spec.name, RefreshMode::Incremental, &rewritten)
@@ -479,11 +480,8 @@ impl CvRefresher {
             }
         };
 
-        let kept_batches = filter_below_watermark(
-            &existing_batches,
-            &bucket.bucket_alias,
-            watermark,
-        )?;
+        let kept_batches =
+            filter_below_watermark(&existing_batches, &bucket.bucket_alias, watermark)?;
 
         // 3. Combine kept rows + freshly aggregated rows. The schemas are
         //    expected to match (the new rewrite preserves the projection
@@ -622,7 +620,10 @@ impl CvRefresher {
                     .downcast_ref::<TimestampNanosecondArray>()
                     .and_then(|a| {
                         let v = a.value(0);
-                        DateTime::<Utc>::from_timestamp(v / 1_000_000_000, (v % 1_000_000_000) as u32)
+                        DateTime::<Utc>::from_timestamp(
+                            v / 1_000_000_000,
+                            (v % 1_000_000_000) as u32,
+                        )
                     }),
                 DataType::Timestamp(TimeUnit::Second, _) => arr
                     .as_any()
@@ -678,18 +679,15 @@ fn filter_below_watermark(
     }
     // Locate the bucket column once (all batches share the schema).
     let schema = batches[0].schema();
-    let col_idx = schema
-        .index_of(bucket_alias)
-        .ok()
-        .or_else(|| {
-            // Tolerate case-insensitive match — Postgres folds unquoted
-            // identifiers to lowercase, but Arrow preserves whatever case
-            // the projection emitted.
-            schema
-                .fields()
-                .iter()
-                .position(|f| f.name().eq_ignore_ascii_case(bucket_alias))
-        });
+    let col_idx = schema.index_of(bucket_alias).ok().or_else(|| {
+        // Tolerate case-insensitive match — Postgres folds unquoted
+        // identifiers to lowercase, but Arrow preserves whatever case
+        // the projection emitted.
+        schema
+            .fields()
+            .iter()
+            .position(|f| f.name().eq_ignore_ascii_case(bucket_alias))
+    });
     let Some(col_idx) = col_idx else {
         // Couldn't find the column — keep nothing, and rely on the new
         // aggregation alone. This is rare; the `cast(... AS TEXT)` shape
@@ -769,7 +767,9 @@ fn build_lt_watermark_mask(
             let watermark_str = watermark.format("%Y-%m-%d %H:%M:%S").to_string();
             let watermark_str_t = watermark.format("%Y-%m-%dT%H:%M:%S").to_string();
             let arr_strs: Vec<Option<&str>> = if matches!(arr.data_type(), DataType::LargeUtf8) {
-                let s = arr.as_any().downcast_ref::<arrow_array::LargeStringArray>()?;
+                let s = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeStringArray>()?;
                 (0..s.len())
                     .map(|i| if s.is_null(i) { None } else { Some(s.value(i)) })
                     .collect()

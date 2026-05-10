@@ -143,11 +143,12 @@ async fn viability_pg_trgm() {
     // Reported here so the dashboard captures the substrate cost. A
     // 100-char string with average word length ~5 yields ≈ 100 trigrams
     // × 3 bytes = ~300 B trigram bytes plus the Vec header.
-    let probe_input: String = "the quick brown fox jumps over the lazy dog repeatedly until the moon \
+    let probe_input: String =
+        "the quick brown fox jumps over the lazy dog repeatedly until the moon \
         rises over a quiet evening at home"
-        .chars()
-        .take(100)
-        .collect();
+            .chars()
+            .take(100)
+            .collect();
     assert_eq!(probe_input.len(), 100);
     let probe_set = basin_trgm::extract(&probe_input);
     let trgm_bytes_for_100_chars = set_bytes(&probe_set);

@@ -88,7 +88,9 @@ async fn create_call_procedure_round_trip() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE log (msg TEXT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
+        .await
+        .unwrap();
 
     let res = sess
         .execute(
@@ -203,7 +205,9 @@ async fn call_failure_mid_procedure_persists_prior_statements() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE log (msg TEXT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
+        .await
+        .unwrap();
     // No `missing_table` exists, so the second statement will error.
     sess.execute(
         "CREATE PROCEDURE half_fail() LANGUAGE sql AS $$ \
@@ -239,11 +243,9 @@ async fn drop_procedure_works() {
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT)").await.unwrap();
-    sess.execute(
-        "CREATE PROCEDURE noop() LANGUAGE sql AS $$ INSERT INTO t VALUES (1) $$",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE PROCEDURE noop() LANGUAGE sql AS $$ INSERT INTO t VALUES (1) $$")
+        .await
+        .unwrap();
 
     let res = sess.execute("DROP PROCEDURE noop()").await.unwrap();
     match res {
@@ -258,7 +260,9 @@ async fn drop_procedure_works() {
     );
 
     // DROP PROCEDURE IF EXISTS on a missing procedure is a no-op.
-    sess.execute("DROP PROCEDURE IF EXISTS noop()").await.unwrap();
+    sess.execute("DROP PROCEDURE IF EXISTS noop()")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -273,11 +277,12 @@ async fn cross_tenant_isolation() {
     let sess_a = eng_a.open_session(tenant_a).await.unwrap();
     let sess_b = eng_b.open_session(tenant_b).await.unwrap();
 
-    sess_a.execute("CREATE TABLE log (msg TEXT NOT NULL)").await.unwrap();
     sess_a
-        .execute(
-            "CREATE PROCEDURE note() LANGUAGE sql AS $$ INSERT INTO log VALUES ('a') $$",
-        )
+        .execute("CREATE TABLE log (msg TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess_a
+        .execute("CREATE PROCEDURE note() LANGUAGE sql AS $$ INSERT INTO log VALUES ('a') $$")
         .await
         .unwrap();
 
@@ -331,9 +336,7 @@ async fn language_other_than_sql_rejected() {
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
     let err = sess
-        .execute(
-            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$",
-        )
+        .execute("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$")
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -352,11 +355,15 @@ async fn procedure_with_user_function_call_works() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (x BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE summary (val BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO t VALUES (10), (20), (30)").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (10), (20), (30)")
+        .await
+        .unwrap();
 
     sess.execute(
         "CREATE FUNCTION add_one(x BIGINT) RETURNS BIGINT \

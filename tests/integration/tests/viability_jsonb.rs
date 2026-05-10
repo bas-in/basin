@@ -55,9 +55,7 @@ fn canonicalize(v: serde_json::Value) -> serde_json::Value {
             }
             Value::Object(out)
         }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(canonicalize).collect())
-        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonicalize).collect()),
         other => other,
     }
 }
@@ -85,7 +83,7 @@ async fn viability_jsonb() {
     });
 
     let tenant = TenantId::new();
-    let sess = engine.open_session(tenant.clone()).await.unwrap();
+    let sess = engine.open_session(tenant).await.unwrap();
 
     // Step 1 — CREATE TABLE with a JSONB column. JSONB has no dedicated
     // Arrow `DataType`, so the engine plants a `BASIN_TYPE=JSONB` marker on
@@ -108,7 +106,10 @@ async fn viability_jsonb() {
         payload_field.data_type()
     );
     assert_eq!(
-        payload_field.metadata().get("BASIN_TYPE").map(|s| s.as_str()),
+        payload_field
+            .metadata()
+            .get("BASIN_TYPE")
+            .map(|s| s.as_str()),
         Some("JSONB"),
         "payload field is missing the BASIN_TYPE=JSONB marker"
     );
@@ -132,9 +133,9 @@ async fn viability_jsonb() {
 
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
-        ExecResult::Empty { tag } => panic!(
-            "expected ExecResult::Rows for SELECT, got Empty with tag={tag:?}"
-        ),
+        ExecResult::Empty { tag } => {
+            panic!("expected ExecResult::Rows for SELECT, got Empty with tag={tag:?}")
+        }
     };
 
     let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -190,13 +191,15 @@ async fn viability_jsonb() {
     let alice_canonical = canonical_bytes(r#"{"name":"alice","tags":["a","b"]}"#);
     let bob_canonical = canonical_bytes(r#"{"tags":["c"],"name":"bob"}"#);
     assert_eq!(
-        rows[0].1, alice_canonical,
+        rows[0].1,
+        alice_canonical,
         "alice's stored bytes don't match canonical form;\n  got: {:?}\n  expected: {:?}",
         String::from_utf8_lossy(&rows[0].1),
         String::from_utf8_lossy(&alice_canonical),
     );
     assert_eq!(
-        rows[1].1, bob_canonical,
+        rows[1].1,
+        bob_canonical,
         "bob's stored bytes don't match canonical form;\n  got: {:?}\n  expected: {:?}",
         String::from_utf8_lossy(&rows[1].1),
         String::from_utf8_lossy(&bob_canonical),

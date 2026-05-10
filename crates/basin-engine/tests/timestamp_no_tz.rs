@@ -199,11 +199,7 @@ async fn timestamp_and_timestamptz_distinct_types() {
     let names = col_string(&batches, "attname");
     let oids = col_i64(&batches, "atttypid");
     let pairs: Vec<(String, i64)> = names.into_iter().zip(oids.into_iter()).collect();
-    let expected: Vec<(&str, i64)> = vec![
-        ("id", 20),
-        ("naive", 1114),
-        ("zoned", 1184),
-    ];
+    let expected: Vec<(&str, i64)> = vec![("id", 20), ("naive", 1114), ("zoned", 1184)];
     let got: Vec<(&str, i64)> = pairs.iter().map(|(n, o)| (n.as_str(), *o)).collect();
     assert_eq!(
         got, expected,

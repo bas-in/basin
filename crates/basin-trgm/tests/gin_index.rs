@@ -84,7 +84,10 @@ fn search_returns_empty_when_query_unknown() {
     idx.insert(2, "bob");
     // Query whose trigrams don't appear in the corpus — should return empty.
     let hits = idx.search("xyzzy", 0.0, 10);
-    assert!(hits.is_empty(), "novel-trigram query returns empty: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "novel-trigram query returns empty: {hits:?}"
+    );
     // Query that's all whitespace produces no trigrams → empty.
     let hits = idx.search("   ", 0.0, 10);
     assert!(hits.is_empty());
@@ -101,23 +104,112 @@ fn gin_results_match_brute_force() {
     // Load-bearing correctness test: same set + same scores as
     // brute-force `similarity` over the full corpus.
     let corpus: Vec<&str> = vec![
-        "alice", "alyce", "alyssa", "bob", "robert", "smith", "smyth",
-        "smithson", "johnson", "jonson", "jonsen", "anderson", "andersen",
-        "michael", "micheal", "mikael", "mike", "mick", "mickael", "mick mick",
-        "elizabeth", "elisabeth", "lizbeth", "liz", "beth", "betsy", "betty",
-        "william", "willem", "wilhelm", "will", "bill", "billy", "wm",
-        "katherine", "katharine", "kathryn", "catherine", "cathy", "kathy",
-        "richard", "rickard", "rick", "dick", "ricky", "rich", "richie",
-        "thomas", "tomas", "tom", "tommy", "thompson", "tomson",
-        "edward", "edmund", "ed", "eddie", "ted", "teddy", "ned",
-        "henry", "henri", "hank", "harry", "harold", "harriet", "henrietta",
-        "george", "georg", "georges", "geo", "georgie",
-        "charles", "charlie", "carl", "karl", "chuck", "chas",
-        "joseph", "josef", "joe", "joey", "jose", "jodie", "yossi",
-        "francis", "francisco", "frank", "frankie", "francisca",
-        "patricia", "patrick", "patty", "pat", "patrice", "patsy",
-        "barbara", "barb", "babs", "barbra", "barbie",
-        "jennifer", "jenny", "jenn", "jen", "ginny",
+        "alice",
+        "alyce",
+        "alyssa",
+        "bob",
+        "robert",
+        "smith",
+        "smyth",
+        "smithson",
+        "johnson",
+        "jonson",
+        "jonsen",
+        "anderson",
+        "andersen",
+        "michael",
+        "micheal",
+        "mikael",
+        "mike",
+        "mick",
+        "mickael",
+        "mick mick",
+        "elizabeth",
+        "elisabeth",
+        "lizbeth",
+        "liz",
+        "beth",
+        "betsy",
+        "betty",
+        "william",
+        "willem",
+        "wilhelm",
+        "will",
+        "bill",
+        "billy",
+        "wm",
+        "katherine",
+        "katharine",
+        "kathryn",
+        "catherine",
+        "cathy",
+        "kathy",
+        "richard",
+        "rickard",
+        "rick",
+        "dick",
+        "ricky",
+        "rich",
+        "richie",
+        "thomas",
+        "tomas",
+        "tom",
+        "tommy",
+        "thompson",
+        "tomson",
+        "edward",
+        "edmund",
+        "ed",
+        "eddie",
+        "ted",
+        "teddy",
+        "ned",
+        "henry",
+        "henri",
+        "hank",
+        "harry",
+        "harold",
+        "harriet",
+        "henrietta",
+        "george",
+        "georg",
+        "georges",
+        "geo",
+        "georgie",
+        "charles",
+        "charlie",
+        "carl",
+        "karl",
+        "chuck",
+        "chas",
+        "joseph",
+        "josef",
+        "joe",
+        "joey",
+        "jose",
+        "jodie",
+        "yossi",
+        "francis",
+        "francisco",
+        "frank",
+        "frankie",
+        "francisca",
+        "patricia",
+        "patrick",
+        "patty",
+        "pat",
+        "patrice",
+        "patsy",
+        "barbara",
+        "barb",
+        "babs",
+        "barbra",
+        "barbie",
+        "jennifer",
+        "jenny",
+        "jenn",
+        "jen",
+        "ginny",
     ];
     let mut idx = TrigramIndex::new();
     for (i, text) in corpus.iter().enumerate() {
@@ -150,7 +242,10 @@ fn gin_results_match_brute_force() {
             bf.len()
         );
         for (g, b) in gin.iter().zip(bf.iter()) {
-            assert_eq!(g.0, b.0, "query {q:?}: row_id mismatch gin={gin:?}, bf={bf:?}");
+            assert_eq!(
+                g.0, b.0,
+                "query {q:?}: row_id mismatch gin={gin:?}, bf={bf:?}"
+            );
             assert!(
                 approx_eq(g.1, b.1),
                 "query {q:?} row {}: gin score {}, brute-force {}",
@@ -226,7 +321,10 @@ fn gin_index_concurrent_inserts_safe() {
     let final_idx = idx.lock().unwrap();
     assert_eq!(final_idx.len(), 10 * 50, "all rows indexed");
     let hits = final_idx.search("row", 0.0, 1000);
-    assert!(!hits.is_empty(), "search returns rows after concurrent inserts");
+    assert!(
+        !hits.is_empty(),
+        "search returns rows after concurrent inserts"
+    );
 }
 
 #[test]
@@ -237,8 +335,16 @@ fn gin_speedup_over_brute_force() {
 
     let n = 1000usize;
     let bases = [
-        "alice", "smith", "johnson", "anderson", "michael",
-        "elizabeth", "william", "katherine", "richard", "thomas",
+        "alice",
+        "smith",
+        "johnson",
+        "anderson",
+        "michael",
+        "elizabeth",
+        "william",
+        "katherine",
+        "richard",
+        "thomas",
     ];
     let corpus: Vec<String> = (0..n)
         .map(|i| format!("{}-{}", bases[i % bases.len()], i))

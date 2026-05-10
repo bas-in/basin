@@ -43,8 +43,8 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult,
 };
 use tokio::sync::Semaphore;
 
@@ -166,10 +166,7 @@ impl ObjectStore for TenantScopedStore {
         self.inner.delete(location).await
     }
 
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         // We collect the inner stream into a Vec under a single
         // permit + scheduler slot, then return a stream over that Vec.
         // Every caller in `basin-storage` and the engine listings
@@ -186,7 +183,7 @@ impl ObjectStore for TenantScopedStore {
             let _slot = scheduler.acquire(tenant, Priority::High).await;
             inner_stream.collect::<Vec<_>>().await
         })
-        .flat_map(|items| futures::stream::iter(items))
+        .flat_map(futures::stream::iter)
         .boxed()
     }
 

@@ -156,7 +156,9 @@ fn extract_from_binding(sel: &Select) -> Option<FromBinding> {
         return None;
     }
     match &twj.relation {
-        TableFactor::Table { name, alias, args, .. } => {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
             if args.is_some() {
                 // table-valued function — skip.
                 return None;
@@ -306,9 +308,7 @@ fn rewrite_expr_in_predicate<'a>(
                 BinaryOperator::Lt
                 | BinaryOperator::Gt
                 | BinaryOperator::LtEq
-                | BinaryOperator::GtEq => {
-                    rewrite_ordering_pair(ctx, binding, left, right).await
-                }
+                | BinaryOperator::GtEq => rewrite_ordering_pair(ctx, binding, left, right).await,
                 BinaryOperator::And | BinaryOperator::Or => {
                     rewrite_expr_in_predicate(ctx, binding, left).await?;
                     rewrite_expr_in_predicate(ctx, binding, right).await?;
@@ -319,18 +319,13 @@ fn rewrite_expr_in_predicate<'a>(
                 _ => Ok(()),
             },
             Expr::Between {
-                expr: e,
-                low,
-                high,
-                ..
+                expr: e, low, high, ..
             } => {
                 // BETWEEN: if the column is enum-typed, both bounds
                 // must rewrite from label literal to ordinal.
                 let col = as_column_ref(e.as_ref());
                 let def = match col {
-                    Some((qual, c)) => {
-                        resolve_enum_column(ctx, binding, qual.as_deref(), &c).await
-                    }
+                    Some((qual, c)) => resolve_enum_column(ctx, binding, qual.as_deref(), &c).await,
                     None => None,
                 };
                 if let Some(def) = def {

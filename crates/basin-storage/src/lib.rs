@@ -128,7 +128,10 @@ impl StorageConfig {
     /// Convenience for tests / fixtures that want caches on without
     /// hand-rolling the path.
     pub fn default_disk_cache() -> DiskCacheConfig {
-        DiskCacheConfig::new(Self::default_disk_cache_root(), Self::DEFAULT_DISK_CACHE_BYTES)
+        DiskCacheConfig::new(
+            Self::default_disk_cache_root(),
+            Self::DEFAULT_DISK_CACHE_BYTES,
+        )
     }
 
     /// Like [`default_disk_cache`](Self::default_disk_cache) but with an
@@ -350,9 +353,7 @@ impl Storage {
             None => cfg.object_store,
         };
 
-        let page_cache = cfg
-            .page_cache
-            .map(|pc| Arc::new(PageCache::new(pc)));
+        let page_cache = cfg.page_cache.map(|pc| Arc::new(PageCache::new(pc)));
 
         Self {
             inner: Arc::new(Inner {
@@ -388,18 +389,13 @@ impl Storage {
     /// key as a `<path>.wrapped` sidecar; reads transparently unwrap.
     /// Files written before the attach remain readable as plaintext (no
     /// sidecar present means no decryption attempt).
-    pub fn attach_encryption_provider(
-        &self,
-        provider: Arc<dyn encryption::EncryptionProvider>,
-    ) {
+    pub fn attach_encryption_provider(&self, provider: Arc<dyn encryption::EncryptionProvider>) {
         let _ = self.inner.encryption.set(provider);
     }
 
     /// Crate-private accessor: clone of the attached provider (if any).
     /// Used by the writer / reader modules to gate the envelope path.
-    pub(crate) fn encryption_provider(
-        &self,
-    ) -> Option<Arc<dyn encryption::EncryptionProvider>> {
+    pub(crate) fn encryption_provider(&self) -> Option<Arc<dyn encryption::EncryptionProvider>> {
         self.inner.encryption.get().cloned()
     }
 
@@ -429,9 +425,7 @@ impl Storage {
                 "set_tenant_storage_config: no catalog attached to Storage".into(),
             )
         })?;
-        catalog
-            .set_tenant_storage_config(tenant, config)
-            .await?;
+        catalog.set_tenant_storage_config(tenant, config).await?;
         // Invalidate cache so the next read re-fetches the freshly
         // persisted config. Holding the write lock briefly is fine; the
         // path is rare (admin / setup, not hot write).
@@ -526,7 +520,6 @@ impl Storage {
     pub fn scheduler(&self) -> &Scheduler {
         &self.inner.scheduler
     }
-
 
     /// Per-tenant semaphore handle. Used internally to gate every
     /// underlying object_store RPC behind a tenant-scoped permit pool.
@@ -726,11 +719,7 @@ impl Storage {
     /// Files already in the cold tier are returned unchanged (the descriptor
     /// is rebuilt by re-stat'ing the cold object).
     #[tracing::instrument(skip(self), fields(tenant=%tenant, from=%from))]
-    pub async fn migrate_to_cold(
-        &self,
-        tenant: &TenantId,
-        from: &ObjectPath,
-    ) -> Result<DataFile> {
+    pub async fn migrate_to_cold(&self, tenant: &TenantId, from: &ObjectPath) -> Result<DataFile> {
         // Already cold? Re-stat and return without touching anything.
         if matches!(Tier::from_path(from.as_ref()), Tier::Cold) {
             let store = self.tenant_store(tenant);
@@ -862,20 +851,12 @@ impl Storage {
         // and fan-out 64-way through `bulk_delete` (the default
         // `.buffered(10)` is the bottleneck at 5000+ files).
         let inner = self.inner.object_store.clone();
-        let collected: Vec<ObjectPath> = paths_stream
-            .try_collect()
-            .await
-            .map_err(|e| {
-                basin_common::BasinError::storage(format!(
-                    "delete_tenant_prefix({tenant}) list: {e}"
-                ))
-            })?;
-        let deleted: Vec<ObjectPath> =
-            bulk_delete(&inner, collected).await.map_err(|e| {
-                basin_common::BasinError::storage(format!(
-                    "delete_tenant_prefix({tenant}): {e}"
-                ))
-            })?;
+        let collected: Vec<ObjectPath> = paths_stream.try_collect().await.map_err(|e| {
+            basin_common::BasinError::storage(format!("delete_tenant_prefix({tenant}) list: {e}"))
+        })?;
+        let deleted: Vec<ObjectPath> = bulk_delete(&inner, collected).await.map_err(|e| {
+            basin_common::BasinError::storage(format!("delete_tenant_prefix({tenant}): {e}"))
+        })?;
         let list_delete_ms = list_started.elapsed().as_millis();
         // Drop any cached decoded batches for each deleted file. Same
         // rationale as `delete_file`: page cache lives one layer above
@@ -998,9 +979,7 @@ impl Storage {
             bulk_delete(&cat_delete_inner, cat_paths_for_delete)
                 .await
                 .map_err(|e| {
-                    basin_common::BasinError::storage(format!(
-                        "delete_tenant catalog batch: {e}"
-                    ))
+                    basin_common::BasinError::storage(format!("delete_tenant catalog batch: {e}"))
                 })
         };
 
@@ -1018,11 +997,7 @@ impl Storage {
                 .map_ok(|m| m.location)
                 .try_collect::<Vec<_>>()
                 .await
-                .map_err(|e| {
-                    basin_common::BasinError::storage(format!(
-                        "delete_tenant list: {e}"
-                    ))
-                })
+                .map_err(|e| basin_common::BasinError::storage(format!("delete_tenant list: {e}")))
         };
 
         let cat_delete_started = std::time::Instant::now();
@@ -1044,9 +1019,7 @@ impl Storage {
         let orphan_count = orphans.len();
         let orphan_deleted = if !orphans.is_empty() {
             bulk_delete(&inner, orphans).await.map_err(|e| {
-                basin_common::BasinError::storage(format!(
-                    "delete_tenant orphan batch: {e}"
-                ))
+                basin_common::BasinError::storage(format!("delete_tenant orphan batch: {e}"))
             })?
         } else {
             Vec::new()
@@ -1245,10 +1218,7 @@ mod tests {
             .await
             .unwrap();
         let batches: Vec<_> = stream.collect::<Vec<_>>().await;
-        let total: usize = batches
-            .iter()
-            .map(|b| b.as_ref().unwrap().num_rows())
-            .sum();
+        let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
         assert_eq!(total, 1_000);
 
         let first = batches[0].as_ref().unwrap();
@@ -1284,10 +1254,7 @@ mod tests {
             async move {
                 let stream = s.read(&t, &table, ReadOptions::default()).await.unwrap();
                 let batches: Vec<_> = stream.collect::<Vec<_>>().await;
-                let total: usize = batches
-                    .iter()
-                    .map(|b| b.as_ref().unwrap().num_rows())
-                    .sum();
+                let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
                 let any_name = batches
                     .first()
                     .map(|b| {
@@ -1480,10 +1447,7 @@ mod tests {
         };
         let stream = s.read(&tenant, &table, opts).await.unwrap();
         let batches: Vec<_> = stream.collect::<Vec<_>>().await;
-        let total: usize = batches
-            .iter()
-            .map(|b| b.as_ref().unwrap().num_rows())
-            .sum();
+        let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
         assert!(total >= 1, "expected the matching row");
 
         // 10 row groups exist; pruning must drop the vast majority. We allow
@@ -1491,12 +1455,10 @@ mod tests {
         // the full file. A single matching row group + footer should be far
         // under half the file size.
         let bytes = counting.range_bytes.load(Ordering::Relaxed);
-        let full_file = std::fs::metadata(
-            walkdir_first_parquet(dir.path())
-                .expect("parquet file to exist"),
-        )
-        .unwrap()
-        .len() as usize;
+        let full_file =
+            std::fs::metadata(walkdir_first_parquet(dir.path()).expect("parquet file to exist"))
+                .unwrap()
+                .len() as usize;
         assert!(
             bytes * 2 < full_file,
             "row-group pruning failed: read {bytes} bytes of {full_file}"

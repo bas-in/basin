@@ -23,11 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use basin_common::TenantId;
-use governor::{
-    clock::DefaultClock,
-    state::keyed::DefaultKeyedStateStore,
-    Quota, RateLimiter,
-};
+use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use tokio::sync::RwLock;
 
 use crate::types::HttpError;
@@ -123,8 +119,8 @@ impl AllowList {
     /// behaviour is **deny** so a freshly-provisioned tenant cannot
     /// accidentally exfiltrate to anywhere.
     pub async fn check(&self, tenant: &TenantId, url: &str) -> Result<(), HttpError> {
-        let parsed = url::Url::parse(url)
-            .map_err(|e| HttpError::InvalidUrl(format!("{url}: {e}")))?;
+        let parsed =
+            url::Url::parse(url).map_err(|e| HttpError::InvalidUrl(format!("{url}: {e}")))?;
         let host = parsed
             .host_str()
             .ok_or_else(|| HttpError::InvalidUrl(format!("no host in url: {url}")))?

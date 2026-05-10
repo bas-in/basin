@@ -81,14 +81,11 @@ pub async fn spawn_server(default_status: u16) -> ServerHandle {
         default: default_status,
         requests: Vec::new(),
     }));
-    let app = Router::new()
-        .fallback(handler)
-        .with_state(state.clone());
+    let app = Router::new().fallback(handler).with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app.into_make_service())
-            .await;
+        let _ = axum::serve(listener, app.into_make_service()).await;
     });
     // Sanity wait so the server is bound before the test issues requests.
     tokio::task::yield_now().await;
@@ -96,10 +93,7 @@ pub async fn spawn_server(default_status: u16) -> ServerHandle {
 }
 
 /// Wait until `predicate` returns true, polling every 5ms up to `timeout`.
-pub async fn wait_for<F: FnMut() -> bool>(
-    mut predicate: F,
-    timeout: std::time::Duration,
-) -> bool {
+pub async fn wait_for<F: FnMut() -> bool>(mut predicate: F, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if predicate() {

@@ -47,8 +47,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -286,7 +285,12 @@ async fn postgrest_routine_discovery() {
         .expect("information_schema.routines query");
 
     // The fixture registers exactly one FUNCTION + one PROCEDURE.
-    assert_eq!(rows.len(), 2, "expected 1 function + 1 procedure, got {}", rows.len());
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected 1 function + 1 procedure, got {}",
+        rows.len()
+    );
 
     let mut by_name: HashMap<String, (String, Option<String>)> = HashMap::new();
     for r in &rows {
@@ -302,7 +306,10 @@ async fn postgrest_routine_discovery() {
 
     let (rtype, dt) = by_name.get("log_msg").expect("log_msg missing");
     assert_eq!(rtype, "PROCEDURE");
-    assert!(dt.is_none(), "procedure data_type must be NULL (PG behaviour)");
+    assert!(
+        dt.is_none(),
+        "procedure data_type must be NULL (PG behaviour)"
+    );
 }
 
 /// Query 6 — `information_schema.tables`. PostgREST reads this view to
@@ -327,7 +334,10 @@ async fn postgrest_information_schema_tables() {
     let names: std::collections::BTreeSet<String> =
         rows.iter().map(|r| r.get::<_, String>(0)).collect();
     for expected in ["accounts", "orders", "audit_log"] {
-        assert!(names.contains(expected), "missing {expected:?} in info_schema.tables: {names:?}");
+        assert!(
+            names.contains(expected),
+            "missing {expected:?} in info_schema.tables: {names:?}"
+        );
     }
     for r in &rows {
         let table_type: String = r.get(1);
@@ -393,10 +403,7 @@ async fn postgrest_information_schema_columns() {
     // expect to read here.
     for ((table, column), (_, nn)) in &by_col {
         if matches!(table.as_str(), "accounts" | "orders" | "audit_log") {
-            assert_eq!(
-                nn, "NO",
-                "{table}.{column} should be NOT NULL"
-            );
+            assert_eq!(nn, "NO", "{table}.{column} should be NOT NULL");
         }
     }
 }
@@ -493,7 +500,9 @@ async fn pgadmin_pg_type_join_succeeds() {
     assert_eq!(*n, 2);
     assert_eq!(ty, "text", "TEXT must surface as PG 'text'");
 
-    let (n, ty, _) = by_name.get("created_at").expect("created_at column missing");
+    let (n, ty, _) = by_name
+        .get("created_at")
+        .expect("created_at column missing");
     assert_eq!(*n, 3);
     assert_eq!(
         ty, "timestamptz",

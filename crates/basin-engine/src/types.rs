@@ -72,11 +72,19 @@ pub(crate) fn field_is_uuid(field: &arrow_schema::Field) -> bool {
 }
 
 pub(crate) fn field_is_auto_update(field: &arrow_schema::Field) -> bool {
-    field.metadata().get(BASIN_AUTO_UPDATE_KEY).map(|s| s.as_str()) == Some("1")
+    field
+        .metadata()
+        .get(BASIN_AUTO_UPDATE_KEY)
+        .map(|s| s.as_str())
+        == Some("1")
 }
 
 pub(crate) fn field_is_soft_delete(field: &arrow_schema::Field) -> bool {
-    field.metadata().get(BASIN_SOFT_DELETE_KEY).map(|s| s.as_str()) == Some("1")
+    field
+        .metadata()
+        .get(BASIN_SOFT_DELETE_KEY)
+        .map(|s| s.as_str())
+        == Some("1")
 }
 
 /// Return the stored expression text for a `GENERATED ALWAYS AS (...)
@@ -91,7 +99,10 @@ pub(crate) fn field_is_generated(field: &arrow_schema::Field) -> Option<&str> {
 /// The text is the user's expression source (e.g. `nextval('s')`,
 /// `'pending'`).
 pub(crate) fn field_default_text(field: &arrow_schema::Field) -> Option<&str> {
-    field.metadata().get(BASIN_COLUMN_DEFAULT).map(|s| s.as_str())
+    field
+        .metadata()
+        .get(BASIN_COLUMN_DEFAULT)
+        .map(|s| s.as_str())
 }
 
 /// Locate the unique soft-delete column on `schema`, if any. Returns the
@@ -108,13 +119,72 @@ pub(crate) fn soft_delete_column(schema: &arrow_schema::Schema) -> Option<String
 /// Bare audit-table name when the source table was declared with
 /// `AUDIT TO <name>`.
 pub(crate) fn audit_table_name(schema: &arrow_schema::Schema) -> Option<&str> {
-    schema.metadata().get(BASIN_AUDIT_TABLE_KEY).map(|s| s.as_str())
+    schema
+        .metadata()
+        .get(BASIN_AUDIT_TABLE_KEY)
+        .map(|s| s.as_str())
+}
+
+/// PG `SERIAL` family — recognised forms and the integer width each one
+/// implies. `SERIAL` rides on the int4 / int8 / int2 surface; the
+/// `nextval` machinery doesn't care which one, but we keep the
+/// distinction so the column type matches what `psql \d` would print.
+///
+/// sqlparser 0.52 has no dedicated AST variant for SERIAL — every form
+/// lands in `Custom` with the keyword as the identifier. We match on
+/// the unparameterised identifier (no modifiers) so `serial(8)` (which
+/// PG would reject anyway) stays out of this matcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SerialKind {
+    /// `SMALLSERIAL` / `SERIAL2` → INT2-backed.
+    Small,
+    /// `SERIAL` / `SERIAL4` → INT4-backed (we widen to Int64 since the
+    /// engine treats `INTEGER` as Int64 throughout).
+    Regular,
+    /// `BIGSERIAL` / `SERIAL8` → INT8-backed.
+    Big,
+}
+
+/// Recognise `SERIAL` / `SMALLSERIAL` / `BIGSERIAL` (+ `SERIAL2` /
+/// `SERIAL4` / `SERIAL8` aliases). Returns `None` for non-SERIAL types.
+///
+/// SERIAL is a *pseudo-type* in PG: it expands to an integer column
+/// with an auto-created sequence and a `DEFAULT nextval(...)`. The
+/// expansion happens in `ddl::schema_and_constraints_from_columns`;
+/// this helper exists so the type-bridge and the DDL site both agree
+/// on which sqlparser shapes count as SERIAL.
+pub(crate) fn serial_kind(sql: &SqlDataType) -> Option<SerialKind> {
+    if let SqlDataType::Custom(name, modifiers) = sql {
+        if !modifiers.is_empty() || name.0.len() != 1 {
+            return None;
+        }
+        let kw = name.0[0].value.to_ascii_uppercase();
+        return match kw.as_str() {
+            "SMALLSERIAL" | "SERIAL2" => Some(SerialKind::Small),
+            "SERIAL" | "SERIAL4" => Some(SerialKind::Regular),
+            "BIGSERIAL" | "SERIAL8" => Some(SerialKind::Big),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Map a sqlparser column type to an Arrow [`DataType`]. Only the small set
 /// listed in the engine's PoC SQL contract is accepted; anything else is an
 /// `InvalidSchema` error so callers see exactly which type they tripped on.
 pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
+    // SERIAL family: widen to Int64 across all three widths. PG uses
+    // int2/int4/int8 distinctly, but the engine's INSERT/builder path
+    // only supports `Int64` for now (SmallInt columns exist in DDL but
+    // have no Int16 row-builder), so SMALLSERIAL would otherwise trip
+    // an "unsupported Arrow column type for INSERT: Int16". Widening
+    // here trades a small PG-fidelity loss (you can't write a value
+    // outside the int4 / int2 range and have it rejected at the column
+    // level) for end-to-end correctness through INSERT / pgwire / OIDs.
+    // The auto-created sequence + DEFAULT lives in the DDL site, not here.
+    if serial_kind(sql).is_some() {
+        return Ok(DataType::Int64);
+    }
     match sql {
         SqlDataType::Int(_)
         | SqlDataType::Integer(_)
@@ -157,7 +227,8 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // catch-all (some sqlparser dialects route there for unrecognised
         // keywords). Same Arrow type, same JSONB tag downstream.
         SqlDataType::Custom(name, modifiers)
-            if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("jsonb")
+            if name.0.len() == 1
+                && name.0[0].value.eq_ignore_ascii_case("jsonb")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::LargeBinary)
@@ -171,7 +242,8 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // and REST layer key off to render the hyphenated canonical form.
         SqlDataType::Uuid => Ok(DataType::FixedSizeBinary(16)),
         SqlDataType::Custom(name, modifiers)
-            if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("uuid")
+            if name.0.len() == 1
+                && name.0[0].value.eq_ignore_ascii_case("uuid")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::FixedSizeBinary(16))
@@ -199,9 +271,10 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // pgwire encoding, convert.rs bridge) already key off `Some(_)` vs
         // `None` to advertise OID 1184 vs 1114.
         SqlDataType::Timestamp(_, tz_info) => match tz_info {
-            TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => {
-                Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
-            }
+            TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => Ok(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
             _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         },
 
@@ -315,11 +388,9 @@ pub(crate) fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
     let mut out = Vec::new();
     for piece in inner.split(',') {
         let p = piece.trim();
-        let v: f32 = p.parse().map_err(|e| {
-            BasinError::InvalidSchema(format!(
-                "bad vector element {p:?}: {e}"
-            ))
-        })?;
+        let v: f32 = p
+            .parse()
+            .map_err(|e| BasinError::InvalidSchema(format!("bad vector element {p:?}: {e}")))?;
         out.push(v);
     }
     Ok(out)

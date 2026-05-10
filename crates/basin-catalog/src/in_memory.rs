@@ -199,11 +199,7 @@ impl InMemoryCatalog {
             .ok_or_else(|| BasinError::not_found(format!("{tenant}/{table}")))
     }
 
-    fn build_metadata(
-        tenant: &TenantId,
-        table: &TableName,
-        state: &TableState,
-    ) -> TableMetadata {
+    fn build_metadata(tenant: &TenantId, table: &TableName, state: &TableState) -> TableMetadata {
         TableMetadata {
             tenant: *tenant,
             table: table.clone(),
@@ -462,11 +458,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn list_snapshots(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-    ) -> Result<Vec<Snapshot>> {
+    async fn list_snapshots(&self, tenant: &TenantId, table: &TableName) -> Result<Vec<Snapshot>> {
         let state = self.get_table(tenant, table).await?;
         let guard = state.lock().await;
         Ok(guard.snapshots.clone())
@@ -614,12 +606,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
-    async fn set_schema(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-        schema: Schema,
-    ) -> Result<()> {
+    async fn set_schema(&self, tenant: &TenantId, table: &TableName, schema: Schema) -> Result<()> {
         let state_arc = self.get_table(tenant, table).await?;
         let mut state = state_arc.lock().await;
         state.schema = Arc::new(schema);
@@ -712,12 +699,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
-    async fn drop_index(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-        name: &str,
-    ) -> Result<()> {
+    async fn drop_index(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
         let state_arc = self.get_table(tenant, table).await?;
         let mut state = state_arc.lock().await;
         let before = state.indexes.len();
@@ -751,11 +733,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_sql_function(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-    ) -> Option<SqlFunctionDef> {
+    async fn lookup_sql_function(&self, tenant: &TenantId, name: &str) -> Option<SqlFunctionDef> {
         let key = (*tenant, name.to_string());
         let map = self.sql_functions.lock().await;
         map.get(&key).cloned()
@@ -818,9 +796,9 @@ impl Catalog for InMemoryCatalog {
         let entry = {
             let key = (*tenant, name.to_string());
             let map = self.sequences.lock().await;
-            map.get(&key).cloned().ok_or_else(|| {
-                BasinError::not_found(format!("{tenant}: sequence {name:?}"))
-            })?
+            map.get(&key)
+                .cloned()
+                .ok_or_else(|| BasinError::not_found(format!("{tenant}: sequence {name:?}")))?
         };
         // Per-sequence mutex serialises increments; concurrent callers
         // see distinct values, but two sequences (or two tenants) never
@@ -842,9 +820,9 @@ impl Catalog for InMemoryCatalog {
         let entry = {
             let key = (*tenant, name.to_string());
             let map = self.sequences.lock().await;
-            map.get(&key).cloned().ok_or_else(|| {
-                BasinError::not_found(format!("{tenant}: sequence {name:?}"))
-            })?
+            map.get(&key)
+                .cloned()
+                .ok_or_else(|| BasinError::not_found(format!("{tenant}: sequence {name:?}")))?
         };
         let state = entry.state.lock().await;
         if !state.started {
@@ -866,9 +844,9 @@ impl Catalog for InMemoryCatalog {
         let entry = {
             let key = (*tenant, name.to_string());
             let map = self.sequences.lock().await;
-            map.get(&key).cloned().ok_or_else(|| {
-                BasinError::not_found(format!("{tenant}: sequence {name:?}"))
-            })?
+            map.get(&key)
+                .cloned()
+                .ok_or_else(|| BasinError::not_found(format!("{tenant}: sequence {name:?}")))?
         };
         let mut state = entry.state.lock().await;
         // PG's `setval(seq, n, true)` (the default) makes `n` the most
@@ -884,8 +862,12 @@ impl Catalog for InMemoryCatalog {
         } else {
             value.wrapping_sub(entry.def.increment)
         };
-        state.current.store(stored, std::sync::atomic::Ordering::Relaxed);
-        state.block_end.store(stored, std::sync::atomic::Ordering::Relaxed);
+        state
+            .current
+            .store(stored, std::sync::atomic::Ordering::Relaxed);
+        state
+            .block_end
+            .store(stored, std::sync::atomic::Ordering::Relaxed);
         state.started = true;
         Ok(value)
     }
@@ -917,12 +899,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
-    async fn drop_reactor(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-        name: &str,
-    ) -> Result<()> {
+    async fn drop_reactor(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
         let key = (*tenant, format!("{table}:{name}"));
         let mut state = self.reactors.lock().await;
         if state.map.remove(&key).is_none() {
@@ -1000,12 +977,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = %value))]
-    async fn add_enum_value(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-        value: &str,
-    ) -> Result<()> {
+    async fn add_enum_value(&self, tenant: &TenantId, name: &str, value: &str) -> Result<()> {
         if value.is_empty() {
             return Err(BasinError::InvalidSchema(
                 "ALTER TYPE ADD VALUE: label cannot be empty".into(),
@@ -1099,9 +1071,7 @@ impl Catalog for InMemoryCatalog {
         let key = (*tenant, name.to_string());
         let mut map = self.domains.lock().await;
         if map.remove(&key).is_none() {
-            return Err(BasinError::not_found(format!(
-                "{tenant}: domain {name:?}"
-            )));
+            return Err(BasinError::not_found(format!("{tenant}: domain {name:?}")));
         }
         Ok(())
     }
@@ -1143,11 +1113,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_procedure(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-    ) -> Option<SqlProcedureDef> {
+    async fn lookup_procedure(&self, tenant: &TenantId, name: &str) -> Option<SqlProcedureDef> {
         let key = (*tenant, name.to_string());
         let map = self.procedures.lock().await;
         map.get(&key).cloned()
@@ -1275,9 +1241,7 @@ fn reactor_err_to_basin(e: ReactorError) -> BasinError {
         ReactorError::Duplicate => {
             BasinError::Catalog("reactor with the same name already exists".into())
         }
-        ReactorError::InvalidBody(msg) => {
-            BasinError::InvalidSchema(format!("reactor body: {msg}"))
-        }
+        ReactorError::InvalidBody(msg) => BasinError::InvalidSchema(format!("reactor body: {msg}")),
         ReactorError::InvalidPredicate(msg) => {
             BasinError::InvalidSchema(format!("reactor when-predicate: {msg}"))
         }
@@ -1459,7 +1423,10 @@ mod tests {
             .count();
         let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
         assert_eq!(oks, 1, "exactly one append must win: {r1:?} {r2:?}");
-        assert_eq!(conflicts, 1, "exactly one append must conflict: {r1:?} {r2:?}");
+        assert_eq!(
+            conflicts, 1,
+            "exactly one append must conflict: {r1:?} {r2:?}"
+        );
 
         let head = cat.load_table(&t, &tbl).await.unwrap();
         assert_eq!(head.current_snapshot, SnapshotId(1));
@@ -1622,14 +1589,9 @@ mod tests {
         )
         .await
         .unwrap();
-        cat.append_data_files(
-            &t,
-            &tbl,
-            SnapshotId(1),
-            vec![file("b.parquet", 20, 200)],
-        )
-        .await
-        .unwrap();
+        cat.append_data_files(&t, &tbl, SnapshotId(1), vec![file("b.parquet", 20, 200)])
+            .await
+            .unwrap();
         let pre = cat.list_snapshots(&t, &tbl).await.unwrap();
         assert_eq!(pre.len(), 3);
 
@@ -1649,16 +1611,15 @@ mod tests {
 
         // A new commit chains off the rolled-back head.
         let after = cat
-            .append_data_files(
-                &t,
-                &tbl,
-                SnapshotId(1),
-                vec![file("c.parquet", 30, 300)],
-            )
+            .append_data_files(&t, &tbl, SnapshotId(1), vec![file("c.parquet", 30, 300)])
             .await
             .unwrap();
         assert_eq!(after.current_snapshot, SnapshotId(2));
-        let head = after.snapshots.iter().find(|s| s.id == SnapshotId(2)).unwrap();
+        let head = after
+            .snapshots
+            .iter()
+            .find(|s| s.id == SnapshotId(2))
+            .unwrap();
         assert_eq!(head.parent, Some(SnapshotId(1)));
         assert_eq!(head.data_files.len(), 1);
         assert_eq!(head.data_files[0].path, "c.parquet");
@@ -1720,14 +1681,9 @@ mod tests {
         )
         .await
         .unwrap();
-        cat.append_data_files(
-            &t,
-            &src,
-            SnapshotId(1),
-            vec![file("b.parquet", 20, 200)],
-        )
-        .await
-        .unwrap();
+        cat.append_data_files(&t, &src, SnapshotId(1), vec![file("b.parquet", 20, 200)])
+            .await
+            .unwrap();
 
         let forked = cat.fork_table(&t, &src, &dst).await.unwrap();
         assert_eq!(forked.current_snapshot, SnapshotId(2));
@@ -1887,7 +1843,10 @@ mod tests {
         assert_eq!(after.indexes[0].column, "id");
 
         // Duplicate name on the same table is rejected.
-        let err = cat.create_index(&t, &tbl, "ix_id", "name").await.unwrap_err();
+        let err = cat
+            .create_index(&t, &tbl, "ix_id", "name")
+            .await
+            .unwrap_err();
         assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
 
         // Unknown column is rejected with InvalidSchema.
@@ -1895,10 +1854,7 @@ mod tests {
             .create_index(&t, &tbl, "ix_bogus", "ghost_col")
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, BasinError::InvalidSchema(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, BasinError::InvalidSchema(_)), "got {err:?}");
 
         // Fork carries the index forward.
         let dst = TableName::new("idx_forked").unwrap();
@@ -1932,7 +1888,11 @@ mod tests {
         // table boundaries and sort order is non-trivial.
         for round in 0..2 {
             for tbl in &tbls {
-                let parent = if round == 0 { SnapshotId::GENESIS } else { SnapshotId(1) };
+                let parent = if round == 0 {
+                    SnapshotId::GENESIS
+                } else {
+                    SnapshotId(1)
+                };
                 cat.append_data_files(
                     &t,
                     tbl,

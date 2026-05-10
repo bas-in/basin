@@ -65,7 +65,8 @@ impl HttpRequest {
 
     /// Add or override a header. Returns the same request for chaining.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.insert(name.into().to_lowercase(), value.into());
+        self.headers
+            .insert(name.into().to_lowercase(), value.into());
         self
     }
 }

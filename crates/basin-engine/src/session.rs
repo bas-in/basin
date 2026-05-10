@@ -27,12 +27,12 @@ use basin_catalog::{PartitionSpec, SnapshotId};
 use basin_common::{BasinError, Result, TableName, TenantId};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::prelude::SessionContext;
 use object_store::path::Path as ObjectPath;
-use sqlparser::ast::{
-    BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value,
-};
+use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::sync::Mutex;
@@ -90,11 +90,7 @@ pub(crate) async fn open(
     current_user: String,
 ) -> Result<TenantSession> {
     // 1. Idempotent namespace.
-    engine
-        .config()
-        .catalog
-        .create_namespace(&tenant)
-        .await?;
+    engine.config().catalog.create_namespace(&tenant).await?;
 
     // 2. SessionContext + register the storage's object store under our
     //    synthetic scheme. Recursively descend into the date-and-partition
@@ -124,8 +120,11 @@ pub(crate) async fn open(
     // a v0.3 catalog field. The noisy detector still applies — it
     // would catch a hypothetical per-deployment override that bumps
     // partitions back up for a tenant that abuses it.
-    let mut cfg = datafusion::execution::config::SessionConfig::new()
-        .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+    let cfg = datafusion::execution::config::SessionConfig::new()
+        .set_str(
+            "datafusion.execution.listing_table_ignore_subdirectory",
+            "false",
+        )
         .with_target_partitions(1);
     if engine.is_noisy(&tenant) {
         // Already pinned to 1; keep the log so noisy detection is
@@ -224,8 +223,8 @@ pub(crate) async fn refresh_table(
         None
     };
 
-    let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_file_extension(".parquet");
+    let listing_options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
     // Drop any stale registration before re-registering. `deregister_table`
     // returns Ok(None) for the first-time path, which is exactly what we want.
@@ -241,9 +240,8 @@ pub(crate) async fn refresh_table(
         let cfg = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(listing_options)
             .with_schema(df_schema);
-        let provider = ListingTable::try_new(cfg).map_err(|e| {
-            BasinError::internal(format!("ListingTable::try_new {table}: {e}"))
-        })?;
+        let provider = ListingTable::try_new(cfg)
+            .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
         ctx.register_table(table.as_str(), Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
     } else {
@@ -369,14 +367,7 @@ pub(crate) async fn apply_partition_pruning_for_query(
             // matches (no point re-registering). Skip the swap.
             continue;
         }
-        let _ = register_pruned_listing_table(
-            engine,
-            ctx,
-            &table,
-            &meta.schema,
-            &matching,
-        )
-        .await;
+        let _ = register_pruned_listing_table(engine, ctx, &table, &meta.schema, &matching).await;
     }
     Ok(())
 }
@@ -386,15 +377,15 @@ pub(crate) async fn apply_partition_pruning_for_query(
 /// entirely, so no footer GET is issued for files we already proved
 /// irrelevant.
 async fn register_pruned_listing_table(
-    engine: &Engine,
+    _engine: &Engine,
     ctx: &SessionContext,
     table: &TableName,
     schema: &arrow_schema::Schema,
     paths: &[String],
 ) -> Result<()> {
     let df_schema = Arc::new(schema_ws_to_df(schema)?);
-    let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_file_extension(".parquet");
+    let listing_options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
     let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(paths.len());
     for p in paths {
@@ -405,18 +396,16 @@ async fn register_pruned_listing_table(
         // root prefix or it'll appear twice in the resulting URL.
         let mut s = String::from(BASIN_URL_BASE);
         s.push_str(p);
-        let url = ListingTableUrl::parse(&s).map_err(|e| {
-            BasinError::internal(format!("listing url parse {s}: {e}"))
-        })?;
+        let url = ListingTableUrl::parse(&s)
+            .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
         urls.push(url);
     }
 
     let cfg = ListingTableConfig::new_with_multi_paths(urls)
         .with_listing_options(listing_options)
         .with_schema(df_schema);
-    let provider = ListingTable::try_new(cfg).map_err(|e| {
-        BasinError::internal(format!("ListingTable::try_new (pruned): {e}"))
-    })?;
+    let provider = ListingTable::try_new(cfg)
+        .map_err(|e| BasinError::internal(format!("ListingTable::try_new (pruned): {e}")))?;
 
     let _ = ctx.deregister_table(table.as_str());
     ctx.register_table(table.as_str(), Arc::new(provider))
@@ -519,7 +508,11 @@ fn extract_range_predicate(query: &Query, column: &str) -> Option<YearMonthRange
 /// "skip pruning".
 fn walk_predicate(expr: &Expr, column: &str) -> (Option<i64>, Option<i64>) {
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             let (lmin, lmax) = walk_predicate(left, column);
             let (rmin, rmax) = walk_predicate(right, column);
             (
@@ -541,7 +534,11 @@ fn walk_predicate(expr: &Expr, column: &str) -> (Option<i64>, Option<i64>) {
                 return (None, None);
             };
             // Normalise: rewrite `lit OP col` as `col REVERSE_OP lit`.
-            let logical_op = if col_side_left { op.clone() } else { reverse_op(op.clone()) };
+            let logical_op = if col_side_left {
+                op.clone()
+            } else {
+                reverse_op(op.clone())
+            };
             match logical_op {
                 BinaryOperator::Eq => (Some(micros), Some(micros)),
                 BinaryOperator::Gt => (Some(micros + 1), None),
@@ -551,12 +548,16 @@ fn walk_predicate(expr: &Expr, column: &str) -> (Option<i64>, Option<i64>) {
                 _ => (None, None),
             }
         }
-        Expr::Between { expr, low, high, negated: false } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } => {
             if !matches_column(expr, column) {
                 return (None, None);
             }
-            let (Some(lo), Some(hi)) = (literal_to_micros(low), literal_to_micros(high))
-            else {
+            let (Some(lo), Some(hi)) = (literal_to_micros(low), literal_to_micros(high)) else {
                 return (None, None);
             };
             (Some(lo), Some(hi))
@@ -605,9 +606,7 @@ fn literal_to_micros(expr: &Expr) -> Option<i64> {
         Expr::Value(Value::SingleQuotedString(s))
         | Expr::Value(Value::DoubleQuotedString(s))
         | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => {
-            parse_timestamp_string_for_pruning(s)
-        }
+        | Expr::Value(Value::NationalStringLiteral(s)) => parse_timestamp_string_for_pruning(s),
         Expr::Value(Value::Number(n, _)) => n.parse().ok(),
         _ => None,
     }
@@ -632,9 +631,7 @@ fn parse_timestamp_string_for_pruning(s: &str) -> Option<i64> {
     let naive = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"];
     for fmt in naive {
         if let Ok(n) = NaiveDateTime::parse_from_str(trimmed, fmt) {
-            return Some(
-                DateTime::<Utc>::from_naive_utc_and_offset(n, Utc).timestamp_micros(),
-            );
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(n, Utc).timestamp_micros());
         }
     }
     if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {

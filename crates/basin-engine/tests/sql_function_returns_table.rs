@@ -235,7 +235,9 @@ async fn column_name_uniqueness_enforced() {
         .unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
-        msg.contains("appears more than once") || msg.contains("duplicate") || msg.contains("more than once"),
+        msg.contains("appears more than once")
+            || msg.contains("duplicate")
+            || msg.contains("more than once"),
         "expected a duplicate-column error, got: {err}"
     );
 }
@@ -259,7 +261,8 @@ async fn returns_table_in_scalar_position_rejected() {
         .unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
-        msg.contains("table") && (msg.contains("expression") || msg.contains("scalar") || msg.contains("from")),
+        msg.contains("table")
+            && (msg.contains("expression") || msg.contains("scalar") || msg.contains("from")),
         "expected a 'table return cannot be used as scalar' error, got: {err}"
     );
 }

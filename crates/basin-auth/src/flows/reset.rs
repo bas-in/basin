@@ -114,7 +114,9 @@ pub(crate) async fn reset_password(
         return Err(BasinError::InvalidIdent("token has wrong purpose".into()));
     }
     if consumed_at.is_some() {
-        return Err(BasinError::InvalidIdent("reset token already consumed".into()));
+        return Err(BasinError::InvalidIdent(
+            "reset token already consumed".into(),
+        ));
     }
     if expires_at < Utc::now() {
         return Err(BasinError::InvalidIdent("reset token expired".into()));

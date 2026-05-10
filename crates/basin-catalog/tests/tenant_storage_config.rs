@@ -27,7 +27,9 @@ async fn set_then_get_round_trips_in_memory() {
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
     let cfg = sample_config("arn:aws:kms:us-east-1:123:key/abc");
-    cat.set_tenant_storage_config(&t, cfg.clone()).await.unwrap();
+    cat.set_tenant_storage_config(&t, cfg.clone())
+        .await
+        .unwrap();
     let got = cat.get_tenant_storage_config(&t).await.unwrap();
     assert_eq!(got, Some(cfg));
 }
@@ -72,7 +74,9 @@ async fn cross_tenant_isolation_in_memory() {
 async fn drop_namespace_clears_config_in_memory() {
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
-    cat.set_tenant_storage_config(&t, sample_config("k")).await.unwrap();
+    cat.set_tenant_storage_config(&t, sample_config("k"))
+        .await
+        .unwrap();
     cat.create_namespace(&t).await.unwrap();
     cat.drop_namespace(&t).await.unwrap();
     let got = cat.get_tenant_storage_config(&t).await.unwrap();
@@ -156,7 +160,9 @@ async fn set_then_get_round_trips_postgres() {
     let t = TenantId::new();
     cat.create_namespace(&t).await.unwrap();
     let cfg = sample_config("arn:aws:kms:eu-west-1:99:key/xyz");
-    cat.set_tenant_storage_config(&t, cfg.clone()).await.unwrap();
+    cat.set_tenant_storage_config(&t, cfg.clone())
+        .await
+        .unwrap();
     let got = cat.get_tenant_storage_config(&t).await.unwrap();
     assert_eq!(got, Some(cfg));
 }
@@ -219,7 +225,9 @@ async fn survives_simulated_restart_postgres() {
     let t = TenantId::new();
     cat.create_namespace(&t).await.unwrap();
     let cfg = sample_config("arn:aws:kms:us-east-2:1:key/persist");
-    cat.set_tenant_storage_config(&t, cfg.clone()).await.unwrap();
+    cat.set_tenant_storage_config(&t, cfg.clone())
+        .await
+        .unwrap();
     drop(cat);
 
     let cat2 = PostgresCatalog::connect_with_schema(PG_URL, &schema)

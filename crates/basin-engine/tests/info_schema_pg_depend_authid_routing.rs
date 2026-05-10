@@ -106,8 +106,14 @@ async fn select_pg_depend_routes() {
         total_rows(&batches)
     );
     let refobjids = col_i64(&batches, "refobjid");
-    assert!(refobjids.contains(&20), "missing BIGINT (20) in {refobjids:?}");
-    assert!(refobjids.contains(&25), "missing TEXT (25) in {refobjids:?}");
+    assert!(
+        refobjids.contains(&20),
+        "missing BIGINT (20) in {refobjids:?}"
+    );
+    assert!(
+        refobjids.contains(&25),
+        "missing TEXT (25) in {refobjids:?}"
+    );
 }
 
 #[tokio::test]
@@ -152,13 +158,20 @@ async fn pg_authid_join_pg_class_owner_pattern() {
          ORDER BY c.relname",
     )
     .await;
-    assert_eq!(total_rows(&batches), 2, "two relations × one role = two rows");
+    assert_eq!(
+        total_rows(&batches),
+        2,
+        "two relations × one role = two rows"
+    );
     let relnames = col_string(&batches, "relname");
     let rolnames = col_string(&batches, "rolname");
     assert_eq!(relnames, vec!["accounts".to_string(), "orders".to_string()]);
     let expected = tenant.to_string();
     for r in &rolnames {
-        assert_eq!(r, &expected, "every relation maps to the calling tenant role");
+        assert_eq!(
+            r, &expected,
+            "every relation maps to the calling tenant role"
+        );
     }
 }
 

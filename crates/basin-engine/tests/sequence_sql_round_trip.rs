@@ -41,7 +41,7 @@ fn first_i64(res: ExecResult) -> i64 {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("column 0 is BIGINT");
-            assert!(arr.len() >= 1);
+            assert!(!arr.is_empty());
             arr.value(0)
         }
         other => panic!("expected rows, got {other:?}"),
@@ -57,17 +57,27 @@ async fn create_sequence_full_grammar_round_trip() {
     // Multi-option CREATE SEQUENCE: this is the form sqlparser 0.52
     // cannot parse natively (it bails at the second option). The
     // textual pre-screen routes the full statement to the catalog.
-    sess.execute(
-        "CREATE SEQUENCE order_id_seq START 1000 INCREMENT 5 MINVALUE 1000 MAXVALUE 9999",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE SEQUENCE order_id_seq START 1000 INCREMENT 5 MINVALUE 1000 MAXVALUE 9999")
+        .await
+        .unwrap();
 
-    let v1 = first_i64(sess.execute("SELECT nextval('order_id_seq')").await.unwrap());
+    let v1 = first_i64(
+        sess.execute("SELECT nextval('order_id_seq')")
+            .await
+            .unwrap(),
+    );
     assert_eq!(v1, 1000);
-    let v2 = first_i64(sess.execute("SELECT nextval('order_id_seq')").await.unwrap());
+    let v2 = first_i64(
+        sess.execute("SELECT nextval('order_id_seq')")
+            .await
+            .unwrap(),
+    );
     assert_eq!(v2, 1005);
-    let v3 = first_i64(sess.execute("SELECT nextval('order_id_seq')").await.unwrap());
+    let v3 = first_i64(
+        sess.execute("SELECT nextval('order_id_seq')")
+            .await
+            .unwrap(),
+    );
     assert_eq!(v3, 1010);
 }
 

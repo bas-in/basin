@@ -184,7 +184,13 @@ pub(crate) fn extract_basin_cv_options(sql: &str) -> Result<(String, Option<CvOp
     }
 
     let Some((start, end, inside)) = found else {
-        return Ok((sql.to_string(), Some(CvOptions { continuous: false, refresh_interval_secs: None })));
+        return Ok((
+            sql.to_string(),
+            Some(CvOptions {
+                continuous: false,
+                refresh_interval_secs: None,
+            }),
+        ));
     };
 
     let opts = parse_cv_options(&inside)?;
@@ -192,7 +198,9 @@ pub(crate) fn extract_basin_cv_options(sql: &str) -> Result<(String, Option<CvOp
     stripped.push_str(&sql[..start]);
     // Trim a trailing whitespace before the WITH so we don't get double
     // spaces; sqlparser tolerates either, but cleaner output helps debugging.
-    let stripped = stripped.trim_end_matches(|c: char| c.is_whitespace()).to_string();
+    let stripped = stripped
+        .trim_end_matches(|c: char| c.is_whitespace())
+        .to_string();
     let mut stripped = stripped;
     stripped.push(' ');
     stripped.push_str(sql[end..].trim_start());
@@ -337,11 +345,12 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
                 )));
             }
         };
-        total = total.checked_add(num.checked_mul(factor).ok_or_else(|| {
-            BasinError::InvalidSchema("refresh_interval: overflow".into())
-        })?).ok_or_else(|| {
-            BasinError::InvalidSchema("refresh_interval: overflow".into())
-        })?;
+        total =
+            total
+                .checked_add(num.checked_mul(factor).ok_or_else(|| {
+                    BasinError::InvalidSchema("refresh_interval: overflow".into())
+                })?)
+                .ok_or_else(|| BasinError::InvalidSchema("refresh_interval: overflow".into()))?;
         saw_component = true;
     }
     if !saw_component {
@@ -432,9 +441,7 @@ pub(crate) fn match_refresh_materialized_view(sql: &str) -> Result<Option<(Strin
         // Find the matching `)`. We don't expect nested parens here; the
         // option grammar is intentionally tiny.
         let close = after_with.find(')').ok_or_else(|| {
-            BasinError::InvalidSchema(
-                "REFRESH MATERIALIZED VIEW: unterminated WITH (...)".into(),
-            )
+            BasinError::InvalidSchema("REFRESH MATERIALIZED VIEW: unterminated WITH (...)".into())
         })?;
         let inside = after_with[1..close].trim();
         let trail = after_with[close + 1..].trim();
@@ -680,14 +687,15 @@ pub(crate) async fn exec_refresh_materialized_view(
 
     // Load the CV definition. A non-CV table or a missing one are both
     // user-visible errors.
-    let meta = catalog.load_table(&sess.tenant, &table).await.map_err(|e| {
-        match e {
+    let meta = catalog
+        .load_table(&sess.tenant, &table)
+        .await
+        .map_err(|e| match e {
             BasinError::NotFound(_) => {
                 BasinError::not_found(format!("materialized view {name:?} does not exist"))
             }
             other => other,
-        }
-    })?;
+        })?;
     let def = meta.continuous_aggregate.clone().ok_or_else(|| {
         BasinError::InvalidSchema(format!(
             "REFRESH MATERIALIZED VIEW: {name:?} is not a continuous aggregate"
@@ -702,9 +710,7 @@ pub(crate) async fn exec_refresh_materialized_view(
         .and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
 
     match (bucket_info, watermark) {
-        (Some(info), Some(wm)) => {
-            do_refresh_incremental(sess, &table, &meta, def, &info, wm).await
-        }
+        (Some(info), Some(wm)) => do_refresh_incremental(sess, &table, &meta, def, &info, wm).await,
         (info, _) => do_refresh_full(sess, &table, &meta, def, info).await,
     }
 }
@@ -852,11 +858,7 @@ async fn do_refresh_incremental(
         }
     };
 
-    let kept_batches = filter_below_watermark(
-        &existing_batches,
-        &bucket.bucket_alias,
-        watermark,
-    )?;
+    let kept_batches = filter_below_watermark(&existing_batches, &bucket.bucket_alias, watermark)?;
 
     let mut all_batches: Vec<RecordBatch> = Vec::new();
     if new_schema.fields() == existing_schema.fields() {
@@ -1383,11 +1385,8 @@ mod tests {
         assert!(opts.continuous);
         assert_eq!(opts.refresh_interval_secs, Some(300));
         // sqlparser must accept what's left.
-        sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::PostgreSqlDialect {},
-            &stripped,
-        )
-        .unwrap();
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &stripped)
+            .unwrap();
     }
 
     #[test]
@@ -1434,17 +1433,16 @@ mod tests {
             match_refresh_materialized_view("refresh materialized view mv;").unwrap(),
             Some(("mv".to_string(), false))
         );
-        assert_eq!(
-            match_refresh_materialized_view("SELECT 1").unwrap(),
-            None
-        );
+        assert_eq!(match_refresh_materialized_view("SELECT 1").unwrap(), None);
         // WITH (full = true) opts out of incremental.
         assert_eq!(
-            match_refresh_materialized_view("REFRESH MATERIALIZED VIEW mv WITH (full = true)").unwrap(),
+            match_refresh_materialized_view("REFRESH MATERIALIZED VIEW mv WITH (full = true)")
+                .unwrap(),
             Some(("mv".to_string(), true))
         );
         assert_eq!(
-            match_refresh_materialized_view("REFRESH MATERIALIZED VIEW mv WITH (full=false);").unwrap(),
+            match_refresh_materialized_view("REFRESH MATERIALIZED VIEW mv WITH (full=false);")
+                .unwrap(),
             Some(("mv".to_string(), false))
         );
     }
@@ -1465,22 +1463,13 @@ mod tests {
             match_drop_materialized_view("DROP TABLE foo").unwrap(),
             None
         );
-        assert_eq!(
-            match_drop_materialized_view("DROP VIEW foo").unwrap(),
-            None
-        );
+        assert_eq!(match_drop_materialized_view("DROP VIEW foo").unwrap(), None);
     }
 
     #[test]
     fn unquote_string_literal_handles_doubled_quotes() {
-        assert_eq!(
-            unquote_string_literal("'hello'"),
-            Some("hello".to_string())
-        );
-        assert_eq!(
-            unquote_string_literal("'it''s'"),
-            Some("it's".to_string())
-        );
+        assert_eq!(unquote_string_literal("'hello'"), Some("hello".to_string()));
+        assert_eq!(unquote_string_literal("'it''s'"), Some("it's".to_string()));
         assert_eq!(unquote_string_literal("hello"), None);
     }
 

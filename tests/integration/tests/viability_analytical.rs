@@ -60,12 +60,13 @@ fn build_batch(start: i64, len: i64) -> RecordBatch {
     let groups: Int64Array = (start..start + len).map(|i| i % GROUPS).collect();
     // Short, varying payload so Parquet doesn't dictionary-encode it down to
     // nothing — we want a representative columnar layout for the scan.
-    let payloads: Vec<String> = (0..len)
-        .map(|i| format!("p-{:08}", start + i))
-        .collect();
+    let payloads: Vec<String> = (0..len).map(|i| format!("p-{:08}", start + i)).collect();
     let payload_arr: StringArray = payloads.iter().map(|s| Some(s.as_str())).collect();
-    RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(groups), Arc::new(payload_arr)])
-        .unwrap()
+    RecordBatch::try_new(
+        schema(),
+        vec![Arc::new(ids), Arc::new(groups), Arc::new(payload_arr)],
+    )
+    .unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +172,11 @@ async fn viability_analytical() {
     // bar would still be valid but the "10 files" claim in the report
     // wouldn't be, and we'd want to know.
     let files = storage.list_data_files(&tenant, &table).await.unwrap();
-    assert_eq!(files.len(), FILES as usize, "expected {FILES} parquet files");
+    assert_eq!(
+        files.len(),
+        FILES as usize,
+        "expected {FILES} parquet files"
+    );
 
     // Aggregate that forces a real scan in both engines:
     // - GROUP BY group_id => 16 groups, hash-aggregate
@@ -250,7 +255,10 @@ async fn viability_analytical() {
         );
     }
     let total_count: i64 = engine_agg.iter().map(|a| a.count).sum();
-    assert_eq!(total_count, ROWS, "row count drift: {total_count} != {ROWS}");
+    assert_eq!(
+        total_count, ROWS,
+        "row count drift: {total_count} != {ROWS}"
+    );
 
     // ---- Speedup -----------------------------------------------------------
     // Add 1ms floor on the divisor so a freakishly fast warm DuckDB run

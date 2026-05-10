@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use basin_common::{BasinError, Result, TenantId};
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
-};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -124,9 +122,10 @@ impl JwtKeys {
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<(String, DateTime<Utc>)> {
-        let exp_dt = now + chrono::Duration::from_std(ttl).map_err(|e| {
-            BasinError::internal(format!("token_ttl out of range for chrono: {e}"))
-        })?;
+        let exp_dt = now
+            + chrono::Duration::from_std(ttl).map_err(|e| {
+                BasinError::internal(format!("token_ttl out of range for chrono: {e}"))
+            })?;
         let wire = WireClaims {
             tenant_id: tenant.to_string(),
             user_id: user.to_string(),
@@ -176,9 +175,10 @@ impl JwtKeys {
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<(String, String, DateTime<Utc>)> {
-        let exp_dt = now + chrono::Duration::from_std(ttl).map_err(|e| {
-            BasinError::internal(format!("refresh_ttl out of range for chrono: {e}"))
-        })?;
+        let exp_dt = now
+            + chrono::Duration::from_std(ttl).map_err(|e| {
+                BasinError::internal(format!("refresh_ttl out of range for chrono: {e}"))
+            })?;
         let jti = Uuid::new_v4().to_string();
         let wire = RefreshWireClaims {
             tenant_id: tenant.to_string(),
@@ -275,7 +275,13 @@ mod tests {
         let user = Uuid::new_v4();
         let now = Utc::now();
         let (jwt, jti, exp) = keys
-            .issue_refresh(&tenant, user, "alice@example.com", now, Duration::from_secs(60))
+            .issue_refresh(
+                &tenant,
+                user,
+                "alice@example.com",
+                now,
+                Duration::from_secs(60),
+            )
             .unwrap();
         let claims = keys.verify_refresh(&jwt).unwrap();
         assert_eq!(claims.tenant_id, tenant);

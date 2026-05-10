@@ -80,7 +80,10 @@ async fn viability_alter_table() {
         "device_id missing from schema after ADD COLUMN"
     );
     let n_cols_after_add = m.schema.fields().len();
-    assert_eq!(n_cols_after_add, 5, "expected 5 cols, got {n_cols_after_add}");
+    assert_eq!(
+        n_cols_after_add, 5,
+        "expected 5 cols, got {n_cols_after_add}"
+    );
     variants_passed.push("ADD COLUMN");
 
     // 2) SET cold_after — tier policy gains a threshold.
@@ -143,7 +146,11 @@ async fn viability_alter_table() {
         .await
         .expect("DROP POLICY");
     let m = catalog.load_table(&tenant, &table).await.unwrap();
-    assert_eq!(m.policies.len(), 0, "policy list should be empty after DROP");
+    assert_eq!(
+        m.policies.len(),
+        0,
+        "policy list should be empty after DROP"
+    );
     variants_passed.push("DROP POLICY");
 
     // 8) DISABLE ROW LEVEL SECURITY — flip the bit off.
@@ -160,7 +167,10 @@ async fn viability_alter_table() {
     let res = sess
         .execute("ALTER TABLE events ADD COLUMN required_col TEXT NOT NULL")
         .await;
-    assert!(res.is_err(), "ADD COLUMN ... NOT NULL should be rejected in v0.1");
+    assert!(
+        res.is_err(),
+        "ADD COLUMN ... NOT NULL should be rejected in v0.1"
+    );
 
     let pass = variants_passed.len() == 8;
     println!(
@@ -188,5 +198,8 @@ async fn viability_alter_table() {
         }),
     );
 
-    assert!(pass, "expected all 8 ALTER variants to pass; got {variants_passed:?}");
+    assert!(
+        pass,
+        "expected all 8 ALTER variants to pass; got {variants_passed:?}"
+    );
 }

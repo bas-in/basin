@@ -315,8 +315,8 @@ impl RaftSnapshotBuilder<C> for Arc<BasinRaftStorage> {
     async fn build_snapshot(&mut self) -> std::result::Result<Snapshot<C>, StorageError<NodeId>> {
         let (data, last_applied_log, last_membership) = {
             let sm = self.sm.read().await;
-            let bytes = serde_json::to_vec(&*sm)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let bytes =
+                serde_json::to_vec(&*sm).map_err(|e| StorageIOError::read_state_machine(&e))?;
             (bytes, sm.last_applied_log, sm.last_membership.clone())
         };
 
@@ -375,16 +375,24 @@ impl RaftStorage<C> for Arc<BasinRaftStorage> {
         self.clone()
     }
 
-    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> std::result::Result<(), StorageError<NodeId>> {
+    async fn save_vote(
+        &mut self,
+        vote: &Vote<NodeId>,
+    ) -> std::result::Result<(), StorageError<NodeId>> {
         *self.vote.write().await = Some(*vote);
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> std::result::Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
+    async fn read_vote(
+        &mut self,
+    ) -> std::result::Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
         Ok(*self.vote.read().await)
     }
 
-    async fn append_to_log<I>(&mut self, entries: I) -> std::result::Result<(), StorageError<NodeId>>
+    async fn append_to_log<I>(
+        &mut self,
+        entries: I,
+    ) -> std::result::Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<C>> + Send,
     {
@@ -583,7 +591,9 @@ struct SimNetwork {
 }
 
 impl SimNetwork {
-    async fn unreachable<E: std::error::Error + 'static>(&self) -> Option<RPCError<NodeId, BasicNode, E>> {
+    async fn unreachable<E: std::error::Error + 'static>(
+        &self,
+    ) -> Option<RPCError<NodeId, BasicNode, E>> {
         if self.cluster.is_down(self.source).await || self.cluster.is_down(self.target).await {
             Some(RPCError::Unreachable(openraft::error::Unreachable::new(
                 &SimDown(self.target),
@@ -606,9 +616,11 @@ impl RaftNetwork<C> for SimNetwork {
         if let Some(e) = self.unreachable().await {
             return Err(e);
         }
-        let h = self.cluster.handle(self.target).await.ok_or_else(|| {
-            RPCError::Network(NetworkError::new(&SimMissing(self.target)))
-        })?;
+        let h = self
+            .cluster
+            .handle(self.target)
+            .await
+            .ok_or_else(|| RPCError::Network(NetworkError::new(&SimMissing(self.target))))?;
         h.append_entries(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -625,9 +637,11 @@ impl RaftNetwork<C> for SimNetwork {
         if let Some(e) = self.unreachable().await {
             return Err(e);
         }
-        let h = self.cluster.handle(self.target).await.ok_or_else(|| {
-            RPCError::Network(NetworkError::new(&SimMissing(self.target)))
-        })?;
+        let h = self
+            .cluster
+            .handle(self.target)
+            .await
+            .ok_or_else(|| RPCError::Network(NetworkError::new(&SimMissing(self.target))))?;
         h.install_snapshot(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -644,9 +658,11 @@ impl RaftNetwork<C> for SimNetwork {
         if let Some(e) = self.unreachable().await {
             return Err(e);
         }
-        let h = self.cluster.handle(self.target).await.ok_or_else(|| {
-            RPCError::Network(NetworkError::new(&SimMissing(self.target)))
-        })?;
+        let h = self
+            .cluster
+            .handle(self.target)
+            .await
+            .ok_or_else(|| RPCError::Network(NetworkError::new(&SimMissing(self.target))))?;
         h.vote(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -711,10 +727,7 @@ impl RaftWal {
     /// immediately; multi-node clusters wait for the caller to bootstrap
     /// one node and add the rest).
     pub async fn new(config: RaftWalConfig) -> Result<Self> {
-        let cluster = config
-            .cluster
-            .clone()
-            .unwrap_or_else(SimCluster::new);
+        let cluster = config.cluster.clone().unwrap_or_else(SimCluster::new);
 
         let raft_config = Arc::new(
             Config {
@@ -788,7 +801,10 @@ impl RaftWal {
 
     /// Promote learners to voters by changing the cluster membership. Call
     /// from the leader.
-    pub async fn change_membership(&self, members: std::collections::BTreeSet<NodeId>) -> Result<()> {
+    pub async fn change_membership(
+        &self,
+        members: std::collections::BTreeSet<NodeId>,
+    ) -> Result<()> {
         self.raft
             .change_membership(members, false)
             .await

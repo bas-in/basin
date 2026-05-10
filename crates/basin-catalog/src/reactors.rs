@@ -200,9 +200,7 @@ mod tests {
 
     #[test]
     fn validate_predicate_accepts_compound_expr() {
-        assert!(
-            validate_predicate("NEW.status = 'paid' AND OLD.status != 'paid'").is_ok()
-        );
+        assert!(validate_predicate("NEW.status = 'paid' AND OLD.status != 'paid'").is_ok());
     }
 
     #[test]

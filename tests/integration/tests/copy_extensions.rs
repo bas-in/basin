@@ -42,8 +42,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -290,10 +289,7 @@ async fn copy_to_file_path_writes_csv() {
         .expect("CREATE TABLE");
     for i in 0..5i64 {
         client
-            .execute(
-                "INSERT INTO t VALUES ($1, $2)",
-                &[&i, &format!("name-{i}")],
-            )
+            .execute("INSERT INTO t VALUES ($1, $2)", &[&i, &format!("name-{i}")])
             .await
             .expect("insert");
     }
@@ -336,8 +332,7 @@ async fn copy_to_file_path_relative_rejected() {
     let err = client
         .simple_query("COPY t TO 'relative.csv' WITH (FORMAT CSV)")
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let dbe = err.as_db_error().expect("DbError");
     assert_eq!(dbe.code().code(), "42601");
     assert!(
@@ -366,8 +361,7 @@ async fn copy_to_file_path_outside_allowlist_rejected() {
     let err = client
         .simple_query("COPY t TO '/tmp/should-be-denied.csv' WITH (FORMAT CSV)")
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let dbe = err.as_db_error().expect("DbError");
     assert_eq!(dbe.code().code(), "42601");
     assert!(
@@ -386,8 +380,7 @@ async fn copy_to_file_path_outside_allowlist_rejected() {
     let err = client
         .simple_query("COPY t TO '/tmp/also-denied.csv' WITH (FORMAT CSV)")
         .await
-        .err()
-        .expect("expected error 2");
+        .expect_err("expected error 2");
     let dbe = err.as_db_error().expect("DbError");
     assert_eq!(dbe.code().code(), "42601");
     assert!(
@@ -416,10 +409,7 @@ async fn copy_from_file_path_round_trips() {
         .expect("CREATE TABLE");
     for i in 0..4i64 {
         client
-            .execute(
-                "INSERT INTO t VALUES ($1, $2)",
-                &[&i, &format!("name-{i}")],
-            )
+            .execute("INSERT INTO t VALUES ($1, $2)", &[&i, &format!("name-{i}")])
             .await
             .expect("insert");
     }
@@ -427,10 +417,7 @@ async fn copy_from_file_path_round_trips() {
     let path = scratch.path().join("rt.csv");
     let path_str = path.to_str().unwrap().to_owned();
     client
-        .simple_query(&format!(
-            "COPY t TO '{}' WITH (FORMAT CSV)",
-            path_str
-        ))
+        .simple_query(&format!("COPY t TO '{}' WITH (FORMAT CSV)", path_str))
         .await
         .expect("COPY TO");
 
@@ -440,10 +427,7 @@ async fn copy_from_file_path_round_trips() {
         .await
         .expect("CREATE TABLE u");
     client
-        .simple_query(&format!(
-            "COPY u FROM '{}' WITH (FORMAT CSV)",
-            path_str
-        ))
+        .simple_query(&format!("COPY u FROM '{}' WITH (FORMAT CSV)", path_str))
         .await
         .expect("COPY FROM");
 

@@ -28,9 +28,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use basin_common::TenantId;
-use governor::{
-    clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter,
-};
+use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 
 /// Sustained statements/sec when the limiter is enabled. Matches the
 /// 10:30 ratio basin-net uses for outbound HTTP, scaled 10× because
@@ -128,7 +126,8 @@ mod tests {
         // At 10 qps sustained × 3 burst = 30 free tokens before throttle.
         // Hit it 20 times immediately — must all succeed.
         for i in 0..20 {
-            rl.check(&t).unwrap_or_else(|_| panic!("rejected at iter {i}"));
+            rl.check(&t)
+                .unwrap_or_else(|_| panic!("rejected at iter {i}"));
         }
     }
 

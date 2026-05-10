@@ -36,9 +36,9 @@ struct EventRow {
 fn collect_all_rows(result: ExecResult) -> Vec<EventRow> {
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
-        ExecResult::Empty { tag } => panic!(
-            "expected ExecResult::Rows for SELECT, got Empty with tag={tag:?}"
-        ),
+        ExecResult::Empty { tag } => {
+            panic!("expected ExecResult::Rows for SELECT, got Empty with tag={tag:?}")
+        }
     };
 
     let mut out = Vec::new();
@@ -201,8 +201,7 @@ async fn s3_viability_alter_add_column() {
     }
 
     let rows_visible = rows.len();
-    let pass =
-        rows_visible == 10 && pre_alter_tags_all_null && post_alter_tags_match;
+    let pass = rows_visible == 10 && pre_alter_tags_all_null && post_alter_tags_match;
 
     println!(
         "[S3 viability_alter_add_column] rows_visible={rows_visible}, pre_alter_tags_all_null={pre_alter_tags_all_null}, post_alter_tags_match={post_alter_tags_match}"

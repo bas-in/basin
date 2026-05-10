@@ -70,25 +70,19 @@ pub(crate) async fn exec_create_function(
     let fn_name = single_part_object_name(&name)?;
 
     let return_dt = return_type.ok_or_else(|| {
-        BasinError::InvalidSchema(
-            "CREATE FUNCTION: RETURNS clause is required".into(),
-        )
+        BasinError::InvalidSchema("CREATE FUNCTION: RETURNS clause is required".into())
     })?;
     let parsed_return = parse_return_type(&return_dt, &fn_name)?;
 
     let mut def_args: Vec<SqlFunctionArg> = Vec::new();
     if let Some(arg_list) = args {
         for (idx, a) in arg_list.iter().enumerate() {
-            let aname = a
-                .name
-                .as_ref()
-                .map(|i| i.value.clone())
-                .ok_or_else(|| {
-                    BasinError::InvalidSchema(format!(
-                        "CREATE FUNCTION {fn_name}: argument #{idx} is unnamed; \
+            let aname = a.name.as_ref().map(|i| i.value.clone()).ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "CREATE FUNCTION {fn_name}: argument #{idx} is unnamed; \
                          all arguments must be named in v0.1"
-                    ))
-                })?;
+                ))
+            })?;
             let dt = sql_data_type_to_arg(&a.data_type).map_err(|e| {
                 BasinError::InvalidSchema(format!(
                     "CREATE FUNCTION {fn_name}: arg {aname:?} type unsupported ({e})"
@@ -182,9 +176,7 @@ pub(crate) async fn exec_alter_function_rename(
     let existing = catalog
         .lookup_sql_function(&sess.tenant, old_name)
         .await
-        .ok_or_else(|| {
-            BasinError::not_found(format!("function {old_name:?} does not exist"))
-        })?;
+        .ok_or_else(|| BasinError::not_found(format!("function {old_name:?} does not exist")))?;
     if catalog
         .lookup_sql_function(&sess.tenant, new_name)
         .await
@@ -355,9 +347,7 @@ fn parse_type_text(s: &str) -> Result<SqlDataType> {
 /// targets the narrower scalar set the function catalog supports.
 fn sql_data_type_to_arg(dt: &SqlDataType) -> Result<SqlArgType> {
     match dt {
-        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
-            Ok(SqlArgType::Int)
-        }
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(SqlArgType::Int),
         SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(SqlArgType::BigInt),
         SqlDataType::Text
         | SqlDataType::Varchar(_)
@@ -522,8 +512,8 @@ mod tests {
 
     #[test]
     fn match_alter_rename_basic() {
-        let r = match_alter_function_rename("ALTER FUNCTION add_one(BIGINT) RENAME TO add_1")
-            .unwrap();
+        let r =
+            match_alter_function_rename("ALTER FUNCTION add_one(BIGINT) RENAME TO add_1").unwrap();
         assert_eq!(r, Some(("add_one".into(), "add_1".into())));
     }
 

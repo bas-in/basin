@@ -278,7 +278,10 @@ async fn insert_negative_and_high_precision_numeric() {
         .unwrap();
     assert_eq!(arr.value(0), -42_000_001);
     assert_eq!(arr.value_as_string(0), "-42.000001");
-    assert_eq!(arr.value_as_string(1), "12345678901234567890123456789012.345678");
+    assert_eq!(
+        arr.value_as_string(1),
+        "12345678901234567890123456789012.345678"
+    );
 }
 
 #[tokio::test]

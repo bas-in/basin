@@ -60,7 +60,7 @@ async fn viability_uuid() {
     });
 
     let tenant = TenantId::new();
-    let sess = engine.open_session(tenant.clone()).await.unwrap();
+    let sess = engine.open_session(tenant).await.unwrap();
 
     // ---- 1. CREATE TABLE with a UUID column ---------------------------------
     sess.execute("CREATE TABLE users (id UUID, email TEXT)")
@@ -92,18 +92,14 @@ async fn viability_uuid() {
     ))
     .await
     .expect("INSERT alice");
-    sess.execute(
-        "INSERT INTO users VALUES (gen_random_uuid(), 'bob@example.com')",
-    )
-    .await
-    .expect("INSERT bob via gen_random_uuid()");
+    sess.execute("INSERT INTO users VALUES (gen_random_uuid(), 'bob@example.com')")
+        .await
+        .expect("INSERT bob via gen_random_uuid()");
 
     // Also exercise the uuid-ossp alias to make sure both names resolve.
-    sess.execute(
-        "INSERT INTO users VALUES (uuid_generate_v4(), 'carol@example.com')",
-    )
-    .await
-    .expect("INSERT carol via uuid_generate_v4()");
+    sess.execute("INSERT INTO users VALUES (uuid_generate_v4(), 'carol@example.com')")
+        .await
+        .expect("INSERT carol via uuid_generate_v4()");
 
     // ---- 3. SELECT and inspect bytes ---------------------------------------
     let result = sess
@@ -112,9 +108,9 @@ async fn viability_uuid() {
         .expect("SELECT");
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
-        ExecResult::Empty { tag } => panic!(
-            "expected ExecResult::Rows for SELECT, got Empty tag={tag:?}"
-        ),
+        ExecResult::Empty { tag } => {
+            panic!("expected ExecResult::Rows for SELECT, got Empty tag={tag:?}")
+        }
     };
 
     let mut uuids: Vec<(String, [u8; 16])> = Vec::new();
@@ -170,7 +166,11 @@ async fn viability_uuid() {
     let bob_uuid = uuid::Uuid::from_bytes(bob);
     let carol_uuid = uuid::Uuid::from_bytes(carol);
     assert_ne!(bob_uuid, uuid::Uuid::nil(), "bob's UUID is the nil UUID");
-    assert_ne!(carol_uuid, uuid::Uuid::nil(), "carol's UUID is the nil UUID");
+    assert_ne!(
+        carol_uuid,
+        uuid::Uuid::nil(),
+        "carol's UUID is the nil UUID"
+    );
     assert_eq!(
         bob_uuid.get_version_num(),
         4,
@@ -195,7 +195,9 @@ async fn viability_uuid() {
     // `Immutable`) in one shot — DataFusion's optimiser will fold an
     // `Immutable` UDF call to one row's worth of bytes broadcast across the
     // batch, and that's exactly what we *don't* want for `gen_random_uuid()`.
-    sess.execute("CREATE TABLE many (id UUID, n BIGINT)").await.unwrap();
+    sess.execute("CREATE TABLE many (id UUID, n BIGINT)")
+        .await
+        .unwrap();
     let mut sql = String::from("INSERT INTO many VALUES ");
     for i in 0..1000 {
         if i > 0 {
@@ -258,8 +260,7 @@ async fn viability_uuid() {
         .expect("h col not StringArray");
     assert_eq!(h_arr.len(), 1, "expected 1 row for digest result");
     let h = h_arr.value(0);
-    let expected_sha256 =
-        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    let expected_sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
     assert_eq!(
         h, expected_sha256,
         "sha256(hello) hex mismatch:\n  got: {h}\n  expected: {expected_sha256}"
@@ -300,10 +301,7 @@ async fn viability_uuid() {
         .await;
     assert!(bad.is_err(), "malformed UUID literal should be rejected");
 
-    let pass = uuid_roundtrip
-        && random_uuid_unique
-        && sha256_hex_correct
-        && bcrypt_format_correct;
+    let pass = uuid_roundtrip && random_uuid_unique && sha256_hex_correct && bcrypt_format_correct;
 
     println!(
         "[VIABILITY UUID] roundtrip={uuid_roundtrip} unique_1k={random_uuid_unique} \

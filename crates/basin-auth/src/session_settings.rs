@@ -47,8 +47,7 @@ fn validate_value(key: &str, value: &str) -> Result<()> {
             let ok = matches!(bytes.len(), 2 | 5)
                 && bytes[..2].iter().all(|c| c.is_ascii_lowercase())
                 && (bytes.len() == 2
-                    || (bytes[2] == b'-'
-                        && bytes[3..].iter().all(|c| c.is_ascii_uppercase())));
+                    || (bytes[2] == b'-' && bytes[3..].iter().all(|c| c.is_ascii_uppercase())));
             if !ok {
                 return Err(BasinError::InvalidIdent(format!(
                     "language must match `xx` or `xx-XX`: {value:?}"

@@ -72,7 +72,10 @@ async fn host_check_lowercases() {
     let allow = AllowList::new();
     let tenant = TenantId::new();
     allow.allow(&tenant, "EXAMPLE.com").await;
-    allow.check(&tenant, "http://example.COM/path").await.unwrap();
+    allow
+        .check(&tenant, "http://example.COM/path")
+        .await
+        .unwrap();
     allow
         .check(&tenant, "http://EXAMPLE.com/path")
         .await

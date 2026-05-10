@@ -86,15 +86,18 @@ async fn subscribe_webhook_round_trip() {
     assert_eq!(intent.label.as_deref(), Some("my_hook"));
     assert_eq!(intent.ops, WebhookOps::INSERT | WebhookOps::UPDATE);
 
-    let id = exec_subscribe_webhook(intent, &tenant, &registry).await.unwrap();
+    let id = exec_subscribe_webhook(intent, &tenant, &registry)
+        .await
+        .unwrap();
     assert!(registry.get(id).await.is_some());
 
-    let unsub = match_alter_table_unsubscribe_webhook(
-        "ALTER TABLE orders UNSUBSCRIBE WEBHOOK my_hook",
-    )
-    .unwrap()
-    .unwrap();
-    exec_unsubscribe_webhook(unsub, &tenant, &registry).await.unwrap();
+    let unsub =
+        match_alter_table_unsubscribe_webhook("ALTER TABLE orders UNSUBSCRIBE WEBHOOK my_hook")
+            .unwrap()
+            .unwrap();
+    exec_unsubscribe_webhook(unsub, &tenant, &registry)
+        .await
+        .unwrap();
     assert!(registry.get(id).await.is_none());
 }
 
@@ -104,17 +107,15 @@ async fn subscribe_webhook_validation_errors() {
     let tenant = TenantId::new();
 
     // Empty URL (caught in match_*).
-    let err = match_alter_table_subscribe_webhook(
-        "ALTER TABLE t SUBSCRIBE WEBHOOK TO '' ON INSERT",
-    )
-    .unwrap_err();
+    let err =
+        match_alter_table_subscribe_webhook("ALTER TABLE t SUBSCRIBE WEBHOOK TO '' ON INSERT")
+            .unwrap_err();
     assert!(matches!(err, basin_common::BasinError::InvalidSchema(_)));
 
     // Empty OPS (caught in match_*).
-    let err = match_alter_table_subscribe_webhook(
-        "ALTER TABLE t SUBSCRIBE WEBHOOK TO 'http://h' ON",
-    )
-    .unwrap_err();
+    let err =
+        match_alter_table_subscribe_webhook("ALTER TABLE t SUBSCRIBE WEBHOOK TO 'http://h' ON")
+            .unwrap_err();
     assert!(matches!(err, basin_common::BasinError::InvalidSchema(_)));
 
     // Malformed predicate (caught in match_*).
@@ -130,7 +131,9 @@ async fn subscribe_webhook_validation_errors() {
     )
     .unwrap()
     .unwrap();
-    let err = exec_subscribe_webhook(intent, &tenant, &registry).await.unwrap_err();
+    let err = exec_subscribe_webhook(intent, &tenant, &registry)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, basin_common::BasinError::InvalidSchema(_)),
         "got {err:?}"
@@ -155,7 +158,9 @@ async fn subscribe_webhook_filter_predicate_works() {
     .unwrap()
     .unwrap();
     assert_eq!(intent.predicate.as_deref(), Some("NEW.status = 'paid'"));
-    exec_subscribe_webhook(intent, &tenant, &registry).await.unwrap();
+    exec_subscribe_webhook(intent, &tenant, &registry)
+        .await
+        .unwrap();
 
     // Build a sink against a TempDir-rooted queue so we can read the
     // queue depth as ground truth.
@@ -182,7 +187,11 @@ async fn subscribe_webhook_filter_predicate_works() {
         causation_user: None,
     };
     sink.publish(&ev_skip).await.unwrap();
-    assert_eq!(queue.depth().await, 0, "non-matching event must not enqueue");
+    assert_eq!(
+        queue.depth().await,
+        0,
+        "non-matching event must not enqueue"
+    );
 
     // Matching event — predicate is true, sink enqueues.
     let ev_fire = ChangeEvent {
@@ -224,7 +233,9 @@ async fn react_on_insert_round_trip() {
     .unwrap();
     exec_react_on(intent, &tenant, &cat).await.unwrap();
 
-    sess.execute("INSERT INTO orders VALUES (42)").await.unwrap();
+    sess.execute("INSERT INTO orders VALUES (42)")
+        .await
+        .unwrap();
     let res = sess.execute("SELECT id FROM log").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(col_i64(&batches, "id"), vec![42]);
@@ -255,7 +266,10 @@ async fn react_when_predicate() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(intent.when_predicate.as_deref(), Some("NEW.status = 'paid'"));
+    assert_eq!(
+        intent.when_predicate.as_deref(),
+        Some("NEW.status = 'paid'")
+    );
     exec_react_on(intent, &tenant, &cat).await.unwrap();
 
     // UPDATE with non-matching status — predicate false, no fire.
@@ -316,7 +330,10 @@ async fn drop_reactor_works() {
     exec_drop_reactor(drop_intent, &tenant, &cat).await.unwrap();
 
     sess.execute("INSERT INTO src VALUES (2)").await.unwrap();
-    let res = sess.execute("SELECT id FROM log ORDER BY id").await.unwrap();
+    let res = sess
+        .execute("SELECT id FROM log ORDER BY id")
+        .await
+        .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         // Only the pre-DROP insert landed.
         assert_eq!(col_i64(&batches, "id"), vec![1]);
@@ -363,7 +380,10 @@ async fn constraint_predicate_blocks_violating_insert() {
     );
 
     // Source mutation rolled back — still 2 rows.
-    let res = sess.execute("SELECT id FROM orders ORDER BY id").await.unwrap();
+    let res = sess
+        .execute("SELECT id FROM orders ORDER BY id")
+        .await
+        .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(col_i64(&batches, "id"), vec![1, 2]);
     } else {
@@ -395,11 +415,17 @@ async fn constraint_with_subquery_against_sibling_table() {
     .unwrap();
     exec_react_constraint(intent, &tenant, &cat).await.unwrap();
 
-    sess.execute("INSERT INTO siblings VALUES (1)").await.unwrap();
+    sess.execute("INSERT INTO siblings VALUES (1)")
+        .await
+        .unwrap();
     // Allowed: siblings has 1 row, predicate `1 <= 1` true.
-    sess.execute("INSERT INTO orders VALUES (10)").await.unwrap();
+    sess.execute("INSERT INTO orders VALUES (10)")
+        .await
+        .unwrap();
     // Now add another row to siblings and try again — 2 > 1, blocked.
-    sess.execute("INSERT INTO siblings VALUES (2)").await.unwrap();
+    sess.execute("INSERT INTO siblings VALUES (2)")
+        .await
+        .unwrap();
     let err = sess
         .execute("INSERT INTO orders VALUES (20)")
         .await
@@ -435,7 +461,10 @@ async fn constraint_passes_under_cap() {
             .await
             .expect("should pass under cap");
     }
-    let res = sess.execute("SELECT id FROM orders ORDER BY id").await.unwrap();
+    let res = sess
+        .execute("SELECT id FROM orders ORDER BY id")
+        .await
+        .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(col_i64(&batches, "id"), vec![0, 1, 2, 3, 4]);
     } else {

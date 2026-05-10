@@ -29,9 +29,7 @@ const ROWS: usize = 1_000_000;
 const ACTORS: [&str; 8] = [
     "alice", "bob", "carol", "dan", "erin", "frank", "grace", "heidi",
 ];
-const EVENTS: [&str; 4] = [
-    "login", "logout", "create_record", "update_record",
-];
+const EVENTS: [&str; 4] = ["login", "logout", "create_record", "update_record"];
 
 fn body_for(i: usize) -> String {
     // ~120 bytes, varying digits keep entropy non-zero so we don't accidentally

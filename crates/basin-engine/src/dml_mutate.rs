@@ -51,8 +51,8 @@ use basin_storage::{
 };
 use futures::StreamExt;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, ObjectName,
-    TableFactor, TableWithJoins, UnaryOperator, Value,
+    Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, ObjectName, TableFactor,
+    TableWithJoins, UnaryOperator, Value,
 };
 
 use crate::events::{
@@ -62,10 +62,7 @@ use crate::lifecycle::AuditRecord;
 use crate::session::refresh_table;
 use crate::{ExecResult, TenantSession};
 
-pub(crate) async fn exec_delete(
-    sess: &TenantSession,
-    delete: Delete,
-) -> Result<ExecResult> {
+pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<ExecResult> {
     let table = single_table_from_delete(&delete)?;
     let predicate_expr = delete.selection.as_ref();
 
@@ -110,7 +107,9 @@ pub(crate) async fn exec_delete(
 
     let storage = sess.engine.config().storage.clone();
 
-    let data_files = storage.list_data_files_with_stats(&sess.tenant, &table).await?;
+    let data_files = storage
+        .list_data_files_with_stats(&sess.tenant, &table)
+        .await?;
     if data_files.is_empty() {
         return Ok(ExecResult::Empty {
             tag: "DELETE 0".into(),
@@ -152,13 +151,8 @@ pub(crate) async fn exec_delete(
             }
             (PruneOutcome::Mixed, Some(p)) => {
                 let (kept, deleted_rows) = if capture_events {
-                    evaluate_and_partition_delete_capturing(
-                        &storage,
-                        &sess.tenant,
-                        &f.path,
-                        p,
-                    )
-                    .await?
+                    evaluate_and_partition_delete_capturing(&storage, &sess.tenant, &f.path, p)
+                        .await?
                 } else {
                     let kept =
                         evaluate_and_partition_delete(&storage, &sess.tenant, &f.path, p).await?;
@@ -198,8 +192,7 @@ pub(crate) async fn exec_delete(
     // captures rows for a follow-on DELETE.
     let mut cascades: Vec<crate::constraints::CascadeDelete> = Vec::new();
     if !meta.pk_columns.is_empty() {
-        let mut deleted_pks: std::collections::HashSet<Vec<String>> =
-            Default::default();
+        let mut deleted_pks: std::collections::HashSet<Vec<String>> = Default::default();
         for p in &dropped_paths {
             let mut stream = sess
                 .engine
@@ -213,15 +206,13 @@ pub(crate) async fn exec_delete(
                     .pk_columns
                     .iter()
                     .map(|c| {
-                        rb.schema().index_of(c).map_err(|_| {
-                            BasinError::internal(format!("PK column {c:?} missing"))
-                        })
+                        rb.schema()
+                            .index_of(c)
+                            .map_err(|_| BasinError::internal(format!("PK column {c:?} missing")))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 for row in 0..rb.num_rows() {
-                    if let Some(k) =
-                        crate::constraints::pk_tuple_for_row(&rb, &idx, row)?
-                    {
+                    if let Some(k) = crate::constraints::pk_tuple_for_row(&rb, &idx, row)? {
                         deleted_pks.insert(k);
                     }
                 }
@@ -241,23 +232,19 @@ pub(crate) async fn exec_delete(
                     .pk_columns
                     .iter()
                     .map(|c| {
-                        rb.schema().index_of(c).map_err(|_| {
-                            BasinError::internal(format!("PK column {c:?} missing"))
-                        })
+                        rb.schema()
+                            .index_of(c)
+                            .map_err(|_| BasinError::internal(format!("PK column {c:?} missing")))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 for row in 0..rb.num_rows() {
-                    if let Some(k) =
-                        crate::constraints::pk_tuple_for_row(&rb, &idx, row)?
-                    {
+                    if let Some(k) = crate::constraints::pk_tuple_for_row(&rb, &idx, row)? {
                         original.insert(k);
                     }
                 }
             }
-            let kept = crate::constraints::pk_tuples_from_batches(
-                &replacement_batches,
-                &meta.pk_columns,
-            )?;
+            let kept =
+                crate::constraints::pk_tuples_from_batches(&replacement_batches, &meta.pk_columns)?;
             for k in original {
                 if !kept.contains(&k) {
                     deleted_pks.insert(k);
@@ -276,7 +263,7 @@ pub(crate) async fn exec_delete(
     }
 
     let audit_rows: Vec<RowChange> = if audit_table.is_some() {
-        event_payloads.iter().map(|r| r.clone()).collect()
+        event_payloads.iter().cloned().collect()
     } else {
         Vec::new()
     };
@@ -351,7 +338,9 @@ pub(crate) async fn exec_update(
         ));
     }
     let table_name = match &table_with_joins.relation {
-        TableFactor::Table { name, alias, args, .. } => {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
             if alias.is_some() || args.is_some() {
                 return Err(BasinError::InvalidSchema(
                     "UPDATE with table alias or function args not supported".into(),
@@ -386,7 +375,9 @@ pub(crate) async fn exec_update(
     // user didn't explicitly set gets a fresh `now()` micros value.
     inject_auto_update_assignments(schema.as_ref(), &mut assignments);
 
-    let data_files = storage.list_data_files_with_stats(&sess.tenant, &table).await?;
+    let data_files = storage
+        .list_data_files_with_stats(&sess.tenant, &table)
+        .await?;
     if data_files.is_empty() {
         return Ok(ExecResult::Empty {
             tag: "UPDATE 0".into(),
@@ -426,8 +417,7 @@ pub(crate) async fn exec_update(
             // matched. We still need the file's contents to apply SET.
             (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
                 let (mut new_batches, before_batches) = if capture_events {
-                    let befores =
-                        read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                    let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
                     let news = apply_assignments_all(&befores, &assignments)?;
                     (news, befores)
                 } else {
@@ -470,8 +460,7 @@ pub(crate) async fn exec_update(
             (PruneOutcome::Mixed, Some(p)) => {
                 let (rows_matched, mut new_batches, before_batches, mask_per_batch) =
                     if capture_events {
-                        let befores =
-                            read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                        let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
                         let mut masks = Vec::with_capacity(befores.len());
                         let mut news = Vec::with_capacity(befores.len());
                         let mut matched = 0usize;
@@ -553,14 +542,11 @@ pub(crate) async fn exec_update(
             .await?;
         }
     }
-    let assignments_touch_pk = meta
-        .pk_columns
-        .iter()
-        .any(|p| {
-            assignments
-                .iter()
-                .any(|(idx, _)| meta.schema.field(*idx).name() == p)
-        });
+    let assignments_touch_pk = meta.pk_columns.iter().any(|p| {
+        assignments
+            .iter()
+            .any(|(idx, _)| meta.schema.field(*idx).name() == p)
+    });
     let assignments_touch_fk = meta.foreign_keys.iter().any(|fk| {
         fk.columns.iter().any(|fc| {
             assignments
@@ -597,7 +583,7 @@ pub(crate) async fn exec_update(
     // Materialise audit rows from the same captured before/after pairs
     // before they're consumed by the event-builder.
     let audit_rows: Vec<RowChange> = if audit_table.is_some() {
-        event_payloads.iter().map(|r| r.clone()).collect()
+        event_payloads.iter().cloned().collect()
     } else {
         Vec::new()
     };
@@ -605,8 +591,7 @@ pub(crate) async fn exec_update(
     // Pre-commit before writing the replacement file so a rejecting
     // sink leaves no orphan parquet on disk.
     dispatch_pre_commit(&sess.engine, &events).await?;
-    let added_files =
-        write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
+    let added_files = write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
     commit_replace(
         sess,
         &table,
@@ -773,8 +758,7 @@ fn capture_update_events(
     for (i, (b, a)) in befores.iter().zip(afters.iter()).enumerate() {
         let mask = masks.map(|m| &m[i]);
         for row in 0..b.num_rows() {
-            let matched =
-                mask.map_or(true, |m| !m.is_null(row) && m.value(row));
+            let matched = mask.is_none_or(|m| !m.is_null(row) && m.value(row));
             if !matched {
                 continue;
             }
@@ -840,9 +824,8 @@ async fn read_and_apply_assignments(
     while let Some(batch) = stream.next().await {
         let batch = batch?;
         let mask = match pred {
-            Some(p) => evaluate_compound(&batch, p).map_err(|e| {
-                BasinError::internal(format!("update predicate eval: {e}"))
-            })?,
+            Some(p) => evaluate_compound(&batch, p)
+                .map_err(|e| BasinError::internal(format!("update predicate eval: {e}")))?,
             None => BooleanArray::from(vec![true; batch.num_rows()]),
         };
         out.push(apply_assignments(&batch, &mask, assignments)?);
@@ -972,9 +955,8 @@ async fn write_replacement(
         batches.into_iter().next().unwrap()
     } else {
         let refs: Vec<&RecordBatch> = batches.iter().collect();
-        arrow_select::concat::concat_batches(&schema, refs).map_err(|e| {
-            BasinError::internal(format!("concat batches for rewrite: {e}"))
-        })?
+        arrow_select::concat::concat_batches(&schema, refs)
+            .map_err(|e| BasinError::internal(format!("concat batches for rewrite: {e}")))?
     };
     if merged.num_rows() == 0 {
         return Ok(Vec::new());
@@ -1048,13 +1030,7 @@ async fn commit_replace(
             sess.engine
                 .config()
                 .catalog
-                .replace_data_files(
-                    &sess.tenant,
-                    table,
-                    fresh.current_snapshot,
-                    removed,
-                    added,
-                )
+                .replace_data_files(&sess.tenant, table, fresh.current_snapshot, removed, added)
                 .await?;
             Ok(())
         }
@@ -1087,9 +1063,7 @@ async fn delete_objects(
         .fields()
         .iter()
         .filter_map(|f| match f.data_type() {
-            DataType::FixedSizeList(child, _)
-                if *child.data_type() == DataType::Float32 =>
-            {
+            DataType::FixedSizeList(child, _) if *child.data_type() == DataType::Float32 => {
                 Some(f.name().clone())
             }
             _ => None,
@@ -1326,9 +1300,9 @@ fn literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<ScalarValu
             Ok(ScalarValue::Int64(if negated { -parsed } else { parsed }))
         }
         (DataType::Float64, Expr::Value(Value::Number(s, _))) => {
-            let parsed: f64 = s.parse().map_err(|e| {
-                BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}"))
-            })?;
+            let parsed: f64 = s
+                .parse()
+                .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")))?;
             Ok(ScalarValue::Float64(if negated { -parsed } else { parsed }))
         }
         (DataType::Utf8, Expr::Value(Value::SingleQuotedString(s)))
@@ -1417,9 +1391,12 @@ fn parse_compound_predicate(expr: &Expr, schema: &Schema) -> Result<CompoundPred
                 "WHERE operator {other:?} not supported"
             ))),
         },
-        Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => Ok(CompoundPredicate::Not(
-            Box::new(parse_compound_predicate(inner, schema)?),
-        )),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => Ok(CompoundPredicate::Not(Box::new(parse_compound_predicate(
+            inner, schema,
+        )?))),
         Expr::IsNull(col) => {
             let name = identifier_or_err(col)?;
             schema
@@ -1434,7 +1411,11 @@ fn parse_compound_predicate(expr: &Expr, schema: &Schema) -> Result<CompoundPred
                 .map_err(|_| BasinError::InvalidSchema(format!("unknown column {name}")))?;
             Ok(CompoundPredicate::IsNotNull(name))
         }
-        Expr::InList { expr: col_expr, list, negated } => {
+        Expr::InList {
+            expr: col_expr,
+            list,
+            negated,
+        } => {
             let name = identifier_or_err(col_expr)?;
             let idx = schema
                 .index_of(&name)
@@ -1594,9 +1575,7 @@ fn single_table_from_delete(d: &Delete) -> Result<TableName> {
         FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
     };
     if tables.len() != 1 {
-        return Err(BasinError::InvalidSchema(
-            "single-table DELETE only".into(),
-        ));
+        return Err(BasinError::InvalidSchema("single-table DELETE only".into()));
     }
     let twj = &tables[0];
     if !twj.joins.is_empty() {
@@ -1605,7 +1584,9 @@ fn single_table_from_delete(d: &Delete) -> Result<TableName> {
         ));
     }
     let name = match &twj.relation {
-        TableFactor::Table { name, alias, args, .. } => {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
             if alias.is_some() || args.is_some() {
                 return Err(BasinError::InvalidSchema(
                     "DELETE target must be a bare table name".into(),
@@ -1635,10 +1616,7 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
 /// AUTO_UPDATE column on `schema` the user didn't already explicitly set.
 /// `now_micros` is captured once per UPDATE so every AUTO_UPDATE column
 /// stamped in the same statement gets the same timestamp.
-fn inject_auto_update_assignments(
-    schema: &Schema,
-    assignments: &mut Vec<(usize, ScalarValue)>,
-) {
+fn inject_auto_update_assignments(schema: &Schema, assignments: &mut Vec<(usize, ScalarValue)>) {
     let now_micros = chrono::Utc::now().timestamp_micros();
     for (idx, field) in schema.fields().iter().enumerate() {
         if !crate::types::field_is_auto_update(field) {
@@ -1704,10 +1682,7 @@ async fn exec_soft_delete(
         None => CompoundPredicate::IsNull(sd_col.clone()),
         Some(e) => {
             let user_pred = parse_compound_predicate(e, schema.as_ref())?;
-            CompoundPredicate::And(vec![
-                user_pred,
-                CompoundPredicate::IsNull(sd_col.clone()),
-            ])
+            CompoundPredicate::And(vec![user_pred, CompoundPredicate::IsNull(sd_col.clone())])
         }
     };
     // Strip the trivial single-leg AND so pruning sees the same shape.
@@ -1717,7 +1692,9 @@ async fn exec_soft_delete(
         }
     }
 
-    let data_files = storage.list_data_files_with_stats(&sess.tenant, &table).await?;
+    let data_files = storage
+        .list_data_files_with_stats(&sess.tenant, &table)
+        .await?;
     if data_files.is_empty() {
         return Ok(ExecResult::Empty {
             tag: "DELETE 0".into(),
@@ -1795,8 +1772,7 @@ async fn exec_soft_delete(
 
     let events = build_events(sess, &table, ChangeOp::Delete, event_payloads);
     dispatch_pre_commit(&sess.engine, &events).await?;
-    let added_files =
-        write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
+    let added_files = write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
     commit_replace(
         sess,
         &table,

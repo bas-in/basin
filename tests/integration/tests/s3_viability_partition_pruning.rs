@@ -27,8 +27,8 @@ use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
 
@@ -141,10 +141,7 @@ impl ObjectStore for CountingStore {
         self.inner.delete(location).await
     }
 
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         self.list_count.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix)
     }
@@ -173,10 +170,9 @@ impl ObjectStore for CountingStore {
 async fn total_select_rows(sess: &TenantSession, sql: &str) -> usize {
     let res = sess.execute(sql).await.unwrap();
     match res {
-        ExecResult::Rows { batches, .. } => batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
+        ExecResult::Rows { batches, .. } => {
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+        }
         ExecResult::Empty { .. } => 0,
     }
 }
@@ -264,11 +260,7 @@ async fn s3_viability_partition_pruning() {
     let baseline_full = counting.snapshot();
     let total_full = total_select_rows(&sess, "SELECT id FROM events").await;
     let full_delta = counting.snapshot().delta(baseline_full);
-    assert_eq!(
-        total_full,
-        12 * ROWS_PER_MONTH,
-        "full-scan rows mismatch"
-    );
+    assert_eq!(total_full, 12 * ROWS_PER_MONTH, "full-scan rows mismatch");
 
     let baseline_range = counting.snapshot();
     let total_range = total_select_rows(
@@ -324,14 +316,11 @@ async fn s3_viability_partition_pruning() {
     assert!(
         pass_ratio,
         "partition pruning failed: full-scan {} bytes, range-scan {} bytes (ratio {:.3})",
-        full_delta.bytes,
-        range_delta.bytes,
-        ratio
+        full_delta.bytes, range_delta.bytes, ratio
     );
     assert!(
         pass_files,
         "expected fewer than 12 file-level reads (one per partition); got gets={} range_gets={}",
-        range_delta.gets,
-        range_delta.range_gets
+        range_delta.gets, range_delta.range_gets
     );
 }

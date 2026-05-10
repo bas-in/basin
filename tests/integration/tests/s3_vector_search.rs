@@ -160,9 +160,8 @@ async fn s3_vector_search() {
     let query = det_vec(424_242, DIM);
     let query_lit = vector_lit(&query);
 
-    let brute_sql = format!(
-        "SELECT id FROM docs ORDER BY l2_distance(embedding, '{query_lit}') LIMIT {TOP_K}"
-    );
+    let brute_sql =
+        format!("SELECT id FROM docs ORDER BY l2_distance(embedding, '{query_lit}') LIMIT {TOP_K}");
     let t0 = Instant::now();
     let res = session.execute(&brute_sql).await.unwrap();
     let brute_ms = t0.elapsed().as_secs_f64() * 1_000.0;

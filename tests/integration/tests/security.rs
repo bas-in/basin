@@ -110,7 +110,11 @@ async fn start_server() -> TestServer {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
 
     let alice = TenantId::new();
     let bob = TenantId::new();
@@ -137,9 +141,15 @@ async fn start_server() -> TestServer {
 }
 
 async fn connect(addr: SocketAddr, user: &str) -> tokio_postgres::Client {
-    let conn_str = format!("host={} port={} user={user} password=ignored", addr.ip(), addr.port());
+    let conn_str = format!(
+        "host={} port={} user={user} password=ignored",
+        addr.ip(),
+        addr.port()
+    );
     let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     client
 }
 
@@ -153,7 +163,11 @@ fn engine_with_two_tenants() -> (Engine, TenantId, TenantId, TempDir) {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
     let a = TenantId::new();
     let b = TenantId::new();
     (engine, a, b, dir)
@@ -166,11 +180,20 @@ async fn pgwire_sql_injection_via_simple_query() {
     let server = start_server().await;
     let alice = connect(server.addr, "alice").await;
     let bob = connect(server.addr, "bob").await;
-    alice.simple_query("CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL)")
-        .await.unwrap();
-    alice.simple_query("INSERT INTO foo VALUES (1, 'alpha')").await.unwrap();
-    bob.simple_query("CREATE TABLE only_b (id BIGINT NOT NULL)").await.unwrap();
-    bob.simple_query("INSERT INTO only_b VALUES (42)").await.unwrap();
+    alice
+        .simple_query("CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    alice
+        .simple_query("INSERT INTO foo VALUES (1, 'alpha')")
+        .await
+        .unwrap();
+    bob.simple_query("CREATE TABLE only_b (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    bob.simple_query("INSERT INTO only_b VALUES (42)")
+        .await
+        .unwrap();
 
     for p in PAYLOADS {
         // Drive the payload through a query string that splices it raw.
@@ -183,19 +206,30 @@ async fn pgwire_sql_injection_via_simple_query() {
     }
 
     // Tenant A's table is intact + still reachable.
-    let res = alice.simple_query("SELECT id FROM foo ORDER BY id").await
+    let res = alice
+        .simple_query("SELECT id FROM foo ORDER BY id")
+        .await
         .expect("foo must still exist after injection attempts");
-    let rows: Vec<_> = res.iter().filter_map(|m| match m {
-        SimpleQueryMessage::Row(r) => Some(r.get(0).map(|s| s.to_owned())),
-        _ => None,
-    }).collect();
+    let rows: Vec<_> = res
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r.get(0).map(|s| s.to_owned())),
+            _ => None,
+        })
+        .collect();
     assert_eq!(rows.len(), 1, "tenant A lost rows: {rows:?}");
 
     // Tenant B's row is intact + alice still cannot reach `only_b`.
     let leak = alice.simple_query("SELECT * FROM only_b").await;
-    assert!(leak.is_err(), "alice reached tenant B's table — SECURITY breach");
+    assert!(
+        leak.is_err(),
+        "alice reached tenant B's table — SECURITY breach"
+    );
     let res = bob.simple_query("SELECT id FROM only_b").await.unwrap();
-    let rows = res.iter().filter(|m| matches!(m, SimpleQueryMessage::Row(_))).count();
+    let rows = res
+        .iter()
+        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+        .count();
     assert_eq!(rows, 1, "tenant B lost its row");
 }
 
@@ -205,22 +239,34 @@ async fn pgwire_sql_injection_via_simple_query() {
 async fn pgwire_sql_injection_via_extended_bind() {
     let server = start_server().await;
     let alice = connect(server.addr, "alice").await;
-    alice.execute("CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL)", &[])
-        .await.unwrap();
+    alice
+        .execute(
+            "CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
 
     // Each payload binds as $1 — the driver MUST escape it. We then read it
     // back; the stored bytes must match the input verbatim.
     for (i, p) in PAYLOADS.iter().enumerate() {
         let id = i as i64 + 1;
-        alice.execute("INSERT INTO foo VALUES ($1, $2)", &[&id, p]).await
+        alice
+            .execute("INSERT INTO foo VALUES ($1, $2)", &[&id, p])
+            .await
             .unwrap_or_else(|e| panic!("SECURITY: parameter bind altered the plan: {e}"));
-        let row = alice.query_one("SELECT name FROM foo WHERE id = $1", &[&id]).await
+        let row = alice
+            .query_one("SELECT name FROM foo WHERE id = $1", &[&id])
+            .await
             .unwrap_or_else(|e| panic!("SECURITY: lookup of payload {p:?} failed: {e}"));
         let got: &str = row.get(0);
         assert_eq!(got, *p, "SECURITY: payload mutated through bind");
     }
     // Sanity: every payload landed as a row, table cardinality is exact.
-    let n = alice.query_one("SELECT count(*) FROM foo", &[]).await.unwrap();
+    let n = alice
+        .query_one("SELECT count(*) FROM foo", &[])
+        .await
+        .unwrap();
     let n: i64 = n.get(0);
     assert_eq!(n as usize, PAYLOADS.len());
 }
@@ -245,8 +291,8 @@ async fn path_injection_table_name() {
         "a\rb",
         "a\tb",
         // Mixed Unicode normalization: NFC vs NFD on accented chars
-        "café", // contains non-ASCII
-        "users\u{2024}etc", // ONE DOT LEADER mimicking '.'
+        "café",              // contains non-ASCII
+        "users\u{2024}etc",  // ONE DOT LEADER mimicking '.'
         "table\u{200E}name", // LRM mark
     ];
     for bad in evil {
@@ -270,8 +316,8 @@ async fn path_injection_tenant_id() {
         "01ARZ3NDEKTSV4RRFFQ69G5FA",   // 25 chars
         "",
         " ",
-        "01ARZ3NDEKTSV4RRFFQ69G5FAV\0", // trailing NUL
-        "01ARZ3NDEKTSV4RRFFQ69G5FAV;",  // SQL fragment
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV\0",      // trailing NUL
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV;",       // SQL fragment
         "01ARZ3NDEKTSV4RRFFQ\u{200E}9G5FAV", // LRM mark mid-id
     ];
     for bad in evil {
@@ -309,14 +355,28 @@ async fn partition_key_rejects_path_traversal() {
 async fn rls_select_excluded_rows() {
     let (engine, t, _, _dir) = engine_with_two_tenants();
     let admin = engine.open_session(t).await.unwrap();
-    admin.execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)").await.unwrap();
-    admin.execute("INSERT INTO orders VALUES (1, 'alice'), (2, 'bob'), (3, 'alice')").await.unwrap();
-    admin.execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY").await.unwrap();
-    admin.execute("CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)")
-        .await.unwrap();
+    admin
+        .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)")
+        .await
+        .unwrap();
+    admin
+        .execute("INSERT INTO orders VALUES (1, 'alice'), (2, 'bob'), (3, 'alice')")
+        .await
+        .unwrap();
+    admin
+        .execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    admin
+        .execute("CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)")
+        .await
+        .unwrap();
 
     let alice = engine.open_session_as(t, "alice").await.unwrap();
-    let res = alice.execute("SELECT id FROM orders ORDER BY id").await.unwrap();
+    let res = alice
+        .execute("SELECT id FROM orders ORDER BY id")
+        .await
+        .unwrap();
     let ids = collect_int64(res, "id");
     assert_eq!(ids, vec![1, 3], "RLS leaked bob's row to alice");
 }
@@ -338,11 +398,22 @@ async fn rls_select_excluded_rows() {
 async fn rls_union_subquery_cannot_bypass() {
     let (engine, t, _, _dir) = engine_with_two_tenants();
     let admin = engine.open_session(t).await.unwrap();
-    admin.execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)").await.unwrap();
-    admin.execute("INSERT INTO orders VALUES (1, 'alice'), (2, 'bob')").await.unwrap();
-    admin.execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY").await.unwrap();
-    admin.execute("CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)")
-        .await.unwrap();
+    admin
+        .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)")
+        .await
+        .unwrap();
+    admin
+        .execute("INSERT INTO orders VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .unwrap();
+    admin
+        .execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    admin
+        .execute("CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)")
+        .await
+        .unwrap();
 
     let alice = engine.open_session_as(t, "alice").await.unwrap();
     // The same table on both sides of the UNION; both legs must apply the
@@ -377,11 +448,22 @@ async fn rls_union_subquery_cannot_bypass() {
 async fn rls_cte_cannot_bypass() {
     let (engine, t, _, _dir) = engine_with_two_tenants();
     let admin = engine.open_session(t).await.unwrap();
-    admin.execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)").await.unwrap();
-    admin.execute("INSERT INTO orders VALUES (1, 'alice'), (2, 'bob')").await.unwrap();
-    admin.execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY").await.unwrap();
-    admin.execute("CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)")
-        .await.unwrap();
+    admin
+        .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)")
+        .await
+        .unwrap();
+    admin
+        .execute("INSERT INTO orders VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .unwrap();
+    admin
+        .execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    admin
+        .execute("CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)")
+        .await
+        .unwrap();
     let alice = engine.open_session_as(t, "alice").await.unwrap();
     let sql = "WITH peek AS (SELECT id, owner_id FROM orders) SELECT id FROM peek ORDER BY id";
     match alice.execute(sql).await {
@@ -407,9 +489,11 @@ async fn cross_tenant_fork_structurally_impossible() {
     cat.create_namespace(&alice).await.unwrap();
     cat.create_namespace(&bob).await.unwrap();
     let src = TableName::new("payments").unwrap();
-    let schema = arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-    ]);
+    let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "id",
+        arrow_schema::DataType::Int64,
+        false,
+    )]);
     cat.create_table(&alice, &src, &schema).await.unwrap();
 
     // The Catalog::fork_table signature takes a *single* TenantId; the API
@@ -436,7 +520,9 @@ async fn pgwire_rate_limit_throttles_burst() {
     let t = TenantId::new();
     let mut throttled_count = 0u32;
     for _ in 0..100 {
-        if rl.check(&t).is_err() { throttled_count += 1; }
+        if rl.check(&t).is_err() {
+            throttled_count += 1;
+        }
     }
     assert!(
         throttled_count >= 1,
@@ -464,12 +550,20 @@ async fn tenant_id_round_trip_is_strict() {
 // --- helpers ----------------------------------------------------------------
 
 fn collect_int64(res: ExecResult, col: &str) -> Vec<i64> {
-    let ExecResult::Rows { batches, .. } = res else { return Vec::new(); };
+    let ExecResult::Rows { batches, .. } = res else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for b in &batches {
-        let arr = b.column_by_name(col).unwrap()
-            .as_any().downcast_ref::<arrow_array::Int64Array>().expect("int64");
-        for i in 0..arr.len() { out.push(arr.value(i)); }
+        let arr = b
+            .column_by_name(col)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64");
+        for i in 0..arr.len() {
+            out.push(arr.value(i));
+        }
     }
     out
 }

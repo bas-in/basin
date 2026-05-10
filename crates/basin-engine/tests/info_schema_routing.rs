@@ -220,10 +220,7 @@ async fn tenant_filter_enforced_at_select_time() {
         "table_name",
     );
     assert_eq!(names_a, vec!["only_a".to_string()]);
-    assert_eq!(
-        names_b,
-        vec!["only_b1".to_string(), "only_b2".to_string()]
-    );
+    assert_eq!(names_b, vec!["only_b1".to_string(), "only_b2".to_string()]);
 }
 
 #[tokio::test]

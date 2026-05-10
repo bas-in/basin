@@ -262,10 +262,7 @@ impl WebhookWorker {
                 "X-Basin-Idempotency-Key",
                 entry.idempotency_key.as_str().to_string(),
             )
-            .with_header(
-                "X-Basin-Webhook-Subscription",
-                sub.id.to_string(),
-            );
+            .with_header("X-Basin-Webhook-Subscription", sub.id.to_string());
 
         let attempt_count_after = entry.attempt_count + 1;
         let started = Instant::now();
@@ -338,8 +335,7 @@ impl WebhookWorker {
             self.inner.cfg.backoff_max,
         );
         let next_attempt_at = self.inner.clock.now()
-            + chrono::Duration::from_std(backoff)
-                .unwrap_or_else(|_| chrono::Duration::seconds(1));
+            + chrono::Duration::from_std(backoff).unwrap_or_else(|_| chrono::Duration::seconds(1));
         let requeued = self.inner.queue.requeue(entry, next_attempt_at).await;
         if let Err(e) = &requeued {
             tracing::warn!(error = %e, "requeue failed");

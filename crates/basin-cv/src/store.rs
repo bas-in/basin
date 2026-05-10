@@ -99,14 +99,19 @@ impl CvStore {
         spec: CvSpec,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), RegisterError> {
-        let name = TableName::new(spec.name.clone()).map_err(|e| {
-            RegisterError::InvalidName(spec.name.clone(), format!("{e}"))
-        })?;
+        let name = TableName::new(spec.name.clone())
+            .map_err(|e| RegisterError::InvalidName(spec.name.clone(), format!("{e}")))?;
 
         // Reject if a table with the same name already exists. The catalog's
         // `create_table` itself returns a Catalog error on conflict, but we
         // want a typed `Duplicate` error at this layer.
-        let existing = self.inner.engine.config().catalog.list_tables(tenant).await?;
+        let existing = self
+            .inner
+            .engine
+            .config()
+            .catalog
+            .list_tables(tenant)
+            .await?;
         if existing.iter().any(|t| t.as_str() == name.as_str()) {
             return Err(RegisterError::Duplicate(spec.name.clone()));
         }
@@ -138,9 +143,7 @@ impl CvStore {
         let merged = concat_batches(&schema, &batches)?;
         let storage = self.inner.engine.config().storage.clone();
         let part = PartitionKey::default_key();
-        let written = storage
-            .write_batch(tenant, &name, &part, &merged)
-            .await?;
+        let written = storage.write_batch(tenant, &name, &part, &merged).await?;
 
         // 4. Append the file to the catalog.
         let after = catalog
@@ -202,7 +205,10 @@ impl CvStore {
             Err(BasinError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(meta.continuous_aggregate.clone().map(|d| spec_from_meta(&meta, d)))
+        Ok(meta
+            .continuous_aggregate
+            .clone()
+            .map(|d| spec_from_meta(&meta, d)))
     }
 
     /// Update the bookkeeping fields after a successful refresh. The
@@ -218,9 +224,10 @@ impl CvStore {
         let table = TableName::new(name.to_string())
             .map_err(|e| BasinError::internal(format!("update_refresh_state: bad name: {e}")))?;
         let meta = catalog.load_table(tenant, &table).await?;
-        let mut def = meta.continuous_aggregate.clone().ok_or_else(|| {
-            BasinError::not_found(format!("CV {name} on {tenant}"))
-        })?;
+        let mut def = meta
+            .continuous_aggregate
+            .clone()
+            .ok_or_else(|| BasinError::not_found(format!("CV {name} on {tenant}")))?;
         def.last_refreshed_at_unix_ms = Some(state.last_refreshed_at.timestamp_millis());
         def.last_bucket_max_unix_ms = state.last_bucket_max.map(|t| t.timestamp_millis());
         catalog
@@ -239,10 +246,10 @@ fn spec_from_meta(meta: &TableMetadata, def: CvDef) -> CvSpec {
         refresh_interval_secs: def.refresh_interval_secs,
         last_refreshed_at: def
             .last_refreshed_at_unix_ms
-            .and_then(|ms| DateTime::<Utc>::from_timestamp_millis(ms)),
+            .and_then(DateTime::<Utc>::from_timestamp_millis),
         last_bucket_max: def
             .last_bucket_max_unix_ms
-            .and_then(|ms| DateTime::<Utc>::from_timestamp_millis(ms)),
+            .and_then(DateTime::<Utc>::from_timestamp_millis),
     }
 }
 

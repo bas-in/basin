@@ -16,9 +16,7 @@ use std::time::Instant;
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{TableName, TenantId};
 use basin_engine::{Engine, EngineConfig};
-use basin_integration_tests::benchmark::{
-    report_real_postgres_compare, CompareMetric, WhichWins,
-};
+use basin_integration_tests::benchmark::{report_real_postgres_compare, CompareMetric, WhichWins};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use object_store::path::Path as ObjectPath;
 use tempfile::TempDir;
@@ -72,9 +70,7 @@ impl Drop for SchemaGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });
@@ -135,9 +131,11 @@ async fn s3_compare_backup_cost() {
     let tenant = TenantId::new();
     let table = TableName::new("events").unwrap();
     let sess = engine.open_session(tenant).await.unwrap();
-    sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
 
     for batch in 0..FILES {
         let mut stmt = String::with_capacity(ROWS_PER_FILE * 80);

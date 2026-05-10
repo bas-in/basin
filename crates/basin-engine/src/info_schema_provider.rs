@@ -121,8 +121,8 @@ impl TableProvider for InfoSchemaTablesProvider {
         let ws_batch = InfoSchemaQuery::tables(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         // MemoryExec wants `&[Vec<RecordBatch>]` — one inner Vec per
         // partition. We always emit a single partition (the catalog scan
         // is cheap enough that splitting wouldn't help).
@@ -187,8 +187,8 @@ impl TableProvider for InfoSchemaColumnsProvider {
         let ws_batch = InfoSchemaQuery::columns(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -250,8 +250,8 @@ impl TableProvider for PgAttributeProvider {
         let ws_batch = InfoSchemaQuery::pg_attribute(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -312,8 +312,8 @@ impl TableProvider for PgNamespaceProvider {
         let ws_batch = InfoSchemaQuery::pg_namespace(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -373,8 +373,8 @@ impl TableProvider for PgClassProvider {
         let ws_batch = InfoSchemaQuery::pg_class(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -437,8 +437,8 @@ impl TableProvider for PgProcProvider {
         let ws_batch = InfoSchemaQuery::pg_proc(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -500,8 +500,8 @@ impl TableProvider for RoutinesProvider {
         let ws_batch = InfoSchemaQuery::routines(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -564,8 +564,8 @@ impl TableProvider for PgIndexProvider {
         let ws_batch = InfoSchemaQuery::pg_index(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -626,8 +626,8 @@ impl TableProvider for PgConstraintProvider {
         let ws_batch = InfoSchemaQuery::pg_constraint(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -689,8 +689,8 @@ impl TableProvider for InfoSchemaViewsProvider {
         let ws_batch = InfoSchemaQuery::views(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -750,8 +750,8 @@ impl TableProvider for InfoSchemaSchemataProvider {
         let ws_batch = InfoSchemaQuery::schemata(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -811,12 +811,11 @@ impl TableProvider for TableConstraintsProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch =
-            InfoSchemaQuery::table_constraints(self.catalog.as_ref(), &self.tenant)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
+        let ws_batch = InfoSchemaQuery::table_constraints(self.catalog.as_ref(), &self.tenant)
+            .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -877,8 +876,8 @@ impl TableProvider for KeyColumnUsageProvider {
         let ws_batch = InfoSchemaQuery::key_column_usage(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -940,8 +939,8 @@ impl TableProvider for ReferentialConstraintsProvider {
             InfoSchemaQuery::referential_constraints(self.catalog.as_ref(), &self.tenant)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -1003,8 +1002,8 @@ impl TableProvider for PgTypeProvider {
         let ws_batch = InfoSchemaQuery::pg_type(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -1065,8 +1064,8 @@ impl TableProvider for PgDependProvider {
         let ws_batch = InfoSchemaQuery::pg_depend(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -1128,8 +1127,8 @@ impl TableProvider for PgAuthidProvider {
         let ws_batch = InfoSchemaQuery::pg_authid(self.catalog.as_ref(), &self.tenant)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let df_batch = batch_ws_to_df(&ws_batch)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(exec))
@@ -1164,12 +1163,7 @@ pub(crate) fn register_info_schema_providers(
     // defaults to true; we look it up rather than rebuild it so the
     // already-registered `public` schema (which `register_listing_table`
     // populates) is preserved.
-    let catalog_name = ctx
-        .state()
-        .config_options()
-        .catalog
-        .default_catalog
-        .clone();
+    let catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
     let df_catalog = ctx.catalog(&catalog_name).ok_or_else(|| {
         DataFusionError::Internal(format!(
             "default catalog {catalog_name:?} not registered on session"
@@ -1230,18 +1224,13 @@ pub(crate) fn register_info_schema_providers(
     // additions above merge cleanly.
     let table_constraints_provider: Arc<dyn TableProvider> =
         Arc::new(TableConstraintsProvider::new(catalog.clone(), tenant)?);
-    info_schema.register_table(
-        "table_constraints".to_string(),
-        table_constraints_provider,
-    )?;
+    info_schema.register_table("table_constraints".to_string(), table_constraints_provider)?;
     let key_column_usage_provider: Arc<dyn TableProvider> =
         Arc::new(KeyColumnUsageProvider::new(catalog.clone(), tenant)?);
-    info_schema.register_table(
-        "key_column_usage".to_string(),
-        key_column_usage_provider,
-    )?;
-    let referential_constraints_provider: Arc<dyn TableProvider> =
-        Arc::new(ReferentialConstraintsProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("key_column_usage".to_string(), key_column_usage_provider)?;
+    let referential_constraints_provider: Arc<dyn TableProvider> = Arc::new(
+        ReferentialConstraintsProvider::new(catalog.clone(), tenant)?,
+    );
     info_schema.register_table(
         "referential_constraints".to_string(),
         referential_constraints_provider,

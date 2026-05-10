@@ -15,9 +15,7 @@ pub(crate) fn validate_schema_ident(s: &str) -> Result<()> {
         return Err(BasinError::catalog("auth schema name is empty"));
     }
     if s.len() > 63 {
-        return Err(BasinError::catalog(
-            "auth schema name longer than 63 chars",
-        ));
+        return Err(BasinError::catalog("auth schema name longer than 63 chars"));
     }
     let mut chars = s.chars();
     let first = chars.next().unwrap();

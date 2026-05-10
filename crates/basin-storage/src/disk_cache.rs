@@ -414,7 +414,9 @@ impl DiskCachedStore {
 
         // We are the leader. Fetch from the inner store, write through
         // to disk, update the index, then notify waiters.
-        let result = self.miss_fetch_and_store(location, range, &key, &fs_path).await;
+        let result = self
+            .miss_fetch_and_store(location, range, &key, &fs_path)
+            .await;
 
         {
             let mut g = self.state.inflight.lock().await;
@@ -497,11 +499,7 @@ impl DiskCachedStore {
     }
 }
 
-async fn try_read_cached(
-    state: &DiskCacheState,
-    key: &KeyHash,
-    fs_path: &FsPath,
-) -> Option<Bytes> {
+async fn try_read_cached(state: &DiskCacheState, key: &KeyHash, fs_path: &FsPath) -> Option<Bytes> {
     // Bump the LRU. If the index says we have it, read from disk.
     let exists_in_index = {
         let mut g = state.index.lock().expect("disk-cache index mutex poisoned");
@@ -549,7 +547,7 @@ async fn write_through(fs_path: &FsPath, bytes: &Bytes) -> std::io::Result<()> {
         Ok(())
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+    .map_err(std::io::Error::other)?
 }
 
 fn repopulate_from_disk(root: &FsPath, index: &mut CacheIndex) -> std::io::Result<()> {
@@ -571,7 +569,11 @@ fn repopulate_from_disk(root: &FsPath, index: &mut CacheIndex) -> std::io::Resul
                     Some(s) => s,
                     None => continue,
                 };
-                let two1 = match p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+                let two1 = match p
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
@@ -725,7 +727,8 @@ impl ObjectStore for DiskCachedStore {
         location: &ObjectPath,
         range: std::ops::Range<usize>,
     ) -> object_store::Result<Bytes> {
-        self.get_cached(location, Some(GetRange::Bounded(range))).await
+        self.get_cached(location, Some(GetRange::Bounded(range)))
+            .await
     }
 
     async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
@@ -742,10 +745,7 @@ impl ObjectStore for DiskCachedStore {
         res
     }
 
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 

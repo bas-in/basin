@@ -43,8 +43,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::webhook_registry::{
-    SubscriptionError, WebhookOps, WebhookRegistry, WebhookSubscription,
-    WebhookSubscriptionId,
+    SubscriptionError, WebhookOps, WebhookRegistry, WebhookSubscription, WebhookSubscriptionId,
 };
 
 /// Parsed `ALTER TABLE ... SUBSCRIBE WEBHOOK ...` statement.
@@ -254,15 +253,12 @@ pub async fn exec_unsubscribe_webhook(
 ) -> Result<()> {
     let table = TableName::new(&intent.table)?;
     let subs = registry.list(tenant).await;
-    let candidate = subs
-        .into_iter()
-        .find(|s| s.table == table)
-        .ok_or_else(|| {
-            BasinError::not_found(format!(
-                "subscription {:?} on {:?} does not exist",
-                intent.label, intent.table
-            ))
-        })?;
+    let candidate = subs.into_iter().find(|s| s.table == table).ok_or_else(|| {
+        BasinError::not_found(format!(
+            "subscription {:?} on {:?} does not exist",
+            intent.label, intent.table
+        ))
+    })?;
     let _ = registry.remove(candidate.id).await;
     Ok(())
 }
@@ -278,9 +274,9 @@ fn map_subscription_err(e: SubscriptionError) -> BasinError {
         SubscriptionError::InvalidUrl(u) => {
             BasinError::InvalidSchema(format!("invalid webhook URL: {u}"))
         }
-        SubscriptionError::NoOps => BasinError::InvalidSchema(
-            "ALTER TABLE SUBSCRIBE WEBHOOK: ON list is empty".into(),
-        ),
+        SubscriptionError::NoOps => {
+            BasinError::InvalidSchema("ALTER TABLE SUBSCRIBE WEBHOOK: ON list is empty".into())
+        }
         SubscriptionError::InvalidMaxRetries => BasinError::InvalidSchema(
             "ALTER TABLE SUBSCRIBE WEBHOOK: max_retries must be >= 1".into(),
         ),
@@ -289,13 +285,11 @@ fn map_subscription_err(e: SubscriptionError) -> BasinError {
 
 fn validate_predicate(pred: &str) -> Result<()> {
     let dialect = PostgreSqlDialect {};
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(pred)
-        .map_err(|e| {
-            BasinError::InvalidSchema(format!(
-                "ALTER TABLE SUBSCRIBE WEBHOOK: WHERE predicate parse error: {e}"
-            ))
-        })?;
+    let mut parser = Parser::new(&dialect).try_with_sql(pred).map_err(|e| {
+        BasinError::InvalidSchema(format!(
+            "ALTER TABLE SUBSCRIBE WEBHOOK: WHERE predicate parse error: {e}"
+        ))
+    })?;
     parser.parse_expr().map_err(|e| {
         BasinError::InvalidSchema(format!(
             "ALTER TABLE SUBSCRIBE WEBHOOK: WHERE predicate parse error: {e}"
@@ -574,19 +568,17 @@ mod tests {
 
     #[test]
     fn match_subscribe_rejects_empty_url() {
-        let err = match_alter_table_subscribe_webhook(
-            "ALTER TABLE t SUBSCRIBE WEBHOOK TO '' ON INSERT",
-        )
-        .unwrap_err();
+        let err =
+            match_alter_table_subscribe_webhook("ALTER TABLE t SUBSCRIBE WEBHOOK TO '' ON INSERT")
+                .unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
     }
 
     #[test]
     fn match_subscribe_rejects_empty_ops() {
-        let err = match_alter_table_subscribe_webhook(
-            "ALTER TABLE t SUBSCRIBE WEBHOOK TO 'http://h' ON",
-        )
-        .unwrap_err();
+        let err =
+            match_alter_table_subscribe_webhook("ALTER TABLE t SUBSCRIBE WEBHOOK TO 'http://h' ON")
+                .unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
     }
 
@@ -612,9 +604,9 @@ mod tests {
 
     #[test]
     fn match_subscribe_non_match_returns_none() {
-        assert!(
-            match_alter_table_subscribe_webhook("SELECT 1").unwrap().is_none()
-        );
+        assert!(match_alter_table_subscribe_webhook("SELECT 1")
+            .unwrap()
+            .is_none());
         assert!(
             match_alter_table_subscribe_webhook("ALTER TABLE t ADD COLUMN x INT")
                 .unwrap()
@@ -624,8 +616,8 @@ mod tests {
 
     #[test]
     fn match_unsubscribe_non_match_returns_none() {
-        assert!(
-            match_alter_table_unsubscribe_webhook("SELECT 1").unwrap().is_none()
-        );
+        assert!(match_alter_table_unsubscribe_webhook("SELECT 1")
+            .unwrap()
+            .is_none());
     }
 }

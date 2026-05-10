@@ -131,9 +131,6 @@ async fn unschedule_unknown_returns_not_found() {
     let store = CronStore::new(eng);
     let tenant = TenantId::new();
 
-    let err = store
-        .unschedule(&tenant, "ghost")
-        .await
-        .unwrap_err();
+    let err = store.unschedule(&tenant, "ghost").await.unwrap_err();
     assert!(matches!(err, ScheduleError::NotFound(_)));
 }

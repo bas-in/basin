@@ -114,7 +114,9 @@ async fn reactor_fires_on_matching_op() {
     }
 
     // DELETE: should NOT fire.
-    sess.execute("DELETE FROM orders WHERE id = 1").await.unwrap();
+    sess.execute("DELETE FROM orders WHERE id = 1")
+        .await
+        .unwrap();
     let res = sess.execute("SELECT n FROM log ORDER BY n").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(col_i64(&batches, "n"), vec![1]);
@@ -576,8 +578,7 @@ async fn bind_var_substitution_correctness() {
         name: "binds".into(),
         ops: ReactorOps::UPDATE,
         when_predicate: None,
-        body: "INSERT INTO journal VALUES (NEW.id, OLD.status, TG_OP, TG_TABLE_NAME)"
-            .into(),
+        body: "INSERT INTO journal VALUES (NEW.id, OLD.status, TG_OP, TG_TABLE_NAME)".into(),
     })
     .await
     .unwrap();
@@ -629,7 +630,10 @@ async fn drop_reactor_stops_firing() {
     .unwrap();
 
     sess.execute("INSERT INTO src VALUES (1)").await.unwrap();
-    let res = sess.execute("SELECT id FROM log ORDER BY id").await.unwrap();
+    let res = sess
+        .execute("SELECT id FROM log ORDER BY id")
+        .await
+        .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(col_i64(&batches, "id"), vec![1]);
     } else {
@@ -638,7 +642,10 @@ async fn drop_reactor_stops_firing() {
 
     cat.drop_reactor(&tenant, &table, "r").await.unwrap();
     sess.execute("INSERT INTO src VALUES (2)").await.unwrap();
-    let res = sess.execute("SELECT id FROM log ORDER BY id").await.unwrap();
+    let res = sess
+        .execute("SELECT id FROM log ORDER BY id")
+        .await
+        .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(col_i64(&batches, "id"), vec![1], "should not have fired");
     } else {
@@ -674,11 +681,9 @@ async fn counter_denormalization_pattern() {
     sess.execute("CREATE TABLE parent (id BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute(
-        "CREATE TABLE child (id BIGINT NOT NULL, parent_id BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE child (id BIGINT NOT NULL, parent_id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE child_events (parent_id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -712,7 +717,11 @@ async fn counter_denormalization_pattern() {
         .await
         .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
-        assert_eq!(total_rows(&batches), 2, "parent 1 should have 2 child events");
+        assert_eq!(
+            total_rows(&batches),
+            2,
+            "parent 1 should have 2 child events"
+        );
     } else {
         panic!();
     }
@@ -721,7 +730,11 @@ async fn counter_denormalization_pattern() {
         .await
         .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
-        assert_eq!(total_rows(&batches), 1, "parent 2 should have 1 child event");
+        assert_eq!(
+            total_rows(&batches),
+            1,
+            "parent 2 should have 1 child event"
+        );
     } else {
         panic!();
     }

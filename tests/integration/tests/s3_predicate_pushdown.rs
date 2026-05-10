@@ -214,7 +214,10 @@ async fn s3_predicate_pushdown() {
         let b = b.unwrap();
         hit_rows += b.num_rows();
     }
-    assert_eq!(hit_rows, 1, "expected exactly one row for id={TARGET_ID}, got {hit_rows}");
+    assert_eq!(
+        hit_rows, 1,
+        "expected exactly one row for id={TARGET_ID}, got {hit_rows}"
+    );
     let point_bytes =
         counting.range_bytes.load(Ordering::Relaxed) + counting.full_bytes.load(Ordering::Relaxed);
 

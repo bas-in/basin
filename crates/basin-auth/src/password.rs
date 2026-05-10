@@ -14,8 +14,7 @@ pub fn hash(password: &str, cost: u32) -> Result<String> {
 /// Verify a password against a previously stored hash. Constant-time relative
 /// to the hash structure (bcrypt's own implementation).
 pub fn verify(password: &str, hash: &str) -> Result<bool> {
-    bcrypt::verify(password, hash)
-        .map_err(|e| BasinError::internal(format!("bcrypt verify: {e}")))
+    bcrypt::verify(password, hash).map_err(|e| BasinError::internal(format!("bcrypt verify: {e}")))
 }
 
 /// Reject passwords shorter than `min_len` bytes. Length is checked in bytes,

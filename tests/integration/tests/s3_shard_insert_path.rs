@@ -45,8 +45,7 @@ async fn start_server_with_shard(
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
 
     // WAL is in-memory — sub-ms ack latency is the WAL's job; an S3-backed
     // WAL would crater INSERT throughput in this single-shard PoC.
@@ -152,17 +151,12 @@ async fn s3_shard_insert_path() {
         prefix: run_prefix.clone(),
     };
 
-    let mut server = start_server_with_shard(
-        object_store,
-        ObjectPath::from(run_prefix.as_str()),
-    )
-    .await;
+    let mut server =
+        start_server_with_shard(object_store, ObjectPath::from(run_prefix.as_str())).await;
     let alice = connect(server.addr, "alice").await;
 
     alice
-        .simple_query(
-            "CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
         .expect("create");
 

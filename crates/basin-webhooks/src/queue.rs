@@ -56,12 +56,7 @@ pub struct IdempotencyKey(pub String);
 impl IdempotencyKey {
     /// Stable hash. Rebuilds to the same digest for the same logical
     /// event-to-subscription delivery.
-    pub fn compute(
-        sub: WebhookSubscriptionId,
-        tenant: &TenantId,
-        table: &str,
-        seq: u64,
-    ) -> Self {
+    pub fn compute(sub: WebhookSubscriptionId, tenant: &TenantId, table: &str, seq: u64) -> Self {
         let mut h = Sha256::new();
         h.update(sub.0.as_bytes());
         h.update(tenant.as_prefix().as_bytes());
@@ -176,7 +171,8 @@ impl RetryQueue {
         tenant: TenantId,
         envelope: WebhookEnvelope,
     ) -> Result<IdempotencyKey> {
-        self.enqueue_at(subscription_id, tenant, envelope, Utc::now()).await
+        self.enqueue_at(subscription_id, tenant, envelope, Utc::now())
+            .await
     }
 
     /// Same as [`Self::enqueue_new`] but with an explicit `now`. The
@@ -191,12 +187,7 @@ impl RetryQueue {
         envelope: WebhookEnvelope,
         now: DateTime<Utc>,
     ) -> Result<IdempotencyKey> {
-        let key = IdempotencyKey::compute(
-            subscription_id,
-            &tenant,
-            &envelope.table,
-            envelope.seq,
-        );
+        let key = IdempotencyKey::compute(subscription_id, &tenant, &envelope.table, envelope.seq);
         let entry = QueueEntry {
             subscription_id,
             idempotency_key: key.clone(),
@@ -216,10 +207,7 @@ impl RetryQueue {
     /// (on retry) or drop (on terminal success / dead-letter).
     pub async fn take_due(&self, now: DateTime<Utc>) -> Option<QueueEntry> {
         let mut g = self.inner.state.lock().await;
-        let pos = g
-            .entries
-            .iter()
-            .position(|e| e.next_attempt_at <= now)?;
+        let pos = g.entries.iter().position(|e| e.next_attempt_at <= now)?;
         g.entries.remove(pos)
     }
 
@@ -234,14 +222,25 @@ impl RetryQueue {
     /// still-failing attempt for a given subscription. Cheap-ish (one
     /// allocation; bounded by total pending deliveries).
     pub async fn snapshot(&self) -> Vec<QueueEntry> {
-        self.inner.state.lock().await.entries.iter().cloned().collect()
+        self.inner
+            .state
+            .lock()
+            .await
+            .entries
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Re-enqueue an entry whose attempt failed transiently. Increments
     /// `attempt_count` and pushes the entry back at the tail of the
     /// deque. The caller computes `next_attempt_at` (so the worker's
     /// backoff policy is centralised there, not split across two files).
-    pub async fn requeue(&self, mut entry: QueueEntry, next_attempt_at: DateTime<Utc>) -> Result<()> {
+    pub async fn requeue(
+        &self,
+        mut entry: QueueEntry,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<()> {
         entry.attempt_count += 1;
         entry.next_attempt_at = next_attempt_at;
         self.persist_and_push_back(entry).await

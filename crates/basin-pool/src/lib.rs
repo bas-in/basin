@@ -132,10 +132,7 @@ impl SessionPool {
         tenant: TenantId,
         client_key: Option<String>,
     ) -> Result<PooledSession> {
-        let key = PoolKey {
-            tenant,
-            client_key,
-        };
+        let key = PoolKey { tenant, client_key };
 
         loop {
             // Step 1: try to satisfy from the cache, or detect that we
@@ -351,7 +348,7 @@ mod tests {
             object_store: Arc::new(fs),
             root_prefix: None,
             disk_cache: None,
-        page_cache: None,
+            page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
         Engine::new(EngineConfig {
@@ -437,10 +434,7 @@ mod tests {
             .acquire(tenant, Some("alice".to_string()))
             .await
             .unwrap();
-        let s2 = pool
-            .acquire(tenant, Some("bob".to_string()))
-            .await
-            .unwrap();
+        let s2 = pool.acquire(tenant, Some("bob".to_string())).await.unwrap();
 
         let pool_clone = pool.clone();
         let mut blocked = tokio::spawn(async move {

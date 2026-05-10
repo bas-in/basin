@@ -221,7 +221,12 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
 
     // Pre-sweep sanity: list_data_files reports both as Hot.
     let pre = storage.list_data_files(&tenant, &table).await.unwrap();
-    assert_eq!(pre.len(), 2, "expected two hot files pre-sweep, got {}", pre.len());
+    assert_eq!(
+        pre.len(),
+        2,
+        "expected two hot files pre-sweep, got {}",
+        pre.len()
+    );
     for f in &pre {
         assert_eq!(
             f.tier,
@@ -327,7 +332,10 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
         .iter()
         .filter(|f| matches!(f.tier, basin_storage::Tier::Cold))
         .count();
-    assert_eq!(cold2, 1, "second sweep must not move more files; got {cold2} cold");
+    assert_eq!(
+        cold2, 1,
+        "second sweep must not move more files; got {cold2} cold"
+    );
 
     // ----------------------------------------------------------------------
     // Dashboard: the card has two qualitative bars; the JSON primary uses
@@ -355,5 +363,8 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
         }),
     );
 
-    assert!(pass, "card primary failed: cold={cold_after_sweep} rows={total_rows}");
+    assert!(
+        pass,
+        "card primary failed: cold={cold_after_sweep} rows={total_rows}"
+    );
 }

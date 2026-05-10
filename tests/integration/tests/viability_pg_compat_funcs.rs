@@ -16,11 +16,11 @@
 
 use std::sync::Arc;
 
+use arrow_array::Date32Array;
 use arrow_array::{
     Array, BooleanArray, Float64Array, Int32Array, Int64Array, IntervalMonthDayNanoArray,
     StringArray, TimestampNanosecondArray,
 };
-use arrow_array::Date32Array;
 use arrow_schema::{DataType, IntervalUnit};
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
@@ -53,8 +53,15 @@ async fn open_engine() -> (TempDir, Engine) {
 async fn one_string(sess: &basin_engine::TenantSession, sql: &str) -> String {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
-            let b = batches.first().unwrap_or_else(|| panic!("no batches: {sql}"));
-            assert_eq!(b.num_rows(), 1, "expected 1 row from {sql}, got {}", b.num_rows());
+            let b = batches
+                .first()
+                .unwrap_or_else(|| panic!("no batches: {sql}"));
+            assert_eq!(
+                b.num_rows(),
+                1,
+                "expected 1 row from {sql}, got {}",
+                b.num_rows()
+            );
             assert_eq!(b.num_columns(), 1, "expected 1 column from {sql}");
             let col = b.column(0);
             render_scalar(col.as_ref(), 0)
@@ -139,8 +146,14 @@ async fn pg_compat_string_functions() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(TenantId::new()).await.unwrap();
 
-    assert_eq!(one_string(&sess, "SELECT lower('Hello WORLD')").await, "hello world");
-    assert_eq!(one_string(&sess, "SELECT upper('Hello WORLD')").await, "HELLO WORLD");
+    assert_eq!(
+        one_string(&sess, "SELECT lower('Hello WORLD')").await,
+        "hello world"
+    );
+    assert_eq!(
+        one_string(&sess, "SELECT upper('Hello WORLD')").await,
+        "HELLO WORLD"
+    );
     // PG `length` returns INT4. Both the chrono rendering and the integer
     // value must match.
     assert_eq!(one_string(&sess, "SELECT length('hello')").await, "5");
@@ -237,15 +250,9 @@ async fn pg_compat_math_functions() {
     // Return type must be Float64 (not Int64) — verify by exercising a
     // float-aware operation on the result. `power(2,8) + 0.5` must
     // succeed without integer-truncation.
-    assert_eq!(
-        one_string(&sess, "SELECT power(2, 8) + 0.5").await,
-        "256.5"
-    );
+    assert_eq!(one_string(&sess, "SELECT power(2, 8) + 0.5").await, "256.5");
     // Fractional exponent — PG: `power(2.5, 2) = 6.25`.
-    assert_eq!(
-        one_string(&sess, "SELECT power(2.5, 2)").await,
-        "6.25"
-    );
+    assert_eq!(one_string(&sess, "SELECT power(2.5, 2)").await, "6.25");
     // PG-shape edge case: power(0, 0) = 1.
     assert_eq!(one_string(&sess, "SELECT power(0, 0)").await, "1");
 
@@ -290,8 +297,14 @@ async fn pg_compat_null_handling() {
 
     // IS DISTINCT FROM treats NULLs as comparable values: NULL is NOT
     // distinct from NULL, but NULL IS distinct from any non-NULL.
-    assert_eq!(one_string(&sess, "SELECT 1 IS DISTINCT FROM 1").await, "false");
-    assert_eq!(one_string(&sess, "SELECT 1 IS DISTINCT FROM 2").await, "true");
+    assert_eq!(
+        one_string(&sess, "SELECT 1 IS DISTINCT FROM 1").await,
+        "false"
+    );
+    assert_eq!(
+        one_string(&sess, "SELECT 1 IS DISTINCT FROM 2").await,
+        "true"
+    );
     assert_eq!(
         one_string(&sess, "SELECT NULL IS DISTINCT FROM NULL").await,
         "false"
@@ -331,7 +344,10 @@ async fn pg_compat_datetime_functions() {
     // (test runs in the same wall-clock minute, so `current_date` cannot
     // disagree by more than a calendar day in pathological time-zone
     // edge cases; we assert "is a parseable date").
-    let res = sess.execute("SELECT current_date").await.expect("current_date");
+    let res = sess
+        .execute("SELECT current_date")
+        .await
+        .expect("current_date");
     if let ExecResult::Rows { batches, .. } = res {
         let b = batches.first().unwrap();
         assert_eq!(b.column(0).data_type(), &DataType::Date32);
@@ -347,9 +363,7 @@ async fn pg_compat_datetime_functions() {
         ("quarter", "2024-04-01T00:00:00+00:00"),
         ("year", "2024-01-01T00:00:00+00:00"),
     ] {
-        let q = format!(
-            "SELECT date_trunc('{unit}', TIMESTAMP '2024-05-09 12:34:56')"
-        );
+        let q = format!("SELECT date_trunc('{unit}', TIMESTAMP '2024-05-09 12:34:56')");
         assert_eq!(
             one_string(&sess, &q).await,
             expected_iso,
@@ -572,9 +586,7 @@ async fn age_returns_interval_type() {
     let sess = engine.open_session(TenantId::new()).await.unwrap();
 
     let res = sess
-        .execute(
-            "SELECT age(TIMESTAMP '2024-12-31', TIMESTAMP '2024-01-01')",
-        )
+        .execute("SELECT age(TIMESTAMP '2024-12-31', TIMESTAMP '2024-01-01')")
         .await
         .expect("age plans");
     if let ExecResult::Rows { batches, .. } = res {

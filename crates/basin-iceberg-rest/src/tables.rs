@@ -147,7 +147,10 @@ pub(crate) async fn create_table(
         .catalog
         .create_table(&tenant, &table_name, &arrow_schema)
         .await?;
-    Ok((StatusCode::OK, Json(translate_table_metadata(&state, &meta))))
+    Ok((
+        StatusCode::OK,
+        Json(translate_table_metadata(&state, &meta)),
+    ))
 }
 
 /// `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}` —
@@ -427,7 +430,11 @@ fn extract_added_files(snapshot: &IcebergSnapshot) -> Result<Vec<DataFileRef>, I
             ));
         }
     };
-    let paths: Vec<&str> = paths.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    let paths: Vec<&str> = paths
+        .split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
     if paths.is_empty() {
         return Err(IcebergRestError::BadRequest(
             "`added-files-paths` parsed to zero paths".into(),
@@ -464,7 +471,9 @@ fn extract_added_files(snapshot: &IcebergSnapshot) -> Result<Vec<DataFileRef>, I
 }
 
 fn parse_per_file_u64(raw: Option<&String>) -> Result<Vec<u64>, IcebergRestError> {
-    let Some(raw) = raw else { return Ok(Vec::new()) };
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
     if raw.is_empty() {
         return Ok(Vec::new());
     }
@@ -505,10 +514,7 @@ pub(crate) fn translate_table_metadata(
     state: &State,
     meta: &BasinTableMetadata,
 ) -> LoadTableResponse {
-    let location = format!(
-        "{}{}/{}/",
-        state.cfg.base_location, meta.tenant, meta.table
-    );
+    let location = format!("{}{}/{}/", state.cfg.base_location, meta.tenant, meta.table);
 
     let fields: Vec<IcebergSchemaField> = meta
         .schema
@@ -543,12 +549,12 @@ pub(crate) fn translate_table_metadata(
                     basin_catalog::SnapshotOperation::Replace => "overwrite".into(),
                 },
             );
-            summary.insert("added-files-count".into(), s.summary.added_files.to_string());
-            summary.insert("added-records".into(), s.summary.added_rows.to_string());
             summary.insert(
-                "added-files-size".into(),
-                s.summary.added_bytes.to_string(),
+                "added-files-count".into(),
+                s.summary.added_files.to_string(),
             );
+            summary.insert("added-records".into(), s.summary.added_rows.to_string());
+            summary.insert("added-files-size".into(), s.summary.added_bytes.to_string());
             if s.summary.removed_files > 0 {
                 summary.insert(
                     "deleted-files-count".into(),

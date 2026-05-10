@@ -135,7 +135,7 @@ fn is_word_byte(b: u8) -> bool {
 /// `set.len() * std::mem::size_of::<Trigram>()` plus the `Vec` header.
 #[inline]
 pub fn set_bytes(set: &[Trigram]) -> usize {
-    set.len() * std::mem::size_of::<Trigram>()
+    std::mem::size_of_val(set)
 }
 
 /// Cardinality of the intersection of two **sorted** trigram sets.

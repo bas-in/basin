@@ -60,7 +60,10 @@ fn sydney_to_tokyo_is_about_7820_km() {
     let measured = haversine_meters(&sydney, &tokyo);
     let reference = 7_822_000.0;
     let err = relative_error(measured, reference);
-    assert!(err < TOL, "sydney↔tokyo measured={measured:.1} err={err:.4}");
+    assert!(
+        err < TOL,
+        "sydney↔tokyo measured={measured:.1} err={err:.4}"
+    );
 }
 
 #[test]

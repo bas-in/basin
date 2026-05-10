@@ -10,9 +10,7 @@
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_catalog::{
-    info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog,
-};
+use basin_catalog::{info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog};
 use basin_common::{TableName, TenantId};
 
 fn name(s: &str) -> TableName {
@@ -21,7 +19,10 @@ fn name(s: &str) -> TableName {
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<StringArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -36,18 +37,18 @@ async fn pg_index_returns_empty_for_v01() {
         Field::new("id", DataType::Int64, false),
         Field::new("label", DataType::Utf8, false),
     ]);
-    cat.create_table(&t, &name("orders"), &schema).await.unwrap();
-    cat.create_table(&t, &name("widgets"), &schema).await.unwrap();
+    cat.create_table(&t, &name("orders"), &schema)
+        .await
+        .unwrap();
+    cat.create_table(&t, &name("widgets"), &schema)
+        .await
+        .unwrap();
 
     let batch = InfoSchemaQuery::pg_index(&cat, &t).await.unwrap();
     assert_eq!(batch.num_rows(), 0);
     // Schema sanity: column names are PG-flavoured.
     let s = batch.schema();
-    let names: Vec<String> = s
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    let names: Vec<String> = s.fields().iter().map(|f| f.name().clone()).collect();
     assert_eq!(
         names,
         vec![
@@ -70,16 +71,14 @@ async fn pg_constraint_returns_empty_for_v01() {
         Field::new("id", DataType::Int64, false),
         Field::new("label", DataType::Utf8, true),
     ]);
-    cat.create_table(&t, &name("orders"), &schema).await.unwrap();
+    cat.create_table(&t, &name("orders"), &schema)
+        .await
+        .unwrap();
 
     let batch = InfoSchemaQuery::pg_constraint(&cat, &t).await.unwrap();
     assert_eq!(batch.num_rows(), 0);
     let s = batch.schema();
-    let names: Vec<String> = s
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    let names: Vec<String> = s.fields().iter().map(|f| f.name().clone()).collect();
     assert_eq!(
         names,
         vec![
@@ -110,9 +109,13 @@ async fn views_lists_materialized_views() {
         Field::new("total", DataType::Int64, false),
     ]);
     // The CV target table mirrors the source query's projection.
-    cat.create_table(&t, &name("daily_totals"), &schema).await.unwrap();
+    cat.create_table(&t, &name("daily_totals"), &schema)
+        .await
+        .unwrap();
     // A non-CV table should not appear.
-    cat.create_table(&t, &name("plain_table"), &schema).await.unwrap();
+    cat.create_table(&t, &name("plain_table"), &schema)
+        .await
+        .unwrap();
 
     let cv = CvDef {
         source_table: "events".to_string(),
@@ -148,7 +151,9 @@ async fn views_excludes_plain_tables() {
     let t = TenantId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![Field::new("c", DataType::Int64, false)]);
-    cat.create_table(&t, &name("only_table"), &schema).await.unwrap();
+    cat.create_table(&t, &name("only_table"), &schema)
+        .await
+        .unwrap();
 
     let batch = InfoSchemaQuery::views(&cat, &t).await.unwrap();
     assert_eq!(batch.num_rows(), 0);
@@ -167,17 +172,32 @@ async fn schemata_one_row_per_tenant() {
     assert_eq!(col_str(&batch, "schema_owner").value(0), "");
     // Character-set columns are nullable; v0.1 reports NULL.
     let cs_cat = batch
-        .column(batch.schema().index_of("default_character_set_catalog").unwrap())
+        .column(
+            batch
+                .schema()
+                .index_of("default_character_set_catalog")
+                .unwrap(),
+        )
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     let cs_schema = batch
-        .column(batch.schema().index_of("default_character_set_schema").unwrap())
+        .column(
+            batch
+                .schema()
+                .index_of("default_character_set_schema")
+                .unwrap(),
+        )
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     let cs_name = batch
-        .column(batch.schema().index_of("default_character_set_name").unwrap())
+        .column(
+            batch
+                .schema()
+                .index_of("default_character_set_name")
+                .unwrap(),
+        )
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();

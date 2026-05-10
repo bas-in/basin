@@ -286,14 +286,11 @@ async fn infer_param_types(
                                             *slot = field.data_type().clone();
                                         }
                                         if field_is_jsonb(field) {
-                                            if let Some(s) =
-                                                is_jsonb_out.get_mut(n - 1)
-                                            {
+                                            if let Some(s) = is_jsonb_out.get_mut(n - 1) {
                                                 *s = true;
                                             }
                                         } else if field_is_uuid(field) {
-                                            if let Some(s) = is_uuid_out.get_mut(n - 1)
-                                            {
+                                            if let Some(s) = is_uuid_out.get_mut(n - 1) {
                                                 *s = true;
                                             }
                                         }
@@ -326,13 +323,7 @@ async fn infer_param_types(
                         .await
                     {
                         let schema = (*meta.schema).clone();
-                        infer_assignments(
-                            &assignments,
-                            &schema,
-                            out,
-                            is_jsonb_out,
-                            is_uuid_out,
-                        );
+                        infer_assignments(&assignments, &schema, out, is_jsonb_out, is_uuid_out);
                         if let Some(pred) = &selection {
                             walk_pred(
                                 pred,
@@ -590,9 +581,8 @@ fn resolve_column_meta(
             let (qualifier, col) = (&parts[0].value, &parts[1].value);
             for (label, schema) in tables {
                 if label == qualifier {
-                    return column_field(schema, col).map(|f| {
-                        (f.data_type().clone(), field_is_jsonb(f), field_is_uuid(f))
-                    });
+                    return column_field(schema, col)
+                        .map(|f| (f.data_type().clone(), field_is_jsonb(f), field_is_uuid(f)));
                 }
             }
             None
@@ -811,9 +801,7 @@ fn substitute(sql: &str, params: &[ScalarParam]) -> Result<String> {
                         BasinError::InvalidSchema(format!("bad placeholder ${digits}: {e}"))
                     })?;
                     let p = params.get(n - 1).ok_or_else(|| {
-                        BasinError::InvalidSchema(format!(
-                            "placeholder ${n} has no bound value"
-                        ))
+                        BasinError::InvalidSchema(format!("placeholder ${n} has no bound value"))
                     })?;
                     out.push_str(&render_param(p));
                     i = j;
@@ -935,7 +923,10 @@ mod tests {
 
     #[test]
     fn scan_finds_basic_placeholders() {
-        assert_eq!(scan_placeholders("SELECT * FROM t WHERE id = $1").unwrap(), 1);
+        assert_eq!(
+            scan_placeholders("SELECT * FROM t WHERE id = $1").unwrap(),
+            1
+        );
         assert_eq!(
             scan_placeholders("INSERT INTO t VALUES ($1, $2, $3)").unwrap(),
             3
@@ -971,21 +962,13 @@ mod tests {
     #[test]
     fn substitute_int_and_string() {
         let sql = "INSERT INTO t VALUES ($1, $2)";
-        let out = substitute(
-            sql,
-            &[ScalarParam::Int8(7), ScalarParam::Text("hi".into())],
-        )
-        .unwrap();
+        let out = substitute(sql, &[ScalarParam::Int8(7), ScalarParam::Text("hi".into())]).unwrap();
         assert_eq!(out, "INSERT INTO t VALUES (7, 'hi')");
     }
 
     #[test]
     fn substitute_escapes_apostrophe() {
-        let out = substitute(
-            "SELECT $1",
-            &[ScalarParam::Text("it's".into())],
-        )
-        .unwrap();
+        let out = substitute("SELECT $1", &[ScalarParam::Text("it's".into())]).unwrap();
         assert_eq!(out, "SELECT 'it''s'");
     }
 
@@ -1009,18 +992,16 @@ mod tests {
     fn substitute_float_keeps_decimal_point() {
         let out = substitute("SELECT $1", &[ScalarParam::Float8(3.0)]).unwrap();
         assert_eq!(out, "SELECT 3.0");
-        let out = substitute("SELECT $1", &[ScalarParam::Float8(3.14)]).unwrap();
-        assert_eq!(out, "SELECT 3.14");
+        // Use a non-PI value to keep clippy::approx_constant happy —
+        // the test only cares that decimal-point preservation works.
+        let out = substitute("SELECT $1", &[ScalarParam::Float8(2.25)]).unwrap();
+        assert_eq!(out, "SELECT 2.25");
     }
 
     #[test]
     fn substitute_string_in_literal_left_alone() {
         // `$1` inside an existing single-quoted literal must NOT be substituted.
-        let out = substitute(
-            "SELECT '$1', $1",
-            &[ScalarParam::Int8(42)],
-        )
-        .unwrap();
+        let out = substitute("SELECT '$1', $1", &[ScalarParam::Int8(42)]).unwrap();
         assert_eq!(out, "SELECT '$1', 42");
     }
 
@@ -1034,19 +1015,12 @@ mod tests {
             &[ScalarParam::Text("'; DROP TABLE t; --".into())],
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "SELECT * FROM t WHERE name = '''; DROP TABLE t; --'"
-        );
+        assert_eq!(out, "SELECT * FROM t WHERE name = '''; DROP TABLE t; --'");
     }
 
     #[test]
     fn substitute_param_appearing_twice() {
-        let out = substitute(
-            "SELECT $1 + $1",
-            &[ScalarParam::Int4(5)],
-        )
-        .unwrap();
+        let out = substitute("SELECT $1 + $1", &[ScalarParam::Int4(5)]).unwrap();
         assert_eq!(out, "SELECT 5 + 5");
     }
 }

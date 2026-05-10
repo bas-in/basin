@@ -310,7 +310,12 @@ impl InProcessShard {
                 }
             };
 
-            let parent_snapshot = self.cfg.catalog.load_table(tenant, table).await?.current_snapshot;
+            let parent_snapshot = self
+                .cfg
+                .catalog
+                .load_table(tenant, table)
+                .await?
+                .current_snapshot;
             let added = DataFileRef {
                 path: cold_file.path.as_ref().to_string(),
                 size_bytes: cold_file.size_bytes,
@@ -461,8 +466,7 @@ impl InProcessShard {
                 .expect("non-empty table tail");
 
             // Concatenate all batches for this table into one Parquet write.
-            let batches: Vec<RecordBatch> =
-                entries.iter().map(|(_, b)| b.clone()).collect();
+            let batches: Vec<RecordBatch> = entries.iter().map(|(_, b)| b.clone()).collect();
             let schema = batches[0].schema();
             let merged = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| BasinError::storage(format!("concat batches: {e}")))?;
@@ -480,7 +484,8 @@ impl InProcessShard {
                 column_stats: data_file.column_stats.clone(),
             };
 
-            self.commit_with_retry(tenant, &table, &merged, file_ref).await?;
+            self.commit_with_retry(tenant, &table, &merged, file_ref)
+                .await?;
 
             drained_per_table.insert(table, max_lsn);
             max_lsn_overall = Some(match max_lsn_overall {
@@ -581,11 +586,7 @@ fn unique_tenants(map: &PartitionMap) -> usize {
 #[async_trait]
 impl ShardImpl for InProcessShard {
     #[instrument(skip(self), fields(tenant = %tenant, partition = %partition))]
-    async fn get(
-        &self,
-        tenant: &TenantId,
-        partition: &PartitionKey,
-    ) -> Result<TenantHandle> {
+    async fn get(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<TenantHandle> {
         let state = self.load_or_create(tenant, partition).await?;
         self.refresh_resident_stats().await;
         let inner: Arc<dyn TenantHandleImpl> = Arc::new(InProcessTenantHandle {
@@ -624,10 +625,7 @@ impl ShardImpl for InProcessShard {
                 }
             }
         });
-        ShardBackgroundHandle {
-            shutdown: tx,
-            join,
-        }
+        ShardBackgroundHandle { shutdown: tx, join }
     }
 
     fn stats(&self) -> ShardStats {
@@ -717,11 +715,7 @@ impl TenantHandleImpl for InProcessTenantHandle {
     }
 
     #[instrument(skip(self, opts), fields(tenant = %self.tenant, partition = %self.partition, table = %table))]
-    async fn read(
-        &self,
-        table: &TableName,
-        opts: ReadOptions,
-    ) -> Result<Vec<RecordBatch>> {
+    async fn read(&self, table: &TableName, opts: ReadOptions) -> Result<Vec<RecordBatch>> {
         // Stream the Parquet base.
         let parquet_opts = ReadOptions {
             projection: opts.projection.clone(),
@@ -808,7 +802,9 @@ fn encode_payload(table: &TableName, batch: &RecordBatch) -> Result<Bytes> {
 /// Inverse of [`encode_payload`].
 fn decode_payload(bytes: &[u8]) -> Result<(TableName, Vec<RecordBatch>)> {
     if bytes.len() < 4 {
-        return Err(BasinError::wal("WAL payload shorter than 4 bytes".to_string()));
+        return Err(BasinError::wal(
+            "WAL payload shorter than 4 bytes".to_string(),
+        ));
     }
     let tlen = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     if bytes.len() < 4 + tlen {
@@ -883,10 +879,7 @@ fn project_batch(batch: &RecordBatch, cols: &[String]) -> Result<RecordBatch> {
 
 /// AND together every predicate against the batch, returning only the rows
 /// that pass all of them. Empty filter list returns the input untouched.
-fn apply_filters(
-    batch: RecordBatch,
-    filters: &[basin_storage::Predicate],
-) -> Result<RecordBatch> {
+fn apply_filters(batch: RecordBatch, filters: &[basin_storage::Predicate]) -> Result<RecordBatch> {
     if filters.is_empty() {
         return Ok(batch);
     }
@@ -1040,7 +1033,7 @@ mod tests {
             object_store: Arc::new(storage_fs),
             root_prefix: None,
             disk_cache: None,
-        page_cache: None,
+            page_cache: None,
         });
         let catalog = Arc::new(InMemoryCatalog::new());
         let wal: Arc<dyn Wal> = Arc::new(
@@ -1089,10 +1082,7 @@ mod tests {
                 .unwrap();
         }
 
-        let read = handle
-            .read(&table, ReadOptions::default())
-            .await
-            .unwrap();
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
         assert_eq!(rows_in(&read), 30);
     }
 
@@ -1125,11 +1115,12 @@ mod tests {
         // After truncate, read_from(ZERO) should return no entries with
         // lsn <= watermark; we just check the partition's tail in memory is
         // empty.
-        let read = handle
-            .read(&table, ReadOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(rows_in(&read), 30, "rows should still be visible via Parquet");
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            rows_in(&read),
+            30,
+            "rows should still be visible via Parquet"
+        );
 
         // Tail empty after compaction.
         let state = {
@@ -1137,7 +1128,10 @@ mod tests {
             map.get(&(tenant, partition.clone())).unwrap().clone()
         };
         let guard = state.read().await;
-        assert!(guard.tail_is_empty(), "tail should be empty after compaction");
+        assert!(
+            guard.tail_is_empty(),
+            "tail should be empty after compaction"
+        );
 
         // Sanity: WAL high_water reflects truncation by returning the pre-trunc
         // value or higher, never resetting to ZERO. Just call it to ensure
@@ -1156,7 +1150,7 @@ mod tests {
             object_store: Arc::new(storage_fs),
             root_prefix: None,
             disk_cache: None,
-        page_cache: None,
+            page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
         let wal_cfg = || WalConfig {
@@ -1192,11 +1186,12 @@ mod tests {
             let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal);
             let shard = crate::Shard::new(cfg);
             let handle = shard.get(&tenant, &partition).await.unwrap();
-            let read = handle
-                .read(&table, ReadOptions::default())
-                .await
-                .unwrap();
-            assert_eq!(rows_in(&read), 50, "cold load should replay all WAL entries");
+            let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+            assert_eq!(
+                rows_in(&read),
+                50,
+                "cold load should replay all WAL entries"
+            );
         }
     }
 
@@ -1271,12 +1266,8 @@ mod tests {
         let ha = shard.get(&a, &partition).await.unwrap();
         let hb = shard.get(&b, &partition).await.unwrap();
 
-        ha.write_batch(&table, batch(0, 5, "a-"))
-            .await
-            .unwrap();
-        hb.write_batch(&table, batch(0, 7, "b-"))
-            .await
-            .unwrap();
+        ha.write_batch(&table, batch(0, 5, "a-")).await.unwrap();
+        hb.write_batch(&table, batch(0, 7, "b-")).await.unwrap();
 
         let ra = ha.read(&table, ReadOptions::default()).await.unwrap();
         let rb = hb.read(&table, ReadOptions::default()).await.unwrap();

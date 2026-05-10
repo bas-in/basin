@@ -64,15 +64,14 @@ impl TestClock {
     }
 
     pub fn advance(&self, d: Duration) {
-        self.ms
-            .fetch_add(d.num_milliseconds(), Ordering::Relaxed);
+        self.ms.fetch_add(d.num_milliseconds(), Ordering::Relaxed);
     }
 }
 
 impl Clock for TestClock {
     fn now(&self) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp_millis(self.ms.load(Ordering::Relaxed))
-            .unwrap_or_else(|| Utc::now())
+            .unwrap_or_else(Utc::now)
     }
 }
 
@@ -149,7 +148,9 @@ impl CronRunner {
         if !tenants.contains(&tenant) {
             tenants.push(tenant);
             let mut anchors = self.inner.last_tick.lock().await;
-            anchors.entry(tenant).or_insert_with(|| self.inner.clock.now());
+            anchors
+                .entry(tenant)
+                .or_insert_with(|| self.inner.clock.now());
         }
     }
 
@@ -179,11 +180,7 @@ impl CronRunner {
         self.tick().await
     }
 
-    async fn tick_tenant(
-        &self,
-        tenant: &TenantId,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<RunOutcome>> {
+    async fn tick_tenant(&self, tenant: &TenantId, now: DateTime<Utc>) -> Result<Vec<RunOutcome>> {
         let last = {
             let mut anchors = self.inner.last_tick.lock().await;
             let anchor = anchors.entry(*tenant).or_insert(now);
@@ -258,7 +255,11 @@ impl CronRunner {
 
             // "Due" check: any upcoming run after `last` that is `<= now`.
             // The cron crate's `after(last)` iterator yields exactly that.
-            let due = schedule.after(&last).next().map(|t| t <= now).unwrap_or(false);
+            let due = schedule
+                .after(&last)
+                .next()
+                .map(|t| t <= now)
+                .unwrap_or(false);
             if !due {
                 continue;
             }
@@ -318,9 +319,7 @@ impl CronRunner {
                 .await?
                 .unwrap_or_else(|| basin_engine::ANONYMOUS_USER.to_string());
             let start = self.inner.clock.now();
-            let res = self
-                .run_one(*tenant, &username, &job.command)
-                .await;
+            let res = self.run_one(*tenant, &username, &job.command).await;
             let end = self.inner.clock.now();
             let (status, message) = match res {
                 Ok(tag) => (JobStatus::Succeeded, tag),
@@ -365,12 +364,7 @@ impl CronRunner {
 
     /// Execute one statement under `tenant` as `username`. Returns the
     /// command tag on success.
-    async fn run_one(
-        &self,
-        tenant: TenantId,
-        username: &str,
-        sql: &str,
-    ) -> Result<String> {
+    async fn run_one(&self, tenant: TenantId, username: &str, sql: &str) -> Result<String> {
         let sess = self
             .inner
             .store

@@ -113,6 +113,9 @@ pub(crate) async fn run_once(pool: &Arc<Inner>) {
         for _ in 0..evicted_total {
             pool.stats.record_eviction();
         }
-        debug!(evicted = evicted_total, "eviction tick dropped idle sessions");
+        debug!(
+            evicted = evicted_total,
+            "eviction tick dropped idle sessions"
+        );
     }
 }

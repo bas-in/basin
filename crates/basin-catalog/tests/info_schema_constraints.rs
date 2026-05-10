@@ -19,7 +19,10 @@ fn name(s: &str) -> TableName {
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<StringArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
 }
 
 /// Build an Arrow schema where each `(name, type, nullable)` triple
@@ -39,9 +42,9 @@ async fn not_null_columns_appear_in_table_constraints() {
     cat.create_namespace(&t).await.unwrap();
 
     let s = schema_with(&[
-        ("id", DataType::Int64, false),     // NOT NULL
-        ("payload", DataType::Utf8, true),  // nullable
-        ("created", DataType::Int64, false),// NOT NULL
+        ("id", DataType::Int64, false),      // NOT NULL
+        ("payload", DataType::Utf8, true),   // nullable
+        ("created", DataType::Int64, false), // NOT NULL
     ]);
     cat.create_table(&t, &name("orders"), &s).await.unwrap();
 
@@ -77,10 +80,7 @@ async fn nullable_columns_absent_from_table_constraints() {
     cat.create_namespace(&t).await.unwrap();
 
     // Every column is nullable: zero NOT NULL rows should land.
-    let s = schema_with(&[
-        ("a", DataType::Int64, true),
-        ("b", DataType::Utf8, true),
-    ]);
+    let s = schema_with(&[("a", DataType::Int64, true), ("b", DataType::Utf8, true)]);
     cat.create_table(&t, &name("loose"), &s).await.unwrap();
 
     let batch = InfoSchemaQuery::table_constraints(&cat, &t).await.unwrap();

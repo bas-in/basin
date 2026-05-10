@@ -35,9 +35,7 @@ use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use basin_common::{BasinError, Result, TenantId};
-use basin_engine::{
-    BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema,
-};
+use basin_engine::{BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -177,10 +175,7 @@ impl Session for RemoteShardSession {
         Ok(simple_query_to_exec_result(&msgs))
     }
 
-    async fn describe_statement(
-        &self,
-        handle: &StatementHandle,
-    ) -> Result<StatementSchema> {
+    async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema> {
         let prepared = self.prepared.lock().await;
         let entry = prepared.get(handle).ok_or_else(|| {
             BasinError::not_found(format!("remote prepared statement {handle:?}"))
@@ -215,12 +210,7 @@ fn simple_query_to_exec_result(msgs: &[SimpleQueryMessage]) -> ExecResult {
         match m {
             SimpleQueryMessage::Row(r) => {
                 if col_names.is_none() {
-                    col_names = Some(
-                        r.columns()
-                            .iter()
-                            .map(|c| c.name().to_owned())
-                            .collect(),
-                    );
+                    col_names = Some(r.columns().iter().map(|c| c.name().to_owned()).collect());
                 }
                 let n = r.len();
                 let mut row: Vec<Option<String>> = Vec::with_capacity(n);
@@ -234,8 +224,7 @@ fn simple_query_to_exec_result(msgs: &[SimpleQueryMessage]) -> ExecResult {
             }
             SimpleQueryMessage::RowDescription(cols) => {
                 if col_names.is_none() {
-                    col_names =
-                        Some(cols.iter().map(|c| c.name().to_owned()).collect());
+                    col_names = Some(cols.iter().map(|c| c.name().to_owned()).collect());
                 }
             }
             _ => {}
@@ -251,7 +240,8 @@ fn simple_query_to_exec_result(msgs: &[SimpleQueryMessage]) -> ExecResult {
                     .collect::<Vec<_>>(),
             ));
             let n_cols = names.len();
-            let mut columns: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(rows.len()); n_cols];
+            let mut columns: Vec<Vec<Option<String>>> =
+                vec![Vec::with_capacity(rows.len()); n_cols];
             for row in rows {
                 for (i, cell) in row.into_iter().enumerate() {
                     if i < n_cols {
@@ -267,9 +257,7 @@ fn simple_query_to_exec_result(msgs: &[SimpleQueryMessage]) -> ExecResult {
             }
             let arrow_columns: Vec<Arc<dyn arrow_array::Array>> = columns
                 .into_iter()
-                .map(|col| {
-                    Arc::new(StringArray::from(col)) as Arc<dyn arrow_array::Array>
-                })
+                .map(|col| Arc::new(StringArray::from(col)) as Arc<dyn arrow_array::Array>)
                 .collect();
             let batch = RecordBatch::try_new(schema.clone(), arrow_columns)
                 .expect("RecordBatch::try_new on text-only schema");
@@ -502,11 +490,7 @@ impl RemoteShardSessionFactory {
 #[async_trait]
 impl SessionFactory for RemoteShardSessionFactory {
     type Session = RemoteShardSession;
-    async fn open(
-        &self,
-        tenant: TenantId,
-        username: &str,
-    ) -> Result<Arc<RemoteShardSession>> {
+    async fn open(&self, tenant: TenantId, username: &str) -> Result<Arc<RemoteShardSession>> {
         let endpoint = self.map.shard_for(&tenant).to_owned();
         let client = connect_upstream(&endpoint, username).await?;
         Ok(Arc::new(RemoteShardSession::new(client, tenant)))
@@ -528,16 +512,16 @@ mod tests {
             &[ScalarParam::Int8(7), ScalarParam::Text("hi".into())],
         );
         assert_eq!(s, "INSERT INTO t VALUES (7, 'hi')");
-        let s = substitute(
-            "SELECT $1",
-            &[ScalarParam::Text("it's".into())],
-        );
+        let s = substitute("SELECT $1", &[ScalarParam::Text("it's".into())]);
         assert_eq!(s, "SELECT 'it''s'");
     }
 
     #[test]
     fn endpoint_parses() {
-        assert_eq!(parse_endpoint("127.0.0.1:5433").unwrap(), ("127.0.0.1", 5433));
+        assert_eq!(
+            parse_endpoint("127.0.0.1:5433").unwrap(),
+            ("127.0.0.1", 5433)
+        );
         assert!(parse_endpoint("nocolon").is_err());
         assert!(parse_endpoint("127.0.0.1:notaport").is_err());
     }

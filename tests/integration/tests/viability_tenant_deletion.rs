@@ -114,11 +114,7 @@ async fn viability_4_tenant_deletion() {
 
     // Sanity check (outside any timed window).
     let tenant_prefix = ObjectPath::from(format!("tenants/{tenant}"));
-    let listed_before: Vec<_> = fs
-        .list(Some(&tenant_prefix))
-        .try_collect()
-        .await
-        .unwrap();
+    let listed_before: Vec<_> = fs.list(Some(&tenant_prefix)).try_collect().await.unwrap();
     let parquet_count = listed_before
         .iter()
         .filter(|m| m.location.as_ref().ends_with(".parquet"))
@@ -150,20 +146,13 @@ async fn viability_4_tenant_deletion() {
         .expect("delete_tenant");
     let deletion_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-    let listed_after: Vec<_> = fs
-        .list(Some(&tenant_prefix))
-        .try_collect()
-        .await
-        .unwrap();
+    let listed_after: Vec<_> = fs.list(Some(&tenant_prefix)).try_collect().await.unwrap();
     assert!(
         listed_after.is_empty(),
         "expected zero residual objects, got {}",
         listed_after.len()
     );
-    assert!(
-        deleted >= FILES,
-        "deleted only {deleted} of >= {FILES}"
-    );
+    assert!(deleted >= FILES, "deleted only {deleted} of >= {FILES}");
 
     // Catalog must be empty after deletion: drop_table for every table
     // and drop_namespace for the tenant must have fired inside
@@ -205,8 +194,5 @@ async fn viability_4_tenant_deletion() {
         }),
     );
 
-    assert!(
-        pass,
-        "deletion took {deletion_ms:.1} ms, bar <{BAR_MS} ms"
-    );
+    assert!(pass, "deletion took {deletion_ms:.1} ms, bar <{BAR_MS} ms");
 }

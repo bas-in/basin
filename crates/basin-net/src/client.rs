@@ -87,11 +87,7 @@ impl HttpClient {
 
     /// `http_get(url)` — synchronous GET. Mirrors the Postgres `http`
     /// extension's signature.
-    pub async fn http_get(
-        &self,
-        tenant: &TenantId,
-        url: &str,
-    ) -> Result<HttpResponse, HttpError> {
+    pub async fn http_get(&self, tenant: &TenantId, url: &str) -> Result<HttpResponse, HttpError> {
         self.send(tenant, &HttpRequest::get(url)).await
     }
 
@@ -186,4 +182,3 @@ impl Default for HttpClient {
         Self::new()
     }
 }
-

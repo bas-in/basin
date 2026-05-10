@@ -84,7 +84,10 @@ async fn insert_unknown_enum_label_rejected() {
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("22P02") || msg.to_ascii_lowercase().contains("invalid_text_representation"),
+        msg.contains("22P02")
+            || msg
+                .to_ascii_lowercase()
+                .contains("invalid_text_representation"),
         "expected SQLSTATE 22P02, got: {err}"
     );
     assert!(
@@ -132,13 +135,18 @@ async fn add_existing_enum_value_rejected() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute("CREATE TYPE k AS ENUM ('a', 'b')").await.unwrap();
+    sess.execute("CREATE TYPE k AS ENUM ('a', 'b')")
+        .await
+        .unwrap();
     let err = sess
         .execute("ALTER TYPE k ADD VALUE 'a'")
         .await
         .unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
-    assert!(msg.contains("already") || msg.contains("contains"), "got: {err}");
+    assert!(
+        msg.contains("already") || msg.contains("contains"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -169,12 +177,13 @@ async fn drop_type_if_exists_idempotent() {
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
     // Idempotent: dropping a non-existent type with IF EXISTS is Ok.
-    sess.execute("DROP TYPE IF EXISTS missing")
-        .await
-        .unwrap();
+    sess.execute("DROP TYPE IF EXISTS missing").await.unwrap();
     // Without IF EXISTS, the same DROP errors.
     let err = sess.execute("DROP TYPE missing").await.unwrap_err();
-    assert!(matches!(err, basin_common::BasinError::NotFound(_)), "got: {err}");
+    assert!(
+        matches!(err, basin_common::BasinError::NotFound(_)),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -254,7 +263,10 @@ async fn drop_domain_if_exists_idempotent() {
 
     sess.execute("DROP DOMAIN IF EXISTS missing").await.unwrap();
     let err = sess.execute("DROP DOMAIN missing").await.unwrap_err();
-    assert!(matches!(err, basin_common::BasinError::NotFound(_)), "got: {err}");
+    assert!(
+        matches!(err, basin_common::BasinError::NotFound(_)),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -285,10 +297,7 @@ async fn cross_tenant_type_isolation() {
     // Tenant B cannot see tenant A's type — using `k` in a column type
     // should surface as an "unsupported custom type" error from the
     // standard arrow_data_type fallback.
-    let err = sess_b
-        .execute("CREATE TABLE t (c k)")
-        .await
-        .unwrap_err();
+    let err = sess_b.execute("CREATE TABLE t (c k)").await.unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
         msg.contains("unsupported") || msg.contains("custom type") || msg.contains("invalid"),

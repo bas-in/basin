@@ -154,8 +154,7 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 // keys, no whitespace) and store the bytes. Anything that
                 // isn't a string literal is a hard error so the user sees
                 // *exactly* which row tripped the check.
-                let mut b =
-                    LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 32);
+                let mut b = LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 32);
                 for row in rows {
                     match coerce_jsonb(&row[col_idx], field.name())? {
                         Some(v) => b.append_value(&v),
@@ -168,8 +167,7 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 Arc::new(b.finish())
             }
             DataType::LargeBinary => {
-                let mut b =
-                    LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
+                let mut b = LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
                 for row in rows {
                     match coerce_bytea(&row[col_idx])? {
                         Some(v) => b.append_value(&v),
@@ -191,7 +189,7 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 for row in rows {
                     match coerce_uuid(&row[col_idx], field.name())? {
                         Some(bytes) => {
-                            b.append_value(&bytes).map_err(|e| {
+                            b.append_value(bytes).map_err(|e| {
                                 BasinError::internal(format!(
                                     "UUID append for column {}: {e}",
                                     field.name()
@@ -226,9 +224,8 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                         }
                     }
                 }
-                let arr = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                    row_iter, *dim,
-                );
+                let arr =
+                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(row_iter, *dim);
                 Arc::new(arr)
             }
             DataType::Decimal128(p, s) => {
@@ -418,7 +415,11 @@ fn build_f64_nullable(
 /// Anything else is an `InvalidSchema` error.
 fn coerce_bytea(expr: &Expr) -> Result<Option<Vec<u8>>> {
     let inner = match expr {
-        Expr::Cast { expr: inner, data_type: SqlDataType::Bytea, .. } => inner.as_ref(),
+        Expr::Cast {
+            expr: inner,
+            data_type: SqlDataType::Bytea,
+            ..
+        } => inner.as_ref(),
         Expr::Value(Value::Null) => return Ok(None),
         _ => expr,
     };
@@ -435,9 +436,7 @@ fn coerce_bytea(expr: &Expr) -> Result<Option<Vec<u8>>> {
         }
     };
     let hex = s.strip_prefix("\\x").ok_or_else(|| {
-        BasinError::InvalidSchema(format!(
-            "bytea literal must start with `\\x`, got {s:?}"
-        ))
+        BasinError::InvalidSchema(format!("bytea literal must start with `\\x`, got {s:?}"))
     })?;
     if hex.len() % 2 != 0 {
         return Err(BasinError::InvalidSchema(format!(
@@ -446,12 +445,10 @@ fn coerce_bytea(expr: &Expr) -> Result<Option<Vec<u8>>> {
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     for chunk in hex.as_bytes().chunks(2) {
-        let h = std::str::from_utf8(chunk).map_err(|_| {
-            BasinError::InvalidSchema(format!("non-utf8 bytea hex: {s:?}"))
-        })?;
-        let byte = u8::from_str_radix(h, 16).map_err(|_| {
-            BasinError::InvalidSchema(format!("bad bytea hex byte {h:?} in {s:?}"))
-        })?;
+        let h = std::str::from_utf8(chunk)
+            .map_err(|_| BasinError::InvalidSchema(format!("non-utf8 bytea hex: {s:?}")))?;
+        let byte = u8::from_str_radix(h, 16)
+            .map_err(|_| BasinError::InvalidSchema(format!("bad bytea hex byte {h:?} in {s:?}")))?;
         out.push(byte);
     }
     Ok(Some(out))
@@ -492,14 +489,11 @@ fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
         }
     };
     let parsed: serde_json::Value = serde_json::from_str(s).map_err(|e| {
-        BasinError::InvalidSchema(format!(
-            "invalid JSON literal for column {col}: {e}"
-        ))
+        BasinError::InvalidSchema(format!("invalid JSON literal for column {col}: {e}"))
     })?;
     let canonical = canonicalize_json(parsed);
-    let bytes = serde_json::to_vec(&canonical).map_err(|e| {
-        BasinError::internal(format!("re-serialising JSON for column {col}: {e}"))
-    })?;
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|e| BasinError::internal(format!("re-serialising JSON for column {col}: {e}")))?;
     Ok(Some(bytes))
 }
 
@@ -619,9 +613,9 @@ fn check_null_allowed(field: &arrow_schema::Field) -> Result<()> {
 fn coerce_i64(expr: &Expr) -> Result<Option<i64>> {
     match peel_unary(expr) {
         (negated, Expr::Value(Value::Number(s, _))) => {
-            let parsed: i64 = s
-                .parse()
-                .map_err(|e| BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}")))?;
+            let parsed: i64 = s.parse().map_err(|e| {
+                BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
+            })?;
             Ok(Some(if negated { -parsed } else { parsed }))
         }
         (false, Expr::Value(Value::Null)) => Ok(None),
@@ -659,12 +653,7 @@ fn coerce_f64(expr: &Expr) -> Result<Option<f64>> {
 /// numeric; sqlparser parses these as `Value::Number` strings, which we
 /// pass to a manual base-10 parser to keep the implementation small —
 /// a parse error here is preferable to silent f64 rounding).
-fn coerce_decimal128(
-    expr: &Expr,
-    precision: u8,
-    scale: i8,
-    col: &str,
-) -> Result<Option<i128>> {
+fn coerce_decimal128(expr: &Expr, precision: u8, scale: i8, col: &str) -> Result<Option<i128>> {
     let (negated, inner) = peel_unary(expr);
     let s = match inner {
         Expr::Value(Value::Number(s, _)) => s.as_str(),
@@ -700,7 +689,11 @@ fn coerce_decimal128(
 /// scale are silently dropped (matching PG); fractional digits that
 /// would require *more* scale than the column allows are an error so the
 /// user sees the precision-loss explicitly.
-fn parse_decimal_to_i128(s: &str, precision: u8, target_scale: i8) -> std::result::Result<i128, String> {
+fn parse_decimal_to_i128(
+    s: &str,
+    precision: u8,
+    target_scale: i8,
+) -> std::result::Result<i128, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty literal".into());
@@ -708,11 +701,13 @@ fn parse_decimal_to_i128(s: &str, precision: u8, target_scale: i8) -> std::resul
     // Split off a possible exponent first; sqlparser keeps the `e`/`E`
     // verbatim in the number string. We re-anchor the decimal point by
     // adjusting the effective scale.
-    let (mantissa, exp): (&str, i32) = match s.find(|c: char| c == 'e' || c == 'E') {
+    let (mantissa, exp): (&str, i32) = match s.find(['e', 'E']) {
         Some(i) => {
             let (m, rest) = s.split_at(i);
             let exp_str = &rest[1..];
-            let exp: i32 = exp_str.parse().map_err(|_| format!("bad exponent {exp_str:?}"))?;
+            let exp: i32 = exp_str
+                .parse()
+                .map_err(|_| format!("bad exponent {exp_str:?}"))?;
             (m, exp)
         }
         None => (s, 0),
@@ -896,12 +891,13 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
             })?;
             Ok(Some(parsed))
         }
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => {
             if let Expr::Value(Value::Number(n, _)) = inner.as_ref() {
                 let parsed: i64 = n.parse().map_err(|e| {
-                    BasinError::InvalidSchema(format!(
-                        "bad timestamp integer literal -{n:?}: {e}"
-                    ))
+                    BasinError::InvalidSchema(format!("bad timestamp integer literal -{n:?}: {e}"))
                 })?;
                 Ok(Some(-parsed))
             } else {
@@ -1084,9 +1080,7 @@ fn ticks_to_utc_micros(ticks: i64, unit: Option<TimeUnit>) -> Result<DateTime<Ut
     let sub_us = micros.rem_euclid(1_000_000) as u32;
     Utc.timestamp_opt(secs, sub_us * 1000)
         .single()
-        .ok_or_else(|| {
-            BasinError::InvalidSchema(format!("timestamp {micros}us out of range"))
-        })
+        .ok_or_else(|| BasinError::InvalidSchema(format!("timestamp {micros}us out of range")))
 }
 
 #[cfg(test)]
@@ -1114,18 +1108,13 @@ mod tests {
     #[test]
     fn bulk_path_matches_slow_path_for_1000_rows() {
         // Build a 1000-row INSERT exercising Int64+Utf8+Boolean+Float64.
-        let mut sql = String::from(
-            "INSERT INTO t (id, name, ok, score) VALUES ",
-        );
+        let mut sql = String::from("INSERT INTO t (id, name, ok, score) VALUES ");
         for i in 0..1000 {
             if i > 0 {
                 sql.push(',');
             }
             let bool_lit = if i % 2 == 0 { "TRUE" } else { "FALSE" };
-            sql.push_str(&format!(
-                "({i}, 'row-{i}', {bool_lit}, {}.5)",
-                i as f64
-            ));
+            sql.push_str(&format!("({i}, 'row-{i}', {bool_lit}, {}.5)", i as f64));
         }
         let rows = rows_from_sql(&sql);
 
@@ -1206,7 +1195,11 @@ mod tests {
         let slow_a_batch = batch_from_rows(schema.clone(), &slow_a).unwrap();
         let slow_b_batch = batch_from_rows(schema.clone(), &slow_b).unwrap();
 
-        let bulk_ids = bulk.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let bulk_ids = bulk
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let bulk_names = bulk
             .column(1)
             .as_any()

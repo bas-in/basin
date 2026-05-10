@@ -223,9 +223,9 @@ async fn fuzz_cross_tenant_isolation() {
                     }
                 }
             }
-            ExecResult::Empty { tag } => panic!(
-                "expected rows from {sql:?}, got Empty({tag}) — seed={seed}"
-            ),
+            ExecResult::Empty { tag } => {
+                panic!("expected rows from {sql:?}, got Empty({tag}) — seed={seed}")
+            }
         }
     }
 

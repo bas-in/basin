@@ -103,9 +103,7 @@ impl ReactorSink {
                     if arr.is_null(0) {
                         return Ok(false);
                     }
-                    if let Some(b) =
-                        arr.as_any().downcast_ref::<arrow_array::BooleanArray>()
-                    {
+                    if let Some(b) = arr.as_any().downcast_ref::<arrow_array::BooleanArray>() {
                         return Ok(b.value(0));
                     }
                     return Err(BasinError::InvalidSchema(format!(
@@ -124,10 +122,7 @@ impl ReactorSink {
 
     async fn run_reactor_body(&self, reactor: &ReactorDef, event: &ChangeEvent) -> Result<()> {
         let body_sql = rewrite_sql_statement(&reactor.body, event).map_err(|e| {
-            BasinError::InvalidSchema(format!(
-                "reactor {:?}: body: {e}",
-                reactor.name
-            ))
+            BasinError::InvalidSchema(format!("reactor {:?}: body: {e}", reactor.name))
         })?;
         let _ = self.run_sql(event, &body_sql).await?;
         Ok(())
@@ -323,12 +318,7 @@ fn rewrite_expr(expr: &mut Expr, event: &ChangeEvent) {
                 rewrite_expr(else_, event);
             }
         }
-        Expr::Like {
-            expr, pattern, ..
-        }
-        | Expr::ILike {
-            expr, pattern, ..
-        } => {
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
             rewrite_expr(expr, event);
             rewrite_expr(pattern, event);
         }

@@ -31,11 +31,7 @@ pub trait EncryptionProvider: Send + Sync {
 
     /// Inverse of `wrap_key`. Given the wrapped sidecar, return the
     /// plaintext data key. Used at GET time.
-    async fn unwrap_key(
-        &self,
-        tenant: &TenantId,
-        wrapped: &WrappedKey,
-    ) -> Result<Vec<u8>>;
+    async fn unwrap_key(&self, tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>>;
 
     /// Optional: when the engine has a [`TenantStorageConfig`] for this
     /// tenant, it threads it through here so the impl can route to the
@@ -160,11 +156,7 @@ mod tests {
             Ok((plaintext, WrappedKey(sidecar)))
         }
 
-        async fn unwrap_key(
-            &self,
-            _tenant: &TenantId,
-            wrapped: &WrappedKey,
-        ) -> Result<Vec<u8>> {
+        async fn unwrap_key(&self, _tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
             let bytes = &wrapped.0;
             if bytes.first().copied() != Some(0x01) {
                 return Err(BasinError::storage("mock unwrap: bad version byte"));

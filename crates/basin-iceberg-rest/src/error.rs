@@ -103,9 +103,7 @@ impl From<BasinError> for IcebergRestError {
                 tracing::error!(?err, "ISOLATION VIOLATION at iceberg-rest layer");
                 IcebergRestError::Internal("internal error".to_string())
             }
-            BasinError::FeatureNotSupported(_) => {
-                IcebergRestError::NotImplemented(err.to_string())
-            }
+            BasinError::FeatureNotSupported(_) => IcebergRestError::NotImplemented(err.to_string()),
             _ => IcebergRestError::Internal(err.to_string()),
         }
     }

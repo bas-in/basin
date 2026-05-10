@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::TenantId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
@@ -129,10 +129,8 @@ async fn viability_migration_manager() {
         .list_snapshots_project_wide(&tenant)
         .await
         .expect("list_snapshots_project_wide");
-    let observed_tables: std::collections::BTreeSet<String> = entries
-        .iter()
-        .map(|e| e.table.to_string())
-        .collect();
+    let observed_tables: std::collections::BTreeSet<String> =
+        entries.iter().map(|e| e.table.to_string()).collect();
     for name in &table_names {
         assert!(
             observed_tables.contains(*name),

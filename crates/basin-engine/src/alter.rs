@@ -135,7 +135,10 @@ pub(crate) fn match_basin_alter_extension(sql: &str) -> Result<Option<BasinAlter
     // Bare `CLUSTER BY (...)` — no `SET` prefix.
     if let Some(rest) = strip_keyword(after_alter_table, &lower_rest, "cluster by") {
         let columns = parse_paren_ident_list(rest)?;
-        return Ok(Some(BasinAlterExtension::SetClusterColumns { table, columns }));
+        return Ok(Some(BasinAlterExtension::SetClusterColumns {
+            table,
+            columns,
+        }));
     }
 
     if !after_alter_table
@@ -169,11 +172,17 @@ pub(crate) fn match_basin_alter_extension(sql: &str) -> Result<Option<BasinAlter
     }
     if let Some(rest) = strip_keyword(after_set, &after_set_lower, "cold_age_column") {
         let column = parse_eq_string_or_ident(rest, "cold_age_column")?;
-        return Ok(Some(BasinAlterExtension::SetColdAgeColumn { table, column }));
+        return Ok(Some(BasinAlterExtension::SetColdAgeColumn {
+            table,
+            column,
+        }));
     }
     if let Some(rest) = strip_keyword(after_set, &after_set_lower, "bloom filters on") {
         let columns = parse_paren_ident_list(rest)?;
-        return Ok(Some(BasinAlterExtension::SetBloomFilterColumns { table, columns }));
+        return Ok(Some(BasinAlterExtension::SetBloomFilterColumns {
+            table,
+            columns,
+        }));
     }
     if let Some(rest) = strip_keyword(after_set, &after_set_lower, "row_group_rows") {
         let value = parse_eq_int(rest, "row_group_rows")?;
@@ -283,7 +292,9 @@ impl BasinAlterExtension {
             }
             BasinAlterExtension::ResetClusterColumns { table } => {
                 let _ = catalog.load_table(tenant, &table).await?;
-                catalog.set_cluster_columns(tenant, &table, Vec::new()).await?;
+                catalog
+                    .set_cluster_columns(tenant, &table, Vec::new())
+                    .await?;
                 Ok("ALTER TABLE")
             }
         }
@@ -354,7 +365,8 @@ async fn add_column(
             ColumnOption::NotNull => {
                 return Err(BasinError::InvalidSchema(
                     "ALTER TABLE ADD COLUMN with NOT NULL is not supported in v0.1; \
-                     existing rows would have no value for the new column".into(),
+                     existing rows would have no value for the new column"
+                        .into(),
                 ));
             }
             ColumnOption::Null => nullable = true,
@@ -497,9 +509,7 @@ fn parse_paren_ident_list(rest: &str) -> Result<Vec<String>> {
         ))
     })?;
     let close = after_paren.rfind(')').ok_or_else(|| {
-        BasinError::InvalidSchema(
-            "ALTER TABLE … SET BLOOM FILTERS ON: missing closing ')'".into(),
-        )
+        BasinError::InvalidSchema("ALTER TABLE … SET BLOOM FILTERS ON: missing closing ')'".into())
     })?;
     let inside = &after_paren[..close];
     let mut out = Vec::new();
@@ -558,11 +568,10 @@ mod tests {
 
     #[test]
     fn match_set_bloom_filters() {
-        let m = match_basin_alter_extension(
-            "ALTER TABLE events SET BLOOM FILTERS ON (id, owner_id)",
-        )
-        .unwrap()
-        .unwrap();
+        let m =
+            match_basin_alter_extension("ALTER TABLE events SET BLOOM FILTERS ON (id, owner_id)")
+                .unwrap()
+                .unwrap();
         assert_eq!(
             m,
             BasinAlterExtension::SetBloomFilterColumns {
@@ -580,8 +589,7 @@ mod tests {
             match_basin_alter_extension("ALTER TABLE events ADD COLUMN device_id TEXT").unwrap();
         assert!(m.is_none());
         // Non-ALTER statement.
-        let m =
-            match_basin_alter_extension("SELECT * FROM events WHERE id = 1").unwrap();
+        let m = match_basin_alter_extension("SELECT * FROM events WHERE id = 1").unwrap();
         assert!(m.is_none());
         // ALTER TABLE … ENABLE RLS — handled by sqlparser AST + rls.rs.
         let m =
@@ -591,8 +599,9 @@ mod tests {
 
     #[test]
     fn match_handles_trailing_semicolon_and_case() {
-        let m =
-            match_basin_alter_extension("alter table EVENTS set cold_after=42;").unwrap().unwrap();
+        let m = match_basin_alter_extension("alter table EVENTS set cold_after=42;")
+            .unwrap()
+            .unwrap();
         match m {
             BasinAlterExtension::SetColdAfter { seconds, .. } => assert_eq!(seconds, 42),
             other => panic!("unexpected: {other:?}"),
@@ -628,11 +637,11 @@ mod tests {
 
     #[test]
     fn set_row_group_rows_rejects_non_positive() {
-        let err = match_basin_alter_extension("ALTER TABLE events SET row_group_rows = 0")
-            .unwrap_err();
+        let err =
+            match_basin_alter_extension("ALTER TABLE events SET row_group_rows = 0").unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
-        let err = match_basin_alter_extension("ALTER TABLE events SET row_group_rows = -7")
-            .unwrap_err();
+        let err =
+            match_basin_alter_extension("ALTER TABLE events SET row_group_rows = -7").unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
     }
 

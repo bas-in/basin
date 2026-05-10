@@ -127,15 +127,9 @@ async fn pk_column_must_be_not_null_at_create() {
         .execute("CREATE TABLE t (id BIGINT NULL PRIMARY KEY)")
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, BasinError::InvalidSchema(_)),
-        "got {err:?}"
-    );
+    assert!(matches!(err, BasinError::InvalidSchema(_)), "got {err:?}");
     let msg = err.to_string();
-    assert!(
-        msg.to_ascii_lowercase().contains("not null"),
-        "msg = {msg}"
-    );
+    assert!(msg.to_ascii_lowercase().contains("not null"), "msg = {msg}");
 }
 
 #[tokio::test]
@@ -257,9 +251,11 @@ async fn fk_insert_with_existing_referenced_row() {
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id))")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id))",
+    )
+    .await
+    .unwrap();
     sess.execute("INSERT INTO users VALUES (1, 'Ada')")
         .await
         .unwrap();
@@ -277,9 +273,11 @@ async fn fk_insert_without_referenced_row_fails() {
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id))")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id))",
+    )
+    .await
+    .unwrap();
     let err = sess
         .execute("INSERT INTO orders VALUES (10, 999)")
         .await
@@ -299,9 +297,11 @@ async fn fk_delete_referenced_no_action_blocks() {
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id))")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id))",
+    )
+    .await
+    .unwrap();
     sess.execute("INSERT INTO users VALUES (1, 'Ada')")
         .await
         .unwrap();
@@ -359,10 +359,7 @@ async fn fk_referenced_must_be_pk_or_unique() {
         .execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, user_email TEXT NOT NULL REFERENCES users(email))")
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, BasinError::InvalidSchema(_)),
-        "got {err:?}"
-    );
+    assert!(matches!(err, BasinError::InvalidSchema(_)), "got {err:?}");
 }
 
 #[tokio::test]
@@ -403,8 +400,14 @@ async fn fk_in_information_schema_referential_constraints() {
     .await;
     let updates = col_string(&batches, "update_rule");
     let deletes = col_string(&batches, "delete_rule");
-    assert!(updates.contains(&"NO ACTION".to_string()), "updates={updates:?}");
-    assert!(deletes.contains(&"CASCADE".to_string()), "deletes={deletes:?}");
+    assert!(
+        updates.contains(&"NO ACTION".to_string()),
+        "updates={updates:?}"
+    );
+    assert!(
+        deletes.contains(&"CASCADE".to_string()),
+        "deletes={deletes:?}"
+    );
 }
 
 // ----- pg_constraint / table_constraints / key_column_usage --------------
@@ -430,7 +433,10 @@ async fn pg_constraint_lists_pk_check_fk_rows() {
     let pk_count = contypes.iter().filter(|s| s == &"p").count();
     let fk_count = contypes.iter().filter(|s| s == &"f").count();
     let ck_count = contypes.iter().filter(|s| s == &"c").count();
-    assert_eq!(pk_count, 2, "expected 2 PKs (users + orders), got {contypes:?}");
+    assert_eq!(
+        pk_count, 2,
+        "expected 2 PKs (users + orders), got {contypes:?}"
+    );
     assert_eq!(fk_count, 1, "expected 1 FK, got {contypes:?}");
     assert_eq!(ck_count, 1, "expected 1 CHECK, got {contypes:?}");
 }

@@ -65,10 +65,7 @@ fn decode_accepts_big_endian() {
 #[test]
 fn decode_rejects_wrong_length() {
     let err = decode_point(&[0u8; 20]).unwrap_err();
-    assert!(matches!(
-        err,
-        basin_geo::WkbError::BadLength { got: 20 }
-    ));
+    assert!(matches!(err, basin_geo::WkbError::BadLength { got: 20 }));
 }
 
 #[test]

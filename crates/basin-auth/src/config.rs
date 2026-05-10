@@ -136,12 +136,19 @@ impl AuthConfig {
         };
 
         // --- Optional knobs -------------------------------------------------
-        let token_ttl = optional_duration_secs("BASIN_AUTH_TOKEN_TTL", DEFAULT_TOKEN_TTL_SECS, &mut invalid);
-        let refresh_ttl =
-            optional_duration_secs("BASIN_AUTH_REFRESH_TTL", DEFAULT_REFRESH_TTL_SECS, &mut invalid);
+        let token_ttl =
+            optional_duration_secs("BASIN_AUTH_TOKEN_TTL", DEFAULT_TOKEN_TTL_SECS, &mut invalid);
+        let refresh_ttl = optional_duration_secs(
+            "BASIN_AUTH_REFRESH_TTL",
+            DEFAULT_REFRESH_TTL_SECS,
+            &mut invalid,
+        );
         let bcrypt_cost = optional_u32("BASIN_AUTH_BCRYPT_COST", DEFAULT_BCRYPT_COST, &mut invalid);
-        let password_min_len =
-            optional_usize("BASIN_AUTH_PASSWORD_MIN_LEN", DEFAULT_PASSWORD_MIN_LEN, &mut invalid);
+        let password_min_len = optional_usize(
+            "BASIN_AUTH_PASSWORD_MIN_LEN",
+            DEFAULT_PASSWORD_MIN_LEN,
+            &mut invalid,
+        );
         let rate_limit_per_ip_per_min = optional_u32(
             "BASIN_AUTH_RATE_LIMIT_PER_IP_PER_MIN",
             DEFAULT_RATE_LIMIT_PER_IP_PER_MIN,

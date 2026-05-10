@@ -33,7 +33,10 @@ pub enum LogFormat {
 ///
 /// Idempotent only at first call — repeated calls return Err. Tests should
 /// call [`try_init_for_tests`] which silently ignores reinit errors.
-pub fn init(default_level: Level, format: LogFormat) -> Result<(), tracing_subscriber::util::TryInitError> {
+pub fn init(
+    default_level: Level,
+    format: LogFormat,
+) -> Result<(), tracing_subscriber::util::TryInitError> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_level.to_string()));
 
@@ -89,7 +92,11 @@ struct LatencyRing {
 
 impl Default for LatencyRing {
     fn default() -> Self {
-        Self { samples: [0; LATENCY_RING_SIZE], head: 0, len: 0 }
+        Self {
+            samples: [0; LATENCY_RING_SIZE],
+            head: 0,
+            len: 0,
+        }
     }
 }
 
@@ -177,12 +184,18 @@ impl TenantCounterRegistry {
     /// hold their own handle without re-locking on every bump.
     pub fn for_tenant(&self, tenant: &TenantId) -> Arc<TenantCounters> {
         {
-            let map = self.counters.read().expect("tenant counter registry poisoned");
+            let map = self
+                .counters
+                .read()
+                .expect("tenant counter registry poisoned");
             if let Some(c) = map.get(tenant) {
                 return c.clone();
             }
         }
-        let mut map = self.counters.write().expect("tenant counter registry poisoned");
+        let mut map = self
+            .counters
+            .write()
+            .expect("tenant counter registry poisoned");
         map.entry(*tenant)
             .or_insert_with(|| Arc::new(TenantCounters::default()))
             .clone()
@@ -190,7 +203,10 @@ impl TenantCounterRegistry {
 
     /// `None` for tenants with no recorded activity yet.
     pub fn snapshot(&self, tenant: &TenantId) -> Option<TenantCountersSnapshot> {
-        let map = self.counters.read().expect("tenant counter registry poisoned");
+        let map = self
+            .counters
+            .read()
+            .expect("tenant counter registry poisoned");
         map.get(tenant).map(|c| c.snapshot())
     }
 }

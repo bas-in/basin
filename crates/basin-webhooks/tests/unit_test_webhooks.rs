@@ -14,13 +14,11 @@ mod common;
 
 use std::sync::Arc;
 
-use basin_common::{
-    ChangeEvent, ChangeEventSink, ChangeOp, TableName, TenantId,
-};
+use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, TenantId};
 use basin_net::HttpClient;
 use basin_webhooks::{
-    AttemptOutcome, RetryQueue, TestClock, WebhookConfig, WebhookOps, WebhookRegistry,
-    WebhookSink, WebhookSubscription, WebhookSubscriptionId, WebhookWorker,
+    AttemptOutcome, RetryQueue, TestClock, WebhookConfig, WebhookOps, WebhookRegistry, WebhookSink,
+    WebhookSubscription, WebhookSubscriptionId, WebhookWorker,
 };
 use chrono::Utc;
 use tempfile::TempDir;
@@ -137,7 +135,10 @@ async fn webhook_subscription_routes_event() {
     let body = body_as_json(&reqs[0]);
     assert_eq!(body["op"], "insert");
     assert_eq!(body["seq"], 1);
-    assert_eq!(body["subscription_id"], serde_json::Value::String(id.to_string()));
+    assert_eq!(
+        body["subscription_id"],
+        serde_json::Value::String(id.to_string())
+    );
     let key = reqs[0]
         .headers
         .get("x-basin-idempotency-key")
@@ -235,7 +236,13 @@ async fn webhook_4xx_kills_immediately() {
     net.allow_host(&tenant, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(tenant, "orders", server.url("/hook"), WebhookOps::INSERT, 16);
+    let s = sub(
+        tenant,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        16,
+    );
     let id = stack.registry.add(s).await.unwrap();
 
     let ev = evt(tenant, "orders", ChangeOp::Insert, 1);
@@ -244,9 +251,16 @@ async fn webhook_4xx_kills_immediately() {
     let o = stack.worker.tick().await;
     assert_eq!(o.len(), 1);
     match &o[0] {
-        AttemptOutcome::DeadLettered { attempt_count, reason, .. } => {
+        AttemptOutcome::DeadLettered {
+            attempt_count,
+            reason,
+            ..
+        } => {
             assert_eq!(*attempt_count, 1, "dead-letter on the first attempt");
-            assert!(reason.contains("422"), "reason includes the status: {reason}");
+            assert!(
+                reason.contains("422"),
+                "reason includes the status: {reason}"
+            );
         }
         other => panic!("expected dead-letter, got {other:?}"),
     }
@@ -305,11 +319,7 @@ async fn webhook_auto_pause_after_24h() {
     );
     let registry = WebhookRegistry::new();
     let clock = TestClock::new(Utc::now());
-    let sink = WebhookSink::with_clock(
-        registry.clone(),
-        queue.clone(),
-        Arc::new(clock.clone()),
-    );
+    let sink = WebhookSink::with_clock(registry.clone(), queue.clone(), Arc::new(clock.clone()));
     let worker = WebhookWorker::with_clock(
         cfg.clone(),
         queue.clone(),
@@ -318,7 +328,13 @@ async fn webhook_auto_pause_after_24h() {
         Arc::new(clock.clone()),
     );
 
-    let s = sub(tenant, "orders", server.url("/hook"), WebhookOps::INSERT, 100);
+    let s = sub(
+        tenant,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        100,
+    );
     let id = registry.add(s).await.unwrap();
 
     let ev = evt(tenant, "orders", ChangeOp::Insert, 1);
@@ -357,7 +373,10 @@ async fn cross_tenant_isolation() {
     let evb = evt(b, "orders", ChangeOp::Insert, 1);
     stack.sink.publish(&evb).await.unwrap();
     let _ = stack.worker.tick().await;
-    assert!(server.requests().is_empty(), "B's event must not reach A's hook");
+    assert!(
+        server.requests().is_empty(),
+        "B's event must not reach A's hook"
+    );
 
     // Tenant A's event lands.
     let eva = evt(a, "orders", ChangeOp::Insert, 1);
@@ -458,7 +477,5 @@ async fn post_commit_failure_does_not_rollback() {
 fn futures_block_on_depth(queue: &Arc<RetryQueue>) -> usize {
     // We can't .await inside a sync closure; use a blocking handle on
     // the current runtime.
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(queue.depth())
-    })
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(queue.depth()))
 }

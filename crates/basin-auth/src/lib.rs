@@ -155,21 +155,12 @@ impl AuthService {
     // --- public flows -------------------------------------------------------
 
     #[instrument(skip(self, password), fields(tenant = %tenant, email = %email))]
-    pub async fn signup(
-        &self,
-        tenant: &TenantId,
-        email: &str,
-        password: &str,
-    ) -> Result<UserId> {
+    pub async fn signup(&self, tenant: &TenantId, email: &str, password: &str) -> Result<UserId> {
         flows::signup::signup(&self.inner, tenant, email, password).await
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, user_id = %user))]
-    pub async fn request_email_verification(
-        &self,
-        tenant: &TenantId,
-        user: UserId,
-    ) -> Result<()> {
+    pub async fn request_email_verification(&self, tenant: &TenantId, user: UserId) -> Result<()> {
         flows::signup::request_email_verification(&self.inner, tenant, user).await
     }
 
@@ -179,12 +170,7 @@ impl AuthService {
     }
 
     #[instrument(skip(self, password), fields(tenant = %tenant, email = %email))]
-    pub async fn signin(
-        &self,
-        tenant: &TenantId,
-        email: &str,
-        password: &str,
-    ) -> Result<Tokens> {
+    pub async fn signin(&self, tenant: &TenantId, email: &str, password: &str) -> Result<Tokens> {
         flows::signin::signin(&self.inner, tenant, email, password).await
     }
 
@@ -199,11 +185,7 @@ impl AuthService {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, email = %email))]
-    pub async fn request_password_reset(
-        &self,
-        tenant: &TenantId,
-        email: &str,
-    ) -> Result<()> {
+    pub async fn request_password_reset(&self, tenant: &TenantId, email: &str) -> Result<()> {
         flows::reset::request_password_reset(&self.inner, tenant, email).await
     }
 
@@ -246,11 +228,7 @@ impl AuthService {
     }
 
     #[instrument(skip(self, token), fields(tenant = %tenant))]
-    pub async fn signin_with_magic_link(
-        &self,
-        tenant: &TenantId,
-        token: &str,
-    ) -> Result<Tokens> {
+    pub async fn signin_with_magic_link(&self, tenant: &TenantId, token: &str) -> Result<Tokens> {
         flows::magic::signin_with_magic_link(&self.inner, tenant, token).await
     }
 
@@ -453,10 +431,7 @@ mod tests {
     const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 
     fn unique_schema() -> String {
-        format!(
-            "basin_auth_test_{}",
-            Ulid::new().to_string().to_lowercase()
-        )
+        format!("basin_auth_test_{}", Ulid::new().to_string().to_lowercase())
     }
 
     /// Drop-guard. Mirrors the pattern in `basin-catalog::postgres`.
@@ -726,8 +701,10 @@ mod tests {
 
         // Old refresh must now fail.
         let err = svc.refresh(&toks.refresh_token).await.unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("invalid")
-            || err.to_string().to_lowercase().contains("revoked"));
+        assert!(
+            err.to_string().to_lowercase().contains("invalid")
+                || err.to_string().to_lowercase().contains("revoked")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -763,7 +740,9 @@ mod tests {
         svc.request_email_verification(&t, user).await.unwrap();
         svc.verify_email(&t, &last_token(&mailer)).await.unwrap();
 
-        svc.request_password_reset(&t, "pr@example.com").await.unwrap();
+        svc.request_password_reset(&t, "pr@example.com")
+            .await
+            .unwrap();
         let token = last_token(&mailer);
         svc.reset_password(&t, &token, "newlongpassword!")
             .await
@@ -832,8 +811,10 @@ mod tests {
         drop(client);
 
         let err = svc.verify_email(&t, &token).await.unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("expired")
-            || err.to_string().to_lowercase().contains("invalid"));
+        assert!(
+            err.to_string().to_lowercase().contains("expired")
+                || err.to_string().to_lowercase().contains("invalid")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -940,7 +921,10 @@ mod tests {
         let Some((svc, _m, _g)) = try_connect().await else {
             return;
         };
-        let err = svc.validate_api_key("nope-not-a-real-key").await.unwrap_err();
+        let err = svc
+            .validate_api_key("nope-not-a-real-key")
+            .await
+            .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("invalid"));
     }
 
@@ -1003,11 +987,21 @@ mod tests {
         let issued = svc.issue_api_key(user, &t, "ts").await.unwrap();
         // Before validation, last_used_at must be NULL.
         let pre = svc.list_api_keys(user, &t).await.unwrap();
-        assert!(pre.iter().find(|d| d.id == issued.id).unwrap().last_used_at.is_none());
+        assert!(pre
+            .iter()
+            .find(|d| d.id == issued.id)
+            .unwrap()
+            .last_used_at
+            .is_none());
 
         svc.validate_api_key(&issued.secret).await.unwrap();
         let post = svc.list_api_keys(user, &t).await.unwrap();
-        assert!(post.iter().find(|d| d.id == issued.id).unwrap().last_used_at.is_some());
+        assert!(post
+            .iter()
+            .find(|d| d.id == issued.id)
+            .unwrap()
+            .last_used_at
+            .is_some());
     }
 
     // --- session-setting tests ----------------------------------------------
@@ -1026,7 +1020,10 @@ mod tests {
             .await
             .unwrap();
         let got = svc.get_session_settings(user, &t).await.unwrap();
-        assert_eq!(got.get("timezone").map(|s| s.as_str()), Some("America/New_York"));
+        assert_eq!(
+            got.get("timezone").map(|s| s.as_str()),
+            Some("America/New_York")
+        );
         assert_eq!(got.get("language").map(|s| s.as_str()), Some("en-US"));
     }
 
@@ -1180,11 +1177,11 @@ mod tests {
             _ => return,
         };
         let _g = SchemaGuard { schema };
-        let err = svc.request_email_link("anyone@example.com").await.unwrap_err();
-        assert!(
-            err.to_string().contains("E_EMAIL_DISABLED"),
-            "got {err:?}"
-        );
+        let err = svc
+            .request_email_link("anyone@example.com")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("E_EMAIL_DISABLED"), "got {err:?}");
         assert!(!svc.is_email_enabled());
     }
 

@@ -29,8 +29,8 @@
 //! is tracked as a v0.3 follow-up.
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Query, SelectItem, SetExpr, Statement,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query,
+    SelectItem, SetExpr, Statement,
 };
 
 /// The marker we look for in the raw SQL string. Keep this in one place so
@@ -159,9 +159,7 @@ fn is_aggregate_function(f: &Function) -> bool {
 
 fn function_args_contain_aggregate(f: &Function) -> bool {
     match &f.args {
-        FunctionArguments::List(list) => {
-            list.args.iter().any(function_arg_contains_aggregate)
-        }
+        FunctionArguments::List(list) => list.args.iter().any(function_arg_contains_aggregate),
         FunctionArguments::Subquery(_) | FunctionArguments::None => false,
     }
 }
@@ -206,7 +204,10 @@ mod tests {
             "SELECT min(x), max(x) FROM t",
             "SELECT stddev(x) FROM t",
         ] {
-            assert!(is_analytical(&parse(sql), sql), "expected analytical for {sql}");
+            assert!(
+                is_analytical(&parse(sql), sql),
+                "expected analytical for {sql}"
+            );
         }
     }
 

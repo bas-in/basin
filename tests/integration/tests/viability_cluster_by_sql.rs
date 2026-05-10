@@ -58,11 +58,9 @@ async fn viability_cluster_by_sql() {
     // 1) CREATE TABLE … CLUSTER BY (...). The trailing clause is stripped
     //    pre-parse, the table is created, then `set_cluster_columns` is
     //    invoked with the extracted column list.
-    sess.execute(
-        "CREATE TABLE foo (id BIGINT NOT NULL, ts BIGINT NOT NULL) CLUSTER BY (id, ts)",
-    )
-    .await
-    .expect("CREATE TABLE … CLUSTER BY (...)");
+    sess.execute("CREATE TABLE foo (id BIGINT NOT NULL, ts BIGINT NOT NULL) CLUSTER BY (id, ts)")
+        .await
+        .expect("CREATE TABLE … CLUSTER BY (...)");
     let table = TableName::new("foo").unwrap();
     let m = catalog.load_table(&tenant, &table).await.unwrap();
     assert_eq!(m.cluster_columns, vec!["id".to_string(), "ts".to_string()]);
@@ -91,9 +89,7 @@ async fn viability_cluster_by_sql() {
     // 4) Reject CLUSTER BY column not in the table schema. Catches the
     //    common typo before we silently produce unsorted Parquet files.
     let res = sess
-        .execute(
-            "CREATE TABLE bar (a BIGINT NOT NULL) CLUSTER BY (does_not_exist)",
-        )
+        .execute("CREATE TABLE bar (a BIGINT NOT NULL) CLUSTER BY (does_not_exist)")
         .await;
     assert!(
         res.is_err(),
@@ -106,11 +102,9 @@ async fn viability_cluster_by_sql() {
     //    runs on every Parquet flush so within a single row group the
     //    rows are in cluster-column order. A single-batch INSERT lands
     //    in one file, so the SELECT is in physical (sorted) order.
-    sess.execute(
-        "CREATE TABLE bench (id BIGINT NOT NULL, payload TEXT NOT NULL) CLUSTER BY (id)",
-    )
-    .await
-    .expect("CREATE TABLE bench CLUSTER BY (id)");
+    sess.execute("CREATE TABLE bench (id BIGINT NOT NULL, payload TEXT NOT NULL) CLUSTER BY (id)")
+        .await
+        .expect("CREATE TABLE bench CLUSTER BY (id)");
     let bench_table = TableName::new("bench").unwrap();
     let m = catalog.load_table(&tenant, &bench_table).await.unwrap();
     assert_eq!(m.cluster_columns, vec!["id".to_string()]);
@@ -163,7 +157,10 @@ async fn viability_cluster_by_sql() {
         }),
     );
 
-    assert!(pass, "expected all 5 CLUSTER BY variants to pass; got {variants_passed:?}");
+    assert!(
+        pass,
+        "expected all 5 CLUSTER BY variants to pass; got {variants_passed:?}"
+    );
 }
 
 /// Pull a single Int64 column from an `ExecResult::Rows` batch list, in

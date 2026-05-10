@@ -122,7 +122,9 @@ fn schema() -> Arc<Schema> {
 fn make_batch(seed: u64, batch_idx: usize) -> RecordBatch {
     let start = (batch_idx * ROWS_PER_BATCH) as i64;
     let mut ids: Vec<i64> = (start..start + ROWS_PER_BATCH as i64).collect();
-    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(batch_idx as u64);
+    let mut state = seed
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(batch_idx as u64);
     for i in (1..ids.len()).rev() {
         state ^= state << 13;
         state ^= state >> 7;
@@ -188,10 +190,7 @@ impl ObjectStore for LatencyStore {
     async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
         self.inner.delete(location).await
     }
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(
@@ -408,19 +407,18 @@ async fn viability_perf_stack() {
         speedup, BAR_SPEEDUP, BAR_A_MIN_P50_MS, bar_a_ok, BAR_D_MAX_P99_MS, bar_d_ok,
     );
 
-    let layer_row =
-        |key: &str, label: &str, d: &LatencyDistribution| -> serde_json::Value {
-            json!({
-                "stack_layer": key,
-                "label": label,
-                "p50_ms": d.p50_ms,
-                "p99_ms": d.p99_ms,
-                "p999_ms": d.p999_ms,
-                "min_ms": d.min_ms,
-                "max_ms": d.max_ms,
-                "mean_ms": d.mean_ms,
-            })
-        };
+    let layer_row = |key: &str, label: &str, d: &LatencyDistribution| -> serde_json::Value {
+        json!({
+            "stack_layer": key,
+            "label": label,
+            "p50_ms": d.p50_ms,
+            "p99_ms": d.p99_ms,
+            "p999_ms": d.p999_ms,
+            "min_ms": d.min_ms,
+            "max_ms": d.max_ms,
+            "mean_ms": d.mean_ms,
+        })
+    };
     let rows = vec![
         layer_row("a_baseline", "(a) no cache", &dist_a),
         layer_row("b_disk", "(b) +disk cache", &dist_b),

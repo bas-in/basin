@@ -10,9 +10,7 @@ mod common;
 
 use std::sync::Arc;
 
-use basin_common::{
-    ChangeEvent, ChangeEventSink, ChangeOp, TableName, TenantId,
-};
+use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, TenantId};
 use basin_net::HttpClient;
 use basin_webhooks::{
     Clock, RetryQueue, TestClock, WebhookConfig, WebhookCountersRegistry, WebhookOps,
@@ -199,7 +197,10 @@ async fn metrics_dead_letter_counted() {
     let snap = stack.counters.snapshot(&tenant);
     assert_eq!(snap.deliveries_succeeded, 0);
     assert_eq!(snap.deliveries_failed, 2, "two non-2xx responses");
-    assert_eq!(snap.retries, 1, "only attempt 1 was a retry; 2 was terminal");
+    assert_eq!(
+        snap.retries, 1,
+        "only attempt 1 was a retry; 2 was terminal"
+    );
     assert_eq!(snap.dead_lettered, 1);
     assert_eq!(snap.pending_queue_depth, 0);
 }

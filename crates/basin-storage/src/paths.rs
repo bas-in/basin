@@ -161,9 +161,8 @@ mod tests {
         let id = Ulid::new();
         let key = data_file_key(None, &tenant, &table, &part, now, id);
         let s = key.as_ref();
-        let expected_prefix = format!(
-            "tenants/{tenant}/tables/orders/data/region:us/2026/04/30/{id}.parquet"
-        );
+        let expected_prefix =
+            format!("tenants/{tenant}/tables/orders/data/region:us/2026/04/30/{id}.parquet");
         assert_eq!(s, expected_prefix);
     }
 
@@ -173,14 +172,7 @@ mod tests {
         let table = TableName::new("t").unwrap();
         let part = PartitionKey::default_key();
         let root = ObjectPath::from("warehouse");
-        let key = data_file_key(
-            Some(&root),
-            &tenant,
-            &table,
-            &part,
-            Utc::now(),
-            Ulid::new(),
-        );
+        let key = data_file_key(Some(&root), &tenant, &table, &part, Utc::now(), Ulid::new());
         assert!(key.as_ref().starts_with("warehouse/tenants/"));
     }
 
@@ -198,14 +190,7 @@ mod tests {
             } else {
                 PartitionKey::new(format!("p{}", Ulid::new())).unwrap()
             };
-            let key = data_file_key(
-                None,
-                &tenant,
-                &table,
-                &part,
-                Utc::now(),
-                Ulid::new(),
-            );
+            let key = data_file_key(None, &tenant, &table, &part, Utc::now(), Ulid::new());
             let prefix = format!("tenants/{tenant}/");
             assert!(
                 key.as_ref().starts_with(&prefix),

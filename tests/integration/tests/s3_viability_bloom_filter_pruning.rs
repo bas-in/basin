@@ -21,9 +21,7 @@ use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{PartitionKey, TableName, TenantId};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
-use basin_storage::{
-    Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions,
-};
+use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use serde_json::json;
@@ -260,7 +258,8 @@ async fn run_bloom_only_phase(
     let id_arr: Int64Array = ids.iter().copied().collect();
     let payloads: Vec<String> = (0..ROWS).map(|i| format!("p-{:08}", i)).collect();
     let payload_arr: StringArray = payloads.iter().map(|s| Some(s.as_str())).collect();
-    let batch = RecordBatch::try_new(schema(), vec![Arc::new(id_arr), Arc::new(payload_arr)]).unwrap();
+    let batch =
+        RecordBatch::try_new(schema(), vec![Arc::new(id_arr), Arc::new(payload_arr)]).unwrap();
 
     let opts = WriteOptions {
         bloom_filter_columns: vec!["id".to_string()],
@@ -283,6 +282,9 @@ async fn run_bloom_only_phase(
     while let Some(b) = stream.next().await {
         rows += b.unwrap().num_rows();
     }
-    assert_eq!(rows, 0, "expected zero rows for absent in-range id={target}");
+    assert_eq!(
+        rows, 0,
+        "expected zero rows for absent in-range id={target}"
+    );
     counters.snapshot()
 }

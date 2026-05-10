@@ -57,8 +57,8 @@ use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -163,10 +163,7 @@ impl ObjectStore for CountingStore {
         self.inner.delete(location).await
     }
 
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         self.list_count.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix)
     }
@@ -228,13 +225,22 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
     let part = PartitionKey::default_key();
 
     let catalog = InMemoryCatalog::new();
-    catalog.create_table(&tenant, &table, &schema()).await.unwrap();
+    catalog
+        .create_table(&tenant, &table, &schema())
+        .await
+        .unwrap();
 
     // Two files with disjoint id ranges. file-A: 0..500; file-B: 500..1000.
     let batch_a = build_batch(0, 500);
-    let df_a = storage.write_batch(&tenant, &table, &part, &batch_a).await.unwrap();
+    let df_a = storage
+        .write_batch(&tenant, &table, &part, &batch_a)
+        .await
+        .unwrap();
     let batch_b = build_batch(500, 500);
-    let df_b = storage.write_batch(&tenant, &table, &part, &batch_b).await.unwrap();
+    let df_b = storage
+        .write_batch(&tenant, &table, &part, &batch_b)
+        .await
+        .unwrap();
 
     // Commit both via the catalog. After A4 the committed `DataFileRef`s
     // carry `column_stats`, so the catalog-loaded snapshot is enough to
@@ -268,21 +274,24 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
             .column_stats
             .get("id")
             .unwrap_or_else(|| panic!("catalog snapshot missing id stats for {}", f.path));
-        assert!(id_stats.min_bytes.is_some(), "missing min_bytes on {}", f.path);
-        assert!(id_stats.max_bytes.is_some(), "missing max_bytes on {}", f.path);
+        assert!(
+            id_stats.min_bytes.is_some(),
+            "missing min_bytes on {}",
+            f.path
+        );
+        assert!(
+            id_stats.max_bytes.is_some(),
+            "missing max_bytes on {}",
+            f.path
+        );
     }
 
     // Predicate that prunes EVERYTHING: id = 1500 is outside [0, 999].
-    let pred_all_out = CompoundPredicate::Atom(Predicate::Eq(
-        "id".into(),
-        ScalarValue::Int64(1500),
-    ));
+    let pred_all_out =
+        CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(1500)));
 
     // Predicate that prunes only file-A: id = 750 is in file-B's range only.
-    let pred_only_b = CompoundPredicate::Atom(Predicate::Eq(
-        "id".into(),
-        ScalarValue::Int64(750),
-    ));
+    let pred_only_b = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(750)));
 
     // ----- Catalog-stats prune: out-of-range predicate prunes both -----
     let mut survivors: Vec<ObjectPath> = Vec::new();
@@ -380,12 +389,8 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
     let mut selective_survivors: Vec<ObjectPath> = Vec::new();
     let mut pruned_paths: Vec<String> = Vec::new();
     for f in &head_snapshot.data_files {
-        let outcome = evaluate_compound_for_pruning(
-            &pred_only_b,
-            &f.column_stats,
-            &meta.schema,
-            f.row_count,
-        );
+        let outcome =
+            evaluate_compound_for_pruning(&pred_only_b, &f.column_stats, &meta.schema, f.row_count);
         match outcome {
             PruneOutcome::NoMatch => pruned_paths.push(f.path.clone()),
             _ => selective_survivors.push(ObjectPath::from(f.path.as_str())),

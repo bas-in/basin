@@ -71,16 +71,12 @@ async fn viability_row_group_sizing() {
 
     // Create both tables with identical schema. `events_small` immediately
     // gets the override; `events_default` keeps the writer global default.
-    sess.execute(
-        "CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
-    sess.execute(
-        "CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL)")
+        .await
+        .unwrap();
 
     // Catalog round-trip for the override before any INSERT runs — the
     // INSERT path reads `meta.row_group_rows` and feeds it to the writer.
@@ -125,9 +121,11 @@ async fn viability_row_group_sizing() {
         ExecResult::Empty { .. } => 0,
     };
     let default_snap = counters.snapshot();
-    assert_eq!(default_hits, 1, "expected one row for id={target} (default)");
-    let default_scan_rows =
-        default_snap.row_groups_scanned as usize * DEFAULT_RG_ROWS;
+    assert_eq!(
+        default_hits, 1,
+        "expected one row for id={target} (default)"
+    );
+    let default_scan_rows = default_snap.row_groups_scanned as usize * DEFAULT_RG_ROWS;
     println!(
         "[VIABILITY row_group_sizing] DEFAULT 65k: groups_considered={}, groups_scanned={}, rows_scanned≈{}",
         default_snap.row_groups_considered, default_snap.row_groups_scanned, default_scan_rows,

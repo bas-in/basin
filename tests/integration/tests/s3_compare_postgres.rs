@@ -52,9 +52,7 @@ impl Drop for SchemaGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });
@@ -69,7 +67,9 @@ impl Drop for SchemaGuard {
     }
 }
 
-async fn pg_connect(pg_cfg: &basin_integration_tests::test_config::PostgresConfig) -> Option<(Client, String)> {
+async fn pg_connect(
+    pg_cfg: &basin_integration_tests::test_config::PostgresConfig,
+) -> Option<(Client, String)> {
     let conn_str = format!(
         "host={} port={} user={} password={} dbname={}",
         pg_cfg.host, pg_cfg.port, pg_cfg.user, pg_cfg.password, pg_cfg.dbname
@@ -223,7 +223,10 @@ async fn s3_compare_postgres() {
             pg_point_ms.push(ms);
         }
     }
-    assert!(!pg_point_ms.is_empty(), "no PG execution time samples parsed");
+    assert!(
+        !pg_point_ms.is_empty(),
+        "no PG execution time samples parsed"
+    );
     let pg_point_p50 = median(&pg_point_ms);
 
     // ---- Basin path on real S3 ---------------------------------------------
@@ -259,9 +262,11 @@ async fn s3_compare_postgres() {
     });
     let tenant = TenantId::new();
     let sess = engine.open_session(tenant).await.unwrap();
-    sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
 
     let basin_insert_started = Instant::now();
     let mut row_idx: i64 = 0;

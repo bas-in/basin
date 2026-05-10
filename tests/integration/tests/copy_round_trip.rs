@@ -42,8 +42,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -117,11 +116,7 @@ async fn copy_from_stdin_round_trip() {
     sink.send(Bytes::from(payload.into_bytes()))
         .await
         .expect("send copy data");
-    let written = sink
-        .as_mut()
-        .finish()
-        .await
-        .expect("finish copy_in");
+    let written = sink.as_mut().finish().await.expect("finish copy_in");
     assert_eq!(written, 1000, "CommandComplete tag count");
 
     // Confirm via SELECT count(*).
@@ -134,10 +129,7 @@ async fn copy_from_stdin_round_trip() {
 
     // Spot-check one specific row: id=42 / body='body-42'.
     let row = client
-        .query_one(
-            "SELECT body FROM events WHERE id = $1",
-            &[&42i64],
-        )
+        .query_one("SELECT body FROM events WHERE id = $1", &[&42i64])
         .await
         .expect("spot check");
     let body: &str = row.get(0);
@@ -187,11 +179,7 @@ async fn copy_to_stdout_round_trip() {
     let mut seen = std::collections::HashMap::<i64, String>::new();
     for line in &rows {
         let mut parts = line.splitn(2, ',');
-        let id: i64 = parts
-            .next()
-            .expect("id col")
-            .parse()
-            .expect("id parse");
+        let id: i64 = parts.next().expect("id col").parse().expect("id parse");
         let label = parts.next().expect("label col").to_owned();
         seen.insert(id, label);
     }
@@ -259,9 +247,9 @@ async fn copy_rejects_unsupported_variants_without_desync() {
             .await
             .err()
             .unwrap_or_else(|| panic!("expected error for: {sql}"));
-        let dbe = err.as_db_error().unwrap_or_else(|| {
-            panic!("expected DbError for {sql:?}, got: {err}")
-        });
+        let dbe = err
+            .as_db_error()
+            .unwrap_or_else(|| panic!("expected DbError for {sql:?}, got: {err}"));
         assert_eq!(
             dbe.code().code(),
             "42601",

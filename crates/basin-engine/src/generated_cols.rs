@@ -38,7 +38,11 @@ pub(crate) async fn materialise_generated_columns(
     batch: RecordBatch,
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
-    if !schema.fields().iter().any(|f| field_is_generated(f).is_some()) {
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| field_is_generated(f).is_some())
+    {
         return Ok(batch);
     }
 
@@ -95,9 +99,7 @@ async fn eval_expression(
         .map_err(|e| BasinError::internal(format!("register temp table: {e}")))?;
 
     let df = ctx.sql(&rewritten).await.map_err(|e| {
-        BasinError::InvalidSchema(format!(
-            "generated column expression failed to plan: {e}"
-        ))
+        BasinError::InvalidSchema(format!("generated column expression failed to plan: {e}"))
     })?;
     let df_collected = df.collect().await.map_err(|e| {
         BasinError::InvalidSchema(format!(
@@ -118,10 +120,8 @@ async fn eval_expression(
         ws_batches.push(batch_df_to_ws(b)?);
     }
     let result_schema = ws_batches[0].schema();
-    let merged_batch =
-        arrow_select::concat::concat_batches(&result_schema, &ws_batches).map_err(|e| {
-            BasinError::internal(format!("concat generated col output: {e}"))
-        })?;
+    let merged_batch = arrow_select::concat::concat_batches(&result_schema, &ws_batches)
+        .map_err(|e| BasinError::internal(format!("concat generated col output: {e}")))?;
     let merged = merged_batch.column(0).clone();
     if merged.len() != batch.num_rows() {
         return Err(BasinError::internal(format!(
@@ -147,11 +147,7 @@ async fn eval_expression(
 
 /// Replace `batch`'s column at `col_idx` with `new_col` and return a new
 /// `RecordBatch` (shared columns are `Arc::clone`'d).
-fn swap_column(
-    batch: &RecordBatch,
-    col_idx: usize,
-    new_col: ArrayRef,
-) -> Result<RecordBatch> {
+fn swap_column(batch: &RecordBatch, col_idx: usize, new_col: ArrayRef) -> Result<RecordBatch> {
     let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
     cols[col_idx] = new_col;
     RecordBatch::try_new(batch.schema(), cols)
@@ -170,7 +166,11 @@ pub(crate) async fn materialise_generated_columns_masked(
     mask: &BooleanArray,
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
-    if !schema.fields().iter().any(|f| field_is_generated(f).is_some()) {
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| field_is_generated(f).is_some())
+    {
         return Ok(batch);
     }
     debug_assert_eq!(mask.len(), batch.num_rows());

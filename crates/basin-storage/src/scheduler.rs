@@ -493,7 +493,11 @@ impl Scheduler {
 
             // If more remain, re-push a fresh entry for the new head.
             if !queue_drained {
-                if let Some(d) = state.queues.get(&top.tenant).and_then(|q| q.head_deadline()) {
+                if let Some(d) = state
+                    .queues
+                    .get(&top.tenant)
+                    .and_then(|q| q.head_deadline())
+                {
                     let seq = state.next_seq;
                     state.next_seq = state.next_seq.wrapping_add(1);
                     state.heap.push(Reverse(DeadlineEntry {
@@ -813,5 +817,4 @@ mod tests {
             p99
         );
     }
-
 }

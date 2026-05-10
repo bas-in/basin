@@ -9,7 +9,8 @@ use basin_net::{AllowList, GuardConfig, HttpClient, RateLimit};
 
 #[tokio::test]
 async fn burst_is_capped_to_governor_budget() {
-    let client = HttpClient::with_config(GuardConfig::default(), AllowList::new(), RateLimit::new());
+    let client =
+        HttpClient::with_config(GuardConfig::default(), AllowList::new(), RateLimit::new());
     let tenant = TenantId::new();
     client.allow_host(&tenant, "127.0.0.1").await;
 
@@ -48,7 +49,8 @@ async fn burst_is_capped_to_governor_budget() {
 
 #[tokio::test]
 async fn rate_limit_is_per_tenant() {
-    let client = HttpClient::with_config(GuardConfig::default(), AllowList::new(), RateLimit::new());
+    let client =
+        HttpClient::with_config(GuardConfig::default(), AllowList::new(), RateLimit::new());
     let alice = TenantId::new();
     let bob = TenantId::new();
     client.allow_host(&alice, "127.0.0.1").await;

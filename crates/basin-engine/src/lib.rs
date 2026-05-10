@@ -39,8 +39,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 
 use arrow_array::RecordBatch;
@@ -182,7 +182,11 @@ impl Engine {
         &self,
         tenant: &TenantId,
     ) -> Result<Option<basin_storage::TenantStorageConfig>, basin_common::BasinError> {
-        self.inner.cfg.storage.get_tenant_storage_config(tenant).await
+        self.inner
+            .cfg
+            .storage
+            .get_tenant_storage_config(tenant)
+            .await
     }
 
     /// Attach an [`AnalyticalEngine`](basin_analytical::AnalyticalEngine) to
@@ -314,7 +318,9 @@ impl Engine {
     /// routings. Crate-private so external callers can't tamper with the
     /// counter (only [`Engine::analytical_routing_count`] is exposed).
     pub(crate) fn note_analytical_routed(&self) {
-        self.inner.analytical_routing_count.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .analytical_routing_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Number of statements successfully routed to the analytical path
@@ -327,7 +333,9 @@ impl Engine {
     /// Crate-private hook bumped by `executor::execute` when a vector
     /// `ORDER BY <-> LIMIT k` query is dispatched to the HNSW fast path.
     pub(crate) fn note_vector_routed(&self) {
-        self.inner.vector_routing_count.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .vector_routing_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Number of `ORDER BY <-> LIMIT k` statements served via the HNSW
@@ -457,10 +465,7 @@ impl TenantSession {
     }
 
     /// Return the schema cached at [`prepare`](Self::prepare) time.
-    pub async fn describe_statement(
-        &self,
-        handle: &StatementHandle,
-    ) -> Result<StatementSchema> {
+    pub async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema> {
         crate::prepared::describe_statement(self, handle).await
     }
 
@@ -554,7 +559,7 @@ mod tests {
             object_store: Arc::new(fs),
             root_prefix: None,
             disk_cache: None,
-        page_cache: None,
+            page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
         Engine::new(EngineConfig {
@@ -646,7 +651,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess.execute("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        let res = sess
+            .execute("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
                 assert_eq!(total_rows(&batches), 3);
@@ -693,13 +701,14 @@ mod tests {
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
             .unwrap();
-        sess.execute(
-            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
-        )
-        .await
-        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
+            .await
+            .unwrap();
 
-        let res = sess.execute("SELECT id, name FROM t WHERE id = 3").await.unwrap();
+        let res = sess
+            .execute("SELECT id, name FROM t WHERE id = 3")
+            .await
+            .unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
                 assert_eq!(total_rows(&batches), 1);
@@ -731,10 +740,18 @@ mod tests {
             .await
             .unwrap();
 
-        let ra = sa.execute("SELECT id, who FROM shared ORDER BY id").await.unwrap();
-        let rb = sb.execute("SELECT id, who FROM shared ORDER BY id").await.unwrap();
+        let ra = sa
+            .execute("SELECT id, who FROM shared ORDER BY id")
+            .await
+            .unwrap();
+        let rb = sb
+            .execute("SELECT id, who FROM shared ORDER BY id")
+            .await
+            .unwrap();
         let (ba, bb) = match (ra, rb) {
-            (ExecResult::Rows { batches: ba, .. }, ExecResult::Rows { batches: bb, .. }) => (ba, bb),
+            (ExecResult::Rows { batches: ba, .. }, ExecResult::Rows { batches: bb, .. }) => {
+                (ba, bb)
+            }
             _ => panic!("expected rows"),
         };
         assert_eq!(col_i64(&ba, "id"), vec![1, 2]);
@@ -753,7 +770,9 @@ mod tests {
         let eng = engine_in(&dir);
         let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-        sess.execute("CREATE TABLE alpha (id BIGINT)").await.unwrap();
+        sess.execute("CREATE TABLE alpha (id BIGINT)")
+            .await
+            .unwrap();
         sess.execute("CREATE TABLE beta (id BIGINT)").await.unwrap();
 
         let res = sess.execute("SHOW TABLES").await.unwrap();
@@ -855,10 +874,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_, schema) = sess
-            .prepare("INSERT INTO t VALUES ($1, $2)")
-            .await
-            .unwrap();
+        let (_, schema) = sess.prepare("INSERT INTO t VALUES ($1, $2)").await.unwrap();
         assert_eq!(schema.param_types.len(), 2);
         assert_eq!(schema.param_types[0], arrow_schema::DataType::Int64);
         assert_eq!(schema.param_types[1], arrow_schema::DataType::Utf8);
@@ -891,11 +907,9 @@ mod tests {
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
             .unwrap();
-        sess.execute(
-            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
-        )
-        .await
-        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1139,7 +1153,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess.execute("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        let res = sess
+            .execute("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
         let names = match res {
             ExecResult::Rows { batches, .. } => col_string(&batches, "name"),
             other => panic!("unexpected: {other:?}"),
@@ -1163,7 +1180,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess.execute("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        let res = sess
+            .execute("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
         let names = match res {
             ExecResult::Rows { batches, .. } => col_string(&batches, "name"),
             other => panic!("unexpected: {other:?}"),
@@ -1207,13 +1227,14 @@ mod tests {
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT)")
             .await
             .unwrap();
-        sess.execute(
-            "INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'c'), (4, NULL), (5, 'e')",
-        )
-        .await
-        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'c'), (4, NULL), (5, 'e')")
+            .await
+            .unwrap();
 
-        let res = sess.execute("DELETE FROM t WHERE name IS NULL").await.unwrap();
+        let res = sess
+            .execute("DELETE FROM t WHERE name IS NULL")
+            .await
+            .unwrap();
         match res {
             ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 2"),
             other => panic!("unexpected: {other:?}"),
@@ -1284,7 +1305,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess.execute("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        let res = sess
+            .execute("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
         let names = match res {
             ExecResult::Rows { batches, .. } => col_string(&batches, "name"),
             other => panic!("unexpected: {other:?}"),
@@ -1357,8 +1381,10 @@ mod tests {
             .into_iter()
             .map(|f| f.path.as_ref().to_string())
             .collect();
-        let kept_unchanged: Vec<&String> =
-            after_paths.iter().filter(|p| before_paths.contains(*p)).collect();
+        let kept_unchanged: Vec<&String> = after_paths
+            .iter()
+            .filter(|p| before_paths.contains(*p))
+            .collect();
         assert_eq!(
             kept_unchanged.len(),
             1,
@@ -1432,8 +1458,10 @@ mod tests {
             .into_iter()
             .map(|f| f.path.as_ref().to_string())
             .collect();
-        let kept_unchanged: Vec<&String> =
-            after_paths.iter().filter(|p| before_paths.contains(*p)).collect();
+        let kept_unchanged: Vec<&String> = after_paths
+            .iter()
+            .filter(|p| before_paths.contains(*p))
+            .collect();
         assert_eq!(
             kept_unchanged.len(),
             (FILE_COUNT - 1) as usize,
@@ -1492,11 +1520,9 @@ mod tests {
         )
         .await
         .unwrap();
-        sess.execute(
-            "INSERT INTO t VALUES (1, 'a', '2026-01-01T00:00:00Z')",
-        )
-        .await
-        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 'a', '2026-01-01T00:00:00Z')")
+            .await
+            .unwrap();
         let res = sess
             .execute("SELECT updated_at FROM t WHERE id = 1")
             .await
@@ -1507,7 +1533,9 @@ mod tests {
         };
 
         // Update only `name`; AUTO_UPDATE must stamp `updated_at`.
-        sess.execute("UPDATE t SET name = 'b' WHERE id = 1").await.unwrap();
+        sess.execute("UPDATE t SET name = 'b' WHERE id = 1")
+            .await
+            .unwrap();
 
         let res = sess
             .execute("SELECT updated_at FROM t WHERE id = 1")
@@ -1528,20 +1556,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let sess = eng.open_session(TenantId::new()).await.unwrap();
-        sess.execute(
-            "CREATE TABLE t (id BIGINT NOT NULL, updated_at TIMESTAMPTZ AUTO_UPDATE)",
-        )
-        .await
-        .unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL, updated_at TIMESTAMPTZ AUTO_UPDATE)")
+            .await
+            .unwrap();
         sess.execute("INSERT INTO t VALUES (1, '2026-01-01T00:00:00Z')")
             .await
             .unwrap();
         // Explicit SET wins over AUTO_UPDATE.
-        sess.execute(
-            "UPDATE t SET updated_at = '2025-06-15T00:00:00Z' WHERE id = 1",
-        )
-        .await
-        .unwrap();
+        sess.execute("UPDATE t SET updated_at = '2025-06-15T00:00:00Z' WHERE id = 1")
+            .await
+            .unwrap();
         let res = sess
             .execute("SELECT updated_at FROM t WHERE id = 1")
             .await
@@ -1621,9 +1645,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let sess = eng.open_session(TenantId::new()).await.unwrap();
-        sess.execute("CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL) AUDIT TO foo_audit")
-            .await
-            .unwrap();
+        sess.execute(
+            "CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL) AUDIT TO foo_audit",
+        )
+        .await
+        .unwrap();
         sess.execute("INSERT INTO foo VALUES (1, 'a'), (2, 'b')")
             .await
             .unwrap();
@@ -1662,11 +1688,15 @@ mod tests {
         let sa = eng.open_session(a).await.unwrap();
         let sb = eng.open_session(b).await.unwrap();
         for s in [&sa, &sb] {
-            s.execute("CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL) AUDIT TO foo_audit")
-                .await
-                .unwrap();
+            s.execute(
+                "CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL) AUDIT TO foo_audit",
+            )
+            .await
+            .unwrap();
         }
-        sa.execute("INSERT INTO foo VALUES (1, 'A1')").await.unwrap();
+        sa.execute("INSERT INTO foo VALUES (1, 'A1')")
+            .await
+            .unwrap();
         sb.execute("INSERT INTO foo VALUES (1, 'B1'), (2, 'B2')")
             .await
             .unwrap();
@@ -1674,10 +1704,7 @@ mod tests {
         let res_a = sa.execute("SELECT op FROM foo_audit").await.unwrap();
         let res_b = sb.execute("SELECT op FROM foo_audit").await.unwrap();
         match (res_a, res_b) {
-            (
-                ExecResult::Rows { batches: ba, .. },
-                ExecResult::Rows { batches: bb, .. },
-            ) => {
+            (ExecResult::Rows { batches: ba, .. }, ExecResult::Rows { batches: bb, .. }) => {
                 assert_eq!(total_rows(&ba), 1);
                 assert_eq!(total_rows(&bb), 2);
             }
@@ -1700,11 +1727,9 @@ mod tests {
         )
         .await
         .unwrap();
-        sess.execute(
-            "INSERT INTO foo VALUES (1, 'a', '2026-01-01T00:00:00Z', NULL)",
-        )
-        .await
-        .unwrap();
+        sess.execute("INSERT INTO foo VALUES (1, 'a', '2026-01-01T00:00:00Z', NULL)")
+            .await
+            .unwrap();
         sess.execute("UPDATE foo SET name = 'b' WHERE id = 1")
             .await
             .unwrap();

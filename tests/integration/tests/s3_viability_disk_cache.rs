@@ -39,9 +39,7 @@ use basin_common::{PartitionKey, TableName, TenantId};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
-use basin_storage::{
-    DiskCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig,
-};
+use basin_storage::{DiskCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use futures::stream::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;

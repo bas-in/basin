@@ -32,9 +32,7 @@ struct TestServer {
     _cleanup: CleanupOnDrop,
 }
 
-async fn start_server(
-    s3_cfg: &basin_integration_tests::test_config::S3Config,
-) -> TestServer {
+async fn start_server(s3_cfg: &basin_integration_tests::test_config::S3Config) -> TestServer {
     basin_common::telemetry::try_init_for_tests();
 
     let object_store = s3_cfg
@@ -52,8 +50,7 @@ async fn start_server(
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -149,10 +146,7 @@ async fn s3_viability_extended_protocol() {
         .prepare("SELECT id, body FROM events WHERE id = $1")
         .await
         .expect("prepare failed");
-    let rows = alice
-        .query(&stmt, &[&2i64])
-        .await
-        .expect("query failed");
+    let rows = alice.query(&stmt, &[&2i64]).await.expect("query failed");
     if rows.len() == 1 {
         let id: i64 = rows[0].get(0);
         let body: &str = rows[0].get(1);

@@ -106,8 +106,12 @@ async fn pg_alive() -> bool {
     }
 }
 
-async fn spawn_with_rest_and_auth(
-) -> Option<(ChildGuard, std::net::SocketAddr, std::net::SocketAddr, TempDir)> {
+async fn spawn_with_rest_and_auth() -> Option<(
+    ChildGuard,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    TempDir,
+)> {
     if !pg_alive().await {
         eprintln!("postgres unreachable, skipping poc_rest_smoke");
         return None;
@@ -125,7 +129,10 @@ async fn spawn_with_rest_and_auth(
     let rest_addr = rest_probe.local_addr().ok()?;
     drop(rest_probe);
 
-    let auth_schema = format!("basin_rest_smoke_{}", Ulid::new().to_string().to_lowercase());
+    let auth_schema = format!(
+        "basin_rest_smoke_{}",
+        Ulid::new().to_string().to_lowercase()
+    );
 
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.env("BASIN_BIND", pg_addr.to_string())
@@ -312,8 +319,10 @@ async fn fetch_latest_email_token(schema: &str, kind: &str) -> Option<String> {
     // as verified directly in PG (the same operation `verify_email` does
     // internally). That keeps us off SMTP and off in-process JWT munging,
     // and is the cheapest way to get to a `signin` happy path.
-    let _ = client
-        .batch_execute(&format!("UPDATE {schema}.users SET email_verified_at = now()"))
+    client
+        .batch_execute(&format!(
+            "UPDATE {schema}.users SET email_verified_at = now()"
+        ))
         .await
         .ok()?;
     drop(client);
@@ -382,10 +391,7 @@ async fn poc_rest_signup_signin_crud_round_trip() {
         String::from_utf8_lossy(&r.body)
     );
     let v = r.json();
-    let access = v["access_token"]
-        .as_str()
-        .expect("access_token")
-        .to_owned();
+    let access = v["access_token"].as_str().expect("access_token").to_owned();
     let bearer = format!("Bearer {access}");
 
     // 4. CREATE TABLE via pgwire (REST has no DDL endpoint). The pgwire user

@@ -31,8 +31,7 @@ fn linestring_construction() {
     let two = LineString::new(vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)]).unwrap();
     assert_eq!(two.num_points(), 2);
     // Many points OK.
-    let many =
-        LineString::from_xy(&[(0.0, 0.0), (1.0, 0.0), (2.0, 1.0), (3.0, 1.5)]).unwrap();
+    let many = LineString::from_xy(&[(0.0, 0.0), (1.0, 0.0), (2.0, 1.0), (3.0, 1.5)]).unwrap();
     assert_eq!(num_points(&many), 4);
     // ST_PointN 1-based.
     assert_eq!(point_n(&many, 1), Some(Point::new(0.0, 0.0)));
@@ -51,21 +50,14 @@ fn polygon_must_be_closed_ring() {
         GeometryError::PolygonRingNotClosed
     );
     // Too-short ring rejected (3 points = degenerate triangle).
-    let too_short =
-        LineString::from_xy(&[(0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]).unwrap();
+    let too_short = LineString::from_xy(&[(0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]).unwrap();
     assert_eq!(
         Polygon::new(too_short).unwrap_err(),
         GeometryError::PolygonRingTooShort { got: 3 }
     );
     // Closed quadrilateral OK.
-    let closed = LineString::from_xy(&[
-        (0.0, 0.0),
-        (1.0, 0.0),
-        (1.0, 1.0),
-        (0.0, 1.0),
-        (0.0, 0.0),
-    ])
-    .unwrap();
+    let closed =
+        LineString::from_xy(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]).unwrap();
     assert!(make_polygon(closed).is_ok());
 
     // Auto-close convenience.
@@ -85,12 +77,8 @@ fn st_length_matches_haversine() {
     // Big Ben (lon=-0.1246, lat=51.5007) — 343_556 m from Eiffel
     // NYC     (lon=-74.0060,lat=40.7128) — 5_570_222 m from London
     // Sum: ~5_913_778 m.
-    let line = LineString::from_xy(&[
-        (2.2945, 48.8584),
-        (-0.1246, 51.5007),
-        (-74.0060, 40.7128),
-    ])
-    .unwrap();
+    let line =
+        LineString::from_xy(&[(2.2945, 48.8584), (-0.1246, 51.5007), (-74.0060, 40.7128)]).unwrap();
     let measured = linestring_length_m(&line);
     // Reference: 343_556 m (eiffel→bigben PostGIS ST_DistanceSphere) +
     // 5_570_222 m (london→nyc) = 5_913_778 m. PostGIS itself reports
@@ -110,10 +98,7 @@ fn st_length_matches_haversine() {
     let one_m_lon_deg = 1.0 / 111_319.49; // m per degree at equator
     let tiny = LineString::from_xy(&[(0.0, 0.0), (one_m_lon_deg, 0.0)]).unwrap();
     let len = linestring_length_m(&tiny);
-    assert!(
-        (len - 1.0).abs() < 1.0,
-        "1-m segment measured {len:.4} m"
-    );
+    assert!((len - 1.0).abs() < 1.0, "1-m segment measured {len:.4} m");
 }
 
 // ---------------------------------------------------------------------
@@ -122,14 +107,8 @@ fn st_length_matches_haversine() {
 
 fn unit_square() -> Polygon {
     // 1° × 1° square at the equator, lower-left at (0, 0).
-    let ring = LineString::from_xy(&[
-        (0.0, 0.0),
-        (1.0, 0.0),
-        (1.0, 1.0),
-        (0.0, 1.0),
-        (0.0, 0.0),
-    ])
-    .unwrap();
+    let ring =
+        LineString::from_xy(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]).unwrap();
     Polygon::new(ring).unwrap()
 }
 
@@ -167,12 +146,12 @@ fn st_contains_point_on_boundary() {
     // Match that.
     let poly = unit_square();
     let boundary_points = [
-        Point::new(0.0, 0.0),  // corner
-        Point::new(1.0, 1.0),  // corner
-        Point::new(0.5, 0.0),  // bottom edge
-        Point::new(1.0, 0.5),  // right edge
-        Point::new(0.0, 0.5),  // left edge
-        Point::new(0.5, 1.0),  // top edge
+        Point::new(0.0, 0.0), // corner
+        Point::new(1.0, 1.0), // corner
+        Point::new(0.5, 0.0), // bottom edge
+        Point::new(1.0, 0.5), // right edge
+        Point::new(0.0, 0.5), // left edge
+        Point::new(0.5, 1.0), // top edge
     ];
     for pt in boundary_points {
         assert!(
@@ -286,7 +265,10 @@ fn polygon_with_hole_area_subtraction() {
     let inner = LineString::from_xy(&[
         (inner_offset_deg, inner_offset_deg),
         (inner_offset_deg + inner_side_deg, inner_offset_deg),
-        (inner_offset_deg + inner_side_deg, inner_offset_deg + inner_side_deg),
+        (
+            inner_offset_deg + inner_side_deg,
+            inner_offset_deg + inner_side_deg,
+        ),
         (inner_offset_deg, inner_offset_deg + inner_side_deg),
         (inner_offset_deg, inner_offset_deg),
     ])
@@ -334,14 +316,8 @@ fn geojson_roundtrip_polygon() {
         (0.0, 0.0),
     ])
     .unwrap();
-    let hole = LineString::from_xy(&[
-        (3.0, 3.0),
-        (7.0, 3.0),
-        (7.0, 7.0),
-        (3.0, 7.0),
-        (3.0, 3.0),
-    ])
-    .unwrap();
+    let hole =
+        LineString::from_xy(&[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0), (3.0, 3.0)]).unwrap();
     let p = Polygon::with_holes(outer, vec![hole]).unwrap();
     let s = geojson::encode_polygon(&p);
     let back = geojson::decode_polygon(&s).unwrap();

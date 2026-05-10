@@ -229,10 +229,7 @@ async fn create_duplicate_errors() {
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
-    let err = cat
-        .create_sequence(def(t, "s", 100, 2))
-        .await
-        .unwrap_err();
+    let err = cat.create_sequence(def(t, "s", 100, 2)).await.unwrap_err();
     assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
 }
 

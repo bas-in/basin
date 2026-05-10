@@ -72,7 +72,9 @@ fn schema() -> Arc<Schema> {
 
 fn build_batch(start: i64, len: usize) -> RecordBatch {
     let ids: Int64Array = (start..start + len as i64).collect();
-    let bodies: Vec<String> = (0..len).map(|i| format!("body-{}", start + i as i64)).collect();
+    let bodies: Vec<String> = (0..len)
+        .map(|i| format!("body-{}", start + i as i64))
+        .collect();
     let body_arr: StringArray = bodies.iter().map(|s| Some(s.as_str())).collect();
     RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(body_arr)]).unwrap()
 }
@@ -114,9 +116,7 @@ impl Drop for SchemaGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });

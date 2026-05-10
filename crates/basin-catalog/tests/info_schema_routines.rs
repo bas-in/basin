@@ -7,9 +7,7 @@
 //! to the rust-side `InfoSchemaQuery::pg_proc` / `routines` shape break
 //! here first, before cascading through DataFusion glue.
 
-use arrow_array::{
-    Array, Int16Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Array, Int16Array, Int64Array, RecordBatch, StringArray};
 use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, InMemoryCatalog, SqlArgType, SqlFunctionArg,
     SqlFunctionDef, SqlFunctionLanguage, SqlProcedureDef, SqlReturnType,
@@ -18,7 +16,10 @@ use basin_common::TenantId;
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<StringArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
 }
 
 fn col_i16<'a>(b: &'a RecordBatch, n: &str) -> &'a Int16Array {
@@ -31,7 +32,13 @@ fn col_i64<'a>(b: &'a RecordBatch, n: &str) -> &'a Int64Array {
     b.column(idx).as_any().downcast_ref::<Int64Array>().unwrap()
 }
 
-fn make_func(tenant: TenantId, name: &str, args: Vec<(&str, SqlArgType)>, ret: SqlArgType, body: &str) -> SqlFunctionDef {
+fn make_func(
+    tenant: TenantId,
+    name: &str,
+    args: Vec<(&str, SqlArgType)>,
+    ret: SqlArgType,
+    body: &str,
+) -> SqlFunctionDef {
     SqlFunctionDef {
         tenant,
         name: name.to_string(),
@@ -48,7 +55,12 @@ fn make_func(tenant: TenantId, name: &str, args: Vec<(&str, SqlArgType)>, ret: S
     }
 }
 
-fn make_proc(tenant: TenantId, name: &str, args: Vec<(&str, SqlArgType)>, body: &str) -> SqlProcedureDef {
+fn make_proc(
+    tenant: TenantId,
+    name: &str,
+    args: Vec<(&str, SqlArgType)>,
+    body: &str,
+) -> SqlProcedureDef {
     SqlProcedureDef {
         tenant,
         name: name.to_string(),
@@ -125,15 +137,9 @@ async fn pg_proc_oid_stable_per_tuple() {
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
     cat.create_namespace(&t).await.unwrap();
-    cat.register_sql_function(make_func(
-        t,
-        "f",
-        vec![],
-        SqlArgType::BigInt,
-        "SELECT 1",
-    ))
-    .await
-    .unwrap();
+    cat.register_sql_function(make_func(t, "f", vec![], SqlArgType::BigInt, "SELECT 1"))
+        .await
+        .unwrap();
 
     let b1 = InfoSchemaQuery::pg_proc(&cat, &t).await.unwrap();
     let b2 = InfoSchemaQuery::pg_proc(&cat, &t).await.unwrap();
@@ -157,14 +163,9 @@ async fn routines_returns_correct_routine_type() {
     ))
     .await
     .unwrap();
-    cat.register_procedure(make_proc(
-        t,
-        "my_proc",
-        vec![],
-        "INSERT INTO t VALUES (1)",
-    ))
-    .await
-    .unwrap();
+    cat.register_procedure(make_proc(t, "my_proc", vec![], "INSERT INTO t VALUES (1)"))
+        .await
+        .unwrap();
 
     let batch = InfoSchemaQuery::routines(&cat, &t).await.unwrap();
     assert_eq!(batch.num_rows(), 2);
@@ -187,23 +188,12 @@ async fn routines_data_type_null_for_procedures() {
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
     cat.create_namespace(&t).await.unwrap();
-    cat.register_sql_function(make_func(
-        t,
-        "f",
-        vec![],
-        SqlArgType::Text,
-        "SELECT 'hi'",
-    ))
-    .await
-    .unwrap();
-    cat.register_procedure(make_proc(
-        t,
-        "p",
-        vec![],
-        "INSERT INTO log VALUES ('hi')",
-    ))
-    .await
-    .unwrap();
+    cat.register_sql_function(make_func(t, "f", vec![], SqlArgType::Text, "SELECT 'hi'"))
+        .await
+        .unwrap();
+    cat.register_procedure(make_proc(t, "p", vec![], "INSERT INTO log VALUES ('hi')"))
+        .await
+        .unwrap();
 
     let batch = InfoSchemaQuery::routines(&cat, &t).await.unwrap();
     let arr = col_str(&batch, "data_type");

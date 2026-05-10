@@ -73,9 +73,7 @@ impl Drop for SchemaGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });
@@ -99,7 +97,9 @@ fn basin_schema_v1() -> Arc<Schema> {
 
 fn build_basin_batch(start: i64, len: usize) -> RecordBatch {
     let ids: Int64Array = (start..start + len as i64).collect();
-    let bodies: Vec<String> = (0..len).map(|i| format!("body-{}", start + i as i64)).collect();
+    let bodies: Vec<String> = (0..len)
+        .map(|i| format!("body-{}", start + i as i64))
+        .collect();
     let body_arr: StringArray = bodies.iter().map(|s| Some(s.as_str())).collect();
     RecordBatch::try_new(basin_schema_v1(), vec![Arc::new(ids), Arc::new(body_arr)]).unwrap()
 }
@@ -158,8 +158,7 @@ async fn compare_lifecycle_ops() {
     // drop_namespace — so the dashboard plots the production teardown
     // latency, not a bypass through the raw object store.
     let dir = TempDir::new().unwrap();
-    let fs: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let storage = Storage::new(StorageConfig {
         object_store: fs.clone(),
         root_prefix: None,
@@ -238,11 +237,9 @@ async fn compare_lifecycle_ops() {
 
     // PG: timed metadata-only ALTER (no default = fast-path on PG 18).
     let pg_alter_started = Instant::now();
-    pg.simple_query(&format!(
-        "ALTER TABLE {schema2}.events ADD COLUMN tag TEXT"
-    ))
-    .await
-    .expect("pg alter");
+    pg.simple_query(&format!("ALTER TABLE {schema2}.events ADD COLUMN tag TEXT"))
+        .await
+        .expect("pg alter");
     let pg_alter_ms = pg_alter_started.elapsed().as_secs_f64() * 1000.0;
 
     // Basin: real ALTER TABLE through the engine's SQL surface. The

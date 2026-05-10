@@ -231,10 +231,7 @@ impl Polygon {
     /// Build a polygon with one or more holes. Each hole must itself be
     /// a closed ring with ≥4 points; v0.1 does NOT verify the holes lie
     /// inside the exterior or are mutually disjoint (see type docs).
-    pub fn with_holes(
-        exterior: LineString,
-        holes: Vec<LineString>,
-    ) -> Result<Self, GeometryError> {
+    pub fn with_holes(exterior: LineString, holes: Vec<LineString>) -> Result<Self, GeometryError> {
         validate_ring(&exterior)?;
         for h in &holes {
             validate_ring(h)?;

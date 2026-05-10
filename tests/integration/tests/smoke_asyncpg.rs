@@ -36,8 +36,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -76,7 +75,7 @@ async fn binary_exists(name: &str) -> bool {
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
-    }
+}
 
 async fn asyncpg_importable(python: &str) -> bool {
     Command::new(python)
@@ -104,9 +103,7 @@ async fn smoke_asyncpg() {
         match installed {
             Ok(o) if o.status.success() => {
                 if !asyncpg_importable("python3").await {
-                    println!(
-                        "[smoke_asyncpg] SKIP: asyncpg still not importable after install"
-                    );
+                    println!("[smoke_asyncpg] SKIP: asyncpg still not importable after install");
                     return;
                 }
             }
@@ -157,8 +154,5 @@ async fn smoke_asyncpg() {
         "asyncpg smoke exited {:?}; stdout above",
         out.status.code()
     );
-    assert!(
-        stdout.contains("PASS"),
-        "asyncpg smoke did not print PASS"
-    );
+    assert!(stdout.contains("PASS"), "asyncpg smoke did not print PASS");
 }

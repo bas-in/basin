@@ -21,7 +21,11 @@ fn make_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, true),
-        Field::new("created_at", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), true),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            true,
+        ),
     ])
 }
 

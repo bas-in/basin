@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Array, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog, Policy, PolicyCommand,
@@ -30,7 +28,10 @@ fn name(s: &str) -> TableName {
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<StringArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
 }
 
 fn col_i64<'a>(b: &'a RecordBatch, n: &str) -> &'a Int64Array {
@@ -40,12 +41,18 @@ fn col_i64<'a>(b: &'a RecordBatch, n: &str) -> &'a Int64Array {
 
 fn col_bool<'a>(b: &'a RecordBatch, n: &str) -> &'a BooleanArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<BooleanArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
 }
 
 fn col_f32<'a>(b: &'a RecordBatch, n: &str) -> &'a Float32Array {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<Float32Array>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -128,7 +135,10 @@ async fn tables_view_includes_materialized_views_as_base_table() {
             found_agg = true;
         }
     }
-    assert!(found_agg, "matview must appear in information_schema.tables");
+    assert!(
+        found_agg,
+        "matview must appear in information_schema.tables"
+    );
 }
 
 #[tokio::test]

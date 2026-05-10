@@ -160,7 +160,9 @@ impl LatencyDistribution {
 pub fn pick_working_set(table_size: u64, working_set_size: usize, seed: u64) -> Vec<u64> {
     assert!(table_size > 0, "table_size must be > 0");
     let mut rng = StdRng::seed_from_u64(seed);
-    (0..working_set_size).map(|_| rng.gen_range(0..table_size)).collect()
+    (0..working_set_size)
+        .map(|_| rng.gen_range(0..table_size))
+        .collect()
 }
 
 /// Run `n_iterations` queries against `query`, picking one id per

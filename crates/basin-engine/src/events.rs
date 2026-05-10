@@ -31,10 +31,7 @@ use crate::Engine;
 
 /// Run every pre-commit sink in registration order. The first sink to
 /// return `Err` aborts the mutation; subsequent sinks are not called.
-pub(crate) async fn dispatch_pre_commit(
-    engine: &Engine,
-    events: &[ChangeEvent],
-) -> Result<()> {
+pub(crate) async fn dispatch_pre_commit(engine: &Engine, events: &[ChangeEvent]) -> Result<()> {
     if events.is_empty() {
         return Ok(());
     }
@@ -339,15 +336,9 @@ mod tests {
         // Two inserts.
         assert!(matches!(events[0].op, ChangeOp::Insert));
         assert!(events[0].before.is_none());
-        assert_eq!(
-            events[0].after.as_ref().unwrap()["id"].as_i64(),
-            Some(1),
-        );
+        assert_eq!(events[0].after.as_ref().unwrap()["id"].as_i64(), Some(1),);
         assert!(matches!(events[1].op, ChangeOp::Insert));
-        assert_eq!(
-            events[1].after.as_ref().unwrap()["id"].as_i64(),
-            Some(2),
-        );
+        assert_eq!(events[1].after.as_ref().unwrap()["id"].as_i64(), Some(2),);
 
         // One update.
         assert!(matches!(events[2].op, ChangeOp::Update));
@@ -362,10 +353,7 @@ mod tests {
 
         // One delete.
         assert!(matches!(events[3].op, ChangeOp::Delete));
-        assert_eq!(
-            events[3].before.as_ref().unwrap()["id"].as_i64(),
-            Some(1),
-        );
+        assert_eq!(events[3].before.as_ref().unwrap()["id"].as_i64(), Some(1),);
         assert!(events[3].after.is_none());
 
         // Seq monotonic per-tenant.

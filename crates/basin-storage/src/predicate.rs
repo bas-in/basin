@@ -170,10 +170,7 @@ pub enum CompoundPredicate {
 /// Three-valued logic matters for DELETE: a NULL mask bit means "we don't
 /// know if this row matched", and the caller must conservatively keep
 /// such rows (see `dml_mutate::invert_mask`).
-pub fn evaluate_compound(
-    batch: &RecordBatch,
-    pred: &CompoundPredicate,
-) -> Result<BooleanArray> {
+pub fn evaluate_compound(batch: &RecordBatch, pred: &CompoundPredicate) -> Result<BooleanArray> {
     match pred {
         CompoundPredicate::Atom(p) => evaluate(batch, p),
         CompoundPredicate::And(children) => {
@@ -381,12 +378,7 @@ pub fn evaluate_compound_for_pruning(
                 .iter()
                 .map(|v| CompoundPredicate::Atom(Predicate::Eq(col.clone(), v.clone())))
                 .collect();
-            evaluate_compound_for_pruning(
-                &CompoundPredicate::Or(alts),
-                stats,
-                schema,
-                row_count,
-            )
+            evaluate_compound_for_pruning(&CompoundPredicate::Or(alts), stats, schema, row_count)
         }
     }
 }
@@ -571,19 +563,19 @@ mod compound_tests {
             Field::new("name", DataType::Utf8, true),
         ]));
         let ids = Int64Array::from(vec![Some(1), Some(2), None, Some(4), Some(5)]);
-        let names = StringArray::from(vec![
-            Some("a"),
-            Some("b"),
-            Some("c"),
-            None,
-            Some("e"),
-        ]);
+        let names = StringArray::from(vec![Some("a"), Some("b"), Some("c"), None, Some("e")]);
         RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names)]).unwrap()
     }
 
     fn collect_mask(arr: &BooleanArray) -> Vec<Option<bool>> {
         (0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect()
     }
 
@@ -616,7 +608,13 @@ mod compound_tests {
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
         assert_eq!(
             collect_mask(&mask),
-            vec![Some(true), Some(false), Some(false), Some(true), Some(false)]
+            vec![
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false)
+            ]
         );
     }
 
@@ -629,7 +627,13 @@ mod compound_tests {
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
         assert_eq!(
             collect_mask(&mask),
-            vec![Some(false), Some(true), Some(false), Some(false), Some(true)]
+            vec![
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true)
+            ]
         );
     }
 
@@ -637,10 +641,7 @@ mod compound_tests {
     fn empty_in_is_false() {
         let pred = CompoundPredicate::In("id".into(), vec![]);
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
-        assert_eq!(
-            collect_mask(&mask),
-            vec![Some(false); 5]
-        );
+        assert_eq!(collect_mask(&mask), vec![Some(false); 5]);
     }
 
     #[test]
@@ -650,7 +651,13 @@ mod compound_tests {
         // Only index 2 (the None id) is null.
         assert_eq!(
             collect_mask(&mask),
-            vec![Some(false), Some(false), Some(true), Some(false), Some(false)]
+            vec![
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false)
+            ]
         );
         let pred = CompoundPredicate::IsNotNull("name".into());
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
@@ -662,9 +669,10 @@ mod compound_tests {
 
     #[test]
     fn not_negates() {
-        let pred = CompoundPredicate::Not(Box::new(CompoundPredicate::Atom(
-            Predicate::Eq("id".into(), ScalarValue::Int64(2)),
-        )));
+        let pred = CompoundPredicate::Not(Box::new(CompoundPredicate::Atom(Predicate::Eq(
+            "id".into(),
+            ScalarValue::Int64(2),
+        ))));
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
         // id=2 is true → NOT = false. Others are false → NOT = true. The NULL
         // id evaluates Eq to false (per atom rules), so NOT(false) = true.
@@ -694,10 +702,7 @@ mod compound_tests {
     #[test]
     fn pruning_eq_outside_range_is_no_match() {
         let stats = stats(100, 200, 0);
-        let pred = CompoundPredicate::Atom(Predicate::Eq(
-            "id".into(),
-            ScalarValue::Int64(42),
-        ));
+        let pred = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(42)));
         assert_eq!(
             evaluate_compound_for_pruning(&pred, &stats, &id_schema(), 1000),
             PruneOutcome::NoMatch
@@ -707,10 +712,7 @@ mod compound_tests {
     #[test]
     fn pruning_eq_inside_range_is_mixed() {
         let stats = stats(0, 1000, 0);
-        let pred = CompoundPredicate::Atom(Predicate::Eq(
-            "id".into(),
-            ScalarValue::Int64(42),
-        ));
+        let pred = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(42)));
         assert_eq!(
             evaluate_compound_for_pruning(&pred, &stats, &id_schema(), 1000),
             PruneOutcome::Mixed
@@ -722,14 +724,8 @@ mod compound_tests {
         let stats = stats(100, 200, 0);
         // id = 42 prunes; combined with anything via AND prunes the whole.
         let pred = CompoundPredicate::And(vec![
-            CompoundPredicate::Atom(Predicate::Eq(
-                "id".into(),
-                ScalarValue::Int64(42),
-            )),
-            CompoundPredicate::Atom(Predicate::Lt(
-                "id".into(),
-                ScalarValue::Int64(1_000_000),
-            )),
+            CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(42))),
+            CompoundPredicate::Atom(Predicate::Lt("id".into(), ScalarValue::Int64(1_000_000))),
         ]);
         assert_eq!(
             evaluate_compound_for_pruning(&pred, &stats, &id_schema(), 1000),
@@ -743,14 +739,8 @@ mod compound_tests {
         // 42 is outside range (NoMatch); 150 is inside (Mixed). OR result =
         // Mixed because one branch can't be ruled out.
         let pred = CompoundPredicate::Or(vec![
-            CompoundPredicate::Atom(Predicate::Eq(
-                "id".into(),
-                ScalarValue::Int64(42),
-            )),
-            CompoundPredicate::Atom(Predicate::Eq(
-                "id".into(),
-                ScalarValue::Int64(150),
-            )),
+            CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(42))),
+            CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(150))),
         ]);
         assert_eq!(
             evaluate_compound_for_pruning(&pred, &stats, &id_schema(), 1000),
@@ -759,14 +749,8 @@ mod compound_tests {
 
         // Both outside: NoMatch.
         let pred = CompoundPredicate::Or(vec![
-            CompoundPredicate::Atom(Predicate::Eq(
-                "id".into(),
-                ScalarValue::Int64(42),
-            )),
-            CompoundPredicate::Atom(Predicate::Eq(
-                "id".into(),
-                ScalarValue::Int64(999),
-            )),
+            CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(42))),
+            CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(999))),
         ]);
         assert_eq!(
             evaluate_compound_for_pruning(&pred, &stats, &id_schema(), 1000),
@@ -816,10 +800,7 @@ mod compound_tests {
     fn pruning_eq_singleton_with_no_nulls_is_all_match() {
         // min == max == v and zero nulls → every row matches.
         let stats = stats(42, 42, 0);
-        let pred = CompoundPredicate::Atom(Predicate::Eq(
-            "id".into(),
-            ScalarValue::Int64(42),
-        ));
+        let pred = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Int64(42)));
         assert_eq!(
             evaluate_compound_for_pruning(&pred, &stats, &id_schema(), 1000),
             PruneOutcome::AllMatch

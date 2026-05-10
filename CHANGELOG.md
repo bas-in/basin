@@ -10,7 +10,41 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`SERIAL` / `BIGSERIAL` / `SMALLSERIAL` pseudo-types** (+ `SERIAL2` /
+  `SERIAL4` / `SERIAL8` aliases). PG-shaped expansion: each `SERIAL`
+  column auto-creates a sequence named `<table>_<col>_seq` and stamps
+  `DEFAULT nextval('<seq>')` + implicit `NOT NULL`. Driver-emitted
+  `CREATE TABLE t (id SERIAL PRIMARY KEY, …)` now works through the
+  pgwire surface without the user having to spell out the sequence.
+  (Note: `SMALLSERIAL` widens to Int64 physically since the INSERT path
+  doesn't yet have an Int16 row-builder — see
+  `basin_engine::types::arrow_data_type`.)
+
+### Changed
+
+- **CI pipeline performance**: dropped the duplicate
+  `cargo build` step in the `test` job (let `cargo test` build the
+  artefacts itself), dropped macOS from the test matrix (single Linux
+  runner — re-add when a platform-specific regression actually surfaces),
+  added `concurrency` cancellation so re-pushes don't queue duplicate
+  runs, and switched `cargo audit` to advisory-only (no `--deny warnings`)
+  so a yanked transitive doesn't block the release path.
+- **Release pipeline performance**: replaced `cross` + Docker
+  cross-compile for `aarch64-unknown-linux-gnu` with GitHub's native
+  `ubuntu-24.04-arm` runner — duckdb-bundled was timing out the
+  cross-compile path; native compile finishes in ~⅓ of the wall-clock.
+  Also persists the per-target build cache across tag pushes and strips
+  debug info from release artefacts (`CARGO_PROFILE_RELEASE_DEBUG=0`).
+
+### Fixed
+
+- `rewrite_sequence_calls` now emits a plain integer literal instead of
+  `<n>::bigint`. The cast was surviving rewrite and tripping
+  `coerce_i64` in the INSERT-default evaluator, which only recognised
+  bare `Number` / `UnaryOp(Minus, Number)`. Negative values are
+  parenthesised to keep adjacent operators from fusing.
 
 ## [0.1.1] - 2026-05-10
 

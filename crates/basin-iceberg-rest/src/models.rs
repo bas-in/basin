@@ -264,7 +264,11 @@ pub struct IcebergSnapshot {
     pub timestamp_ms: i64,
     #[serde(default)]
     pub summary: HashMap<String, String>,
-    #[serde(rename = "manifest-list", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "manifest-list",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub manifest_list: String,
     /// Optional on the wire — Basin's single-schema model always uses 0.
     #[serde(default, rename = "schema-id")]

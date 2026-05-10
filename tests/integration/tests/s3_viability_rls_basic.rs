@@ -111,12 +111,18 @@ async fn s3_viability_rls_basic() {
 
     let alice_rows = rows_seen(alice.execute("SELECT * FROM orders").await.unwrap());
     let bob_rows = rows_seen(bob.execute("SELECT * FROM orders").await.unwrap());
-    assert_eq!(alice_rows, 5, "alice sees her 5 rows under RLS, got {alice_rows}");
+    assert_eq!(
+        alice_rows, 5,
+        "alice sees her 5 rows under RLS, got {alice_rows}"
+    );
     assert_eq!(bob_rows, 5, "bob sees his 5 rows under RLS, got {bob_rows}");
 
     let anon = engine.open_session(tenant).await.unwrap();
     let anon_rows = rows_seen(anon.execute("SELECT * FROM orders").await.unwrap());
-    assert_eq!(anon_rows, 0, "anon sees zero rows under RLS, got {anon_rows}");
+    assert_eq!(
+        anon_rows, 0,
+        "anon sees zero rows under RLS, got {anon_rows}"
+    );
 
     admin
         .execute("ALTER TABLE orders DISABLE ROW LEVEL SECURITY")

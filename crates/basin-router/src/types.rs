@@ -130,18 +130,21 @@ fn type_size(ty: &Type) -> i16 {
 
 /// Encode every row in `batches` as a `DataRow`. Returns the rows in batch
 /// order, batch-internal row order. All values are encoded as text.
-pub(crate) fn encode_batches(
-    schema: &Arc<Schema>,
-    batches: &[RecordBatch],
-) -> Vec<DataRow> {
+pub(crate) fn encode_batches(schema: &Arc<Schema>, batches: &[RecordBatch]) -> Vec<DataRow> {
     let mut rows = Vec::new();
     let n_cols = schema.fields().len();
     // Pre-compute the `is_jsonb` / `is_uuid` bitmaps so the per-cell hot
     // loop doesn't redo a metadata lookup per row.
-    let jsonb_cols: Vec<bool> =
-        schema.fields().iter().map(|f| field_is_jsonb(f.as_ref())).collect();
-    let uuid_cols: Vec<bool> =
-        schema.fields().iter().map(|f| field_is_uuid(f.as_ref())).collect();
+    let jsonb_cols: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| field_is_jsonb(f.as_ref()))
+        .collect();
+    let uuid_cols: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| field_is_uuid(f.as_ref()))
+        .collect();
     for batch in batches {
         let n_rows = batch.num_rows();
         for r in 0..n_rows {
@@ -169,10 +172,16 @@ pub(crate) fn encode_batches_with_formats(
     format_codes: &[i16],
 ) -> Result<Vec<DataRow>> {
     let n_cols = schema.fields().len();
-    let jsonb_cols: Vec<bool> =
-        schema.fields().iter().map(|f| field_is_jsonb(f.as_ref())).collect();
-    let uuid_cols: Vec<bool> =
-        schema.fields().iter().map(|f| field_is_uuid(f.as_ref())).collect();
+    let jsonb_cols: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| field_is_jsonb(f.as_ref()))
+        .collect();
+    let uuid_cols: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| field_is_uuid(f.as_ref()))
+        .collect();
     let mut rows = Vec::new();
     for batch in batches {
         let n_rows = batch.num_rows();
@@ -186,13 +195,7 @@ pub(crate) fn encode_batches_with_formats(
                     _ => format_codes.get(c).copied().unwrap_or(0) == 1,
                 };
                 if is_binary {
-                    encode_value_binary(
-                        col.as_ref(),
-                        r,
-                        &mut buf,
-                        jsonb_cols[c],
-                        uuid_cols[c],
-                    )?;
+                    encode_value_binary(col.as_ref(), r, &mut buf, jsonb_cols[c], uuid_cols[c])?;
                 } else {
                     encode_value(col.as_ref(), r, &mut buf, jsonb_cols[c], uuid_cols[c]);
                 }
@@ -327,15 +330,9 @@ fn encode_value_binary(
             // after normalizing the granularity to microseconds.
             let raw: i64 = match unit {
                 TimeUnit::Second => col.as_primitive::<TimestampSecondType>().value(idx),
-                TimeUnit::Millisecond => {
-                    col.as_primitive::<TimestampMillisecondType>().value(idx)
-                }
-                TimeUnit::Microsecond => {
-                    col.as_primitive::<TimestampMicrosecondType>().value(idx)
-                }
-                TimeUnit::Nanosecond => {
-                    col.as_primitive::<TimestampNanosecondType>().value(idx)
-                }
+                TimeUnit::Millisecond => col.as_primitive::<TimestampMillisecondType>().value(idx),
+                TimeUnit::Microsecond => col.as_primitive::<TimestampMicrosecondType>().value(idx),
+                TimeUnit::Nanosecond => col.as_primitive::<TimestampNanosecondType>().value(idx),
             };
             let unix_micros: i64 = match unit {
                 TimeUnit::Second => raw.saturating_mul(1_000_000),
@@ -440,8 +437,7 @@ fn render_uuid(bytes: &[u8]) -> String {
 /// CSV cell looks the way a `psql \copy` user expects (raw JSON text,
 /// hyphenated UUID).
 pub(crate) fn render_cell_for_copy(col: &dyn Array, idx: usize, field: &Field) -> String {
-    if field_is_jsonb(field)
-        && matches!(col.data_type(), DataType::LargeBinary | DataType::Binary)
+    if field_is_jsonb(field) && matches!(col.data_type(), DataType::LargeBinary | DataType::Binary)
     {
         let bytes: &[u8] = match col.data_type() {
             DataType::LargeBinary => col.as_binary::<i64>().value(idx),
@@ -490,7 +486,9 @@ fn render_cell(col: &dyn Array, idx: usize) -> String {
         DataType::Timestamp(unit, tz) => render_timestamp(col, idx, unit, tz.as_deref()),
         DataType::Date32 => {
             let days = col.as_primitive::<Date32Type>().value(idx);
-            Date32Type::to_naive_date(days).format("%Y-%m-%d").to_string()
+            Date32Type::to_naive_date(days)
+                .format("%Y-%m-%d")
+                .to_string()
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
             let v = col.as_primitive::<IntervalMonthDayNanoType>().value(idx);
@@ -530,13 +528,22 @@ fn render_interval(months: i32, days: i32, nanos: i64) -> String {
     let years = months / 12;
     let mons = months % 12;
     if years != 0 {
-        parts.push(format!("{years} year{}", if years.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{years} year{}",
+            if years.abs() == 1 { "" } else { "s" }
+        ));
     }
     if mons != 0 {
-        parts.push(format!("{mons} mon{}", if mons.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{mons} mon{}",
+            if mons.abs() == 1 { "" } else { "s" }
+        ));
     }
     if days != 0 {
-        parts.push(format!("{days} day{}", if days.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{days} day{}",
+            if days.abs() == 1 { "" } else { "s" }
+        ));
     }
     if nanos != 0 || parts.is_empty() {
         let neg = nanos < 0;
@@ -643,9 +650,8 @@ mod tests {
             false,
         )]));
         // 2024-03-14 = 19796 days since 1970-01-01.
-        let days = Date32Type::from_naive_date(
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 14).unwrap(),
-        );
+        let days =
+            Date32Type::from_naive_date(chrono::NaiveDate::from_ymd_opt(2024, 3, 14).unwrap());
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Date32Array::from(vec![days]))],
@@ -771,8 +777,7 @@ mod tests {
         use arrow_array::TimestampMicrosecondArray;
         // 2024-03-14 12:34:56 UTC = 1710419696 unix-seconds.
         let unix_micros: i64 = 1_710_419_696_000_000;
-        let arr = TimestampMicrosecondArray::from(vec![unix_micros])
-            .with_timezone("UTC");
+        let arr = TimestampMicrosecondArray::from(vec![unix_micros]).with_timezone("UTC");
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -792,8 +797,7 @@ mod tests {
     fn renders_timestamp_binary() {
         use arrow_array::TimestampMicrosecondArray;
         let unix_micros: i64 = 1_710_419_696_000_000;
-        let arr = TimestampMicrosecondArray::from(vec![unix_micros])
-            .with_timezone("UTC");
+        let arr = TimestampMicrosecondArray::from(vec![unix_micros]).with_timezone("UTC");
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),

@@ -111,8 +111,12 @@ async fn pg_alive() -> bool {
     }
 }
 
-async fn spawn_with_auth(
-) -> Option<(ChildGuard, std::net::SocketAddr, std::net::SocketAddr, TempDir)> {
+async fn spawn_with_auth() -> Option<(
+    ChildGuard,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    TempDir,
+)> {
     if !pg_alive().await {
         eprintln!("postgres unreachable, skipping poc_pgwire_jwt_smoke");
         return None;

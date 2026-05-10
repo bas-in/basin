@@ -10,7 +10,9 @@ use basin_common::{BasinError, Result, TableName, TenantId};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
-use parquet::arrow::arrow_reader::{ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::RowGroupMetaData;
@@ -18,7 +20,6 @@ use parquet::file::statistics::Statistics;
 
 use crate::data_file::{ColumnStats, DataFile};
 use crate::encryption::{decrypt_envelope, BytesFileReader, EncryptionProvider, WrappedKey};
-use basin_catalog::TenantStorageConfig;
 use crate::metadata_cache::{CachedParquetMeta, ParquetMetaCache};
 use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache};
 use crate::paths::table_tier_prefix;
@@ -26,6 +27,7 @@ use crate::predicate::{self, Predicate, ScalarValue};
 use crate::tier::Tier;
 use crate::writer::wrapped_sidecar_key;
 use crate::{ReadCounters, ReadOptions, Storage};
+use basin_catalog::TenantStorageConfig;
 
 pub(crate) async fn list_data_files(
     storage: &Storage,
@@ -115,7 +117,10 @@ pub(crate) async fn list_data_files_with_stats(
         .collect();
 
     let resolved: Vec<Result<(usize, (u64, BTreeMap<String, ColumnStats>))>> =
-        futures::stream::iter(work).buffer_unordered(8).collect().await;
+        futures::stream::iter(work)
+            .buffer_unordered(8)
+            .collect()
+            .await;
 
     for r in resolved {
         let (i, (rows, stats)) = r?;
@@ -152,10 +157,7 @@ fn decode_file_stats(
 /// Mirror of `writer::merge_typed_stats`: uses typed comparisons for
 /// primitive numerics so the merged bytes round-trip back to the actual
 /// min/max. Lexicographic merge is correct for byte-array (Utf8) stats.
-fn merge_typed_stats(
-    entry: &mut ColumnStats,
-    stats: &parquet::file::statistics::Statistics,
-) {
+fn merge_typed_stats(entry: &mut ColumnStats, stats: &parquet::file::statistics::Statistics) {
     use parquet::file::statistics::Statistics as ParquetStats;
     match stats {
         ParquetStats::Int64(s) => {
@@ -211,13 +213,23 @@ fn merge_typed_stats(
         ParquetStats::ByteArray(_) | ParquetStats::FixedLenByteArray(_) => {
             if let Some(min) = stats.min_bytes_opt() {
                 let v = min.to_vec();
-                if entry.min_bytes.as_deref().map(|p| p > v.as_slice()).unwrap_or(true) {
+                if entry
+                    .min_bytes
+                    .as_deref()
+                    .map(|p| p > v.as_slice())
+                    .unwrap_or(true)
+                {
                     entry.min_bytes = Some(v);
                 }
             }
             if let Some(max) = stats.max_bytes_opt() {
                 let v = max.to_vec();
-                if entry.max_bytes.as_deref().map(|p| p < v.as_slice()).unwrap_or(true) {
+                if entry
+                    .max_bytes
+                    .as_deref()
+                    .map(|p| p < v.as_slice())
+                    .unwrap_or(true)
+                {
                     entry.max_bytes = Some(v);
                 }
             }
@@ -372,10 +384,12 @@ async fn read_paths_inner(
             }
         })
         .buffered(4)
-        .map(|res: Result<BoxStream<'static, Result<RecordBatch>>>| match res {
-            Ok(s) => s,
-            Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
-        })
+        .map(
+            |res: Result<BoxStream<'static, Result<RecordBatch>>>| match res {
+                Ok(s) => s,
+                Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
+            },
+        )
         .flatten();
 
     Ok(stream.boxed())
@@ -450,8 +464,7 @@ async fn read_one(
     });
     if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key.as_ref()) {
         if let Some(batches) = pc.get(key) {
-            let owned: Vec<RecordBatch> =
-                batches.iter().map(|b| (**b).clone()).collect();
+            let owned: Vec<RecordBatch> = batches.iter().map(|b| (**b).clone()).collect();
             let s = futures::stream::iter(owned.into_iter().map(Ok));
             return Ok(s.boxed());
         }
@@ -503,8 +516,9 @@ async fn read_one(
             version: None,
         };
         let reader = ParquetObjectReader::new(store, synthetic);
-        let arrow_meta = ArrowReaderMetadata::try_new(cached.meta, ArrowReaderOptions::default())
-            .map_err(|e| BasinError::storage(format!("rehydrate parquet meta {path}: {e}")))?;
+        let arrow_meta =
+            ArrowReaderMetadata::try_new(cached.meta, ArrowReaderOptions::default())
+                .map_err(|e| BasinError::storage(format!("rehydrate parquet meta {path}: {e}")))?;
         (
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta),
             size,
@@ -516,9 +530,10 @@ async fn read_one(
             .map_err(|e| BasinError::storage(format!("head {path}: {e}")))?;
         let size = head.size as u64;
         let mut reader = ParquetObjectReader::new(store, head);
-        let arrow_meta = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
-            .await
-            .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
+        let arrow_meta =
+            ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
+                .await
+                .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
         meta_cache.insert(
             path.clone(),
             CachedParquetMeta {
@@ -760,11 +775,7 @@ async fn try_load_encrypted(
     let sidecar_exists = match head_res {
         Ok(_) => true,
         Err(object_store::Error::NotFound { .. }) => false,
-        Err(e) => {
-            return Err(BasinError::storage(format!(
-                "head sidecar {sidecar}: {e}"
-            )))
-        }
+        Err(e) => return Err(BasinError::storage(format!("head sidecar {sidecar}: {e}"))),
     };
     if !sidecar_exists {
         return Ok(None);
@@ -819,12 +830,10 @@ async fn finalize_encrypted_stream(
     let mut bytes_reader = BytesFileReader {
         bytes: bytes::Bytes::from(plaintext),
     };
-    let arrow_meta = ArrowReaderMetadata::load_async(
-        &mut bytes_reader,
-        ArrowReaderOptions::default(),
-    )
-    .await
-    .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
+    let arrow_meta =
+        ArrowReaderMetadata::load_async(&mut bytes_reader, ArrowReaderOptions::default())
+            .await
+            .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
 
     let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(bytes_reader, arrow_meta);
     finalize_pipeline(builder, path, opts, counters, page_cache, cache_key).await
@@ -906,7 +915,8 @@ where
     let stream = builder
         .build()
         .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
-    let mapped = stream.map(|res| res.map_err(|e| BasinError::storage(format!("parquet read: {e}"))));
+    let mapped =
+        stream.map(|res| res.map_err(|e| BasinError::storage(format!("parquet read: {e}"))));
 
     if let (Some(pc), Some(key)) = (page_cache, cache_key) {
         let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
@@ -940,4 +950,3 @@ where
 
     Ok(mapped.boxed())
 }
-

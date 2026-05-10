@@ -152,12 +152,8 @@ pub(crate) async fn provision(
         drop(client);
         match row {
             Some(_) => {
-                let connection_url = build_connection_url(
-                    &inner.cfg.pgwire_public_host,
-                    &user,
-                    &secret,
-                    dbname,
-                );
+                let connection_url =
+                    build_connection_url(&inner.cfg.pgwire_public_host, &user, &secret, dbname);
                 return Ok(ConnectionInfo {
                     tenant_id: *tenant,
                     pgwire_user: user,
@@ -174,16 +170,11 @@ pub(crate) async fn provision(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        BasinError::internal("provision_tenant_db: exhausted user retries")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| BasinError::internal("provision_tenant_db: exhausted user retries")))
 }
 
-pub(crate) async fn validate(
-    inner: &Inner,
-    user: &str,
-    password_plain: &str,
-) -> Result<TenantId> {
+pub(crate) async fn validate(inner: &Inner, user: &str, password_plain: &str) -> Result<TenantId> {
     // Uniform error for both "no such user" and "user exists but wrong
     // password" — keeps the SQLSTATE 28P01 surface minimal and avoids
     // leaking enumeration information. bcrypt's constant-ish work factor
@@ -248,12 +239,8 @@ pub(crate) async fn rotate(inner: &Inner, pgwire_user: &str) -> Result<Connectio
     let tenant: TenantId = tenant_str
         .parse()
         .map_err(|e| BasinError::internal(format!("tenant_credentials tenant parse: {e}")))?;
-    let connection_url = build_connection_url(
-        &inner.cfg.pgwire_public_host,
-        pgwire_user,
-        &secret,
-        &dbname,
-    );
+    let connection_url =
+        build_connection_url(&inner.cfg.pgwire_public_host, pgwire_user, &secret, &dbname);
     Ok(ConnectionInfo {
         tenant_id: tenant,
         pgwire_user: pgwire_user.to_owned(),

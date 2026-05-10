@@ -55,11 +55,7 @@ impl Catalog for RestCatalog {
         unimplemented!("RestCatalog::create_table lands in Phase 2")
     }
 
-    async fn load_table(
-        &self,
-        _tenant: &TenantId,
-        _table: &TableName,
-    ) -> Result<TableMetadata> {
+    async fn load_table(&self, _tenant: &TenantId, _table: &TableName) -> Result<TableMetadata> {
         unimplemented!("RestCatalog::load_table lands in Phase 2")
     }
 
@@ -117,7 +113,6 @@ mod tests {
     #[test]
     fn constructable() {
         // We can build the stub even though every method panics.
-        let _ = RestCatalog::new("https://catalog.example/iceberg/v1")
-            .with_bearer("dev-token");
+        let _ = RestCatalog::new("https://catalog.example/iceberg/v1").with_bearer("dev-token");
     }
 }

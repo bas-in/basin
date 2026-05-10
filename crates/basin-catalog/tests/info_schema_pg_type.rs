@@ -10,7 +10,10 @@ use basin_common::TenantId;
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<StringArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
 }
 
 fn col_i64<'a>(b: &'a RecordBatch, n: &str) -> &'a Int64Array {
@@ -25,7 +28,10 @@ fn col_i16<'a>(b: &'a RecordBatch, n: &str) -> &'a Int16Array {
 
 fn col_bool<'a>(b: &'a RecordBatch, n: &str) -> &'a BooleanArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<BooleanArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
 }
 
 fn typname_to_oid(b: &RecordBatch, want: &str) -> Option<i64> {
@@ -46,7 +52,11 @@ async fn pg_type_lists_basin_supported_types() {
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::pg_type(&cat, &t).await.unwrap();
-    assert!(batch.num_rows() >= 14, "expected at least 14 PG types, got {}", batch.num_rows());
+    assert!(
+        batch.num_rows() >= 14,
+        "expected at least 14 PG types, got {}",
+        batch.num_rows()
+    );
 
     // Schema sanity.
     let names: Vec<String> = batch
@@ -69,7 +79,15 @@ async fn pg_type_lists_basin_supported_types() {
     );
 
     // Core types every Basin tenant needs.
-    for required in ["bool", "int4", "int8", "text", "timestamptz", "jsonb", "uuid"] {
+    for required in [
+        "bool",
+        "int4",
+        "int8",
+        "text",
+        "timestamptz",
+        "jsonb",
+        "uuid",
+    ] {
         assert!(
             typname_to_oid(&batch, required).is_some(),
             "pg_type missing {required:?}"
@@ -124,8 +142,8 @@ async fn pg_type_oids_match_router() {
         ("jsonb", 3802),
     ];
     for (name, oid) in expected {
-        let got = typname_to_oid(&batch, name)
-            .unwrap_or_else(|| panic!("pg_type missing {name:?}"));
+        let got =
+            typname_to_oid(&batch, name).unwrap_or_else(|| panic!("pg_type missing {name:?}"));
         assert_eq!(got, *oid, "{name} OID");
     }
 }

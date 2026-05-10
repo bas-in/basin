@@ -115,11 +115,7 @@ impl ResponseStore {
 
     /// Fetch one response row by id. Returns `None` until the runner has
     /// recorded it.
-    pub async fn get(
-        &self,
-        tenant: &TenantId,
-        id: RequestId,
-    ) -> Result<Option<ResponseRow>> {
+    pub async fn get(&self, tenant: &TenantId, id: RequestId) -> Result<Option<ResponseRow>> {
         self.ensure_tables(tenant).await?;
         let sess = self.inner.engine.open_session(*tenant).await?;
         let res = sess
@@ -143,7 +139,7 @@ impl ResponseStore {
             let body = downcast_str(&b, "body")?;
             let err = downcast_opt_str(&b, "error")?;
             let completed = downcast_i64(&b, "completed_unix_ms")?;
-            for i in 0..b.num_rows() {
+            if let Some(i) = (0..b.num_rows()).next() {
                 let row = ResponseRow {
                     id: parse_uuid(&ids[i])?,
                     request_id: parse_uuid(&req_ids[i])?,

@@ -271,5 +271,8 @@ async fn s3_viability_tiered_storage() {
         }),
     );
 
-    assert!(pass, "card primary failed: cold={cold_after_sweep} rows={total_rows}");
+    assert!(
+        pass,
+        "card primary failed: cold={cold_after_sweep} rows={total_rows}"
+    );
 }

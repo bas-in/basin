@@ -196,7 +196,11 @@ fn parse_projection(items: &[SelectItem]) -> Option<Option<Vec<String>>> {
 /// Parse `<col> = <literal>` (or its mirror, `<literal> = <col>`).
 fn parse_eq_literal(expr: &Expr) -> Option<Predicate> {
     let (left, right) = match expr {
-        Expr::BinaryOp { op: BinaryOperator::Eq, left, right } => (left.as_ref(), right.as_ref()),
+        Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref()),
         _ => return None,
     };
 
@@ -221,8 +225,14 @@ fn as_identifier(e: &Expr) -> Option<String> {
 /// the fast path.
 fn literal_value(e: &Expr) -> Option<ScalarValue> {
     let (negate, inner) = match e {
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (true, expr.as_ref()),
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => (false, expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => (false, expr.as_ref()),
         other => (false, other),
     };
     match inner {
@@ -293,9 +303,10 @@ pub(crate) async fn execute_simple_select(
         Some(cols) => {
             let mut idxs = Vec::with_capacity(cols.len());
             for c in cols {
-                let i = meta.schema.index_of(c).map_err(|_| {
-                    BasinError::InvalidSchema(format!("unknown column {c}"))
-                })?;
+                let i = meta
+                    .schema
+                    .index_of(c)
+                    .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
                 idxs.push(i);
             }
             Some(idxs)
@@ -330,7 +341,9 @@ pub(crate) async fn execute_simple_select(
         // The pre-flush above already drained the tail into Parquet so this
         // read is bounded, then `handle.read` only has to scan whatever new
         // tail rows have arrived since.
-        let handle = shard.get(&sess.tenant, &PartitionKey::default_key()).await?;
+        let handle = shard
+            .get(&sess.tenant, &PartitionKey::default_key())
+            .await?;
         if heavy {
             let table = plan.table.clone();
             run_blocking(move || async move { handle.read(&table, opts).await }).await?
@@ -363,9 +376,11 @@ pub(crate) async fn execute_simple_select(
     };
 
     let projected_schema: Arc<Schema> = match &proj_indices {
-        Some(idxs) => Arc::new(meta.schema.project(idxs).map_err(|e| {
-            BasinError::internal(format!("project schema: {e}"))
-        })?),
+        Some(idxs) => Arc::new(
+            meta.schema
+                .project(idxs)
+                .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
+        ),
         None => meta.schema.clone(),
     };
 
@@ -465,7 +480,10 @@ mod tests {
     fn matches_select_star_with_string_literal() {
         let stmt = parse_one("SELECT * FROM events WHERE name = 'alice' LIMIT 10");
         let plan = match_simple_select(&stmt).expect("fast path should match");
-        assert!(plan.projection.is_none(), "wildcard should mean no projection");
+        assert!(
+            plan.projection.is_none(),
+            "wildcard should mean no projection"
+        );
         match plan.predicate {
             Some(Predicate::Eq(col, ScalarValue::Utf8(v))) => {
                 assert_eq!(col, "name");

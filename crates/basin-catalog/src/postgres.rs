@@ -28,10 +28,10 @@ use tracing::instrument;
 use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
 use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
 use crate::functions::SqlFunctionDef;
-use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, TableMetadata,
 };
+use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::reactors::{self, ReactorDef, ReactorError, ReactorOps};
 use crate::sequences::{compute_next, SequenceDef, SequenceError};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
@@ -283,9 +283,7 @@ impl PostgresCatalog {
             // One global sequence keeps assignment monotonic across all
             // tenants without a per-tenant counter row; lookup orders by
             // the value, so cross-tenant interleaving is fine.
-            format!(
-                "CREATE SEQUENCE IF NOT EXISTS {schema}.reactor_seq START 1"
-            ),
+            format!("CREATE SEQUENCE IF NOT EXISTS {schema}.reactor_seq START 1"),
             // Per-tenant `CREATE TYPE … AS ENUM` rows. `labels` is the
             // ordered JSONB array of label strings; `ALTER TYPE … ADD
             // VALUE` appends to it inside a row-locked transaction.
@@ -533,9 +531,8 @@ impl Catalog for PostgresCatalog {
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
         let partition_spec = match partition_spec_json {
-            Some(v) => serde_json::from_value(v).map_err(|e| {
-                BasinError::catalog(format!("deserialise partition spec: {e}"))
-            })?,
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise partition spec: {e}")))?,
             None => PartitionSpec::Unpartitioned,
         };
         let policies: Vec<Policy> = match policies_json {
@@ -555,8 +552,13 @@ impl Catalog for PostgresCatalog {
         // Postgres BIGINT is i64; clamp negatives / wider-than-usize defensively.
         // A negative row-group size has no meaning and shouldn't propagate; an
         // overflow on 32-bit hosts likewise falls back to "use the default".
-        let row_group_rows: Option<usize> = row_group_rows_pg
-            .and_then(|v| if v >= 0 { usize::try_from(v).ok() } else { None });
+        let row_group_rows: Option<usize> = row_group_rows_pg.and_then(|v| {
+            if v >= 0 {
+                usize::try_from(v).ok()
+            } else {
+                None
+            }
+        });
         let continuous_aggregate: Option<CvDef> = match continuous_aggregate_json {
             Some(v) => Some(serde_json::from_value(v).map_err(|e| {
                 BasinError::catalog(format!("deserialise continuous_aggregate: {e}"))
@@ -564,9 +566,8 @@ impl Catalog for PostgresCatalog {
             None => None,
         };
         let cluster_columns: Vec<String> = match cluster_columns_json {
-            Some(v) => serde_json::from_value(v).map_err(|e| {
-                BasinError::catalog(format!("deserialise cluster_columns: {e}"))
-            })?,
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise cluster_columns: {e}")))?,
             None => Vec::new(),
         };
         let home_region: Option<String> = row.get(12);
@@ -576,9 +577,8 @@ impl Catalog for PostgresCatalog {
             None => Vec::new(),
         };
         let check_constraints: Vec<CheckConstraint> = match check_constraints_json {
-            Some(v) => serde_json::from_value(v).map_err(|e| {
-                BasinError::catalog(format!("deserialise check_constraints: {e}"))
-            })?,
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise check_constraints: {e}")))?,
             None => Vec::new(),
         };
         let foreign_keys: Vec<ForeignKeyDef> = match foreign_keys_json {
@@ -735,9 +735,7 @@ impl Catalog for PostgresCatalog {
         let client = self.client.lock().await;
         let rows = client
             .query(
-                &format!(
-                    "SELECT data_files FROM {sch}.snapshots WHERE tenant_id = $1"
-                ),
+                &format!("SELECT data_files FROM {sch}.snapshots WHERE tenant_id = $1"),
                 &[&tenant.to_string()],
             )
             .await
@@ -745,9 +743,8 @@ impl Catalog for PostgresCatalog {
         let mut out: Vec<DataFileRef> = Vec::new();
         for row in rows {
             let files_json: serde_json::Value = row.get(0);
-            let files: Vec<DataFileRef> = serde_json::from_value(files_json).map_err(|e| {
-                BasinError::catalog(format!("deserialise data files: {e}"))
-            })?;
+            let files: Vec<DataFileRef> = serde_json::from_value(files_json)
+                .map_err(|e| BasinError::catalog(format!("deserialise data files: {e}")))?;
             out.extend(files);
         }
         Ok(out)
@@ -1085,9 +1082,8 @@ impl Catalog for PostgresCatalog {
         columns: Vec<String>,
     ) -> Result<()> {
         let sch = &self.schema;
-        let json = serde_json::to_value(&columns).map_err(|e| {
-            BasinError::catalog(format!("serialise bloom_filter_columns: {e}"))
-        })?;
+        let json = serde_json::to_value(&columns)
+            .map_err(|e| BasinError::catalog(format!("serialise bloom_filter_columns: {e}")))?;
         let client = self.client.lock().await;
         let n = client
             .execute(
@@ -1185,9 +1181,10 @@ impl Catalog for PostgresCatalog {
         let json: Option<serde_json::Value> = if columns.is_empty() {
             None
         } else {
-            Some(serde_json::to_value(&columns).map_err(|e| {
-                BasinError::catalog(format!("serialise cluster_columns: {e}"))
-            })?)
+            Some(
+                serde_json::to_value(&columns)
+                    .map_err(|e| BasinError::catalog(format!("serialise cluster_columns: {e}")))?,
+            )
         };
         let client = self.client.lock().await;
         let n = client
@@ -1249,13 +1246,14 @@ impl Catalog for PostgresCatalog {
                     .map_err(|e| BasinError::catalog(format!("serialise pk_columns: {e}")))?,
             )
         };
-        let check_json: Option<serde_json::Value> = if check_constraints.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(&check_constraints).map_err(|e| {
-                BasinError::catalog(format!("serialise check_constraints: {e}"))
-            })?)
-        };
+        let check_json: Option<serde_json::Value> =
+            if check_constraints.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&check_constraints).map_err(|e| {
+                    BasinError::catalog(format!("serialise check_constraints: {e}"))
+                })?)
+            };
         let fk_json: Option<serde_json::Value> = if foreign_keys.is_empty() {
             None
         } else {
@@ -1291,12 +1289,7 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
-    async fn set_schema(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-        schema: Schema,
-    ) -> Result<()> {
+    async fn set_schema(&self, tenant: &TenantId, table: &TableName, schema: Schema) -> Result<()> {
         let sch = &self.schema;
         let schema_json = serde_json::to_value(&schema)
             .map_err(|e| BasinError::catalog(format!("serialise arrow schema: {e}")))?;
@@ -1318,11 +1311,7 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn list_snapshots(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-    ) -> Result<Vec<Snapshot>> {
+    async fn list_snapshots(&self, tenant: &TenantId, table: &TableName) -> Result<Vec<Snapshot>> {
         let sch = &self.schema;
         let tenant_str = tenant.to_string();
         let table_str = table.to_string();
@@ -1331,9 +1320,7 @@ impl Catalog for PostgresCatalog {
         // rather than an empty list when the table is missing.
         let exists = client
             .query_opt(
-                &format!(
-                    "SELECT 1 FROM {sch}.tables WHERE tenant_id = $1 AND table_name = $2"
-                ),
+                &format!("SELECT 1 FROM {sch}.tables WHERE tenant_id = $1 AND table_name = $2"),
                 &[&tenant_str, &table_str],
             )
             .await
@@ -1584,7 +1571,7 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("serialise fn args: {e}")))?;
         let return_json = serde_json::to_value(&def.return_type)
             .map_err(|e| BasinError::catalog(format!("serialise fn return: {e}")))?;
-        let language = serde_json::to_value(&def.language)
+        let language = serde_json::to_value(def.language)
             .map_err(|e| BasinError::catalog(format!("serialise fn language: {e}")))?
             .as_str()
             .unwrap_or("sql")
@@ -1640,11 +1627,7 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_sql_function(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-    ) -> Option<SqlFunctionDef> {
+    async fn lookup_sql_function(&self, tenant: &TenantId, name: &str) -> Option<SqlFunctionDef> {
         let sch = &self.schema;
         let tenant_str = tenant.to_string();
         let client = self.client.lock().await;
@@ -2003,10 +1986,7 @@ impl Catalog for PostgresCatalog {
         // within any single (tenant, table). Done before the INSERT so we
         // can roll the txn back cleanly on conflict.
         let seq_row = txn
-            .query_one(
-                &format!("SELECT nextval('{sch}.reactor_seq')"),
-                &[],
-            )
+            .query_one(&format!("SELECT nextval('{sch}.reactor_seq')"), &[])
             .await
             .map_err(|e| BasinError::catalog(format!("reactor seq nextval: {e}")))?;
         let seq: i64 = seq_row.get(0);
@@ -2044,12 +2024,7 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
-    async fn drop_reactor(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-        name: &str,
-    ) -> Result<()> {
+    async fn drop_reactor(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let n = client
@@ -2239,12 +2214,7 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = %value))]
-    async fn add_enum_value(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-        value: &str,
-    ) -> Result<()> {
+    async fn add_enum_value(&self, tenant: &TenantId, name: &str, value: &str) -> Result<()> {
         if value.is_empty() {
             return Err(BasinError::InvalidSchema(
                 "ALTER TYPE ADD VALUE: label cannot be empty".into(),
@@ -2287,9 +2257,8 @@ impl Catalog for PostgresCatalog {
         // Append via JSONB concat. Equivalent to `labels.push(value)` in
         // the in-memory backend; the row lock ensures the read above
         // sees the same array we mutate here.
-        let value_arr = serde_json::Value::Array(vec![serde_json::Value::String(
-            value.to_string(),
-        )]);
+        let value_arr =
+            serde_json::Value::Array(vec![serde_json::Value::String(value.to_string())]);
         tx.execute(
             &format!(
                 "UPDATE {sch}.enum_types \
@@ -2312,9 +2281,7 @@ impl Catalog for PostgresCatalog {
         // reject the drop if any column carries `BASIN_ENUM_TYPE=<name>`.
         // Mirrors the in-memory backend's `tables_referencing_type`
         // approach exactly — same metadata key, same lazy scan.
-        let referencing = self
-            .tables_referencing_type(tenant, name, true)
-            .await?;
+        let referencing = self.tables_referencing_type(tenant, name, true).await?;
         if !referencing.is_empty() {
             return Err(BasinError::catalog(format!(
                 "cannot drop enum {name:?}: still referenced by table column(s) {referencing:?}; \
@@ -2375,7 +2342,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
     async fn register_domain(&self, def: DomainDef) -> Result<()> {
         domains::validate_new(&def).map_err(domain_err_to_basin)?;
-        let base_type_json = serde_json::to_value(&def.base_type)
+        let base_type_json = serde_json::to_value(def.base_type)
             .map_err(|e| BasinError::catalog(format!("serialise domain base_type: {e}")))?;
         let sch = &self.schema;
         let tenant_str = def.tenant.to_string();
@@ -2461,9 +2428,7 @@ impl Catalog for PostgresCatalog {
 
     #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
     async fn drop_domain(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let referencing = self
-            .tables_referencing_type(tenant, name, false)
-            .await?;
+        let referencing = self.tables_referencing_type(tenant, name, false).await?;
         if !referencing.is_empty() {
             return Err(BasinError::catalog(format!(
                 "cannot drop domain {name:?}: still referenced by table column(s) {referencing:?}; \
@@ -2483,9 +2448,7 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("drop_domain: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!(
-                "{tenant}: domain {name:?}"
-            )));
+            return Err(BasinError::not_found(format!("{tenant}: domain {name:?}")));
         }
         Ok(())
     }
@@ -2574,11 +2537,7 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_procedure(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-    ) -> Option<SqlProcedureDef> {
+    async fn lookup_procedure(&self, tenant: &TenantId, name: &str) -> Option<SqlProcedureDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let row = client
@@ -2644,9 +2603,8 @@ impl Catalog for PostgresCatalog {
     ) -> Result<()> {
         let sch = &self.schema;
         let tenant_str = tenant.to_string();
-        let config_json = serde_json::to_value(&config).map_err(|e| {
-            BasinError::catalog(format!("serialise tenant_storage_config: {e}"))
-        })?;
+        let config_json = serde_json::to_value(&config)
+            .map_err(|e| BasinError::catalog(format!("serialise tenant_storage_config: {e}")))?;
         let client = self.client.lock().await;
         client
             .execute(
@@ -2687,9 +2645,8 @@ impl Catalog for PostgresCatalog {
             return Ok(None);
         };
         let config_json: serde_json::Value = row.get(0);
-        let config: TenantStorageConfig = serde_json::from_value(config_json).map_err(|e| {
-            BasinError::catalog(format!("deserialise tenant_storage_config: {e}"))
-        })?;
+        let config: TenantStorageConfig = serde_json::from_value(config_json)
+            .map_err(|e| BasinError::catalog(format!("deserialise tenant_storage_config: {e}")))?;
         Ok(Some(config))
     }
 }
@@ -2798,21 +2755,15 @@ fn reactor_err_to_basin(e: ReactorError) -> BasinError {
         ReactorError::Duplicate => {
             BasinError::catalog("reactor already registered for this (tenant, table)")
         }
-        ReactorError::InvalidBody(msg) => {
-            BasinError::InvalidSchema(format!("reactor body: {msg}"))
-        }
+        ReactorError::InvalidBody(msg) => BasinError::InvalidSchema(format!("reactor body: {msg}")),
         ReactorError::InvalidPredicate(msg) => {
             BasinError::InvalidSchema(format!("reactor predicate: {msg}"))
         }
-        ReactorError::NoOps => {
-            BasinError::InvalidSchema("reactor ops bitset is empty".into())
+        ReactorError::NoOps => BasinError::InvalidSchema("reactor ops bitset is empty".into()),
+        ReactorError::MultiStatementBody => {
+            BasinError::InvalidSchema("reactor body must be a single SQL statement".into())
         }
-        ReactorError::MultiStatementBody => BasinError::InvalidSchema(
-            "reactor body must be a single SQL statement".into(),
-        ),
-        ReactorError::NotFound => {
-            BasinError::not_found("reactor not found")
-        }
+        ReactorError::NotFound => BasinError::not_found("reactor not found"),
     }
 }
 
@@ -2909,7 +2860,10 @@ mod tests {
     /// 26 chars, so the prefix + ULID fits comfortably and is mixed-case-
     /// insensitive enough to be safe.
     fn unique_schema() -> String {
-        format!("basin_catalog_test_{}", Ulid::new().to_string().to_lowercase())
+        format!(
+            "basin_catalog_test_{}",
+            Ulid::new().to_string().to_lowercase()
+        )
     }
 
     /// Drops the schema (and every table inside) in `Drop`. Uses a fresh
@@ -3151,7 +3105,10 @@ mod tests {
             .count();
         let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
         assert_eq!(oks, 1, "exactly one append must win: {r1:?} {r2:?}");
-        assert_eq!(conflicts, 1, "exactly one append must conflict: {r1:?} {r2:?}");
+        assert_eq!(
+            conflicts, 1,
+            "exactly one append must conflict: {r1:?} {r2:?}"
+        );
 
         let head = cat.load_table(&t, &tbl).await.unwrap();
         assert_eq!(head.current_snapshot, SnapshotId(1));
@@ -3341,12 +3298,22 @@ mod tests {
         let beta = TableName::new("beta").unwrap();
         cat.create_table(&t, &alpha, &schema()).await.unwrap();
         cat.create_table(&t, &beta, &schema()).await.unwrap();
-        cat.append_data_files(&t, &alpha, SnapshotId::GENESIS, vec![file("a1.parquet", 1, 10)])
-            .await
-            .unwrap();
-        cat.append_data_files(&t, &beta, SnapshotId::GENESIS, vec![file("b1.parquet", 1, 10)])
-            .await
-            .unwrap();
+        cat.append_data_files(
+            &t,
+            &alpha,
+            SnapshotId::GENESIS,
+            vec![file("a1.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+        cat.append_data_files(
+            &t,
+            &beta,
+            SnapshotId::GENESIS,
+            vec![file("b1.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
         cat.append_data_files(&t, &alpha, SnapshotId(1), vec![file("a2.parquet", 1, 10)])
             .await
             .unwrap();
@@ -3399,8 +3366,7 @@ mod tests {
     #[tokio::test]
     async fn sql_function_round_trip() {
         use crate::functions::{
-            SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage,
-            SqlReturnType,
+            SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
         };
         let Some((cat, _guard)) = try_connect().await else {
             return;
@@ -3552,7 +3518,9 @@ mod tests {
         let b = TenantId::new();
         cat.create_namespace(&a).await.unwrap();
         cat.create_namespace(&b).await.unwrap();
-        cat.create_sequence(seq_def(a, "shared", 1, 1)).await.unwrap();
+        cat.create_sequence(seq_def(a, "shared", 1, 1))
+            .await
+            .unwrap();
 
         // Tenant B can't see tenant A's sequence.
         let err = cat.nextval(&b, "shared").await.unwrap_err();
@@ -3633,10 +3601,7 @@ mod tests {
         assert_eq!(listed[0], def);
 
         cat.drop_reactor(&t, &tbl, "after_paid").await.unwrap();
-        let err = cat
-            .drop_reactor(&t, &tbl, "after_paid")
-            .await
-            .unwrap_err();
+        let err = cat.drop_reactor(&t, &tbl, "after_paid").await.unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)));
         assert!(cat.list_reactors(&t).await.is_empty());
     }

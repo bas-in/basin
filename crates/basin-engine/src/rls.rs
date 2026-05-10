@@ -47,8 +47,7 @@ use basin_common::{BasinError, Result, TableName};
 use datafusion::logical_expr::{Filter, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::{DataFrame, SessionContext};
 use sqlparser::ast::{
-    AlterPolicyOperation, AlterTableOperation, CreatePolicyCommand, ObjectName, Owner,
-    Statement,
+    AlterPolicyOperation, AlterTableOperation, CreatePolicyCommand, ObjectName, Owner, Statement,
 };
 
 /// Compile `Statement::CreatePolicy` (and friends) into a catalog mutation.
@@ -86,14 +85,11 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
                 .into_iter()
                 .filter(|r| !r.eq_ignore_ascii_case("public"))
                 .collect();
-            let using_expr = using
-                .as_ref()
-                .map(|e| e.to_string())
-                .ok_or_else(|| {
-                    BasinError::InvalidSchema(
-                        "CREATE POLICY without USING is not supported in v0.1".into(),
-                    )
-                })?;
+            let using_expr = using.as_ref().map(|e| e.to_string()).ok_or_else(|| {
+                BasinError::InvalidSchema(
+                    "CREATE POLICY without USING is not supported in v0.1".into(),
+                )
+            })?;
             let with_check_expr = with_check.as_ref().map(|e| e.to_string());
             Ok(Some(RlsDdl::CreatePolicy {
                 table,
@@ -116,7 +112,11 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
                 AlterPolicyOperation::Rename { new_name } => {
                     AlterPolicyOp::Rename(new_name.value.clone())
                 }
-                AlterPolicyOperation::Apply { to, using, with_check } => {
+                AlterPolicyOperation::Apply {
+                    to,
+                    using,
+                    with_check,
+                } => {
                     let roles = to.as_ref().map(|owners| {
                         owners
                             .iter()
@@ -151,9 +151,7 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
             }))
         }
         Statement::AlterTable {
-            name,
-            operations,
-            ..
+            name, operations, ..
         } => {
             // We only intercept `ENABLE/DISABLE ROW LEVEL SECURITY`; every
             // other ALTER TABLE op is out of scope for this module and the
@@ -162,11 +160,17 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
                 match op {
                     AlterTableOperation::EnableRowLevelSecurity => {
                         let table = single_part_object_name(name)?;
-                        return Ok(Some(RlsDdl::SetRlsEnabled { table, enabled: true }));
+                        return Ok(Some(RlsDdl::SetRlsEnabled {
+                            table,
+                            enabled: true,
+                        }));
                     }
                     AlterTableOperation::DisableRowLevelSecurity => {
                         let table = single_part_object_name(name)?;
-                        return Ok(Some(RlsDdl::SetRlsEnabled { table, enabled: false }));
+                        return Ok(Some(RlsDdl::SetRlsEnabled {
+                            table,
+                            enabled: false,
+                        }));
                     }
                     _ => {}
                 }
@@ -229,7 +233,11 @@ impl RlsDdl {
         match self {
             RlsDdl::SetRlsEnabled { enabled, .. } => {
                 *rls_enabled = enabled;
-                Ok(if enabled { "ALTER TABLE" } else { "ALTER TABLE" })
+                Ok(if enabled {
+                    "ALTER TABLE"
+                } else {
+                    "ALTER TABLE"
+                })
             }
             RlsDdl::CreatePolicy { policy, .. } => {
                 if policies.iter().any(|p| p.name == policy.name) {
@@ -245,12 +253,14 @@ impl RlsDdl {
                 let p = policies
                     .iter_mut()
                     .find(|p| p.name == name)
-                    .ok_or_else(|| {
-                        BasinError::not_found(format!("policy {name:?}"))
-                    })?;
+                    .ok_or_else(|| BasinError::not_found(format!("policy {name:?}")))?;
                 match op {
                     AlterPolicyOp::Rename(new) => p.name = new,
-                    AlterPolicyOp::Apply { roles, using_expr, with_check_expr } => {
+                    AlterPolicyOp::Apply {
+                        roles,
+                        using_expr,
+                        with_check_expr,
+                    } => {
                         if let Some(r) = roles {
                             p.applies_to_roles = r;
                         }
@@ -264,7 +274,9 @@ impl RlsDdl {
                 }
                 Ok("ALTER POLICY")
             }
-            RlsDdl::DropPolicy { name, if_exists, .. } => {
+            RlsDdl::DropPolicy {
+                name, if_exists, ..
+            } => {
                 let pos = policies.iter().position(|p| p.name == name);
                 match (pos, if_exists) {
                     (Some(i), _) => {
@@ -323,15 +335,12 @@ pub(crate) fn select_applicable<'a>(
 ) -> Vec<&'a Policy> {
     policies
         .iter()
-        .filter(|p| {
-            match p.command {
-                PolicyCommand::All => true,
-                other => other == kind,
-            }
+        .filter(|p| match p.command {
+            PolicyCommand::All => true,
+            other => other == kind,
         })
         .filter(|p| {
-            p.applies_to_roles.is_empty()
-                || p.applies_to_roles.iter().any(|r| r == current_user)
+            p.applies_to_roles.is_empty() || p.applies_to_roles.iter().any(|r| r == current_user)
         })
         .collect()
 }
@@ -435,14 +444,11 @@ async fn build_predicate_expr(
     // be a SQL keyword still parses. The `current_user` substitution above
     // has already escaped the literal.
     let probe_sql = format!("SELECT 1 FROM \"{table}\" WHERE {prepared}");
-    let df = ctx
-        .sql(&probe_sql)
-        .await
-        .map_err(|e| {
-            BasinError::InvalidSchema(format!(
-                "rls policy USING failed to plan ({probe_sql:?}): {e}"
-            ))
-        })?;
+    let df = ctx.sql(&probe_sql).await.map_err(|e| {
+        BasinError::InvalidSchema(format!(
+            "rls policy USING failed to plan ({probe_sql:?}): {e}"
+        ))
+    })?;
     // The plan is `Projection(SELECT 1) -> Filter(<using>) -> TableScan(t)`.
     // Walk it once and pull the first Filter's predicate.
     let plan = df.logical_plan().clone();
@@ -467,9 +473,7 @@ fn extract_first_filter(plan: &LogicalPlan) -> Option<datafusion::logical_expr::
     }
 }
 
-fn combine_or(
-    mut exprs: Vec<datafusion::logical_expr::Expr>,
-) -> datafusion::logical_expr::Expr {
+fn combine_or(mut exprs: Vec<datafusion::logical_expr::Expr>) -> datafusion::logical_expr::Expr {
     let mut acc = exprs.pop().expect("combine_or: empty");
     for e in exprs {
         acc = acc.or(e);
@@ -505,9 +509,7 @@ fn substitute_current_user(using_expr: &str, current_user: &str) -> String {
             i += 1;
         }
         let tok = &using_expr[start..i];
-        if tok.eq_ignore_ascii_case("current_user")
-            || tok.eq_ignore_ascii_case("current_role")
-        {
+        if tok.eq_ignore_ascii_case("current_user") || tok.eq_ignore_ascii_case("current_role") {
             out.push_str(&literal);
         } else {
             out.push_str(tok);
@@ -596,8 +598,7 @@ mod tests {
     #[test]
     fn substitute_current_user_leaves_substrings_alone() {
         // a column named `mycurrent_user_col` should be left intact.
-        let out =
-            substitute_current_user("mycurrent_user_col = 'x'", "alice");
+        let out = substitute_current_user("mycurrent_user_col = 'x'", "alice");
         assert_eq!(out, "mycurrent_user_col = 'x'");
     }
 

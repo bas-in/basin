@@ -184,11 +184,7 @@ fn apply_options(def: &mut SequenceDef, options: &[SequenceOptions]) -> Result<(
                 def.min_value = parse_signed_int(expr, "MINVALUE")?;
             }
             SequenceOptions::MinValue(None) => {
-                def.min_value = if def.increment < 0 {
-                    i64::MIN + 1
-                } else {
-                    1
-                };
+                def.min_value = if def.increment < 0 { i64::MIN + 1 } else { 1 };
             }
             SequenceOptions::MaxValue(Some(expr)) => {
                 def.max_value = parse_signed_int(expr, "MAXVALUE")?;
@@ -350,13 +346,12 @@ pub(crate) fn match_create_sequence(sql: &str) -> Result<Option<CreateSequenceIn
         return Ok(None);
     }
     let after_create = skip_word(trimmed).trim_start();
-    let (after_temp, temporary) = if starts_with_kw(after_create, "TEMPORARY")
-        || starts_with_kw(after_create, "TEMP")
-    {
-        (skip_word(after_create).trim_start(), true)
-    } else {
-        (after_create, false)
-    };
+    let (after_temp, temporary) =
+        if starts_with_kw(after_create, "TEMPORARY") || starts_with_kw(after_create, "TEMP") {
+            (skip_word(after_create).trim_start(), true)
+        } else {
+            (after_create, false)
+        };
     if !starts_with_kw(after_temp, "SEQUENCE") {
         return Ok(None);
     }
@@ -514,7 +509,10 @@ fn int_to_expr(n: i64) -> Expr {
     if n < 0 {
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
-            expr: Box::new(Expr::Value(Value::Number((-(n as i128)).to_string(), false))),
+            expr: Box::new(Expr::Value(Value::Number(
+                (-(n as i128)).to_string(),
+                false,
+            ))),
         }
     } else {
         Expr::Value(Value::Number(n.to_string(), false))
@@ -721,7 +719,9 @@ mod tests {
         assert!(match_create_sequence("CREATE TABLE foo (id BIGINT)")
             .unwrap()
             .is_none());
-        assert!(match_create_sequence("DROP SEQUENCE foo").unwrap().is_none());
+        assert!(match_create_sequence("DROP SEQUENCE foo")
+            .unwrap()
+            .is_none());
         assert!(match_create_sequence("SELECT 1").unwrap().is_none());
         assert!(match_create_sequence("ALTER SEQUENCE foo INCREMENT 2")
             .unwrap()
@@ -786,8 +786,7 @@ mod tests {
 
     #[test]
     fn match_create_sequence_unknown_option_errors() {
-        let err =
-            match_create_sequence("CREATE SEQUENCE foo NUDGE 5").unwrap_err();
+        let err = match_create_sequence("CREATE SEQUENCE foo NUDGE 5").unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
     }
 
@@ -801,7 +800,11 @@ mod tests {
     fn drop_sequence_parses_natively() {
         let stmt = parse_one("DROP SEQUENCE IF EXISTS foo");
         match stmt {
-            sqlparser::ast::Statement::Drop { object_type, if_exists, .. } => {
+            sqlparser::ast::Statement::Drop {
+                object_type,
+                if_exists,
+                ..
+            } => {
                 assert_eq!(object_type, sqlparser::ast::ObjectType::Sequence);
                 assert!(if_exists);
             }

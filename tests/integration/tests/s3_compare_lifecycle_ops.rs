@@ -43,7 +43,9 @@ fn which_wins_lower(basin: f64, postgres: f64) -> WhichWins {
     }
 }
 
-async fn pg_connect(pg_cfg: &basin_integration_tests::test_config::PostgresConfig) -> Option<(Client, String)> {
+async fn pg_connect(
+    pg_cfg: &basin_integration_tests::test_config::PostgresConfig,
+) -> Option<(Client, String)> {
     let conn_str = format!(
         "host={} port={} user={} password={} dbname={}",
         pg_cfg.host, pg_cfg.port, pg_cfg.user, pg_cfg.password, pg_cfg.dbname
@@ -71,9 +73,7 @@ impl Drop for SchemaGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });
@@ -97,7 +97,9 @@ fn basin_schema_v1() -> Arc<Schema> {
 
 fn build_basin_batch(start: i64, len: usize) -> RecordBatch {
     let ids: Int64Array = (start..start + len as i64).collect();
-    let bodies: Vec<String> = (0..len).map(|i| format!("body-{}", start + i as i64)).collect();
+    let bodies: Vec<String> = (0..len)
+        .map(|i| format!("body-{}", start + i as i64))
+        .collect();
     let body_arr: StringArray = bodies.iter().map(|s| Some(s.as_str())).collect();
     RecordBatch::try_new(basin_schema_v1(), vec![Arc::new(ids), Arc::new(body_arr)]).unwrap()
 }
@@ -270,11 +272,9 @@ async fn s3_compare_lifecycle_ops() {
     .expect("pg populate 2");
 
     let pg_alter_started = Instant::now();
-    pg.simple_query(&format!(
-        "ALTER TABLE {schema2}.events ADD COLUMN tag TEXT"
-    ))
-    .await
-    .expect("pg alter");
+    pg.simple_query(&format!("ALTER TABLE {schema2}.events ADD COLUMN tag TEXT"))
+        .await
+        .expect("pg alter");
     let pg_alter_ms = pg_alter_started.elapsed().as_secs_f64() * 1000.0;
 
     // Basin: real ALTER TABLE through the engine's SQL surface

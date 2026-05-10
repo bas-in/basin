@@ -222,7 +222,11 @@ pub(crate) async fn vector_search(
         }
     }
 
-    hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(k);
     Ok(hits)
 }
@@ -332,7 +336,11 @@ mod tests {
             })
             .collect();
         let emb = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(rows, dim as i32);
-        RecordBatch::try_new(embedding_schema(dim as i32), vec![Arc::new(ids), Arc::new(emb)]).unwrap()
+        RecordBatch::try_new(
+            embedding_schema(dim as i32),
+            vec![Arc::new(ids), Arc::new(emb)],
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -357,7 +365,9 @@ mod tests {
             .unwrap();
 
         // Query exactly the embedding for row 42; it must appear in the top-5.
-        let query: Vec<f32> = (0..dim).map(|d| (42_f32) * 0.001 + d as f32 * 0.01).collect();
+        let query: Vec<f32> = (0..dim)
+            .map(|d| (42_f32) * 0.001 + d as f32 * 0.01)
+            .collect();
         let hits = storage
             .vector_search(&tenant, &table, "embedding", &query, 5, Distance::L2)
             .await

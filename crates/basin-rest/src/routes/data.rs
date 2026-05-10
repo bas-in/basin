@@ -122,7 +122,11 @@ fn render_get_response(
     };
 
     let oversize = row_count >= STREAM_ROW_THRESHOLD;
-    let big_payload = if force_stream { false } else { estimate_bytes(&rows_value) >= STREAM_BYTE_THRESHOLD };
+    let big_payload = if force_stream {
+        false
+    } else {
+        estimate_bytes(&rows_value) >= STREAM_BYTE_THRESHOLD
+    };
     if force_stream || oversize || big_payload {
         return ndjson_stream(rows_value, next_cursor);
     }
@@ -331,7 +335,8 @@ pub(crate) async fn delete_table(
             // to E_ENGINE_UNSUPPORTED so the client SDK can surface a clean
             // message instead of a generic 500.
             let msg = e.to_string().to_ascii_lowercase();
-            if msg.contains("delete") && (msg.contains("not supported") || msg.contains("unsupported"))
+            if msg.contains("delete")
+                && (msg.contains("not supported") || msg.contains("unsupported"))
             {
                 Err(ApiError::unsupported(format!(
                     "DELETE not supported by engine: {e}"

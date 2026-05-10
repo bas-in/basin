@@ -46,8 +46,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -142,12 +141,7 @@ impl PatternResult {
 
 fn render_pg_error(err: &tokio_postgres::Error) -> String {
     if let Some(db) = err.as_db_error() {
-        format!(
-            "{} {}: {}",
-            db.severity(),
-            db.code().code(),
-            db.message()
-        )
+        format!("{} {}: {}", db.severity(), db.code().code(), db.message())
     } else {
         // Walk the source chain — tokio-postgres wraps the underlying I/O
         // or codec failure here.
@@ -200,9 +194,7 @@ async fn orm_compat_smoke() {
                 "INSERT INTO t (id, name, active) VALUES \
                   ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)",
                 &[
-                    &1i64, &"alpha", &true,
-                    &2i64, &"beta", &false,
-                    &3i64, &"gamma", &true,
+                    &1i64, &"alpha", &true, &2i64, &"beta", &false, &3i64, &"gamma", &true,
                 ],
             )
             .await;
@@ -326,10 +318,7 @@ async fn orm_compat_smoke() {
     //    so use a separate table where `note` is nullable.
     {
         let create = client
-            .execute(
-                "CREATE TABLE notes (id BIGINT NOT NULL, note TEXT)",
-                &[],
-            )
+            .execute("CREATE TABLE notes (id BIGINT NOT NULL, note TEXT)", &[])
             .await;
         match create {
             Err(e) => results.push(PatternResult::fail(
@@ -362,9 +351,7 @@ async fn orm_compat_smoke() {
                                 let got: Option<&str> = rs[0].get(1);
                                 match got {
                                     None => Ok(()),
-                                    Some(v) => {
-                                        Err(format!("expected NULL, got Some({v:?})"))
-                                    }
+                                    Some(v) => Err(format!("expected NULL, got Some({v:?})")),
                                 }
                             }
                             Ok(rs) => Err(format!("expected 1 row, got {}", rs.len())),
@@ -393,9 +380,7 @@ async fn orm_compat_smoke() {
     //    in Prisma, `LIMIT $1` in raw SeaQL. Postgres allows it; ours might
     //    not infer the int type yet. Document either outcome.
     {
-        let res = client
-            .query("SELECT id FROM t LIMIT $1", &[&2i64])
-            .await;
+        let res = client.query("SELECT id FROM t LIMIT $1", &[&2i64]).await;
         results.push(match res {
             Ok(rows) if rows.len() == 2 => PatternResult::pass(
                 "limit_param",
@@ -468,7 +453,10 @@ async fn orm_compat_smoke() {
     //    in Diesel and `Buffer` in Prisma's `Bytes` type.
     {
         let create = client
-            .execute("CREATE TABLE blobs (id BIGINT NOT NULL, data BYTEA NOT NULL)", &[])
+            .execute(
+                "CREATE TABLE blobs (id BIGINT NOT NULL, data BYTEA NOT NULL)",
+                &[],
+            )
             .await;
         match create {
             Err(e) => results.push(PatternResult::fail(

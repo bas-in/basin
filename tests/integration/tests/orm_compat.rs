@@ -53,8 +53,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -283,7 +282,10 @@ async fn prisma_pk_discovery() {
     // Flip-marker: when a659ad3 ships, the seeded `users` table's PK
     // column ('id') must be in this set.
     let names: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    assert!(names.contains("id"), "expected PK column 'id', got {names:?}");
+    assert!(
+        names.contains("id"),
+        "expected PK column 'id', got {names:?}"
+    );
 }
 
 /// Prisma query 5 — FK discovery. Same a659ad3 dependency; pin the
@@ -390,7 +392,10 @@ async fn sequelize_table_definition_query() {
             saw_pk = true;
         }
     }
-    assert!(saw_pk, "expected users.id row to carry PRIMARY KEY constraint");
+    assert!(
+        saw_pk,
+        "expected users.id row to carry PRIMARY KEY constraint"
+    );
 }
 
 /// Sequelize query 2 — table-existence check. Trivial probe; must
@@ -451,7 +456,10 @@ async fn sequelize_sequence_listing() {
 
     // Flip-marker: when 5.11.K3 ships, after a `CREATE SEQUENCE seq1;`
     // statement the listing must contain `seq1`.
-    assert!(!rows.is_empty(), "expected at least one sequence in pg_class");
+    assert!(
+        !rows.is_empty(),
+        "expected at least one sequence in pg_class"
+    );
 }
 
 // =============================================================================
@@ -505,7 +513,10 @@ async fn sqlalchemy_full_column_introspection() {
             saw_numeric = true;
         }
     }
-    assert!(saw_numeric, "orders.total numeric column must surface precision/scale");
+    assert!(
+        saw_numeric,
+        "orders.total numeric column must surface precision/scale"
+    );
 }
 
 /// SQLAlchemy query 2 — composite-PK column ordering via `unnest(conkey)

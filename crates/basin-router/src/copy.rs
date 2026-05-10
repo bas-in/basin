@@ -43,10 +43,10 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use basin_engine::ExecResult;
 use bytes::Bytes;
+use pgwire::error::ErrorInfo;
 use pgwire::messages::copy::{CopyData, CopyInResponse, CopyOutResponse};
 use pgwire::messages::response::{CommandComplete, ReadyForQuery, TransactionStatus};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::error::ErrorInfo;
 
 use crate::protocol::Session;
 
@@ -175,7 +175,10 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
     let with_header = parse_with_options(&mut sc)?;
     sc.skip_whitespace();
     if !sc.is_done() {
-        return Err(format!("unexpected trailing input after COPY: {:?}", sc.rest()));
+        return Err(format!(
+            "unexpected trailing input after COPY: {:?}",
+            sc.rest()
+        ));
     }
     Ok(Some(match direction {
         Direction::From => CopyCommand::From {
@@ -272,9 +275,7 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String>
         // anything else (DELIMITER 'x', QUOTE '"', etc.) is still rejected
         // by the keyword check below.
         if !sc.eat_keyword("CSV") {
-            return Err(
-                "expected '(' after WITH, or legacy 'WITH CSV [HEADER]' shorthand".into(),
-            );
+            return Err("expected '(' after WITH, or legacy 'WITH CSV [HEADER]' shorthand".into());
         }
         let mut header = false;
         sc.skip_whitespace();
@@ -298,9 +299,7 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String>
                     .eat_ident()
                     .ok_or_else(|| "expected format value after FORMAT".to_owned())?;
                 if !v.eq_ignore_ascii_case("csv") {
-                    return Err(format!(
-                        "only FORMAT CSV is supported in v0.1, got {v:?}"
-                    ));
+                    return Err(format!("only FORMAT CSV is supported in v0.1, got {v:?}"));
                 }
                 saw_format_csv = true;
             }
@@ -482,18 +481,12 @@ pub(crate) fn select_copy_in_columns(
     for name in column_list {
         let lname = name.to_ascii_lowercase();
         if !listed_names.insert(lname.clone()) {
-            return Err(format!(
-                "COPY: column {name:?} listed twice in column list"
-            ));
+            return Err(format!("COPY: column {name:?} listed twice in column list"));
         }
         let field = table_columns
             .iter()
             .find(|f| f.name().eq_ignore_ascii_case(name))
-            .ok_or_else(|| {
-                format!(
-                    "COPY: column {name:?} does not exist on table {table:?}"
-                )
-            })?;
+            .ok_or_else(|| format!("COPY: column {name:?} does not exist on table {table:?}"))?;
         selected.push(field.clone());
     }
     // Every NOT NULL column without a DEFAULT must be in the list.
@@ -528,11 +521,7 @@ pub(crate) fn select_copy_out_columns(
         let field = table_columns
             .iter()
             .find(|f| f.name().eq_ignore_ascii_case(name))
-            .ok_or_else(|| {
-                format!(
-                    "COPY: column {name:?} does not exist on table {table:?}"
-                )
-            })?;
+            .ok_or_else(|| format!("COPY: column {name:?} does not exist on table {table:?}"))?;
         selected.push(field.clone());
     }
     Ok(selected)
@@ -661,7 +650,11 @@ fn split_record(buf: &[u8], final_chunk: bool) -> Option<(&[u8], usize)> {
             }
             b'\n' => {
                 // Trim the optional preceding \r.
-                let end = if i > 0 && buf[i - 1] == b'\r' { i - 1 } else { i };
+                let end = if i > 0 && buf[i - 1] == b'\r' {
+                    i - 1
+                } else {
+                    i
+                };
                 return Some((&buf[..end], i + 1));
             }
             _ => {
@@ -671,7 +664,11 @@ fn split_record(buf: &[u8], final_chunk: bool) -> Option<(&[u8], usize)> {
     }
     if final_chunk && !buf.is_empty() && !in_quotes {
         // Tail without trailing newline. Strip a trailing \r if present.
-        let end = if buf.last() == Some(&b'\r') { buf.len() - 1 } else { buf.len() };
+        let end = if buf.last() == Some(&b'\r') {
+            buf.len() - 1
+        } else {
+            buf.len()
+        };
         Some((&buf[..end], buf.len()))
     } else {
         None
@@ -728,7 +725,10 @@ fn parse_csv_record(bytes: &[u8]) -> std::result::Result<Vec<Option<String>>, St
                 break;
             }
             if chars[i] != ',' {
-                return Err(format!("expected ',' after quoted field, got {:?}", chars[i]));
+                return Err(format!(
+                    "expected ',' after quoted field, got {:?}",
+                    chars[i]
+                ));
             }
             i += 1;
         } else {
@@ -803,11 +803,7 @@ fn build_insert_sql(
 }
 
 /// Render one CSV cell as a SQL literal in `out`.
-fn render_literal(
-    v: &str,
-    field: &Field,
-    out: &mut String,
-) -> std::result::Result<(), String> {
+fn render_literal(v: &str, field: &Field, out: &mut String) -> std::result::Result<(), String> {
     let dt = field.data_type();
     match dt {
         DataType::Boolean => {
@@ -887,9 +883,7 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
     // and batch can otherwise disagree on column order). For the column-
     // list COPY case we re-derive the output order locally, mapping each
     // requested name to its position in the full-schema result.
-    let res = session
-        .execute(&format!("SELECT * FROM {table}"))
-        .await?;
+    let res = session.execute(&format!("SELECT * FROM {table}")).await?;
     let (schema, batches) = match res {
         ExecResult::Rows { schema, batches } => (schema, batches),
         ExecResult::Empty { .. } => {
@@ -992,19 +986,16 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
             ];
         }
     };
-    let selected =
-        match select_copy_out_columns(table, &table_columns, column_list) {
-            Ok(s) => s,
-            Err(msg) => {
-                let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
-                return vec![
-                    PgWireBackendMessage::ErrorResponse(info.into()),
-                    PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                        TransactionStatus::Idle,
-                    )),
-                ];
-            }
-        };
+    let selected = match select_copy_out_columns(table, &table_columns, column_list) {
+        Ok(s) => s,
+        Err(msg) => {
+            let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
+            return vec![
+                PgWireBackendMessage::ErrorResponse(info.into()),
+                PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
+            ];
+        }
+    };
     let n_cols = selected.len();
     let mut out: Vec<PgWireBackendMessage> = Vec::new();
     let payload = match copy_to_csv_payload(session, table, column_list, with_header).await {
@@ -1020,19 +1011,25 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
         }
     };
     let (header, body, row_count) = payload;
-    out.push(PgWireBackendMessage::CopyOutResponse(copy_out_response(n_cols)));
+    out.push(PgWireBackendMessage::CopyOutResponse(copy_out_response(
+        n_cols,
+    )));
     if let Some(h) = header {
-        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(h))));
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
+            h,
+        ))));
     }
     for row in body {
-        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(row))));
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
+            row,
+        ))));
     }
     out.push(PgWireBackendMessage::CopyDone(
         pgwire::messages::copy::CopyDone::new(),
     ));
-    out.push(PgWireBackendMessage::CommandComplete(
-        CommandComplete::new(format!("COPY {row_count}")),
-    ));
+    out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+        format!("COPY {row_count}"),
+    )));
     out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
         TransactionStatus::Idle,
     )));
@@ -1081,7 +1078,9 @@ fn render_csv_cell(col: &dyn arrow_array::Array, idx: usize, field: &Field) -> S
 /// `CopyInResponse` so the framework routes subsequent `CopyData` /
 /// `CopyDone` to the `CopyHandler`.
 pub(crate) fn copy_from_stdin_messages(n_cols: usize) -> Vec<PgWireBackendMessage> {
-    vec![PgWireBackendMessage::CopyInResponse(copy_in_response(n_cols))]
+    vec![PgWireBackendMessage::CopyInResponse(copy_in_response(
+        n_cols,
+    ))]
 }
 
 /// Env-var-driven allowlist for server-side COPY file paths. Default-deny: if
@@ -1110,9 +1109,7 @@ pub(crate) fn validate_copy_path(path: &str) -> std::result::Result<std::path::P
     }
     let pb = PathBuf::from(path);
     if !pb.is_absolute() {
-        return Err(format!(
-            "COPY: file path must be absolute, got {path:?}"
-        ));
+        return Err(format!("COPY: file path must be absolute, got {path:?}"));
     }
     // Reject `..` components — keeps lexical comparison meaningful even if a
     // listed dir is nested.
@@ -1156,20 +1153,17 @@ pub(crate) async fn copy_to_file<S: Session + ?Sized>(
     let (header, body, row_count) =
         copy_to_csv_payload(session, table, column_list, with_header).await?;
     let mut f = tokio::fs::File::create(path).await.map_err(|e| {
-        basin_common::BasinError::Internal(format!(
-            "COPY TO {}: open: {e}",
-            path.display()
-        ))
+        basin_common::BasinError::Internal(format!("COPY TO {}: open: {e}", path.display()))
     })?;
     if let Some(h) = header {
-        f.write_all(&h).await.map_err(|e| {
-            basin_common::BasinError::Internal(format!("COPY TO write: {e}"))
-        })?;
+        f.write_all(&h)
+            .await
+            .map_err(|e| basin_common::BasinError::Internal(format!("COPY TO write: {e}")))?;
     }
     for row in &body {
-        f.write_all(row).await.map_err(|e| {
-            basin_common::BasinError::Internal(format!("COPY TO write: {e}"))
-        })?;
+        f.write_all(row)
+            .await
+            .map_err(|e| basin_common::BasinError::Internal(format!("COPY TO write: {e}")))?;
     }
     f.flush()
         .await
@@ -1186,10 +1180,7 @@ pub(crate) async fn copy_from_file<S: Session + ?Sized>(
     path: &std::path::Path,
 ) -> std::result::Result<(), basin_common::BasinError> {
     let bytes = tokio::fs::read(path).await.map_err(|e| {
-        basin_common::BasinError::Internal(format!(
-            "COPY FROM {}: read: {e}",
-            path.display()
-        ))
+        basin_common::BasinError::Internal(format!("COPY FROM {}: read: {e}", path.display()))
     })?;
     state.buffer.extend_from_slice(&bytes);
     process_buffered_rows(state, session, true).await;
@@ -1284,8 +1275,7 @@ mod tests {
 
     #[test]
     fn parse_copy_accepts_to_file_path() {
-        let cmd =
-            parse_copy("COPY t TO '/tmp/users.csv' WITH (FORMAT CSV)").unwrap();
+        let cmd = parse_copy("COPY t TO '/tmp/users.csv' WITH (FORMAT CSV)").unwrap();
         assert_eq!(
             cmd,
             Some(CopyCommand::To {
@@ -1300,13 +1290,18 @@ mod tests {
     #[test]
     fn parse_copy_accepts_from_file_path() {
         let cmd = parse_copy("COPY t FROM '/var/lib/import.csv' WITH CSV").unwrap();
-        assert!(matches!(cmd, Some(CopyCommand::From { ref path, .. }) if path.as_deref() == Some("/var/lib/import.csv")));
+        assert!(
+            matches!(cmd, Some(CopyCommand::From { ref path, .. }) if path.as_deref() == Some("/var/lib/import.csv"))
+        );
     }
 
     #[test]
     fn parse_copy_rejects_delimiter_option() {
         let e = parse_copy("COPY t FROM STDIN WITH (FORMAT CSV, DELIMITER '|')").unwrap_err();
-        assert!(e.contains("DELIMITER") || e.contains("not supported"), "got: {e}");
+        assert!(
+            e.contains("DELIMITER") || e.contains("not supported"),
+            "got: {e}"
+        );
     }
 
     #[test]
@@ -1369,10 +1364,7 @@ mod tests {
     #[test]
     fn parse_csv_record_empty_unquoted_is_null() {
         let r = parse_csv_record(b"1,,3").unwrap();
-        assert_eq!(
-            r,
-            vec![Some("1".to_string()), None, Some("3".to_string())]
-        );
+        assert_eq!(r, vec![Some("1".to_string()), None, Some("3".to_string())]);
     }
 
     #[test]

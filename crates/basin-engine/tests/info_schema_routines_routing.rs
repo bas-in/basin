@@ -228,11 +228,19 @@ async fn cross_tenant_isolation_pg_proc() {
     .unwrap();
 
     let names_a = col_string(
-        &rows(&sa, "SELECT proname FROM pg_catalog.pg_proc ORDER BY proname").await,
+        &rows(
+            &sa,
+            "SELECT proname FROM pg_catalog.pg_proc ORDER BY proname",
+        )
+        .await,
         "proname",
     );
     let names_b = col_string(
-        &rows(&sb, "SELECT proname FROM pg_catalog.pg_proc ORDER BY proname").await,
+        &rows(
+            &sb,
+            "SELECT proname FROM pg_catalog.pg_proc ORDER BY proname",
+        )
+        .await,
         "proname",
     );
     assert_eq!(names_a, vec!["secret_a".to_string()]);

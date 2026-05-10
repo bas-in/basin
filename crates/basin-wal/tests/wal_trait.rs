@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use basin_common::{PartitionKey, TenantId};
-use basin_wal::{Lsn, LocalWal, RaftWal, RaftWalConfig, Wal, WalConfig};
+use basin_wal::{LocalWal, Lsn, RaftWal, RaftWalConfig, Wal, WalConfig};
 use bytes::Bytes;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -26,8 +26,12 @@ fn local_cfg(dir: &TempDir) -> WalConfig {
 }
 
 fn raft_cfg() -> RaftWalConfig {
-    RaftWalConfig::new(vec![], "node-1", PathBuf::from("/tmp/basin-raft-trait-test"))
-        .with_node_id(1)
+    RaftWalConfig::new(
+        vec![],
+        "node-1",
+        PathBuf::from("/tmp/basin-raft-trait-test"),
+    )
+    .with_node_id(1)
 }
 
 #[tokio::test]

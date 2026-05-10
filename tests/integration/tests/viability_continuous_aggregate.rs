@@ -106,7 +106,7 @@ async fn viability_continuous_aggregate() {
             sql.push(',');
         }
         let day = 26 + (i / 20); // 26..=30
-        let hour = (i % 24) as u32;
+        let hour = (i % 24);
         sql.push_str(&format!(
             "({i}, '2026-04-{day:02}T{hour:02}:00:00Z', 'p-{i}')"
         ));
@@ -151,17 +151,13 @@ async fn viability_continuous_aggregate() {
     // still our materialised data set — and they reflect the full table.
     let outcomes = refresher.tick().await.unwrap();
     assert_eq!(outcomes.len(), 1, "exactly one CV registered");
-    let first_outcome_idempotent = matches!(
-        outcomes[0].outcome,
-        basin_cv::CvRefreshOutcome::NotDue
-    );
+    let first_outcome_idempotent =
+        matches!(outcomes[0].outcome, basin_cv::CvRefreshOutcome::NotDue);
 
     // ---------- Read CV: must be 5 day-buckets ---------------------------
     let cv_rows_initial = read_cv_rows(&engine, tenant).await;
     let cv_rows_correct = cv_rows_initial.len() == 5;
-    println!(
-        "[VIABILITY continuous_aggregate] initial cv rows: {cv_rows_initial:?}"
-    );
+    println!("[VIABILITY continuous_aggregate] initial cv rows: {cv_rows_initial:?}");
 
     // ---------- Insert 10 more rows in the latest day --------------------
     let writer = engine.open_session(tenant).await.unwrap();
@@ -195,9 +191,7 @@ async fn viability_continuous_aggregate() {
 
     // ---------- Read CV: still 5 day-buckets, latest day count is 30 -----
     let cv_rows_after = read_cv_rows(&engine, tenant).await;
-    println!(
-        "[VIABILITY continuous_aggregate] post-refresh cv rows: {cv_rows_after:?}"
-    );
+    println!("[VIABILITY continuous_aggregate] post-refresh cv rows: {cv_rows_after:?}");
     let still_five = cv_rows_after.len() == 5;
     // The 4 earlier days have 20 rows each; the latest day was 20+10=30.
     let mut counts: Vec<i64> = cv_rows_after.iter().map(|(_, n)| *n).collect();

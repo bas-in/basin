@@ -89,7 +89,11 @@ async fn seed_table(eng: &Engine, n_rows: usize) -> TenantSession {
         // statistical edge (over_fetch=k*4=20 candidates over 60 rows
         // would give ~6.7 'foo' rows on a 1/3 split — too close to the
         // k=5 LIMIT for a deterministic top-k assertion).
-        let category = if (id as usize) < n_rows / 2 { "foo" } else { "bar" };
+        let category = if (id as usize) < n_rows / 2 {
+            "foo"
+        } else {
+            "bar"
+        };
         tuples.push(format!("({id}, '{category}', '{}')", vec_lit(&v)));
     }
     let insert = format!("INSERT INTO embeddings VALUES {}", tuples.join(", "));
@@ -159,7 +163,11 @@ async fn simple_order_by_routes_to_vector_search() {
         _ => panic!("expected rows"),
     };
 
-    assert_eq!(eng.vector_routing_count() - before, 1, "routing did not fire");
+    assert_eq!(
+        eng.vector_routing_count() - before,
+        1,
+        "routing did not fire"
+    );
     assert!(!routed_ids.is_empty(), "routed query returned empty");
     assert!(routed_ids.len() <= 10);
 }
@@ -301,7 +309,11 @@ async fn where_predicate_pushed_down() {
         ))
         .await
         .unwrap();
-    assert_eq!(eng.vector_routing_count() - before, 1, "WHERE-pushdown did not route");
+    assert_eq!(
+        eng.vector_routing_count() - before,
+        1,
+        "WHERE-pushdown did not route"
+    );
 
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,

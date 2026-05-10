@@ -86,7 +86,10 @@ async fn viability_postgis() {
         .iter()
         .filter(|p| haversine_meters(p, &paris) <= RADIUS_M)
         .count();
-    let dwithin_count = points.iter().filter(|p| dwithin(p, &paris, RADIUS_M)).count();
+    let dwithin_count = points
+        .iter()
+        .filter(|p| dwithin(p, &paris, RADIUS_M))
+        .count();
     let dwithin_correct_count = truth_count == dwithin_count && truth_count > 0;
 
     // -- 3. WKB round-trip: encode → decode → bit-for-bit equal ----------

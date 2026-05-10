@@ -44,7 +44,9 @@ fn dir_size_parquet(root: &std::path::Path) -> u64 {
         if entry.file_type().is_file()
             && entry.path().extension().and_then(|s| s.to_str()) == Some("parquet")
         {
-            total += std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
+            total += std::fs::metadata(entry.path())
+                .map(|m| m.len())
+                .unwrap_or(0);
         }
     }
     total
@@ -78,9 +80,7 @@ impl Drop for SchemaGuard {
             // Block on the cleanup so it actually runs before the test exits.
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });
@@ -223,7 +223,10 @@ async fn scaling_5_compare_postgres() {
             pg_point_ms.push(ms);
         }
     }
-    assert!(!pg_point_ms.is_empty(), "no PG execution time samples parsed");
+    assert!(
+        !pg_point_ms.is_empty(),
+        "no PG execution time samples parsed"
+    );
     let pg_point_p50 = median(&pg_point_ms);
 
     // ---- Basin path --------------------------------------------------------
@@ -265,9 +268,11 @@ async fn scaling_5_compare_postgres() {
     });
     let tenant = TenantId::new();
     let sess = engine.open_session(tenant).await.unwrap();
-    sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
 
     // Basin insert: same multi-row batches.
     let basin_insert_started = Instant::now();

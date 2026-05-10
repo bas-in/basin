@@ -18,18 +18,14 @@ use serde::{Deserialize, Serialize};
 /// `#[serde(default)]` on the surrounding fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Tier {
     /// Standard / hot tier. The default for fresh writes.
+    #[default]
     Hot,
     /// Cold tier. Recovered from any Parquet file that happens to live under
     /// the `cold/` segment of a tenant's table.
     Cold,
-}
-
-impl Default for Tier {
-    fn default() -> Self {
-        Tier::Hot
-    }
 }
 
 impl Tier {

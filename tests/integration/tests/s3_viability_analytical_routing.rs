@@ -114,7 +114,11 @@ async fn s3_viability_analytical_routing() {
             .unwrap();
     }
     let files = storage.list_data_files(&tenant, &table).await.unwrap();
-    assert_eq!(files.len(), FILES as usize, "expected {FILES} parquet files");
+    assert_eq!(
+        files.len(),
+        FILES as usize,
+        "expected {FILES} parquet files"
+    );
 
     let sql = "SELECT group_id, count(*) AS n, avg(id) AS avg_id, \
                       CAST(sum(length(payload)) AS BIGINT) AS s_len \

@@ -163,11 +163,7 @@ impl Default for SetvalUdf {
             signature: Signature::one_of(
                 vec![
                     TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
-                    TypeSignature::Exact(vec![
-                        DataType::Utf8,
-                        DataType::Int64,
-                        DataType::Boolean,
-                    ]),
+                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Boolean]),
                 ],
                 Volatility::Volatile,
             ),
@@ -223,10 +219,7 @@ enum SeqCall {
 /// * String-literal interiors are not skipped — a call-shaped substring
 ///   inside `'...'` will be rewritten. Same caveat as
 ///   `rewrite_extract_second` / `rewrite_vector_operators`.
-pub(crate) async fn rewrite_sequence_calls(
-    sql: &str,
-    ctx: &SequenceContext<'_>,
-) -> Result<String> {
+pub(crate) async fn rewrite_sequence_calls(sql: &str, ctx: &SequenceContext<'_>) -> Result<String> {
     let mut s = sql.to_string();
     loop {
         let Some(call) = find_first_sequence_call(&s) else {
@@ -243,7 +236,20 @@ pub(crate) async fn rewrite_sequence_calls(
             }
         };
         let value = dispatch_sequence_call(ctx, kind, &parsed).await?;
-        let replacement = format!("{}::bigint", value);
+        // Emit a plain integer literal rather than `<n>::bigint`. The
+        // ::bigint cast survived rewrite and broke the INSERT-default
+        // path's `coerce_i64`, which only recognises bare Number /
+        // UnaryOp(Minus, Number). The downstream planner re-infers the
+        // type from context (parameter type, column type) so the cast
+        // is unnecessary.
+        let replacement = if value < 0 {
+            // Wrap negatives in parens so the surrounding `replace_range`
+            // doesn't accidentally fuse a `-` with an adjacent operator
+            // (e.g. `a-nextval(...)` becoming `a--5` instead of `a-(-5)`).
+            format!("({value})")
+        } else {
+            value.to_string()
+        };
         s.replace_range(call_start..call_end, &replacement);
     }
     Ok(s)
@@ -498,8 +504,7 @@ mod tests {
     #[test]
     fn find_first_call_locates_nextval() {
         let s = "SELECT nextval('foo')";
-        let (kind, start, end, args) =
-            find_first_sequence_call(s).expect("should find call");
+        let (kind, start, end, args) = find_first_sequence_call(s).expect("should find call");
         assert!(matches!(kind, SeqCall::Nextval));
         assert_eq!(&s[start..end], "nextval('foo')");
         assert_eq!(args, "'foo'");

@@ -135,11 +135,8 @@ async fn s3_isolation_under_load() {
                         ExecResult::Empty { .. } => panic!("expected rows for SELECT"),
                     }
                 } else {
-                    let id_val =
-                        1 + (task_id as i64) * 1_000_000 + op_idx as i64;
-                    let sql = format!(
-                        "INSERT INTO events VALUES ({id_val}, '{expected_marker}')"
-                    );
+                    let id_val = 1 + (task_id as i64) * 1_000_000 + op_idx as i64;
+                    let sql = format!("INSERT INTO events VALUES ({id_val}, '{expected_marker}')");
                     let s = sess.lock().await;
                     let _ = s.execute(&sql).await.expect("write failed");
                 }

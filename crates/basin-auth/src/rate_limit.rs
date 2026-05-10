@@ -17,7 +17,8 @@ use governor::{
 
 /// Per-key limiter. `RateLimiter::keyed::<String>` tracks one bucket per key.
 pub struct PerKey {
-    inner: RateLimiter<String, governor::state::keyed::DefaultKeyedStateStore<String>, DefaultClock>,
+    inner:
+        RateLimiter<String, governor::state::keyed::DefaultKeyedStateStore<String>, DefaultClock>,
     label: &'static str,
 }
 

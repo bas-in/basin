@@ -115,8 +115,7 @@ async fn scaling_3_concurrency() {
             let median_us = median_us.clone();
             let is_sampler = task_idx == 0;
             set.spawn(async move {
-                let mut rng_state: u64 =
-                    (task_idx as u64).wrapping_mul(0xA5A5A5A5).wrapping_add(1);
+                let mut rng_state: u64 = (task_idx as u64).wrapping_mul(0xA5A5A5A5).wrapping_add(1);
                 let mut count: u64 = 0;
                 let mut samples: Vec<u64> = Vec::with_capacity(if is_sampler { 256 } else { 0 });
                 while Instant::now() < deadline {

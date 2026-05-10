@@ -59,9 +59,7 @@ pub(crate) enum UserTypeBinding {
 fn sql_data_type_to_arg(dt: &SqlDataType) -> Result<SqlArgType> {
     use sqlparser::ast::TimezoneInfo;
     match dt {
-        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
-            Ok(SqlArgType::Int)
-        }
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(SqlArgType::Int),
         SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(SqlArgType::BigInt),
         SqlDataType::Text
         | SqlDataType::Varchar(_)
@@ -509,11 +507,9 @@ pub(crate) async fn enforce_domain_checks(
             true,
         );
         let mini_schema = Arc::new(arrow_schema::Schema::new(vec![value_field]));
-        let mini_batch = RecordBatch::try_new(
-            mini_schema.clone(),
-            vec![batch.column(col_idx).clone()],
-        )
-        .map_err(|e| BasinError::internal(format!("domain CHECK batch build: {e}")))?;
+        let mini_batch =
+            RecordBatch::try_new(mini_schema.clone(), vec![batch.column(col_idx).clone()])
+                .map_err(|e| BasinError::internal(format!("domain CHECK batch build: {e}")))?;
         let df_batch = crate::convert::batch_ws_to_df(&mini_batch)?;
         let df_schema = df_batch.schema();
         let provider = MemTable::try_new(df_schema, vec![vec![df_batch]])
@@ -522,24 +518,15 @@ pub(crate) async fn enforce_domain_checks(
         ctx.register_table("v", Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("domain CHECK register: {e}")))?;
         let sql = format!("SELECT ({predicate}) AS ok, value FROM v");
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| {
-                BasinError::InvalidSchema(format!(
-                    "domain {} CHECK predicate {predicate:?}: {e}",
-                    def.name
-                ))
-            })?;
-        let results = df
-            .collect()
-            .await
-            .map_err(|e| {
-                BasinError::InvalidSchema(format!(
-                    "domain {} CHECK evaluation: {e}",
-                    def.name
-                ))
-            })?;
+        let df = ctx.sql(&sql).await.map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "domain {} CHECK predicate {predicate:?}: {e}",
+                def.name
+            ))
+        })?;
+        let results = df.collect().await.map_err(|e| {
+            BasinError::InvalidSchema(format!("domain {} CHECK evaluation: {e}", def.name))
+        })?;
         for rb in &results {
             let ws_rb = crate::convert::batch_df_to_ws(rb)?;
             let ok_arr = ws_rb
@@ -847,8 +834,7 @@ mod tests {
 
     #[test]
     fn match_alter_type_add_value_basic() {
-        let r = match_alter_type_add_value("ALTER TYPE order_status ADD VALUE 'refunded'")
-            .unwrap();
+        let r = match_alter_type_add_value("ALTER TYPE order_status ADD VALUE 'refunded'").unwrap();
         assert_eq!(r, Some(("order_status".into(), "refunded".into())));
     }
 
@@ -896,8 +882,8 @@ mod tests {
 
     #[test]
     fn match_create_domain_double_precision_base_type() {
-        let r = match_create_domain("CREATE DOMAIN p AS DOUBLE PRECISION CHECK (VALUE > 0.0)")
-            .unwrap();
+        let r =
+            match_create_domain("CREATE DOMAIN p AS DOUBLE PRECISION CHECK (VALUE > 0.0)").unwrap();
         let (_, base, _) = r.unwrap();
         assert_eq!(base, SqlArgType::Double);
     }

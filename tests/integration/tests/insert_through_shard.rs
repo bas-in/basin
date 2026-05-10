@@ -58,8 +58,7 @@ async fn start_server_with_shard() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
 
     // WAL rooted at a separate tempdir, mirroring the BASIN_WAL_DIR layout the
     // server uses when the shard is enabled.
@@ -157,9 +156,7 @@ async fn shard_path_select_after_insert_visible() {
         .expect("create");
 
     alice
-        .simple_query(
-            "INSERT INTO events VALUES (1, 'first'), (2, 'second'), (3, 'third')",
-        )
+        .simple_query("INSERT INTO events VALUES (1, 'first'), (2, 'second'), (3, 'third')")
         .await
         .expect("insert");
 
@@ -185,9 +182,7 @@ async fn shard_path_thousand_inserts_within_bound() {
     let alice = connect(server.addr, "alice").await;
 
     alice
-        .simple_query(
-            "CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
         .expect("create");
 
@@ -195,10 +190,7 @@ async fn shard_path_thousand_inserts_within_bound() {
 
     let started = Instant::now();
     for i in 0..N {
-        let sql = format!(
-            "INSERT INTO events VALUES ({i}, 'row-{i}')",
-            i = i,
-        );
+        let sql = format!("INSERT INTO events VALUES ({i}, 'row-{i}')", i = i,);
         alice
             .simple_query(&sql)
             .await

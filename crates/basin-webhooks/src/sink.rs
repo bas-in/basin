@@ -150,9 +150,7 @@ impl ChangeEventSink for WebhookSink {
             // on dequeue. Enqueue-then-fail-to-decrement produces a stale
             // positive count, which is the right signal for "events are
             // accumulating".
-            self.counters
-                .for_tenant(&event.tenant)
-                .record_enqueue();
+            self.counters.for_tenant(&event.tenant).record_enqueue();
         }
         Ok(())
     }

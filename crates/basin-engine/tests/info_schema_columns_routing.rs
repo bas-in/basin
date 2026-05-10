@@ -179,7 +179,9 @@ async fn select_information_schema_columns_basic() {
                 .as_any()
                 .downcast_ref::<arrow_array::Int32Array>()
                 .unwrap();
-            (0..arr.len()).map(|i| arr.value(i) as i64).collect::<Vec<_>>()
+            (0..arr.len())
+                .map(|i| arr.value(i) as i64)
+                .collect::<Vec<_>>()
         })
         .collect();
     assert_eq!(ords, vec![1, 2, 3]);

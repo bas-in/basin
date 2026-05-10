@@ -106,5 +106,9 @@ async fn allowlist_failure_is_recorded_as_terminal_error_row() {
 
     let row = store.get(&tenant, id).await.unwrap().expect("row missing");
     assert_eq!(row.status, 0);
-    assert!(row.error.as_deref().unwrap().contains("host not on allowlist"));
+    assert!(row
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("host not on allowlist"));
 }

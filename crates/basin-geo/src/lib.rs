@@ -351,8 +351,8 @@ fn raycast_inside(ring: &LineString, pt: &Point) -> bool {
         let yi = pts[i].y;
         let xj = pts[j].x;
         let yj = pts[j].y;
-        let intersects = ((yi > pt.y) != (yj > pt.y))
-            && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi);
+        let intersects =
+            ((yi > pt.y) != (yj > pt.y)) && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi);
         if intersects {
             inside = !inside;
         }

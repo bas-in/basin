@@ -41,8 +41,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -133,10 +132,7 @@ async fn poc_extended_protocol_end_to_end() {
         .prepare("SELECT id, body FROM events WHERE id = $1")
         .await
         .expect("prepare failed");
-    let rows = alice
-        .query(&stmt, &[&2i64])
-        .await
-        .expect("query failed");
+    let rows = alice.query(&stmt, &[&2i64]).await.expect("query failed");
     if rows.len() == 1 {
         let id: i64 = rows[0].get(0);
         let body: &str = rows[0].get(1);
@@ -222,5 +218,8 @@ async fn poc_extended_protocol_end_to_end() {
         }),
     );
 
-    assert_eq!(passed, total, "{passed}/{total} extended-protocol queries passed");
+    assert_eq!(
+        passed, total,
+        "{passed}/{total} extended-protocol queries passed"
+    );
 }

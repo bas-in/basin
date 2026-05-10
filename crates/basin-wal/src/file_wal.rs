@@ -307,10 +307,7 @@ async fn recover_partitions(
                 BasinError::storage(format!("wal recovery body {}: {e}", meta.location))
             })?;
         let (header, entries) = decode_segment(&body)?;
-        let last_lsn = entries
-            .last()
-            .map(|e| e.lsn)
-            .unwrap_or(header.first_lsn);
+        let last_lsn = entries.last().map(|e| e.lsn).unwrap_or(header.first_lsn);
         let key = (header.tenant, header.partition.clone());
         closed.entry(key).or_default().push(ClosedSegment {
             path: meta.location,
@@ -323,10 +320,7 @@ async fn recover_partitions(
     let mut out: PartitionMap = HashMap::new();
     for ((tenant, partition), mut segs) in closed {
         segs.sort_by_key(|s| s.first_lsn);
-        let next_lsn = segs
-            .last()
-            .map(|s| Lsn(s.last_lsn.0 + 1))
-            .unwrap_or(Lsn(1));
+        let next_lsn = segs.last().map(|s| Lsn(s.last_lsn.0 + 1)).unwrap_or(Lsn(1));
         let mut state = PartitionState::new(tenant, partition.clone());
         state.next_lsn = next_lsn;
         for s in segs {

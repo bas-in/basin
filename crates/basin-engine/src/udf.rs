@@ -26,13 +26,13 @@ use std::sync::Arc;
 use base64::Engine as _;
 use basin_vector::{cosine_distance as v_cosine, dot_product as v_dot, l2_distance as v_l2};
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
+use datafusion::arrow::array::types::IntervalMonthDayNano;
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int64Array, IntervalMonthDayNanoArray,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
-use datafusion::arrow::array::types::IntervalMonthDayNano;
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
@@ -75,10 +75,7 @@ pub(crate) fn register_pg_udfs(ctx: &SessionContext) {
         signature: Signature::nullary(Volatility::Volatile),
     }));
     ctx.register_udf(ScalarUDF::from(DigestUdf {
-        signature: Signature::exact(
-            vec![DataType::Utf8, DataType::Utf8],
-            Volatility::Immutable,
-        ),
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
     ctx.register_udf(ScalarUDF::from(EncodeUdf {
         signature: Signature::one_of(
@@ -90,16 +87,10 @@ pub(crate) fn register_pg_udfs(ctx: &SessionContext) {
         ),
     }));
     ctx.register_udf(ScalarUDF::from(DecodeUdf {
-        signature: Signature::exact(
-            vec![DataType::Utf8, DataType::Utf8],
-            Volatility::Immutable,
-        ),
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
     ctx.register_udf(ScalarUDF::from(CryptUdf {
-        signature: Signature::exact(
-            vec![DataType::Utf8, DataType::Utf8],
-            Volatility::Volatile,
-        ),
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Volatile),
     }));
     ctx.register_udf(ScalarUDF::from(GenSaltUdf {
         signature: Signature::one_of(
@@ -186,10 +177,7 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
         ),
     }));
     ctx.register_udf(ScalarUDF::from(ToTimestampPgUdf {
-        signature: Signature::exact(
-            vec![DataType::Utf8, DataType::Utf8],
-            Volatility::Immutable,
-        ),
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
     // PG-shape `power(x, y)` — always returns Float64. Overrides
     // DataFusion's default `power`, which returns Int64 for two integer
@@ -309,11 +297,7 @@ impl ScalarUDFImpl for VectorDistanceUdf {
 
 fn invoke_distance(kind: DistanceFn, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
     if args.len() != 2 {
-        return exec_err!(
-            "{} expects 2 arguments, got {}",
-            kind.name(),
-            args.len()
-        );
+        return exec_err!("{} expects 2 arguments, got {}", kind.name(), args.len());
     }
     // Determine row count: prefer an Array; default to 1 for scalar/scalar.
     let num_rows = args
@@ -406,14 +390,9 @@ impl<'a> VectorView<'a> {
                 })
             }
             DataType::Utf8 => {
-                let array = arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "{fn_name} {side}: not a StringArray"
-                        ))
-                    })?;
+                let array = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name} {side}: not a StringArray"))
+                })?;
                 Ok(VectorView::Strs { array })
             }
             other => exec_err!(
@@ -1003,8 +982,7 @@ fn invoke_decode(args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
 
 fn decode_bytes(fmt: &str, s: &str) -> DFResult<Vec<u8>> {
     match fmt.to_ascii_lowercase().as_str() {
-        "hex" => hex::decode(s)
-            .map_err(|e| DataFusionError::Execution(format!("decode hex: {e}"))),
+        "hex" => hex::decode(s).map_err(|e| DataFusionError::Execution(format!("decode hex: {e}"))),
         "base64" => base64::engine::general_purpose::STANDARD
             .decode(s)
             .map_err(|e| DataFusionError::Execution(format!("decode base64: {e}"))),
@@ -1020,16 +998,12 @@ fn decode_bytes(fmt: &str, s: &str) -> DFResult<Vec<u8>> {
                 match bytes.next() {
                     Some(b'\\') => out.push(b'\\'),
                     Some(d1 @ b'0'..=b'7') => {
-                        let d2 = bytes
-                            .next()
-                            .ok_or_else(|| DataFusionError::Execution(
-                                "decode escape: truncated octal".into(),
-                            ))?;
-                        let d3 = bytes
-                            .next()
-                            .ok_or_else(|| DataFusionError::Execution(
-                                "decode escape: truncated octal".into(),
-                            ))?;
+                        let d2 = bytes.next().ok_or_else(|| {
+                            DataFusionError::Execution("decode escape: truncated octal".into())
+                        })?;
+                        let d3 = bytes.next().ok_or_else(|| {
+                            DataFusionError::Execution("decode escape: truncated octal".into())
+                        })?;
                         let val = ((d1 - b'0') * 64) + ((d2 - b'0') * 8) + (d3 - b'0');
                         out.push(val);
                     }
@@ -1129,9 +1103,9 @@ fn hash_with_salt(password: &str, salt: &str) -> DFResult<String> {
             "crypt: unsupported scheme {scheme:?} (only bcrypt $2a/$2b/$2y supported)"
         )));
     }
-    let cost: u32 = parts[2].parse().map_err(|_| {
-        DataFusionError::Execution(format!("crypt: bad cost in salt {salt:?}"))
-    })?;
+    let cost: u32 = parts[2]
+        .parse()
+        .map_err(|_| DataFusionError::Execution(format!("crypt: bad cost in salt {salt:?}")))?;
     let raw_salt: &str = parts[3].get(..22).ok_or_else(|| {
         DataFusionError::Execution(format!(
             "crypt: salt too short — need 22 base64 chars after $NN$, got {salt:?}"
@@ -1157,8 +1131,7 @@ fn bcrypt_base64_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() != 22 {
         return None;
     }
-    const ALPHABET: &[u8; 64] =
-        b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const ALPHABET: &[u8; 64] = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut out = Vec::with_capacity(16);
     let mut bits: u32 = 0;
     let mut nbits: u32 = 0;
@@ -1237,12 +1210,9 @@ fn invoke_gen_salt(args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
         let cost: u32 = match &cost_arr {
             Some(arr) => {
                 use datafusion::arrow::array::Int64Array;
-                let a = arr
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution("gen_salt: arg 2 must be Int64".into())
-                    })?;
+                let a = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    DataFusionError::Execution("gen_salt: arg 2 must be Int64".into())
+                })?;
                 if a.is_null(i) {
                     12
                 } else {
@@ -1274,8 +1244,7 @@ fn build_salt(algo: &str, cost: u32) -> DFResult<String> {
 }
 
 fn bcrypt_base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const ALPHABET: &[u8; 64] = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut out = String::with_capacity(22);
     let mut bits: u32 = 0;
     let mut nbits: u32 = 0;
@@ -1436,9 +1405,7 @@ impl ScalarUDFImpl for ModUdf {
                     }
                     let bv = b.value(i);
                     if bv == 0 {
-                        return Err(DataFusionError::Execution(
-                            "mod: division by zero".into(),
-                        ));
+                        return Err(DataFusionError::Execution("mod: division by zero".into()));
                     }
                     out.append_value(a.value(i) % bv);
                 }
@@ -1456,9 +1423,7 @@ impl ScalarUDFImpl for ModUdf {
                     }
                     let bv = b.value(i);
                     if bv == 0 {
-                        return Err(DataFusionError::Execution(
-                            "mod: division by zero".into(),
-                        ));
+                        return Err(DataFusionError::Execution("mod: division by zero".into()));
                     }
                     out.append_value(a.value(i) % bv);
                 }
@@ -1529,14 +1494,19 @@ impl ScalarUDFImpl for AgeUdf {
                 _ => out.push(None),
             }
         }
-        Ok(ColumnarValue::Array(Arc::new(IntervalMonthDayNanoArray::from(out))))
+        Ok(ColumnarValue::Array(Arc::new(
+            IntervalMonthDayNanoArray::from(out),
+        )))
     }
 }
 
 fn ts_array_to_naive(arr: &ArrayRef, i: usize) -> DFResult<Option<NaiveDateTime>> {
     match arr.data_type() {
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let a = arr.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
             if a.is_null(i) {
                 return Ok(None);
             }
@@ -1546,31 +1516,46 @@ fn ts_array_to_naive(arr: &ArrayRef, i: usize) -> DFResult<Option<NaiveDateTime>
             Ok(Utc.timestamp_opt(secs, ns).single().map(|d| d.naive_utc()))
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let a = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
             if a.is_null(i) {
                 return Ok(None);
             }
             let v = a.value(i);
             let secs = v.div_euclid(1_000_000);
             let us = v.rem_euclid(1_000_000) as u32;
-            Ok(Utc.timestamp_opt(secs, us * 1000).single().map(|d| d.naive_utc()))
+            Ok(Utc
+                .timestamp_opt(secs, us * 1000)
+                .single()
+                .map(|d| d.naive_utc()))
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let a = arr.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
             if a.is_null(i) {
                 return Ok(None);
             }
             let v = a.value(i);
             let secs = v.div_euclid(1_000);
             let ms = v.rem_euclid(1_000) as u32;
-            Ok(Utc.timestamp_opt(secs, ms * 1_000_000).single().map(|d| d.naive_utc()))
+            Ok(Utc
+                .timestamp_opt(secs, ms * 1_000_000)
+                .single()
+                .map(|d| d.naive_utc()))
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
             if a.is_null(i) {
                 return Ok(None);
             }
-            Ok(Utc.timestamp_opt(a.value(i), 0).single().map(|d| d.naive_utc()))
+            Ok(Utc
+                .timestamp_opt(a.value(i), 0)
+                .single()
+                .map(|d| d.naive_utc()))
         }
         DataType::Date32 => {
             let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
@@ -1579,7 +1564,10 @@ fn ts_array_to_naive(arr: &ArrayRef, i: usize) -> DFResult<Option<NaiveDateTime>
             }
             // Date32 stores days since UNIX epoch.
             let days = a.value(i) as i64;
-            Ok(Utc.timestamp_opt(days * 86_400, 0).single().map(|d| d.naive_utc()))
+            Ok(Utc
+                .timestamp_opt(days * 86_400, 0)
+                .single()
+                .map(|d| d.naive_utc()))
         }
         other => exec_err!("age: unsupported timestamp type {other:?}"),
     }
@@ -1672,7 +1660,11 @@ fn days_in_month(year: i32, month: u32) -> u32 {
         4 | 6 | 9 | 11 => 30,
         2 => {
             let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-            if leap { 29 } else { 28 }
+            if leap {
+                29
+            } else {
+                28
+            }
         }
         _ => 30, // unreachable; guard against bad input.
     }
@@ -1787,15 +1779,16 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
             }
             let chrono_fmt = pg_format_to_chrono(fmt.value(i));
             // Try parsing as a full datetime; fall back to date-only.
-            let parsed = NaiveDateTime::parse_from_str(txt.value(i), &chrono_fmt)
-                .or_else(|_| {
-                    chrono::NaiveDate::parse_from_str(txt.value(i), &chrono_fmt)
-                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-                });
+            let parsed = NaiveDateTime::parse_from_str(txt.value(i), &chrono_fmt).or_else(|_| {
+                chrono::NaiveDate::parse_from_str(txt.value(i), &chrono_fmt)
+                    .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+            });
             let parsed = parsed.map_err(|e| {
                 DataFusionError::Execution(format!(
                     "to_timestamp: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
-                    txt.value(i), fmt.value(i), chrono_fmt
+                    txt.value(i),
+                    fmt.value(i),
+                    chrono_fmt
                 ))
             })?;
             let dt: DateTime<Utc> = Utc.from_utc_datetime(&parsed);
@@ -1812,7 +1805,9 @@ mod tests {
 
     #[test]
     fn rewrite_l2_simple() {
-        let r = rewrite_vector_operators("SELECT id FROM t ORDER BY embedding <-> '[0.1, 0.2]' LIMIT 5");
+        let r = rewrite_vector_operators(
+            "SELECT id FROM t ORDER BY embedding <-> '[0.1, 0.2]' LIMIT 5",
+        );
         assert_eq!(
             r,
             "SELECT id FROM t ORDER BY l2_distance(embedding, '[0.1, 0.2]') LIMIT 5"
@@ -1884,14 +1879,9 @@ impl ScalarUDFImpl for PowerFloat64Udf {
             .ok_or_else(|| {
                 DataFusionError::Execution("power: base did not coerce to Float64".into())
             })?;
-        let exp = exp
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| {
-                DataFusionError::Execution(
-                    "power: exponent did not coerce to Float64".into(),
-                )
-            })?;
+        let exp = exp.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+            DataFusionError::Execution("power: exponent did not coerce to Float64".into())
+        })?;
         let mut out = Float64Array::builder(n);
         for i in 0..n {
             if base.is_null(i) || exp.is_null(i) {
@@ -2003,11 +1993,14 @@ impl ScalarUDFImpl for BasinAssertUdf {
             .unwrap_or(1);
         let pred = args[0].clone().into_array(n)?;
         let msg = args[1].clone().into_array(n)?;
-        let pred = pred.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-            DataFusionError::Execution(
-                "__basin_assert: first argument did not coerce to Boolean".into(),
-            )
-        })?;
+        let pred = pred
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "__basin_assert: first argument did not coerce to Boolean".into(),
+                )
+            })?;
         let msg = msg.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
             DataFusionError::Execution(
                 "__basin_assert: second argument did not coerce to Utf8".into(),
@@ -2074,10 +2067,7 @@ fn ts_array_to_seconds_f64(arr: &ArrayRef, i: usize) -> DFResult<Option<f64>> {
             Ok(Some(sub_ms as f64 / 1_000.0))
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
+            let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
             if a.is_null(i) {
                 return Ok(None);
             }

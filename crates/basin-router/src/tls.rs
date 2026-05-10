@@ -121,7 +121,10 @@ mod tests {
             Err(e) => e,
         };
         let msg = format!("{err}");
-        assert!(msg.contains("no certificates") || msg.contains("PEM"), "got: {msg}");
+        assert!(
+            msg.contains("no certificates") || msg.contains("PEM"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -136,6 +139,9 @@ mod tests {
             Err(e) => e,
         };
         let msg = format!("{err}");
-        assert!(msg.contains("no private key") || msg.contains("PEM"), "got: {msg}");
+        assert!(
+            msg.contains("no private key") || msg.contains("PEM"),
+            "got: {msg}"
+        );
     }
 }

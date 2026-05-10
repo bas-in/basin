@@ -148,12 +148,8 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
     /// Drop all entries for `(tenant, partition)` whose LSN is strictly
     /// less than or equal to `up_to`. Called by the compactor after the
     /// segment has been merged into Parquet and committed to the catalog.
-    async fn truncate(
-        &self,
-        tenant: &TenantId,
-        partition: &PartitionKey,
-        up_to: Lsn,
-    ) -> Result<()>;
+    async fn truncate(&self, tenant: &TenantId, partition: &PartitionKey, up_to: Lsn)
+        -> Result<()>;
 
     /// Stop background tasks and drain. Idempotent.
     async fn close(&self) -> Result<()>;
@@ -225,11 +221,7 @@ impl Wal for LocalWal {
         self.inner.read_from(tenant, partition, since_lsn).await
     }
 
-    async fn high_water(
-        &self,
-        tenant: &TenantId,
-        partition: &PartitionKey,
-    ) -> Result<Lsn> {
+    async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn> {
         self.inner.high_water(tenant, partition).await
     }
 
@@ -276,12 +268,8 @@ pub(crate) trait WalImpl: Send + Sync {
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>>;
     async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn>;
-    async fn truncate(
-        &self,
-        tenant: &TenantId,
-        partition: &PartitionKey,
-        up_to: Lsn,
-    ) -> Result<()>;
+    async fn truncate(&self, tenant: &TenantId, partition: &PartitionKey, up_to: Lsn)
+        -> Result<()>;
     async fn close(&self) -> Result<()>;
 }
 

@@ -51,7 +51,9 @@ fn schema() -> Arc<Schema> {
 
 fn build_batch(start: i64, len: usize) -> RecordBatch {
     let ids: Int64Array = (start..start + len as i64).collect();
-    let bodies: Vec<String> = (0..len).map(|i| format!("body-{}", start + i as i64)).collect();
+    let bodies: Vec<String> = (0..len)
+        .map(|i| format!("body-{}", start + i as i64))
+        .collect();
     let body_arr: StringArray = bodies.iter().map(|s| Some(s.as_str())).collect();
     RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(body_arr)]).unwrap()
 }
@@ -86,9 +88,7 @@ impl Drop for SchemaGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });
@@ -108,8 +108,7 @@ async fn measure_basin_ms(files: usize) -> f64 {
     // with an in-memory catalog. Setup time is NOT included in the timed
     // window; only `Storage::delete_tenant` is.
     let dir = TempDir::new().unwrap();
-    let fs: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
 
     let setup_storage = Storage::new(StorageConfig {
         object_store: fs.clone(),

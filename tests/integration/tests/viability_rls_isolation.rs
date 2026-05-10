@@ -31,11 +31,7 @@ use tempfile::TempDir;
 
 /// Inspect every `marker` cell returned by `sql` in `sess`, count the cells
 /// matching `forbidden_marker`. Any non-zero count is a cross-tenant leak.
-async fn count_forbidden_marker(
-    sess: &TenantSession,
-    sql: &str,
-    forbidden_marker: &str,
-) -> usize {
+async fn count_forbidden_marker(sess: &TenantSession, sql: &str, forbidden_marker: &str) -> usize {
     let res = sess.execute(sql).await.expect("query failed");
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
@@ -89,23 +85,19 @@ async fn viability_rls_isolation() {
     let admin_b = engine.open_session(tenant_b).await.unwrap();
 
     for s in [&admin_a, &admin_b] {
-        s.execute("CREATE TABLE events (id BIGINT NOT NULL, marker TEXT NOT NULL, owner TEXT NOT NULL)")
-            .await
-            .unwrap();
+        s.execute(
+            "CREATE TABLE events (id BIGINT NOT NULL, marker TEXT NOT NULL, owner TEXT NOT NULL)",
+        )
+        .await
+        .unwrap();
     }
 
     // Use the same principal name (`"shared"`) in both tenants. This is the
     // attack surface: if RLS were to leak across tenants (say, by sharing a
     // policy table), shared's session under tenant A could see tenant B's
     // rows. The test asserts that doesn't happen.
-    let shared_a = engine
-        .open_session_as(tenant_a, "shared")
-        .await
-        .unwrap();
-    let shared_b = engine
-        .open_session_as(tenant_b, "shared")
-        .await
-        .unwrap();
+    let shared_a = engine.open_session_as(tenant_a, "shared").await.unwrap();
+    let shared_b = engine.open_session_as(tenant_b, "shared").await.unwrap();
 
     // Seed: each tenant gets 5 rows, all with owner='shared' so the
     // RLS policy matches the principal. The marker is what we count for
@@ -140,9 +132,7 @@ async fn viability_rls_isolation() {
         .await
         .unwrap();
     admin_a
-        .execute(
-            "CREATE POLICY a_shared ON events FOR ALL TO PUBLIC USING (owner = current_user)",
-        )
+        .execute("CREATE POLICY a_shared ON events FOR ALL TO PUBLIC USING (owner = current_user)")
         .await
         .unwrap();
 
@@ -178,11 +168,7 @@ async fn viability_rls_isolation() {
     leak_count += count_forbidden_marker(&shared_b, "SELECT marker FROM events", &marker_a).await;
 
     // A's row count under RLS-on + no-policy must be 0 (deny-default).
-    let a_post_drop = match shared_a
-        .execute("SELECT marker FROM events")
-        .await
-        .unwrap()
-    {
+    let a_post_drop = match shared_a.execute("SELECT marker FROM events").await.unwrap() {
         ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
         ExecResult::Empty { .. } => 0,
     };
@@ -191,11 +177,7 @@ async fn viability_rls_isolation() {
         "tenant A under RLS-on + no policy should see 0 rows; got {a_post_drop}"
     );
     // B is unaffected: still sees its own 5 rows.
-    let b_unaffected = match shared_b
-        .execute("SELECT marker FROM events")
-        .await
-        .unwrap()
-    {
+    let b_unaffected = match shared_b.execute("SELECT marker FROM events").await.unwrap() {
         ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
         ExecResult::Empty { .. } => 0,
     };
@@ -228,5 +210,8 @@ async fn viability_rls_isolation() {
         }),
     );
 
-    assert_eq!(leak_count, 0, "{leak_count} cross-tenant rows leaked under RLS");
+    assert_eq!(
+        leak_count, 0,
+        "{leak_count} cross-tenant rows leaked under RLS"
+    );
 }

@@ -126,7 +126,10 @@ async fn create_or_replace_function_handled() {
         .await
         .unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
-    assert!(msg.contains("already") || msg.contains("exist"), "got {err}");
+    assert!(
+        msg.contains("already") || msg.contains("exist"),
+        "got {err}"
+    );
 
     // OR REPLACE should re-register cleanly.
     sess.execute(
@@ -136,10 +139,7 @@ async fn create_or_replace_function_handled() {
     .await
     .unwrap();
 
-    let res = sess
-        .execute("SELECT shift(x) AS y FROM t")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT shift(x) AS y FROM t").await.unwrap();
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("unexpected: {other:?}"),
@@ -167,10 +167,7 @@ async fn drop_function_works() {
 
     sess.execute("DROP FUNCTION add_one(BIGINT)").await.unwrap();
 
-    let err = sess
-        .execute("SELECT add_one(x) FROM t")
-        .await
-        .unwrap_err();
+    let err = sess.execute("SELECT add_one(x) FROM t").await.unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
         msg.contains("add_one") || msg.contains("not") || msg.contains("invalid"),
@@ -237,10 +234,7 @@ async fn alter_function_rename() {
     assert_eq!(col_i64(&batches, "y"), vec![2, 3]);
 
     // Old name no longer resolves.
-    let err = sess
-        .execute("SELECT add_one(x) FROM t")
-        .await
-        .unwrap_err();
+    let err = sess.execute("SELECT add_one(x) FROM t").await.unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
         msg.contains("add_one") || msg.contains("not") || msg.contains("invalid"),

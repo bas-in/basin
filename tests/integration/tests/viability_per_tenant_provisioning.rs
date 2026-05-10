@@ -57,7 +57,10 @@ async fn pg_alive() -> bool {
 }
 
 fn unique_schema() -> String {
-    format!("basin_viability_prov_{}", Ulid::new().to_string().to_lowercase())
+    format!(
+        "basin_viability_prov_{}",
+        Ulid::new().to_string().to_lowercase()
+    )
 }
 
 fn auth_cfg(schema: &str) -> AuthConfig {
@@ -182,7 +185,10 @@ async fn viability_per_tenant_bcrypt_validate_cost() {
     // validations. This isolates the bcrypt-verify path from the
     // provision path.
     let tenant = TenantId::new();
-    let info = auth.provision_tenant_db(&tenant, None).await.expect("provision");
+    let info = auth
+        .provision_tenant_db(&tenant, None)
+        .await
+        .expect("provision");
     let user = info.pgwire_user.clone();
     let password = info.password_secret.clone();
 
@@ -320,14 +326,20 @@ async fn viability_cluster_by_sort_overhead() {
         let table_a = TableName::new(format!("nc_{i}")).unwrap();
         let table_b = TableName::new(format!("cl_{i}")).unwrap();
         let batch = shuffled_batch(ROWS);
-        no_cluster_ms.push(write_with_options(&storage, &tenant, &table_a, &batch, &no_cluster).await);
-        with_cluster_ms.push(write_with_options(&storage, &tenant, &table_b, &batch, &with_cluster).await);
+        no_cluster_ms
+            .push(write_with_options(&storage, &tenant, &table_a, &batch, &no_cluster).await);
+        with_cluster_ms
+            .push(write_with_options(&storage, &tenant, &table_b, &batch, &with_cluster).await);
     }
 
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
     let nc_mean = mean(&no_cluster_ms);
     let cl_mean = mean(&with_cluster_ms);
-    let ratio = if nc_mean > 0.0 { cl_mean / nc_mean } else { f64::INFINITY };
+    let ratio = if nc_mean > 0.0 {
+        cl_mean / nc_mean
+    } else {
+        f64::INFINITY
+    };
 
     let pass = ratio < BAR_RATIO;
     println!(

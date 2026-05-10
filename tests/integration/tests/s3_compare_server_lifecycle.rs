@@ -24,9 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use basin_common::TenantId;
-use basin_integration_tests::benchmark::{
-    report_real_postgres_compare, CompareMetric, WhichWins,
-};
+use basin_integration_tests::benchmark::{report_real_postgres_compare, CompareMetric, WhichWins};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_router::{ServerConfig, StaticTenantResolver};
 use basin_storage::{Storage, StorageConfig};
@@ -248,17 +246,14 @@ async fn measure_conn_ceiling(
         let success = success.clone();
         let conn_str = conn_str.clone();
         joins.push(tokio::spawn(async move {
-            match tokio_postgres::connect(&conn_str, NoTls).await {
-                Ok((client, conn)) => {
-                    success.fetch_add(1, Ordering::Relaxed);
-                    let driver = tokio::spawn(async move {
-                        let _ = conn.await;
-                    });
-                    let _ = rx.await;
-                    drop(client);
-                    driver.abort();
-                }
-                Err(_) => {}
+            if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
+                success.fetch_add(1, Ordering::Relaxed);
+                let driver = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let _ = rx.await;
+                drop(client);
+                driver.abort();
             }
         }));
     }
@@ -361,8 +356,7 @@ async fn s3_compare_server_lifecycle() {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,

@@ -346,6 +346,8 @@ impl TableMetadata {
     /// in-memory implementation always keeps these consistent; this helper
     /// is for callers who don't want to re-scan `snapshots` themselves.
     pub fn current(&self) -> Option<&Snapshot> {
-        self.snapshots.iter().find(|s| s.id == self.current_snapshot)
+        self.snapshots
+            .iter()
+            .find(|s| s.id == self.current_snapshot)
     }
 }

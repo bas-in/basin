@@ -69,9 +69,7 @@ impl TenantSession {
         }
 
         // Sort global top-k by distance ascending.
-        output_rows.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        output_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         output_rows.truncate(k);
 
         // Concatenate single-row batches and append the `_distance` column.
@@ -79,7 +77,8 @@ impl TenantSession {
             return Ok(Vec::new());
         }
         let table_schema = output_rows[0].1.schema();
-        let mut out_schema_fields: Vec<Arc<Field>> = table_schema.fields().iter().cloned().collect();
+        let mut out_schema_fields: Vec<Arc<Field>> =
+            table_schema.fields().iter().cloned().collect();
         out_schema_fields.push(Arc::new(Field::new("_distance", DataType::Float64, false)));
         let out_schema = Arc::new(Schema::new(out_schema_fields));
 
@@ -170,4 +169,3 @@ async fn read_rows_at_positions(
         .map_err(|e| BasinError::storage(format!("hit concat {path}: {e}")))?;
     Ok(out)
 }
-

@@ -32,10 +32,7 @@ const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 // --- helpers -----------------------------------------------------------------
 
 fn unique_schema() -> String {
-    format!(
-        "basin_rest_test_{}",
-        Ulid::new().to_string().to_lowercase()
-    )
+    format!("basin_rest_test_{}", Ulid::new().to_string().to_lowercase())
 }
 
 struct SchemaGuard {
@@ -122,21 +119,38 @@ fn auth_cfg(schema: &str) -> AuthConfig {
 
 /// Try to spin up a server backed by live PG. Returns None if PG is
 /// unreachable — every test then prints a skip line and exits Ok.
-async fn try_serve() -> Option<(crate::RunningRest, RestService, AuthService, StubMailer, SchemaGuard)>
-{
+async fn try_serve() -> Option<(
+    crate::RunningRest,
+    RestService,
+    AuthService,
+    StubMailer,
+    SchemaGuard,
+)> {
     try_serve_with(50).await
 }
 
 async fn try_serve_with(
     max_page_size: usize,
-) -> Option<(crate::RunningRest, RestService, AuthService, StubMailer, SchemaGuard)> {
+) -> Option<(
+    crate::RunningRest,
+    RestService,
+    AuthService,
+    StubMailer,
+    SchemaGuard,
+)> {
     try_serve_full(max_page_size, 256).await
 }
 
 async fn try_serve_full(
     max_page_size: usize,
     max_body_bytes: usize,
-) -> Option<(crate::RunningRest, RestService, AuthService, StubMailer, SchemaGuard)> {
+) -> Option<(
+    crate::RunningRest,
+    RestService,
+    AuthService,
+    StubMailer,
+    SchemaGuard,
+)> {
     let schema = unique_schema();
     let cfg = auth_cfg(&schema);
     let mailer = StubMailer::new(cfg.smtp.from_email.clone());
@@ -190,7 +204,12 @@ fn last_token(mailer: &StubMailer) -> String {
 
 /// Verified email, signed-in tokens for `tenant`, ready to use in
 /// `Authorization: Bearer <jwt>` headers.
-async fn make_user(auth: &AuthService, mailer: &StubMailer, tenant: &TenantId, email: &str) -> basin_auth::Tokens {
+async fn make_user(
+    auth: &AuthService,
+    mailer: &StubMailer,
+    tenant: &TenantId,
+    email: &str,
+) -> basin_auth::Tokens {
     let user = auth
         .signup(tenant, email, "longenoughpassword")
         .await
@@ -222,8 +241,12 @@ impl HttpResp {
     }
 
     fn json(&self) -> Value {
-        serde_json::from_slice(&self.body)
-            .unwrap_or_else(|e| panic!("body is not JSON ({e}): {}", String::from_utf8_lossy(&self.body)))
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "body is not JSON ({e}): {}",
+                String::from_utf8_lossy(&self.body)
+            )
+        })
     }
 }
 
@@ -373,7 +396,12 @@ async fn signup_signin_returns_jwt() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 200, "verify-email body: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "verify-email body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Now signin and assert tokens come back.
     let body = serde_json::json!({
@@ -390,7 +418,12 @@ async fn signup_signin_returns_jwt() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 200, "signin body: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "signin body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let v = r.json();
     assert!(v["access_token"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(v["refresh_token"].as_str().is_some_and(|s| !s.is_empty()));
@@ -453,18 +486,29 @@ async fn crud_round_trip() {
         addr,
         "POST",
         "/rest/v1/items",
-        &[("Authorization", &bearer), ("Content-Type", "application/json")],
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
         Some(br#"{"id": 1, "name": "alpha"}"#),
     )
     .await;
-    assert_eq!(r.status, 201, "POST body: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        201,
+        "POST body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // POST an array.
     let r = http_request(
         addr,
         "POST",
         "/rest/v1/items",
-        &[("Authorization", &bearer), ("Content-Type", "application/json")],
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
         Some(br#"[{"id": 2, "name": "beta"}, {"id": 3, "name": "gamma"}]"#),
     )
     .await;
@@ -777,12 +821,20 @@ async fn openapi_lists_tenant_tables() {
 
     // Tenant A owns 3 tables.
     let sa = svc.inner.cfg.engine.open_session(tenant_a).await.unwrap();
-    sa.execute("CREATE TABLE alpha (id BIGINT NOT NULL)").await.unwrap();
-    sa.execute("CREATE TABLE beta  (id BIGINT NOT NULL)").await.unwrap();
-    sa.execute("CREATE TABLE gamma (id BIGINT NOT NULL)").await.unwrap();
+    sa.execute("CREATE TABLE alpha (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sa.execute("CREATE TABLE beta  (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sa.execute("CREATE TABLE gamma (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     // Tenant B owns 1.
     let sb = svc.inner.cfg.engine.open_session(tenant_b).await.unwrap();
-    sb.execute("CREATE TABLE only_b (id BIGINT NOT NULL)").await.unwrap();
+    sb.execute("CREATE TABLE only_b (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     let toks = make_user(&auth, &mailer, &tenant_a, "oa@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
@@ -795,7 +847,12 @@ async fn openapi_lists_tenant_tables() {
         None,
     )
     .await;
-    assert_eq!(r.status, 200, "openapi body: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "openapi body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let v = r.json();
     assert_eq!(v["openapi"], "3.0.3");
     let paths = v["paths"].as_object().expect("paths object");
@@ -861,7 +918,12 @@ async fn openapi_includes_column_types() {
         None,
     )
     .await;
-    assert_eq!(r.status, 200, "openapi body: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "openapi body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let v = r.json();
     let comp = &v["components"]["schemas"]["shapes"];
     assert_eq!(comp["type"], "object");
@@ -939,7 +1001,12 @@ async fn api_key_bearer_authenticates_rest() {
         Some(br#"{"name":"ci"}"#),
     )
     .await;
-    assert_eq!(r.status, 201, "create body: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        201,
+        "create body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let v = r.json();
     let secret = v["secret"].as_str().expect("secret in response").to_owned();
     let id = v["id"].as_i64().expect("id in response");
@@ -966,7 +1033,10 @@ async fn api_key_bearer_authenticates_rest() {
         .execute("CREATE TABLE k (id BIGINT NOT NULL)")
         .await
         .unwrap();
-    session.execute("INSERT INTO k VALUES (1), (2)").await.unwrap();
+    session
+        .execute("INSERT INTO k VALUES (1), (2)")
+        .await
+        .unwrap();
 
     // Use the API key (NOT the JWT) as the bearer.
     let bearer_key = format!("Bearer {}", secret);
@@ -1052,9 +1122,7 @@ async fn pagination_cursor_advances() {
         .execute("CREATE TABLE pages (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
         .unwrap();
-    let values: Vec<String> = (1..=50)
-        .map(|i| format!("({i}, 'r{i}')"))
-        .collect();
+    let values: Vec<String> = (1..=50).map(|i| format!("({i}, 'r{i}')")).collect();
     session
         .execute(&format!("INSERT INTO pages VALUES {}", values.join(", ")))
         .await
@@ -1070,15 +1138,13 @@ async fn pagination_cursor_advances() {
             None => "/rest/v1/pages?limit=10".to_string(),
             Some(c) => format!("/rest/v1/pages?limit=10&cursor={c}"),
         };
-        let r = http_request(
-            addr,
-            "GET",
-            &path,
-            &[("Authorization", &bearer)],
-            None,
-        )
-        .await;
-        assert_eq!(r.status, 200, "page {page} body: {}", String::from_utf8_lossy(&r.body));
+        let r = http_request(addr, "GET", &path, &[("Authorization", &bearer)], None).await;
+        assert_eq!(
+            r.status,
+            200,
+            "page {page} body: {}",
+            String::from_utf8_lossy(&r.body)
+        );
         let v = r.json();
         let rows = v["rows"].as_array().expect("rows array");
         for row in rows {
@@ -1259,7 +1325,12 @@ async fn refresh_token_reuse_detected_revokes_all() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 200, "first rotate: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "first rotate: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let v = r.json();
     let b_refresh = v["refresh_token"].as_str().unwrap().to_owned();
 
@@ -1276,7 +1347,12 @@ async fn refresh_token_reuse_detected_revokes_all() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 200, "second rotate: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "second rotate: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let v = r.json();
     let c_refresh = v["refresh_token"].as_str().unwrap().to_owned();
 
@@ -1291,7 +1367,12 @@ async fn refresh_token_reuse_detected_revokes_all() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 401, "leaked-A replay: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        401,
+        "leaked-A replay: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     assert_eq!(r.json()["code"], "E_REVOKED_TOKEN");
 
     // C must now also fail — blanket revoke.

@@ -212,11 +212,7 @@ pub trait Catalog: Send + Sync {
 
     /// Snapshots in commit order (oldest first). Used by point-in-time-restore
     /// and the analytical reader.
-    async fn list_snapshots(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-    ) -> Result<Vec<Snapshot>>;
+    async fn list_snapshots(&self, tenant: &TenantId, table: &TableName) -> Result<Vec<Snapshot>>;
 
     /// Copy-on-write table fork. Creates `dst_table` for `tenant` as a
     /// clone of `src_table`'s current state: same schema, same snapshot
@@ -364,7 +360,8 @@ pub trait Catalog: Send + Sync {
             }
             // Genesis-in-window flags a brand-new table; SnapshotId::GENESIS
             // is the only snapshot with no parent, by construction.
-            if entry.parent_id.is_none() && entry.snapshot_id == SnapshotId::GENESIS
+            if entry.parent_id.is_none()
+                && entry.snapshot_id == SnapshotId::GENESIS
                 && !seen_genesis_in_window.contains(&entry.table)
             {
                 created_in_window.push(entry.table.clone());
@@ -603,12 +600,7 @@ pub trait Catalog: Send + Sync {
     /// Returns [`basin_common::BasinError::NotFound`] if no index with that
     /// name exists on the table. Default impl returns `Internal("not
     /// implemented")` so the stub `RestCatalog` stays buildable.
-    async fn drop_index(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-        name: &str,
-    ) -> Result<()> {
+    async fn drop_index(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
         let _ = (tenant, table, name);
         Err(basin_common::BasinError::Internal(
             "drop_index not implemented for this catalog backend".into(),
@@ -644,11 +636,7 @@ pub trait Catalog: Send + Sync {
     /// `None` for both "tenant has no functions" and "name is unknown" —
     /// callers can't distinguish, mirroring the lookup semantics of
     /// `load_table` for tables. Default impl returns `None`.
-    async fn lookup_sql_function(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-    ) -> Option<SqlFunctionDef> {
+    async fn lookup_sql_function(&self, tenant: &TenantId, name: &str) -> Option<SqlFunctionDef> {
         let _ = (tenant, name);
         None
     }
@@ -769,12 +757,7 @@ pub trait Catalog: Send + Sync {
     /// Drop a previously-registered reactor. Returns
     /// [`basin_common::BasinError::NotFound`] if no reactor with that
     /// `(tenant, table, name)` exists.
-    async fn drop_reactor(
-        &self,
-        tenant: &TenantId,
-        table: &TableName,
-        name: &str,
-    ) -> Result<()> {
+    async fn drop_reactor(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
         let _ = (tenant, table, name);
         Err(basin_common::BasinError::Internal(
             "drop_reactor not implemented for this catalog backend".into(),
@@ -832,12 +815,7 @@ pub trait Catalog: Send + Sync {
     /// registered under that name, and
     /// [`basin_common::BasinError::Catalog`] when `value` already
     /// exists in the label list. Default impl: not-implemented.
-    async fn add_enum_value(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-        value: &str,
-    ) -> Result<()> {
+    async fn add_enum_value(&self, tenant: &TenantId, name: &str, value: &str) -> Result<()> {
         let _ = (tenant, name, value);
         Err(basin_common::BasinError::Internal(
             "add_enum_value not implemented for this catalog backend".into(),
@@ -931,11 +909,7 @@ pub trait Catalog: Send + Sync {
     /// `None` for both "tenant has no procedures" and "name is
     /// unknown" — same lookup semantics as
     /// [`Catalog::lookup_sql_function`]. Default impl returns `None`.
-    async fn lookup_procedure(
-        &self,
-        tenant: &TenantId,
-        name: &str,
-    ) -> Option<SqlProcedureDef> {
+    async fn lookup_procedure(&self, tenant: &TenantId, name: &str) -> Option<SqlProcedureDef> {
         let _ = (tenant, name);
         None
     }

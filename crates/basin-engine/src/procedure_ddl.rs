@@ -124,10 +124,7 @@ pub(crate) async fn exec_drop_procedure(
 /// per Phase 5). The return tag carries the count of statements that
 /// ran successfully so callers can distinguish full from partial
 /// completion.
-pub(crate) async fn exec_call(
-    sess: &TenantSession,
-    call: Function,
-) -> Result<ExecResult> {
+pub(crate) async fn exec_call(sess: &TenantSession, call: Function) -> Result<ExecResult> {
     let proc_name = single_part_object_name(&call.name)?;
 
     // Reject the same shape modifiers the function inliner rejects
@@ -142,9 +139,7 @@ pub(crate) async fn exec_call(
     let def = catalog
         .lookup_procedure(&sess.tenant, &proc_name)
         .await
-        .ok_or_else(|| {
-            BasinError::not_found(format!("procedure {proc_name:?} does not exist"))
-        })?;
+        .ok_or_else(|| BasinError::not_found(format!("procedure {proc_name:?} does not exist")))?;
 
     // Extract call-site arguments. Wildcard / qualified-wildcard arg
     // forms are rejected — only named or positional expressions can be
@@ -343,9 +338,7 @@ fn parse_arg_list(inside: &str, proc_name: &str) -> Result<Vec<SqlFunctionArg>> 
     // Wrap in a synthetic CREATE FUNCTION so sqlparser does the heavy
     // lifting — keeps the type-token logic in one place
     // (`function_ddl::sql_data_type_to_arg`-equivalent here).
-    let synth = format!(
-        "CREATE FUNCTION __tmp({s}) RETURNS BIGINT LANGUAGE sql AS $$ SELECT 1 $$"
-    );
+    let synth = format!("CREATE FUNCTION __tmp({s}) RETURNS BIGINT LANGUAGE sql AS $$ SELECT 1 $$");
     let dialect = PostgreSqlDialect {};
     let mut stmts = Parser::parse_sql(&dialect, &synth).map_err(|e| {
         BasinError::InvalidSchema(format!(
@@ -367,16 +360,12 @@ fn parse_arg_list(inside: &str, proc_name: &str) -> Result<Vec<SqlFunctionArg>> 
     };
     let mut out: Vec<SqlFunctionArg> = Vec::with_capacity(parsed_args.len());
     for (idx, a) in parsed_args.iter().enumerate() {
-        let aname = a
-            .name
-            .as_ref()
-            .map(|i| i.value.clone())
-            .ok_or_else(|| {
-                BasinError::InvalidSchema(format!(
-                    "CREATE PROCEDURE {proc_name}: argument #{idx} is unnamed; \
+        let aname = a.name.as_ref().map(|i| i.value.clone()).ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "CREATE PROCEDURE {proc_name}: argument #{idx} is unnamed; \
                      all arguments must be named in v0.1"
-                ))
-            })?;
+            ))
+        })?;
         let dt = sql_data_type_to_arg(&a.data_type).map_err(|e| {
             BasinError::InvalidSchema(format!(
                 "CREATE PROCEDURE {proc_name}: arg {aname:?} type unsupported ({e})"
@@ -397,9 +386,7 @@ fn parse_arg_list(inside: &str, proc_name: &str) -> Result<Vec<SqlFunctionArg>> 
 fn sql_data_type_to_arg(dt: &sqlparser::ast::DataType) -> Result<SqlArgType> {
     use sqlparser::ast::{DataType as SqlDataType, TimezoneInfo};
     match dt {
-        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
-            Ok(SqlArgType::Int)
-        }
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(SqlArgType::Int),
         SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(SqlArgType::BigInt),
         SqlDataType::Text
         | SqlDataType::Varchar(_)
@@ -433,10 +420,7 @@ fn sql_data_type_to_arg(dt: &sqlparser::ast::DataType) -> Result<SqlArgType> {
 /// can carry. Mirrors `sql_functions::substitute_args_in_query` but
 /// covers the wider statement set (INSERT / UPDATE / DELETE / CREATE
 /// TABLE / DROP TABLE / SELECT).
-fn substitute_args_in_statement(
-    stmt: &mut Statement,
-    subs: &HashMap<String, Expr>,
-) -> Result<()> {
+fn substitute_args_in_statement(stmt: &mut Statement, subs: &HashMap<String, Expr>) -> Result<()> {
     match stmt {
         Statement::Query(q) => substitute_args_in_query(q, subs),
         Statement::Insert(ins) => {
@@ -507,10 +491,7 @@ fn substitute_args_in_query(
     Ok(())
 }
 
-fn substitute_args_in_set_expr(
-    set: &mut SetExpr,
-    subs: &HashMap<String, Expr>,
-) -> Result<()> {
+fn substitute_args_in_set_expr(set: &mut SetExpr, subs: &HashMap<String, Expr>) -> Result<()> {
     match set {
         SetExpr::Select(sel) => {
             for item in sel.projection.iter_mut() {
@@ -545,10 +526,7 @@ fn substitute_args_in_set_expr(
     }
 }
 
-fn substitute_args_in_expr(
-    expr: &mut Expr,
-    subs: &HashMap<String, Expr>,
-) -> Result<()> {
+fn substitute_args_in_expr(expr: &mut Expr, subs: &HashMap<String, Expr>) -> Result<()> {
     if let Expr::Identifier(id) = expr {
         if let Some(replacement) = subs.get(&id.value.to_ascii_lowercase()) {
             *expr = wrap_paren(replacement.clone());
@@ -558,10 +536,7 @@ fn substitute_args_in_expr(
     walk_expr_children(expr, subs)
 }
 
-fn walk_expr_children(
-    expr: &mut Expr,
-    subs: &HashMap<String, Expr>,
-) -> Result<()> {
+fn walk_expr_children(expr: &mut Expr, subs: &HashMap<String, Expr>) -> Result<()> {
     match expr {
         Expr::BinaryOp { left, right, .. } => {
             substitute_args_in_expr(left, subs)?;
@@ -589,7 +564,9 @@ fn walk_expr_children(
             }
             Ok(())
         }
-        Expr::InSubquery { expr: e, subquery, .. } => {
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
             substitute_args_in_expr(e, subs)?;
             substitute_args_in_query(subquery, subs)
         }
@@ -600,9 +577,15 @@ fn walk_expr_children(
             substitute_args_in_expr(low, subs)?;
             substitute_args_in_expr(high, subs)
         }
-        Expr::Like { expr: e, pattern, .. }
-        | Expr::ILike { expr: e, pattern, .. }
-        | Expr::SimilarTo { expr: e, pattern, .. } => {
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        }
+        | Expr::SimilarTo {
+            expr: e, pattern, ..
+        } => {
             substitute_args_in_expr(e, subs)?;
             substitute_args_in_expr(pattern, subs)
         }
@@ -626,9 +609,7 @@ fn walk_expr_children(
             }
             Ok(())
         }
-        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
-            substitute_args_in_query(q, subs)
-        }
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => substitute_args_in_query(q, subs),
         Expr::Function(func) => {
             if let FunctionArguments::List(list) = &mut func.args {
                 for arg in list.args.iter_mut() {
@@ -931,17 +912,15 @@ mod tests {
 
     #[test]
     fn match_create_procedure_plpgsql_rejected() {
-        let err = match_create_procedure(
-            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$",
-        )
-        .unwrap_err();
+        let err =
+            match_create_procedure("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$")
+                .unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
     }
 
     #[test]
     fn match_create_procedure_missing_language_rejected() {
-        let err =
-            match_create_procedure("CREATE PROCEDURE p() AS $$ SELECT 1 $$").unwrap_err();
+        let err = match_create_procedure("CREATE PROCEDURE p() AS $$ SELECT 1 $$").unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
     }
 
@@ -953,8 +932,7 @@ mod tests {
 
     #[test]
     fn match_create_procedure_dollar_tagged_body() {
-        let sql =
-            "CREATE PROCEDURE p() LANGUAGE sql AS $body$ SELECT 1 $body$";
+        let sql = "CREATE PROCEDURE p() LANGUAGE sql AS $body$ SELECT 1 $body$";
         let r = match_create_procedure(sql).unwrap().expect("matched");
         assert_eq!(r.2.trim(), "SELECT 1");
     }

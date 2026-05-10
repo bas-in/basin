@@ -176,7 +176,7 @@ async fn s3_scaling_compute_shards() {
     let consistent_routing_pct = 100.0 * consistent_count as f64 / N_TENANTS as f64;
 
     let mut load_per_shard: Vec<usize> = vec![0; N_SHARDS];
-    for (_, idx) in &placement {
+    for idx in placement.values() {
         load_per_shard[*idx] += 1;
     }
     let max_load: usize = *load_per_shard.iter().max().unwrap();

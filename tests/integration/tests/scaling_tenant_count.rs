@@ -100,7 +100,10 @@ async fn scaling_tenant_count() {
         s.execute("INSERT INTO events VALUES (0, 'warm')")
             .await
             .unwrap();
-        let _ = s.execute("SELECT id FROM events WHERE id = 0").await.unwrap();
+        let _ = s
+            .execute("SELECT id FROM events WHERE id = 0")
+            .await
+            .unwrap();
     }
 
     struct Row {

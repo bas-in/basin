@@ -200,10 +200,7 @@ async fn s3_tenant_deletion() {
         "expected zero residual objects, got {}",
         listed_after.len()
     );
-    assert!(
-        deleted >= FILES,
-        "deleted only {deleted} of >= {FILES}"
-    );
+    assert!(deleted >= FILES, "deleted only {deleted} of >= {FILES}");
 
     // Catalog must be empty after deletion: drop_namespace is the
     // last step in `delete_tenant` and cascades through every table.
@@ -246,8 +243,5 @@ async fn s3_tenant_deletion() {
         }),
     );
 
-    assert!(
-        pass,
-        "deletion took {deletion_ms:.1} ms, bar <{BAR_MS} ms"
-    );
+    assert!(pass, "deletion took {deletion_ms:.1} ms, bar <{BAR_MS} ms");
 }

@@ -33,9 +33,7 @@ use basin_common::{PartitionKey, TableName, TenantId};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
-use basin_storage::{
-    PageCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig,
-};
+use basin_storage::{PageCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use futures::stream::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -197,15 +195,11 @@ async fn s3_viability_page_cache() {
     );
     println!(
         "[S3 page_cache] cold counters: hits={}, misses={}, evictions={}",
-        counters_after_cold.hits,
-        counters_after_cold.misses,
-        counters_after_cold.evictions,
+        counters_after_cold.hits, counters_after_cold.misses, counters_after_cold.evictions,
     );
     println!(
         "[S3 page_cache] warm counters: hits={}, misses={}, evictions={}",
-        counters_after_warm.hits,
-        counters_after_warm.misses,
-        counters_after_warm.evictions,
+        counters_after_warm.hits, counters_after_warm.misses, counters_after_warm.evictions,
     );
 
     let cold_to_warm_p50_ratio = if warm_dist.p50_ms > 0.0 {

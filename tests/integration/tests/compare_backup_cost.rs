@@ -33,9 +33,7 @@ use std::time::Instant;
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{TableName, TenantId};
 use basin_engine::{Engine, EngineConfig};
-use basin_integration_tests::benchmark::{
-    report_postgres_compare, CompareMetric, WhichWins,
-};
+use basin_integration_tests::benchmark::{report_postgres_compare, CompareMetric, WhichWins};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio::process::Command as TokioCommand;
@@ -87,9 +85,7 @@ impl Drop for SchemaGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect(&conn_str, NoTls).await
-                    {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                         tokio::spawn(async move {
                             let _ = conn.await;
                         });
@@ -124,9 +120,11 @@ async fn compare_backup_cost() {
     let tenant = TenantId::new();
     let table = TableName::new("events").unwrap();
     let sess = engine.open_session(tenant).await.unwrap();
-    sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
 
     // 100 batches × 1000 rows. Each INSERT goes through the legacy
     // synchronous Parquet write path (no shard configured), so each batch

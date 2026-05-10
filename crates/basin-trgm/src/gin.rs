@@ -186,10 +186,7 @@ impl TrigramIndex {
             }
         }
 
-        let mut out: Vec<(u64, f32)> = best
-            .into_iter()
-            .filter(|(_, s)| *s >= threshold)
-            .collect();
+        let mut out: Vec<(u64, f32)> = best.into_iter().filter(|(_, s)| *s >= threshold).collect();
         // Descending score, ascending row_id on ties for determinism.
         out.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)

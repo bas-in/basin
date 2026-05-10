@@ -130,9 +130,7 @@ async fn vector_search_smoke() {
     let bulk_rows = TOTAL_ROWS - SQL_INSERT_ROWS;
     let ids: Int64Array = (SQL_INSERT_ROWS as i64..(SQL_INSERT_ROWS + bulk_rows) as i64).collect();
     let raw_vecs: Vec<Option<Vec<Option<f32>>>> = (SQL_INSERT_ROWS..(SQL_INSERT_ROWS + bulk_rows))
-        .map(|id| {
-            Some(det_vec(id as u64, DIM).into_iter().map(Some).collect())
-        })
+        .map(|id| Some(det_vec(id as u64, DIM).into_iter().map(Some).collect()))
         .collect();
     let emb = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(raw_vecs, DIM as i32);
     let batch = RecordBatch::try_new(
@@ -175,9 +173,8 @@ async fn vector_search_smoke() {
     let query_lit = vector_lit(&query);
 
     // 5. Brute force via SQL: ORDER BY l2_distance(embedding, '[...]').
-    let brute_sql = format!(
-        "SELECT id FROM docs ORDER BY l2_distance(embedding, '{query_lit}') LIMIT {TOP_K}"
-    );
+    let brute_sql =
+        format!("SELECT id FROM docs ORDER BY l2_distance(embedding, '{query_lit}') LIMIT {TOP_K}");
     let t0 = Instant::now();
     let res = session.execute(&brute_sql).await.unwrap();
     let brute_ms = t0.elapsed().as_secs_f64() * 1_000.0;

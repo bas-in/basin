@@ -27,8 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    StringArray,
+    Array, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Schema};
 use basin_catalog::{Catalog, CheckConstraint, ForeignKeyDef, RefAction, TableMetadata};
@@ -102,8 +101,7 @@ pub(crate) async fn enforce_pk_on_insert(
     if data_files.is_empty() {
         return Ok(());
     }
-    let mut existing: std::collections::HashSet<Vec<String>> =
-        std::collections::HashSet::new();
+    let mut existing: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     for f in &data_files {
         let mut stream = storage.read_file(tenant, &f.path).await?;
         while let Some(rb) = stream.next().await {
@@ -260,10 +258,7 @@ pub(crate) async fn enforce_check_constraints(
             ))
         })?;
         let results = df.collect().await.map_err(|e| {
-            BasinError::InvalidSchema(format!(
-                "CHECK constraint {:?} evaluation: {e}",
-                c.name
-            ))
+            BasinError::InvalidSchema(format!("CHECK constraint {:?} evaluation: {e}", c.name))
         })?;
         let mut row_global: usize = 0;
         for rb in &results {
@@ -407,7 +402,9 @@ async fn collect_pk_tuples(
                 .iter()
                 .map(|c| {
                     rb.schema().index_of(c).map_err(|_| {
-                        BasinError::internal(format!("PK column {c:?} missing from referenced data file"))
+                        BasinError::internal(format!(
+                            "PK column {c:?} missing from referenced data file"
+                        ))
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -515,9 +512,7 @@ pub(crate) async fn check_parent_delete(
                         // as a HashMap so the caller can build a
                         // WHERE clause for CASCADE DELETE.
                         let mut m = HashMap::new();
-                        for (col_name, col_idx) in
-                            local_in_parent_pk_order.iter().zip(idx.iter())
-                        {
+                        for (col_name, col_idx) in local_in_parent_pk_order.iter().zip(idx.iter()) {
                             let arr = rb.column(*col_idx);
                             if arr.is_null(row) {
                                 m.insert(col_name.clone(), "NULL".into());
@@ -541,12 +536,7 @@ pub(crate) async fn check_parent_delete(
                 let example_row = &matching_rows[0];
                 let example_tuple: Vec<String> = local_in_parent_pk_order
                     .iter()
-                    .map(|c| {
-                        example_row
-                            .get(c)
-                            .cloned()
-                            .unwrap_or_else(|| "?".into())
-                    })
+                    .map(|c| example_row.get(c).cloned().unwrap_or_else(|| "?".into()))
                     .collect();
                 return Err(BasinError::ForeignKeyViolation(format!(
                     "update or delete on table \"{parent_table_str}\" violates foreign key \
@@ -620,9 +610,9 @@ pub(crate) fn build_in_predicate_sql(
     for r in rows {
         let mut parts = Vec::with_capacity(fk_columns.len());
         for c in fk_columns {
-            let raw = r.get(c).ok_or_else(|| {
-                BasinError::internal(format!("cascade row missing column {c}"))
-            })?;
+            let raw = r
+                .get(c)
+                .ok_or_else(|| BasinError::internal(format!("cascade row missing column {c}")))?;
             let field = schema
                 .field_with_name(c)
                 .map_err(|_| BasinError::internal(format!("cascade column {c} missing")))?;

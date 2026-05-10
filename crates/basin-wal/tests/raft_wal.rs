@@ -136,12 +136,22 @@ async fn three_node_cluster_appends() {
         assert_eq!(lsn, Lsn(i));
     }
     let elapsed = start.elapsed();
-    eprintln!("3-node append: 10 entries in {elapsed:?} ({:?}/op)", elapsed / 10);
+    eprintln!(
+        "3-node append: 10 entries in {elapsed:?} ({:?}/op)",
+        elapsed / 10
+    );
 
     // Wait for replication to all nodes and verify every node's state
     // machine sees the full log.
     for node in &nodes {
-        wait_for_high_water(node.as_ref(), &tenant, &part, Lsn(10), Duration::from_secs(2)).await;
+        wait_for_high_water(
+            node.as_ref(),
+            &tenant,
+            &part,
+            Lsn(10),
+            Duration::from_secs(2),
+        )
+        .await;
         let entries = node.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(entries.len(), 10);
     }
@@ -169,7 +179,14 @@ async fn five_node_cluster_appends() {
     }
 
     for node in &nodes {
-        wait_for_high_water(node.as_ref(), &tenant, &part, Lsn(10), Duration::from_secs(3)).await;
+        wait_for_high_water(
+            node.as_ref(),
+            &tenant,
+            &part,
+            Lsn(10),
+            Duration::from_secs(3),
+        )
+        .await;
     }
 
     for n in &nodes {
@@ -192,7 +209,14 @@ async fn leader_failure_triggers_election() {
         .await
         .unwrap();
     for node in &nodes {
-        wait_for_high_water(node.as_ref(), &tenant, &part, Lsn(1), Duration::from_secs(2)).await;
+        wait_for_high_water(
+            node.as_ref(),
+            &tenant,
+            &part,
+            Lsn(1),
+            Duration::from_secs(2),
+        )
+        .await;
     }
 
     // Take leader down.
@@ -301,7 +325,14 @@ async fn log_replicated_to_all_nodes() {
             .unwrap();
     }
     for node in &nodes {
-        wait_for_high_water(node.as_ref(), &tenant, &part, Lsn(100), Duration::from_secs(5)).await;
+        wait_for_high_water(
+            node.as_ref(),
+            &tenant,
+            &part,
+            Lsn(100),
+            Duration::from_secs(5),
+        )
+        .await;
         let entries = node.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(entries.len(), 100);
         for (i, e) in entries.iter().enumerate() {
@@ -330,13 +361,24 @@ async fn truncate_with_snapshot() {
             .unwrap();
     }
     for node in &nodes {
-        wait_for_high_water(node.as_ref(), &tenant, &part, Lsn(1000), Duration::from_secs(10)).await;
+        wait_for_high_water(
+            node.as_ref(),
+            &tenant,
+            &part,
+            Lsn(1000),
+            Duration::from_secs(10),
+        )
+        .await;
     }
 
     leader.truncate(&tenant, &part, Lsn(500)).await.unwrap();
     let remaining = leader.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
     for e in &remaining {
-        assert!(e.lsn > Lsn(500), "entry {} should have been truncated", e.lsn);
+        assert!(
+            e.lsn > Lsn(500),
+            "entry {} should have been truncated",
+            e.lsn
+        );
     }
     assert_eq!(remaining.len(), 500);
 
@@ -344,4 +386,3 @@ async fn truncate_with_snapshot() {
         n.close().await.unwrap();
     }
 }
-

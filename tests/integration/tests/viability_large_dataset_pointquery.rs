@@ -105,10 +105,7 @@ async fn engine_point_query(sess: &TenantSession, id: i64) -> Result<(), String>
                     .ok_or_else(|| format!("id={id}: id column not Int64"))?;
                 for i in 0..ids.len() {
                     if ids.value(i) != id {
-                        return Err(format!(
-                            "id={id}: returned row had id={}",
-                            ids.value(i)
-                        ));
+                        return Err(format!("id={id}: returned row had id={}", ids.value(i)));
                     }
                     hits += 1;
                 }
@@ -139,7 +136,10 @@ async fn viability_6_large_dataset_pointquery() {
     let part = PartitionKey::default_key();
 
     catalog.create_namespace(&tenant).await.unwrap();
-    catalog.create_table(&tenant, &table, &schema()).await.unwrap();
+    catalog
+        .create_table(&tenant, &table, &schema())
+        .await
+        .unwrap();
 
     println!(
         "WARNING: viability_6 seeds {} rows across {} files; this is slow on debug builds",

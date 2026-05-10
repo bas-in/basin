@@ -16,7 +16,12 @@ async fn oversized_post_body_rejected() {
 
     let body = vec![b'x'; 4096];
     let err = client
-        .http_post(&tenant, "http://127.0.0.1:1/", body, "application/octet-stream")
+        .http_post(
+            &tenant,
+            "http://127.0.0.1:1/",
+            body,
+            "application/octet-stream",
+        )
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -38,7 +43,12 @@ async fn at_cap_post_body_passes_the_gate() {
 
     let body = vec![b'y'; 64];
     let err = client
-        .http_post(&tenant, "http://127.0.0.1:1/", body, "application/octet-stream")
+        .http_post(
+            &tenant,
+            "http://127.0.0.1:1/",
+            body,
+            "application/octet-stream",
+        )
         .await
         .unwrap_err();
     let msg = format!("{err}");

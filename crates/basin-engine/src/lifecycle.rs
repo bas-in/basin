@@ -60,16 +60,22 @@ pub(crate) fn extract_create_table_lifecycle(sql: &str) -> Result<(String, Creat
     let bytes = after_audit_strip.as_bytes();
     // Find the `(` that opens the column list.
     let Some(open) = find_top_level_open_paren(bytes) else {
-        return Ok((after_audit_strip, CreateTableLifecycle {
-            audit_table,
-            ..CreateTableLifecycle::default()
-        }));
+        return Ok((
+            after_audit_strip,
+            CreateTableLifecycle {
+                audit_table,
+                ..CreateTableLifecycle::default()
+            },
+        ));
     };
     let Some(close) = find_matching_close_paren(bytes, open) else {
-        return Ok((after_audit_strip, CreateTableLifecycle {
-            audit_table,
-            ..CreateTableLifecycle::default()
-        }));
+        return Ok((
+            after_audit_strip,
+            CreateTableLifecycle {
+                audit_table,
+                ..CreateTableLifecycle::default()
+            },
+        ));
     };
     let body = &after_audit_strip[open + 1..close];
     let head = &after_audit_strip[..open + 1];
@@ -125,9 +131,9 @@ fn strip_column_lifecycle_attrs(segment: &str) -> (String, Vec<ColumnAttr>) {
     // First non-whitespace token is the column name.
     let trimmed_start = segment.trim_start();
     let leading_ws_len = segment.len() - trimmed_start.len();
-    let mut chars = trimmed_start.char_indices();
+    let chars = trimmed_start.char_indices();
     let mut name_end = 0;
-    while let Some((idx, c)) = chars.next() {
+    for (idx, c) in chars {
         if c.is_ascii_alphanumeric() || c == '_' {
             name_end = idx + c.len_utf8();
         } else {
@@ -449,7 +455,11 @@ fn strip_trailing_audit_to(sql: &str) -> Result<(String, Option<String>)> {
             }
             // Validate the audit-table identifier is a clean bare ident.
             if name.is_empty()
-                || name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true)
+                || name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(true)
             {
                 return Err(BasinError::InvalidSchema(format!(
                     "AUDIT TO requires a bare identifier, got {name:?}"
@@ -651,10 +661,7 @@ pub(crate) fn audit_schema() -> Schema {
 /// Ensure `audit_table` exists in the tenant's catalog, creating it on
 /// first reference with the canonical [`audit_schema`]. No-op if it
 /// already exists.
-async fn ensure_audit_table_exists(
-    sess: &TenantSession,
-    audit_table: &TableName,
-) -> Result<()> {
+async fn ensure_audit_table_exists(sess: &TenantSession, audit_table: &TableName) -> Result<()> {
     let cat = sess.engine.config().catalog.clone();
     match cat.load_table(&sess.tenant, audit_table).await {
         Ok(_) => Ok(()),
@@ -720,8 +727,8 @@ pub(crate) async fn write_audit_rows(
     let mut op_b = StringBuilder::with_capacity(n, n * 8);
     let mut before_b = LargeBinaryBuilder::with_capacity(n, n * 64);
     let mut after_b = LargeBinaryBuilder::with_capacity(n, n * 64);
-    let mut ts_b =
-        TimestampMicrosecondBuilder::with_capacity(n).with_data_type(schema.field(4).data_type().clone());
+    let mut ts_b = TimestampMicrosecondBuilder::with_capacity(n)
+        .with_data_type(schema.field(4).data_type().clone());
     let mut user_b = StringBuilder::with_capacity(n, n * 8);
 
     // Audit-id is a per-(tenant, audit_table) sequence; the engine's
@@ -743,9 +750,8 @@ pub(crate) async fn write_audit_rows(
         }
         match rec.after.as_ref() {
             Some(v) => {
-                let bytes = serde_json::to_vec(v).map_err(|e| {
-                    BasinError::internal(format!("audit after_row serialise: {e}"))
-                })?;
+                let bytes = serde_json::to_vec(v)
+                    .map_err(|e| BasinError::internal(format!("audit after_row serialise: {e}")))?;
                 after_b.append_value(&bytes);
             }
             None => after_b.append_null(),
@@ -765,9 +771,8 @@ pub(crate) async fn write_audit_rows(
         Arc::new(ts_b.finish()),
         Arc::new(user_b.finish()),
     ];
-    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
-        BasinError::internal(format!("audit batch build: {e}"))
-    })?;
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| BasinError::internal(format!("audit batch build: {e}")))?;
 
     let storage = &sess.engine.config().storage;
     let part = PartitionKey::default_key();
@@ -791,8 +796,13 @@ pub(crate) async fn write_audit_rows(
         Ok(_) => {}
         Err(BasinError::CommitConflict(_)) => {
             let fresh = cat.load_table(&sess.tenant, &audit_table).await?;
-            cat.append_data_files(&sess.tenant, &audit_table, fresh.current_snapshot, vec![file_ref])
-                .await?;
+            cat.append_data_files(
+                &sess.tenant,
+                &audit_table,
+                fresh.current_snapshot,
+                vec![file_ref],
+            )
+            .await?;
         }
         Err(e) => return Err(e),
     }
@@ -874,21 +884,18 @@ mod tests {
 
     #[test]
     fn select_include_deleted_strips() {
-        let (out, included) =
-            extract_select_include_deleted("SELECT id FROM foo INCLUDE DELETED");
+        let (out, included) = extract_select_include_deleted("SELECT id FROM foo INCLUDE DELETED");
         assert!(included);
         assert!(!out.to_ascii_uppercase().contains("INCLUDE DELETED"));
 
-        let (out, included) =
-            extract_select_include_deleted("SELECT id FROM foo");
+        let (out, included) = extract_select_include_deleted("SELECT id FROM foo");
         assert!(!included);
         assert!(!out.to_ascii_uppercase().contains("INCLUDE DELETED"));
     }
 
     #[test]
     fn select_include_deleted_with_semicolon() {
-        let (_, included) =
-            extract_select_include_deleted("SELECT id FROM foo INCLUDE DELETED;");
+        let (_, included) = extract_select_include_deleted("SELECT id FROM foo INCLUDE DELETED;");
         assert!(included);
     }
 }

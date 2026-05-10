@@ -52,8 +52,8 @@ pub(crate) const FORMAT_VERSION: u16 = 1;
 
 /// Length-prefix one record's bincode bytes onto `buf`.
 pub(crate) fn frame_into(buf: &mut Vec<u8>, record: &SegmentRecord) -> Result<()> {
-    let bytes = bincode::serialize(record)
-        .map_err(|e| BasinError::wal(format!("segment encode: {e}")))?;
+    let bytes =
+        bincode::serialize(record).map_err(|e| BasinError::wal(format!("segment encode: {e}")))?;
     let len: u32 = bytes
         .len()
         .try_into()

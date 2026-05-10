@@ -52,8 +52,8 @@ use pgwire::api::{
     Type, METADATA_USER,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::data::{NoData, ParameterDescription};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
+use pgwire::messages::data::{NoData, ParameterDescription};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Describe, Execute, Flush, Parse, ParseComplete,
     Sync as PgSync, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
@@ -88,10 +88,7 @@ pub(crate) trait Session: Send + Sync {
 
     async fn execute(&self, sql: &str) -> Result<ExecResult>;
 
-    async fn prepare(
-        &self,
-        sql: &str,
-    ) -> Result<(StatementHandle, StatementSchema)>;
+    async fn prepare(&self, sql: &str) -> Result<(StatementHandle, StatementSchema)>;
 
     async fn bind(
         &self,
@@ -105,10 +102,7 @@ pub(crate) trait Session: Send + Sync {
     /// router caches schemas at parse time so this is unused on the hot path,
     /// but the trait keeps it for parity with the engine API.
     #[allow(dead_code)]
-    async fn describe_statement(
-        &self,
-        handle: &StatementHandle,
-    ) -> Result<StatementSchema>;
+    async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema>;
 
     async fn close_statement(&self, handle: &StatementHandle);
 }
@@ -123,10 +117,7 @@ impl Session for TenantSession {
         TenantSession::execute(self, sql).await
     }
 
-    async fn prepare(
-        &self,
-        sql: &str,
-    ) -> Result<(StatementHandle, StatementSchema)> {
+    async fn prepare(&self, sql: &str) -> Result<(StatementHandle, StatementSchema)> {
         TenantSession::prepare(self, sql).await
     }
 
@@ -142,10 +133,7 @@ impl Session for TenantSession {
         TenantSession::execute_bound(self, bound).await
     }
 
-    async fn describe_statement(
-        &self,
-        handle: &StatementHandle,
-    ) -> Result<StatementSchema> {
+    async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema> {
         TenantSession::describe_statement(self, handle).await
     }
 
@@ -255,10 +243,7 @@ pub(crate) fn split_simple_query(sql: &str) -> Vec<String> {
 /// exchange. On the first failing statement we emit `ErrorResponse` and
 /// stop processing further statements (PG's non-transactional semicolon
 /// batch behaviour).
-pub(crate) async fn simple_query_messages<S>(
-    session: &S,
-    sql: &str,
-) -> Vec<PgWireBackendMessage>
+pub(crate) async fn simple_query_messages<S>(session: &S, sql: &str) -> Vec<PgWireBackendMessage>
 where
     S: Session + ?Sized,
 {
@@ -278,9 +263,9 @@ where
     for stmt_sql in &stmts {
         match session.execute(stmt_sql).await {
             Ok(ExecResult::Empty { tag }) => {
-                out.push(PgWireBackendMessage::CommandComplete(
-                    CommandComplete::new(tag),
-                ));
+                out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                    tag,
+                )));
             }
             Ok(ExecResult::Rows { schema, batches }) => {
                 let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -289,9 +274,9 @@ where
                 for row in encode_batches(&schema, &batches) {
                     out.push(PgWireBackendMessage::DataRow(row));
                 }
-                out.push(PgWireBackendMessage::CommandComplete(
-                    CommandComplete::new(format!("SELECT {row_count}")),
-                ));
+                out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                    format!("SELECT {row_count}"),
+                )));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "query failed");
@@ -461,15 +446,21 @@ fn decode_param_text(
 
     match *declared {
         Type::INT2 | Type::INT4 => {
-            let v: i32 = s.parse().map_err(|e: std::num::ParseIntError| parse_err("int4", &e))?;
+            let v: i32 = s
+                .parse()
+                .map_err(|e: std::num::ParseIntError| parse_err("int4", &e))?;
             Ok(ScalarParam::Int4(v))
         }
         Type::INT8 => {
-            let v: i64 = s.parse().map_err(|e: std::num::ParseIntError| parse_err("int8", &e))?;
+            let v: i64 = s
+                .parse()
+                .map_err(|e: std::num::ParseIntError| parse_err("int8", &e))?;
             Ok(ScalarParam::Int8(v))
         }
         Type::FLOAT4 | Type::FLOAT8 => {
-            let v: f64 = s.parse().map_err(|e: std::num::ParseFloatError| parse_err("float", &e))?;
+            let v: f64 = s
+                .parse()
+                .map_err(|e: std::num::ParseFloatError| parse_err("float", &e))?;
             Ok(ScalarParam::Float8(v))
         }
         Type::BOOL => {
@@ -663,11 +654,7 @@ where
             // ("unexpected message"). Failing at Parse short-circuits before
             // Bind/Execute is ever sent.
             if let Err(emsg) = validate_copy_at_parse(session, &cmd).await {
-                let info = ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "42601".to_owned(),
-                    emsg,
-                );
+                let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), emsg);
                 return vec![PgWireBackendMessage::ErrorResponse(info.into())];
             }
             let mut g = state.lock().await;
@@ -679,11 +666,7 @@ where
         }
         Ok(None) => {}
         Err(msg) => {
-            let info = ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42601".to_owned(),
-                msg,
-            );
+            let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
             return vec![PgWireBackendMessage::ErrorResponse(info.into())];
         }
     }
@@ -742,9 +725,7 @@ where
             .await
             .map_err(|e| format!("COPY: {e}"))?;
         if table_cols.is_empty() {
-            return Err(format!(
-                "COPY: cannot resolve schema of {table:?}"
-            ));
+            return Err(format!("COPY: cannot resolve schema of {table:?}"));
         }
         if is_from {
             crate::copy::select_copy_in_columns(table, &table_cols, columns)?;
@@ -829,12 +810,7 @@ where
         let is_binary = match msg.parameter_format_codes.len() {
             0 => false,
             1 => msg.parameter_format_codes[0] == 1,
-            _ => msg
-                .parameter_format_codes
-                .get(i)
-                .copied()
-                .unwrap_or(0)
-                == 1,
+            _ => msg.parameter_format_codes.get(i).copied().unwrap_or(0) == 1,
         };
         match raw {
             None => params.push(ScalarParam::Null),
@@ -874,10 +850,7 @@ where
     }
 }
 
-async fn handle_describe(
-    state: &Mutex<ExtendedState>,
-    msg: Describe,
-) -> Vec<PgWireBackendMessage> {
+async fn handle_describe(state: &Mutex<ExtendedState>, msg: Describe) -> Vec<PgWireBackendMessage> {
     let name = msg.name.clone().unwrap_or_default();
     let g = state.lock().await;
     match msg.target_type {
@@ -886,9 +859,9 @@ async fn handle_describe(
             // (empty) + NoData keeps strict drivers like JDBC happy.
             if g.copy_statements.contains_key(&name) {
                 return vec![
-                    PgWireBackendMessage::ParameterDescription(
-                        ParameterDescription::new(Vec::new()),
-                    ),
+                    PgWireBackendMessage::ParameterDescription(ParameterDescription::new(
+                        Vec::new(),
+                    )),
                     PgWireBackendMessage::NoData(NoData::new()),
                 ];
             }
@@ -934,7 +907,9 @@ async fn handle_describe(
                 out.push(PgWireBackendMessage::NoData(NoData::new()));
             } else {
                 let schema = arrow_schema::Schema::new(entry.schema.columns.clone());
-                out.push(PgWireBackendMessage::RowDescription(row_description(&schema)));
+                out.push(PgWireBackendMessage::RowDescription(row_description(
+                    &schema,
+                )));
             }
             out
         }
@@ -959,7 +934,9 @@ async fn handle_describe(
                 vec![PgWireBackendMessage::NoData(NoData::new())]
             } else {
                 let schema = arrow_schema::Schema::new(entry.schema.columns.clone());
-                vec![PgWireBackendMessage::RowDescription(row_description(&schema))]
+                vec![PgWireBackendMessage::RowDescription(row_description(
+                    &schema,
+                ))]
             }
         }
         other => {
@@ -1043,9 +1020,9 @@ where
     let mut is_error = false;
     match session.execute_bound(entry.bound).await {
         Ok(ExecResult::Empty { tag }) => {
-            out.push(PgWireBackendMessage::CommandComplete(
-                CommandComplete::new(tag),
-            ));
+            out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                tag,
+            )));
         }
         Ok(ExecResult::Rows { schema, batches }) => {
             let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1083,9 +1060,9 @@ where
                     pgwire::messages::extendedquery::PortalSuspended::new(),
                 ));
             } else {
-                out.push(PgWireBackendMessage::CommandComplete(
-                    CommandComplete::new(format!("SELECT {emitted}")),
-                ));
+                out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                    format!("SELECT {emitted}"),
+                )));
             }
         }
         Err(e) => {
@@ -1129,14 +1106,17 @@ where
                     return ExecuteOutcome::error(error_response(&e));
                 }
             };
-            let cols =
-                match crate::copy::select_copy_in_columns(&table, &table_cols, columns.as_deref()) {
-                    Ok(c) => c,
-                    Err(msg) => {
-                        let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
-                        return ExecuteOutcome::error_info(info);
-                    }
-                };
+            let cols = match crate::copy::select_copy_in_columns(
+                &table,
+                &table_cols,
+                columns.as_deref(),
+            ) {
+                Ok(c) => c,
+                Err(msg) => {
+                    let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
+                    return ExecuteOutcome::error_info(info);
+                }
+            };
             let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header);
             if let Some(list) = columns.clone() {
                 state = state.with_column_list(list);
@@ -1671,10 +1651,7 @@ impl Session for PooledSessionWrapper {
         self.pooled.session().execute(sql).await
     }
 
-    async fn prepare(
-        &self,
-        sql: &str,
-    ) -> Result<(StatementHandle, StatementSchema)> {
+    async fn prepare(&self, sql: &str) -> Result<(StatementHandle, StatementSchema)> {
         self.pooled.session().prepare(sql).await
     }
 
@@ -1690,10 +1667,7 @@ impl Session for PooledSessionWrapper {
         self.pooled.session().execute_bound(bound).await
     }
 
-    async fn describe_statement(
-        &self,
-        handle: &StatementHandle,
-    ) -> Result<StatementSchema> {
+    async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema> {
         self.pooled.session().describe_statement(handle).await
     }
 
@@ -1912,11 +1886,8 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                 columns,
                 path,
             } => {
-                let table_cols = match crate::copy::resolve_table_columns(
-                    session.as_ref(),
-                    &table,
-                )
-                .await
+                let table_cols = match crate::copy::resolve_table_columns(session.as_ref(), &table)
+                    .await
                 {
                     Ok(c) if !c.is_empty() => c,
                     Ok(_) => {
@@ -1946,8 +1917,7 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                         return finish_copy_error(client, info.into()).await;
                     }
                 };
-                let mut state =
-                    crate::copy::CopyInState::new(table.clone(), cols, with_header);
+                let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header);
                 if let Some(list) = columns.clone() {
                     state = state.with_column_list(list);
                 }
@@ -2034,11 +2004,8 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            return finish_copy_error(
-                                client,
-                                crate::error::error_response(&e),
-                            )
-                            .await;
+                            return finish_copy_error(client, crate::error::error_response(&e))
+                                .await;
                         }
                     };
                     client
@@ -2109,9 +2076,7 @@ impl<S: Session + 'static> CopyHandler for BasinSimpleQueryHandlerSlot<S> {
         let session = {
             let g = self.slot.lock().await;
             g.clone().ok_or_else(|| {
-                PgWireError::ApiError(
-                    "session not bound to connection at CopyData time".into(),
-                )
+                PgWireError::ApiError("session not bound to connection at CopyData time".into())
             })?
         };
         let mut g = self.copy_state.lock().await;
@@ -2143,17 +2108,12 @@ impl<S: Session + 'static> CopyHandler for BasinSimpleQueryHandlerSlot<S> {
         // works if WE move out of CopyInProgress here, otherwise the
         // following `Sync` falls into the catch-all `_ => {}` branch and
         // is silently dropped, deadlocking the client.
-        let is_extended = matches!(
-            client.state(),
-            PgWireConnectionState::CopyInProgress(true)
-        );
+        let is_extended = matches!(client.state(), PgWireConnectionState::CopyInProgress(true));
 
         let session = {
             let g = self.slot.lock().await;
             g.clone().ok_or_else(|| {
-                PgWireError::ApiError(
-                    "session not bound to connection at CopyDone time".into(),
-                )
+                PgWireError::ApiError("session not bound to connection at CopyDone time".into())
             })?
         };
         let state = {
@@ -2179,20 +2139,12 @@ impl<S: Session + 'static> CopyHandler for BasinSimpleQueryHandlerSlot<S> {
         // to `on_sync`, which sends ReadyForQuery.
         let msg = if let Some(err) = state.error {
             PgWireBackendMessage::ErrorResponse(
-                pgwire::error::ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    err,
-                )
-                .into(),
+                pgwire::error::ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), err).into(),
             )
         } else {
-            PgWireBackendMessage::CommandComplete(
-                pgwire::messages::response::CommandComplete::new(format!(
-                    "COPY {}",
-                    state.row_count
-                )),
-            )
+            PgWireBackendMessage::CommandComplete(pgwire::messages::response::CommandComplete::new(
+                format!("COPY {}", state.row_count),
+            ))
         };
         client.feed(msg).await?;
         client.flush().await?;
@@ -2270,10 +2222,7 @@ mod tests {
             }
         }
 
-        async fn prepare(
-            &self,
-            _sql: &str,
-        ) -> Result<(StatementHandle, StatementSchema)> {
+        async fn prepare(&self, _sql: &str) -> Result<(StatementHandle, StatementSchema)> {
             unimplemented!("simple-query test fake")
         }
 
@@ -2289,10 +2238,7 @@ mod tests {
             unimplemented!("simple-query test fake")
         }
 
-        async fn describe_statement(
-            &self,
-            _handle: &StatementHandle,
-        ) -> Result<StatementSchema> {
+        async fn describe_statement(&self, _handle: &StatementHandle) -> Result<StatementSchema> {
             unimplemented!("simple-query test fake")
         }
 
@@ -2405,7 +2351,8 @@ mod tests {
     #[test]
     fn split_preserves_dollar_quoted_bodies() {
         // `;` inside the dollar-quoted body must NOT split.
-        let sql = "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS $$ SELECT 1; SELECT 2 $$; SELECT 3";
+        let sql =
+            "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS $$ SELECT 1; SELECT 2 $$; SELECT 3";
         let parts = split_simple_query(sql);
         assert_eq!(parts.len(), 2, "got {parts:?}");
         assert!(parts[0].contains("$$ SELECT 1; SELECT 2 $$"));
@@ -2428,7 +2375,8 @@ mod tests {
 
     #[test]
     fn split_handles_newline_separated_statements() {
-        let parts = split_simple_query("CREATE TABLE a (id BIGINT);\nCREATE TABLE b (id BIGINT);\n");
+        let parts =
+            split_simple_query("CREATE TABLE a (id BIGINT);\nCREATE TABLE b (id BIGINT);\n");
         assert_eq!(parts.len(), 2, "got {parts:?}");
         assert_eq!(parts[0], "CREATE TABLE a (id BIGINT)");
         assert_eq!(parts[1], "CREATE TABLE b (id BIGINT)");
@@ -2474,11 +2422,7 @@ mod tests {
         async fn prepare(&self, _sql: &str) -> Result<(StatementHandle, StatementSchema)> {
             unimplemented!()
         }
-        async fn bind(
-            &self,
-            _h: &StatementHandle,
-            _p: Vec<ScalarParam>,
-        ) -> Result<BoundStatement> {
+        async fn bind(&self, _h: &StatementHandle, _p: Vec<ScalarParam>) -> Result<BoundStatement> {
             unimplemented!()
         }
         async fn execute_bound(&self, _b: BoundStatement) -> Result<ExecResult> {
@@ -2496,11 +2440,9 @@ mod tests {
             FakeOutcome::Empty("CREATE TABLE".into()),
             FakeOutcome::Empty("CREATE TABLE".into()),
         ]);
-        let msgs = simple_query_messages(
-            &s,
-            "CREATE TABLE t (id BIGINT); CREATE TABLE s (val TEXT)",
-        )
-        .await;
+        let msgs =
+            simple_query_messages(&s, "CREATE TABLE t (id BIGINT); CREATE TABLE s (val TEXT)")
+                .await;
         // Expect: CommandComplete, CommandComplete, ReadyForQuery.
         assert_eq!(msgs.len(), 3, "got {msgs:?}");
         assert_command_complete(&msgs[0], "CREATE TABLE");
@@ -2542,7 +2484,11 @@ mod tests {
         assert_ready_for_query(&msgs[2]);
 
         let executed = s.executed.lock().await.clone();
-        assert_eq!(executed.len(), 2, "third statement must not be dispatched: {executed:?}");
+        assert_eq!(
+            executed.len(),
+            2,
+            "third statement must not be dispatched: {executed:?}"
+        );
     }
 
     #[tokio::test]
@@ -2589,22 +2535,14 @@ mod tests {
         }
 
         async fn execute(&self, _sql: &str) -> Result<ExecResult> {
-            Ok(ExecResult::Empty {
-                tag: "OK".into(),
-            })
+            Ok(ExecResult::Empty { tag: "OK".into() })
         }
 
-        async fn prepare(
-            &self,
-            sql: &str,
-        ) -> Result<(StatementHandle, StatementSchema)> {
+        async fn prepare(&self, sql: &str) -> Result<(StatementHandle, StatementSchema)> {
             let h = StatementHandle::new();
             // Crude placeholder count for the test: scan once for `$N`s.
             let n = self.param_types.len();
-            self.prepared
-                .lock()
-                .await
-                .insert(h, (sql.to_owned(), n));
+            self.prepared.lock().await.insert(h, (sql.to_owned(), n));
             Ok((
                 h,
                 StatementSchema {
@@ -2636,7 +2574,13 @@ mod tests {
                     ScalarParam::Null => "NULL".to_string(),
                     ScalarParam::Int4(v) => v.to_string(),
                     ScalarParam::Int8(v) => v.to_string(),
-                    ScalarParam::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
+                    ScalarParam::Bool(b) => {
+                        if *b {
+                            "TRUE".into()
+                        } else {
+                            "FALSE".into()
+                        }
+                    }
                     ScalarParam::Float8(f) => format!("{f}"),
                     ScalarParam::Text(s) => format!("'{}'", s.replace('\'', "''")),
                     ScalarParam::Bytea(b) => format!("'{:?}'", b),
@@ -2654,10 +2598,7 @@ mod tests {
             Ok(ExecResult::Empty { tag: "OK".into() })
         }
 
-        async fn describe_statement(
-            &self,
-            _handle: &StatementHandle,
-        ) -> Result<StatementSchema> {
+        async fn describe_statement(&self, _handle: &StatementHandle) -> Result<StatementSchema> {
             let n = self.param_types.len();
             Ok(StatementSchema {
                 param_types: self.param_types.clone(),
@@ -2703,12 +2644,7 @@ mod tests {
             Some(PgWireBackendMessage::BindComplete(_))
         ));
 
-        let exec_msgs = handle_execute(
-            &state,
-            &sess,
-            Execute::new(Some("p1".into()), 0),
-        )
-        .await;
+        let exec_msgs = handle_execute(&state, &sess, Execute::new(Some("p1".into()), 0)).await;
         assert!(matches!(
             exec_msgs.messages.first(),
             Some(PgWireBackendMessage::CommandComplete(_))
@@ -2829,7 +2765,7 @@ mod tests {
             object_store: StdArc::new(fs),
             root_prefix: None,
             disk_cache: None,
-        page_cache: None,
+            page_cache: None,
         });
         let catalog: StdArc<dyn basin_catalog::Catalog> =
             StdArc::new(basin_catalog::InMemoryCatalog::new());
@@ -2853,7 +2789,10 @@ mod tests {
         drop(s2);
 
         let stats = pool.stats();
-        assert_eq!(stats.misses, 1, "first open is the only miss, got {stats:?}");
+        assert_eq!(
+            stats.misses, 1,
+            "first open is the only miss, got {stats:?}"
+        );
         assert!(stats.hits >= 1, "second open should hit, got {stats:?}");
     }
 
@@ -2888,8 +2827,8 @@ mod tests {
 
     #[test]
     fn decode_param_binary_jsonb_empty_is_invalid() {
-        let err = super::decode_param_binary(&[], &Type::JSONB)
-            .expect_err("empty JSONB must error");
+        let err =
+            super::decode_param_binary(&[], &Type::JSONB).expect_err("empty JSONB must error");
         match err {
             PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
             other => panic!("expected UserError, got {other:?}"),
@@ -2902,8 +2841,8 @@ mod tests {
     fn decode_param_binary_uuid_renders_hyphenated() {
         // Test vector: 8400e29b-41d4-4716-a716-446655440000.
         let wire: [u8; 16] = [
-            0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0x47, 0x16,
-            0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+            0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0x47, 0x16, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
         ];
         let p = super::decode_param_binary(&wire, &Type::UUID).expect("decode");
         match p {
@@ -2916,8 +2855,8 @@ mod tests {
 
     #[test]
     fn decode_param_binary_uuid_wrong_length_is_22p03() {
-        let err = super::decode_param_binary(&[0u8; 15], &Type::UUID)
-            .expect_err("short UUID must error");
+        let err =
+            super::decode_param_binary(&[0u8; 15], &Type::UUID).expect_err("short UUID must error");
         match err {
             PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
             other => panic!("expected UserError, got {other:?}"),
@@ -2935,11 +2874,8 @@ mod tests {
 
     #[test]
     fn decode_param_text_uuid_passes_through() {
-        let p = super::decode_param_text(
-            b"8400e29b-41d4-4716-a716-446655440000",
-            &Type::UUID,
-        )
-        .expect("decode");
+        let p = super::decode_param_text(b"8400e29b-41d4-4716-a716-446655440000", &Type::UUID)
+            .expect("decode");
         match p {
             ScalarParam::Text(s) => {
                 assert_eq!(s, "8400e29b-41d4-4716-a716-446655440000");

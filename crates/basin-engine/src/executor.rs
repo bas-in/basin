@@ -15,13 +15,13 @@ use crate::analytical_route::is_analytical;
 use crate::convert::{batch_df_to_ws, schema_df_to_ws};
 use crate::ddl::{extract_create_table_cluster_by, partition_spec_from_ast};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
-use crate::lifecycle::{
-    extract_create_table_lifecycle, extract_select_include_deleted, CreateTableLifecycle,
-};
 use crate::events::{
     build_row_json, dispatch_post_commit, dispatch_pre_commit, make_event, registry_has_any,
 };
 use crate::fast_select::{execute_simple_select, match_simple_select};
+use crate::lifecycle::{
+    extract_create_table_lifecycle, extract_select_include_deleted, CreateTableLifecycle,
+};
 use crate::session::refresh_table;
 use crate::{ExecResult, TenantSession};
 use basin_catalog::PartitionSpec;
@@ -41,15 +41,11 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // falls through.
     if let Some(ext) = crate::alter::match_basin_alter_extension(sql)? {
         let table = ext.table().clone();
-        let tag = ext.apply(&sess.engine.config().catalog, &sess.tenant).await?;
-        crate::session::refresh_table(
-            &sess.engine,
-            &sess.tenant,
-            &sess.ctx,
-            &sess.state,
-            &table,
-        )
-        .await?;
+        let tag = ext
+            .apply(&sess.engine.config().catalog, &sess.tenant)
+            .await?;
+        crate::session::refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table)
+            .await?;
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
 
@@ -262,8 +258,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         tenant: sess.tenant,
         session_cache: &sess.state.sequence_cache,
     };
-    let seq_rewritten =
-        crate::seq_udf::rewrite_sequence_calls(&inlined, &seq_ctx).await?;
+    let seq_rewritten = crate::seq_udf::rewrite_sequence_calls(&inlined, &seq_ctx).await?;
     // Phase 5.11.K2 follow-up: enum columns referenced in ORDER BY or
     // ordering comparisons (`<`, `>`, `<=`, `>=`, BETWEEN) need to be
     // sorted/compared by declaration-order ordinal, not by Arrow's
@@ -416,18 +411,22 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             option: _,
         } => crate::procedure_ddl::exec_drop_procedure(sess, if_exists, proc_desc).await,
         Statement::Call(call) => crate::procedure_ddl::exec_call(sess, call).await,
-        Statement::CreateType { name, representation } => {
+        Statement::CreateType {
+            name,
+            representation,
+        } => {
             use sqlparser::ast::UserDefinedTypeRepresentation;
             match representation {
                 UserDefinedTypeRepresentation::Enum { labels } => {
                     crate::type_ddl::exec_create_type_enum(sess, name, labels).await
                 }
-                UserDefinedTypeRepresentation::Composite { .. } => Err(
-                    BasinError::FeatureNotSupported(
+                UserDefinedTypeRepresentation::Composite { .. } => {
+                    Err(BasinError::FeatureNotSupported(
                         "CREATE TYPE … AS (composite) is out of scope for v0.1; \
-                         only AS ENUM is supported".into(),
-                    ),
-                ),
+                         only AS ENUM is supported"
+                            .into(),
+                    ))
+                }
             }
         }
         Statement::Drop {
@@ -528,19 +527,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             selection,
             returning,
         } => {
-            crate::dml_mutate::exec_update(
-                sess,
-                table,
-                assignments,
-                from,
-                selection,
-                returning,
-            )
-            .await
+            crate::dml_mutate::exec_update(sess, table, assignments, from, selection, returning)
+                .await
         }
-        other => Err(BasinError::internal(format!(
-            "unsupported in PoC: {other}"
-        ))),
+        other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     }
 }
 
@@ -623,18 +613,16 @@ async fn execute_vector_search_plan(
             continue;
         }
         // Use arrow-select::take to preserve column order + types.
-        let indices = arrow_array::UInt32Array::from(
-            keep.iter().map(|i| *i as u32).collect::<Vec<_>>(),
-        );
+        let indices =
+            arrow_array::UInt32Array::from(keep.iter().map(|i| *i as u32).collect::<Vec<_>>());
         let mut taken_cols = Vec::with_capacity(batch.num_columns());
         for c in batch.columns() {
             let t = arrow_select::take::take(c.as_ref(), &indices, None)
                 .map_err(|e| BasinError::internal(format!("take rows: {e}")))?;
             taken_cols.push(t);
         }
-        let taken =
-            RecordBatch::try_new(batch.schema(), taken_cols)
-                .map_err(|e| BasinError::internal(format!("rebuild taken batch: {e}")))?;
+        let taken = RecordBatch::try_new(batch.schema(), taken_cols)
+            .map_err(|e| BasinError::internal(format!("rebuild taken batch: {e}")))?;
         total_kept += taken.num_rows();
         filtered_batches.push(taken);
     }
@@ -654,7 +642,10 @@ async fn execute_vector_search_plan(
 
     let mut projected: Vec<RecordBatch> = Vec::with_capacity(filtered_batches.len());
     for b in &filtered_batches {
-        projected.push(crate::vector_planner::project_for_user(b, &plan.projection)?);
+        projected.push(crate::vector_planner::project_for_user(
+            b,
+            &plan.projection,
+        )?);
     }
     let schema = projected[0].schema();
     sess.engine.note_vector_routed();
@@ -740,10 +731,8 @@ async fn exec_create_table(
                 fk.name, fk.ref_table
             )));
         }
-        let mut pk_set: std::collections::HashSet<String> = pk_of_ref
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
+        let mut pk_set: std::collections::HashSet<String> =
+            pk_of_ref.iter().map(|s| s.to_ascii_lowercase()).collect();
         for c in &fk.ref_columns {
             if !pk_set.remove(&c.to_ascii_lowercase()) {
                 return Err(BasinError::InvalidSchema(format!(
@@ -798,6 +787,26 @@ async fn exec_create_table(
         .create_table(&sess.tenant, &table, &schema)
         .await?;
 
+    // Register implicit sequences promised by `SERIAL` / `BIGSERIAL` /
+    // `SMALLSERIAL` columns. PG would auto-create these inline with the
+    // table; we do it as a follow-on catalog call so the table-create
+    // path stays one focused step. `IF NOT EXISTS`-shaped: if the
+    // sequence already exists (re-run after a partial failure) we
+    // swallow the duplicate-name error so the table can keep going.
+    for seq in &constraints.implicit_sequences {
+        let def = basin_catalog::SequenceDef::with_defaults(sess.tenant, seq.name.clone());
+        match sess.engine.config().catalog.create_sequence(def).await {
+            Ok(()) => {}
+            Err(BasinError::Catalog(_)) => {
+                // Pre-existing; SERIAL on a column whose sequence is
+                // already there (e.g. from a prior partial create or
+                // a hand-rolled `CREATE SEQUENCE`) — same shape PG
+                // tolerates with `IF NOT EXISTS`.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     if spec.is_partitioned() {
         sess.engine
             .config()
@@ -845,9 +854,10 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     // Pull literal rows out of `INSERT ... VALUES (...)`. Subquery inserts
     // (`INSERT ... SELECT ...`) are routed through `exec_insert_select`
     // below; the body is materialised into VALUES-shaped rows.
-    let source = ins.source.as_ref().ok_or_else(|| {
-        BasinError::internal("INSERT without VALUES is not supported in PoC")
-    })?;
+    let source = ins
+        .source
+        .as_ref()
+        .ok_or_else(|| BasinError::internal("INSERT without VALUES is not supported in PoC"))?;
     if !matches!(source.body.as_ref(), SetExpr::Values(_)) {
         // INSERT INTO <t> SELECT ... — materialise the SELECT into a
         // RecordBatch via the session's DataFusion context (which already
@@ -875,8 +885,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     // unmentioned columns. Generated columns are NULL'd here too;
     // `materialise_generated_columns` overwrites them once the per-row
     // batch is built.
-    let mut rows_expanded =
-        expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
+    let mut rows_expanded = expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
     // Substitute column-level DEFAULT expressions for omitted columns.
     // For columns with `BASIN_COLUMN_DEFAULT` metadata that the user did
     // not explicitly write, evaluate the default text (which routes any
@@ -989,18 +998,10 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         batch,
     )
     .await?;
-    crate::type_ddl::enforce_enum_labels(
-        &sess.engine.config().catalog,
-        &sess.tenant,
-        &batch,
-    )
-    .await?;
-    crate::type_ddl::enforce_domain_checks(
-        &sess.engine.config().catalog,
-        &sess.tenant,
-        &batch,
-    )
-    .await?;
+    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.tenant, &batch)
+        .await?;
+    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.tenant, &batch)
+        .await?;
     // PK / CHECK / FK enforcement. Order: CHECK (no I/O), then FK
     // (one referenced-table scan), then PK (one full-table scan).
     // v0.2 secondary indexes (Phase 5.7 B1) will collapse PK / FK
@@ -1084,8 +1085,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
             .storage
             .delete_file(&sess.tenant, &df.path)
             .await;
-        let _ =
-            refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await;
+        let _ = refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await;
         return Err(e);
     }
 
@@ -1211,10 +1211,7 @@ async fn exec_insert_select(
         for c in &ins.columns {
             let key = c.value.to_ascii_lowercase();
             let idx = *by_name.get(&key).ok_or_else(|| {
-                BasinError::InvalidSchema(format!(
-                    "INSERT references unknown column {:?}",
-                    c.value
-                ))
+                BasinError::InvalidSchema(format!("INSERT references unknown column {:?}", c.value))
             })?;
             out.push(idx);
         }
@@ -1252,18 +1249,10 @@ async fn exec_insert_select(
 
     // Enum / domain check enforcement matches the VALUES path so
     // constraint violations surface identically regardless of source.
-    crate::type_ddl::enforce_enum_labels(
-        &sess.engine.config().catalog,
-        &sess.tenant,
-        &batch,
-    )
-    .await?;
-    crate::type_ddl::enforce_domain_checks(
-        &sess.engine.config().catalog,
-        &sess.tenant,
-        &batch,
-    )
-    .await?;
+    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.tenant, &batch)
+        .await?;
+    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.tenant, &batch)
+        .await?;
     crate::constraints::enforce_check_constraints(
         table.as_str(),
         meta.schema.as_ref(),
@@ -1362,10 +1351,7 @@ fn expand_insert_rows(
     for c in insert_columns {
         let key = c.value.to_ascii_lowercase();
         let idx = *by_name.get(&key).ok_or_else(|| {
-            BasinError::InvalidSchema(format!(
-                "INSERT references unknown column {:?}",
-                c.value
-            ))
+            BasinError::InvalidSchema(format!("INSERT references unknown column {:?}", c.value))
         })?;
         if crate::types::field_is_generated(schema.field(idx)).is_some() {
             return Err(BasinError::InvalidSchema(format!(
@@ -1633,11 +1619,7 @@ async fn commit_with_retry(
     }
 }
 
-async fn exec_select(
-    sess: &TenantSession,
-    sql: &str,
-    include_deleted: bool,
-) -> Result<ExecResult> {
+async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> Result<ExecResult> {
     // Option A for tail-visibility: when the shard is wired in, the in-RAM
     // tail produced by INSERTs hasn't yet landed in Parquet. Force a synchronous
     // flush + catalog commit before planning so DataFusion's ListingTable scan
@@ -1839,8 +1821,7 @@ async fn apply_soft_delete_to_select(
     if referenced.is_empty() {
         return Ok(df);
     }
-    let mut soft_cols: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut soft_cols: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for table in &referenced {
         let meta = match sess
             .engine
@@ -1944,7 +1925,9 @@ fn collect_from_table_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<Tab
             }
         }
         TableFactor::Derived { subquery, .. } => collect_from_query(subquery, out),
-        TableFactor::NestedJoin { table_with_joins, .. } => {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
             collect_from_table_factor(&table_with_joins.relation, out);
             for join in &table_with_joins.joins {
                 collect_from_table_factor(&join.relation, out);
@@ -1972,7 +1955,11 @@ fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
     use sqlparser::ast::Expr;
     match expr {
         Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => collect_from_query(q, out),
-        Expr::InSubquery { subquery: q, expr: e, .. } => {
+        Expr::InSubquery {
+            subquery: q,
+            expr: e,
+            ..
+        } => {
             collect_from_query(q, out);
             collect_from_expr(e, out);
         }
@@ -1991,14 +1978,22 @@ fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
         | Expr::IsNotFalse(e)
         | Expr::IsUnknown(e)
         | Expr::IsNotUnknown(e) => collect_from_expr(e, out),
-        Expr::Between { expr: e, low, high, .. } => {
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
             collect_from_expr(e, out);
             collect_from_expr(low, out);
             collect_from_expr(high, out);
         }
-        Expr::Like { expr: e, pattern, .. }
-        | Expr::ILike { expr: e, pattern, .. }
-        | Expr::SimilarTo { expr: e, pattern, .. } => {
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        }
+        | Expr::SimilarTo {
+            expr: e, pattern, ..
+        } => {
             collect_from_expr(e, out);
             collect_from_expr(pattern, out);
         }
@@ -2008,7 +2003,12 @@ fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
                 collect_from_expr(x, out);
             }
         }
-        Expr::Case { operand, conditions, results, else_result } => {
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
             if let Some(o) = operand {
                 collect_from_expr(o, out);
             }
@@ -2043,10 +2043,7 @@ fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
 /// here — RLS state is consulted at SELECT time by re-reading the catalog
 /// (per-query) so a freshly created policy takes effect on the very next
 /// query without per-session bookkeeping.
-async fn exec_rls_ddl(
-    sess: &TenantSession,
-    ddl: crate::rls::RlsDdl,
-) -> Result<ExecResult> {
+async fn exec_rls_ddl(sess: &TenantSession, ddl: crate::rls::RlsDdl) -> Result<ExecResult> {
     let table = ddl.table().clone();
     let meta = sess
         .engine

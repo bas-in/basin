@@ -29,11 +29,7 @@ pub trait TenantResolver: Send + Sync {
     /// [`TenantCredentialsResolver`] overrides this to bcrypt-validate
     /// the `(user, password)` pair against the per-tenant credential row
     /// and resolve the tenant from there.
-    async fn resolve_credentials(
-        &self,
-        username: &str,
-        _password: &str,
-    ) -> Result<TenantId> {
+    async fn resolve_credentials(&self, username: &str, _password: &str) -> Result<TenantId> {
         self.resolve(username).await
     }
 }
@@ -59,9 +55,10 @@ impl StaticTenantResolver {
 #[async_trait]
 impl TenantResolver for StaticTenantResolver {
     async fn resolve(&self, username: &str) -> Result<TenantId> {
-        self.map.get(username).copied().ok_or_else(|| {
-            BasinError::not_found(format!("no tenant mapped for user {username:?}"))
-        })
+        self.map
+            .get(username)
+            .copied()
+            .ok_or_else(|| BasinError::not_found(format!("no tenant mapped for user {username:?}")))
     }
 }
 
@@ -160,12 +157,10 @@ impl TenantResolver for TenantCredentialsResolver {
         ))
     }
 
-    async fn resolve_credentials(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<TenantId> {
-        self.auth.validate_pgwire_credentials(username, password).await
+    async fn resolve_credentials(&self, username: &str, password: &str) -> Result<TenantId> {
+        self.auth
+            .validate_pgwire_credentials(username, password)
+            .await
     }
 }
 
@@ -193,16 +188,11 @@ impl TenantResolver for StackedTenantResolver {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            BasinError::not_found(format!("no resolver matched {username:?}"))
-        }))
+        Err(last_err
+            .unwrap_or_else(|| BasinError::not_found(format!("no resolver matched {username:?}"))))
     }
 
-    async fn resolve_credentials(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<TenantId> {
+    async fn resolve_credentials(&self, username: &str, password: &str) -> Result<TenantId> {
         let mut last_err = None;
         for r in &self.resolvers {
             match r.resolve_credentials(username, password).await {
@@ -210,9 +200,8 @@ impl TenantResolver for StackedTenantResolver {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            BasinError::not_found(format!("no resolver matched {username:?}"))
-        }))
+        Err(last_err
+            .unwrap_or_else(|| BasinError::not_found(format!("no resolver matched {username:?}"))))
     }
 }
 
@@ -267,8 +256,7 @@ mod tests {
             inner: static_with("alice", t2),
             calls: second_calls.clone(),
         });
-        let stacked =
-            StackedTenantResolver::new(vec![static_with("alice", t1), second]);
+        let stacked = StackedTenantResolver::new(vec![static_with("alice", t1), second]);
 
         assert_eq!(stacked.resolve("alice").await.unwrap(), t1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 0);
@@ -295,7 +283,10 @@ mod tests {
         // Last resolver is the carol-only map; its NotFound message mentions
         // alice (the username it was queried with), confirming the error came
         // from the *last* poll, not the first.
-        assert!(matches!(err, BasinError::NotFound(ref m) if m.contains("alice")), "got {err:?}");
+        assert!(
+            matches!(err, BasinError::NotFound(ref m) if m.contains("alice")),
+            "got {err:?}"
+        );
     }
 
     // --- JwtTenantResolver tests --------------------------------------------
@@ -312,7 +303,10 @@ mod tests {
     const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 
     fn unique_schema() -> String {
-        format!("basin_router_jwt_{}", Ulid::new().to_string().to_lowercase())
+        format!(
+            "basin_router_jwt_{}",
+            Ulid::new().to_string().to_lowercase()
+        )
     }
 
     fn base_cfg(schema: &str) -> AuthConfig {

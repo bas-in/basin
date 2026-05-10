@@ -50,10 +50,7 @@ impl SmtpMailer {
                 .map_err(|e| BasinError::internal(format!("smtp relay: {e}")))?,
             SmtpTls::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host),
         };
-        let transport = builder
-            .credentials(credentials)
-            .port(cfg.port)
-            .build();
+        let transport = builder.credentials(credentials).port(cfg.port).build();
         let from = match cfg.from_name.as_deref() {
             Some(name) => format!("{name} <{addr}>", addr = cfg.from_email),
             None => cfg.from_email.clone(),

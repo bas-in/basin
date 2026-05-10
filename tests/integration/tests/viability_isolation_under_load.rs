@@ -132,11 +132,8 @@ async fn viability_5_isolation_under_load() {
                     // 30% writes: insert a row stamped with this tenant's
                     // marker. id derived from task+op so collisions don't
                     // matter (no PK enforcement in PoC).
-                    let id_val =
-                        1 + (task_id as i64) * 1_000_000 + op_idx as i64;
-                    let sql = format!(
-                        "INSERT INTO events VALUES ({id_val}, '{expected_marker}')"
-                    );
+                    let id_val = 1 + (task_id as i64) * 1_000_000 + op_idx as i64;
+                    let sql = format!("INSERT INTO events VALUES ({id_val}, '{expected_marker}')");
                     let s = sess.lock().await;
                     let _ = s.execute(&sql).await.expect("write failed");
                 }

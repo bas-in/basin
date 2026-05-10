@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use arrow_schema::{DataType, Field};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
-use arrow_schema::{DataType, Field};
 use basin_common::TableName;
 use serde_json::{json, Map, Value};
 
@@ -43,8 +43,14 @@ pub(crate) async fn openapi(
         };
         let name = tn.as_str();
         let component_ref = format!("#/components/schemas/{name}");
-        paths.insert(format!("/rest/v1/{name}"), table_path_item(name, &component_ref));
-        schemas.insert(name.to_string(), table_component_schema(meta.schema.fields()));
+        paths.insert(
+            format!("/rest/v1/{name}"),
+            table_path_item(name, &component_ref),
+        );
+        schemas.insert(
+            name.to_string(),
+            table_component_schema(meta.schema.fields()),
+        );
     }
 
     let spec = json!({
@@ -127,8 +133,12 @@ fn arrow_field_to_openapi(field: &Field) -> Value {
     let basin_type = field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str());
     match field.data_type() {
         DataType::Boolean => json!({ "type": "boolean" }),
-        DataType::Int8 | DataType::Int16 | DataType::Int32
-        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => {
             json!({ "type": "integer", "format": "int32" })
         }
         DataType::Int64 | DataType::UInt64 => {

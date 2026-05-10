@@ -172,7 +172,10 @@ mod tests {
         }
         // The first inserted key should have been evicted by the (cap+1)-th
         // insert; all others must still be present.
-        assert!(cache.get(&keys[0]).is_none(), "oldest entry must be evicted");
+        assert!(
+            cache.get(&keys[0]).is_none(),
+            "oldest entry must be evicted"
+        );
         for k in &keys[1..] {
             assert!(cache.get(k).is_some(), "newer entry {k} should still hit");
         }

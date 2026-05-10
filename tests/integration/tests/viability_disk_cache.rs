@@ -48,9 +48,7 @@ use async_trait::async_trait;
 use basin_common::{PartitionKey, TableName, TenantId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
-use basin_storage::{
-    DiskCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig,
-};
+use basin_storage::{DiskCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use object_store::local::LocalFileSystem;
@@ -149,10 +147,7 @@ impl ObjectStore for LatencyStore {
     async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
         self.inner.delete(location).await
     }
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(
@@ -262,8 +257,7 @@ async fn viability_disk_cache() {
         async move { point_query(storage, tenant, table, id as i64).await }
     })
     .await;
-    let cold_inner_gets =
-        latency.inner_gets.load(Ordering::Relaxed) - inner_gets_at_cold_start;
+    let cold_inner_gets = latency.inner_gets.load(Ordering::Relaxed) - inner_gets_at_cold_start;
 
     // ---- warm pass: caches populated --------------------------------------
     //
@@ -278,8 +272,7 @@ async fn viability_disk_cache() {
         async move { point_query(storage, tenant, table, id as i64).await }
     })
     .await;
-    let warm_inner_gets =
-        latency.inner_gets.load(Ordering::Relaxed) - inner_gets_at_warm_start;
+    let warm_inner_gets = latency.inner_gets.load(Ordering::Relaxed) - inner_gets_at_warm_start;
 
     let pass = cold_dist.p99_ms < BAR_COLD_P99_MS;
 

@@ -24,11 +24,7 @@ use serde_json::json;
 
 const TEST_NAME: &str = "s3_viability_rls_isolation";
 
-async fn count_forbidden_marker(
-    sess: &TenantSession,
-    sql: &str,
-    forbidden_marker: &str,
-) -> usize {
+async fn count_forbidden_marker(sess: &TenantSession, sql: &str, forbidden_marker: &str) -> usize {
     let res = sess.execute(sql).await.expect("query failed");
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
@@ -94,9 +90,11 @@ async fn s3_viability_rls_isolation() {
     let admin_b = engine.open_session(tenant_b).await.unwrap();
 
     for s in [&admin_a, &admin_b] {
-        s.execute("CREATE TABLE events (id BIGINT NOT NULL, marker TEXT NOT NULL, owner TEXT NOT NULL)")
-            .await
-            .unwrap();
+        s.execute(
+            "CREATE TABLE events (id BIGINT NOT NULL, marker TEXT NOT NULL, owner TEXT NOT NULL)",
+        )
+        .await
+        .unwrap();
     }
 
     let shared_a = engine.open_session_as(tenant_a, "shared").await.unwrap();
@@ -139,7 +137,9 @@ async fn s3_viability_rls_isolation() {
         .await
         .unwrap();
     admin_b
-        .execute("CREATE POLICY b_shared ON events FOR SELECT TO PUBLIC USING (owner = current_user)")
+        .execute(
+            "CREATE POLICY b_shared ON events FOR SELECT TO PUBLIC USING (owner = current_user)",
+        )
         .await
         .unwrap();
 
@@ -194,5 +194,8 @@ async fn s3_viability_rls_isolation() {
         }),
     );
 
-    assert_eq!(leak_count, 0, "{leak_count} cross-tenant rows leaked under RLS");
+    assert_eq!(
+        leak_count, 0,
+        "{leak_count} cross-tenant rows leaked under RLS"
+    );
 }

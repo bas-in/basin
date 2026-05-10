@@ -52,16 +52,16 @@ impl WebhookConfig {
     /// Filesystem path of the (single, shared) retry queue file. Per-
     /// tenant cost rule: this is one file process-wide, not per-tenant.
     pub fn queue_path(&self) -> PathBuf {
-        self.data_dir.join("webhooks").join("queue").join("queue.jsonl")
+        self.data_dir
+            .join("webhooks")
+            .join("queue")
+            .join("queue.jsonl")
     }
 
     /// Filesystem path of the dead-letter file for `subscription_id`.
     /// Dead-letter storage is per-subscription (a customer-facing entity)
     /// not per-tenant.
-    pub fn dead_letter_path(
-        &self,
-        subscription_id: &crate::WebhookSubscriptionId,
-    ) -> PathBuf {
+    pub fn dead_letter_path(&self, subscription_id: &crate::WebhookSubscriptionId) -> PathBuf {
         self.data_dir
             .join("webhooks")
             .join("dead_letter")

@@ -73,7 +73,10 @@ fn typo_pair_scores_above_threshold() {
     // default PG threshold, so we assert > 0.3 (the same threshold real PG
     // users tune their queries against).
     let s = similarity("alice smith", "alyce smyth");
-    assert!(s > 0.3, "typo pair scored only {s} (must clear PG default 0.3 threshold)");
+    assert!(
+        s > 0.3,
+        "typo pair scored only {s} (must clear PG default 0.3 threshold)"
+    );
     assert!(s < 1.0, "typo pair must be < 1.0");
 }
 

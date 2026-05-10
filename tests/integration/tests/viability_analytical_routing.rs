@@ -177,7 +177,11 @@ async fn viability_analytical_routing() {
             .unwrap();
     }
     let files = storage.list_data_files(&tenant, &table).await.unwrap();
-    assert_eq!(files.len(), FILES as usize, "expected {FILES} parquet files");
+    assert_eq!(
+        files.len(),
+        FILES as usize,
+        "expected {FILES} parquet files"
+    );
 
     // GROUP BY guarantees `is_analytical()` returns true. The CAST on the
     // sum() keeps the Arrow output type in BIGINT regardless of DuckDB's
@@ -273,7 +277,10 @@ async fn viability_analytical_routing() {
         );
     }
     let total_count: i64 = routed_agg.iter().map(|a| a.count).sum();
-    assert_eq!(total_count, ROWS, "row count drift: {total_count} != {ROWS}");
+    assert_eq!(
+        total_count, ROWS,
+        "row count drift: {total_count} != {ROWS}"
+    );
 
     // ---- Speedup ------------------------------------------------------
     // Floor the divisor to dodge a divide-by-near-zero when DuckDB returns

@@ -83,7 +83,10 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Tables => {
             let client = connect(&resolve_url(cli.url.as_deref(), None)?).await?;
             // SHOW TABLES is Basin's per-tenant table listing; see CAPABILITIES.md.
-            let rows = client.simple_query("SHOW TABLES").await.context("SHOW TABLES")?;
+            let rows = client
+                .simple_query("SHOW TABLES")
+                .await
+                .context("SHOW TABLES")?;
             for msg in rows {
                 if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
                     if let Some(v) = r.get(0) {
@@ -95,7 +98,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Query { sql } => {
             let client = connect(&resolve_url(cli.url.as_deref(), None)?).await?;
-            let rows = client.simple_query(&sql).await.with_context(|| format!("query: {sql}"))?;
+            let rows = client
+                .simple_query(&sql)
+                .await
+                .with_context(|| format!("query: {sql}"))?;
             print_simple(&rows);
             Ok(())
         }

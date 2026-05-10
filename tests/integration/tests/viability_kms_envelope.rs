@@ -52,11 +52,7 @@ impl EncryptionProvider for MockProvider {
         Ok((plaintext, WrappedKey(sidecar)))
     }
 
-    async fn unwrap_key(
-        &self,
-        _tenant: &TenantId,
-        wrapped: &WrappedKey,
-    ) -> Result<Vec<u8>> {
+    async fn unwrap_key(&self, _tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
         let bytes = &wrapped.0;
         if bytes.first().copied() != Some(0xC0) {
             return Err(BasinError::storage("mock unwrap: bad version byte"));
@@ -145,8 +141,8 @@ async fn viability_kms_envelope() {
         .expect("encrypted write");
 
     // Body file exists and is NOT plaintext bytes.
-    let enc_path = first_file_with_suffix(enc_dir.path(), ".parquet")
-        .expect("encrypted parquet path exists");
+    let enc_path =
+        first_file_with_suffix(enc_dir.path(), ".parquet").expect("encrypted parquet path exists");
     let enc_bytes = std::fs::read(&enc_path).unwrap();
     assert_ne!(
         &enc_bytes[..4.min(enc_bytes.len())],
@@ -175,10 +171,7 @@ async fn viability_kms_envelope() {
         .await
         .expect("read");
     let batches: Vec<_> = stream.collect::<Vec<_>>().await;
-    let total: usize = batches
-        .iter()
-        .map(|b| b.as_ref().unwrap().num_rows())
-        .sum();
+    let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
     assert_eq!(total, batch.num_rows(), "row count round-trip mismatch");
 
     // Confirm the values, not just the row count. Pick the first batch's
@@ -213,12 +206,10 @@ async fn viability_kms_envelope() {
         .await
         .expect("plain read");
     let batches: Vec<_> = stream.collect::<Vec<_>>().await;
-    let plain_total: usize = batches
-        .iter()
-        .map(|b| b.as_ref().unwrap().num_rows())
-        .sum();
+    let plain_total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
     assert_eq!(
-        plain_total, batch.num_rows(),
+        plain_total,
+        batch.num_rows(),
         "plaintext bucket must remain readable without a provider"
     );
 

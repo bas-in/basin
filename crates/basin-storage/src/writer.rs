@@ -36,9 +36,7 @@ pub(crate) const AES_GCM_NONCE_LEN: usize = 12;
 /// Build the sidecar key for an envelope-encrypted data file. The format
 /// is `<data-file-path>.wrapped`; tenant-prefix enforcement is implicit
 /// because the input key already lives under the tenant prefix.
-pub(crate) fn wrapped_sidecar_key(
-    data_key: &object_store::path::Path,
-) -> object_store::path::Path {
+pub(crate) fn wrapped_sidecar_key(data_key: &object_store::path::Path) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}{}", data_key.as_ref(), WRAPPED_SIDECAR_SUFFIX))
 }
 
@@ -121,8 +119,15 @@ pub(crate) async fn write_batch(
     partition: &PartitionKey,
     batch: &RecordBatch,
 ) -> Result<DataFile> {
-    write_batch_with_options(storage, tenant, table, partition, batch, &WriteOptions::default())
-        .await
+    write_batch_with_options(
+        storage,
+        tenant,
+        table,
+        partition,
+        batch,
+        &WriteOptions::default(),
+    )
+    .await
 }
 
 pub(crate) async fn write_batch_with_options(
@@ -200,10 +205,7 @@ pub(crate) async fn write_batch_with_options(
         let sidecar_key = wrapped_sidecar_key(&key);
         storage
             .tenant_store(tenant)
-            .put(
-                &sidecar_key,
-                PutPayload::from_bytes(Bytes::from(wrapped.0)),
-            )
+            .put(&sidecar_key, PutPayload::from_bytes(Bytes::from(wrapped.0)))
             .await
             .map_err(|e| BasinError::storage(format!("put sidecar {sidecar_key}: {e}")))?;
     }
@@ -217,7 +219,8 @@ pub(crate) async fn write_batch_with_options(
     // Build and persist HNSW sidecars for any FixedSizeList<Float32> columns
     // in the batch. One sidecar per Parquet write, mirroring the data-file
     // pattern; merging across writes is deferred to the future compactor.
-    crate::vector_index::build_indexes_for_batch(storage, tenant, table, batch_to_write, data_ulid).await?;
+    crate::vector_index::build_indexes_for_batch(storage, tenant, table, batch_to_write, data_ulid)
+        .await?;
 
     Ok(DataFile {
         path: key,
@@ -244,13 +247,10 @@ fn sort_batch_by_cluster_cols(
     let sort_cols: Vec<SortColumn> = cluster_columns
         .iter()
         .filter_map(|name| {
-            schema
-                .index_of(name.as_str())
-                .ok()
-                .map(|idx| SortColumn {
-                    values: batch.column(idx).clone(),
-                    options: None,
-                })
+            schema.index_of(name.as_str()).ok().map(|idx| SortColumn {
+                values: batch.column(idx).clone(),
+                options: None,
+            })
         })
         .collect();
     if sort_cols.is_empty() {
@@ -259,9 +259,8 @@ fn sort_batch_by_cluster_cols(
         // caller can still treat the result uniformly.
         return Ok(batch.clone());
     }
-    let indices = lexsort_to_indices(&sort_cols, None).map_err(|e| {
-        BasinError::storage(format!("lexsort cluster columns: {e}"))
-    })?;
+    let indices = lexsort_to_indices(&sort_cols, None)
+        .map_err(|e| BasinError::storage(format!("lexsort cluster columns: {e}")))?;
     let columns = batch
         .columns()
         .iter()
@@ -362,10 +361,7 @@ fn extract_column_stats(
 /// value across row groups (same for `max`). The bytes we store are the
 /// raw Parquet PLAIN encoding, which the pruning helper decodes per
 /// `DataType` to recover the typed value.
-fn merge_typed_stats(
-    entry: &mut ColumnStats,
-    stats: &parquet::file::statistics::Statistics,
-) {
+fn merge_typed_stats(entry: &mut ColumnStats, stats: &parquet::file::statistics::Statistics) {
     use parquet::file::statistics::Statistics as ParquetStats;
     match stats {
         ParquetStats::Int64(s) => {
@@ -536,8 +532,7 @@ mod tests {
         // A column name that's not in the schema is silently skipped; if
         // every name is unknown, the batch passes through unchanged.
         let b = batch(&[3, 1, 2], &["c", "a", "b"]);
-        let sorted =
-            sort_batch_by_cluster_cols(&b, &["nonexistent".into()]).unwrap();
+        let sorted = sort_batch_by_cluster_cols(&b, &["nonexistent".into()]).unwrap();
         assert_eq!(ids(&sorted), vec![3, 1, 2]);
     }
 
@@ -548,4 +543,3 @@ mod tests {
         assert_eq!(sorted.num_rows(), 0);
     }
 }
-

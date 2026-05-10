@@ -4,9 +4,7 @@
 //! Engine-side SELECT routing is exercised in
 //! `crates/basin-engine/tests/info_schema_pg_depend_authid_routing.rs`.
 
-use arrow_array::{
-    Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog, SqlArgType, SqlFunctionArg,
@@ -28,9 +26,7 @@ fn cv_schema() -> Schema {
 fn make_cv(source: &str) -> CvDef {
     CvDef {
         source_table: source.to_string(),
-        query_sql: format!(
-            "SELECT bucket, sum(n) AS total FROM {source} GROUP BY bucket"
-        ),
+        query_sql: format!("SELECT bucket, sum(n) AS total FROM {source} GROUP BY bucket"),
         refresh_interval_secs: 60,
         last_refreshed_at_unix_ms: None,
         last_bucket_max_unix_ms: None,
@@ -39,7 +35,10 @@ fn make_cv(source: &str) -> CvDef {
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<StringArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
 }
 
 fn col_i64<'a>(b: &'a RecordBatch, n: &str) -> &'a Int64Array {
@@ -54,7 +53,10 @@ fn col_i32<'a>(b: &'a RecordBatch, n: &str) -> &'a Int32Array {
 
 fn col_bool<'a>(b: &'a RecordBatch, n: &str) -> &'a BooleanArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<BooleanArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
 }
 
 fn make_func(
@@ -114,15 +116,17 @@ async fn pg_depend_includes_function_type_deps() {
     for i in 0..batch.num_rows() {
         seen_type_oids.push(refobjids.value(i));
         seen_refclassids.insert(refclassids.value(i));
-        assert_eq!(
-            deptypes.value(i),
-            "n",
-            "v0.1 only emits 'n' (normal) deps"
-        );
+        assert_eq!(deptypes.value(i), "n", "v0.1 only emits 'n' (normal) deps");
     }
     // BIGINT (return + arg) → OID 20; TEXT → OID 25.
-    assert!(seen_type_oids.contains(&20), "missing BIGINT (20): {seen_type_oids:?}");
-    assert!(seen_type_oids.contains(&25), "missing TEXT (25): {seen_type_oids:?}");
+    assert!(
+        seen_type_oids.contains(&20),
+        "missing BIGINT (20): {seen_type_oids:?}"
+    );
+    assert!(
+        seen_type_oids.contains(&25),
+        "missing TEXT (25): {seen_type_oids:?}"
+    );
     // refclassid is the synthetic pg_type catalog OID — it must be a
     // single stable value within the tenant.
     assert_eq!(
@@ -187,7 +191,10 @@ async fn pg_authid_cross_tenant_isolation() {
     let bb = InfoSchemaQuery::pg_authid(&cat, &b).await.unwrap();
     let oid_a = col_i64(&ba, "oid").value(0);
     let oid_b = col_i64(&bb, "oid").value(0);
-    assert_ne!(oid_a, oid_b, "different tenants must hash to different oids");
+    assert_ne!(
+        oid_a, oid_b,
+        "different tenants must hash to different oids"
+    );
 
     let name_a = col_str(&ba, "rolname").value(0).to_string();
     let name_b = col_str(&bb, "rolname").value(0).to_string();
@@ -228,7 +235,9 @@ async fn pg_depend_cv_source_table_edge() {
     cat.create_namespace(&t).await.unwrap();
     let s = cv_schema();
     cat.create_table(&t, &tname("events"), &s).await.unwrap();
-    cat.create_table(&t, &tname("events_daily"), &s).await.unwrap();
+    cat.create_table(&t, &tname("events_daily"), &s)
+        .await
+        .unwrap();
     cat.set_continuous_aggregate(&t, &tname("events_daily"), Some(make_cv("events")))
         .await
         .unwrap();
@@ -273,7 +282,10 @@ async fn pg_depend_cv_source_table_edge() {
                 refclassids.value(i),
                 "CV→src classids must both point at pg_class"
             );
-            assert!(classids.value(i) > 0, "pg_class catalog oid must be positive");
+            assert!(
+                classids.value(i) > 0,
+                "pg_class catalog oid must be positive"
+            );
         }
     }
     assert_eq!(hits, 1, "expected exactly one CV→source pg_depend edge");
@@ -303,8 +315,7 @@ async fn pg_depend_cv_source_table_edge_pgdump_ordering_pattern() {
     // Build oid→relname index from pg_class.
     let class_relnames = col_str(&class, "relname");
     let class_oids = col_i64(&class, "oid");
-    let mut by_oid: std::collections::HashMap<i64, &str> =
-        std::collections::HashMap::new();
+    let mut by_oid: std::collections::HashMap<i64, &str> = std::collections::HashMap::new();
     for i in 0..class.num_rows() {
         by_oid.insert(class_oids.value(i), class_relnames.value(i));
     }

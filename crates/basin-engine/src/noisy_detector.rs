@@ -139,8 +139,7 @@ impl NoisyState {
             // Without this guard a single fast burst at the start of a
             // session could trip the bit before `rate_qps` had time to
             // converge to a meaningful estimate.
-            let integrated_secs =
-                ((now_ms.saturating_sub(self.first_seen_ms)) as f32) / 1000.0;
+            let integrated_secs = ((now_ms.saturating_sub(self.first_seen_ms)) as f32) / 1000.0;
             if integrated_secs >= NOISY_ARM_SECS {
                 self.is_noisy = true;
             }
@@ -152,8 +151,7 @@ impl NoisyState {
             // here because we want the disarm window to count from the
             // *first* moment we dropped below, not the most recent
             // is_noisy poll.
-            let quiet_secs =
-                ((now_ms.saturating_sub(self.last_quiet_since_ms)) as f32) / 1000.0;
+            let quiet_secs = ((now_ms.saturating_sub(self.last_quiet_since_ms)) as f32) / 1000.0;
             if self.is_noisy && quiet_secs >= NOISY_DISARM_SECS {
                 self.is_noisy = false;
             }
@@ -199,9 +197,7 @@ impl NoisyDetector {
                 .read()
                 .expect("noisy detector states lock poisoned");
             if let Some(state) = map.get(tenant) {
-                let mut s = state
-                    .lock()
-                    .expect("noisy detector tenant state poisoned");
+                let mut s = state.lock().expect("noisy detector tenant state poisoned");
                 s.record(now);
                 return;
             }

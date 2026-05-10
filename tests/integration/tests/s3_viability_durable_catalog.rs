@@ -20,9 +20,7 @@ use std::time::Duration;
 
 use basin_common::TenantId;
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
-use basin_integration_tests::test_config::{
-    BasinTestConfig, CleanupOnDrop, PostgresConfig,
-};
+use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop, PostgresConfig};
 use basin_router::{RunningServer, ServerConfig, StaticTenantResolver};
 use basin_storage::{Storage, StorageConfig};
 use object_store::path::Path as ObjectPath;
@@ -83,11 +81,8 @@ impl Drop for SchemaGuard {
 }
 
 async fn pg_reachable(url: &str) -> bool {
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio_postgres::connect(url, NoTls),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(2), tokio_postgres::connect(url, NoTls)).await;
     matches!(result, Ok(Ok(_)))
 }
 
@@ -107,10 +102,9 @@ async fn boot_server(
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let pg_catalog =
-        basin_catalog::PostgresCatalog::connect_with_schema(pg_url, schema_name)
-            .await
-            .expect("connect postgres catalog");
+    let pg_catalog = basin_catalog::PostgresCatalog::connect_with_schema(pg_url, schema_name)
+        .await
+        .expect("connect postgres catalog");
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(pg_catalog);
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
@@ -167,9 +161,7 @@ fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
 }
 
 async fn shutdown(server: RunningServer) {
-    let RunningServer {
-        shutdown, join, ..
-    } = server;
+    let RunningServer { shutdown, join, .. } = server;
     drop(shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
@@ -266,15 +258,11 @@ async fn s3_viability_durable_catalog() {
     let client1 = connect(addr1, user).await;
 
     client1
-        .simple_query(
-            "CREATE TABLE durable_events (id BIGINT NOT NULL, body TEXT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE durable_events (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
         .expect("create table");
     client1
-        .simple_query(
-            "INSERT INTO durable_events VALUES (1, 'first'), (2, 'second'), (3, 'third')",
-        )
+        .simple_query("INSERT INTO durable_events VALUES (1, 'first'), (2, 'second'), (3, 'third')")
         .await
         .expect("insert");
 

@@ -137,10 +137,7 @@ impl ObjectStore for SlowStore {
         r
     }
 
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         // No latency injection on streaming list — the tests don't
         // exercise it.
         self.inner.list(prefix)
@@ -192,12 +189,7 @@ fn storage_with_slow(slow: Arc<SlowStore>) -> Storage {
 /// Pre-populate the inner store with a key shaped under `tenant`'s
 /// prefix and return the path. Bytes are tunable so a test can request
 /// a small (point-shaped) or large (bulk-shaped) value.
-async fn seed_object(
-    storage: &Storage,
-    tenant: &TenantId,
-    name: &str,
-    bytes: usize,
-) -> ObjectPath {
+async fn seed_object(storage: &Storage, tenant: &TenantId, name: &str, bytes: usize) -> ObjectPath {
     let path = ObjectPath::from(format!("tenants/{}/data/{}", tenant.as_prefix(), name));
     let store = storage.tenant_object_store(tenant);
     let payload = PutPayload::from(Bytes::from(vec![0u8; bytes]));
@@ -250,8 +242,7 @@ async fn noisy_tenant_no_starvation_for_quiet_tenant() {
     let tenant_b = TenantId::new();
     // Seed a >256KB object for A (so A's get_range maps to Low) and a
     // small object for B (so B's HEAD maps to High).
-    let a_path =
-        seed_object(&storage, &tenant_a, "bulk", 1024 * 1024).await; // 1 MiB
+    let a_path = seed_object(&storage, &tenant_a, "bulk", 1024 * 1024).await; // 1 MiB
     let b_path = seed_object(&storage, &tenant_b, "point", 64).await;
 
     let store_a = storage.tenant_object_store(&tenant_a);
@@ -316,9 +307,7 @@ async fn large_op_doesnt_starve_point_lookups() {
     let stop_flag = stop.clone();
     let scan_handle = tokio::spawn(async move {
         while !stop_flag.load(Ordering::Relaxed) {
-            let _ = scan_store
-                .get_range(&bulk_path, 0..1024 * 1024)
-                .await;
+            let _ = scan_store.get_range(&bulk_path, 0..1024 * 1024).await;
         }
     });
 

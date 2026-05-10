@@ -139,8 +139,7 @@ impl AnalyticalEngine {
         // Snapshot the file set for each table. DuckDB will see exactly these
         // files; concurrent writes on another shard owner won't be visible
         // until the next query (snapshot isolation, v0.1 flavour).
-        let mut registered: Vec<(TableName, Vec<String>)> =
-            Vec::with_capacity(tables.len());
+        let mut registered: Vec<(TableName, Vec<String>)> = Vec::with_capacity(tables.len());
         for t in tables {
             let files = self.inner.cfg.storage.list_data_files(tenant, &t).await?;
             let mut paths = Vec::with_capacity(files.len());
@@ -189,10 +188,7 @@ impl AnalyticalEngine {
 /// `duckdb` crate's connection and statement types are `!Send` (they hold
 /// raw FFI handles); creating and destroying them all inside one
 /// `spawn_blocking` keeps lifetimes inside that single thread.
-fn run_query_blocking(
-    sql: &str,
-    tables: &[(TableName, Vec<String>)],
-) -> Result<Vec<RecordBatch>> {
+fn run_query_blocking(sql: &str, tables: &[(TableName, Vec<String>)]) -> Result<Vec<RecordBatch>> {
     use duckdb::Connection;
 
     let conn = Connection::open_in_memory()
@@ -306,7 +302,7 @@ mod tests {
             object_store: Arc::new(fs),
             root_prefix: None,
             disk_cache: None,
-        page_cache: None,
+            page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
         let engine = AnalyticalEngine::new(AnalyticalConfig {
@@ -362,7 +358,14 @@ mod tests {
         let (_dir, engine, storage, catalog) = fixture();
         let tenant = TenantId::new();
         let table = TableName::new("t").unwrap();
-        seed_one_batch(&storage, &catalog, &tenant, &table, batch_with_category(0, 100)).await;
+        seed_one_batch(
+            &storage,
+            &catalog,
+            &tenant,
+            &table,
+            batch_with_category(0, 100),
+        )
+        .await;
 
         let batches = engine.query(&tenant, "SELECT * FROM t").await.unwrap();
         assert_eq!(total_rows(&batches), 100);
@@ -382,7 +385,14 @@ mod tests {
         let (_dir, engine, storage, catalog) = fixture();
         let tenant = TenantId::new();
         let table = TableName::new("t").unwrap();
-        seed_one_batch(&storage, &catalog, &tenant, &table, batch_with_category(0, 100)).await;
+        seed_one_batch(
+            &storage,
+            &catalog,
+            &tenant,
+            &table,
+            batch_with_category(0, 100),
+        )
+        .await;
 
         // DuckDB returns `sum(BIGINT)` as a `HUGEINT` (i128) by default. Cast
         // to BIGINT in SQL so the resulting Arrow type is the workspace-known
@@ -419,7 +429,14 @@ mod tests {
         let (_dir, engine, storage, catalog) = fixture();
         let tenant = TenantId::new();
         let table = TableName::new("t").unwrap();
-        seed_one_batch(&storage, &catalog, &tenant, &table, batch_with_category(0, 100)).await;
+        seed_one_batch(
+            &storage,
+            &catalog,
+            &tenant,
+            &table,
+            batch_with_category(0, 100),
+        )
+        .await;
 
         let batches = engine
             .query(
@@ -515,10 +532,23 @@ mod tests {
         // B returns ids 1000..1100. If isolation breaks, the assertions below
         // would see ids from the other tenant's prefix.
         seed_one_batch(&storage, &catalog, &a, &table, batch_with_category(0, 50)).await;
-        seed_one_batch(&storage, &catalog, &b, &table, batch_with_category(1000, 100)).await;
+        seed_one_batch(
+            &storage,
+            &catalog,
+            &b,
+            &table,
+            batch_with_category(1000, 100),
+        )
+        .await;
 
-        let ra = engine.query(&a, "SELECT id FROM t ORDER BY id").await.unwrap();
-        let rb = engine.query(&b, "SELECT id FROM t ORDER BY id").await.unwrap();
+        let ra = engine
+            .query(&a, "SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
+        let rb = engine
+            .query(&b, "SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
 
         let ids_a: Vec<i64> = ra
             .iter()
@@ -560,7 +590,7 @@ mod tests {
             object_store: Arc::new(fs),
             root_prefix: None,
             disk_cache: None,
-        page_cache: None,
+            page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
         let engine = AnalyticalEngine::new(AnalyticalConfig {

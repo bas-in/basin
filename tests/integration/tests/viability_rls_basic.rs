@@ -69,10 +69,7 @@ async fn viability_rls_basic() {
     //    its own `current_user`. INSERTs do not yet enforce WITH CHECK in
     //    v0.1 (see TODO in `crates/basin-engine/src/rls.rs`), so this also
     //    tests that pre-existing data lands without restriction.
-    let alice = engine
-        .open_session_as(tenant, "alice")
-        .await
-        .unwrap();
+    let alice = engine.open_session_as(tenant, "alice").await.unwrap();
     let bob = engine.open_session_as(tenant, "bob").await.unwrap();
 
     for i in 1..=5_i64 {
@@ -117,8 +114,14 @@ async fn viability_rls_basic() {
     // 5) Each principal sees only their own rows.
     let alice_rows = rows_seen(alice.execute("SELECT * FROM orders").await.unwrap());
     let bob_rows = rows_seen(bob.execute("SELECT * FROM orders").await.unwrap());
-    assert_eq!(alice_rows, 5, "alice should see her 5 rows under RLS, got {alice_rows}");
-    assert_eq!(bob_rows, 5, "bob should see his 5 rows under RLS, got {bob_rows}");
+    assert_eq!(
+        alice_rows, 5,
+        "alice should see her 5 rows under RLS, got {alice_rows}"
+    );
+    assert_eq!(
+        bob_rows, 5,
+        "bob should see his 5 rows under RLS, got {bob_rows}"
+    );
 
     // 6) An anonymous session under the same tenant sees zero rows (no
     //    policy matches `current_user = 'anonymous'` for a row whose
@@ -184,8 +187,7 @@ async fn viability_rls_basic() {
         "RLS on + no policy → deny-all (Postgres semantics); got {alice_no_policy}"
     );
 
-    let pass =
-        alice_rows == 5 && bob_rows == 5 && (alice_rows + bob_rows) == 10 && pre_rls == 10;
+    let pass = alice_rows == 5 && bob_rows == 5 && (alice_rows + bob_rows) == 10 && pre_rls == 10;
     println!(
         "[VIABILITY RLS basic] alice={alice_rows}, bob={bob_rows}, all={pre_rls}, anon={anon_rows} {}",
         if pass { "PASS" } else { "FAIL" }

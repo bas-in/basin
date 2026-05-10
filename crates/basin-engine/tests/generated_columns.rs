@@ -346,11 +346,9 @@ async fn composition_with_audit_to() {
     )
     .await
     .unwrap();
-    sess.execute(
-        "INSERT INTO users (id, first_name, last_name) VALUES (1, 'Ada', 'Lovelace')",
-    )
-    .await
-    .unwrap();
+    sess.execute("INSERT INTO users (id, first_name, last_name) VALUES (1, 'Ada', 'Lovelace')")
+        .await
+        .unwrap();
 
     // Audit table's after_row should include the computed full_name.
     let res = sess
@@ -403,7 +401,9 @@ async fn composition_with_soft_delete() {
     // generated column must be re-evaluated on the matched row but the
     // computed value is unchanged because the source columns haven't
     // changed.
-    sess.execute("DELETE FROM users WHERE id = 1").await.unwrap();
+    sess.execute("DELETE FROM users WHERE id = 1")
+        .await
+        .unwrap();
 
     // Default SELECT hides the soft-deleted row.
     let res = sess
@@ -454,11 +454,9 @@ async fn cross_tenant_isolation() {
     a.execute("INSERT INTO users (first_name, last_name) VALUES ('A', 'X')")
         .await
         .unwrap();
-    b.execute(
-        "INSERT INTO users (first_name, last_name) VALUES ('B', 'Y'), ('C', 'Z')",
-    )
-    .await
-    .unwrap();
+    b.execute("INSERT INTO users (first_name, last_name) VALUES ('B', 'Y'), ('C', 'Z')")
+        .await
+        .unwrap();
 
     let res_a = a.execute("SELECT full_name FROM users").await.unwrap();
     let res_b = b

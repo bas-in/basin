@@ -81,16 +81,12 @@ async fn s3_viability_row_group_sizing() {
     let tenant = TenantId::new();
     let sess = engine.open_session(tenant).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
-    sess.execute(
-        "CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL)")
+        .await
+        .unwrap();
 
     sess.execute("ALTER TABLE events_small SET row_group_rows = 4096")
         .await
@@ -125,9 +121,11 @@ async fn s3_viability_row_group_sizing() {
         ExecResult::Empty { .. } => 0,
     };
     let default_snap = counters.snapshot();
-    assert_eq!(default_hits, 1, "expected one row for id={target} (default)");
-    let default_scan_rows =
-        default_snap.row_groups_scanned as usize * DEFAULT_RG_ROWS;
+    assert_eq!(
+        default_hits, 1,
+        "expected one row for id={target} (default)"
+    );
+    let default_scan_rows = default_snap.row_groups_scanned as usize * DEFAULT_RG_ROWS;
     println!(
         "[S3 row_group_sizing] DEFAULT 65k: groups_considered={}, groups_scanned={}, rows_scanned≈{}",
         default_snap.row_groups_considered, default_snap.row_groups_scanned, default_scan_rows,

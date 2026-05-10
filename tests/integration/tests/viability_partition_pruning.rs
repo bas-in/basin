@@ -33,8 +33,8 @@ use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -153,10 +153,7 @@ impl ObjectStore for CountingStore {
         self.inner.delete(location).await
     }
 
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         self.list_count.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix)
     }
@@ -182,9 +179,7 @@ impl ObjectStore for CountingStore {
     }
 }
 
-fn engine_with_counting_store(
-    dir: &TempDir,
-) -> (Engine, Arc<CountingStore>) {
+fn engine_with_counting_store(dir: &TempDir) -> (Engine, Arc<CountingStore>) {
     let fs = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let counting = CountingStore::new(fs);
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
@@ -205,10 +200,9 @@ fn engine_with_counting_store(
 async fn total_select_rows(sess: &TenantSession, sql: &str) -> usize {
     let res = sess.execute(sql).await.unwrap();
     match res {
-        ExecResult::Rows { batches, .. } => batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
+        ExecResult::Rows { batches, .. } => {
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+        }
         ExecResult::Empty { .. } => 0,
     }
 }
@@ -283,17 +277,15 @@ async fn viability_partition_pruning_one_month_range_reads_one_partition() {
     let baseline_full = counting.snapshot();
     let total_full = total_select_rows(&sess, "SELECT id FROM events").await;
     let full_delta = counting.snapshot().delta(baseline_full);
-    assert_eq!(
-        total_full,
-        12 * ROWS_PER_MONTH,
-        "full-scan rows mismatch"
-    );
+    assert_eq!(total_full, 12 * ROWS_PER_MONTH, "full-scan rows mismatch");
 
     // Now the partition-pruning query: one month's range.
     let baseline_range = counting.snapshot();
-    let total_range =
-        total_select_rows(&sess, "SELECT id FROM events WHERE ts >= '2026-04-01T00:00:00Z' AND ts < '2026-05-01T00:00:00Z'")
-            .await;
+    let total_range = total_select_rows(
+        &sess,
+        "SELECT id FROM events WHERE ts >= '2026-04-01T00:00:00Z' AND ts < '2026-05-01T00:00:00Z'",
+    )
+    .await;
     let range_delta = counting.snapshot().delta(baseline_range);
     assert_eq!(
         total_range, ROWS_PER_MONTH,
@@ -339,9 +331,7 @@ async fn viability_partition_pruning_one_month_range_reads_one_partition() {
     assert!(
         pass_ratio,
         "partition pruning failed: full-scan {} bytes, range-scan {} bytes (ratio {:.3})",
-        full_delta.bytes,
-        range_delta.bytes,
-        ratio
+        full_delta.bytes, range_delta.bytes, ratio
     );
 
     // Spec also offers `partitions_read_for_range_query == 1` as an
@@ -353,7 +343,6 @@ async fn viability_partition_pruning_one_month_range_reads_one_partition() {
     assert!(
         pass_files,
         "expected fewer than 12 file-level reads (one per partition); got gets={} range_gets={}",
-        range_delta.gets,
-        range_delta.range_gets
+        range_delta.gets, range_delta.range_gets
     );
 }

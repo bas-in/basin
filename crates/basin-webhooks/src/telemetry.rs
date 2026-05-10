@@ -210,9 +210,7 @@ impl WebhookCountersRegistry {
             .per_tenant
             .read()
             .expect("webhook counter registry poisoned");
-        map.get(tenant)
-            .map(|c| c.snapshot())
-            .unwrap_or_default()
+        map.get(tenant).map(|c| c.snapshot()).unwrap_or_default()
     }
 
     /// Snapshot every tenant that has ever recorded a webhook event.

@@ -449,10 +449,7 @@ pub(crate) fn build_insert_sql(
     Ok(sql)
 }
 
-fn write_where(
-    sql: &mut String,
-    filters: &[Filter],
-) -> std::result::Result<(), ApiError> {
+fn write_where(sql: &mut String, filters: &[Filter]) -> std::result::Result<(), ApiError> {
     write_where_with_cursor(sql, filters, None)
 }
 
@@ -624,7 +621,11 @@ mod tests {
 
     #[test]
     fn parses_order_and_limit() {
-        let parsed = q(&[("order", "id.desc,name.asc"), ("limit", "10"), ("offset", "5")]);
+        let parsed = q(&[
+            ("order", "id.desc,name.asc"),
+            ("limit", "10"),
+            ("offset", "5"),
+        ]);
         assert_eq!(parsed.order.len(), 2);
         assert!(parsed.order[0].desc);
         assert!(!parsed.order[1].desc);
@@ -655,7 +656,10 @@ mod tests {
     #[test]
     fn quote_sql_string_doubles_internal_quotes() {
         assert_eq!(quote_sql_string("o'reilly"), "'o''reilly'");
-        assert_eq!(quote_sql_string("'; DROP TABLE x; --"), "'''; DROP TABLE x; --'");
+        assert_eq!(
+            quote_sql_string("'; DROP TABLE x; --"),
+            "'''; DROP TABLE x; --'"
+        );
     }
 
     #[test]
@@ -705,10 +709,7 @@ mod tests {
         let sql = build_select_sql("t", &q, 100, 1000).unwrap();
         // The single quote in the payload gets doubled; the `;` and friends
         // sit inside the string literal where they're inert.
-        assert!(
-            sql.contains("''';"),
-            "expected escaped quote in {sql}"
-        );
+        assert!(sql.contains("''';"), "expected escaped quote in {sql}");
         assert!(
             !sql.contains("DROP TABLE users; --;"),
             "control chars escaped into SQL: {sql}"

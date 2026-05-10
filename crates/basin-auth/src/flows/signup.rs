@@ -111,11 +111,7 @@ pub(crate) async fn request_email_verification(
     Ok(())
 }
 
-pub(crate) async fn verify_email(
-    inner: &Inner,
-    tenant: &TenantId,
-    raw_token: &str,
-) -> Result<()> {
+pub(crate) async fn verify_email(inner: &Inner, tenant: &TenantId, raw_token: &str) -> Result<()> {
     let h = hash_token(raw_token);
     let tenant_str = tenant.to_string();
 
@@ -149,9 +145,7 @@ pub(crate) async fn verify_email(
     let purpose: String = row.get(3);
 
     if purpose != EmailTokenPurpose::Verify.as_str() {
-        return Err(BasinError::InvalidIdent(
-            "token has wrong purpose".into(),
-        ));
+        return Err(BasinError::InvalidIdent("token has wrong purpose".into()));
     }
     if consumed_at.is_some() {
         return Err(BasinError::InvalidIdent(

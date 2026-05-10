@@ -66,11 +66,9 @@ async fn order_by_enum_uses_declaration_order() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, status status NOT NULL)")
         .await
         .unwrap();
@@ -104,11 +102,9 @@ async fn order_by_enum_desc() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, status status NOT NULL)")
         .await
         .unwrap();
@@ -127,7 +123,10 @@ async fn order_by_enum_desc() {
         .iter()
         .map(|s| Some(s.to_string()))
         .collect();
-    assert_eq!(got, expected, "ORDER BY enum DESC must reverse declaration order");
+    assert_eq!(
+        got, expected,
+        "ORDER BY enum DESC must reverse declaration order"
+    );
 }
 
 #[tokio::test]
@@ -136,11 +135,9 @@ async fn range_filter_uses_ordinal() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, status status NOT NULL)")
         .await
         .unwrap();
@@ -173,19 +170,15 @@ async fn equality_filter_unaffected() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(TenantId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, status status NOT NULL)")
         .await
         .unwrap();
-    sess.execute(
-        "INSERT INTO t VALUES (1, 'pending'), (2, 'paid'), (3, 'shipped'), (4, 'paid')",
-    )
-    .await
-    .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'pending'), (2, 'paid'), (3, 'shipped'), (4, 'paid')")
+        .await
+        .unwrap();
 
     let res = sess
         .execute("SELECT status FROM t WHERE status = 'paid'")

@@ -651,10 +651,7 @@ impl InfoSchemaQuery {
     /// Build `pg_catalog.pg_constraint` filtered to `tenant`. Always empty
     /// in v0.1 (no FK / explicit PK / CHECK / UNIQUE surfaces). `tenant`
     /// is held for signature stability.
-    pub async fn pg_constraint(
-        _catalog: &dyn Catalog,
-        _tenant: &TenantId,
-    ) -> Result<RecordBatch> {
+    pub async fn pg_constraint(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
         let schema = Self::pg_constraint_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(Vec::<i64>::new())),
@@ -780,7 +777,9 @@ impl InfoSchemaQuery {
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec![BASIN_CATALOG_NAME.to_string()])),
             Arc::new(StringArray::from(vec![DEFAULT_SCHEMA.to_string()])),
-            Arc::new(StringArray::from(vec![SCHEMA_OWNER_PLACEHOLDER.to_string()])),
+            Arc::new(StringArray::from(
+                vec![SCHEMA_OWNER_PLACEHOLDER.to_string()],
+            )),
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![None::<String>])),
@@ -945,9 +944,8 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(is_deferrables)),
             Arc::new(StringArray::from(initially_deferreds)),
         ];
-        RecordBatch::try_new(schema, columns).map_err(|e| {
-            BasinError::internal(format!("info_schema.table_constraints build: {e}"))
-        })
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("info_schema.table_constraints build: {e}")))
     }
 
     /// Build `information_schema.key_column_usage` filtered to `tenant`.
@@ -961,10 +959,7 @@ impl InfoSchemaQuery {
     ///
     /// Cross-tenant leak is a P0 invariant: this only ever calls
     /// [`Catalog::list_tables`] for `tenant`.
-    pub async fn key_column_usage(
-        catalog: &dyn Catalog,
-        tenant: &TenantId,
-    ) -> Result<RecordBatch> {
+    pub async fn key_column_usage(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
         // Walk the tables to keep the access pattern (and therefore the
         // tenant-isolation surface) identical to the other views, even
         // though no rows are produced today.
@@ -982,9 +977,8 @@ impl InfoSchemaQuery {
             Arc::new(Int32Array::from(Vec::<i32>::new())),
             Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
         ];
-        RecordBatch::try_new(schema, columns).map_err(|e| {
-            BasinError::internal(format!("info_schema.key_column_usage build: {e}"))
-        })
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("info_schema.key_column_usage build: {e}")))
     }
 
     /// Schema for `pg_catalog.pg_type` rows.
@@ -1084,9 +1078,7 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
         RecordBatch::try_new(schema, columns).map_err(|e| {
-            BasinError::internal(format!(
-                "info_schema.referential_constraints build: {e}"
-            ))
+            BasinError::internal(format!("info_schema.referential_constraints build: {e}"))
         })
     }
 
@@ -1485,7 +1477,6 @@ fn pg_type_oid_for_field(field: &Field) -> i64 {
     }
 }
 
-
 /// Stable 64-bit oid for a `(tenant, table)` pair.
 ///
 /// Hashing scheme: FNV-1a 64-bit over the byte sequence
@@ -1566,10 +1557,9 @@ fn pg_type_oid_for_arg(arg: SqlArgType) -> i64 {
         SqlArgType::Text => DataType::Utf8,
         SqlArgType::Bytea => DataType::LargeBinary,
         SqlArgType::Date => DataType::Date32,
-        SqlArgType::TimestampTz => DataType::Timestamp(
-            arrow_schema::TimeUnit::Microsecond,
-            Some("UTC".into()),
-        ),
+        SqlArgType::TimestampTz => {
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        }
     };
     pg_type_oid_for_field(&Field::new("_", dt, false))
 }

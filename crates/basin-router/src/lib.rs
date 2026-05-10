@@ -113,9 +113,9 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 /// fires. A fired shutdown stops accepting new connections; in-flight
 /// connections proceed to completion as their tasks finish.
 pub async fn run_with_shutdown(cfg: ServerConfig, shutdown: oneshot::Receiver<()>) -> Result<()> {
-    let listener = TcpListener::bind(cfg.bind_addr).await.map_err(|e| {
-        BasinError::Internal(format!("bind {} failed: {e}", cfg.bind_addr))
-    })?;
+    let listener = TcpListener::bind(cfg.bind_addr)
+        .await
+        .map_err(|e| BasinError::Internal(format!("bind {} failed: {e}", cfg.bind_addr)))?;
     accept_loop(
         listener,
         cfg.engine,
@@ -132,9 +132,9 @@ pub async fn run_with_shutdown(cfg: ServerConfig, shutdown: oneshot::Receiver<()
 /// accept loop on a background task. Useful for integration tests that need
 /// a `0.0.0.0:0` ephemeral port.
 pub async fn run_until_bound(cfg: ServerConfig) -> Result<RunningServer> {
-    let listener = TcpListener::bind(cfg.bind_addr).await.map_err(|e| {
-        BasinError::Internal(format!("bind {} failed: {e}", cfg.bind_addr))
-    })?;
+    let listener = TcpListener::bind(cfg.bind_addr)
+        .await
+        .map_err(|e| BasinError::Internal(format!("bind {} failed: {e}", cfg.bind_addr)))?;
     let local_addr = listener
         .local_addr()
         .map_err(|e| BasinError::Internal(format!("local_addr: {e}")))?;
@@ -187,12 +187,11 @@ async fn accept_loop(
     // `0` / unset / empty = disabled. A typo (non-numeric) is a hard
     // startup error so the operator finds out immediately, not on the
     // first burst that should have been throttled.
-    let rate_limit = match from_env_qps(
-        std::env::var("BASIN_PGWIRE_RATE_LIMIT_QPS").ok().as_deref(),
-    ) {
-        Ok(rl) => rl.map(Arc::new),
-        Err(e) => return Err(BasinError::Internal(e)),
-    };
+    let rate_limit =
+        match from_env_qps(std::env::var("BASIN_PGWIRE_RATE_LIMIT_QPS").ok().as_deref()) {
+            Ok(rl) => rl.map(Arc::new),
+            Err(e) => return Err(BasinError::Internal(e)),
+        };
     if let Some(rl) = &rate_limit {
         tracing::info!(
             sustained_qps = rl.sustained_qps(),
@@ -219,31 +218,51 @@ async fn accept_loop(
         // Parse failure is a hard startup error so a typo doesn't silently
         // route a whale onto the wrong (overloaded) shard.
         let pins = match std::env::var("BASIN_TENANT_PINS") {
-            Ok(s) => parse_pins_env(&s).map_err(|e| {
-                BasinError::Internal(format!("BASIN_TENANT_PINS: {e}"))
-            })?,
+            Ok(s) => parse_pins_env(&s)
+                .map_err(|e| BasinError::Internal(format!("BASIN_TENANT_PINS: {e}")))?,
             Err(_) => Default::default(),
         };
-        let map = Arc::new(
-            ShardMap::with_pins(endpoints, pins)
-                .map_err(BasinError::Internal)?,
-        );
+        let map = Arc::new(ShardMap::with_pins(endpoints, pins).map_err(BasinError::Internal)?);
         tracing::info!(
             shards = map.endpoints().len(),
             pinned_tenants = map.pin_count(),
             "router running in compute-sharded mode"
         );
         let factory = Arc::new(RemoteShardSessionFactory::new(map));
-        return run_accept_loop(listener, factory, resolver, rate_limit, tls_acceptor, &mut shutdown).await;
+        return run_accept_loop(
+            listener,
+            factory,
+            resolver,
+            rate_limit,
+            tls_acceptor,
+            &mut shutdown,
+        )
+        .await;
     }
 
     if let Some(pool) = pool {
         let factory = Arc::new(PooledSessionFactory::new(pool));
-        return run_accept_loop(listener, factory, resolver, rate_limit, tls_acceptor, &mut shutdown).await;
+        return run_accept_loop(
+            listener,
+            factory,
+            resolver,
+            rate_limit,
+            tls_acceptor,
+            &mut shutdown,
+        )
+        .await;
     }
 
     let factory = Arc::new(EngineSessionFactory(engine));
-    run_accept_loop(listener, factory, resolver, rate_limit, tls_acceptor, &mut shutdown).await
+    run_accept_loop(
+        listener,
+        factory,
+        resolver,
+        rate_limit,
+        tls_acceptor,
+        &mut shutdown,
+    )
+    .await
 }
 
 /// Inner accept loop, parameterised on a single concrete factory type.
@@ -308,11 +327,7 @@ where
     ));
     let copy_state = simple.copy_state.clone();
     let handlers = BasinHandlers {
-        startup: Arc::new(BasinStartupHandler::new(
-            factory,
-            resolver,
-            slot.clone(),
-        )),
+        startup: Arc::new(BasinStartupHandler::new(factory, resolver, slot.clone())),
         simple,
         extended: Arc::new(BasinExtendedQueryHandler::new(slot, rate_limit, copy_state)),
     };

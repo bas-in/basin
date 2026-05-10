@@ -102,9 +102,15 @@ fn rss_kib_tree(root_pid: u32) -> u64 {
     let mut total: u64 = 0;
     for line in s.lines() {
         let mut it = line.split_whitespace();
-        let Some(pid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
-        let Some(ppid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
-        let Some(rss) = it.next().and_then(|v| v.parse::<u64>().ok()) else { continue };
+        let Some(pid) = it.next().and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = it.next().and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(rss) = it.next().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
         if pid == root_pid || ppid == root_pid {
             total += rss;
         }
@@ -128,8 +134,12 @@ fn find_postmaster_pid() -> Option<u32> {
         // leading/repeated spaces; we manually re-join the tail to keep
         // any spaces inside the command line.
         let mut it = line.split_whitespace();
-        let Some(pid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
-        let Some(ppid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
+        let Some(pid) = it.next().and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = it.next().and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
         let cmd: String = it.collect::<Vec<_>>().join(" ");
         // The postmaster's command line is the absolute path to the
         // `postgres` binary, possibly with `-D <datadir>`. Backends look
@@ -365,8 +375,7 @@ async fn compare_server_lifecycle() {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -428,7 +437,9 @@ async fn compare_server_lifecycle() {
             Some(delta as f64 / RSS_CONNS as f64)
         }
         None => {
-            println!("[COMPARE server_lifecycle] basin-server binary not found; skipping RSS metric");
+            println!(
+                "[COMPARE server_lifecycle] basin-server binary not found; skipping RSS metric"
+            );
             None
         }
     };
@@ -446,7 +457,9 @@ async fn compare_server_lifecycle() {
             Some(delta as f64 / RSS_CONNS as f64)
         }
         None => {
-            println!("[COMPARE server_lifecycle] could not find postmaster PID; skipping RSS metric");
+            println!(
+                "[COMPARE server_lifecycle] could not find postmaster PID; skipping RSS metric"
+            );
             None
         }
     };

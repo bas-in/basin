@@ -87,7 +87,9 @@ async fn enum_empty_label_list_rejected() {
 async fn enum_duplicate_registration_rejected() {
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
-    cat.register_enum_type(enum_def(t, "z", &["a"])).await.unwrap();
+    cat.register_enum_type(enum_def(t, "z", &["a"]))
+        .await
+        .unwrap();
     let err = cat
         .register_enum_type(enum_def(t, "z", &["b"]))
         .await
@@ -115,9 +117,14 @@ async fn drop_enum_unknown_errors() {
 async fn domain_round_trip() {
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
-    cat.register_domain(domain_def(t, "positive_int", SqlArgType::Int, Some("VALUE > 0")))
-        .await
-        .unwrap();
+    cat.register_domain(domain_def(
+        t,
+        "positive_int",
+        SqlArgType::Int,
+        Some("VALUE > 0"),
+    ))
+    .await
+    .unwrap();
     let looked_up = cat.lookup_domain(&t, "positive_int").await.unwrap();
     assert_eq!(looked_up.base_type, SqlArgType::Int);
     assert_eq!(looked_up.check_predicate.unwrap(), "VALUE > 0");
@@ -253,7 +260,9 @@ async fn drop_domain_blocked_when_referenced() {
 async fn drop_namespace_clears_enums_and_domains() {
     let cat = Arc::new(InMemoryCatalog::new());
     let t = TenantId::new();
-    cat.register_enum_type(enum_def(t, "e", &["a"])).await.unwrap();
+    cat.register_enum_type(enum_def(t, "e", &["a"]))
+        .await
+        .unwrap();
     cat.register_domain(domain_def(t, "d", SqlArgType::Int, None))
         .await
         .unwrap();

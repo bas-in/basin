@@ -108,17 +108,15 @@ async fn boot_server(
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let pg_catalog =
-        basin_catalog::PostgresCatalog::connect_with_schema(PG_URL, schema_name)
-            .await
-            .expect("connect postgres catalog");
+    let pg_catalog = basin_catalog::PostgresCatalog::connect_with_schema(PG_URL, schema_name)
+        .await
+        .expect("connect postgres catalog");
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(pg_catalog);
-    let engine =
-        basin_engine::Engine::new(basin_engine::EngineConfig {
-            storage,
-            catalog,
-            shard: None,
-        });
+    let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
 
     let mut map = HashMap::new();
     map.insert(user.to_owned(), tenant);
@@ -174,9 +172,7 @@ fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
 /// task spec calls "drop the `RunningServer.shutdown` channel; await
 /// `join`".
 async fn shutdown(server: RunningServer) {
-    let RunningServer {
-        shutdown, join, ..
-    } = server;
+    let RunningServer { shutdown, join, .. } = server;
     drop(shutdown);
     // Bound the wait — if the join hangs (it shouldn't), we don't want the
     // test to hang either.
@@ -186,9 +182,7 @@ async fn shutdown(server: RunningServer) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_catalog_survives_restart() {
     if !pg_reachable().await {
-        eprintln!(
-            "postgres not reachable at {PG_URL}, skipping durable_catalog_survives_restart"
-        );
+        eprintln!("postgres not reachable at {PG_URL}, skipping durable_catalog_survives_restart");
         // Emit a viability sidecar reflecting that the test was skipped so
         // the dashboard reports "unavailable" instead of stale data.
         report_viability(
@@ -227,15 +221,11 @@ async fn durable_catalog_survives_restart() {
     let client1 = connect(addr1, user).await;
 
     client1
-        .simple_query(
-            "CREATE TABLE durable_events (id BIGINT NOT NULL, body TEXT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE durable_events (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
         .expect("create table");
     client1
-        .simple_query(
-            "INSERT INTO durable_events VALUES (1, 'first'), (2, 'second'), (3, 'third')",
-        )
+        .simple_query("INSERT INTO durable_events VALUES (1, 'first'), (2, 'second'), (3, 'third')")
         .await
         .expect("insert");
 
@@ -293,5 +283,8 @@ async fn durable_catalog_survives_restart() {
         }),
     );
 
-    assert!(survived, "rows did not survive simulated restart: {post_rows:?}");
+    assert!(
+        survived,
+        "rows did not survive simulated restart: {post_rows:?}"
+    );
 }

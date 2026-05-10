@@ -200,8 +200,7 @@ async fn boot() -> Option<Servers> {
         disk_cache: None,
         page_cache: None,
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -229,11 +228,8 @@ async fn boot() -> Option<Servers> {
     .await
     .expect("router bind");
 
-    let rest_cfg = basin_rest::RestConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        engine,
-        auth.clone(),
-    );
+    let rest_cfg =
+        basin_rest::RestConfig::new("127.0.0.1:0".parse().unwrap(), engine, auth.clone());
     let rest_svc = basin_rest::RestService::new(rest_cfg);
     let rest = rest_svc.run_until_bound().await.expect("rest bind");
     let rest_addr = rest.local_addr;
@@ -335,7 +331,10 @@ async fn per_tenant_credentials_round_trip() {
         String::from_utf8_lossy(&r.body)
     );
     let v = r.json();
-    let conn_url = v["connection_url"].as_str().expect("connection_url").to_owned();
+    let conn_url = v["connection_url"]
+        .as_str()
+        .expect("connection_url")
+        .to_owned();
     let pgwire_user = v["pgwire_user"].as_str().expect("pgwire_user").to_owned();
     let tenant_id = v["tenant_id"].as_str().expect("tenant_id").to_owned();
     assert!(pgwire_user.starts_with("tenant_"));
@@ -397,7 +396,10 @@ async fn per_tenant_credentials_round_trip() {
         .iter()
         .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .count();
-    assert_eq!(n, 1, "row from first connection must be visible to reconnect");
+    assert_eq!(
+        n, 1,
+        "row from first connection must be visible to reconnect"
+    );
     drop(client2);
     let _ = driver2.await;
 
@@ -421,7 +423,10 @@ async fn per_tenant_credentials_round_trip() {
         String::from_utf8_lossy(&r.body)
     );
     let v = r.json();
-    let new_url = v["connection_url"].as_str().expect("connection_url").to_owned();
+    let new_url = v["connection_url"]
+        .as_str()
+        .expect("connection_url")
+        .to_owned();
     assert_ne!(new_url, conn_url, "rotate must produce a fresh URL");
 
     // Old URL: must fail with auth error (28P01). tokio_postgres surfaces
@@ -473,9 +478,18 @@ async fn per_tenant_credentials_round_trip() {
     let v = r.json();
     let arr = v.as_array().expect("array");
     assert_eq!(arr.len(), 1);
-    assert!(arr[0].get("password").is_none(), "list must not return plaintext");
-    assert!(arr[0].get("password_hash").is_none(), "list must not return hash");
-    assert!(arr[0]["rotated_at"].is_string(), "rotated_at should be set after rotate");
+    assert!(
+        arr[0].get("password").is_none(),
+        "list must not return plaintext"
+    );
+    assert!(
+        arr[0].get("password_hash").is_none(),
+        "list must not return hash"
+    );
+    assert!(
+        arr[0]["rotated_at"].is_string(),
+        "rotated_at should be set after rotate"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -581,7 +595,12 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
                 Some(b"{}"),
             )
             .await;
-            assert_eq!(r.status, 201, "{name}: {}", String::from_utf8_lossy(&r.body));
+            assert_eq!(
+                r.status,
+                201,
+                "{name}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
             let v = r.json();
             (
                 v["connection_url"].as_str().unwrap().to_owned(),
@@ -619,9 +638,7 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
     let collect_bodies = |msgs: &[tokio_postgres::SimpleQueryMessage]| -> Vec<String> {
         msgs.iter()
             .filter_map(|m| match m {
-                tokio_postgres::SimpleQueryMessage::Row(r) => {
-                    r.get("body").map(|s| s.to_owned())
-                }
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get("body").map(|s| s.to_owned()),
                 _ => None,
             })
             .collect()

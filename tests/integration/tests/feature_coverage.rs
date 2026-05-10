@@ -144,13 +144,23 @@ async fn show_tables_per_tenant_scoped() {
     let engine = engine_in(&dir);
     let a = engine.open_session(TenantId::new()).await.unwrap();
     let b = engine.open_session(TenantId::new()).await.unwrap();
-    a.execute("CREATE TABLE only_a (id BIGINT NOT NULL)").await.unwrap();
-    b.execute("CREATE TABLE only_b (id BIGINT NOT NULL)").await.unwrap();
+    a.execute("CREATE TABLE only_a (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    b.execute("CREATE TABLE only_b (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     let res = a.execute("SHOW TABLES").await.unwrap();
     let names = collect_strings(res, "table_name");
-    assert!(names.iter().any(|n| n == "only_a"), "tenant A missing own: {names:?}");
-    assert!(!names.iter().any(|n| n == "only_b"), "tenant A leaked tenant B's table: {names:?}");
+    assert!(
+        names.iter().any(|n| n == "only_a"),
+        "tenant A missing own: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "only_b"),
+        "tenant A leaked tenant B's table: {names:?}"
+    );
 }
 
 /// `DOUBLE PRECISION` round-trips through the engine via Arrow `Float64`.
@@ -160,16 +170,28 @@ async fn double_precision_round_trips() {
     let engine = engine_in(&dir);
     let s = engine.open_session(TenantId::new()).await.unwrap();
     s.execute("CREATE TABLE m (id BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL)")
-        .await.unwrap();
-    s.execute("INSERT INTO m VALUES (1, 1.5), (2, 2.25), (3, -3.0)").await.unwrap();
+        .await
+        .unwrap();
+    s.execute("INSERT INTO m VALUES (1, 1.5), (2, 2.25), (3, -3.0)")
+        .await
+        .unwrap();
 
-    let ExecResult::Rows { batches, .. } = s.execute("SELECT score FROM m ORDER BY id").await.unwrap()
-    else { panic!("expected Rows"); };
+    let ExecResult::Rows { batches, .. } =
+        s.execute("SELECT score FROM m ORDER BY id").await.unwrap()
+    else {
+        panic!("expected Rows");
+    };
     let mut got = Vec::new();
     for b in &batches {
-        let arr = b.column_by_name("score").unwrap()
-            .as_any().downcast_ref::<Float64Array>().expect("Float64Array");
-        for i in 0..arr.len() { got.push(arr.value(i)); }
+        let arr = b
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64Array");
+        for i in 0..arr.len() {
+            got.push(arr.value(i));
+        }
     }
     assert_eq!(got, vec![1.5, 2.25, -3.0]);
 }
@@ -183,10 +205,17 @@ async fn table_fork_clones_within_tenant() {
     cat.create_namespace(&t).await.unwrap();
     let src = TableName::new("src").unwrap();
     let dst = TableName::new("dst").unwrap();
-    let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false)]);
+    let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "id",
+        arrow_schema::DataType::Int64,
+        false,
+    )]);
     cat.create_table(&t, &src, &schema).await.unwrap();
     let forked = cat.fork_table(&t, &src, &dst).await.unwrap();
-    assert_eq!(forked.snapshots.len(), cat.load_table(&t, &src).await.unwrap().snapshots.len());
+    assert_eq!(
+        forked.snapshots.len(),
+        cat.load_table(&t, &src).await.unwrap().snapshots.len()
+    );
     let listed = cat.list_tables(&t).await.unwrap();
     assert!(listed.contains(&src) && listed.contains(&dst));
 }
@@ -200,7 +229,11 @@ async fn whale_tenant_pinning_routes_deterministically() {
     let mut pins = HashMap::new();
     pins.insert(whale, 3);
     let map = ShardMap::with_pins(endpoints.clone(), pins).unwrap();
-    assert_eq!(map.shard_index(&whale), 3, "pin must override consistent hash");
+    assert_eq!(
+        map.shard_index(&whale),
+        3,
+        "pin must override consistent hash"
+    );
     assert!(map.is_pinned(&whale));
     // parse_pins_env round-trips the same shape
     let parsed = parse_pins_env(&format!("{whale}:2")).unwrap();
@@ -214,14 +247,27 @@ async fn vector_distance_operators_rewrite() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
     let s = engine.open_session(TenantId::new()).await.unwrap();
-    s.execute("CREATE TABLE v (id BIGINT NOT NULL, e VECTOR(3) NOT NULL)").await.unwrap();
-    s.execute("INSERT INTO v VALUES (1, '[1.0, 0.0, 0.0]'), (2, '[0.0, 1.0, 0.0]')").await.unwrap();
+    s.execute("CREATE TABLE v (id BIGINT NOT NULL, e VECTOR(3) NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("INSERT INTO v VALUES (1, '[1.0, 0.0, 0.0]'), (2, '[0.0, 1.0, 0.0]')")
+        .await
+        .unwrap();
     for op in ["<->", "<#>", "<=>"] {
         let sql = format!("SELECT id FROM v ORDER BY e {op} '[1.0, 0.0, 0.0]' LIMIT 1");
-        let ExecResult::Rows { batches, .. } = s.execute(&sql).await
-            .unwrap_or_else(|e| panic!("{op}: {e:?}")) else { panic!("{op}: expected Rows"); };
-        let arr = batches[0].column_by_name("id").unwrap()
-            .as_any().downcast_ref::<Int64Array>().expect("id");
+        let ExecResult::Rows { batches, .. } = s
+            .execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{op}: {e:?}"))
+        else {
+            panic!("{op}: expected Rows");
+        };
+        let arr = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id");
         assert_eq!(arr.value(0), 1, "{op}: nearest to query is row 1");
     }
 }
@@ -234,10 +280,15 @@ async fn pgwire_rate_limit_returns_53400() {
     let rl = PgRateLimit::with_qps(1);
     let t = TenantId::new();
     // 1 qps × 3 burst = 3 free tokens; the 4th-onwards must reject.
-    for _ in 0..3 { rl.check(&t).expect("burst should pass"); }
+    for _ in 0..3 {
+        rl.check(&t).expect("burst should pass");
+    }
     let mut throttled = false;
     for _ in 0..50 {
-        if rl.check(&t).is_err() { throttled = true; break; }
+        if rl.check(&t).is_err() {
+            throttled = true;
+            break;
+        }
     }
     assert!(throttled, "rate limiter never threw, despite drained burst");
 }
@@ -245,12 +296,20 @@ async fn pgwire_rate_limit_returns_53400() {
 // --- helpers ----------------------------------------------------------------
 
 fn collect_strings(res: ExecResult, col: &str) -> Vec<String> {
-    let ExecResult::Rows { batches, .. } = res else { return Vec::new(); };
+    let ExecResult::Rows { batches, .. } = res else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for b in &batches {
-        let arr = b.column_by_name(col).unwrap()
-            .as_any().downcast_ref::<StringArray>().expect("utf8");
-        for i in 0..arr.len() { out.push(arr.value(i).to_owned()); }
+        let arr = b
+            .column_by_name(col)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        for i in 0..arr.len() {
+            out.push(arr.value(i).to_owned());
+        }
     }
     out
 }

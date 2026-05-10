@@ -31,9 +31,7 @@ struct TestServer {
     _cleanup: CleanupOnDrop,
 }
 
-async fn start_server(
-    s3_cfg: &basin_integration_tests::test_config::S3Config,
-) -> TestServer {
+async fn start_server(s3_cfg: &basin_integration_tests::test_config::S3Config) -> TestServer {
     basin_common::telemetry::try_init_for_tests();
 
     let object_store = s3_cfg
@@ -51,8 +49,7 @@ async fn start_server(
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -473,9 +470,7 @@ async fn s3_viability_orm_compat() {
                             if got == payload {
                                 Ok(())
                             } else {
-                                Err(format!(
-                                    "byte mismatch: expected {payload:?}, got {got:?}"
-                                ))
+                                Err(format!("byte mismatch: expected {payload:?}, got {got:?}"))
                             }
                         }
                         Ok(rs) => Err(format!("expected 1 row, got {}", rs.len())),
@@ -517,10 +512,7 @@ async fn s3_viability_orm_compat() {
     emit_report(&results, &s3_cfg);
 }
 
-fn emit_report(
-    results: &[PatternResult],
-    s3_cfg: &basin_integration_tests::test_config::S3Config,
-) {
+fn emit_report(results: &[PatternResult], s3_cfg: &basin_integration_tests::test_config::S3Config) {
     let total = results.len() as u32;
     let passed = results.iter().filter(|r| r.passed).count() as u32;
     let ratio = if total == 0 {

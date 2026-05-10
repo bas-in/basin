@@ -82,7 +82,14 @@ impl BucketWidth {
     pub fn floor(self, t: DateTime<Utc>) -> DateTime<Utc> {
         match self {
             BucketWidth::Second => Utc
-                .with_ymd_and_hms(t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second())
+                .with_ymd_and_hms(
+                    t.year(),
+                    t.month(),
+                    t.day(),
+                    t.hour(),
+                    t.minute(),
+                    t.second(),
+                )
                 .unwrap(),
             BucketWidth::Minute => Utc
                 .with_ymd_and_hms(t.year(), t.month(), t.day(), t.hour(), t.minute(), 0)
@@ -162,9 +169,7 @@ pub fn detect_time_bucket(query_sql: &str) -> Option<BucketInfo> {
                     if let Some((col, width)) = match_bucket_call(expr) {
                         return Some(BucketInfo {
                             bucket_column: col,
-                            bucket_alias: alias_opt
-                                .clone()
-                                .unwrap_or_else(|| format!("col{idx}")),
+                            bucket_alias: alias_opt.clone().unwrap_or_else(|| format!("col{idx}")),
                             width,
                         });
                     }
@@ -430,11 +435,7 @@ pub fn rewrite_for_watermark(
     let new_factor = match &derived_stmts[0] {
         Statement::Query(q) => match q.body.as_ref() {
             SetExpr::Select(s) => s.from[0].relation.clone(),
-            _ => {
-                return Err(BasinError::internal(
-                    "cv incremental: derived SELECT lost",
-                ))
-            }
+            _ => return Err(BasinError::internal("cv incremental: derived SELECT lost")),
         },
         _ => return Err(BasinError::internal("cv incremental: derived not a SELECT")),
     };
@@ -449,7 +450,8 @@ mod tests {
 
     #[test]
     fn detect_date_trunc_hour_group_by_alias() {
-        let sql = "SELECT date_trunc('hour', ts) AS bucket, count(*) AS n FROM events GROUP BY bucket";
+        let sql =
+            "SELECT date_trunc('hour', ts) AS bucket, count(*) AS n FROM events GROUP BY bucket";
         let info = detect_time_bucket(sql).expect("should detect");
         assert_eq!(info.bucket_column, "ts");
         assert_eq!(info.bucket_alias, "bucket");
@@ -466,7 +468,8 @@ mod tests {
 
     #[test]
     fn detect_through_cast() {
-        let sql = "SELECT cast(date_trunc('day', ts) AS TEXT) AS d, count(*) FROM events GROUP BY 1";
+        let sql =
+            "SELECT cast(date_trunc('day', ts) AS TEXT) AS d, count(*) FROM events GROUP BY 1";
         let info = detect_time_bucket(sql).expect("should detect");
         assert_eq!(info.bucket_column, "ts");
         assert_eq!(info.width, BucketWidth::Day);

@@ -236,7 +236,10 @@ async fn scaling_4_noisy_neighbor() {
     let p50_ratio = under_p50 / baseline_p50.max(1e-9);
     let p99_ratio = under_p99 / baseline_p99.max(1e-9);
 
-    println!("(noisy full scans completed during phase B: {})", noisy_scans);
+    println!(
+        "(noisy full scans completed during phase B: {})",
+        noisy_scans
+    );
     println!("{:>14} {:>10} {:>10}", "scenario", "p50_ms", "p99_ms");
     println!(
         "{:>14} {:>10.2} {:>10.2}",

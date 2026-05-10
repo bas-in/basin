@@ -12,9 +12,7 @@ use std::time::Instant;
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
-use basin_cv::{
-    CvRefreshOutcome, CvRefresher, CvSpec, RefreshMode, RefreshSpy, TestClock,
-};
+use basin_cv::{CvRefreshOutcome, CvRefresher, CvSpec, RefreshMode, RefreshSpy, TestClock};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use chrono::{Duration, TimeZone, Utc};
 use object_store::local::LocalFileSystem;
@@ -143,7 +141,10 @@ async fn first_refresh_full_scan_then_watermark_set() {
 
     // No watermark after registration.
     let cvs = refresher.store().list_cvs(&tenant).await.unwrap();
-    assert!(cvs[0].last_bucket_max.is_none(), "registration should not set watermark");
+    assert!(
+        cvs[0].last_bucket_max.is_none(),
+        "registration should not set watermark"
+    );
 
     // Insert a few rows, advance, tick. First refresh = full.
     let s = eng.open_session(tenant).await.unwrap();
@@ -209,7 +210,11 @@ async fn incremental_refresh_only_aggregates_new_rows() {
 
     let logged = spy.drain();
     assert_eq!(logged.len(), 1);
-    assert_eq!(logged[0].1, RefreshMode::Incremental, "second tick must be incremental");
+    assert_eq!(
+        logged[0].1,
+        RefreshMode::Incremental,
+        "second tick must be incremental"
+    );
     let sql = &logged[0].2;
     let lower = sql.to_ascii_lowercase();
     assert!(
@@ -526,10 +531,7 @@ async fn incremental_speedup_observability() {
         let id = 100_000 + i;
         // All in one bucket so the rewrite plan is small.
         let minute = i % 60;
-        sql.push_str(&format!(
-            "({id}, '2026-06-15T12:{:02}:00Z')",
-            minute
-        ));
+        sql.push_str(&format!("({id}, '2026-06-15T12:{:02}:00Z')", minute));
     }
     s.execute(&sql).await.unwrap();
     clock.advance(Duration::seconds(120));

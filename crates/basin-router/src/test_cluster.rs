@@ -231,8 +231,8 @@ impl TenantResolver for CountingResolver {
 /// resolver, so resolution is consistent across processes.
 pub async fn start_n_shards(n: usize) -> Cluster {
     let data_dir = TempDir::new().expect("tempdir for shared storage");
-    let fs = LocalFileSystem::new_with_prefix(data_dir.path())
-        .expect("local fs at storage tempdir");
+    let fs =
+        LocalFileSystem::new_with_prefix(data_dir.path()).expect("local fs at storage tempdir");
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
@@ -259,8 +259,7 @@ pub async fn start_n_shards_with_storage(
 ) -> Cluster {
     assert!(n >= 1, "start_n_shards requires N >= 1");
 
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
 
     let resolver = Arc::new(DynamicTenantResolver::new());
 

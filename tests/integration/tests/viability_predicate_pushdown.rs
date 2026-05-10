@@ -27,12 +27,12 @@ use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric}
 use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;
-use serde_json::json;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
     PutOptions, PutPayload, PutResult,
 };
+use serde_json::json;
 use tempfile::TempDir;
 
 const ROWS_PER_BATCH: usize = 10_000;
@@ -156,11 +156,7 @@ fn total_bytes_on_disk(root: &std::path::Path) -> u64 {
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry.unwrap();
         if entry.file_type().is_file()
-            && entry
-                .path()
-                .extension()
-                .and_then(|s| s.to_str())
-                == Some("parquet")
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("parquet")
         {
             total += std::fs::metadata(entry.path()).unwrap().len();
         }
@@ -171,7 +167,8 @@ fn total_bytes_on_disk(root: &std::path::Path) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn viability_3_predicate_pushdown() {
     let dir = TempDir::new().unwrap();
-    let inner: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let inner: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let counting = Arc::new(CountingStore {
         inner,
         range_bytes: AtomicU64::new(0),
@@ -241,7 +238,10 @@ async fn viability_3_predicate_pushdown() {
         let b = b.unwrap();
         hit_rows += b.num_rows();
     }
-    assert_eq!(hit_rows, 1, "expected exactly one row for id={TARGET_ID}, got {hit_rows}");
+    assert_eq!(
+        hit_rows, 1,
+        "expected exactly one row for id={TARGET_ID}, got {hit_rows}"
+    );
     let point_bytes =
         counting.range_bytes.load(Ordering::Relaxed) + counting.full_bytes.load(Ordering::Relaxed);
 

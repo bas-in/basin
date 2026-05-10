@@ -39,8 +39,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -148,7 +147,11 @@ async fn simple_query_select_then_select() {
         }
     }
     assert_eq!(row_values, vec!["1".to_string(), "2".to_string()]);
-    assert_eq!(complete_tags.len(), 2, "expected two CommandCompletes, got {complete_tags:?}");
+    assert_eq!(
+        complete_tags.len(),
+        2,
+        "expected two CommandCompletes, got {complete_tags:?}"
+    );
 }
 
 /// Mid-batch failure — the failing statement reports an error AND every

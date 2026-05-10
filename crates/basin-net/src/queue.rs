@@ -165,12 +165,7 @@ impl RequestQueue {
         }
     }
 
-    async fn persist(
-        &self,
-        tenant: &TenantId,
-        id: RequestId,
-        resp: &HttpResponse,
-    ) -> Result<()> {
+    async fn persist(&self, tenant: &TenantId, id: RequestId, resp: &HttpResponse) -> Result<()> {
         self.inner.store.record(tenant, id, id, resp).await
     }
 }

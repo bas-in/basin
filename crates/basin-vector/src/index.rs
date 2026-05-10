@@ -205,10 +205,14 @@ mod tests {
     use super::*;
 
     fn rand_vec(seed: u64, dim: usize) -> Vec<f32> {
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (0..dim)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / u32::MAX as f32) - 0.5
             })
             .collect()

@@ -259,9 +259,7 @@ pub async fn rewrite_vector_order_by(
     };
     let dim = match meta.schema.field_with_name(&vec_col) {
         Ok(field) => match field.data_type() {
-            DataType::FixedSizeList(child, n)
-                if matches!(child.data_type(), DataType::Float32) =>
-            {
+            DataType::FixedSizeList(child, n) if matches!(child.data_type(), DataType::Float32) => {
                 *n as usize
             }
             _ => return Ok(None),
@@ -358,12 +356,20 @@ fn parse_pushdown_predicate(expr: &Expr) -> Option<Vec<Predicate>> {
 
 fn collect_eq_atoms(expr: &Expr, out: &mut Vec<Predicate>) -> Option<()> {
     match expr {
-        Expr::BinaryOp { op: BinaryOperator::And, left, right } => {
+        Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left,
+            right,
+        } => {
             collect_eq_atoms(left, out)?;
             collect_eq_atoms(right, out)
         }
         Expr::Nested(inner) => collect_eq_atoms(inner, out),
-        Expr::BinaryOp { op: BinaryOperator::Eq, left, right } => {
+        Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left,
+            right,
+        } => {
             let pred = parse_eq_atom(left, right)?;
             out.push(pred);
             Some(())
@@ -393,8 +399,14 @@ fn as_identifier(e: &Expr) -> Option<String> {
 /// vocabulary the point-query fast path accepts.
 fn literal_value(e: &Expr) -> Option<ScalarValue> {
     let (negate, inner) = match e {
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (true, expr.as_ref()),
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => (false, expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => (false, expr.as_ref()),
         other => (false, other),
     };
     match inner {
@@ -679,10 +691,7 @@ pub fn surviving_indices(batch: &RecordBatch, filters: &[Predicate]) -> Result<V
 /// Project `batch` down to `cols` (in the user's order) and drop the
 /// trailing `_distance` column the engine `vector_search` appends. When
 /// `cols` is `None` we return every column except `_distance`.
-pub fn project_for_user(
-    batch: &RecordBatch,
-    cols: &Option<Vec<String>>,
-) -> Result<RecordBatch> {
+pub fn project_for_user(batch: &RecordBatch, cols: &Option<Vec<String>>) -> Result<RecordBatch> {
     let schema = batch.schema();
     let names: Vec<String> = match cols {
         Some(cols) => cols.clone(),
@@ -744,7 +753,10 @@ pub fn empty_for_projection(
         })
         .collect::<Result<Vec<_>>>()?;
     let schema = Arc::new(Schema::new(
-        fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
+        fields
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
     ));
     let cols = fields
         .iter()
@@ -778,7 +790,10 @@ mod tests {
     #[test]
     fn mark_vector_ops_basic() {
         let s = mark_vector_ops("SELECT * FROM t ORDER BY embedding <-> '[0.1, 0.2]' LIMIT 5");
-        assert!(s.contains("__basin_vop_l2(embedding, '[0.1, 0.2]')"), "got: {s}");
+        assert!(
+            s.contains("__basin_vop_l2(embedding, '[0.1, 0.2]')"),
+            "got: {s}"
+        );
     }
 
     #[test]

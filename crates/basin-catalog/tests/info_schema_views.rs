@@ -24,7 +24,10 @@ fn name(s: &str) -> TableName {
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<StringArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
 }
 
 fn col_i16<'a>(b: &'a RecordBatch, n: &str) -> &'a Int16Array {
@@ -44,7 +47,10 @@ fn col_i64<'a>(b: &'a RecordBatch, n: &str) -> &'a Int64Array {
 
 fn col_bool<'a>(b: &'a RecordBatch, n: &str) -> &'a BooleanArray {
     let idx = b.schema().index_of(n).unwrap();
-    b.column(idx).as_any().downcast_ref::<BooleanArray>().unwrap()
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
 }
 
 /// Build a `Schema` that exercises the type-mapping table: int4/int8/text/
@@ -251,10 +257,7 @@ async fn pg_attribute_attrelid_matches_pg_class_oid() {
         .map(|i| col_i64(&pg_attr, "attrelid").value(i))
         .collect();
     for r in attrelids {
-        assert_eq!(
-            r, class_oid,
-            "attrelid must equal the table's pg_class.oid"
-        );
+        assert_eq!(r, class_oid, "attrelid must equal the table's pg_class.oid");
     }
 }
 

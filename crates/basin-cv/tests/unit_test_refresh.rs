@@ -161,5 +161,8 @@ async fn refresh_picks_up_new_rows() {
         }
         other => panic!("unexpected: {other:?}"),
     };
-    assert_eq!(total, 7, "refresh should reflect the 7 events now in the table");
+    assert_eq!(
+        total, 7,
+        "refresh should reflect the 7 events now in the table"
+    );
 }

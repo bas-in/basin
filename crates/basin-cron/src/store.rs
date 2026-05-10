@@ -191,10 +191,8 @@ impl CronStore {
             .ok_or_else(|| ScheduleError::NotFound(jobname.to_string()))?;
         let jobid = job.jobid;
         let sess = self.inner.engine.open_session(*tenant).await?;
-        sess.execute(&format!(
-            "DELETE FROM {JOB_TABLE} WHERE jobid = {jobid}"
-        ))
-        .await?;
+        sess.execute(&format!("DELETE FROM {JOB_TABLE} WHERE jobid = {jobid}"))
+            .await?;
         Ok(jobid)
     }
 
@@ -267,11 +265,7 @@ impl CronStore {
     }
 
     /// Append one row to `cron_job_run_details`.
-    pub async fn record_run(
-        &self,
-        tenant: &TenantId,
-        detail: &CronRunDetail,
-    ) -> Result<()> {
+    pub async fn record_run(&self, tenant: &TenantId, detail: &CronRunDetail) -> Result<()> {
         self.ensure_tables(tenant).await?;
         let sess = self.inner.engine.open_session(*tenant).await?;
         sess.execute(&format!(
@@ -404,7 +398,7 @@ fn sql_text(s: &str) -> String {
 }
 
 fn unix_ms_to_dt(ms: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_else(|| Utc::now())
+    DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
 }
 
 fn status_from_str(s: &str) -> JobStatus {
@@ -435,10 +429,7 @@ async fn list_table_names(sess: &basin_engine::TenantSession) -> Result<Vec<Stri
     Ok(out)
 }
 
-fn downcast_i64(
-    b: &arrow_array::RecordBatch,
-    col: &str,
-) -> Result<Vec<i64>> {
+fn downcast_i64(b: &arrow_array::RecordBatch, col: &str) -> Result<Vec<i64>> {
     let arr = b
         .column_by_name(col)
         .ok_or_else(|| BasinError::internal(format!("missing col {col}")))?;
@@ -453,10 +444,7 @@ fn downcast_i64(
     Ok(v)
 }
 
-fn downcast_opt_i64(
-    b: &arrow_array::RecordBatch,
-    col: &str,
-) -> Result<Vec<Option<i64>>> {
+fn downcast_opt_i64(b: &arrow_array::RecordBatch, col: &str) -> Result<Vec<Option<i64>>> {
     let arr = b
         .column_by_name(col)
         .ok_or_else(|| BasinError::internal(format!("missing col {col}")))?;
@@ -466,15 +454,16 @@ fn downcast_opt_i64(
         .ok_or_else(|| BasinError::internal(format!("col {col} not Int64")))?;
     let mut v = Vec::with_capacity(arr.len());
     for i in 0..arr.len() {
-        v.push(if arr.is_null(i) { None } else { Some(arr.value(i)) });
+        v.push(if arr.is_null(i) {
+            None
+        } else {
+            Some(arr.value(i))
+        });
     }
     Ok(v)
 }
 
-fn downcast_str(
-    b: &arrow_array::RecordBatch,
-    col: &str,
-) -> Result<Vec<String>> {
+fn downcast_str(b: &arrow_array::RecordBatch, col: &str) -> Result<Vec<String>> {
     let arr = b
         .column_by_name(col)
         .ok_or_else(|| BasinError::internal(format!("missing col {col}")))?;
@@ -489,10 +478,7 @@ fn downcast_str(
     Ok(v)
 }
 
-fn downcast_opt_str(
-    b: &arrow_array::RecordBatch,
-    col: &str,
-) -> Result<Vec<Option<String>>> {
+fn downcast_opt_str(b: &arrow_array::RecordBatch, col: &str) -> Result<Vec<Option<String>>> {
     let arr = b
         .column_by_name(col)
         .ok_or_else(|| BasinError::internal(format!("missing col {col}")))?;
@@ -502,7 +488,11 @@ fn downcast_opt_str(
         .ok_or_else(|| BasinError::internal(format!("col {col} not Utf8")))?;
     let mut v = Vec::with_capacity(arr.len());
     for i in 0..arr.len() {
-        v.push(if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) });
+        v.push(if arr.is_null(i) {
+            None
+        } else {
+            Some(arr.value(i).to_string())
+        });
     }
     Ok(v)
 }

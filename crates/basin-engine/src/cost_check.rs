@@ -40,7 +40,9 @@ use sqlparser::ast::{Statement, TableFactor};
 /// whose estimate exceeds `n` rows. Cached so repeated calls are free.
 pub fn cost_limit_rows() -> Option<u64> {
     static CACHED: OnceLock<Option<u64>> = OnceLock::new();
-    *CACHED.get_or_init(|| parse_cost_limit(std::env::var("BASIN_QUERY_COST_LIMIT_ROWS").ok().as_deref()))
+    *CACHED.get_or_init(|| {
+        parse_cost_limit(std::env::var("BASIN_QUERY_COST_LIMIT_ROWS").ok().as_deref())
+    })
 }
 
 /// Pure parse: takes the raw string (or `None` for unset) and produces the

@@ -102,24 +102,21 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
         ws_schema::DataType::LargeBinary => df_schema::DataType::LargeBinary,
         ws_schema::DataType::FixedSizeBinary(n) => df_schema::DataType::FixedSizeBinary(*n),
         ws_schema::DataType::Date32 => df_schema::DataType::Date32,
-        ws_schema::DataType::Timestamp(unit, tz) => df_schema::DataType::Timestamp(
-            timeunit_ws_to_df(unit),
-            tz.clone(),
-        ),
+        ws_schema::DataType::Timestamp(unit, tz) => {
+            df_schema::DataType::Timestamp(timeunit_ws_to_df(unit), tz.clone())
+        }
         ws_schema::DataType::Decimal128(p, s) => df_schema::DataType::Decimal128(*p, *s),
         ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano) => {
             df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano)
         }
-        ws_schema::DataType::FixedSizeList(child, n) => {
-            df_schema::DataType::FixedSizeList(
-                Arc::new(df_schema::Field::new(
-                    child.name().clone(),
-                    data_type_ws_to_df(child.data_type())?,
-                    child.is_nullable(),
-                )),
-                *n,
-            )
-        }
+        ws_schema::DataType::FixedSizeList(child, n) => df_schema::DataType::FixedSizeList(
+            Arc::new(df_schema::Field::new(
+                child.name().clone(),
+                data_type_ws_to_df(child.data_type())?,
+                child.is_nullable(),
+            )),
+            *n,
+        ),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "cannot convert workspace-arrow type to df-arrow: {other:?}"
@@ -142,24 +139,21 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         df_schema::DataType::LargeBinary => ws_schema::DataType::LargeBinary,
         df_schema::DataType::FixedSizeBinary(n) => ws_schema::DataType::FixedSizeBinary(*n),
         df_schema::DataType::Date32 => ws_schema::DataType::Date32,
-        df_schema::DataType::Timestamp(unit, tz) => ws_schema::DataType::Timestamp(
-            timeunit_df_to_ws(unit),
-            tz.clone(),
-        ),
+        df_schema::DataType::Timestamp(unit, tz) => {
+            ws_schema::DataType::Timestamp(timeunit_df_to_ws(unit), tz.clone())
+        }
         df_schema::DataType::Decimal128(p, s) => ws_schema::DataType::Decimal128(*p, *s),
         df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano) => {
             ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano)
         }
-        df_schema::DataType::FixedSizeList(child, n) => {
-            ws_schema::DataType::FixedSizeList(
-                Arc::new(ws_schema::Field::new(
-                    child.name().clone(),
-                    data_type_df_to_ws(child.data_type())?,
-                    child.is_nullable(),
-                )),
-                *n,
-            )
-        }
+        df_schema::DataType::FixedSizeList(child, n) => ws_schema::DataType::FixedSizeList(
+            Arc::new(ws_schema::Field::new(
+                child.name().clone(),
+                data_type_df_to_ws(child.data_type())?,
+                child.is_nullable(),
+            )),
+            *n,
+        ),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "cannot convert df-arrow type to workspace-arrow: {other:?}"
@@ -173,24 +167,20 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
 /// strategy, opposite arrow versions. Used when the engine needs to feed
 /// a workspace-arrow batch into DataFusion (e.g. registering a one-row
 /// `MemTable` for generated-column expression evaluation).
-pub(crate) fn batch_ws_to_df(
-    batch: &ws_array::RecordBatch,
-) -> Result<df_array::RecordBatch> {
+pub(crate) fn batch_ws_to_df(batch: &ws_array::RecordBatch) -> Result<df_array::RecordBatch> {
     let target_schema = Arc::new(schema_ws_to_df(batch.schema().as_ref())?);
     let mut columns: Vec<Arc<dyn df_array::Array>> = Vec::with_capacity(batch.num_columns());
     for (i, field) in target_schema.fields().iter().enumerate() {
         let src = batch.column(i);
         let dst: Arc<dyn df_array::Array> = match field.data_type() {
-            df_schema::DataType::Null => {
-                Arc::new(df_array::NullArray::new(src.len()))
-            }
+            df_schema::DataType::Null => Arc::new(df_array::NullArray::new(src.len())),
             df_schema::DataType::Int16 => {
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::Int16Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Int16Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Int16Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i16>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -200,9 +190,9 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::Int32Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Int32Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Int32Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i32>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -212,9 +202,9 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::Int64Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Int64Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Int64Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i64>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -224,9 +214,9 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::Date32Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Date32Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Date32Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i32>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -236,11 +226,17 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::StringArray>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected StringArray for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected StringArray for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<String>> = (0..s.len())
-                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j).to_string()) })
+                    .map(|j| {
+                        if s.is_null(j) {
+                            None
+                        } else {
+                            Some(s.value(j).to_string())
+                        }
+                    })
                     .collect();
                 Arc::new(df_array::StringArray::from(vals))
             }
@@ -248,9 +244,9 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::BooleanArray>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected BooleanArray for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected BooleanArray for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<bool>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -260,9 +256,9 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::Float32Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Float32Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Float32Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<f32>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -272,9 +268,9 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::Float64Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Float64Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Float64Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<f64>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -284,9 +280,9 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::BinaryArray>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected BinaryArray for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected BinaryArray for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<&[u8]>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -296,9 +292,12 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::LargeBinaryArray>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected LargeBinaryArray for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected LargeBinaryArray for {}",
+                            field.name()
+                        ))
+                    })?;
                 let vals: Vec<Option<&[u8]>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -308,9 +307,12 @@ pub(crate) fn batch_ws_to_df(
                 let s = src
                     .as_any()
                     .downcast_ref::<ws_array::FixedSizeBinaryArray>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected FixedSizeBinaryArray for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected FixedSizeBinaryArray for {}",
+                            field.name()
+                        ))
+                    })?;
                 let size = *n;
                 let mut rows: Vec<Option<Vec<u8>>> = Vec::with_capacity(s.len());
                 for j in 0..s.len() {
@@ -334,19 +336,20 @@ pub(crate) fn batch_ws_to_df(
             }
             df_schema::DataType::Timestamp(unit, tz) => {
                 use datafusion::arrow::array::types::{
-                    TimestampMicrosecondType as DfMicros,
-                    TimestampMillisecondType as DfMilli,
-                    TimestampNanosecondType as DfNanos,
-                    TimestampSecondType as DfSec,
+                    TimestampMicrosecondType as DfMicros, TimestampMillisecondType as DfMilli,
+                    TimestampNanosecondType as DfNanos, TimestampSecondType as DfSec,
                 };
                 let vals: Vec<Option<i64>> = match unit {
                     DfTimeUnit::Microsecond => {
                         let s = src
                             .as_any()
                             .downcast_ref::<ws_array::TimestampMicrosecondArray>()
-                            .ok_or_else(|| BasinError::internal(format!(
-                                "expected TimestampMicrosecondArray for {}", field.name()
-                            )))?;
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected TimestampMicrosecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
                         (0..s.len())
                             .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                             .collect()
@@ -355,9 +358,12 @@ pub(crate) fn batch_ws_to_df(
                         let s = src
                             .as_any()
                             .downcast_ref::<ws_array::TimestampMillisecondArray>()
-                            .ok_or_else(|| BasinError::internal(format!(
-                                "expected TimestampMillisecondArray for {}", field.name()
-                            )))?;
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected TimestampMillisecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
                         (0..s.len())
                             .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                             .collect()
@@ -366,9 +372,12 @@ pub(crate) fn batch_ws_to_df(
                         let s = src
                             .as_any()
                             .downcast_ref::<ws_array::TimestampNanosecondArray>()
-                            .ok_or_else(|| BasinError::internal(format!(
-                                "expected TimestampNanosecondArray for {}", field.name()
-                            )))?;
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected TimestampNanosecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
                         (0..s.len())
                             .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                             .collect()
@@ -377,28 +386,31 @@ pub(crate) fn batch_ws_to_df(
                         let s = src
                             .as_any()
                             .downcast_ref::<ws_array::TimestampSecondArray>()
-                            .ok_or_else(|| BasinError::internal(format!(
-                                "expected TimestampSecondArray for {}", field.name()
-                            )))?;
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected TimestampSecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
                         (0..s.len())
                             .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                             .collect()
                     }
                 };
-                let dt = df_schema::DataType::Timestamp(unit.clone(), tz.clone());
+                let dt = df_schema::DataType::Timestamp(*unit, tz.clone());
                 let arr: Arc<dyn df_array::Array> = match unit {
                     DfTimeUnit::Microsecond => Arc::new(
                         df_array::PrimitiveArray::<DfMicros>::from(vals).with_data_type(dt),
                     ),
-                    DfTimeUnit::Millisecond => Arc::new(
-                        df_array::PrimitiveArray::<DfMilli>::from(vals).with_data_type(dt),
-                    ),
-                    DfTimeUnit::Nanosecond => Arc::new(
-                        df_array::PrimitiveArray::<DfNanos>::from(vals).with_data_type(dt),
-                    ),
-                    DfTimeUnit::Second => Arc::new(
-                        df_array::PrimitiveArray::<DfSec>::from(vals).with_data_type(dt),
-                    ),
+                    DfTimeUnit::Millisecond => {
+                        Arc::new(df_array::PrimitiveArray::<DfMilli>::from(vals).with_data_type(dt))
+                    }
+                    DfTimeUnit::Nanosecond => {
+                        Arc::new(df_array::PrimitiveArray::<DfNanos>::from(vals).with_data_type(dt))
+                    }
+                    DfTimeUnit::Second => {
+                        Arc::new(df_array::PrimitiveArray::<DfSec>::from(vals).with_data_type(dt))
+                    }
                 };
                 arr
             }
@@ -410,11 +422,20 @@ pub(crate) fn batch_ws_to_df(
                 let src_arr = src
                     .as_any()
                     .downcast_ref::<ws_array::Decimal128Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Decimal128Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected Decimal128Array for {}",
+                            field.name()
+                        ))
+                    })?;
                 let vals: Vec<Option<i128>> = (0..src_arr.len())
-                    .map(|j| if src_arr.is_null(j) { None } else { Some(src_arr.value(j)) })
+                    .map(|j| {
+                        if src_arr.is_null(j) {
+                            None
+                        } else {
+                            Some(src_arr.value(j))
+                        }
+                    })
                     .collect();
                 let arr = df_array::Decimal128Array::from(vals)
                     .with_precision_and_scale(*p, *s)
@@ -443,17 +464,13 @@ pub(crate) fn batch_ws_to_df(
 /// `RecordBatch`. Since both arrow crates store the same physical layouts and
 /// the PoC only exercises a handful of scalar types, we walk arrays
 /// element-by-element rather than touching the FFI layer.
-pub(crate) fn batch_df_to_ws(
-    batch: &df_array::RecordBatch,
-) -> Result<ws_array::RecordBatch> {
+pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::RecordBatch> {
     let target_schema = Arc::new(schema_df_to_ws(batch.schema().as_ref())?);
     let mut columns: Vec<Arc<dyn ws_array::Array>> = Vec::with_capacity(batch.num_columns());
     for (i, field) in target_schema.fields().iter().enumerate() {
         let src = batch.column(i);
         let dst: Arc<dyn ws_array::Array> = match field.data_type() {
-            ws_schema::DataType::Null => {
-                Arc::new(ws_array::NullArray::new(src.len()))
-            }
+            ws_schema::DataType::Null => Arc::new(ws_array::NullArray::new(src.len())),
             ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano) => {
                 let s = src
                     .as_any()
@@ -484,7 +501,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::Int16Array>()
-                    .ok_or_else(|| BasinError::internal(format!("expected Int16Array for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Int16Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i16>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -494,7 +513,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::Int32Array>()
-                    .ok_or_else(|| BasinError::internal(format!("expected Int32Array for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Int32Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i32>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -504,7 +525,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::Int64Array>()
-                    .ok_or_else(|| BasinError::internal(format!("expected Int64Array for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Int64Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i64>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -514,7 +537,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::Date32Array>()
-                    .ok_or_else(|| BasinError::internal(format!("expected Date32Array for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Date32Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<i32>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -524,9 +549,17 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::StringArray>()
-                    .ok_or_else(|| BasinError::internal(format!("expected StringArray for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected StringArray for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<String>> = (0..s.len())
-                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j).to_string()) })
+                    .map(|j| {
+                        if s.is_null(j) {
+                            None
+                        } else {
+                            Some(s.value(j).to_string())
+                        }
+                    })
                     .collect();
                 Arc::new(ws_array::StringArray::from(vals))
             }
@@ -534,7 +567,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::BooleanArray>()
-                    .ok_or_else(|| BasinError::internal(format!("expected BooleanArray for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected BooleanArray for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<bool>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -544,7 +579,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::Float64Array>()
-                    .ok_or_else(|| BasinError::internal(format!("expected Float64Array for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Float64Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<f64>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -557,7 +594,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::Float32Array>()
-                    .ok_or_else(|| BasinError::internal(format!("expected Float32Array for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected Float32Array for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<f32>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -567,7 +606,9 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::BinaryArray>()
-                    .ok_or_else(|| BasinError::internal(format!("expected BinaryArray for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected BinaryArray for {}", field.name()))
+                    })?;
                 let vals: Vec<Option<&[u8]>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -577,7 +618,12 @@ pub(crate) fn batch_df_to_ws(
                 let s = src
                     .as_any()
                     .downcast_ref::<df_array::LargeBinaryArray>()
-                    .ok_or_else(|| BasinError::internal(format!("expected LargeBinaryArray for {}", field.name())))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected LargeBinaryArray for {}",
+                            field.name()
+                        ))
+                    })?;
                 let vals: Vec<Option<&[u8]>> = (0..s.len())
                     .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
                     .collect();
@@ -624,10 +670,8 @@ pub(crate) fn batch_df_to_ws(
                 // encoding, so we just rebuild on the workspace side using
                 // the typed array matching `unit`.
                 use arrow_array::types::{
-                    TimestampMicrosecondType as WsMicros,
-                    TimestampMillisecondType as WsMilli,
-                    TimestampNanosecondType as WsNanos,
-                    TimestampSecondType as WsSec,
+                    TimestampMicrosecondType as WsMicros, TimestampMillisecondType as WsMilli,
+                    TimestampNanosecondType as WsNanos, TimestampSecondType as WsSec,
                 };
                 use datafusion::arrow::array::TimestampMicrosecondArray as DfMicros;
                 use datafusion::arrow::array::TimestampMillisecondArray as DfMilli;
@@ -679,20 +723,20 @@ pub(crate) fn batch_df_to_ws(
                             .collect()
                     }
                 };
-                let dt = ws_schema::DataType::Timestamp(unit.clone(), tz.clone());
+                let dt = ws_schema::DataType::Timestamp(*unit, tz.clone());
                 let arr: Arc<dyn ws_array::Array> = match unit {
                     WsTimeUnit::Microsecond => Arc::new(
                         ws_array::PrimitiveArray::<WsMicros>::from(vals).with_data_type(dt),
                     ),
-                    WsTimeUnit::Millisecond => Arc::new(
-                        ws_array::PrimitiveArray::<WsMilli>::from(vals).with_data_type(dt),
-                    ),
-                    WsTimeUnit::Nanosecond => Arc::new(
-                        ws_array::PrimitiveArray::<WsNanos>::from(vals).with_data_type(dt),
-                    ),
-                    WsTimeUnit::Second => Arc::new(
-                        ws_array::PrimitiveArray::<WsSec>::from(vals).with_data_type(dt),
-                    ),
+                    WsTimeUnit::Millisecond => {
+                        Arc::new(ws_array::PrimitiveArray::<WsMilli>::from(vals).with_data_type(dt))
+                    }
+                    WsTimeUnit::Nanosecond => {
+                        Arc::new(ws_array::PrimitiveArray::<WsNanos>::from(vals).with_data_type(dt))
+                    }
+                    WsTimeUnit::Second => {
+                        Arc::new(ws_array::PrimitiveArray::<WsSec>::from(vals).with_data_type(dt))
+                    }
                 };
                 arr
             }
@@ -703,11 +747,20 @@ pub(crate) fn batch_df_to_ws(
                 let src_arr = src
                     .as_any()
                     .downcast_ref::<df_array::Decimal128Array>()
-                    .ok_or_else(|| BasinError::internal(format!(
-                        "expected Decimal128Array for {}", field.name()
-                    )))?;
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected Decimal128Array for {}",
+                            field.name()
+                        ))
+                    })?;
                 let vals: Vec<Option<i128>> = (0..src_arr.len())
-                    .map(|j| if src_arr.is_null(j) { None } else { Some(src_arr.value(j)) })
+                    .map(|j| {
+                        if src_arr.is_null(j) {
+                            None
+                        } else {
+                            Some(src_arr.value(j))
+                        }
+                    })
                     .collect();
                 let arr = ws_array::Decimal128Array::from(vals)
                     .with_precision_and_scale(*p, *s)

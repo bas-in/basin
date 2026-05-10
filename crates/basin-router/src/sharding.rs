@@ -147,12 +147,12 @@ pub fn parse_pins_env(s: &str) -> Result<HashMap<TenantId, usize>, String> {
         let (tenant_str, idx_str) = entry
             .split_once(':')
             .ok_or_else(|| format!("pin entry {entry:?} missing ':' separator"))?;
-        let tenant = TenantId::from_str(tenant_str.trim()).map_err(|e| {
-            format!("pin entry {entry:?}: invalid tenant ulid {tenant_str:?}: {e}")
-        })?;
-        let idx: usize = idx_str.trim().parse().map_err(|e| {
-            format!("pin entry {entry:?}: invalid endpoint index {idx_str:?}: {e}")
-        })?;
+        let tenant = TenantId::from_str(tenant_str.trim())
+            .map_err(|e| format!("pin entry {entry:?}: invalid tenant ulid {tenant_str:?}: {e}"))?;
+        let idx: usize = idx_str
+            .trim()
+            .parse()
+            .map_err(|e| format!("pin entry {entry:?}: invalid endpoint index {idx_str:?}: {e}"))?;
         out.insert(tenant, idx);
     }
     Ok(out)

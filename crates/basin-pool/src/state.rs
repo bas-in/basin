@@ -74,7 +74,10 @@ impl PoolState {
     /// Push `entry` onto the idle queue for `key` and wake at most one
     /// waiter for that tenant. Used by `PooledSession::Drop`.
     pub(crate) fn return_entry(&mut self, key: PoolKey, entry: PooledEntry) {
-        self.available.entry(key.clone()).or_default().push_back(entry);
+        self.available
+            .entry(key.clone())
+            .or_default()
+            .push_back(entry);
 
         // Wake one waiter for this tenant, if any. We don't need to match
         // the `client_key`: a waiter will retry `acquire` and pick up

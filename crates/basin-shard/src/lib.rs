@@ -102,11 +102,7 @@ impl Shard {
 
     /// Get a handle to `(tenant, partition)`. Lazy-loads the state from WAL +
     /// Parquet on first access; subsequent calls return a cheap clone.
-    pub async fn get(
-        &self,
-        tenant: &TenantId,
-        partition: &PartitionKey,
-    ) -> Result<TenantHandle> {
+    pub async fn get(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<TenantHandle> {
         self.inner.get(tenant, partition).await
     }
 
@@ -196,11 +192,7 @@ pub struct TenantHandle {
 impl TenantHandle {
     /// Append a batch into this tenant's table. Durable when this returns
     /// (WAL committed). The batch is ack'd before it has reached Parquet.
-    pub async fn write_batch(
-        &self,
-        table: &TableName,
-        batch: RecordBatch,
-    ) -> Result<()> {
+    pub async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
         self.inner.write_batch(table, batch).await
     }
 

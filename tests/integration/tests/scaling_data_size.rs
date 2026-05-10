@@ -134,7 +134,10 @@ async fn scaling_2_data_size() {
                 hits += b.unwrap().num_rows();
             }
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(hits, 1, "expected one hit for id={target_id} at n_rows={n_rows}, got {hits}");
+            assert_eq!(
+                hits, 1,
+                "expected one hit for id={target_id} at n_rows={n_rows}, got {hits}"
+            );
             point_samples.push(elapsed_ms);
         }
 
