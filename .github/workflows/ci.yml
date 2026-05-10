@@ -20,14 +20,13 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   # Pin to the toolchain the team develops against. Bump deliberately.
   RUST_TOOLCHAIN: 1.83.0
-  # sccache wraps rustc + cc/c++ and caches their outputs in the GitHub
-  # Actions cache. The biggest win is on duckdb-bundled, which is ~30
-  # MB of C++ that doesn't change between PRs; sccache turns that from
-  # ~5-10 min of compile into seconds of cache lookup.
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
-  CC: "sccache cc"
-  CXX: "sccache c++"
+  # NOTE: sccache via the GHA cache backend was tried here and reverted —
+  # the Azure-hosted artifactcache endpoint returns 400s intermittently
+  # (`Server startup failed: cache storage failed to read`), and because
+  # `RUSTC_WRAPPER=sccache` propagates to every rustc invocation, every
+  # build step fails when the backend is degraded. Rely on Swatinem
+  # rust-cache for incremental compilation across runs; that path is
+  # stable and gets us most of the benefit without the failure surface.
 
 jobs:
   fmt:
@@ -50,7 +49,6 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-clippy"
@@ -75,7 +73,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
         with:
           # Distinct key from clippy so the larger test-incremental

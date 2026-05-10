@@ -14,17 +14,6 @@ env:
   # that here so released tarballs don't ship ~hundreds of MB of
   # DWARF the user never reads.
   CARGO_PROFILE_RELEASE_DEBUG: "0"
-  # Wrap rustc and cc/c++ through sccache. This is the single biggest
-  # release-pipeline win: DuckDB-bundled is ~5-10 min of pure C++
-  # compile on every tag and almost nothing about it changes between
-  # tags. With sccache hits, the C++ portion drops to seconds.
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
-  CC: "sccache cc"
-  CXX: "sccache c++"
-  # The release profile already sets `lto = false` / `codegen-units = 16`
-  # in the workspace Cargo.toml — both pro-throughput choices. Don't
-  # set RUSTFLAGS=-Clto here; LTO doubles wall-clock for marginal size.
 
 permissions:
   contents: write
@@ -41,7 +30,7 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -53,61 +42,34 @@ jobs:
         # macOS-13 (x86_64 Intel Mac) was dropped: the Intel Mac install
         # base is shrinking fast, the runner-hour cost is high, and
         # users on Intel Macs can still run the Rosetta-translated
-        # aarch64 binary or build from source. Re-add when there's
-        # user-reported demand.
+        # aarch64 binary or build from source.
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
-      # sccache: C/C++ compile cache, backed by GitHub Actions cache.
-      # Most of the release wall-clock is duckdb-bundled compiling ~30
-      # MB of C++. Once the cache is warmed (first tag after a duckdb
-      # bump), subsequent tags hit ~99% sccache hits on the C++ side.
-      - uses: mozilla-actions/sccache-action@v0.0.6
-      # Use `lld` on Linux for ~2-3× faster final link. macOS already
-      # uses a fast linker by default.
-      - name: Install lld (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-      - name: Configure rustc to use lld (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p .cargo
-          {
-            echo "[target.${{ matrix.target }}]"
-            echo "linker = \"clang\""
-            echo "rustflags = [\"-C\", \"link-arg=-fuse-ld=lld\"]"
-          } >> .cargo/config.toml
-      # Cache target/ keyed on Cargo.lock + target triple. The C++
-      # build artefacts inside target/ (duckdb-sys's `.o` / archives)
-      # also survive here, complementing sccache's CC/CXX layer.
+
+      # Cache target/ keyed on Cargo.lock + target triple. duckdb-bundled
+      # is ~5-10 min of C++ compile on a cold cache; persisting target/
+      # across tag pushes means only the first tag pays it.
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-          # Persist the workspace target/ across release tags too, not
-          # just within one workflow run.
           save-if: "true"
 
       # Build only the binary crates. `-p basin-server -p basinctl`
-      # avoids compiling test-only deps; `--bins` is implied by the
-      # specific package selection.
+      # avoids compiling test-only deps.
       - name: Build basin-server + basinctl
         run: cargo build --release --target ${{ matrix.target }} -p basin-server -p basinctl
-
-      - name: Show sccache stats
-        run: sccache --show-stats
 
       - name: Package
         id: package
