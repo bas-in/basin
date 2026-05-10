@@ -10,6 +10,10 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.2] - 2026-05-10
+
 ### Added
 
 - **`SERIAL` / `BIGSERIAL` / `SMALLSERIAL` pseudo-types** (+ `SERIAL2` /
@@ -24,7 +28,8 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ### Changed
 
-- **CI pipeline performance**: dropped the duplicate
+- **CI pipeline performance**: sccache on clippy + test jobs (~5-10 min
+  saved per run on duckdb-bundled's C++ compile), dropped the duplicate
   `cargo build` step in the `test` job (let `cargo test` build the
   artefacts itself), dropped macOS from the test matrix (single Linux
   runner — re-add when a platform-specific regression actually surfaces),
@@ -35,8 +40,12 @@ graduate to 1.0 and the standard SemVer guarantees.
   cross-compile for `aarch64-unknown-linux-gnu` with GitHub's native
   `ubuntu-24.04-arm` runner — duckdb-bundled was timing out the
   cross-compile path; native compile finishes in ~⅓ of the wall-clock.
-  Also persists the per-target build cache across tag pushes and strips
-  debug info from release artefacts (`CARGO_PROFILE_RELEASE_DEBUG=0`).
+  Added sccache for the C++ layer + `lld` linker on Linux for ~2-3×
+  faster link. Dropped the `macos-13` (Intel Mac) target — runner-hour
+  cost vs. shrinking user base; aarch64 binary still runs under
+  Rosetta. Persists the per-target build cache across tag pushes and
+  strips debug info from release artefacts
+  (`CARGO_PROFILE_RELEASE_DEBUG=0`).
 
 ### Fixed
 
@@ -45,6 +54,12 @@ graduate to 1.0 and the standard SemVer guarantees.
   `coerce_i64` in the INSERT-default evaluator, which only recognised
   bare `Number` / `UnaryOp(Minus, Number)`. Negative values are
   parenthesised to keep adjacent operators from fusing.
+- `clippy::approx_constant` deny in `prepared.rs:995` (the `3.14` in
+  `substitute_float_keeps_decimal_point`) — was breaking both the
+  `clippy` and `test` CI jobs because clippy's deny-by-default lints
+  turn into hard compile errors. Changed the literal to `2.25`; the
+  test only ever cared about decimal-point preservation, not the
+  specific value.
 
 ## [0.1.1] - 2026-05-10
 
@@ -114,5 +129,6 @@ Phase 6 production-hardening entry batch.
 - `basin-cloud` and `basin-billing` workspace crates (moved to `basin-cloud` repo)
 - `CLOUD_ROADMAP.md` (canonical copy lives in `basin-cloud` repo)
 
-[Unreleased]: https://github.com/bas-in/basin/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/bas-in/basin/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/bas-in/basin/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/bas-in/basin/releases/tag/v0.1.1
