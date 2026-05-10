@@ -192,6 +192,89 @@ pub(crate) async fn exec_delete(
         });
     }
 
+    // Parent-side FK enforcement on DELETE. Compute the deleted PK
+    // tuple set, then for every child table that references this
+    // one: NO ACTION rejects when referring rows exist; CASCADE
+    // captures rows for a follow-on DELETE.
+    let mut cascades: Vec<crate::constraints::CascadeDelete> = Vec::new();
+    if !meta.pk_columns.is_empty() {
+        let mut deleted_pks: std::collections::HashSet<Vec<String>> =
+            Default::default();
+        for p in &dropped_paths {
+            let mut stream = sess
+                .engine
+                .config()
+                .storage
+                .read_file(&sess.tenant, &object_store::path::Path::from(p.as_str()))
+                .await?;
+            while let Some(rb) = stream.next().await {
+                let rb = rb?;
+                let idx: Vec<usize> = meta
+                    .pk_columns
+                    .iter()
+                    .map(|c| {
+                        rb.schema().index_of(c).map_err(|_| {
+                            BasinError::internal(format!("PK column {c:?} missing"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..rb.num_rows() {
+                    if let Some(k) =
+                        crate::constraints::pk_tuple_for_row(&rb, &idx, row)?
+                    {
+                        deleted_pks.insert(k);
+                    }
+                }
+            }
+        }
+        for p in &replaced_paths {
+            let mut original: std::collections::HashSet<Vec<String>> = Default::default();
+            let mut stream = sess
+                .engine
+                .config()
+                .storage
+                .read_file(&sess.tenant, &object_store::path::Path::from(p.as_str()))
+                .await?;
+            while let Some(rb) = stream.next().await {
+                let rb = rb?;
+                let idx: Vec<usize> = meta
+                    .pk_columns
+                    .iter()
+                    .map(|c| {
+                        rb.schema().index_of(c).map_err(|_| {
+                            BasinError::internal(format!("PK column {c:?} missing"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..rb.num_rows() {
+                    if let Some(k) =
+                        crate::constraints::pk_tuple_for_row(&rb, &idx, row)?
+                    {
+                        original.insert(k);
+                    }
+                }
+            }
+            let kept = crate::constraints::pk_tuples_from_batches(
+                &replacement_batches,
+                &meta.pk_columns,
+            )?;
+            for k in original {
+                if !kept.contains(&k) {
+                    deleted_pks.insert(k);
+                }
+            }
+        }
+        cascades = crate::constraints::check_parent_delete(
+            &sess.engine.config().catalog,
+            &sess.engine.config().storage,
+            &sess.tenant,
+            table.as_str(),
+            &deleted_pks,
+            &meta.pk_columns,
+        )
+        .await?;
+    }
+
     let audit_rows: Vec<RowChange> = if audit_table.is_some() {
         event_payloads.iter().map(|r| r.clone()).collect()
     } else {
@@ -218,6 +301,25 @@ pub(crate) async fn exec_delete(
 
     if let Some(audit) = audit_table.as_ref() {
         write_audit_rows(sess, audit, ChangeOp::Delete, audit_rows).await?;
+    }
+
+    // Dispatch CASCADE DELETEs on child tables. Each cascade is a
+    // standard recursive DELETE call; same code path → triggers any
+    // grand-child cascades automatically.
+    for cd in cascades {
+        let child_meta = sess
+            .engine
+            .config()
+            .catalog
+            .load_table(&sess.tenant, &cd.child_table)
+            .await?;
+        let where_sql = crate::constraints::build_in_predicate_sql(
+            &cd.rows,
+            &cd.fk_columns,
+            child_meta.schema.as_ref(),
+        )?;
+        let sql = format!("DELETE FROM {} WHERE {where_sql}", cd.child_table.as_str());
+        Box::pin(sess.execute(&sql)).await?;
     }
 
     Ok(ExecResult::Empty {
@@ -437,6 +539,59 @@ pub(crate) async fn exec_update(
         return Ok(ExecResult::Empty {
             tag: "UPDATE 0".into(),
         });
+    }
+
+    // CHECK / FK / PK enforcement on the post-SET batches.
+    if !meta.check_constraints.is_empty() {
+        for batch in &replacement_batches {
+            crate::constraints::enforce_check_constraints(
+                table.as_str(),
+                meta.schema.as_ref(),
+                &meta.check_constraints,
+                batch,
+            )
+            .await?;
+        }
+    }
+    let assignments_touch_pk = meta
+        .pk_columns
+        .iter()
+        .any(|p| {
+            assignments
+                .iter()
+                .any(|(idx, _)| meta.schema.field(*idx).name() == p)
+        });
+    let assignments_touch_fk = meta.foreign_keys.iter().any(|fk| {
+        fk.columns.iter().any(|fc| {
+            assignments
+                .iter()
+                .any(|(idx, _)| meta.schema.field(*idx).name() == fc)
+        })
+    });
+    if assignments_touch_pk && !meta.pk_columns.is_empty() {
+        check_update_pk(
+            &sess.engine.config().storage,
+            &sess.tenant,
+            &table,
+            table.as_str(),
+            &meta.pk_columns,
+            &replacement_batches,
+            &replaced_paths,
+        )
+        .await?;
+    }
+    if assignments_touch_fk {
+        for batch in &replacement_batches {
+            crate::constraints::enforce_fk_on_insert(
+                &sess.engine.config().catalog,
+                &sess.engine.config().storage,
+                &sess.tenant,
+                table.as_str(),
+                &meta.foreign_keys,
+                batch,
+            )
+            .await?;
+        }
     }
 
     // Materialise audit rows from the same captured before/after pairs
@@ -722,6 +877,77 @@ async fn read_and_apply_assignments_mixed(
 /// Force-flush any in-RAM tail rows in the shard before we list data files.
 /// Without this, a DELETE / UPDATE issued shortly after an INSERT through
 /// the shard owner would silently skip rows that are still in the WAL.
+/// PK enforcement on UPDATE. Build the "existing PK set" from data
+/// files NOT in `replaced_paths` and validate the post-SET batches
+/// against that plus their own intra-batch duplicates.
+async fn check_update_pk(
+    storage: &Storage,
+    tenant: &basin_common::TenantId,
+    table: &TableName,
+    table_name_str: &str,
+    pk_columns: &[String],
+    batches: &[RecordBatch],
+    replaced_paths: &[String],
+) -> Result<()> {
+    if pk_columns.is_empty() {
+        return Ok(());
+    }
+    use std::collections::HashSet;
+    let replaced: HashSet<&str> = replaced_paths.iter().map(|s| s.as_str()).collect();
+    let data_files = storage.list_data_files_with_stats(tenant, table).await?;
+    let mut existing: HashSet<Vec<String>> = HashSet::new();
+    for f in &data_files {
+        if replaced.contains(f.path.as_ref()) {
+            continue;
+        }
+        let mut stream = storage.read_file(tenant, &f.path).await?;
+        while let Some(rb) = stream.next().await {
+            let rb = rb?;
+            let idx: Vec<usize> = pk_columns
+                .iter()
+                .map(|c| {
+                    rb.schema().index_of(c).map_err(|_| {
+                        BasinError::internal(format!("PK column {c:?} missing from data file"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for row in 0..rb.num_rows() {
+                if let Some(k) = crate::constraints::pk_tuple_for_row(&rb, &idx, row)? {
+                    existing.insert(k);
+                }
+            }
+        }
+    }
+    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    for b in batches {
+        let idx: Vec<usize> = pk_columns
+            .iter()
+            .map(|c| {
+                b.schema().index_of(c).map_err(|_| {
+                    BasinError::internal(format!("PK column {c:?} missing from update batch"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..b.num_rows() {
+            let Some(k) = crate::constraints::pk_tuple_for_row(b, &idx, row)? else {
+                return Err(BasinError::CheckViolation(format!(
+                    "null value in column violates not-null constraint on PRIMARY KEY of \
+                     \"{table_name_str}\""
+                )));
+            };
+            if existing.contains(&k) || !seen.insert(k.clone()) {
+                return Err(BasinError::UniqueViolation(format!(
+                    "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+                     Key ({})=({}) already exists.",
+                    pk_columns.join(", "),
+                    k.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn pre_mutation_flush(sess: &TenantSession) -> Result<()> {
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;

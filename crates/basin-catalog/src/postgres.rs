@@ -30,7 +30,7 @@ use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
 use crate::functions::SqlFunctionDef;
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::metadata::{
-    CvDef, DataFileRef, PartitionSpec, Policy, TableMetadata,
+    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, TableMetadata,
 };
 use crate::reactors::{self, ReactorDef, ReactorError, ReactorOps};
 use crate::sequences::{compute_next, SequenceDef, SequenceError};
@@ -205,6 +205,21 @@ impl PostgresCatalog {
             format!(
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS home_region TEXT"
+            ),
+            // Constraint enforcement (PK / CHECK / FK). Each is a JSONB
+            // payload — empty array / null means "no constraints"
+            // (back-compat: old rows deserialise to empty vecs).
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS pk_columns_json JSONB"
+            ),
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS check_constraints_json JSONB"
+            ),
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS foreign_keys_json JSONB"
             ),
             // Per-tenant SQL function definitions. One row per
             // (tenant, name); body is stored as raw SQL, args/return as
@@ -468,6 +483,9 @@ impl Catalog for PostgresCatalog {
             // Phase 5.7 B1 (parallel agent) — indexes placeholder so the
             // metadata struct stays buildable; B1 wires real reads.
             indexes: Vec::new(),
+            pk_columns: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         })
     }
 
@@ -485,7 +503,8 @@ impl Catalog for PostgresCatalog {
                             rls_enabled, policies_json, cold_after_seconds, cold_age_column,
                             bloom_filter_columns_json, row_group_rows,
                             continuous_aggregate_json, cluster_columns_json,
-                            home_region
+                            home_region,
+                            pk_columns_json, check_constraints_json, foreign_keys_json
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2"
                 ),
@@ -508,6 +527,9 @@ impl Catalog for PostgresCatalog {
         let row_group_rows_pg: Option<i64> = row.get(9);
         let continuous_aggregate_json: Option<serde_json::Value> = row.get(10);
         let cluster_columns_json: Option<serde_json::Value> = row.get(11);
+        let pk_columns_json: Option<serde_json::Value> = row.get(13);
+        let check_constraints_json: Option<serde_json::Value> = row.get(14);
+        let foreign_keys_json: Option<serde_json::Value> = row.get(15);
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
         let partition_spec = match partition_spec_json {
@@ -548,6 +570,22 @@ impl Catalog for PostgresCatalog {
             None => Vec::new(),
         };
         let home_region: Option<String> = row.get(12);
+        let pk_columns: Vec<String> = match pk_columns_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise pk_columns: {e}")))?,
+            None => Vec::new(),
+        };
+        let check_constraints: Vec<CheckConstraint> = match check_constraints_json {
+            Some(v) => serde_json::from_value(v).map_err(|e| {
+                BasinError::catalog(format!("deserialise check_constraints: {e}"))
+            })?,
+            None => Vec::new(),
+        };
+        let foreign_keys: Vec<ForeignKeyDef> = match foreign_keys_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise foreign_keys: {e}")))?,
+            None => Vec::new(),
+        };
 
         let snapshots = fetch_snapshots(&client, sch, &tenant_str, &table_str).await?;
         Ok(TableMetadata {
@@ -570,6 +608,9 @@ impl Catalog for PostgresCatalog {
             // Phase 5.7 B1 (parallel agent) — indexes placeholder so the
             // metadata struct stays buildable; B1 wires real reads.
             indexes: Vec::new(),
+            pk_columns,
+            check_constraints,
+            foreign_keys,
         })
     }
 
@@ -1190,6 +1231,65 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
+    #[instrument(skip(self, check_constraints, foreign_keys), fields(tenant = %tenant, table = %table))]
+    async fn set_table_constraints(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        pk_columns: Vec<String>,
+        check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<ForeignKeyDef>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let pk_json: Option<serde_json::Value> = if pk_columns.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_value(&pk_columns)
+                    .map_err(|e| BasinError::catalog(format!("serialise pk_columns: {e}")))?,
+            )
+        };
+        let check_json: Option<serde_json::Value> = if check_constraints.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&check_constraints).map_err(|e| {
+                BasinError::catalog(format!("serialise check_constraints: {e}"))
+            })?)
+        };
+        let fk_json: Option<serde_json::Value> = if foreign_keys.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_value(&foreign_keys)
+                    .map_err(|e| BasinError::catalog(format!("serialise foreign_keys: {e}")))?,
+            )
+        };
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables
+                     SET pk_columns_json = $3,
+                         check_constraints_json = $4,
+                         foreign_keys_json = $5
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[
+                    &tenant.to_string(),
+                    &table.to_string(),
+                    &pk_json,
+                    &check_json,
+                    &fk_json,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_table_constraints: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
     async fn set_schema(
         &self,
@@ -1339,14 +1439,16 @@ impl Catalog for PostgresCatalog {
                         policies_json, cold_after_seconds, cold_age_column,
                         bloom_filter_columns_json, row_group_rows,
                         continuous_aggregate_json, cluster_columns_json,
-                        home_region
+                        home_region,
+                        pk_columns_json, check_constraints_json, foreign_keys_json
                      )
                      SELECT tenant_id, $3, schema_json, current_snapshot,
                             format_version, partition_spec_json, rls_enabled,
                             policies_json, cold_after_seconds, cold_age_column,
                             bloom_filter_columns_json, row_group_rows,
                             continuous_aggregate_json, cluster_columns_json,
-                            home_region
+                            home_region,
+                            pk_columns_json, check_constraints_json, foreign_keys_json
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2
                      ON CONFLICT (tenant_id, table_name) DO NOTHING"

@@ -105,6 +105,11 @@ pub(crate) fn arrow_to_pg_type(dt: &DataType) -> Type {
         DataType::Interval(IntervalUnit::MonthDayNano) => Type::INTERVAL,
         DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
         DataType::Timestamp(_, None) => Type::TIMESTAMP,
+        // PG `numeric` (OID 1700) → Arrow `Decimal128(p, s)`. Wire format
+        // is text-only for v0.1 (binary numeric encoding is varlena-shaped:
+        // sign + weight + dscale + ndigits + base-10000 digit array; lots
+        // of edge cases. Lenient drivers tolerate text in a binary slot.)
+        DataType::Decimal128(_, _) => Type::NUMERIC,
         // Everything else gets formatted as text.
         _ => Type::TEXT,
     }
@@ -117,6 +122,8 @@ fn type_size(ty: &Type) -> i16 {
         Type::INT2 => 2,
         Type::BOOL => 1,
         Type::INTERVAL => 16,
+        // NUMERIC is varlena (-1) — variable-length wire payload.
+        Type::NUMERIC => -1,
         _ => -1,
     }
 }
@@ -489,6 +496,17 @@ fn render_cell(col: &dyn Array, idx: usize) -> String {
             let v = col.as_primitive::<IntervalMonthDayNanoType>().value(idx);
             let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(v);
             render_interval(months, days, nanos)
+        }
+        DataType::Decimal128(_, _) => {
+            // PG `numeric` text form: base-10 string with `scale` digits
+            // after the decimal point (or no point if scale=0). Arrow's
+            // `Decimal128Array::value_as_string` already produces exactly
+            // this shape (e.g. value `1234500` with scale=4 → `"123.4500"`).
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .expect("Decimal128Array for NUMERIC column");
+            arr.value_as_string(idx)
         }
         // Fallback: best-effort Debug rendering.
         other => format!("{other:?}@{idx}"),

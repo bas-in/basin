@@ -43,7 +43,7 @@ use basin_common::{PartitionKey, Result, TableName, TenantId};
 pub struct ShardConfig {
     pub storage: basin_storage::Storage,
     pub catalog: Arc<dyn basin_catalog::Catalog>,
-    pub wal: basin_wal::Wal,
+    pub wal: Arc<dyn basin_wal::Wal>,
     /// Tenants idle for at least this long are evicted by the eviction loop.
     /// Default 5 minutes.
     pub eviction_idle: Duration,
@@ -57,7 +57,7 @@ impl ShardConfig {
     pub fn new(
         storage: basin_storage::Storage,
         catalog: Arc<dyn basin_catalog::Catalog>,
-        wal: basin_wal::Wal,
+        wal: Arc<dyn basin_wal::Wal>,
     ) -> Self {
         Self {
             storage,
@@ -96,7 +96,7 @@ impl Shard {
 
     /// Handle to the underlying WAL. Exposed so the engine can plumb its
     /// per-tenant counter registry into the WAL alongside the storage layer.
-    pub fn wal(&self) -> &basin_wal::Wal {
+    pub fn wal(&self) -> &Arc<dyn basin_wal::Wal> {
         self.inner.wal()
     }
 
@@ -257,7 +257,7 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle;
     fn stats(&self) -> ShardStats;
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
-    fn wal(&self) -> &basin_wal::Wal;
+    fn wal(&self) -> &Arc<dyn basin_wal::Wal>;
     async fn flush_to_parquet(&self) -> Result<()>;
     async fn run_tiering_sweep(&self) -> Result<()>;
     /// Tenants the shard has resident state for. Used by the CV

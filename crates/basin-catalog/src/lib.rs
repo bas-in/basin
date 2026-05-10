@@ -49,8 +49,8 @@ pub use functions::{
 };
 pub use in_memory::InMemoryCatalog;
 pub use metadata::{
-    ColumnStats, CvDef, DataFileRef, PartitionSpec, Policy, PolicyCommand, SecondaryIndex,
-    TableMetadata,
+    CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
+    PolicyCommand, RefAction, SecondaryIndex, TableMetadata,
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
@@ -979,5 +979,23 @@ pub trait Catalog: Send + Sync {
     ) -> Result<Option<TenantStorageConfig>> {
         let _ = tenant;
         Ok(None)
+    }
+
+    /// Persist the PRIMARY KEY column list, CHECK constraints, and
+    /// FOREIGN KEY definitions for `(tenant, table)`. Called by
+    /// `CREATE TABLE` after the table itself has been created. Empty
+    /// vectors clear the corresponding constraint set. Default impl
+    /// is a no-op so the stub `RestCatalog` and any future backend
+    /// stay buildable; the in-memory and Postgres backends override.
+    async fn set_table_constraints(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        pk_columns: Vec<String>,
+        check_constraints: Vec<metadata::CheckConstraint>,
+        foreign_keys: Vec<metadata::ForeignKeyDef>,
+    ) -> Result<()> {
+        let _ = (tenant, table, pk_columns, check_constraints, foreign_keys);
+        Ok(())
     }
 }

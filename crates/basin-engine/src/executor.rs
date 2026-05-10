@@ -13,9 +13,7 @@ use sqlparser::parser::Parser;
 
 use crate::analytical_route::is_analytical;
 use crate::convert::{batch_df_to_ws, schema_df_to_ws};
-use crate::ddl::{
-    extract_create_table_cluster_by, partition_spec_from_ast, schema_from_columns_with_lifecycle,
-};
+use crate::ddl::{extract_create_table_cluster_by, partition_spec_from_ast};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
 use crate::lifecycle::{
     extract_create_table_lifecycle, extract_select_include_deleted, CreateTableLifecycle,
@@ -55,10 +53,12 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
 
-    // REFRESH MATERIALIZED VIEW <name> — sqlparser has no AST node for
-    // REFRESH, so we recognise the full statement textually and dispatch.
-    if let Some(name) = crate::cv_ddl::match_refresh_materialized_view(sql)? {
-        return crate::cv_ddl::exec_refresh_materialized_view(sess, &name).await;
+    // REFRESH MATERIALIZED VIEW <name> [WITH (full = true)] — sqlparser
+    // has no AST node for REFRESH, so we recognise the full statement
+    // textually and dispatch. `force_full` toggles the v0.1 opt-out from
+    // incremental refresh.
+    if let Some((name, force_full)) = crate::cv_ddl::match_refresh_materialized_view(sql)? {
+        return crate::cv_ddl::exec_refresh_materialized_view(sess, &name, force_full).await;
     }
 
     // ALTER FUNCTION <name>(<args>) RENAME TO <new>: sqlparser 0.52 has no
@@ -203,6 +203,34 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // INCLUDE DELETED on SELECT is the soft-delete opt-out.
     let (select_stripped, include_deleted) = extract_select_include_deleted(sql);
     let sql = select_stripped.as_str();
+
+    // Auto-route `ORDER BY <vec_col> <op> <lit> LIMIT k` to the HNSW fast
+    // path BEFORE the operator-to-UDF rewrite below. Once `<->` becomes
+    // `l2_distance(...)` the structural signal is gone. A `None` here
+    // means at least one criterion failed; the brute-force pipeline below
+    // takes over and correctness is preserved.
+    if let Some(plan) = crate::vector_planner::rewrite_vector_order_by(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        sql,
+    )
+    .await?
+    {
+        match execute_vector_search_plan(sess, plan).await {
+            Ok(res) => return Ok(res),
+            Err(e) => {
+                // The HNSW segment may carry a different metric than the
+                // user's operator (current sidecars are L2-only; users
+                // wanting cosine/dot still parse but the segment header
+                // mismatches). Fall back to brute-force rather than
+                // surfacing a routing-only error.
+                tracing::debug!(
+                    error = %e,
+                    "vector planner routed but storage rejected; falling back"
+                );
+            }
+        }
+    }
 
     // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
     // matching UDF calls before handing the SQL to sqlparser. See
@@ -528,6 +556,114 @@ fn rows_from_batches(batches: Vec<RecordBatch>) -> ExecResult {
     ExecResult::Rows { schema, batches }
 }
 
+/// Execute a `VectorSearchPlan` produced by `vector_planner`. Calls
+/// `Storage::vector_search` (via the existing `TenantSession::vector_search`
+/// fast path) with `fetch_k` candidates, applies any column-equality
+/// pushdown filters, truncates to the user's `LIMIT`, and projects to the
+/// user's `SELECT` list.
+///
+/// Mirrors the result shape `exec_select` would produce for the same query
+/// in brute-force mode: the projected user columns only, no synthetic
+/// `_distance` column. (Brute-force computes the distance in `ORDER BY` but
+/// only emits whatever the user wrote in `SELECT`.)
+async fn execute_vector_search_plan(
+    sess: &TenantSession,
+    plan: crate::vector_planner::VectorSearchPlan,
+) -> Result<ExecResult> {
+    let fetch_k = crate::vector_planner::fetch_k(&plan);
+    let distance = crate::vector_planner::distance_for(plan.distance_op);
+
+    // Resolve the user-projection schema up front so an empty result still
+    // has the correct column list.
+    let table_meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, &plan.table)
+        .await?;
+
+    let raw_batches = sess
+        .vector_search(
+            &plan.table,
+            &plan.vec_col,
+            plan.query_vec.clone(),
+            fetch_k,
+            distance,
+        )
+        .await?;
+
+    if raw_batches.is_empty() {
+        let empty = crate::vector_planner::empty_for_projection(
+            table_meta.schema.as_ref(),
+            &plan.projection,
+        )?;
+        let schema = empty.schema();
+        sess.engine.note_vector_routed();
+        return Ok(ExecResult::Rows {
+            schema,
+            batches: vec![empty],
+        });
+    }
+
+    // Apply any pushdown filters and truncate to k. The single-batch
+    // contract from `TenantSession::vector_search` keeps the loop trivial:
+    // each batch already carries `_distance` ascending, so the global
+    // top-k after filter is the prefix of `keep` indices.
+    let mut filtered_batches: Vec<RecordBatch> = Vec::with_capacity(raw_batches.len());
+    let mut total_kept = 0usize;
+    for batch in &raw_batches {
+        if total_kept >= plan.k {
+            break;
+        }
+        let mut keep = crate::vector_planner::surviving_indices(batch, &plan.filters)?;
+        if total_kept + keep.len() > plan.k {
+            keep.truncate(plan.k - total_kept);
+        }
+        if keep.is_empty() {
+            continue;
+        }
+        // Use arrow-select::take to preserve column order + types.
+        let indices = arrow_array::UInt32Array::from(
+            keep.iter().map(|i| *i as u32).collect::<Vec<_>>(),
+        );
+        let mut taken_cols = Vec::with_capacity(batch.num_columns());
+        for c in batch.columns() {
+            let t = arrow_select::take::take(c.as_ref(), &indices, None)
+                .map_err(|e| BasinError::internal(format!("take rows: {e}")))?;
+            taken_cols.push(t);
+        }
+        let taken =
+            RecordBatch::try_new(batch.schema(), taken_cols)
+                .map_err(|e| BasinError::internal(format!("rebuild taken batch: {e}")))?;
+        total_kept += taken.num_rows();
+        filtered_batches.push(taken);
+    }
+
+    if filtered_batches.is_empty() {
+        let empty = crate::vector_planner::empty_for_projection(
+            table_meta.schema.as_ref(),
+            &plan.projection,
+        )?;
+        let schema = empty.schema();
+        sess.engine.note_vector_routed();
+        return Ok(ExecResult::Rows {
+            schema,
+            batches: vec![empty],
+        });
+    }
+
+    let mut projected: Vec<RecordBatch> = Vec::with_capacity(filtered_batches.len());
+    for b in &filtered_batches {
+        projected.push(crate::vector_planner::project_for_user(b, &plan.projection)?);
+    }
+    let schema = projected[0].schema();
+    sess.engine.note_vector_routed();
+    Ok(ExecResult::Rows {
+        schema,
+        batches: projected,
+    })
+}
+
 async fn exec_create_table(
     sess: &TenantSession,
     mut ct: sqlparser::ast::CreateTable,
@@ -550,7 +686,12 @@ async fn exec_create_table(
     .await?;
     let extra_md = crate::type_ddl::rewrite_user_type_columns(&mut ct.columns, &bindings)?;
 
-    let schema = schema_from_columns_with_lifecycle(&ct.columns, &lifecycle)?;
+    let (schema, constraints) = crate::ddl::schema_and_constraints_from_columns(
+        &ct.columns,
+        &ct.constraints,
+        name,
+        &lifecycle,
+    )?;
     let schema = crate::type_ddl::apply_user_type_metadata(schema, &extra_md);
     let spec = partition_spec_from_ast(ct.partition_by.as_deref(), &schema)?;
 
@@ -563,6 +704,90 @@ async fn exec_create_table(
                 return Err(BasinError::InvalidSchema(format!(
                     "CLUSTER BY column {c:?} is not in the table schema"
                 )));
+            }
+        }
+    }
+
+    // Validate FK definitions before creating the table — referenced
+    // table must exist in the same tenant, referenced columns must be
+    // exactly the PK of the referenced table, and types must match.
+    for fk in &constraints.foreign_keys {
+        let ref_table_name = TableName::new(fk.ref_table.clone())?;
+        let pk_of_ref: Vec<String> = if ref_table_name == table {
+            constraints.pk_columns.clone()
+        } else {
+            let meta = sess
+                .engine
+                .config()
+                .catalog
+                .load_table(&sess.tenant, &ref_table_name)
+                .await
+                .map_err(|e| match e {
+                    BasinError::NotFound(_) => BasinError::InvalidSchema(format!(
+                        "FOREIGN KEY {:?}: referenced table {:?} does not exist in this tenant \
+                         (cross-tenant FKs are not supported in v0.1)",
+                        fk.name, fk.ref_table
+                    )),
+                    other => other,
+                })?;
+            meta.pk_columns.clone()
+        };
+        if pk_of_ref.is_empty() {
+            return Err(BasinError::InvalidSchema(format!(
+                "FOREIGN KEY {:?}: referenced table {:?} has no PRIMARY KEY (v0.1 requires \
+                 referenced columns to be the PK of the referenced table; UNIQUE-only \
+                 references are deferred to v0.2)",
+                fk.name, fk.ref_table
+            )));
+        }
+        let mut pk_set: std::collections::HashSet<String> = pk_of_ref
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        for c in &fk.ref_columns {
+            if !pk_set.remove(&c.to_ascii_lowercase()) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "FOREIGN KEY {:?}: referenced column {c:?} is not part of {:?}'s PRIMARY KEY",
+                    fk.name, fk.ref_table
+                )));
+            }
+        }
+        if !pk_set.is_empty() {
+            return Err(BasinError::InvalidSchema(format!(
+                "FOREIGN KEY {:?}: referenced columns must be exactly the PRIMARY KEY of {:?} \
+                 (missing {pk_set:?})",
+                fk.name, fk.ref_table
+            )));
+        }
+        for (lc, rc) in fk.columns.iter().zip(fk.ref_columns.iter()) {
+            let local_field = schema.field_with_name(lc).map_err(|_| {
+                BasinError::InvalidSchema(format!(
+                    "FOREIGN KEY {:?}: local column {lc:?} not in table",
+                    fk.name
+                ))
+            })?;
+            if ref_table_name != table {
+                let ref_meta = sess
+                    .engine
+                    .config()
+                    .catalog
+                    .load_table(&sess.tenant, &ref_table_name)
+                    .await?;
+                let ref_field = ref_meta.schema.field_with_name(rc).map_err(|_| {
+                    BasinError::InvalidSchema(format!(
+                        "FOREIGN KEY {:?}: referenced column {rc:?} not in {:?}",
+                        fk.name, fk.ref_table
+                    ))
+                })?;
+                if local_field.data_type() != ref_field.data_type() {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "FOREIGN KEY {:?}: local column {lc:?} type {:?} does not match \
+                         referenced column {rc:?} type {:?}",
+                        fk.name,
+                        local_field.data_type(),
+                        ref_field.data_type(),
+                    )));
+                }
             }
         }
     }
@@ -586,6 +811,23 @@ async fn exec_create_table(
             .config()
             .catalog
             .set_cluster_columns(&sess.tenant, &table, cols)
+            .await?;
+    }
+
+    if !constraints.pk_columns.is_empty()
+        || !constraints.checks.is_empty()
+        || !constraints.foreign_keys.is_empty()
+    {
+        sess.engine
+            .config()
+            .catalog
+            .set_table_constraints(
+                &sess.tenant,
+                &table,
+                constraints.pk_columns,
+                constraints.checks,
+                constraints.foreign_keys,
+            )
             .await?;
     }
 
@@ -679,6 +921,31 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
                 &batch,
             )
             .await?;
+            crate::constraints::enforce_check_constraints(
+                table.as_str(),
+                meta.schema.as_ref(),
+                &meta.check_constraints,
+                &batch,
+            )
+            .await?;
+            crate::constraints::enforce_fk_on_insert(
+                &sess.engine.config().catalog,
+                &sess.engine.config().storage,
+                &sess.tenant,
+                table.as_str(),
+                &meta.foreign_keys,
+                &batch,
+            )
+            .await?;
+            crate::constraints::enforce_pk_on_insert(
+                &sess.engine.config().storage,
+                &sess.tenant,
+                &table,
+                table.as_str(),
+                &meta.pk_columns,
+                &batch,
+            )
+            .await?;
             materialised_groups.push((pkey, batch));
         }
 
@@ -731,6 +998,35 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     crate::type_ddl::enforce_domain_checks(
         &sess.engine.config().catalog,
         &sess.tenant,
+        &batch,
+    )
+    .await?;
+    // PK / CHECK / FK enforcement. Order: CHECK (no I/O), then FK
+    // (one referenced-table scan), then PK (one full-table scan).
+    // v0.2 secondary indexes (Phase 5.7 B1) will collapse PK / FK
+    // to point lookups; for v0.1 we accept the scan cost.
+    crate::constraints::enforce_check_constraints(
+        table.as_str(),
+        meta.schema.as_ref(),
+        &meta.check_constraints,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_fk_on_insert(
+        &sess.engine.config().catalog,
+        &sess.engine.config().storage,
+        &sess.tenant,
+        table.as_str(),
+        &meta.foreign_keys,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_pk_on_insert(
+        &sess.engine.config().storage,
+        &sess.tenant,
+        &table,
+        table.as_str(),
+        &meta.pk_columns,
         &batch,
     )
     .await?;
@@ -965,6 +1261,31 @@ async fn exec_insert_select(
     crate::type_ddl::enforce_domain_checks(
         &sess.engine.config().catalog,
         &sess.tenant,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_check_constraints(
+        table.as_str(),
+        meta.schema.as_ref(),
+        &meta.check_constraints,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_fk_on_insert(
+        &sess.engine.config().catalog,
+        &sess.engine.config().storage,
+        &sess.tenant,
+        table.as_str(),
+        &meta.foreign_keys,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_pk_on_insert(
+        &sess.engine.config().storage,
+        &sess.tenant,
+        table,
+        table.as_str(),
+        &meta.pk_columns,
         &batch,
     )
     .await?;

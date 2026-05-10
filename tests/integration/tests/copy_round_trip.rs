@@ -246,11 +246,13 @@ async fn copy_rejects_unsupported_variants_without_desync() {
     // connection must remain usable for further queries. We don't check
     // the exact wording — tokio-postgres' top-level `Display` only emits
     // "db error: <SQLSTATE> ..."; assert the SQLSTATE 42601.
+    //
+    // Note: column-list and file-path variants are now SUPPORTED — they're
+    // covered in `copy_extensions.rs`. The only ones still rejected are
+    // BINARY format and custom DELIMITER.
     for sql in [
-        "COPY t (id) FROM STDIN",
         "COPY t FROM STDIN WITH (FORMAT BINARY)",
         "COPY t FROM STDIN WITH (DELIMITER '|')",
-        "COPY t FROM '/etc/passwd'",
     ] {
         let err = client
             .simple_query(sql)

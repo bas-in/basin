@@ -236,14 +236,16 @@ async fn s3_compare_postgres() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     // WAL stays in RAM — same rationale as s3_shard_insert_path.
     let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let wal = basin_wal::Wal::open(basin_wal::WalConfig {
-        object_store: wal_store,
-        root_prefix: None,
-        flush_interval: Duration::from_millis(200),
-        flush_max_bytes: 1024 * 1024,
-    })
-    .await
-    .unwrap();
+    let wal: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: wal_store,
+            root_prefix: None,
+            flush_interval: Duration::from_millis(200),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap(),
+    );
     let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
         storage.clone(),
         catalog.clone(),

@@ -13,8 +13,8 @@ use arrow_array::builder::{
 };
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, RecordBatch,
-    StringArray,
+    ArrayRef, BooleanArray, Decimal128Array, FixedSizeListArray, Float64Array, Int64Array,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Schema, TimeUnit};
 use basin_catalog::PartitionSpec;
@@ -229,6 +229,30 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 let arr = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                     row_iter, *dim,
                 );
+                Arc::new(arr)
+            }
+            DataType::Decimal128(p, s) => {
+                // PG `numeric` literal coercion: scale a base-10 number
+                // literal to the column's `(precision, scale)` and store
+                // as i128. Pre-validated: `1 <= p <= 38`, `0 <= s <= p`.
+                let mut values: Vec<Option<i128>> = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match coerce_decimal128(&row[col_idx], *p, *s, field.name())? {
+                        Some(v) => values.push(Some(v)),
+                        None => {
+                            check_null_allowed(field)?;
+                            values.push(None);
+                        }
+                    }
+                }
+                let arr = Decimal128Array::from(values)
+                    .with_precision_and_scale(*p, *s)
+                    .map_err(|e| {
+                        BasinError::InvalidSchema(format!(
+                            "Decimal128 ({p},{s}) for column {}: {e}",
+                            field.name()
+                        ))
+                    })?;
                 Arc::new(arr)
             }
             other => {
@@ -620,6 +644,155 @@ fn coerce_f64(expr: &Expr) -> Result<Option<f64>> {
             "expected float literal, got {other}"
         ))),
     }
+}
+
+/// Decode a NUMERIC / DECIMAL literal into an i128 scaled by `10^scale`.
+///
+/// Accepts the same shapes as `coerce_f64` (sqlparser surfaces both
+/// integer and fractional numbers as `Value::Number(text, ...)`); a leading
+/// unary minus is handled via `peel_unary`. The caller has already
+/// validated `1 <= precision <= 38` and `0 <= scale <= precision` at DDL
+/// time, so this routine only checks that the literal's *value* fits the
+/// column's declared shape (digit count vs precision after rescaling).
+///
+/// Rejects `NaN`, `Inf`, scientific notation (PG accepts `1e3` for
+/// numeric; sqlparser parses these as `Value::Number` strings, which we
+/// pass to a manual base-10 parser to keep the implementation small —
+/// a parse error here is preferable to silent f64 rounding).
+fn coerce_decimal128(
+    expr: &Expr,
+    precision: u8,
+    scale: i8,
+    col: &str,
+) -> Result<Option<i128>> {
+    let (negated, inner) = peel_unary(expr);
+    let s = match inner {
+        Expr::Value(Value::Number(s, _)) => s.as_str(),
+        Expr::Value(Value::Null) if !negated => return Ok(None),
+        Expr::Cast { expr: ce, .. } => {
+            // Allow `'1.50'::numeric(10,2)` style casts by recursing into
+            // the inner expression.
+            return coerce_decimal128(ce.as_ref(), precision, scale, col);
+        }
+        Expr::Value(Value::SingleQuotedString(s))
+        | Expr::Value(Value::DoubleQuotedString(s))
+        | Expr::Value(Value::EscapedStringLiteral(s))
+        | Expr::Value(Value::NationalStringLiteral(s)) => s.as_str(),
+        other => {
+            return Err(BasinError::InvalidSchema(format!(
+                "expected NUMERIC literal for column {col}, got {other}"
+            )));
+        }
+    };
+    let parsed = parse_decimal_to_i128(s, precision, scale).map_err(|e| {
+        BasinError::InvalidSchema(format!("bad NUMERIC literal {s:?} for column {col}: {e}"))
+    })?;
+    Ok(Some(if negated { -parsed } else { parsed }))
+}
+
+/// Parse a base-10 decimal text into an i128 scaled by `10^target_scale`,
+/// rejecting values whose digit count exceeds `precision`.
+///
+/// Accepts an optional leading `+`/`-`, then digits, an optional `.` with
+/// fractional digits. Scientific notation (`1e3`, `2.5E-1`) is supported
+/// because sqlparser surfaces it as the literal text and PG accepts it
+/// for numeric literals. Trailing fractional zeros beyond the column's
+/// scale are silently dropped (matching PG); fractional digits that
+/// would require *more* scale than the column allows are an error so the
+/// user sees the precision-loss explicitly.
+fn parse_decimal_to_i128(s: &str, precision: u8, target_scale: i8) -> std::result::Result<i128, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty literal".into());
+    }
+    // Split off a possible exponent first; sqlparser keeps the `e`/`E`
+    // verbatim in the number string. We re-anchor the decimal point by
+    // adjusting the effective scale.
+    let (mantissa, exp): (&str, i32) = match s.find(|c: char| c == 'e' || c == 'E') {
+        Some(i) => {
+            let (m, rest) = s.split_at(i);
+            let exp_str = &rest[1..];
+            let exp: i32 = exp_str.parse().map_err(|_| format!("bad exponent {exp_str:?}"))?;
+            (m, exp)
+        }
+        None => (s, 0),
+    };
+    // Optional leading sign.
+    let (neg, rest) = match mantissa.as_bytes().first() {
+        Some(b'-') => (true, &mantissa[1..]),
+        Some(b'+') => (false, &mantissa[1..]),
+        _ => (false, mantissa),
+    };
+    if rest.is_empty() {
+        return Err("missing digits".into());
+    }
+    // Split into integer and fractional parts.
+    let (int_part, frac_part): (&str, &str) = match rest.find('.') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if !int_part.bytes().all(|b| b.is_ascii_digit()) && !int_part.is_empty() {
+        return Err(format!("non-digit in integer part {int_part:?}"));
+    }
+    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("non-digit in fractional part {frac_part:?}"));
+    }
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err("missing digits".into());
+    }
+    // Effective scale of the parsed mantissa = frac_part length, then
+    // shift by `-exp` to fold the exponent in. e.g. "1.5e2" → mantissa
+    // "15" with effective scale 1 - 2 = -1 → 150.
+    let raw_digits: String = format!("{int_part}{frac_part}");
+    let raw_digits = raw_digits.trim_start_matches('0');
+    if raw_digits.is_empty() {
+        return Ok(0);
+    }
+    let mantissa_scale: i32 = (frac_part.len() as i32) - exp;
+    // Final shift: target_scale - mantissa_scale > 0 → multiply by 10^k;
+    // < 0 → divide (must be lossless: trailing zeros only).
+    let shift: i32 = (target_scale as i32) - mantissa_scale;
+    let mut value: i128 = raw_digits
+        .parse::<i128>()
+        .map_err(|e| format!("integer overflow: {e}"))?;
+    if shift > 0 {
+        for _ in 0..shift {
+            value = value
+                .checked_mul(10)
+                .ok_or_else(|| "i128 overflow scaling literal up".to_string())?;
+        }
+    } else if shift < 0 {
+        let drop = (-shift) as usize;
+        for _ in 0..drop {
+            if value % 10 != 0 {
+                return Err(format!(
+                    "literal has more fractional digits than column scale {target_scale}"
+                ));
+            }
+            value /= 10;
+        }
+    }
+    if neg {
+        value = -value;
+    }
+    // Validate digit count against precision.
+    let abs = if value < 0 { -value } else { value };
+    let mut digits = 0u32;
+    let mut probe = abs;
+    if probe == 0 {
+        digits = 1;
+    } else {
+        while probe > 0 {
+            digits += 1;
+            probe /= 10;
+        }
+    }
+    if digits > (precision as u32) {
+        return Err(format!(
+            "value has {digits} digits which exceeds column precision {precision}"
+        ));
+    }
+    Ok(value)
 }
 
 fn coerce_string(expr: &Expr) -> Result<Option<String>> {

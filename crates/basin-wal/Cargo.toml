@@ -21,6 +21,15 @@ chrono.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
+# Raft consensus for `RaftWal`. Pinned at 0.9 (latest stable line); 0.10 is
+# pre-release alpha. `serde` feature lets entries / vote / membership data
+# round-trip through bincode-friendly storage. See `RAFT.md` for the
+# library-choice ADR. v0.1 ships single-process simulation; cross-process
+# gRPC `RaftNetwork` is a follow-up.
+openraft = { version = "=0.9.24", features = ["serde"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# Tests reach into raft types (BasicNode for membership bootstrap).
+openraft = { version = "=0.9.24", features = ["serde"] }

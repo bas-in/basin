@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, TimeUnit};
 use basin_common::{BasinError, Result};
 use sqlparser::ast::DataType as SqlDataType;
+use sqlparser::ast::ExactNumberInfo;
 use sqlparser::ast::TimezoneInfo;
 
 /// Field-metadata key used to mark Basin-specific logical types that don't have
@@ -176,6 +177,21 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             Ok(DataType::FixedSizeBinary(16))
         }
 
+        // NUMERIC / DECIMAL / DEC. PG's `numeric` rides on Arrow
+        // `Decimal128(precision, scale)`. sqlparser's `Numeric`, `Decimal`,
+        // and `Dec` AST variants all carry the same `ExactNumberInfo`
+        // payload and are PG synonyms; we map them identically. PG accepts
+        // a bare `NUMERIC` (no parens) as arbitrary-precision; Arrow can
+        // only express a fixed precision, so we pick (38, 0) — Arrow's
+        // `Decimal128` max precision, large enough for the typical
+        // `numeric` use cases (financial sums, ID-as-numeric, etc.).
+        // Validation: `1 <= p <= 38` and `0 <= s <= p`. Anything else is
+        // a hard `InvalidSchema` error so the user sees the gate trip
+        // explicitly rather than silently truncating to a smaller type.
+        SqlDataType::Numeric(info) | SqlDataType::Decimal(info) | SqlDataType::Dec(info) => {
+            decimal128_from_exact_number_info(info)
+        }
+
         // TIMESTAMPTZ / TIMESTAMP WITH TIME ZONE → microsecond UTC.
         // Bare TIMESTAMP (no zone) → microsecond, no zone string. Both ride
         // on the same Arrow physical type; the timezone string is the only
@@ -216,6 +232,45 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             "unsupported column type in PoC: {other}"
         ))),
     }
+}
+
+/// Map sqlparser's `ExactNumberInfo` (the `(p, s)` payload of `NUMERIC` /
+/// `DECIMAL` / `DEC`) onto an Arrow `Decimal128(precision, scale)`. PG
+/// rules: bare `NUMERIC` is arbitrary-precision; we pin it at `(38, 0)`
+/// — Arrow's `Decimal128` max precision, big enough for typical PG
+/// `numeric` use cases. `NUMERIC(p)` defaults scale to 0, matching PG.
+/// Out-of-range precision/scale is rejected up front so a user can't
+/// silently end up with a smaller-than-expected column.
+fn decimal128_from_exact_number_info(info: &ExactNumberInfo) -> Result<DataType> {
+    let (p, s): (u8, i8) = match info {
+        ExactNumberInfo::None => (38, 0),
+        ExactNumberInfo::Precision(p) => (clamp_precision(*p)?, 0),
+        ExactNumberInfo::PrecisionAndScale(p, s) => {
+            let prec = clamp_precision(*p)?;
+            if *s > i8::MAX as u64 {
+                return Err(BasinError::InvalidSchema(format!(
+                    "NUMERIC scale {s} exceeds i8::MAX"
+                )));
+            }
+            let scale = *s as i8;
+            if scale < 0 || (scale as i16) > (prec as i16) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "NUMERIC scale {scale} must satisfy 0 <= scale <= precision ({prec})"
+                )));
+            }
+            (prec, scale)
+        }
+    };
+    Ok(DataType::Decimal128(p, s))
+}
+
+fn clamp_precision(p: u64) -> Result<u8> {
+    if p == 0 || p > 38 {
+        return Err(BasinError::InvalidSchema(format!(
+            "NUMERIC precision {p} out of range; Arrow Decimal128 supports 1..=38"
+        )));
+    }
+    Ok(p as u8)
 }
 
 /// Pull the dimensionality out of `vector(N)`'s modifier list. sqlparser

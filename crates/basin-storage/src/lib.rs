@@ -46,7 +46,7 @@ pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
     CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
 };
-pub use scheduler::{TenantIoStats, DEFAULT_GLOBAL_BUDGET};
+pub use scheduler::{Scheduler, TenantIoStats, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 pub use writer::WriteOptions;
@@ -262,6 +262,14 @@ struct Inner {
     /// no config) is also cached and avoids re-querying the catalog on
     /// the hot write path.
     tenant_config_cache: RwLock<HashMap<TenantId, Option<TenantStorageConfig>>>,
+    /// Cross-tenant EDF (Earliest Deadline First) fair-share scheduler.
+    /// One per `Storage`; cheap-to-clone `Arc` inside. Each underlying
+    /// `ObjectStore` RPC issued through `tenant_object_store` acquires
+    /// a permit from this scheduler AFTER the per-tenant Semaphore
+    /// liveness floor. Point reads (HEAD / GET / small range / LIST)
+    /// arrive with a 5ms deadline; bulk ops (PUT / large range) get a
+    /// 1s deadline so they can't crowd out point lookups. See ADR 0008.
+    scheduler: Scheduler,
 }
 
 /// Best-effort counters for the read path. See [`Inner::read_counters`].
@@ -364,6 +372,7 @@ impl Storage {
                 encryption: OnceLock::new(),
                 catalog: OnceLock::new(),
                 tenant_config_cache: RwLock::new(HashMap::new()),
+                scheduler: Scheduler::new(DEFAULT_GLOBAL_BUDGET),
             }),
         }
     }
@@ -505,12 +514,17 @@ impl Storage {
         &self.inner.read_counters
     }
 
-    /// Per-tenant live I/O stats. Stub: the v0.2 scheduler exported
-    /// real numbers here; with the scheduler reverted, all fields are
-    /// zero. The noisy detector falls back to its own per-engine
-    /// counter.
-    pub fn tenant_stats(&self, _tenant: &TenantId) -> TenantIoStats {
-        TenantIoStats::default()
+    /// Per-tenant live I/O stats sourced from the EDF scheduler. Returns
+    /// zeros for tenants that have never run an op through this `Storage`.
+    pub fn tenant_stats(&self, tenant: &TenantId) -> TenantIoStats {
+        self.inner.scheduler.tenant_stats(tenant)
+    }
+
+    /// Handle to the cross-tenant EDF scheduler. Cheap to clone. Exposed
+    /// so the engine layer can inspect global state and so tests can
+    /// drive the scheduler directly.
+    pub fn scheduler(&self) -> &Scheduler {
+        &self.inner.scheduler
     }
 
 
@@ -545,6 +559,8 @@ impl Storage {
         Arc::new(concurrency::TenantScopedStore::new(
             self.inner.object_store.clone(),
             sem,
+            self.inner.scheduler.clone(),
+            *tenant,
         ))
     }
 

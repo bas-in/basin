@@ -13,4 +13,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# `geo` 0.33 provides `LineString` / `Polygon` value types and the
+# planar geometric primitives we use for ray-casting and segment-distance
+# math (`ST_Contains` polygon-point, `ST_Distance` LineString variants).
+# We deliberately *don't* use `geo`'s `Area` / `Length` traits — those
+# are planar / Cartesian and would silently drop us into degree-units
+# accuracy near the poles. WGS84-correct surface-area and great-circle
+# arc length are computed directly in this crate against `EARTH_RADIUS_M`.
+geo = "0.33"
+
 [dev-dependencies]

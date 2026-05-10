@@ -47,9 +47,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gin;
 pub mod similarity;
 pub mod trigram;
 
+pub use gin::TrigramIndex;
 pub use similarity::{similarity, word_similarity};
 pub use trigram::{extract, set_bytes, Trigram};
 

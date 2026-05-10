@@ -73,6 +73,21 @@ pub enum BasinError {
     #[error("feature not supported: {0}")]
     FeatureNotSupported(String),
 
+    /// PRIMARY KEY (or UNIQUE) violation. Router maps to SQLSTATE
+    /// `23505` (`unique_violation`).
+    #[error("{0}")]
+    UniqueViolation(String),
+
+    /// CHECK constraint violation. Router maps to SQLSTATE `23514`
+    /// (`check_violation`).
+    #[error("{0}")]
+    CheckViolation(String),
+
+    /// FOREIGN KEY violation. Router maps to SQLSTATE `23503`
+    /// (`foreign_key_violation`).
+    #[error("{0}")]
+    ForeignKeyViolation(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),

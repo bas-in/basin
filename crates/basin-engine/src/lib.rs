@@ -87,6 +87,11 @@ pub(crate) struct EngineInner {
     /// so integration tests can assert that routing actually happened
     /// without resorting to log scraping.
     pub(crate) analytical_routing_count: AtomicU64,
+    /// Counter incremented when the planner detects a vector `ORDER BY <->
+    /// LIMIT k` query and routes it to the HNSW fast path. Tests assert on
+    /// this so they can prove the rewrite actually fired vs. accidentally
+    /// falling through to brute-force.
+    pub(crate) vector_routing_count: AtomicU64,
     /// Per-tenant noisy-tenant detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
     /// successful `TenantSession::execute`. See `noisy_detector` module
@@ -144,6 +149,7 @@ impl Engine {
             cfg,
             analytical: None,
             analytical_routing_count: AtomicU64::new(0),
+            vector_routing_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             tenant_counters,
             event_sinks: RwLock::new(registry),
@@ -201,6 +207,7 @@ impl Engine {
             cfg,
             analytical: Some(analytical),
             analytical_routing_count: AtomicU64::new(0),
+            vector_routing_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             tenant_counters,
             event_sinks: RwLock::new(registry),
@@ -315,6 +322,18 @@ impl Engine {
     /// code should rely on tracing for routing visibility.
     pub fn analytical_routing_count(&self) -> u64 {
         self.inner.analytical_routing_count.load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `executor::execute` when a vector
+    /// `ORDER BY <-> LIMIT k` query is dispatched to the HNSW fast path.
+    pub(crate) fn note_vector_routed(&self) {
+        self.inner.vector_routing_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of `ORDER BY <-> LIMIT k` statements served via the HNSW
+    /// fast path since this `Engine` was built. Test-only.
+    pub fn vector_routing_count(&self) -> u64 {
+        self.inner.vector_routing_count.load(Ordering::Relaxed)
     }
 
     /// Open a session bound to `tenant`. The catalog namespace is created on
@@ -471,10 +490,12 @@ pub enum ExecResult {
 
 mod alter;
 mod analytical_route;
+mod constraints;
 mod convert;
 mod cost_check;
 mod cron_glue;
 mod cv_ddl;
+pub mod cv_time_bucket;
 mod ddl;
 mod dml;
 mod dml_mutate;
@@ -502,6 +523,7 @@ mod trgm_glue;
 mod type_ddl;
 mod types;
 mod udf;
+mod vector_planner;
 mod vector_search;
 pub mod webhook_ddl;
 pub mod webhook_registry;

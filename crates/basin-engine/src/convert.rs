@@ -106,6 +106,7 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
             timeunit_ws_to_df(unit),
             tz.clone(),
         ),
+        ws_schema::DataType::Decimal128(p, s) => df_schema::DataType::Decimal128(*p, *s),
         ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano) => {
             df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano)
         }
@@ -145,6 +146,7 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
             timeunit_df_to_ws(unit),
             tz.clone(),
         ),
+        df_schema::DataType::Decimal128(p, s) => ws_schema::DataType::Decimal128(*p, *s),
         df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano) => {
             ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano)
         }
@@ -399,6 +401,30 @@ pub(crate) fn batch_ws_to_df(
                     ),
                 };
                 arr
+            }
+            df_schema::DataType::Decimal128(p, s) => {
+                // PG `numeric` rides on Decimal128. Both arrow versions
+                // share the i128 layout, so we walk the source array's
+                // raw values and rebuild on the df side preserving the
+                // column's `(precision, scale)`.
+                let src_arr = src
+                    .as_any()
+                    .downcast_ref::<ws_array::Decimal128Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Decimal128Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<i128>> = (0..src_arr.len())
+                    .map(|j| if src_arr.is_null(j) { None } else { Some(src_arr.value(j)) })
+                    .collect();
+                let arr = df_array::Decimal128Array::from(vals)
+                    .with_precision_and_scale(*p, *s)
+                    .map_err(|e| {
+                        BasinError::internal(format!(
+                            "Decimal128 ({p},{s}) for column {}: {e}",
+                            field.name()
+                        ))
+                    })?;
+                Arc::new(arr)
             }
             other => {
                 return Err(BasinError::InvalidSchema(format!(
@@ -669,6 +695,29 @@ pub(crate) fn batch_df_to_ws(
                     ),
                 };
                 arr
+            }
+            ws_schema::DataType::Decimal128(p, s) => {
+                // PG `numeric` round-trip back to the workspace side.
+                // Mirror of the ws→df arm; the i128 buffer is identical
+                // across arrow versions so we just walk per-row.
+                let src_arr = src
+                    .as_any()
+                    .downcast_ref::<df_array::Decimal128Array>()
+                    .ok_or_else(|| BasinError::internal(format!(
+                        "expected Decimal128Array for {}", field.name()
+                    )))?;
+                let vals: Vec<Option<i128>> = (0..src_arr.len())
+                    .map(|j| if src_arr.is_null(j) { None } else { Some(src_arr.value(j)) })
+                    .collect();
+                let arr = ws_array::Decimal128Array::from(vals)
+                    .with_precision_and_scale(*p, *s)
+                    .map_err(|e| {
+                        BasinError::internal(format!(
+                            "Decimal128 ({p},{s}) for column {}: {e}",
+                            field.name()
+                        ))
+                    })?;
+                Arc::new(arr)
             }
             ws_schema::DataType::FixedSizeList(child, n) => {
                 // Only the FixedSizeList<Float32> shape (vector(N)) is in

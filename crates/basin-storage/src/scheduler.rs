@@ -1,10 +1,40 @@
 //! Per-tenant fair-share I/O scheduler over a shared global RPC budget.
 //!
-//! v0.3 of the noisy-neighbor fix (ADR 0008). v0.2 used round-robin;
-//! v0.3 dispatches by **earliest-deadline-first** with a per-tenant
-//! fairness cap. Point reads (5ms deadline) consistently beat bulk
-//! scans (1s deadline); the consecutive-dispatch cap prevents one
-//! tenant from monopolising via deadline=now flooding.
+//! Earliest-deadline-first (EDF) with a per-tenant fairness cap.
+//! Activates the v0.3 fix described in ADR 0008. Point reads (5 ms
+//! deadline) consistently beat bulk scans (1 s deadline); the
+//! consecutive-dispatch cap prevents one tenant from monopolising via
+//! deadline=now flooding.
+//!
+//! ## Deadline-budget formula
+//!
+//! Each request's deadline is a function of its priority class only:
+//!
+//! ```text
+//! deadline = now + match priority {
+//!     Priority::High => HIGH_PRIORITY_DEADLINE,  // 5 ms
+//!     Priority::Low  => LOW_PRIORITY_DEADLINE,   // 1 s
+//! }
+//! ```
+//!
+//! Priority is derived at the `TenantScopedStore` boundary:
+//!
+//! - `head` / small `get_range` (< [`PRIORITY_RANGE_BYTES_THRESHOLD`])
+//!   / `list` / `delete` / `copy` / full `get_opts` → **High** (point-shaped).
+//! - `put` / `put_multipart` / large `get_range` (≥ threshold) → **Low**
+//!   (bulk-shaped).
+//!
+//! ADR 0008 doesn't fully specify the deadline-budget formula. We use a
+//! priority-class formula (rather than a recent-throughput one) because
+//! the workload signal we have is *operation shape*, not historical
+//! tenant volume: a quiet tenant issuing a 1 GB scan should still
+//! receive the bulk deadline, and a noisy tenant issuing a point lookup
+//! should still receive the point deadline. Recent-throughput
+//! prioritisation collapses to the same outcome in steady state (a
+//! tenant doing many bulk ops naturally accumulates bulk-class
+//! deadlines) without the bookkeeping. Per-tenant rate counters are
+//! still maintained on `TenantStatsAtomics` so `Storage::tenant_stats`
+//! exposes them for the noisy-tenant detector at the engine layer.
 //!
 //! Per-tenant cost is O(bytes): two VecDeques + counters. Heap entries
 //! are 24 bytes. No per-tenant tasks. Idle tenants are evicted.

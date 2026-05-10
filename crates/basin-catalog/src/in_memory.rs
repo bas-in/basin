@@ -19,7 +19,10 @@ use basin_common::ChangeOp;
 use crate::domains::{self, DomainDef, DomainError};
 use crate::enums::{self, EnumError, EnumTypeDef};
 use crate::functions::SqlFunctionDef;
-use crate::metadata::{CvDef, DataFileRef, PartitionSpec, Policy, SecondaryIndex, TableMetadata};
+use crate::metadata::{
+    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
+    TableMetadata,
+};
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::reactors::{self, ReactorDef, ReactorError};
 use crate::sequences::{advance_one, SequenceDef, SequenceError, SequenceState};
@@ -44,6 +47,9 @@ struct TableState {
     cluster_columns: Vec<String>,
     home_region: Option<String>,
     indexes: Vec<SecondaryIndex>,
+    pk_columns: Vec<String>,
+    check_constraints: Vec<CheckConstraint>,
+    foreign_keys: Vec<ForeignKeyDef>,
 }
 
 impl TableState {
@@ -77,6 +83,9 @@ impl TableState {
             cluster_columns: Vec::new(),
             home_region: None,
             indexes: Vec::new(),
+            pk_columns: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 }
@@ -213,6 +222,9 @@ impl InMemoryCatalog {
             cluster_columns: state.cluster_columns.clone(),
             home_region: state.home_region.clone(),
             indexes: state.indexes.clone(),
+            pk_columns: state.pk_columns.clone(),
+            check_constraints: state.check_constraints.clone(),
+            foreign_keys: state.foreign_keys.clone(),
         }
     }
 }
@@ -487,6 +499,9 @@ impl Catalog for InMemoryCatalog {
                 cluster_columns: src.cluster_columns.clone(),
                 home_region: src.home_region.clone(),
                 indexes: src.indexes.clone(),
+                pk_columns: src.pk_columns.clone(),
+                check_constraints: src.check_constraints.clone(),
+                foreign_keys: src.foreign_keys.clone(),
             }
         };
 
@@ -647,6 +662,23 @@ impl Catalog for InMemoryCatalog {
         let state_arc = self.get_table(tenant, table).await?;
         let mut state = state_arc.lock().await;
         state.home_region = region;
+        Ok(())
+    }
+
+    #[instrument(skip(self, check_constraints, foreign_keys), fields(tenant = %tenant, table = %table))]
+    async fn set_table_constraints(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        pk_columns: Vec<String>,
+        check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<ForeignKeyDef>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.pk_columns = pk_columns;
+        state.check_constraints = check_constraints;
+        state.foreign_keys = foreign_keys;
         Ok(())
     }
 

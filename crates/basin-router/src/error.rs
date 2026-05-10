@@ -38,6 +38,9 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
         BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
         BasinError::FeatureNotSupported(_) => ("ERROR", "0A000"), // feature_not_supported
+        BasinError::UniqueViolation(_) => ("ERROR", "23505"),    // unique_violation
+        BasinError::CheckViolation(_) => ("ERROR", "23514"),     // check_violation
+        BasinError::ForeignKeyViolation(_) => ("ERROR", "23503"), // foreign_key_violation
         BasinError::IsolationViolation(_) => ("FATAL", "XX000"),
         // Coarse-grained internal categories all collapse to XX000.
         BasinError::Storage(_)

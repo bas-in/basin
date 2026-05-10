@@ -42,7 +42,7 @@ struct TestServer {
     _data_dir: TempDir,
     _wal_dir: TempDir,
     bg: Option<basin_shard::ShardBackgroundHandle>,
-    wal: basin_wal::Wal,
+    wal: Arc<dyn basin_wal::Wal>,
 }
 
 async fn start_server_with_shard() -> TestServer {
@@ -64,14 +64,16 @@ async fn start_server_with_shard() -> TestServer {
     // WAL rooted at a separate tempdir, mirroring the BASIN_WAL_DIR layout the
     // server uses when the shard is enabled.
     let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
-    let wal = basin_wal::Wal::open(basin_wal::WalConfig {
-        object_store: Arc::new(wal_fs),
-        root_prefix: None,
-        flush_interval: Duration::from_millis(200),
-        flush_max_bytes: 1024 * 1024,
-    })
-    .await
-    .expect("open WAL");
+    let wal: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: Arc::new(wal_fs),
+            root_prefix: None,
+            flush_interval: Duration::from_millis(200),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("open WAL"),
+    );
 
     let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
         storage.clone(),

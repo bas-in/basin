@@ -264,7 +264,10 @@ async fn drop_table_round_trip() {
 }
 
 #[tokio::test]
-async fn create_table_returns_501() {
+async fn create_table_round_trip() {
+    // POST a CreateTableRequest with three fields (one required, one
+    // nullable, one Decimal128). A subsequent GET load-table returns
+    // metadata with the same column shape and the same `table-uuid`.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let tenant = TenantId::new();
     seed_catalog(&catalog, &tenant, &[]).await;
@@ -272,7 +275,102 @@ async fn create_table_returns_501() {
     let app = auth_router(catalog);
     let body = serde_json::json!({
         "name": "events",
-        "schema": { "type": "struct", "fields": [] }
+        "schema": {
+            "type": "struct",
+            "fields": [
+                { "id": 1, "name": "event_id", "type": "long",   "required": true },
+                { "id": 2, "name": "label",    "type": "string", "required": false },
+                { "id": 3, "name": "ts",       "type": "timestamptz", "required": true }
+            ]
+        }
+    })
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created: LoadTableResponse = body_json(res.into_body()).await;
+    assert_eq!(created.metadata.schemas[0].fields.len(), 3);
+    assert_eq!(created.metadata.schemas[0].fields[0].name, "event_id");
+    assert_eq!(created.metadata.schemas[0].fields[0].kind, "long");
+    assert!(created.metadata.schemas[0].fields[0].required);
+    assert_eq!(created.metadata.schemas[0].fields[1].name, "label");
+    assert!(!created.metadata.schemas[0].fields[1].required);
+
+    // Same uuid via GET load-table.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables/events"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let loaded: LoadTableResponse = body_json(res.into_body()).await;
+    assert_eq!(loaded.metadata.table_uuid, created.metadata.table_uuid);
+    assert_eq!(loaded.metadata.schemas[0].fields.len(), 3);
+}
+
+#[tokio::test]
+async fn create_table_with_decimal_type() {
+    // Decimal128(p,s) round-trips through the create-table flow.
+    // Depends on Decimal128 having landed in the engine's type
+    // mapping; if the workspace doesn't yet support it, the
+    // load-table response will round-trip as `decimal(P,S)`.
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let tenant = TenantId::new();
+    seed_catalog(&catalog, &tenant, &[]).await;
+
+    let app = auth_router(catalog);
+    let body = serde_json::json!({
+        "name": "ledger",
+        "schema": {
+            "type": "struct",
+            "fields": [
+                { "id": 1, "name": "id",     "type": "long",          "required": true },
+                { "id": 2, "name": "amount", "type": "decimal(10,2)", "required": false }
+            ]
+        }
+    })
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created: LoadTableResponse = body_json(res.into_body()).await;
+    let amount = &created.metadata.schemas[0].fields[1];
+    assert_eq!(amount.name, "amount");
+    assert_eq!(amount.kind, "decimal(10,2)");
+    assert!(!amount.required);
+}
+
+#[tokio::test]
+async fn create_table_unsupported_type_returns_501() {
+    // `fixed` and `list` aren't supported by Basin v0.1; the handler
+    // returns a structured 501 with `NotImplementedException`.
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let tenant = TenantId::new();
+    seed_catalog(&catalog, &tenant, &[]).await;
+
+    let app = auth_router(catalog);
+    let body = serde_json::json!({
+        "name": "events",
+        "schema": {
+            "type": "struct",
+            "fields": [
+                { "id": 1, "name": "blob", "type": "fixed(16)", "required": true }
+            ]
+        }
     })
     .to_string();
     let req = Request::builder()
@@ -284,6 +382,236 @@ async fn create_table_returns_501() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"], 501);
+    assert_eq!(v["error"]["type"], "NotImplementedException");
+}
+
+#[tokio::test]
+async fn commit_table_assert_uuid_passes() {
+    // Round-trip: load-table to read the synthesised UUID, send a
+    // commit-table with `assert-table-uuid` referencing it. Adds one
+    // file via `summary.added-files-paths`. Post-commit head advances.
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let tenant = TenantId::new();
+    seed_catalog(&catalog, &tenant, &["users"]).await;
+
+    let app = auth_router(catalog);
+    // Read the synthesised UUID off the GET endpoint.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let loaded: LoadTableResponse = body_json(res.into_body()).await;
+    let uuid = loaded.metadata.table_uuid.clone();
+
+    let body = serde_json::json!({
+        "requirements": [
+            { "type": "assert-table-uuid", "uuid": uuid },
+            { "type": "assert-current-schema-id", "current-schema-id": 0 },
+            { "type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": 0 }
+        ],
+        "updates": [
+            {
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 1,
+                    "parent-snapshot-id": 0,
+                    "sequence-number": 1,
+                    "timestamp-ms": 0,
+                    "summary": {
+                        "operation": "append",
+                        "added-files-count": "1",
+                        "added-files-paths": "users/data/a.parquet",
+                        "added-records-per-file": "10",
+                        "added-files-size-per-file": "1024"
+                    },
+                    "schema-id": 0
+                }
+            }
+        ]
+    })
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let after: LoadTableResponse = body_json(res.into_body()).await;
+    assert_eq!(after.metadata.current_snapshot_id, Some(1));
+    // The `added-files-paths` echo round-trips so a second commit can
+    // chain off this snapshot without re-fetching the manifest list.
+    let head = after
+        .metadata
+        .snapshots
+        .iter()
+        .find(|s| s.snapshot_id == 1)
+        .unwrap();
+    assert_eq!(
+        head.summary.get("added-files-paths").map(String::as_str),
+        Some("users/data/a.parquet"),
+    );
+}
+
+#[tokio::test]
+async fn commit_table_assert_uuid_fails_returns_409() {
+    // Wrong uuid → CommitFailedException-shaped 409 envelope.
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let tenant = TenantId::new();
+    seed_catalog(&catalog, &tenant, &["users"]).await;
+
+    let app = auth_router(catalog);
+    let body = serde_json::json!({
+        "requirements": [
+            { "type": "assert-table-uuid", "uuid": "00000000-0000-0000-0000-000000000000" }
+        ],
+        "updates": []
+    })
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"], 409);
+}
+
+#[tokio::test]
+async fn commit_table_set_current_snapshot() {
+    // Multi-step: create-table via the REST surface, append data files
+    // via commit-table with `add-snapshot` + `set-current-snapshot`,
+    // then load-table sees the new head.
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let tenant = TenantId::new();
+    seed_catalog(&catalog, &tenant, &["users"]).await;
+
+    let app = auth_router(catalog);
+    let body = serde_json::json!({
+        "requirements": [
+            { "type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": 0 }
+        ],
+        "updates": [
+            {
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 1,
+                    "parent-snapshot-id": 0,
+                    "timestamp-ms": 0,
+                    "summary": {
+                        "operation": "append",
+                        "added-files-count": "2",
+                        "added-files-paths": "users/data/a.parquet,users/data/b.parquet",
+                        "added-records-per-file": "10,20",
+                        "added-files-size-per-file": "1024,2048"
+                    }
+                }
+            },
+            { "action": "set-current-snapshot", "snapshot-id": 1 }
+        ]
+    })
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // load-table sees current = 1, refs.main = 1, with both files.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let loaded: LoadTableResponse = body_json(res.into_body()).await;
+    assert_eq!(loaded.metadata.current_snapshot_id, Some(1));
+    assert_eq!(loaded.metadata.refs["main"].snapshot_id, 1);
+    let head = loaded
+        .metadata
+        .snapshots
+        .iter()
+        .find(|s| s.snapshot_id == 1)
+        .unwrap();
+    let paths = head.summary.get("added-files-paths").unwrap();
+    assert!(paths.contains("a.parquet") && paths.contains("b.parquet"));
+}
+
+#[tokio::test]
+async fn commit_table_unsupported_action_returns_501() {
+    // `add-sort-order` isn't modelled in v0.1; reject as 501.
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let tenant = TenantId::new();
+    seed_catalog(&catalog, &tenant, &["users"]).await;
+
+    let app = auth_router(catalog);
+    let body = serde_json::json!({
+        "requirements": [],
+        "updates": [
+            { "action": "add-sort-order", "sort-order": { "order-id": 1, "fields": [] } }
+        ]
+    })
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["type"], "NotImplementedException");
+}
+
+#[tokio::test]
+async fn register_table_returns_501() {
+    // POST /register isn't supported by Basin v0.1.
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let tenant = TenantId::new();
+    seed_catalog(&catalog, &tenant, &[]).await;
+
+    let app = auth_router(catalog);
+    let body = serde_json::json!({
+        "name": "external_table",
+        "metadata-location": "s3://bucket/path/to/metadata.json"
+    })
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/main/namespaces/{tenant}/register"))
+        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["type"], "NotImplementedException");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("external_table"));
 }
 
 #[tokio::test]

@@ -1,8 +1,11 @@
 //! `COPY FROM STDIN` and `COPY TO STDOUT` for the simple-query path.
 //!
 //! v0.1: CSV format only, comma-delimited, RFC 4180-ish. No binary, no custom
-//! delimiters, no NULL specifications, no column lists. Anything else is
-//! rejected with `42601` syntax_error before we touch the engine.
+//! delimiters, no NULL specifications. Anything else is rejected with `42601`
+//! syntax_error before we touch the engine. Column-list (`COPY t (a, b) ...`)
+//! and server-side file-path variants (`COPY t FROM '/abs/path'` /
+//! `COPY t TO '/abs/path'`) are supported; file paths are gated by the
+//! `BASIN_COPY_PATH_ALLOWLIST` env var (default-deny).
 //!
 //! Architecture:
 //!
@@ -54,10 +57,18 @@ pub(crate) enum CopyCommand {
     From {
         table: String,
         with_header: bool,
+        /// Optional column list as written by the user (`COPY t (b, a) FROM ...`).
+        /// `None` = use every column in schema order.
+        columns: Option<Vec<String>>,
+        /// `None` = STDIN (client streams CopyData); `Some(path)` = server-side
+        /// read of an absolute filesystem path.
+        path: Option<String>,
     },
     To {
         table: String,
         with_header: bool,
+        columns: Option<Vec<String>>,
+        path: Option<String>,
     },
 }
 
@@ -69,8 +80,15 @@ pub(crate) enum CopyCommand {
 pub(crate) struct CopyInState {
     pub(crate) table: String,
     /// Field shape we use to render INSERT VALUES — same Arrow `Field`s the
-    /// engine returns from a `prepare("SELECT * FROM <table>")`.
+    /// engine returns from a `prepare("SELECT * FROM <table>")`. When a
+    /// column list was supplied, this carries only those listed columns
+    /// (in list order). When no column list was supplied, this carries
+    /// the full table schema.
     pub(crate) columns: Vec<Field>,
+    /// User-supplied column list, if any. Populated only when the COPY
+    /// statement included `(col1, col2, ...)`. Used to build
+    /// `INSERT INTO t (col1, col2) VALUES (...)`.
+    pub(crate) column_list: Option<Vec<String>>,
     /// Bytes received but not yet split into a complete row.
     pub(crate) buffer: Vec<u8>,
     /// Successful INSERTs since the COPY started.
@@ -87,11 +105,17 @@ impl CopyInState {
         Self {
             table,
             columns,
+            column_list: None,
             buffer: Vec::new(),
             row_count: 0,
             error: None,
             header_pending: with_header,
         }
+    }
+
+    pub(crate) fn with_column_list(mut self, list: Vec<String>) -> Self {
+        self.column_list = Some(list);
+        self
     }
 }
 
@@ -107,14 +131,14 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
     if !sc.eat_keyword("COPY") {
         return Ok(None);
     }
-    let table = sc.eat_ident().ok_or_else(|| {
-        "expected table name after COPY (column lists not supported in v0.1)".to_owned()
-    })?;
-    if sc.peek_punct('(') {
-        return Err(
-            "COPY <table> (col, ...) column lists are not supported in v0.1".into(),
-        );
-    }
+    let table = sc
+        .eat_ident()
+        .ok_or_else(|| "expected table name after COPY".to_owned())?;
+    let columns = if sc.peek_punct('(') {
+        Some(parse_column_list(&mut sc)?)
+    } else {
+        None
+    };
     let direction = if sc.eat_keyword("FROM") {
         Direction::From
     } else if sc.eat_keyword("TO") {
@@ -122,24 +146,32 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
     } else {
         return Err("expected FROM or TO after COPY <table>".into());
     };
-    match direction {
+    let path = match direction {
         Direction::From => {
-            if !sc.eat_keyword("STDIN") {
+            if sc.eat_keyword("STDIN") {
+                None
+            } else if sc.peek_punct('\'') {
+                Some(parse_string_literal(&mut sc)?)
+            } else {
                 return Err(
-                    "only COPY FROM STDIN is supported in v0.1 (file paths and PROGRAM are not)"
+                    "expected STDIN or '<absolute-path>' after COPY <table> FROM (PROGRAM not supported)"
                         .into(),
                 );
             }
         }
         Direction::To => {
-            if !sc.eat_keyword("STDOUT") {
+            if sc.eat_keyword("STDOUT") {
+                None
+            } else if sc.peek_punct('\'') {
+                Some(parse_string_literal(&mut sc)?)
+            } else {
                 return Err(
-                    "only COPY TO STDOUT is supported in v0.1 (file paths and PROGRAM are not)"
+                    "expected STDOUT or '<absolute-path>' after COPY <table> TO (PROGRAM not supported)"
                         .into(),
                 );
             }
         }
-    }
+    };
     let with_header = parse_with_options(&mut sc)?;
     sc.skip_whitespace();
     if !sc.is_done() {
@@ -149,12 +181,72 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
         Direction::From => CopyCommand::From {
             table,
             with_header,
+            columns,
+            path,
         },
         Direction::To => CopyCommand::To {
             table,
             with_header,
+            columns,
+            path,
         },
     }))
+}
+
+/// Parse `(ident [, ident ...])`. Caller has peeked `(` but not consumed it.
+fn parse_column_list(sc: &mut Scanner<'_>) -> std::result::Result<Vec<String>, String> {
+    if !sc.eat_punct('(') {
+        return Err("expected '(' to start column list".into());
+    }
+    let mut out = Vec::new();
+    loop {
+        sc.skip_whitespace();
+        if sc.eat_punct(')') {
+            break;
+        }
+        let name = sc
+            .eat_ident()
+            .ok_or_else(|| "expected column name in COPY column list".to_owned())?;
+        out.push(name);
+        sc.skip_whitespace();
+        if sc.eat_punct(')') {
+            break;
+        }
+        if !sc.eat_punct(',') {
+            return Err("expected ',' or ')' in COPY column list".into());
+        }
+    }
+    if out.is_empty() {
+        return Err("COPY column list must not be empty".into());
+    }
+    Ok(out)
+}
+
+/// Parse a single-quoted SQL string literal (`'...'` with `''` escaping).
+/// Caller has peeked `'` but not consumed it.
+fn parse_string_literal(sc: &mut Scanner<'_>) -> std::result::Result<String, String> {
+    sc.skip_whitespace();
+    if !sc.eat_punct('\'') {
+        return Err("expected '\\''".into());
+    }
+    let bytes = sc.s.as_bytes();
+    let mut out = String::new();
+    while sc.pos < bytes.len() {
+        let b = bytes[sc.pos];
+        if b == b'\'' {
+            // Doubled quote = literal apostrophe; bare quote ends the literal.
+            if sc.pos + 1 < bytes.len() && bytes[sc.pos + 1] == b'\'' {
+                out.push('\'');
+                sc.pos += 2;
+                continue;
+            }
+            sc.pos += 1;
+            return Ok(out);
+        }
+        out.push(b as char);
+        sc.pos += 1;
+    }
+    Err("unterminated string literal".into())
 }
 
 enum Direction {
@@ -165,6 +257,9 @@ enum Direction {
 /// Parse the optional `WITH (FORMAT CSV [, HEADER {true|false}])`. Anything
 /// else (DELIMITER, NULL, QUOTE, ESCAPE, FORCE_*, ENCODING) is rejected.
 /// Returns the `header` value (default false).
+///
+/// Also accepts the legacy `WITH CSV [HEADER]` shorthand (no parens) that
+/// older Postgres clients still emit.
 fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String> {
     sc.skip_whitespace();
     if !sc.eat_keyword("WITH") {
@@ -173,7 +268,20 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String>
     }
     sc.skip_whitespace();
     if !sc.eat_punct('(') {
-        return Err("expected '(' after WITH".into());
+        // Legacy `WITH CSV [HEADER]` form. Accept that exact shape only —
+        // anything else (DELIMITER 'x', QUOTE '"', etc.) is still rejected
+        // by the keyword check below.
+        if !sc.eat_keyword("CSV") {
+            return Err(
+                "expected '(' after WITH, or legacy 'WITH CSV [HEADER]' shorthand".into(),
+            );
+        }
+        let mut header = false;
+        sc.skip_whitespace();
+        if sc.eat_keyword("HEADER") {
+            header = true;
+        }
+        return Ok(header);
     }
     let mut saw_format_csv = false;
     let mut header = false;
@@ -342,6 +450,94 @@ pub(crate) async fn resolve_table_columns<S: Session + ?Sized>(
     Ok(schema.columns)
 }
 
+/// Metadata key carrying the source text of a column's `DEFAULT <expr>`.
+/// Mirrors `basin_engine::types::BASIN_COLUMN_DEFAULT` (kept private in the
+/// engine crate); the engine's INSERT path reads the metadata back during
+/// row coercion. We rely on the same key here to detect "column has a
+/// default" without taking on a dep on the engine's internal module.
+const BASIN_COLUMN_DEFAULT_KEY: &str = "BASIN_COLUMN_DEFAULT";
+
+fn field_has_default(f: &Field) -> bool {
+    f.metadata().contains_key(BASIN_COLUMN_DEFAULT_KEY)
+}
+
+/// Given the full table schema and an optional user-supplied column list,
+/// return the subset of `Field`s the COPY-IN reader should expect (in column-
+/// list order). For COPY FROM with a column list, also validate that every
+/// column NOT in the list is either nullable or has a DEFAULT — otherwise
+/// the row would have nothing to put there. Each error returns SQLSTATE
+/// 42601 at the call site.
+pub(crate) fn select_copy_in_columns(
+    table: &str,
+    table_columns: &[Field],
+    column_list: Option<&[String]>,
+) -> std::result::Result<Vec<Field>, String> {
+    let column_list = match column_list {
+        Some(l) => l,
+        None => return Ok(table_columns.to_vec()),
+    };
+    let mut selected: Vec<Field> = Vec::with_capacity(column_list.len());
+    let mut listed_names: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(column_list.len());
+    for name in column_list {
+        let lname = name.to_ascii_lowercase();
+        if !listed_names.insert(lname.clone()) {
+            return Err(format!(
+                "COPY: column {name:?} listed twice in column list"
+            ));
+        }
+        let field = table_columns
+            .iter()
+            .find(|f| f.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                format!(
+                    "COPY: column {name:?} does not exist on table {table:?}"
+                )
+            })?;
+        selected.push(field.clone());
+    }
+    // Every NOT NULL column without a DEFAULT must be in the list.
+    for f in table_columns {
+        if listed_names.contains(&f.name().to_ascii_lowercase()) {
+            continue;
+        }
+        if !f.is_nullable() && !field_has_default(f) {
+            return Err(format!(
+                "COPY: column \"{}\" cannot be NULL and has no default",
+                f.name()
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+/// As `select_copy_in_columns`, but for the OUT (export) direction. Validates
+/// that every listed name exists on the table; ordering follows the list.
+/// No nullability check — exporting a subset is always safe.
+pub(crate) fn select_copy_out_columns(
+    table: &str,
+    table_columns: &[Field],
+    column_list: Option<&[String]>,
+) -> std::result::Result<Vec<Field>, String> {
+    let column_list = match column_list {
+        Some(l) => l,
+        None => return Ok(table_columns.to_vec()),
+    };
+    let mut selected: Vec<Field> = Vec::with_capacity(column_list.len());
+    for name in column_list {
+        let field = table_columns
+            .iter()
+            .find(|f| f.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                format!(
+                    "COPY: column {name:?} does not exist on table {table:?}"
+                )
+            })?;
+        selected.push(field.clone());
+    }
+    Ok(selected)
+}
+
 /// Build `CopyInResponse` for a CSV/text-format copy with `n` columns.
 pub(crate) fn copy_in_response(n: usize) -> CopyInResponse {
     CopyInResponse::new(0, n as i16, vec![0; n])
@@ -404,7 +600,12 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
             state.buffer.clear();
             return;
         }
-        let sql = match build_insert_sql(&state.table, &state.columns, &record) {
+        let sql = match build_insert_sql(
+            &state.table,
+            state.column_list.as_deref(),
+            &state.columns,
+            &record,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 state.error = Some(e);
@@ -554,19 +755,34 @@ fn parse_csv_record(bytes: &[u8]) -> std::result::Result<Vec<Option<String>>, St
     Ok(out)
 }
 
-/// Build `INSERT INTO <table> VALUES (v1, v2, ...)` from one CSV record. Each
-/// value is rendered per its target column type:
+/// Build `INSERT INTO <table> [(col, ...)] VALUES (v1, v2, ...)` from one CSV
+/// record. Each value is rendered per its target column type:
 /// - numeric / bool: bare token (parsed by the engine's literal scanner)
 /// - text / json / uuid / bytea: single-quoted with `'` doubled
 /// - empty unquoted CSV cell: `NULL`
+///
+/// When `column_list` is `Some`, the names are emitted verbatim (already
+/// validated against the schema by `select_copy_in_columns`), and the engine
+/// fills the unlisted columns with their `DEFAULT` (or NULL).
 fn build_insert_sql(
     table: &str,
+    column_list: Option<&[String]>,
     columns: &[Field],
     record: &[Option<String>],
 ) -> std::result::Result<String, String> {
     let mut sql = String::with_capacity(64 + record.len() * 16);
     sql.push_str("INSERT INTO ");
     sql.push_str(table);
+    if let Some(list) = column_list {
+        sql.push_str(" (");
+        for (i, name) in list.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(name);
+        }
+        sql.push(')');
+    }
     sql.push_str(" VALUES (");
     for (i, (cell, field)) in record.iter().zip(columns.iter()).enumerate() {
         if i > 0 {
@@ -649,6 +865,92 @@ fn quote_into(v: &str, out: &mut String) {
     out.push('\'');
 }
 
+/// Render the table (or column-list subset) as CSV bytes.
+///
+/// Returns `(header_line, body_lines, row_count)`:
+/// - `header_line` is `Some(...)` when the caller asked for a header row;
+///   each entry is one `<col>,<col>...\n` payload.
+/// - `body_lines` is one `<csv-row>\n` byte vector per data row.
+/// - `row_count` excludes the header.
+///
+/// Errors propagate as `BasinError`. The caller maps these to whatever the
+/// transport (CopyData wire bytes vs. file bytes) needs.
+pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
+    session: &S,
+    table: &str,
+    column_list: Option<&[String]>,
+    with_header: bool,
+) -> std::result::Result<(Option<Vec<u8>>, Vec<Vec<u8>>, u64), basin_common::BasinError> {
+    // Always issue `SELECT * FROM <table>`. The engine's projection-pushdown
+    // returns columns in physical table order regardless of the SELECT
+    // column order (Parquet `ProjectionMask` is a set, not a list — schema
+    // and batch can otherwise disagree on column order). For the column-
+    // list COPY case we re-derive the output order locally, mapping each
+    // requested name to its position in the full-schema result.
+    let res = session
+        .execute(&format!("SELECT * FROM {table}"))
+        .await?;
+    let (schema, batches) = match res {
+        ExecResult::Rows { schema, batches } => (schema, batches),
+        ExecResult::Empty { .. } => {
+            return Err(basin_common::BasinError::Internal(format!(
+                "COPY TO: SELECT * FROM {table} returned no result set"
+            )));
+        }
+    };
+    let column_indices: Vec<usize> = match column_list {
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for name in list {
+                let idx = schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        basin_common::BasinError::Internal(format!(
+                            "COPY TO: column {name:?} not in result schema"
+                        ))
+                    })?;
+                out.push(idx);
+            }
+            out
+        }
+        None => (0..schema.fields().len()).collect(),
+    };
+    let header = if with_header {
+        let mut row = String::new();
+        for (i, &idx) in column_indices.iter().enumerate() {
+            if i > 0 {
+                row.push(',');
+            }
+            csv_encode_into(schema.field(idx).name(), &mut row);
+        }
+        row.push('\n');
+        Some(row.into_bytes())
+    } else {
+        None
+    };
+    let mut body = Vec::with_capacity(batches.iter().map(|b| b.num_rows()).sum());
+    let mut row_count: u64 = 0;
+    for batch in &batches {
+        for r in 0..batch.num_rows() {
+            let mut row = String::new();
+            for (i, &idx) in column_indices.iter().enumerate() {
+                if i > 0 {
+                    row.push(',');
+                }
+                let col = batch.column(idx);
+                let cell = render_csv_cell(col.as_ref(), r, schema.field(idx));
+                csv_encode_into(&cell, &mut row);
+            }
+            row.push('\n');
+            body.push(row.into_bytes());
+            row_count += 1;
+        }
+    }
+    Ok((header, body, row_count))
+}
+
 /// Run the full `COPY TO STDOUT` flow synchronously. Returns the backend
 /// message sequence for the simple-query handler to feed onto the wire.
 ///
@@ -664,27 +966,49 @@ fn quote_into(v: &str, out: &mut String) {
 pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
     session: &S,
     table: &str,
+    column_list: Option<&[String]>,
     with_header: bool,
 ) -> Vec<PgWireBackendMessage> {
-    let mut out = Vec::new();
-    let res = session
-        .execute(&format!("SELECT * FROM {table}"))
-        .await;
-    let (schema, batches) = match res {
-        Ok(ExecResult::Rows { schema, batches }) => (schema, batches),
-        Ok(ExecResult::Empty { .. }) => {
-            // Shouldn't happen for SELECT, but treat as zero-row table.
+    // Resolve full schema once so we know how many columns CopyOutResponse
+    // should advertise, and so we can pre-validate the column list with a
+    // user-friendly error.
+    let table_columns = match resolve_table_columns(session, table).await {
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => {
             let info = ErrorInfo::new(
                 "ERROR".to_owned(),
-                "XX000".to_owned(),
-                format!("COPY TO STDOUT: SELECT * FROM {table} returned no result set"),
+                "42P01".to_owned(),
+                format!("COPY TO: cannot resolve schema of {table:?}"),
             );
-            out.push(PgWireBackendMessage::ErrorResponse(info.into()));
-            out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                TransactionStatus::Idle,
-            )));
-            return out;
+            return vec![
+                PgWireBackendMessage::ErrorResponse(info.into()),
+                PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
+            ];
         }
+        Err(e) => {
+            return vec![
+                PgWireBackendMessage::ErrorResponse(crate::error::error_response(&e)),
+                PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
+            ];
+        }
+    };
+    let selected =
+        match select_copy_out_columns(table, &table_columns, column_list) {
+            Ok(s) => s,
+            Err(msg) => {
+                let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
+                return vec![
+                    PgWireBackendMessage::ErrorResponse(info.into()),
+                    PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                        TransactionStatus::Idle,
+                    )),
+                ];
+            }
+        };
+    let n_cols = selected.len();
+    let mut out: Vec<PgWireBackendMessage> = Vec::new();
+    let payload = match copy_to_csv_payload(session, table, column_list, with_header).await {
+        Ok(p) => p,
         Err(e) => {
             out.push(PgWireBackendMessage::ErrorResponse(
                 crate::error::error_response(&e),
@@ -695,39 +1019,13 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
             return out;
         }
     };
-    let n_cols = schema.fields().len();
+    let (header, body, row_count) = payload;
     out.push(PgWireBackendMessage::CopyOutResponse(copy_out_response(n_cols)));
-    if with_header {
-        let mut row = String::new();
-        for (i, f) in schema.fields().iter().enumerate() {
-            if i > 0 {
-                row.push(',');
-            }
-            csv_encode_into(f.name(), &mut row);
-        }
-        row.push('\n');
-        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-            row.into_bytes(),
-        ))));
+    if let Some(h) = header {
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(h))));
     }
-    let mut row_count: u64 = 0;
-    for batch in &batches {
-        for r in 0..batch.num_rows() {
-            let mut row = String::new();
-            for c in 0..n_cols {
-                if c > 0 {
-                    row.push(',');
-                }
-                let col = batch.column(c);
-                let cell = render_csv_cell(col.as_ref(), r, schema.field(c));
-                csv_encode_into(&cell, &mut row);
-            }
-            row.push('\n');
-            out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-                row.into_bytes(),
-            ))));
-            row_count += 1;
-        }
+    for row in body {
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(row))));
     }
     out.push(PgWireBackendMessage::CopyDone(
         pgwire::messages::copy::CopyDone::new(),
@@ -786,6 +1084,118 @@ pub(crate) fn copy_from_stdin_messages(n_cols: usize) -> Vec<PgWireBackendMessag
     vec![PgWireBackendMessage::CopyInResponse(copy_in_response(n_cols))]
 }
 
+/// Env-var-driven allowlist for server-side COPY file paths. Default-deny: if
+/// `BASIN_COPY_PATH_ALLOWLIST` is unset or empty, every file path is rejected.
+///
+/// Format: colon-separated list of absolute directory prefixes. A path is
+/// accepted iff (a) it is absolute and (b) it lies inside one of the listed
+/// directories (after path-component normalisation; we do NOT canonicalise
+/// symlinks — keep this comparison purely lexical to avoid TOCTOU surprises
+/// and to allow paths to point at files that don't exist yet for COPY TO).
+///
+/// Example: `BASIN_COPY_PATH_ALLOWLIST=/var/lib/basin/imports:/var/lib/basin/exports`.
+pub(crate) const COPY_PATH_ALLOWLIST_ENV: &str = "BASIN_COPY_PATH_ALLOWLIST";
+
+/// Validate `path` for use as a server-side COPY file path. Returns the
+/// path bytes unchanged on success; on rejection, the returned string is
+/// suitable as the SQLSTATE 42601 message.
+pub(crate) fn validate_copy_path(path: &str) -> std::result::Result<std::path::PathBuf, String> {
+    use std::path::{Component, PathBuf};
+
+    let allowlist_raw = std::env::var(COPY_PATH_ALLOWLIST_ENV).unwrap_or_default();
+    if allowlist_raw.is_empty() {
+        return Err(format!(
+            "COPY: server-side file paths are disabled (set {COPY_PATH_ALLOWLIST_ENV}=/dir1:/dir2 to enable)"
+        ));
+    }
+    let pb = PathBuf::from(path);
+    if !pb.is_absolute() {
+        return Err(format!(
+            "COPY: file path must be absolute, got {path:?}"
+        ));
+    }
+    // Reject `..` components — keeps lexical comparison meaningful even if a
+    // listed dir is nested.
+    if pb.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "COPY: file path may not contain '..' components, got {path:?}"
+        ));
+    }
+    let allowlist: Vec<PathBuf> = allowlist_raw
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if allowlist.is_empty() {
+        return Err(format!(
+            "COPY: {COPY_PATH_ALLOWLIST_ENV} is set but contains no entries"
+        ));
+    }
+    let allowed = allowlist.iter().any(|root| pb.starts_with(root));
+    if !allowed {
+        return Err(format!(
+            "COPY: file path {path:?} is outside {COPY_PATH_ALLOWLIST_ENV}"
+        ));
+    }
+    Ok(pb)
+}
+
+/// Drive `COPY <table> [(cols)] TO '<path>'` on the basin-server process.
+/// Writes the rendered CSV bytes to `path` (truncating any existing file)
+/// and returns the row count for the `CommandComplete` tag.
+///
+/// Sequential, single buffer — no per-tenant file handles allocated.
+pub(crate) async fn copy_to_file<S: Session + ?Sized>(
+    session: &S,
+    table: &str,
+    column_list: Option<&[String]>,
+    path: &std::path::Path,
+    with_header: bool,
+) -> std::result::Result<u64, basin_common::BasinError> {
+    use tokio::io::AsyncWriteExt;
+    let (header, body, row_count) =
+        copy_to_csv_payload(session, table, column_list, with_header).await?;
+    let mut f = tokio::fs::File::create(path).await.map_err(|e| {
+        basin_common::BasinError::Internal(format!(
+            "COPY TO {}: open: {e}",
+            path.display()
+        ))
+    })?;
+    if let Some(h) = header {
+        f.write_all(&h).await.map_err(|e| {
+            basin_common::BasinError::Internal(format!("COPY TO write: {e}"))
+        })?;
+    }
+    for row in &body {
+        f.write_all(row).await.map_err(|e| {
+            basin_common::BasinError::Internal(format!("COPY TO write: {e}"))
+        })?;
+    }
+    f.flush()
+        .await
+        .map_err(|e| basin_common::BasinError::Internal(format!("COPY TO flush: {e}")))?;
+    Ok(row_count)
+}
+
+/// Drive `COPY <table> [(cols)] FROM '<path>'` on the basin-server process.
+/// Reads the file in one shot (sequential, single buffer) and feeds it
+/// through the existing CSV-row → INSERT path.
+pub(crate) async fn copy_from_file<S: Session + ?Sized>(
+    session: &S,
+    state: &mut CopyInState,
+    path: &std::path::Path,
+) -> std::result::Result<(), basin_common::BasinError> {
+    let bytes = tokio::fs::read(path).await.map_err(|e| {
+        basin_common::BasinError::Internal(format!(
+            "COPY FROM {}: read: {e}",
+            path.display()
+        ))
+    })?;
+    state.buffer.extend_from_slice(&bytes);
+    process_buffered_rows(state, session, true).await;
+    Ok(())
+}
+
 /// Per-connection mutex around an in-flight `COPY FROM STDIN`. The
 /// simple-query handler pushes one in here when it sends `CopyInResponse`;
 /// `CopyHandler::on_copy_data` / `on_copy_done` pop / mutate it.
@@ -802,7 +1212,9 @@ mod tests {
             cmd,
             Some(CopyCommand::From {
                 table: "events".into(),
-                with_header: false
+                with_header: false,
+                columns: None,
+                path: None,
             })
         );
     }
@@ -814,7 +1226,9 @@ mod tests {
             cmd,
             Some(CopyCommand::To {
                 table: "t".into(),
-                with_header: true
+                with_header: true,
+                columns: None,
+                path: None,
             })
         );
     }
@@ -826,15 +1240,67 @@ mod tests {
             cmd,
             Some(CopyCommand::From {
                 table: "t".into(),
-                with_header: false
+                with_header: false,
+                columns: None,
+                path: None,
             })
         );
     }
 
     #[test]
-    fn parse_copy_rejects_column_list() {
-        let e = parse_copy("COPY t (a, b) FROM STDIN").unwrap_err();
+    fn parse_copy_accepts_column_list() {
+        let cmd = parse_copy("COPY t (b, a) FROM STDIN WITH (FORMAT CSV)").unwrap();
+        assert_eq!(
+            cmd,
+            Some(CopyCommand::From {
+                table: "t".into(),
+                with_header: false,
+                columns: Some(vec!["b".into(), "a".into()]),
+                path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_to_column_list() {
+        let cmd =
+            parse_copy("COPY t (id, email) TO STDOUT WITH (FORMAT CSV, HEADER true)").unwrap();
+        assert_eq!(
+            cmd,
+            Some(CopyCommand::To {
+                table: "t".into(),
+                with_header: true,
+                columns: Some(vec!["id".into(), "email".into()]),
+                path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_copy_rejects_empty_column_list() {
+        let e = parse_copy("COPY t () FROM STDIN").unwrap_err();
         assert!(e.contains("column list"), "got: {e}");
+    }
+
+    #[test]
+    fn parse_copy_accepts_to_file_path() {
+        let cmd =
+            parse_copy("COPY t TO '/tmp/users.csv' WITH (FORMAT CSV)").unwrap();
+        assert_eq!(
+            cmd,
+            Some(CopyCommand::To {
+                table: "t".into(),
+                with_header: false,
+                columns: None,
+                path: Some("/tmp/users.csv".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_from_file_path() {
+        let cmd = parse_copy("COPY t FROM '/var/lib/import.csv' WITH CSV").unwrap();
+        assert!(matches!(cmd, Some(CopyCommand::From { ref path, .. }) if path.as_deref() == Some("/var/lib/import.csv")));
     }
 
     #[test]
@@ -942,7 +1408,7 @@ mod tests {
             Field::new("body", DataType::Utf8, false),
         ];
         let rec = vec![Some("42".to_string()), Some("it's me".to_string())];
-        let sql = build_insert_sql("t", &cols, &rec).unwrap();
+        let sql = build_insert_sql("t", None, &cols, &rec).unwrap();
         assert_eq!(sql, "INSERT INTO t VALUES (42, 'it''s me')");
     }
 
@@ -953,8 +1419,113 @@ mod tests {
             Field::new("body", DataType::Utf8, true),
         ];
         let rec = vec![Some("1".to_string()), None];
-        let sql = build_insert_sql("t", &cols, &rec).unwrap();
+        let sql = build_insert_sql("t", None, &cols, &rec).unwrap();
         assert_eq!(sql, "INSERT INTO t VALUES (1, NULL)");
+    }
+
+    #[test]
+    fn build_insert_sql_with_column_list() {
+        let cols = vec![
+            Field::new("b", DataType::Utf8, false),
+            Field::new("a", DataType::Int64, false),
+        ];
+        let list = vec!["b".to_string(), "a".to_string()];
+        let rec = vec![Some("hi".to_string()), Some("7".to_string())];
+        let sql = build_insert_sql("t", Some(&list), &cols, &rec).unwrap();
+        assert_eq!(sql, "INSERT INTO t (b, a) VALUES ('hi', 7)");
+    }
+
+    #[test]
+    fn select_copy_in_columns_subset_with_default_ok() {
+        use std::collections::HashMap;
+        let mut md = HashMap::new();
+        md.insert(BASIN_COLUMN_DEFAULT_KEY.to_string(), "42".to_string());
+        let table_cols = vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Int64, false).with_metadata(md),
+        ];
+        let list = vec!["a".to_string(), "b".to_string()];
+        let r = select_copy_in_columns("t", &table_cols, Some(&list)).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].name(), "a");
+        assert_eq!(r[1].name(), "b");
+    }
+
+    #[test]
+    fn select_copy_in_columns_missing_required_rejects() {
+        let table_cols = vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false), // NOT NULL, no default
+            Field::new("c", DataType::Int64, true),
+        ];
+        let list = vec!["a".to_string(), "c".to_string()];
+        let e = select_copy_in_columns("t", &table_cols, Some(&list)).unwrap_err();
+        assert!(e.contains("\"b\""), "got: {e}");
+        assert!(e.contains("cannot be NULL"), "got: {e}");
+    }
+
+    #[test]
+    fn select_copy_in_columns_unknown_column_rejects() {
+        let table_cols = vec![Field::new("a", DataType::Int64, true)];
+        let list = vec!["nope".to_string()];
+        let e = select_copy_in_columns("t", &table_cols, Some(&list)).unwrap_err();
+        assert!(e.contains("does not exist"), "got: {e}");
+    }
+
+    /// `BASIN_COPY_PATH_ALLOWLIST` is process-global; tests that mutate it
+    /// must serialise through this mutex, otherwise parallel cargo test
+    /// runners stomp each other.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn validate_copy_path_default_deny() {
+        let _g = env_lock();
+        std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
+        let e = validate_copy_path("/tmp/x.csv").unwrap_err();
+        assert!(e.contains("disabled"), "got: {e}");
+    }
+
+    #[test]
+    fn validate_copy_path_relative_rejected() {
+        let _g = env_lock();
+        std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp");
+        let e = validate_copy_path("rel/path.csv").unwrap_err();
+        assert!(e.contains("absolute"), "got: {e}");
+        std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
+    }
+
+    #[test]
+    fn validate_copy_path_inside_allowlist_ok() {
+        let _g = env_lock();
+        std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp/basin-copy");
+        let p = validate_copy_path("/tmp/basin-copy/x.csv").unwrap();
+        assert_eq!(p.to_str(), Some("/tmp/basin-copy/x.csv"));
+        std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
+    }
+
+    #[test]
+    fn validate_copy_path_outside_allowlist_rejected() {
+        let _g = env_lock();
+        std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp/basin-copy");
+        let e = validate_copy_path("/etc/passwd").unwrap_err();
+        assert!(e.contains("outside"), "got: {e}");
+        std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
+    }
+
+    #[test]
+    fn validate_copy_path_rejects_dotdot() {
+        let _g = env_lock();
+        std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp");
+        let e = validate_copy_path("/tmp/../etc/passwd").unwrap_err();
+        assert!(e.contains(".."), "got: {e}");
+        std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
     }
 
     #[test]

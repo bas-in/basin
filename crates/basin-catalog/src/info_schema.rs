@@ -1437,6 +1437,9 @@ fn pg_type_for_field(field: &Field) -> (&'static str, &'static str) {
         DataType::Timestamp(_, Some(_)) => ("timestamp with time zone", "timestamptz"),
         DataType::Timestamp(_, None) => ("timestamp without time zone", "timestamp"),
         DataType::Interval(IntervalUnit::MonthDayNano) => ("interval", "interval"),
+        // PG `numeric` rides on Decimal128 — surface as the SQL standard
+        // name in `data_type` and PG's short udt_name `numeric`.
+        DataType::Decimal128(_, _) => ("numeric", "numeric"),
         // FixedSizeList<Float32> is the engine's `vector(N)` shape.
         DataType::FixedSizeList(child, _) if matches!(child.data_type(), DataType::Float32) => {
             ("USER-DEFINED", "vector")
@@ -1474,6 +1477,8 @@ fn pg_type_oid_for_field(field: &Field) -> i64 {
         DataType::Timestamp(_, Some(_)) => 1184,
         DataType::Timestamp(_, None) => 1114,
         DataType::Interval(IntervalUnit::MonthDayNano) => 1186,
+        // PG `numeric` (OID 1700). Mirrors the `BASIN_PG_TYPES` row.
+        DataType::Decimal128(_, _) => 1700,
         // Unknown / fallback → text (25). Matches the router's fallback so
         // wire-layer and introspection-layer agree on the mismapped type.
         _ => 25,

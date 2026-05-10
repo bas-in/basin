@@ -39,22 +39,31 @@
 //! `basin-cron` for `cron.schedule(...)` and `basin-net` for
 //! `http_get(...)` / `net.http_post(...)`.
 //!
-//! ## Refresh model (v0.1)
+//! ## Refresh model
 //!
 //! On each [`CvRefresher::tick`] (or [`basin_shard::Shard::run_cv_refresh`]):
 //!
 //! 1. For each registered CV under each resident tenant, check whether
 //!    `now - last_refreshed_at >= refresh_interval`. Skip if not due.
-//! 2. Re-execute the CV's source SQL against the tenant's session, in
-//!    full. v0.2 will narrow this to an incremental scan over rows whose
-//!    bucket key exceeds `last_bucket_max` (similar to TimescaleDB's
-//!    "real-time" continuous aggregates).
+//! 2. Decide full vs. incremental:
+//!    - First refresh of a CV (no `last_bucket_max`), or a SELECT body
+//!      whose GROUP BY shape doesn't match `date_trunc(_, col)` /
+//!      `time_bucket(_, col)`: re-execute the entire SELECT.
+//!    - Otherwise: rewrite the SELECT to filter the source table on
+//!      `<bucket_col> >= last_bucket_max`, run the rewrite, merge the
+//!      result with the matview's prior `bucket < last_bucket_max` rows.
 //! 3. Write the result batches to a fresh Parquet file under the CV's
 //!    table prefix.
 //! 4. Atomically swap the catalog manifest (`replace_data_files`) so
 //!    subsequent reads see the new materialisation.
-//! 5. Stamp `last_refreshed_at_unix_ms` (and `last_bucket_max_unix_ms`,
-//!    when the CV's bucket column is detectable) back into the catalog.
+//! 5. Stamp `last_refreshed_at_unix_ms` and the new `last_bucket_max_unix_ms`
+//!    (start of the bucket containing the source table's max ts) on the
+//!    catalog row.
+//!
+//! The watermark / bucket-spanning correctness invariant — and the v0.1
+//! limitation that rows arriving late into fully-closed buckets are not
+//! re-aggregated — is documented in
+//! [`basin_engine::cv_time_bucket`].
 //!
 //! ## Read model (v0.1)
 //!
@@ -93,6 +102,8 @@ mod refresher;
 mod store;
 mod types;
 
-pub use refresher::{Clock, CvRefresher, RefreshOutcome, SystemClock, TestClock};
+pub use refresher::{
+    Clock, CvRefresher, RefreshMode, RefreshOutcome, RefreshSpy, SystemClock, TestClock,
+};
 pub use store::{CvStore, RegisterError};
 pub use types::{CvRefreshOutcome, CvRefreshState, CvSpec};

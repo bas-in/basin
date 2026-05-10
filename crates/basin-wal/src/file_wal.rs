@@ -513,7 +513,7 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
-    use crate::{Wal, WalConfig};
+    use crate::{LocalWal, Wal, WalConfig};
 
     fn cfg_in(dir: &TempDir) -> WalConfig {
         let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
@@ -532,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn append_assigns_monotonic_lsn() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let part = PartitionKey::default_key();
 
@@ -549,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn read_from_returns_appended() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let part = PartitionKey::default_key();
 
@@ -575,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn high_water_tracks_appends() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let part = PartitionKey::default_key();
 
@@ -590,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_isolation() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let a = TenantId::new();
         let b = TenantId::new();
         let part = PartitionKey::default_key();
@@ -619,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn partition_isolation() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let p1 = PartitionKey::new("p1").unwrap();
         let p2 = PartitionKey::new("p2").unwrap();
@@ -652,7 +652,7 @@ mod tests {
         let part = PartitionKey::default_key();
 
         {
-            let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+            let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
             for i in 1..=30u64 {
                 wal.append(&tenant, &part, payload(i)).await.unwrap();
             }
@@ -660,7 +660,7 @@ mod tests {
             wal.close().await.unwrap();
         }
 
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         assert_eq!(wal.high_water(&tenant, &part).await.unwrap(), Lsn(30));
         let all = wal.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(all.len(), 30);
@@ -673,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn truncate_removes_segments() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let part = PartitionKey::default_key();
 
@@ -699,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn flush_is_idempotent() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let part = PartitionKey::default_key();
 
@@ -717,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_append_serialised() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let part = PartitionKey::default_key();
 
@@ -755,7 +755,7 @@ mod tests {
     #[ignore]
     async fn bench_10k_writes() {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::open(cfg_in(&dir)).await.unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
         let tenant = TenantId::new();
         let part = PartitionKey::default_key();
         let body = vec![0u8; 256];

@@ -2,12 +2,12 @@
 //! that wraps Basin's internal [`basin_catalog::Catalog`] trait.
 //!
 //! See `README.md` for the supported endpoint matrix. Phase 6 entry-point:
-//! GET-only endpoints (namespaces, list-tables, load-table) plus DELETE
-//! table; POST commit / create / refresh-metadata flows are deferred until
-//! we map them onto Basin's snapshot semantics. This crate intentionally
-//! does **not** depend on the upstream `iceberg` crate — we shape for
-//! external-client compatibility (pyiceberg, Spark, Trino, DuckDB,
-//! Polars), not for reuse of apache code.
+//! GET endpoints (namespaces, list-tables, load-table) plus DELETE table,
+//! plus the v0.1 subset of create-table and commit-table. `register-table`
+//! returns 501 until we add foreign-metadata ingest. This crate
+//! intentionally does **not** depend on the upstream `iceberg` crate — we
+//! shape for external-client compatibility (pyiceberg, Spark, Trino,
+//! DuckDB, Polars), not for reuse of apache code.
 //!
 //! ## Mounting
 //!
@@ -41,8 +41,10 @@ mod tables;
 pub use config::IcebergRestConfig;
 pub use error::IcebergRestError;
 pub use models::{
-    CreateTableRequest, IcebergSchema, IcebergSchemaField, IcebergTableMetadata,
-    ListNamespacesResponse, ListTablesResponse, LoadTableResponse, TableIdentifier,
+    CommitRequirement, CommitTableRequest, CommitUpdate, CreateTableRequest, IcebergPartitionSpec,
+    IcebergSchema, IcebergSchemaField, IcebergSnapshot, IcebergSnapshotRef, IcebergSortOrder,
+    IcebergTableMetadata, ListNamespacesResponse, ListTablesResponse, LoadTableResponse,
+    RegisterTableRequest, TableIdentifier,
 };
 
 /// Shared handler state: the Catalog handle plus immutable config.
@@ -79,6 +81,10 @@ pub fn router_with_config(catalog: Arc<dyn Catalog>, cfg: IcebergRestConfig) -> 
             get(tables::load_table)
                 .delete(tables::drop_table)
                 .post(tables::commit_table),
+        )
+        .route(
+            "/v1/:prefix/namespaces/:namespace/register",
+            axum::routing::post(tables::register_table),
         )
         .with_state(state)
 }

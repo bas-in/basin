@@ -648,7 +648,7 @@ impl ShardImpl for InProcessShard {
         Arc::new(self.share_clone())
     }
 
-    fn wal(&self) -> &basin_wal::Wal {
+    fn wal(&self) -> &Arc<dyn basin_wal::Wal> {
         &self.cfg.wal
     }
 
@@ -833,7 +833,7 @@ fn decode_payload(bytes: &[u8]) -> Result<(TableName, Vec<RecordBatch>)> {
 }
 
 async fn replay_wal_into(
-    wal: &basin_wal::Wal,
+    wal: &Arc<dyn basin_wal::Wal>,
     tenant: &TenantId,
     partition: &PartitionKey,
     state: &mut PartitionState,
@@ -1000,7 +1000,7 @@ mod tests {
     use basin_catalog::InMemoryCatalog;
     use basin_common::{PartitionKey, TableName, TenantId};
     use basin_storage::{Storage, StorageConfig};
-    use basin_wal::{Wal, WalConfig};
+    use basin_wal::{LocalWal, Wal, WalConfig};
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
@@ -1029,7 +1029,7 @@ mod tests {
         TempDir,
         Storage,
         Arc<InMemoryCatalog>,
-        Wal,
+        Arc<dyn Wal>,
     ) {
         basin_common::telemetry::try_init_for_tests();
         let storage_dir = TempDir::new().unwrap();
@@ -1043,14 +1043,16 @@ mod tests {
         page_cache: None,
         });
         let catalog = Arc::new(InMemoryCatalog::new());
-        let wal = Wal::open(WalConfig {
-            object_store: Arc::new(wal_fs),
-            root_prefix: None,
-            flush_interval: Duration::from_millis(50),
-            flush_max_bytes: 1024 * 1024,
-        })
-        .await
-        .unwrap();
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
         let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal.clone());
         let shard = crate::Shard::new(cfg);
         (shard, storage_dir, wal_dir, storage, catalog, wal)
@@ -1170,7 +1172,7 @@ mod tests {
 
         // First shard: write 5 batches, drop.
         {
-            let wal = Wal::open(wal_cfg()).await.unwrap();
+            let wal: Arc<dyn Wal> = Arc::new(LocalWal::open(wal_cfg()).await.unwrap());
             let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal.clone());
             let shard = crate::Shard::new(cfg);
             let handle = shard.get(&tenant, &partition).await.unwrap();
@@ -1186,7 +1188,7 @@ mod tests {
 
         // Second shard: reopen, read — all 5 batches replay.
         {
-            let wal = Wal::open(wal_cfg()).await.unwrap();
+            let wal: Arc<dyn Wal> = Arc::new(LocalWal::open(wal_cfg()).await.unwrap());
             let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal);
             let shard = crate::Shard::new(cfg);
             let handle = shard.get(&tenant, &partition).await.unwrap();

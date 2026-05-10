@@ -65,6 +65,56 @@ pub struct SecondaryIndex {
     pub column: String,
 }
 
+/// One CHECK constraint attached to a table. The predicate is stored as
+/// raw SQL text — the engine reparses it at write time and evaluates it
+/// against the row's RecordBatch via DataFusion (same trick used by
+/// `GENERATED ALWAYS AS` columns and `CREATE DOMAIN ... CHECK`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckConstraint {
+    /// Auto-named `<table>_<col>_check` (column-level) or
+    /// `<table>_check_<n>` (table-level), unless the user wrote
+    /// `CONSTRAINT <name> CHECK (...)`.
+    pub name: String,
+    /// Predicate text; e.g. `"price > 0"` (no surrounding parens).
+    pub predicate: String,
+}
+
+/// Referential action for a foreign key. v0.1 supports `NoAction` (the
+/// default — reject DELETE / UPDATE of a referenced row when referring
+/// rows exist) and `Cascade` (delete / update the referencing rows).
+/// `SetNull`, `SetDefault`, `Restrict` are out of scope for v0.1 and
+/// rejected at CREATE time as `feature_not_supported`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RefAction {
+    #[default]
+    NoAction,
+    Cascade,
+}
+
+/// One FOREIGN KEY constraint attached to a table. v0.1 enforces
+/// referential integrity on INSERT / UPDATE of referencing columns
+/// (referenced row must exist) and on DELETE / UPDATE of referenced
+/// columns (NO ACTION rejects, CASCADE propagates). Single-shard,
+/// single-tenant only — cross-tenant FKs are rejected at CREATE.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKeyDef {
+    /// Auto-named `<table>_<col>_fkey` unless user wrote
+    /// `CONSTRAINT <name> FOREIGN KEY (...) REFERENCES ...`.
+    pub name: String,
+    /// Local columns (in order) that participate in the FK.
+    pub columns: Vec<String>,
+    /// Bare table name of the referenced table (same tenant only).
+    pub ref_table: String,
+    /// Referenced columns on `ref_table`. Must be the PK columns of that
+    /// table in v0.1 (UNIQUE-constraint-only references are deferred).
+    pub ref_columns: Vec<String>,
+    #[serde(default)]
+    pub on_delete: RefAction,
+    #[serde(default)]
+    pub on_update: RefAction,
+}
+
 /// Within-tenant partitioning declared via `CREATE TABLE … PARTITION BY …`.
 ///
 /// Catalog-side this is metadata only; the engine consults it at INSERT to
@@ -269,6 +319,26 @@ pub struct TableMetadata {
     /// materialised lazily by the storage reader on first query; this
     /// catalog row is the authoritative declaration.
     pub indexes: Vec<SecondaryIndex>,
+    /// PRIMARY KEY column list (empty when no PK declared). Order is
+    /// declaration order. Single-column or composite. PK columns are
+    /// always NOT NULL — enforced at CREATE TABLE.
+    ///
+    /// Enforcement: on INSERT (and on UPDATE that touches a PK column)
+    /// the engine scans the existing table for a row whose PK tuple
+    /// matches and rejects the write with SQLSTATE 23505 if found.
+    /// v0.1 uses a full-table scan; Phase 5.7 B1 secondary indexes
+    /// will speed this up later.
+    pub pk_columns: Vec<String>,
+    /// CHECK constraints attached to this table. Evaluated on every
+    /// INSERT row and on every UPDATE row that touches any column the
+    /// predicate references. Predicate violations surface as SQLSTATE
+    /// 23514.
+    pub check_constraints: Vec<CheckConstraint>,
+    /// FOREIGN KEY constraints declared on this table. Enforced on
+    /// INSERT / UPDATE (referenced row must exist) and on DELETE /
+    /// UPDATE of the *referenced* table (NO ACTION rejects when
+    /// referring rows exist; CASCADE propagates).
+    pub foreign_keys: Vec<ForeignKeyDef>,
 }
 
 impl TableMetadata {

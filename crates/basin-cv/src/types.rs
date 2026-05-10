@@ -24,9 +24,10 @@ pub struct CvSpec {
     /// re-parsing.
     pub source_table: String,
     /// Full SQL the refresher re-executes on each tick. Stored verbatim;
-    /// the engine reparses at refresh time. v0.2 will inject a
-    /// `WHERE <bucket_col> > <last_bucket_max>` predicate at refresh time
-    /// to make the rebuild incremental.
+    /// the engine reparses at refresh time. When the body matches the
+    /// supported time-bucket shape, the refresher rewrites it to inject a
+    /// `WHERE <bucket_col> >= <last_bucket_max>` predicate and only
+    /// re-aggregates the watermark-and-newer rows.
     pub query_sql: String,
     /// Refresh cadence. Ticks at intervals shorter than this are no-ops.
     /// Stored as seconds rather than `Duration` to keep the catalog
@@ -36,10 +37,11 @@ pub struct CvSpec {
     /// first refresh completes.
     pub last_refreshed_at: Option<DateTime<Utc>>,
     /// Watermark for the latest source-table bucket the materialised data
-    /// covers. `None` after registration, before the first refresh.
-    /// v0.2's incremental refresh will read this as the lower bound on the
-    /// next refresh's source-row scan; v0.1 ignores it but updates it for
-    /// upgrade compatibility.
+    /// covers. `None` after registration, before the first refresh. The
+    /// incremental refresh path reads this as the lower bound on the next
+    /// refresh's source-row scan (re-aggregates rows where
+    /// `bucket_col >= last_bucket_max`); the full-rebuild path also writes
+    /// it back so the next tick can do incremental.
     pub last_bucket_max: Option<DateTime<Utc>>,
 }
 

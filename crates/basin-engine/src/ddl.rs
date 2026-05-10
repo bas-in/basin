@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use basin_catalog::PartitionSpec;
+use basin_catalog::{CheckConstraint, ForeignKeyDef, PartitionSpec, RefAction};
 use basin_common::{BasinError, Result};
 use sqlparser::ast::{
     ColumnDef, ColumnOption, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GeneratedAs,
-    GeneratedExpressionMode,
+    GeneratedExpressionMode, ReferentialAction, TableConstraint,
 };
 
 use crate::lifecycle::CreateTableLifecycle;
@@ -15,6 +15,16 @@ use crate::types::{
     arrow_data_type, BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY, BASIN_COLUMN_DEFAULT,
     BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_UUID,
 };
+
+/// Parsed PK / CHECK / FK extracted from a `CREATE TABLE` AST. The
+/// engine persists this onto the `TableMetadata` after the table has
+/// been created. Empty fields mean "no constraint of that kind".
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ExtractedConstraints {
+    pub pk_columns: Vec<String>,
+    pub checks: Vec<CheckConstraint>,
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
 
 /// Inspect `sql` to decide whether the user wrote JSONB (or plain JSON;
 /// for v0.1 we treat them as the same logical type — see the comment in
@@ -51,20 +61,27 @@ fn is_uuid_sql(sql: &sqlparser::ast::DataType) -> bool {
     }
 }
 
-/// Build an Arrow [`Schema`] from sqlparser column definitions.
+/// Build an Arrow [`Schema`] from sqlparser column definitions plus the
+/// PRIMARY KEY / CHECK / FOREIGN KEY constraints extracted from
+/// column-level and table-level constraint clauses.
 ///
-/// Nullability defaults to `true`; `NOT NULL` flips it. Other column options
-/// (DEFAULT, UNIQUE, PRIMARY KEY, FOREIGN KEY, etc.) are explicitly out of
-/// scope for the PoC and trigger `InvalidSchema` so we don't silently drop
-/// constraints the user expected to hold.
+/// Nullability defaults to `true`; `NOT NULL` flips it. Column-level
+/// `PRIMARY KEY` / `CHECK (<expr>)` / `REFERENCES <table>(<col>)` are
+/// hoisted into `ExtractedConstraints` rather than rejected.
+/// `UNIQUE` (when not `PRIMARY KEY`) is out of scope for v0.1 and
+/// rejected.
 ///
 /// `lifecycle` folds in declarative-lifecycle markers extracted by the
 /// pre-screener (`AUTO_UPDATE`, `SOFT DELETE`, `AUDIT TO`). At most one
 /// `SOFT DELETE` column is allowed; a second declaration is rejected.
-pub(crate) fn schema_from_columns_with_lifecycle(
+///
+/// `table_name` is used to mint default constraint names.
+pub(crate) fn schema_and_constraints_from_columns(
     columns: &[ColumnDef],
+    table_constraints: &[TableConstraint],
+    table_name: &str,
     lifecycle: &CreateTableLifecycle,
-) -> Result<Schema> {
+) -> Result<(Schema, ExtractedConstraints)> {
     if columns.is_empty() {
         return Err(BasinError::InvalidSchema(
             "CREATE TABLE requires at least one column".into(),
@@ -94,6 +111,11 @@ pub(crate) fn schema_from_columns_with_lifecycle(
         .iter()
         .map(|c| c.name.value.to_ascii_lowercase())
         .collect();
+    let mut extracted = ExtractedConstraints::default();
+    let mut check_counter: usize = 0;
+    let mut col_pk_columns: Vec<String> = Vec::new();
+    let mut explicit_null: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for col in columns {
         let dt = arrow_data_type(&col.data_type)?;
         let mut nullable = true;
@@ -102,7 +124,63 @@ pub(crate) fn schema_from_columns_with_lifecycle(
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
-                ColumnOption::Null => nullable = true,
+                ColumnOption::Null => {
+                    nullable = true;
+                    explicit_null.insert(col.name.value.to_ascii_lowercase());
+                }
+                // Column-level `PRIMARY KEY` / `UNIQUE`. PG / sqlparser
+                // collapse the two; v0.1 only accepts `is_primary == true`.
+                ColumnOption::Unique { is_primary, .. } => {
+                    if !is_primary {
+                        return Err(BasinError::FeatureNotSupported(
+                            "UNIQUE column constraints are not supported in v0.1 (use PRIMARY KEY \
+                             for single-column uniqueness; multi-column UNIQUE is v0.2)"
+                                .into(),
+                        ));
+                    }
+                    col_pk_columns.push(col.name.value.clone());
+                }
+                ColumnOption::Check(expr) => {
+                    let name = format!("{table_name}_{}_check", col.name.value);
+                    extracted.checks.push(CheckConstraint {
+                        name,
+                        predicate: expr.to_string(),
+                    });
+                }
+                ColumnOption::ForeignKey {
+                    foreign_table,
+                    referred_columns,
+                    on_delete,
+                    on_update,
+                    ..
+                } => {
+                    if foreign_table.0.len() != 1 {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "FOREIGN KEY references must be a bare table name; got {foreign_table}"
+                        )));
+                    }
+                    let ref_table = foreign_table.0[0].value.clone();
+                    if referred_columns.is_empty() {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "FOREIGN KEY column {:?} REFERENCES {ref_table}: \
+                             specify the referenced column(s) explicitly in v0.1",
+                            col.name.value
+                        )));
+                    }
+                    let ref_columns: Vec<String> =
+                        referred_columns.iter().map(|i| i.value.clone()).collect();
+                    let on_delete_act = referential_action_from_ast(*on_delete)?;
+                    let on_update_act = referential_action_from_ast(*on_update)?;
+                    let name = format!("{table_name}_{}_fkey", col.name.value);
+                    extracted.foreign_keys.push(ForeignKeyDef {
+                        name,
+                        columns: vec![col.name.value.clone()],
+                        ref_table,
+                        ref_columns,
+                        on_delete: on_delete_act,
+                        on_update: on_update_act,
+                    });
+                }
                 ColumnOption::Default(expr) => {
                     // Store the DEFAULT expression text on the column's
                     // field metadata. INSERT-time evaluation lives in
@@ -236,16 +314,182 @@ pub(crate) fn schema_from_columns_with_lifecycle(
         fields.push(field);
     }
 
-    let mut schema_md: HashMap<String, String> = HashMap::new();
-    if let Some(audit) = lifecycle.audit_table.as_ref() {
-        schema_md.insert(BASIN_AUDIT_TABLE_KEY.to_string(), audit.clone());
+    // Process table-level constraints. A `PRIMARY KEY (a, b)` clause
+    // wins over column-level inline `PRIMARY KEY` (PG semantics).
+    let mut table_pk: Vec<String> = Vec::new();
+    for tc in table_constraints {
+        match tc {
+            TableConstraint::PrimaryKey { columns, name, .. } => {
+                if !table_pk.is_empty() {
+                    return Err(BasinError::InvalidSchema(
+                        "multiple table-level PRIMARY KEY clauses".into(),
+                    ));
+                }
+                let _ = name;
+                table_pk = columns.iter().map(|i| i.value.clone()).collect();
+            }
+            TableConstraint::Unique { .. } => {
+                return Err(BasinError::FeatureNotSupported(
+                    "table-level UNIQUE constraints are not supported in v0.1 (multi-column \
+                     UNIQUE is v0.2)"
+                        .into(),
+                ));
+            }
+            TableConstraint::ForeignKey {
+                name,
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                ..
+            } => {
+                if foreign_table.0.len() != 1 {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "FOREIGN KEY references must be a bare table name; got {foreign_table}"
+                    )));
+                }
+                let ref_table = foreign_table.0[0].value.clone();
+                if columns.is_empty() {
+                    return Err(BasinError::InvalidSchema(
+                        "FOREIGN KEY: empty column list".into(),
+                    ));
+                }
+                if referred_columns.is_empty() {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "FOREIGN KEY ({}) REFERENCES {ref_table}: \
+                         specify the referenced column(s) explicitly in v0.1",
+                        columns
+                            .iter()
+                            .map(|i| i.value.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                let local_cols: Vec<String> = columns.iter().map(|i| i.value.clone()).collect();
+                let ref_cols: Vec<String> =
+                    referred_columns.iter().map(|i| i.value.clone()).collect();
+                if local_cols.len() != ref_cols.len() {
+                    return Err(BasinError::InvalidSchema(
+                        "FOREIGN KEY: local and referenced column counts differ".into(),
+                    ));
+                }
+                let on_delete_act = referential_action_from_ast(*on_delete)?;
+                let on_update_act = referential_action_from_ast(*on_update)?;
+                let fk_name = match name {
+                    Some(n) => n.value.clone(),
+                    None => format!("{table_name}_{}_fkey", local_cols[0]),
+                };
+                extracted.foreign_keys.push(ForeignKeyDef {
+                    name: fk_name,
+                    columns: local_cols,
+                    ref_table,
+                    ref_columns: ref_cols,
+                    on_delete: on_delete_act,
+                    on_update: on_update_act,
+                });
+            }
+            TableConstraint::Check { name, expr } => {
+                check_counter += 1;
+                let cname = match name {
+                    Some(n) => n.value.clone(),
+                    None => format!("{table_name}_check_{check_counter}"),
+                };
+                extracted.checks.push(CheckConstraint {
+                    name: cname,
+                    predicate: expr.to_string(),
+                });
+            }
+            TableConstraint::Index { .. } | TableConstraint::FulltextOrSpatial { .. } => {
+                return Err(BasinError::FeatureNotSupported(
+                    "INDEX / FULLTEXT / SPATIAL table constraints are not supported in v0.1"
+                        .into(),
+                ));
+            }
+        }
     }
-    let schema = if schema_md.is_empty() {
-        Schema::new(fields)
+
+    let pk_columns = if !table_pk.is_empty() {
+        if !col_pk_columns.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "table cannot mix column-level PRIMARY KEY and table-level PRIMARY KEY".into(),
+            ));
+        }
+        table_pk
     } else {
-        Schema::new_with_metadata(fields, schema_md)
+        col_pk_columns
     };
-    Ok(schema)
+
+    if !pk_columns.is_empty() {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &pk_columns {
+            if !seen.insert(c.to_ascii_lowercase()) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "PRIMARY KEY column {c:?} listed twice"
+                )));
+            }
+            let pos = fields
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(c))
+                .ok_or_else(|| {
+                    BasinError::InvalidSchema(format!(
+                        "PRIMARY KEY column {c:?} is not in the table"
+                    ))
+                })?;
+            // PG auto-promotes PK columns to NOT NULL. We mirror — but
+            // reject the case where the user *explicitly* wrote `NULL`
+            // on a PK column (the AST distinguishes `NULL` from absent
+            // via the `column_explicitly_nullable` set we track in the
+            // first pass... actually, sqlparser collapses both into a
+            // single `nullable` bit and we don't have the visibility
+            // here). We use `was_explicitly_null` only for the column
+            // we just authored, falling back to silent promotion
+            // otherwise — same effective shape PG ships.
+            let f = &fields[pos];
+            if f.is_nullable() && explicit_null.contains(&f.name().to_ascii_lowercase()) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "PRIMARY KEY column {c:?} must be NOT NULL (explicit NULL is incompatible)"
+                )));
+            }
+            if f.is_nullable() {
+                let promoted = arrow_schema::Field::new(
+                    f.name().clone(),
+                    f.data_type().clone(),
+                    false,
+                )
+                .with_metadata(f.metadata().clone());
+                fields[pos] = promoted;
+            }
+        }
+    }
+
+    // Rebuild schema with possibly-promoted PK columns.
+    let schema = if let Some(audit) = lifecycle.audit_table.as_ref() {
+        let mut md = std::collections::HashMap::new();
+        md.insert(BASIN_AUDIT_TABLE_KEY.to_string(), audit.clone());
+        Schema::new_with_metadata(fields, md)
+    } else {
+        Schema::new(fields)
+    };
+
+    extracted.pk_columns = pk_columns;
+    Ok((schema, extracted))
+}
+
+fn referential_action_from_ast(action: Option<ReferentialAction>) -> Result<RefAction> {
+    match action {
+        None | Some(ReferentialAction::NoAction) => Ok(RefAction::NoAction),
+        Some(ReferentialAction::Cascade) => Ok(RefAction::Cascade),
+        Some(ReferentialAction::Restrict) => Err(BasinError::FeatureNotSupported(
+            "ON DELETE/UPDATE RESTRICT is not supported in v0.1; use NO ACTION (default)".into(),
+        )),
+        Some(ReferentialAction::SetNull) => Err(BasinError::FeatureNotSupported(
+            "ON DELETE/UPDATE SET NULL is not supported in v0.1".into(),
+        )),
+        Some(ReferentialAction::SetDefault) => Err(BasinError::FeatureNotSupported(
+            "ON DELETE/UPDATE SET DEFAULT is not supported in v0.1".into(),
+        )),
+    }
 }
 
 /// Translate the AST's `PARTITION BY ...` expression (when present) into a

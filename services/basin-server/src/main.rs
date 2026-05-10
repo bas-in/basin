@@ -211,20 +211,26 @@ async fn main() -> Result<()> {
     // Optional WAL + shard owner. Constructed when BASIN_SHARD_ENABLED=1 so we
     // can ship the wedge-deepening change incrementally without breaking demos
     // that don't have a writable WAL directory available.
-    let mut shard_handles: Option<(basin_shard::Shard, basin_shard::ShardBackgroundHandle, basin_wal::Wal)> = None;
+    let mut shard_handles: Option<(
+        basin_shard::Shard,
+        basin_shard::ShardBackgroundHandle,
+        Arc<dyn basin_wal::Wal>,
+    )> = None;
     let shard_for_engine: Option<basin_shard::Shard> = if cfg.shard_enabled {
         std::fs::create_dir_all(&cfg.wal_dir)
             .with_context(|| format!("create WAL dir {}", cfg.wal_dir.display()))?;
         let wal_fs = LocalFileSystem::new_with_prefix(&cfg.wal_dir)
             .with_context(|| format!("WAL LocalFileSystem at {}", cfg.wal_dir.display()))?;
-        let wal = basin_wal::Wal::open(basin_wal::WalConfig {
-            object_store: Arc::new(wal_fs),
-            root_prefix: None,
-            flush_interval: std::time::Duration::from_millis(200),
-            flush_max_bytes: 1024 * 1024,
-        })
-        .await
-        .context("open WAL")?;
+        let wal: Arc<dyn basin_wal::Wal> = Arc::new(
+            basin_wal::LocalWal::open(basin_wal::WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: std::time::Duration::from_millis(200),
+                flush_max_bytes: 1024 * 1024,
+            })
+            .await
+            .context("open WAL")?,
+        );
         let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
             storage.clone(),
             catalog.clone(),

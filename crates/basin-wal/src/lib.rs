@@ -2,14 +2,14 @@
 //!
 //! ## Status
 //!
-//! v0.1: **single-node, file-backed**. Per-tenant + per-partition append-only
-//! log. Background batched flush to object storage every 200 ms or 1 MB,
-//! whichever first. Recovery on startup replays from object storage.
+//! v0.1: **single-node, file-backed** ([`LocalWal`]). Per-tenant +
+//! per-partition append-only log. Background batched flush to object storage
+//! every 200 ms or 1 MB, whichever first. Recovery on startup replays from
+//! object storage.
 //!
-//! v0.2 (deferred): Raft replication via `openraft`. The public API of this
-//! crate is shaped so that swap is a *backend change*, not a rewrite of the
-//! callers (the shard owner). See [ADR 0001](../../docs/decisions/0001-single-region-only.md)
-//! for the deferral rationale.
+//! v0.2 (scaffolded): Raft replication via [`RaftWal`]. Trait + stub ship
+//! today; real raft integration is gated on a library-choice ADR. See
+//! [`RAFT.md`](../RAFT.md) for the integration plan.
 //!
 //! ## Why this exists
 //!
@@ -27,9 +27,13 @@
 //!
 //! ## Public API
 //!
-//! - [`Wal`]: handle, cheap to clone (Arc inside).
-//! - [`WalConfig`]: object store + flush knobs.
-//! - [`WalEntry`], [`Lsn`]: data shapes.
+//! - [`Wal`]: object-safe trait. Hold as `Arc<dyn Wal>`.
+//! - [`LocalWal`]: single-node file-backed implementation.
+//! - [`RaftWal`]: multi-node Raft-backed stub (returns
+//!   `BasinError::FeatureNotSupported` until the integration PR lands).
+//! - [`WalConfig`]: object store + flush knobs for [`LocalWal`].
+//! - [`RaftWalConfig`]: peer + timing knobs for [`RaftWal`].
+//! - [`WalEntry`], [`Lsn`]: data shapes shared by all impls.
 
 #![forbid(unsafe_code)]
 
@@ -76,7 +80,7 @@ pub struct WalEntry {
     pub appended_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Knobs for [`Wal::open`].
+/// Knobs for [`LocalWal::open`].
 #[derive(Clone)]
 pub struct WalConfig {
     pub object_store: Arc<dyn ObjectStore>,
@@ -105,9 +109,70 @@ fn panic_no_default_object_store() -> Arc<dyn ObjectStore> {
     panic!("WalConfig::default() requires `.object_store` to be set explicitly");
 }
 
-/// The WAL handle. Cheap to clone; share across the shard owner's tasks.
+/// Object-safe public trait. Callers (shard owner, server, integration tests)
+/// hold `Arc<dyn Wal>` so the same call sites work for [`LocalWal`] today and
+/// [`RaftWal`] once the raft integration lands.
+///
+/// Designed to accept any reasonable real raft implementation:
+/// `append` returns once durability is achieved (single-node: fsync; raft:
+/// quorum ack); `read_from` covers catchup / recovery; `truncate` is called
+/// by the compactor after Parquet commit.
+#[async_trait]
+pub trait Wal: Send + Sync + std::fmt::Debug {
+    /// Append `payload` for `(tenant, partition)`. Durable when this returns.
+    async fn append(
+        &self,
+        tenant: &TenantId,
+        partition: &PartitionKey,
+        payload: Bytes,
+    ) -> Result<Lsn>;
+
+    /// Force a synchronous flush of any queued segments to durable storage.
+    /// For raft this is usually a no-op (already fsync'd on quorum); for
+    /// the local WAL it forces an upload of buffered entries.
+    async fn flush(&self) -> Result<()>;
+
+    /// Return all entries for `(tenant, partition)` with LSN strictly greater
+    /// than `since_lsn`, in append order. Used by the compactor and by shard
+    /// owner cold-start replay.
+    async fn read_from(
+        &self,
+        tenant: &TenantId,
+        partition: &PartitionKey,
+        since_lsn: Lsn,
+    ) -> Result<Vec<WalEntry>>;
+
+    /// Latest LSN for `(tenant, partition)`. `Lsn::ZERO` means no entries.
+    async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn>;
+
+    /// Drop all entries for `(tenant, partition)` whose LSN is strictly
+    /// less than or equal to `up_to`. Called by the compactor after the
+    /// segment has been merged into Parquet and committed to the catalog.
+    async fn truncate(
+        &self,
+        tenant: &TenantId,
+        partition: &PartitionKey,
+        up_to: Lsn,
+    ) -> Result<()>;
+
+    /// Stop background tasks and drain. Idempotent.
+    async fn close(&self) -> Result<()>;
+
+    /// Attach a per-tenant counter registry so the WAL append path bumps the
+    /// same per-tenant rollup as engine-side ops and storage-side bytes.
+    /// Default impl is a no-op for backends that don't track byte counters
+    /// (e.g. the [`RaftWal`] stub).
+    fn attach_tenant_counters(&self, _registry: Arc<TenantCounterRegistry>) {}
+}
+
+/// Single-node, file-backed WAL. Cheap to clone (`Arc` inside); share across
+/// the shard owner's tasks.
+///
+/// "Durable" today = local file fsync + queued for object-storage flush;
+/// once Raft lands (v0.2) the [`RaftWal`] type provides quorum-ack
+/// durability behind the same [`Wal`] trait.
 #[derive(Clone)]
-pub struct Wal {
+pub struct LocalWal {
     inner: Arc<dyn WalImpl>,
     /// Optional per-tenant counter registry (Phase 6 telemetry). Attached by
     /// the engine so the WAL append path bumps the same per-tenant rollup as
@@ -115,7 +180,7 @@ pub struct Wal {
     tenant_counters: Arc<OnceLock<Arc<TenantCounterRegistry>>>,
 }
 
-impl Wal {
+impl LocalWal {
     /// Open a WAL against the configured object store. Replays any persisted
     /// segments to recover in-memory state (per-(tenant, partition) LSN).
     pub async fn open(cfg: WalConfig) -> Result<Self> {
@@ -125,16 +190,11 @@ impl Wal {
             tenant_counters: Arc::new(OnceLock::new()),
         })
     }
+}
 
-    /// Attach a per-tenant counter registry. Idempotent (first attach wins).
-    pub fn attach_tenant_counters(&self, registry: Arc<TenantCounterRegistry>) {
-        let _ = self.tenant_counters.set(registry);
-    }
-
-    /// Append `payload` for `(tenant, partition)`. Durable when this returns.
-    /// "Durable" today = local file fsync + queued for object-storage flush;
-    /// once Raft lands (v0.2) it'll be quorum-ack.
-    pub async fn append(
+#[async_trait]
+impl Wal for LocalWal {
+    async fn append(
         &self,
         tenant: &TenantId,
         partition: &PartitionKey,
@@ -152,16 +212,11 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Force a synchronous flush of any queued segments to object storage.
-    /// Tests and graceful shutdown use this; the hot path doesn't need it.
-    pub async fn flush(&self) -> Result<()> {
+    async fn flush(&self) -> Result<()> {
         self.inner.flush().await
     }
 
-    /// Return all entries for `(tenant, partition)` with LSN strictly greater
-    /// than `since_lsn`, in append order. Used by the compactor and by shard
-    /// owner cold-start replay.
-    pub async fn read_from(
+    async fn read_from(
         &self,
         tenant: &TenantId,
         partition: &PartitionKey,
@@ -170,8 +225,7 @@ impl Wal {
         self.inner.read_from(tenant, partition, since_lsn).await
     }
 
-    /// Latest LSN for `(tenant, partition)`. `Lsn::ZERO` means no entries.
-    pub async fn high_water(
+    async fn high_water(
         &self,
         tenant: &TenantId,
         partition: &PartitionKey,
@@ -179,10 +233,7 @@ impl Wal {
         self.inner.high_water(tenant, partition).await
     }
 
-    /// Drop all entries for `(tenant, partition)` whose LSN is strictly
-    /// less than or equal to `up_to`. Called by the compactor after the
-    /// segment has been merged into Parquet and committed to the catalog.
-    pub async fn truncate(
+    async fn truncate(
         &self,
         tenant: &TenantId,
         partition: &PartitionKey,
@@ -191,20 +242,24 @@ impl Wal {
         self.inner.truncate(tenant, partition, up_to).await
     }
 
-    /// Stop the background flush task and drain. Idempotent.
-    pub async fn close(&self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         self.inner.close().await
+    }
+
+    fn attach_tenant_counters(&self, registry: Arc<TenantCounterRegistry>) {
+        // Idempotent (first attach wins).
+        let _ = self.tenant_counters.set(registry);
     }
 }
 
-impl std::fmt::Debug for Wal {
+impl std::fmt::Debug for LocalWal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Wal").finish_non_exhaustive()
+        f.debug_struct("LocalWal").finish_non_exhaustive()
     }
 }
 
 /// Backend trait. The file-backed implementation is the only one today; v0.2
-/// adds a Raft-backed implementation behind the same trait.
+/// adds a Raft-backed implementation via the public [`Wal`] trait directly.
 #[async_trait]
 pub(crate) trait WalImpl: Send + Sync {
     async fn append(
@@ -231,5 +286,8 @@ pub(crate) trait WalImpl: Send + Sync {
 }
 
 mod file_wal;
+mod raft_wal;
 mod segment;
 mod state;
+
+pub use raft_wal::{BasinRaftRequest, BasinRaftResponse, RaftWal, RaftWalConfig, SimCluster};

@@ -30,7 +30,7 @@ struct TestServer {
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _join: tokio::task::JoinHandle<basin_common::Result<()>>,
     bg: Option<basin_shard::ShardBackgroundHandle>,
-    wal: basin_wal::Wal,
+    wal: Arc<dyn basin_wal::Wal>,
 }
 
 async fn start_server_with_shard(
@@ -51,14 +51,16 @@ async fn start_server_with_shard(
     // WAL is in-memory — sub-ms ack latency is the WAL's job; an S3-backed
     // WAL would crater INSERT throughput in this single-shard PoC.
     let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let wal = basin_wal::Wal::open(basin_wal::WalConfig {
-        object_store: wal_store,
-        root_prefix: None,
-        flush_interval: Duration::from_millis(200),
-        flush_max_bytes: 1024 * 1024,
-    })
-    .await
-    .expect("open WAL");
+    let wal: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: wal_store,
+            root_prefix: None,
+            flush_interval: Duration::from_millis(200),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("open WAL"),
+    );
 
     let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
         storage.clone(),

@@ -1,24 +1,26 @@
 //! Per-tenant concurrency limiting on top of an [`ObjectStore`].
 //!
-//! Two-level gating, both layers required (v0.2):
+//! Two-level gating, both layers required:
 //!
-//! 1. A per-tenant [`tokio::sync::Semaphore`] (default cap 16) — the v0.1
+//! 1. A per-tenant [`tokio::sync::Semaphore`] (default cap 16) — the
 //!    *liveness floor*. Sized so the Parquet reader's range fan-out
 //!    × concurrent queries per tenant never exceeds it (smaller caps
 //!    deadlock; see ADR 0008). It still serves as the "no single tenant
 //!    can use more than N concurrent RPCs" guarantee.
-//! 2. A global [`Scheduler`] with a fair-share round-robin dispatcher
-//!    (default budget 16) across all tenants. This is the v0.2 fix for
-//!    the noisy-neighbor benchmark on bounded backends (single-process
-//!    MinIO at ~8–12 server-side concurrent reads). On real S3 it's a
-//!    no-op for fairness — its job is to ensure that when the
-//!    server-side gets queue-bound, quiet tenants still get their fair
-//!    turn.
+//! 2. A global EDF [`Scheduler`] (default budget 4) across all tenants.
+//!    Each request gets a deadline based on its priority class
+//!    (point-shaped vs bulk-shaped) and the dispatcher pulls the
+//!    earliest-deadline first within the global budget. Point reads
+//!    (HEAD / GET-opts / small range / LIST) carry a 5ms deadline;
+//!    bulk ops (PUT / multipart / large range) carry a 1s deadline so
+//!    they can't crowd out point lookups. A `CONSECUTIVE_DISPATCH_CAP`
+//!    inside the scheduler prevents one tenant from flooding the heap
+//!    with deadline=now requests and starving everyone else.
 //!
-//! Per-RPC ordering: acquire the per-tenant permit FIRST (which costs
-//! ~nothing once we're under the floor), then the scheduler permit.
-//! Holding the per-tenant permit while waiting on the scheduler is fine:
-//! all tenants do the same dance, so there's no priority-inversion path
+//! Per-RPC ordering: acquire the per-tenant semaphore FIRST (cheap when
+//! we're under the floor), THEN the scheduler permit. Holding the
+//! per-tenant permit while waiting on the scheduler is fine: all
+//! tenants do the same dance, so there's no priority-inversion path
 //! between them. Within one tenant, the per-tenant floor serializes us
 //! into the scheduler one request at a time per concurrent caller — the
 //! scheduler then re-fairs across tenants.
@@ -36,6 +38,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use basin_common::TenantId;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
@@ -45,25 +48,35 @@ use object_store::{
 };
 use tokio::sync::Semaphore;
 
-/// Wraps an [`ObjectStore`] so every RPC it forwards is gated on the
-/// per-tenant liveness-floor semaphore. The semaphore is supplied by
-/// [`Storage`] and is shared between every [`TenantScopedStore`] for the
-/// same tenant — so concurrent reads from the engine layer and from
-/// inside `basin-storage` itself contend on the *same* permit pool.
-///
-/// The fair-share scheduler that lived here in v0.2/v0.3 was reverted:
-/// the EDF dispatcher had a deadlock that surfaced even on LocalFS and
-/// we couldn't trust it. The architectural fairness primitive is just
-/// the per-tenant Semaphore for now; ADR 0008 documents the v0.3 path.
+use crate::scheduler::{Priority, Scheduler, PRIORITY_RANGE_BYTES_THRESHOLD};
+
+/// Wraps an [`ObjectStore`] so every RPC it forwards is gated on
+/// (a) the per-tenant liveness-floor semaphore, then (b) the cross-tenant
+/// EDF scheduler. Both fields are cheap-to-clone `Arc`s shared with
+/// every other [`TenantScopedStore`] for the same tenant — so concurrent
+/// reads from the engine layer and from inside `basin-storage` itself
+/// contend on the *same* permit pool and the *same* scheduler heap.
 #[derive(Debug)]
 pub(crate) struct TenantScopedStore {
     inner: Arc<dyn ObjectStore>,
     sem: Arc<Semaphore>,
+    scheduler: Scheduler,
+    tenant: TenantId,
 }
 
 impl TenantScopedStore {
-    pub(crate) fn new(inner: Arc<dyn ObjectStore>, sem: Arc<Semaphore>) -> Self {
-        Self { inner, sem }
+    pub(crate) fn new(
+        inner: Arc<dyn ObjectStore>,
+        sem: Arc<Semaphore>,
+        scheduler: Scheduler,
+        tenant: TenantId,
+    ) -> Self {
+        Self {
+            inner,
+            sem,
+            scheduler,
+            tenant,
+        }
     }
 }
 
@@ -82,6 +95,11 @@ impl ObjectStore for TenantScopedStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        // PUT is bulk-shaped: bytes-on-the-wire scale with the payload,
+        // and a small write is rare in our writer path (we batch into
+        // Parquet files). Schedule as Low so it never starves point
+        // reads.
+        let _slot = self.scheduler.acquire(self.tenant, Priority::Low).await;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -98,6 +116,7 @@ impl ObjectStore for TenantScopedStore {
         // multipart path is only reachable through the engine's analytical
         // plumbing where we don't yet drive uploads at this scale.
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        let _slot = self.scheduler.acquire(self.tenant, Priority::Low).await;
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -107,6 +126,11 @@ impl ObjectStore for TenantScopedStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        // Full-object GET is bulk-shaped on data files (Parquet bodies
+        // are MB-shaped) and sub-MB on footers / sidecars. Without a
+        // size hint, default to High so footers / metadata fetches stay
+        // snappy; the engine's range-read path is the bulk channel.
+        let _slot = self.scheduler.acquire(self.tenant, Priority::High).await;
         self.inner.get_opts(location, options).await
     }
 
@@ -116,16 +140,29 @@ impl ObjectStore for TenantScopedStore {
         range: std::ops::Range<usize>,
     ) -> object_store::Result<Bytes> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        // Range size determines priority: small range = point-shaped
+        // (footer / dictionary page / single page), large range =
+        // bulk-shaped (full row group). The threshold is the same one
+        // `concurrency.rs` heuristics flip on (PRIORITY_RANGE_BYTES_THRESHOLD).
+        let priority = if range.end.saturating_sub(range.start) >= PRIORITY_RANGE_BYTES_THRESHOLD {
+            Priority::Low
+        } else {
+            Priority::High
+        };
+        let _slot = self.scheduler.acquire(self.tenant, priority).await;
         self.inner.get_range(location, range).await
     }
 
     async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        // HEAD is canonical point-shape: 0 bytes, single round-trip.
+        let _slot = self.scheduler.acquire(self.tenant, Priority::High).await;
         self.inner.head(location).await
     }
 
     async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        let _slot = self.scheduler.acquire(self.tenant, Priority::High).await;
         self.inner.delete(location).await
     }
 
@@ -134,29 +171,19 @@ impl ObjectStore for TenantScopedStore {
         prefix: Option<&ObjectPath>,
     ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         // We collect the inner stream into a Vec under a single
-        // permit, then return a stream over that Vec. Every caller in
-        // `basin-storage` and the engine listings consumer drives the
-        // stream to exhaustion before moving on (see
-        // `reader::list_data_files`, `reader::read`'s prelude, and
-        // `vector_index::vector_search`), so the materialised-to-Vec
-        // semantics match observed usage. This also gives us exactly
-        // the right fairness: the entire LIST (including pagination)
-        // consumes one permit, just like a point read or range read.
+        // permit + scheduler slot, then return a stream over that Vec.
+        // Every caller in `basin-storage` and the engine listings
+        // consumer drives the stream to exhaustion before moving on.
         //
-        // Memory: list responses are O(files-per-table). At v0.1 scale
-        // (max millions of files per table) this is bounded by the
-        // workload; if compaction / partitioning ever shrinks the
-        // listing too aggressively we'd revisit, but for v0.2 the
-        // simple shape is preferred over a per-page permit dance.
-        //
-        // LIST is metadata-shaped → High priority by default. A
-        // single LIST often unblocks many subsequent reads, so we
-        // want quiet tenants' LISTs to skip noisy tenants' bulk PUTs.
+        // LIST is metadata-shaped → High priority by default.
         use futures::stream::StreamExt;
         let sem = self.sem.clone();
+        let scheduler = self.scheduler.clone();
+        let tenant = self.tenant;
         let inner_stream = self.inner.list(prefix);
         futures::stream::once(async move {
             let _floor = sem.acquire_owned().await.expect("semaphore not closed");
+            let _slot = scheduler.acquire(tenant, Priority::High).await;
             inner_stream.collect::<Vec<_>>().await
         })
         .flat_map(|items| futures::stream::iter(items))
@@ -168,11 +195,15 @@ impl ObjectStore for TenantScopedStore {
         prefix: Option<&ObjectPath>,
     ) -> object_store::Result<ListResult> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        let _slot = self.scheduler.acquire(self.tenant, Priority::High).await;
         self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        // COPY is server-side; from the client's perspective it's a
+        // single small request, so High.
+        let _slot = self.scheduler.acquire(self.tenant, Priority::High).await;
         self.inner.copy(from, to).await
     }
 
@@ -182,6 +213,7 @@ impl ObjectStore for TenantScopedStore {
         to: &ObjectPath,
     ) -> object_store::Result<()> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        let _slot = self.scheduler.acquire(self.tenant, Priority::High).await;
         self.inner.copy_if_not_exists(from, to).await
     }
 }

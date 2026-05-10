@@ -391,11 +391,16 @@ fn split_top_level_commas(text: &str) -> Vec<&str> {
     out
 }
 
-/// Recognise `REFRESH MATERIALIZED VIEW <name>` (with optional trailing
-/// `;`). Returns the bare identifier on a match, or `None` when the
-/// statement is something else. sqlparser 0.52 has no `REFRESH` AST node,
-/// so we handle the full statement textually.
-pub(crate) fn match_refresh_materialized_view(sql: &str) -> Result<Option<String>> {
+/// Recognise `REFRESH MATERIALIZED VIEW <name> [WITH (full = true)]`
+/// (with optional trailing `;`). Returns `(name, force_full)` on a match,
+/// or `None` when the statement is something else. sqlparser 0.52 has no
+/// `REFRESH` AST node, so we handle the full statement textually.
+///
+/// `WITH (full = true)` opts out of the v0.1 incremental-refresh path and
+/// re-executes the entire SELECT body. Mirrors PG's
+/// `REFRESH MATERIALIZED VIEW CONCURRENTLY` opt-out shape (different keyword,
+/// same role: tell the system "yes, I want a full rebuild").
+pub(crate) fn match_refresh_materialized_view(sql: &str) -> Result<Option<(String, bool)>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if !starts_with_kw(trimmed, "REFRESH") {
         return Ok(None);
@@ -414,13 +419,78 @@ pub(crate) fn match_refresh_materialized_view(sql: &str) -> Result<Option<String
     }
     let after_view = skip_word(after_mat).trim_start();
     let (name, rest) = read_simple_identifier(after_view)?;
-    if !rest.trim().is_empty() {
-        return Err(BasinError::InvalidSchema(format!(
-            "REFRESH MATERIALIZED VIEW: unexpected trailing input {:?}",
-            rest.trim()
-        )));
+    let rest = rest.trim();
+    // Optional `WITH (full = true)` — the v0.1 opt-out for "skip
+    // incremental, do a full rebuild".
+    let force_full = if starts_with_kw(rest, "WITH") {
+        let after_with = skip_word(rest).trim_start();
+        if !after_with.starts_with('(') {
+            return Err(BasinError::InvalidSchema(
+                "REFRESH MATERIALIZED VIEW: expected `(` after WITH".into(),
+            ));
+        }
+        // Find the matching `)`. We don't expect nested parens here; the
+        // option grammar is intentionally tiny.
+        let close = after_with.find(')').ok_or_else(|| {
+            BasinError::InvalidSchema(
+                "REFRESH MATERIALIZED VIEW: unterminated WITH (...)".into(),
+            )
+        })?;
+        let inside = after_with[1..close].trim();
+        let trail = after_with[close + 1..].trim();
+        if !trail.is_empty() {
+            return Err(BasinError::InvalidSchema(format!(
+                "REFRESH MATERIALIZED VIEW: unexpected trailing input {trail:?}"
+            )));
+        }
+        parse_refresh_options(inside)?
+    } else {
+        if !rest.is_empty() {
+            return Err(BasinError::InvalidSchema(format!(
+                "REFRESH MATERIALIZED VIEW: unexpected trailing input {rest:?}"
+            )));
+        }
+        false
+    };
+    Ok(Some((name, force_full)))
+}
+
+/// Parse the body of a `WITH (...)` clause attached to a `REFRESH
+/// MATERIALIZED VIEW`. The only recognised key is `full = true | false`.
+fn parse_refresh_options(inside: &str) -> Result<bool> {
+    let mut force_full = false;
+    for raw in split_top_level_commas(inside) {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(eq) = token.find('=') else {
+            return Err(BasinError::InvalidSchema(format!(
+                "REFRESH MATERIALIZED VIEW: unrecognised option {token:?}"
+            )));
+        };
+        let key = token[..eq].trim().to_ascii_lowercase();
+        let value = token[eq + 1..].trim();
+        match key.as_str() {
+            "full" => {
+                force_full = match value.to_ascii_lowercase().as_str() {
+                    "true" | "t" | "1" => true,
+                    "false" | "f" | "0" => false,
+                    other => {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "REFRESH MATERIALIZED VIEW: full = {other:?} (expected true/false)"
+                        )));
+                    }
+                };
+            }
+            other => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "REFRESH MATERIALIZED VIEW: unsupported option {other:?}"
+                )));
+            }
+        }
     }
-    Ok(Some(name))
+    Ok(force_full)
 }
 
 /// Recognise `DROP MATERIALIZED VIEW <name>` (with optional `IF EXISTS`
@@ -580,17 +650,22 @@ pub(crate) async fn exec_create_materialized_view(
     })
 }
 
-/// Execute a `REFRESH MATERIALIZED VIEW <name>`.
+/// Execute a `REFRESH MATERIALIZED VIEW <name> [WITH (full=true)]`.
 ///
 /// Mirrors `basin_cv::CvRefresher::do_refresh`:
 ///
 /// 1. Read the CV definition from the catalog. Bail if the table isn't a
 ///    CV.
-/// 2. Re-execute the stored `query_sql` against the calling session's
-///    tenant.
+/// 2. Decide refresh mode:
+///    - `force_full = true`, or no prior watermark, or unsupported GROUP
+///      BY shape → re-execute the entire stored `query_sql`.
+///    - Otherwise → incremental: re-aggregate source rows where
+///      `<bucket_col> >= watermark`, drop matview rows where
+///      `<bucket_alias> >= watermark`, append the new aggregation.
 /// 3. Atomically swap the materialised file in via
 ///    `Catalog::replace_data_files`.
-/// 4. Stamp a fresh `last_refreshed_at_unix_ms` on the `CvDef`.
+/// 4. Stamp a fresh `last_refreshed_at_unix_ms` and the new
+///    `last_bucket_max_unix_ms` on the `CvDef`.
 ///
 /// Unlike the production refresher, this is a one-shot — the
 /// `refresh_interval` is **not** consulted. A user-issued `REFRESH
@@ -598,10 +673,10 @@ pub(crate) async fn exec_create_materialized_view(
 pub(crate) async fn exec_refresh_materialized_view(
     sess: &TenantSession,
     name: &str,
+    force_full: bool,
 ) -> Result<ExecResult> {
     let table = TableName::new(name)?;
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
-    let storage = sess.engine.config().storage.clone();
 
     // Load the CV definition. A non-CV table or a missing one are both
     // user-visible errors.
@@ -619,8 +694,31 @@ pub(crate) async fn exec_refresh_materialized_view(
         ))
     })?;
 
-    // 1. Re-run the stored query. Box::pin breaks the async recursion
-    //    through `crate::executor::execute`.
+    let bucket_info = (!force_full)
+        .then(|| crate::cv_time_bucket::detect_time_bucket(&def.query_sql))
+        .flatten();
+    let watermark = def
+        .last_bucket_max_unix_ms
+        .and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
+
+    match (bucket_info, watermark) {
+        (Some(info), Some(wm)) => {
+            do_refresh_incremental(sess, &table, &meta, def, &info, wm).await
+        }
+        (info, _) => do_refresh_full(sess, &table, &meta, def, info).await,
+    }
+}
+
+async fn do_refresh_full(
+    sess: &TenantSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    def: CvDef,
+    bucket_info: Option<crate::cv_time_bucket::BucketInfo>,
+) -> Result<ExecResult> {
+    let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
+    let storage = sess.engine.config().storage.clone();
+
     let res = Box::pin(crate::executor::execute(sess, &def.query_sql)).await?;
     let (schema, batches) = match res {
         ExecResult::Rows { schema, batches } => (schema, batches),
@@ -633,24 +731,27 @@ pub(crate) async fn exec_refresh_materialized_view(
 
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
     let now = Utc::now();
+
+    let new_watermark_ms = match &bucket_info {
+        Some(info) => compute_watermark_ms(sess, &def.source_table, info).await,
+        None => def.last_bucket_max_unix_ms,
+    };
+
     if row_count == 0 {
-        // No rows: skip the file write but still stamp the refresh
-        // timestamp so the next refresh-due check measures from `now`.
         let new_def = CvDef {
             last_refreshed_at_unix_ms: Some(now.timestamp_millis()),
+            last_bucket_max_unix_ms: new_watermark_ms,
             ..def
         };
         catalog
-            .set_continuous_aggregate(&sess.tenant, &table, Some(new_def))
+            .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
             .await?;
-        refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+        refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
         return Ok(ExecResult::Empty {
             tag: "REFRESH MATERIALIZED VIEW".into(),
         });
     }
 
-    // 2. Write the new materialisation as a single Parquet file under the
-    //    CV's prefix.
     let merged = if batches.len() == 1 {
         batches[0].clone()
     } else {
@@ -660,10 +761,9 @@ pub(crate) async fn exec_refresh_materialized_view(
     };
     let part = PartitionKey::default_key();
     let written = storage
-        .write_batch(&sess.tenant, &table, &part, &merged)
+        .write_batch(&sess.tenant, table, &part, &merged)
         .await?;
 
-    // 3. Atomically swap the catalog manifest.
     let removed_paths: Vec<String> = meta
         .snapshots
         .iter()
@@ -678,14 +778,13 @@ pub(crate) async fn exec_refresh_materialized_view(
     catalog
         .replace_data_files(
             &sess.tenant,
-            &table,
+            table,
             meta.current_snapshot,
             removed_paths.clone(),
             added,
         )
         .await?;
 
-    // 4. Best-effort: physically delete the prior files.
     for path in &removed_paths {
         if path == written.path.as_ref() {
             continue;
@@ -694,20 +793,340 @@ pub(crate) async fn exec_refresh_materialized_view(
         let _ = storage.delete_file(&sess.tenant, &p).await;
     }
 
-    // 5. Stamp the refresh state.
     let new_def = CvDef {
         last_refreshed_at_unix_ms: Some(now.timestamp_millis()),
+        last_bucket_max_unix_ms: new_watermark_ms,
         ..def
     };
     catalog
-        .set_continuous_aggregate(&sess.tenant, &table, Some(new_def))
+        .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
         .await?;
-
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
 
     Ok(ExecResult::Empty {
         tag: "REFRESH MATERIALIZED VIEW".into(),
     })
+}
+
+async fn do_refresh_incremental(
+    sess: &TenantSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    def: CvDef,
+    bucket: &crate::cv_time_bucket::BucketInfo,
+    watermark: chrono::DateTime<Utc>,
+) -> Result<ExecResult> {
+    let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
+    let storage = sess.engine.config().storage.clone();
+
+    // Build the rewritten SELECT. On any failure, fall through to full.
+    let rewritten = match crate::cv_time_bucket::rewrite_for_watermark(
+        &def.query_sql,
+        &bucket.bucket_column,
+        watermark,
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            return do_refresh_full(sess, table, meta, def, Some(bucket.clone())).await;
+        }
+    };
+
+    let new_res = Box::pin(crate::executor::execute(sess, &rewritten)).await?;
+    let (new_schema, new_batches) = match new_res {
+        ExecResult::Rows { schema, batches } => (schema, batches),
+        ExecResult::Empty { tag } => {
+            return Err(BasinError::internal(format!(
+                "REFRESH MATERIALIZED VIEW: incremental returned non-rows ({tag})"
+            )));
+        }
+    };
+
+    let kept_sql = format!("SELECT * FROM {}", table.as_str());
+    let kept_res = Box::pin(crate::executor::execute(sess, &kept_sql)).await?;
+    let (existing_schema, existing_batches) = match kept_res {
+        ExecResult::Rows { schema, batches } => (schema, batches),
+        ExecResult::Empty { tag } => {
+            return Err(BasinError::internal(format!(
+                "REFRESH MATERIALIZED VIEW: matview SELECT returned non-rows ({tag})"
+            )));
+        }
+    };
+
+    let kept_batches = filter_below_watermark(
+        &existing_batches,
+        &bucket.bucket_alias,
+        watermark,
+    )?;
+
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    if new_schema.fields() == existing_schema.fields() {
+        all_batches.extend(kept_batches.into_iter());
+    }
+    all_batches.extend(new_batches.into_iter());
+
+    let now = Utc::now();
+    let new_watermark_ms = compute_watermark_ms(sess, &def.source_table, bucket)
+        .await
+        .or(Some(watermark.timestamp_millis()));
+
+    if all_batches.is_empty() {
+        let new_def = CvDef {
+            last_refreshed_at_unix_ms: Some(now.timestamp_millis()),
+            last_bucket_max_unix_ms: new_watermark_ms,
+            ..def
+        };
+        catalog
+            .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
+            .await?;
+        refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+        return Ok(ExecResult::Empty {
+            tag: "REFRESH MATERIALIZED VIEW".into(),
+        });
+    }
+
+    let merged = if all_batches.len() == 1 {
+        all_batches.remove(0)
+    } else {
+        let refs: Vec<&RecordBatch> = all_batches.iter().collect();
+        arrow_select::concat::concat_batches(&new_schema, refs)
+            .map_err(|e| BasinError::internal(format!("REFRESH MATERIALIZED VIEW: concat: {e}")))?
+    };
+    let part = PartitionKey::default_key();
+    let written = storage
+        .write_batch(&sess.tenant, table, &part, &merged)
+        .await?;
+
+    let removed_paths: Vec<String> = meta
+        .snapshots
+        .iter()
+        .flat_map(|s| s.data_files.iter().map(|f| f.path.clone()))
+        .collect();
+    let added = vec![DataFileRef {
+        path: written.path.as_ref().to_string(),
+        size_bytes: written.size_bytes,
+        row_count: written.row_count,
+        column_stats: written.column_stats.clone(),
+    }];
+    catalog
+        .replace_data_files(
+            &sess.tenant,
+            table,
+            meta.current_snapshot,
+            removed_paths.clone(),
+            added,
+        )
+        .await?;
+    for path in &removed_paths {
+        if path == written.path.as_ref() {
+            continue;
+        }
+        let p = object_store::path::Path::from(path.as_str());
+        let _ = storage.delete_file(&sess.tenant, &p).await;
+    }
+
+    let new_def = CvDef {
+        last_refreshed_at_unix_ms: Some(now.timestamp_millis()),
+        last_bucket_max_unix_ms: new_watermark_ms,
+        ..def
+    };
+    catalog
+        .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
+        .await?;
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+
+    Ok(ExecResult::Empty {
+        tag: "REFRESH MATERIALIZED VIEW".into(),
+    })
+}
+
+/// Query the source for `max(<bucket_col>)`, floor to the bucket start,
+/// and return the result as Unix-epoch milliseconds. Returns `None` when
+/// the source is empty / the column type isn't a recognised timestamp.
+async fn compute_watermark_ms(
+    sess: &TenantSession,
+    source_table: &str,
+    bucket: &crate::cv_time_bucket::BucketInfo,
+) -> Option<i64> {
+    if source_table.is_empty() {
+        return None;
+    }
+    let sql = format!(
+        "SELECT max({col}) AS m FROM {tbl}",
+        col = bucket.bucket_column,
+        tbl = source_table,
+    );
+    let res = Box::pin(crate::executor::execute(sess, &sql)).await.ok()?;
+    let batches = match res {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => return None,
+    };
+    use arrow_array::{
+        Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use arrow_schema::{DataType, TimeUnit};
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let arr = batch.column(0);
+        if arr.is_null(0) {
+            return None;
+        }
+        let raw: Option<chrono::DateTime<Utc>> = match arr.data_type() {
+            DataType::Timestamp(TimeUnit::Microsecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .and_then(|a| chrono::DateTime::<Utc>::from_timestamp_micros(a.value(0))),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .and_then(|a| chrono::DateTime::<Utc>::from_timestamp_millis(a.value(0))),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .and_then(|a| {
+                    let v = a.value(0);
+                    chrono::DateTime::<Utc>::from_timestamp(
+                        v / 1_000_000_000,
+                        (v % 1_000_000_000) as u32,
+                    )
+                }),
+            DataType::Timestamp(TimeUnit::Second, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .and_then(|a| chrono::DateTime::<Utc>::from_timestamp(a.value(0), 0)),
+            _ => None,
+        };
+        if let Some(ts) = raw {
+            return Some(bucket.width.floor(ts).timestamp_millis());
+        }
+    }
+    None
+}
+
+/// Filter `batches` to rows whose `<bucket_alias>` value is strictly less
+/// than `watermark`. Mirrors `basin_cv::refresher::filter_below_watermark`.
+fn filter_below_watermark(
+    batches: &[RecordBatch],
+    bucket_alias: &str,
+    watermark: chrono::DateTime<Utc>,
+) -> Result<Vec<RecordBatch>> {
+    use arrow_array::{
+        Array, BooleanArray, LargeStringArray, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow_schema::{DataType, TimeUnit};
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = batches[0].schema();
+    let col_idx = schema.index_of(bucket_alias).ok().or_else(|| {
+        schema
+            .fields()
+            .iter()
+            .position(|f| f.name().eq_ignore_ascii_case(bucket_alias))
+    });
+    let Some(col_idx) = col_idx else {
+        return Ok(Vec::new());
+    };
+    let mut kept: Vec<RecordBatch> = Vec::new();
+    for batch in batches {
+        let arr = batch.column(col_idx);
+        let mask: Option<BooleanArray> = match arr.data_type() {
+            DataType::Timestamp(unit, _) => {
+                let bound = match unit {
+                    TimeUnit::Second => watermark.timestamp(),
+                    TimeUnit::Millisecond => watermark.timestamp_millis(),
+                    TimeUnit::Microsecond => watermark.timestamp_micros(),
+                    TimeUnit::Nanosecond => match watermark.timestamp_nanos_opt() {
+                        Some(v) => v,
+                        None => return Ok(Vec::new()),
+                    },
+                };
+                let values: Vec<Option<bool>> = (0..arr.len())
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            Some(false)
+                        } else {
+                            let v = match unit {
+                                TimeUnit::Second => arr
+                                    .as_any()
+                                    .downcast_ref::<TimestampSecondArray>()
+                                    .unwrap()
+                                    .value(i),
+                                TimeUnit::Millisecond => arr
+                                    .as_any()
+                                    .downcast_ref::<TimestampMillisecondArray>()
+                                    .unwrap()
+                                    .value(i),
+                                TimeUnit::Microsecond => arr
+                                    .as_any()
+                                    .downcast_ref::<TimestampMicrosecondArray>()
+                                    .unwrap()
+                                    .value(i),
+                                TimeUnit::Nanosecond => arr
+                                    .as_any()
+                                    .downcast_ref::<TimestampNanosecondArray>()
+                                    .unwrap()
+                                    .value(i),
+                            };
+                            Some(v < bound)
+                        }
+                    })
+                    .collect();
+                Some(BooleanArray::from(values))
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let watermark_str = watermark.format("%Y-%m-%d %H:%M:%S").to_string();
+                let arr_strs: Vec<Option<String>> =
+                    if matches!(arr.data_type(), DataType::LargeUtf8) {
+                        let s = arr.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                        (0..s.len())
+                            .map(|i| {
+                                if s.is_null(i) {
+                                    None
+                                } else {
+                                    Some(s.value(i).to_string())
+                                }
+                            })
+                            .collect()
+                    } else {
+                        let s = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                        (0..s.len())
+                            .map(|i| {
+                                if s.is_null(i) {
+                                    None
+                                } else {
+                                    Some(s.value(i).to_string())
+                                }
+                            })
+                            .collect()
+                    };
+                let values: Vec<Option<bool>> = arr_strs
+                    .iter()
+                    .map(|opt| match opt {
+                        None => Some(false),
+                        Some(s) => {
+                            let s_norm = s.replace('T', " ");
+                            Some(s_norm.as_str() < watermark_str.as_str())
+                        }
+                    })
+                    .collect();
+                Some(BooleanArray::from(values))
+            }
+            _ => None,
+        };
+        let Some(mask) = mask else {
+            return Ok(Vec::new());
+        };
+        let filtered = arrow_select::filter::filter_record_batch(batch, &mask)
+            .map_err(|e| BasinError::internal(format!("filter: {e}")))?;
+        if filtered.num_rows() > 0 {
+            kept.push(filtered);
+        }
+    }
+    Ok(kept)
 }
 
 /// Execute a `DROP MATERIALIZED VIEW [IF EXISTS] <name>`. Removes the
@@ -1009,15 +1428,24 @@ mod tests {
     fn match_refresh_recognises_form() {
         assert_eq!(
             match_refresh_materialized_view("REFRESH MATERIALIZED VIEW mv").unwrap(),
-            Some("mv".to_string())
+            Some(("mv".to_string(), false))
         );
         assert_eq!(
             match_refresh_materialized_view("refresh materialized view mv;").unwrap(),
-            Some("mv".to_string())
+            Some(("mv".to_string(), false))
         );
         assert_eq!(
             match_refresh_materialized_view("SELECT 1").unwrap(),
             None
+        );
+        // WITH (full = true) opts out of incremental.
+        assert_eq!(
+            match_refresh_materialized_view("REFRESH MATERIALIZED VIEW mv WITH (full = true)").unwrap(),
+            Some(("mv".to_string(), true))
+        );
+        assert_eq!(
+            match_refresh_materialized_view("REFRESH MATERIALIZED VIEW mv WITH (full=false);").unwrap(),
+            Some(("mv".to_string(), false))
         );
     }
 

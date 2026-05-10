@@ -102,14 +102,16 @@ async fn s3_viability_tiered_storage() {
     // WAL in a tempdir is fine and avoids spinning a second S3 connection.
     let wal_dir = TempDir::new().unwrap();
     let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
-    let wal = basin_wal::Wal::open(basin_wal::WalConfig {
-        object_store: Arc::new(wal_fs),
-        root_prefix: None,
-        flush_interval: Duration::from_millis(50),
-        flush_max_bytes: 1024 * 1024,
-    })
-    .await
-    .unwrap();
+    let wal: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: Arc::new(wal_fs),
+            root_prefix: None,
+            flush_interval: Duration::from_millis(50),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap(),
+    );
     let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
         storage.clone(),
         catalog.clone(),

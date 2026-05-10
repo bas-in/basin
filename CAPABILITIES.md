@@ -70,7 +70,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `POINT` (geospatial) | 🛠 | `basin-geo` crate ships Rust API; SQL surface (column type `POINT`) deferred to v0.2 via `geo_glue` stub |
 | `TIMESTAMPTZ` | ✅ | Arrow `Timestamp(Microsecond, "UTC")` |
 | `TIMESTAMP` (without time zone) | ✅ | Arrow `Timestamp(Microsecond, None)`; pgwire OID 1114; surfaces in `information_schema.columns.data_type` as `"timestamp without time zone"` |
-| `NUMERIC` (arbitrary precision) | ◻️ | |
+| `NUMERIC` / `DECIMAL` | ✅ | Arrow `Decimal128(p, s)` (1 ≤ p ≤ 38, 0 ≤ s ≤ p). DDL accepts `NUMERIC`, `NUMERIC(p)`, `NUMERIC(p, s)`, `DECIMAL(...)` synonym. Wire format: text only (binary numeric encoding is varlena-shaped and deferred to v0.2; lenient drivers handle text fine). pgwire OID 1700; `information_schema.columns.data_type` = `"numeric"`. |
 | `INTERVAL`, `MONEY`, `XML`, geometric (LINESTRING/POLYGON) | 🚫 | |
 
 ## Multi-tenancy
@@ -109,7 +109,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Iceberg-style catalog (durable) | ✅ | Postgres-backed; survives restart. Multi-region replication direction: single-writer global PG with regional read replicas via PG logical replication — see [ADR 0010](./docs/decisions/0010-catalog-replication.md). |
 | Point-in-time restore (catalog level) | 🛠 | `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` truncates history to ≤ target and rewinds the head pointer. InMemory + Postgres impls. v0.2 adds physical file GC for orphaned post-rollback files; cross-DML rollback waits on soft-delete (also v0.2). Project-wide variants (`list_snapshots_project_wide`, `diff_snapshots`, `rollback_to_snapshot_project_wide`) shipped for Migration Manager v0.2. |
 | Per-tenant fair-share scheduler | 🛠 | architectural primitive shipped (cap=16); v0.2 EDF deferred — see [ADR 0008](./docs/decisions/0008-noisy-neighbor-fairness.md) |
-| WAL (Raft-backed, 5ms acks) | ◻️ | Phase 2 — closes the insert-latency gap |
+| WAL (Raft-backed via openraft, multi-node) | ✅ | `LocalWal` (single-node fsync) and `RaftWal` (multi-node openraft consensus) both implement the `Wal` trait. Single-process simulation cluster shipped (3-node + leader-failure + quorum-commit tests). Cross-process gRPC `RaftNetwork` deferred to follow-up. Hot-path target: 5ms quorum-ack p50 with 3 nodes on local NVMe — see `crates/basin-wal/RAFT.md`. |
 | Background compactor | 🛠 | merges small files; tier sweep + cold-data move shipped |
 | Iceberg REST catalog (Lakekeeper compatibility) | 🛠 | `basin-iceberg-rest` crate ships GET-only endpoints (namespaces, list-tables, load-table) plus DELETE table. Drop into `basin-server` to expose. POST commit/create flows deferred to follow-up. |
 | Per-tenant secondary indexes (B-tree) | ◻️ | Phase 5.7 B1 — biggest remaining point-query win for true random ids |
@@ -151,7 +151,7 @@ covered natively, as Basin-flavored crates with the same SQL semantics:
 | `uuid-ossp` | native UDFs + `UUID` type | ✅ | `gen_random_uuid()`, `uuid_generate_v4()`, canonical hyphenated text + 16-byte binary on the wire |
 | `PostGIS` (subset) | **`basin-geo`** | ✅ | `Point`, `Box2d`, `ST_MakePoint`, `ST_X`, `ST_Y`, `ST_Distance` (Haversine WGS84), `ST_DWithin`, `ST_Contains`. No `LINESTRING`/`POLYGON`/spatial index in v0.1 — see crate. |
 | `pg_trgm` | **`basin-trgm`** | ✅ | `similarity`, `word_similarity`, `extract` (trigram set). v0.1 brute-force; GIN trigram index deferred to v0.2. |
-| `TimescaleDB` continuous aggregates | **`basin-cv`** | ✅ | `CvSpec` + `CvRefresher::tick`; refresh_interval enforced; per-tenant materialization. v0.1 full re-execution; incremental refresh deferred. The SQL surface (`CREATE MATERIALIZED VIEW … WITH (basin.continuous, refresh_interval = '...')`, `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`) ships in `basin-engine::cv_ddl`. |
+| `TimescaleDB` continuous aggregates | **`basin-cv`** | ✅ | `CvSpec` + `CvRefresher::tick`; refresh_interval enforced; per-tenant materialization. **Incremental refresh shipped** for the `date_trunc(_, col)` / `time_bucket(_, col)` GROUP BY shape — only re-aggregates rows newer than the watermark plus the last partial bucket. Bodies without a detectable time-bucket fall back to full re-execution. `REFRESH MATERIALIZED VIEW … WITH (full=true)` opt-out for explicit full rebuild. SQL surface ships in `basin-engine::cv_ddl`. |
 | `TimescaleDB` hypertables | within-tenant time partitioning | ✅ | `CREATE TABLE … PARTITION BY RANGE (ts)` |
 | `pg_stat_statements` | OTEL traces | ✅ | per-query spans exported via `BASIN_OTLP_ENDPOINT` |
 | `Citus` (sharding) | basin-router consistent-hash | ✅ | sharding is structural via per-tenant prefix |
