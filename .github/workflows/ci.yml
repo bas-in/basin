@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pin to the toolchain the team develops against. Bump deliberately.
+  RUST_TOOLCHAIN: 1.83.0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      # Postgres-backed tests skip on unreachable PG via try_connect();
+      # available locally on the runner is a bonus, not a requirement.
+      - name: Start Postgres (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo systemctl start postgresql.service || true
+          sudo -u postgres psql -c "CREATE USER basin WITH SUPERUSER PASSWORD 'basin';" || true
+          sudo -u postgres psql -c "CREATE DATABASE basin OWNER basin;" || true
+          echo "DATABASE_URL=postgres://basin:basin@localhost:5432/basin" >> $GITHUB_ENV
+      - run: cargo build --workspace --all-targets --locked
+      - run: cargo test --workspace --no-fail-fast --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny warnings

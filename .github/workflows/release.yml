@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.83.0
+
+permissions:
+  contents: write
+
+jobs:
+  # Build prebuilt binaries for the user-facing services (basin-server,
+  # basinctl) on each supported target. Library crates live on crates.io;
+  # this job only handles GitHub Releases for the binaries.
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross (for aarch64 linux)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build basin-server + basinctl
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p basin-server -p basinctl
+          else
+            cargo build --release --target ${{ matrix.target }} -p basin-server -p basinctl
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          ARCHIVE_DIR="basin-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$ARCHIVE_DIR"
+          cp target/${{ matrix.target }}/release/basin-server "$ARCHIVE_DIR/" || true
+          cp target/${{ matrix.target }}/release/basinctl "$ARCHIVE_DIR/" || true
+          cp README.md LICENSE CHANGELOG.md "$ARCHIVE_DIR/"
+          tar czf "${ARCHIVE_DIR}.tar.gz" "$ARCHIVE_DIR"
+          shasum -a 256 "${ARCHIVE_DIR}.tar.gz" > "${ARCHIVE_DIR}.tar.gz.sha256"
+          echo "archive=${ARCHIVE_DIR}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${ARCHIVE_DIR}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: basin-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          # Pull the section between "## [VERSION]" and the next "## [" header.
+          awk -v version="$VERSION" '
+            $0 ~ "^## \\[" version "\\]" { capture=1; next }
+            capture && $0 ~ "^## \\[" { capture=0 }
+            capture { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "Release ${VERSION}" > release_notes.md
+            echo "" >> release_notes.md
+            echo "(No CHANGELOG entry found — see commit history for changes.)" >> release_notes.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+          fail_on_unmatched_files: true
+
+  # Optional: publish library crates to crates.io. Disabled by default;
+  # uncomment when ready and add CARGO_REGISTRY_TOKEN secret.
+  #
+  # publish-crates:
+  #   name: cargo publish
+  #   runs-on: ubuntu-latest
+  #   needs: [release]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         toolchain: ${{ env.RUST_TOOLCHAIN }}
+  #     - run: |
+  #         cargo publish -p basin-common
+  #         cargo publish -p basin-storage
+  #         cargo publish -p basin-catalog
+  #         cargo publish -p basin-engine
+  #         # ... (publish order matches dep graph topo)
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

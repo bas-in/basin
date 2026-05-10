@@ -471,7 +471,7 @@ folded in because every modern SaaS schema uses them constantly.
       above against `tokio-postgres`'s default extended-query path; no
       panic, results match a real PG reference run committed alongside.
 
-#### 5.11.D — `LANGUAGE sql` scalar functions (~3 weeks, depends on A) 🛠 (catalog API + planner inliner ✅; `CREATE FUNCTION` SQL surface queued)
+#### 5.11.D — `LANGUAGE sql` scalar functions (~3 weeks, depends on A) ✅ shipped (catalog API + planner inliner + `CREATE FUNCTION` / `DROP FUNCTION` / `ALTER FUNCTION … RENAME TO` SQL surface + mutual-recursion detection at registration)
 
 The function primitive — body is a single SELECT, inlined at planning
 time. Covers ~50% of all real-world function use cases. No interpreter,
@@ -546,7 +546,7 @@ the engine plumbing already exists in `basin-cv`.
 Each independent. Each plugs into the Tier 0 trait. Order below is
 suggested-priority; real order is whatever Phase 0 surfaces.
 
-#### 5.11.C — SQL-bodied reactors (`REACT ON … EXECUTE`) (~2 weeks, depends on Tier 0 + 5.11.A) 🛠 (machinery ✅: `ReactorSink` pre-commit + `register_reactor` catalog API + AST-level NEW/OLD/TG_OP substitution; ALTER TABLE SQL surface in flight)
+#### 5.11.C — SQL-bodied reactors (`REACT ON … EXECUTE`) (~2 weeks, depends on Tier 0 + 5.11.A) ✅ shipped (machinery: `ReactorSink` pre-commit + `register_reactor` catalog API + AST-level NEW/OLD/TG_OP substitution; ALTER TABLE SQL surface; constraint reactors via `__basin_assert` UDF for SQLSTATE 23514; `DROP REACTOR` parser)
 
 The trigger primitive. `ReactorSink` implements `ChangeEventSink`,
 attached as **pre-commit** so reactor failures abort the mutation.
@@ -574,7 +574,7 @@ rows per tenant", "free-tier caps", "hierarchical depth limit".
 - [ ] Test: cap-at-N rejection works; cap-at-N allows under the cap;
       constraint with subquery against a sibling table works.
 
-#### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0) 🛠 (machinery ✅: `crates/basin-webhooks` ships `WebhookSink` + retry queue + dead-letter; `ALTER TABLE … SUBSCRIBE WEBHOOK` SQL surface queued)
+#### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0) ✅ shipped (machinery: `crates/basin-webhooks` ships `WebhookSink` + retry queue + dead-letter + per-tenant counters/p99-latency observability; `ALTER TABLE … SUBSCRIBE WEBHOOK` / `UNSUBSCRIBE WEBHOOK` SQL surface; predicate evaluation via `predicate_eval` module against ChangeEvent JSON payload)
 
 Replaces "trigger fires HTTP" with a retryable, idempotency-keyed
 fanout. `WebhookSink` implements `ChangeEventSink`, attached as
@@ -640,7 +640,7 @@ than `LANGUAGE sql` functions for the simplest case.
 - [ ] Test: generated column round-trip; expression composing built-ins
       from 5.11.A; rejection of direct write.
 
-#### 5.11.K3 — Sequences (`CREATE SEQUENCE`, `nextval`, `currval`) (~2 weeks) 🛠 (catalog API + scalar UDFs ✅; `CREATE SEQUENCE` SQL surface + `DEFAULT nextval` integration queued)
+#### 5.11.K3 — Sequences (`CREATE SEQUENCE`, `nextval`, `currval`) (~2 weeks) ✅ shipped (catalog API + scalar UDFs `nextval`/`currval`/`setval` + `CREATE SEQUENCE` / `DROP SEQUENCE` SQL surface + multi-option grammar via textual pre-screen — works around sqlparser 0.52's single-option limitation per the production fix)
 
 Custom auto-increment, gap-tolerant counters. Most new SaaS uses ULID/
 UUID, but a real slice still wants sequences for human-readable IDs.
@@ -660,7 +660,7 @@ UUID, but a real slice still wants sequences for human-readable IDs.
 
 ### Tier 3 — Larger asks
 
-#### 5.11.M — `information_schema` + `pg_catalog` read-only views (~6-8 weeks honest) 🛠 (starter ✅, engine-routing ✅, expansion ✅: `tables` + `columns` + `pg_class` + `pg_attribute` + `pg_namespace` all routed through pgwire with PostgREST predicate compatibility verified; remaining for full PG-ecosystem-tooling unblock: `pg_index`, `pg_constraint`, `pg_proc`, `information_schema.routines`, `key_column_usage`, `table_constraints`, `referential_constraints`)
+#### 5.11.M — `information_schema` + `pg_catalog` read-only views (~6-8 weeks honest) ✅ shipped (17 views total: `information_schema.tables`/`columns`/`routines`/`views`/`schemata`/`table_constraints`/`key_column_usage`/`referential_constraints` + `pg_catalog.pg_class`/`pg_attribute`/`pg_namespace`/`pg_proc`/`pg_type`/`pg_constraint`/`pg_index`/`pg_depend`/`pg_authid`. PostgREST/pgAdmin/ORM (Prisma/Sequelize/SQLAlchemy) startup-query compat verified by integration tests. Once 5.11's PK+CHECK+FK enforcement landed, `pg_constraint`/`table_constraints`/`key_column_usage`/`referential_constraints` populate with real PK/CHECK/FK rows. `pg_index` populates when 5.7 B1 secondary indexes ship.)
 
 The gate for proper PG-ecosystem tooling. Every introspecting tool
 (PostgREST, pgAdmin, DataGrip, schema-migration tools, every ORM that
@@ -799,7 +799,7 @@ conditions in its "Trigger to revisit" section are met.
 - [x] Per-tenant metrics from day one (ops/s, p50/p99, RAM, S3 IO, active hours) — public `Engine::tenant_counters` API surfaces ops/bytes/errors + p99 ms estimate aggregated across engine + storage + WAL; viability test `tests/integration/tests/viability_per_tenant_counters.rs` asserts per-tenant byte isolation.
 - [x] OpenTelemetry traces wired through router → shard → WAL — `#[tracing::instrument]` spans on every layer (router/engine/shard/storage::{read,write_batch,read_paths}/WAL append/flush/read_from/truncate); OTLP export available via `BASIN_OTLP_ENDPOINT`.
 - [x] Cross-tenant fuzz tests (find a bug → file a P0) — `tests/integration/tests/fuzz_cross_tenant_isolation.rs` runs a seed-reproducible (`BASIN_FUZZ_SEED`) StdRng fuzzer of 1000 random query shapes across 8 tenants, asserts every returned row carries the calling tenant's payload prefix, and verifies `TableName::new` rejects path-traversal inputs. No isolation breach found.
-- [x] Feature-coverage + security suite — shipped at `tests/integration/tests/feature_coverage.rs` (one assertion per CAPABILITIES.md ✅ row, with audit comment cross-referencing the test that already covers each row) and `tests/integration/tests/security.rs` (OWASP-shaped pgwire SQL-injection probes through both simple and extended-bind paths, path-injection on `TableName`/`TenantId`/`PartitionKey`, RLS bypass attempts via UNION/CTE, structural cross-tenant fork rejection, and pgwire rate-limit enforcement). **P0 finding:** the security suite's `rls_union_subquery_cannot_bypass` and `rls_cte_cannot_bypass` panic — RLS predicate injection is currently skipped for `SetExpr::SetOperation` and `query.with` shapes because `crates/basin-engine/src/executor.rs::collect_table_refs_from_query` only walks `SetExpr::Select`. Fix is in the table collector, not the rewriter.
+- [x] Feature-coverage + security suite — shipped at `tests/integration/tests/feature_coverage.rs` (one assertion per CAPABILITIES.md ✅ row, with audit comment cross-referencing the test that already covers each row) and `tests/integration/tests/security.rs` (OWASP-shaped pgwire SQL-injection probes through both simple and extended-bind paths, path-injection on `TableName`/`TenantId`/`PartitionKey`, RLS bypass attempts via UNION/CTE, structural cross-tenant fork rejection, and pgwire rate-limit enforcement). All 12 security tests pass — `collect_table_refs_from_query` in `executor.rs` walks `SetExpr::SetOperation`, `query.with` CTEs, `TableFactor::Derived` subqueries, `TableFactor::NestedJoin`, and embedded subqueries (EXISTS/IN/scalar) so RLS predicate injection cannot be bypassed via UNION / CTE / subquery shapes.
 - [ ] Bug bounty program before public beta
 - [ ] Security review at each phase boundary
 
