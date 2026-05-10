@@ -20,6 +20,12 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   # Pin to the toolchain the team develops against. Bump deliberately.
   RUST_TOOLCHAIN: 1.83.0
+  # Strip debug info from CI dev builds. Free GitHub runners have ~7GB
+  # RAM and the workspace's test binaries (each statically links ~200
+  # crates) routinely OOM the linker on full debug info. `line-tables-
+  # only` keeps file:line numbers for panics + backtraces, which is all
+  # CI needs — full DWARF is for interactive debugging.
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
   # NOTE: sccache via the GHA cache backend was tried here and reverted —
   # the Azure-hosted artifactcache endpoint returns 400s intermittently
   # (`Server startup failed: cache storage failed to read`), and because
@@ -90,7 +96,15 @@ jobs:
       # Build + test as one step: `cargo test` builds the test artefacts
       # directly, so a prior `cargo build` step just doubles compile
       # cost. `--locked` so a Cargo.lock drift is caught before tests run.
-      - run: cargo test --workspace --no-fail-fast --locked
+      #
+      # `--exclude basin-integration-tests`: those tests are
+      # benchmark-flavoured viability cards (viability_*, s3_scaling_*,
+      # large_dataset_*) that link a near-full workspace per binary and
+      # routinely OOM a 7GB GitHub runner at link time
+      # (`ld terminated with signal 7 [Bus error]`). They're designed
+      # to run on a developer workstation, not on free CI. The per-
+      # crate unit + integration tests still run via `--workspace`.
+      - run: cargo test --workspace --exclude basin-integration-tests --no-fail-fast --locked
 
   audit:
     name: cargo audit
