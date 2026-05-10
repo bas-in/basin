@@ -403,9 +403,7 @@ fn sql_data_type_to_arg(dt: &sqlparser::ast::DataType) -> Result<SqlArgType> {
         SqlDataType::Date => Ok(SqlArgType::Date),
         SqlDataType::Timestamp(_, tz_info) => match tz_info {
             TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => Ok(SqlArgType::TimestampTz),
-            _ => Err(BasinError::InvalidSchema(
-                "TIMESTAMP without time zone is not supported; use TIMESTAMPTZ".into(),
-            )),
+            _ => Ok(SqlArgType::Timestamp),
         },
         other => Err(BasinError::InvalidSchema(format!(
             "unsupported procedure arg type: {other}"

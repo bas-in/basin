@@ -63,7 +63,12 @@ async fn pg_index_returns_empty_for_v01() {
 }
 
 #[tokio::test]
-async fn pg_constraint_returns_empty_for_v01() {
+async fn pg_constraint_lists_not_null_rows() {
+    // Pin the shape that pg_constraint emits one row per constraint
+    // surface. With one NOT NULL column on the table and no PK / FK /
+    // CHECK declared, the table contributes exactly one `contype='n'`
+    // row. Full PK / FK / CHECK coverage lives in the engine-side
+    // `constraints` test.
     let cat = InMemoryCatalog::new();
     let t = TenantId::new();
     cat.create_namespace(&t).await.unwrap();
@@ -76,7 +81,7 @@ async fn pg_constraint_returns_empty_for_v01() {
         .unwrap();
 
     let batch = InfoSchemaQuery::pg_constraint(&cat, &t).await.unwrap();
-    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.num_rows(), 1, "expected one NOT NULL row for `id`");
     let s = batch.schema();
     let names: Vec<String> = s.fields().iter().map(|f| f.name().clone()).collect();
     assert_eq!(

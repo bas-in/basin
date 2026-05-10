@@ -76,9 +76,10 @@ fn sql_data_type_to_arg(dt: &SqlDataType) -> Result<SqlArgType> {
         SqlDataType::Date => Ok(SqlArgType::Date),
         SqlDataType::Timestamp(_, tz_info) => match tz_info {
             TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => Ok(SqlArgType::TimestampTz),
-            _ => Err(BasinError::InvalidSchema(
-                "TIMESTAMP without time zone is not supported; use TIMESTAMPTZ".into(),
-            )),
+            // Bare `TIMESTAMP` and explicit `TIMESTAMP WITHOUT TIME ZONE`
+            // both land as the no-tz variant. PG semantic: a wall-clock
+            // value with no zone information.
+            _ => Ok(SqlArgType::Timestamp),
         },
         other => Err(BasinError::InvalidSchema(format!(
             "unsupported domain base type: {other}"
@@ -181,6 +182,7 @@ fn arg_type_to_sql(arg: SqlArgType) -> SqlDataType {
         SqlArgType::Bytea => SqlDataType::Bytea,
         SqlArgType::Date => SqlDataType::Date,
         SqlArgType::TimestampTz => SqlDataType::Timestamp(None, TimezoneInfo::WithTimeZone),
+        SqlArgType::Timestamp => SqlDataType::Timestamp(None, TimezoneInfo::WithoutTimeZone),
     }
 }
 

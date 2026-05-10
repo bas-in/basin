@@ -12,54 +12,97 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 _Nothing yet._
 
+## [0.1.3] - 2026-05-11
+
+Engine catch-up + CI / release pipeline hot-fix.
+
+### Added
+
+- **`TIMESTAMP` (without time zone) accepted** in `CREATE DOMAIN`,
+  `CREATE FUNCTION` arg / `RETURNS TABLE` column, and `CREATE
+  PROCEDURE` arg surfaces. The v0.1.1 CHANGELOG claimed this but only
+  `CREATE TABLE` actually shipped it. New `SqlArgType::Timestamp`
+  variant bridges to Arrow `Timestamp(Microsecond, None)` and PG OID
+  1114 (distinct from `TIMESTAMPTZ` / OID 1184 at the wire).
+- **Constraint introspection views populated.** `pg_catalog.pg_constraint`,
+  `information_schema.table_constraints`, `key_column_usage`, and
+  `referential_constraints` now emit real rows derived from each
+  table's declared PRIMARY KEY / FOREIGN KEY / CHECK / NOT NULL. The
+  v0.1.1 CHANGELOG claimed these populated but the underlying
+  functions returned empty `RecordBatch`es. PostgREST / pgAdmin
+  schema-discovery queries now resolve.
+  - `pg_constraint.contype` emits `'p'` (PK), `'f'` (FK), `'c'`
+    (CHECK), `'n'` (NOT NULL) per PG convention.
+  - PK constraint named `<table>_pkey`; FK keeps its declared name;
+    CHECK keeps its declared name; NOT NULL named
+    `<table>_<col>_not_null`.
+  - `referential_constraints.update_rule` / `delete_rule` map
+    `RefAction::NoAction` → `"NO ACTION"`, `RefAction::Cascade` →
+    `"CASCADE"`.
+  - `key_column_usage` emits one row per PK column + per FK local
+    column, with 1-based `ordinal_position` within the constraint
+    (not within the table) — matches PG semantics.
+
+### Fixed
+
+- **CI test job OOM at link time.** `basin-integration-tests` was
+  linking a near-full workspace per binary; the linker bus-faulted on
+  GitHub's 7 GB runners. The job now runs
+  `cargo test --workspace --exclude basin-integration-tests` and sets
+  `CARGO_PROFILE_DEV_DEBUG=line-tables-only` to shrink test binaries.
+  Heavy `viability_*` / `s3_scaling_*` cards run on developer
+  workstations, not CI.
+- **sccache broke every workflow.** The GHA cache backend
+  (`artifactcache.actions.githubusercontent.com`) returns HTTP 400
+  intermittently, and `RUSTC_WRAPPER=sccache` propagates to every
+  rustc call — so a degraded backend takes out clippy, test, audit,
+  and release simultaneously. Removed from both workflows. Swatinem
+  `rust-cache` is the sole cache layer.
+
+### Changed
+
+- **Release matrix** trimmed to three targets:
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (native
+  `ubuntu-24.04-arm` runner), `aarch64-apple-darwin`. `macos-13`
+  (Intel Mac) dropped — Rosetta runs the aarch64 binary.
+- **RELEASING.md** refreshed: 3-target matrix, no `-D warnings`,
+  `--exclude basin-integration-tests` in the local sanity-check
+  sequence.
+
 ## [0.1.2] - 2026-05-10
 
 ### Added
 
-- **`SERIAL` / `BIGSERIAL` / `SMALLSERIAL` pseudo-types** (+ `SERIAL2` /
-  `SERIAL4` / `SERIAL8` aliases). PG-shaped expansion: each `SERIAL`
-  column auto-creates a sequence named `<table>_<col>_seq` and stamps
-  `DEFAULT nextval('<seq>')` + implicit `NOT NULL`. Driver-emitted
-  `CREATE TABLE t (id SERIAL PRIMARY KEY, …)` now works through the
-  pgwire surface without the user having to spell out the sequence.
-  (Note: `SMALLSERIAL` widens to Int64 physically since the INSERT path
-  doesn't yet have an Int16 row-builder — see
-  `basin_engine::types::arrow_data_type`.)
-
-### Changed
-
-- **CI pipeline performance**: sccache on clippy + test jobs (~5-10 min
-  saved per run on duckdb-bundled's C++ compile), dropped the duplicate
-  `cargo build` step in the `test` job (let `cargo test` build the
-  artefacts itself), dropped macOS from the test matrix (single Linux
-  runner — re-add when a platform-specific regression actually surfaces),
-  added `concurrency` cancellation so re-pushes don't queue duplicate
-  runs, and switched `cargo audit` to advisory-only (no `--deny warnings`)
-  so a yanked transitive doesn't block the release path.
-- **Release pipeline performance**: replaced `cross` + Docker
-  cross-compile for `aarch64-unknown-linux-gnu` with GitHub's native
-  `ubuntu-24.04-arm` runner — duckdb-bundled was timing out the
-  cross-compile path; native compile finishes in ~⅓ of the wall-clock.
-  Added sccache for the C++ layer + `lld` linker on Linux for ~2-3×
-  faster link. Dropped the `macos-13` (Intel Mac) target — runner-hour
-  cost vs. shrinking user base; aarch64 binary still runs under
-  Rosetta. Persists the per-target build cache across tag pushes and
-  strips debug info from release artefacts
-  (`CARGO_PROFILE_RELEASE_DEBUG=0`).
+- **`SERIAL` / `BIGSERIAL` / `SMALLSERIAL`** column types (+ `SERIAL2`
+  / `SERIAL4` / `SERIAL8` aliases). PG-shaped: each `SERIAL` column
+  auto-creates a sequence named `<table>_<col>_seq`, stamps
+  `DEFAULT nextval('<seq>')`, and is implicitly `NOT NULL`.
+  `CREATE TABLE t (id SERIAL PRIMARY KEY, …)` now works through pgwire
+  without the user spelling out the sequence. `SMALLSERIAL` widens to
+  Int64 physically (the INSERT path has no Int16 row-builder yet).
 
 ### Fixed
 
-- `rewrite_sequence_calls` now emits a plain integer literal instead of
-  `<n>::bigint`. The cast was surviving rewrite and tripping
-  `coerce_i64` in the INSERT-default evaluator, which only recognised
-  bare `Number` / `UnaryOp(Minus, Number)`. Negative values are
-  parenthesised to keep adjacent operators from fusing.
-- `clippy::approx_constant` deny in `prepared.rs:995` (the `3.14` in
-  `substitute_float_keeps_decimal_point`) — was breaking both the
-  `clippy` and `test` CI jobs because clippy's deny-by-default lints
-  turn into hard compile errors. Changed the literal to `2.25`; the
-  test only ever cared about decimal-point preservation, not the
-  specific value.
+- `rewrite_sequence_calls` now emits a plain integer literal instead
+  of `<n>::bigint`. The cast was surviving rewrite and tripping the
+  INSERT-default evaluator, which only recognised bare numbers.
+- `clippy::approx_constant` deny in `prepared.rs` (`3.14` literal in a
+  decimal-preservation test) — was breaking clippy + test CI jobs.
+  Changed to `2.25`.
+
+### Changed
+
+- **CI**: dropped redundant `cargo build` step in `test`, dropped
+  macOS from test matrix, added `concurrency` cancellation, relaxed
+  `cargo audit` (no `--deny warnings`).
+- **Release**: native `ubuntu-24.04-arm` runner for aarch64-linux
+  (replaces `cross` + Docker, which was timing out on
+  duckdb-bundled). Persisted per-target build cache. Stripped debug
+  info from release artefacts.
+
+> **Pipeline note**: v0.1.2 also tried sccache via the GHA cache
+> backend; that broke every workflow when Azure's cache endpoint
+> returned 400s. Fixed in v0.1.3.
 
 ## [0.1.1] - 2026-05-10
 
@@ -129,6 +172,7 @@ Phase 6 production-hardening entry batch.
 - `basin-cloud` and `basin-billing` workspace crates (moved to `basin-cloud` repo)
 - `CLOUD_ROADMAP.md` (canonical copy lives in `basin-cloud` repo)
 
-[Unreleased]: https://github.com/bas-in/basin/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/bas-in/basin/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/bas-in/basin/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/bas-in/basin/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/bas-in/basin/releases/tag/v0.1.1

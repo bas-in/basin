@@ -648,20 +648,205 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_constraint` filtered to `tenant`. Always empty
-    /// in v0.1 (no FK / explicit PK / CHECK / UNIQUE surfaces). `tenant`
-    /// is held for signature stability.
-    pub async fn pg_constraint(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+    /// Build `pg_catalog.pg_constraint` filtered to `tenant`. Emits one
+    /// row per constraint declared on each tenant-owned table:
+    ///
+    /// - `contype = 'p'` for the PRIMARY KEY (one row per table that
+    ///   has a PK), named `<table>_pkey`. `conkey` is the
+    ///   space-separated 1-based attnums of the PK columns in order.
+    /// - `contype = 'f'` for each FOREIGN KEY, named `<table>_<col>_fkey`
+    ///   (or the user-supplied `CONSTRAINT <name>`). `conkey` is the
+    ///   local attnums; `confrelid` is the referenced table's oid;
+    ///   `confkey` is the referenced columns' attnums on that table.
+    /// - `contype = 'c'` for each CHECK constraint.
+    /// - `contype = 'n'` for each NOT NULL column. PG itself doesn't
+    ///   surface NOT NULL in `pg_constraint` (it's a column attribute),
+    ///   but Basin advertises it here so PostgREST / pgAdmin can list
+    ///   every constraint surface in one view.
+    ///
+    /// Cross-tenant leak is a P0 invariant: only [`Catalog::list_tables`]
+    /// / [`Catalog::load_table`] for `tenant`.
+    pub async fn pg_constraint(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let namespace_oid = namespace_oid_for(tenant, DEFAULT_SCHEMA);
+
+        let mut oids: Vec<i64> = Vec::new();
+        let mut connames: Vec<String> = Vec::new();
+        let mut connamespaces: Vec<i64> = Vec::new();
+        let mut contypes: Vec<&'static str> = Vec::new();
+        let mut conrelids: Vec<i64> = Vec::new();
+        let mut conkeys: Vec<String> = Vec::new();
+        let mut confrelids: Vec<i64> = Vec::new();
+        let mut confkeys: Vec<String> = Vec::new();
+
+        // Pre-load metadata for every table so we can resolve FK target
+        // attnums by looking the referenced table back up. The map is
+        // keyed on the bare name as written in the FK; the engine has
+        // already validated cross-tenant FKs are rejected.
+        let mut metas: std::collections::HashMap<String, crate::metadata::TableMetadata> =
+            std::collections::HashMap::with_capacity(names.len());
+        for name in &names {
+            let m = catalog.load_table(tenant, name).await?;
+            metas.insert(name.as_str().to_string(), m);
+        }
+
+        let push = |conname: String,
+                    contype: &'static str,
+                    conrelid: i64,
+                    conkey: String,
+                    confrelid: i64,
+                    confkey: String,
+                    oids: &mut Vec<i64>,
+                    connames: &mut Vec<String>,
+                    connamespaces: &mut Vec<i64>,
+                    contypes: &mut Vec<&'static str>,
+                    conrelids: &mut Vec<i64>,
+                    conkeys: &mut Vec<String>,
+                    confrelids: &mut Vec<i64>,
+                    confkeys: &mut Vec<String>| {
+            let oid_key = format!("basin.pg_constraint:{tenant}:{}:{}", conrelid, &conname);
+            oids.push(fnv1a_64_to_positive_i64(oid_key.as_bytes()));
+            connames.push(conname);
+            connamespaces.push(namespace_oid);
+            contypes.push(contype);
+            conrelids.push(conrelid);
+            conkeys.push(conkey);
+            confrelids.push(confrelid);
+            confkeys.push(confkey);
+        };
+
+        for name in &names {
+            let meta = &metas[name.as_str()];
+            let relid = table_oid(tenant, name);
+
+            // PRIMARY KEY (one row per table with a PK).
+            if !meta.pk_columns.is_empty() {
+                let conkey = meta
+                    .pk_columns
+                    .iter()
+                    .filter_map(|c| attnum_in_schema(&meta.schema, c))
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                push(
+                    pk_constraint_name(name),
+                    CONTYPE_PRIMARY_KEY,
+                    relid,
+                    conkey,
+                    0,
+                    String::new(),
+                    &mut oids,
+                    &mut connames,
+                    &mut connamespaces,
+                    &mut contypes,
+                    &mut conrelids,
+                    &mut conkeys,
+                    &mut confrelids,
+                    &mut confkeys,
+                );
+            }
+
+            // FOREIGN KEY (one row each).
+            for fk in &meta.foreign_keys {
+                let conkey = fk
+                    .columns
+                    .iter()
+                    .filter_map(|c| attnum_in_schema(&meta.schema, c))
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ref_table = TableName::new(fk.ref_table.clone())
+                    .map_err(|e| BasinError::internal(format!("FK ref_table {e}")))?;
+                let confrelid = table_oid(tenant, &ref_table);
+                let confkey = if let Some(ref_meta) = metas.get(&fk.ref_table) {
+                    fk.ref_columns
+                        .iter()
+                        .filter_map(|c| attnum_in_schema(&ref_meta.schema, c))
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    String::new()
+                };
+                push(
+                    fk.name.clone(),
+                    CONTYPE_FOREIGN_KEY,
+                    relid,
+                    conkey,
+                    confrelid,
+                    confkey,
+                    &mut oids,
+                    &mut connames,
+                    &mut connamespaces,
+                    &mut contypes,
+                    &mut conrelids,
+                    &mut conkeys,
+                    &mut confrelids,
+                    &mut confkeys,
+                );
+            }
+
+            // CHECK (one row each). conkey is left empty — PG fills in
+            // referenced attnums via parse of `consrc`, which Basin
+            // doesn't track per-column for CHECK predicates yet.
+            for chk in &meta.check_constraints {
+                push(
+                    chk.name.clone(),
+                    CONTYPE_CHECK,
+                    relid,
+                    String::new(),
+                    0,
+                    String::new(),
+                    &mut oids,
+                    &mut connames,
+                    &mut connamespaces,
+                    &mut contypes,
+                    &mut conrelids,
+                    &mut conkeys,
+                    &mut confrelids,
+                    &mut confkeys,
+                );
+            }
+
+            // NOT NULL (one row per non-nullable column). Optional under
+            // PG's spec; emitted here so the introspection surface has
+            // a single source of truth for "what constraints exist on
+            // this table".
+            for field in meta.schema.fields().iter() {
+                if !field.is_nullable() {
+                    let attnum = attnum_in_schema(&meta.schema, field.name())
+                        .map(|n| n.to_string())
+                        .unwrap_or_default();
+                    push(
+                        not_null_constraint_name(name, field.name()),
+                        CONTYPE_NOT_NULL,
+                        relid,
+                        attnum,
+                        0,
+                        String::new(),
+                        &mut oids,
+                        &mut connames,
+                        &mut connamespaces,
+                        &mut contypes,
+                        &mut conrelids,
+                        &mut conkeys,
+                        &mut confrelids,
+                        &mut confkeys,
+                    );
+                }
+            }
+        }
+
         let schema = Self::pg_constraint_schema();
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(Vec::<i64>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(Int64Array::from(Vec::<i64>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(Int64Array::from(Vec::<i64>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(Int64Array::from(Vec::<i64>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
+            Arc::new(Int64Array::from(oids)),
+            Arc::new(StringArray::from(connames)),
+            Arc::new(Int64Array::from(connamespaces)),
+            Arc::new(StringArray::from(contypes)),
+            Arc::new(Int64Array::from(conrelids)),
+            Arc::new(StringArray::from(conkeys)),
+            Arc::new(Int64Array::from(confrelids)),
+            Arc::new(StringArray::from(confkeys)),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_constraint build: {e}")))
@@ -917,17 +1102,40 @@ impl InfoSchemaQuery {
 
         for name in &names {
             let meta = catalog.load_table(tenant, name).await?;
+            let mut push = |conname: String, ctype: &'static str| {
+                constraint_catalogs.push(BASIN_CATALOG_NAME);
+                constraint_schemas.push(DEFAULT_SCHEMA);
+                constraint_names.push(conname);
+                table_catalogs.push(BASIN_CATALOG_NAME);
+                table_schemas.push(DEFAULT_SCHEMA);
+                table_names.push(name.as_str().to_string());
+                constraint_types.push(ctype);
+                is_deferrables.push(CONSTRAINT_NO);
+                initially_deferreds.push(CONSTRAINT_NO);
+            };
+
+            // PRIMARY KEY (one row per table with a PK).
+            if !meta.pk_columns.is_empty() {
+                push(pk_constraint_name(name), CONSTRAINT_TYPE_PRIMARY_KEY);
+            }
+
+            // FOREIGN KEY (one row each).
+            for fk in &meta.foreign_keys {
+                push(fk.name.clone(), CONSTRAINT_TYPE_FOREIGN_KEY);
+            }
+
+            // CHECK (one row each).
+            for chk in &meta.check_constraints {
+                push(chk.name.clone(), CONSTRAINT_TYPE_CHECK);
+            }
+
+            // NOT NULL (one row per non-nullable column).
             for field in meta.schema.fields().iter() {
                 if !field.is_nullable() {
-                    constraint_catalogs.push(BASIN_CATALOG_NAME);
-                    constraint_schemas.push(DEFAULT_SCHEMA);
-                    constraint_names.push(not_null_constraint_name(name, field.name()));
-                    table_catalogs.push(BASIN_CATALOG_NAME);
-                    table_schemas.push(DEFAULT_SCHEMA);
-                    table_names.push(name.as_str().to_string());
-                    constraint_types.push(CONSTRAINT_TYPE_NOT_NULL);
-                    is_deferrables.push(CONSTRAINT_NO);
-                    initially_deferreds.push(CONSTRAINT_NO);
+                    push(
+                        not_null_constraint_name(name, field.name()),
+                        CONSTRAINT_TYPE_NOT_NULL,
+                    );
                 }
             }
         }
@@ -949,33 +1157,83 @@ impl InfoSchemaQuery {
     }
 
     /// Build `information_schema.key_column_usage` filtered to `tenant`.
+    /// PG semantics: one row per column that participates in a UNIQUE /
+    /// PRIMARY KEY / FOREIGN KEY constraint. NOT NULL is intentionally
+    /// excluded — that's `table_constraints` territory.
     ///
-    /// Always empty in v0.1: PG semantics restrict this view to columns
-    /// participating in PRIMARY KEY / UNIQUE / FOREIGN KEY constraints,
-    /// none of which Basin tracks today (PK/UNIQUE/FK are rejected at
-    /// parse time in `basin_engine::ddl`). NOT NULL constraints are
-    /// surfaced in `table_constraints` only — PG does not list them
-    /// here. Rows will appear once PK enforcement ships.
+    /// `ordinal_position` is 1-based within the constraint, not within
+    /// the table; the test pin `key_column_usage_lists_pk_and_fk_columns`
+    /// expects a composite PK `(order_id, item_id)` to render as
+    /// positions `[1, 2]`.
     ///
-    /// Cross-tenant leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] for `tenant`.
+    /// `position_in_unique_constraint` is set on FK rows to the matching
+    /// position in the referenced table's PK; NULL elsewhere.
+    ///
+    /// Cross-tenant leak is a P0 invariant: only [`Catalog::list_tables`]
+    /// / [`Catalog::load_table`] for `tenant`.
     pub async fn key_column_usage(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        // Walk the tables to keep the access pattern (and therefore the
-        // tenant-isolation surface) identical to the other views, even
-        // though no rows are produced today.
-        let _ = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(tenant).await?;
+
+        let mut constraint_catalogs: Vec<&str> = Vec::new();
+        let mut constraint_schemas: Vec<&str> = Vec::new();
+        let mut constraint_names: Vec<String> = Vec::new();
+        let mut table_catalogs: Vec<&str> = Vec::new();
+        let mut table_schemas: Vec<&str> = Vec::new();
+        let mut table_names: Vec<String> = Vec::new();
+        let mut column_names: Vec<String> = Vec::new();
+        let mut ordinal_positions: Vec<i32> = Vec::new();
+        let mut position_in_unique: Vec<Option<i32>> = Vec::new();
+
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+
+            // PK columns.
+            if !meta.pk_columns.is_empty() {
+                let pkname = pk_constraint_name(name);
+                for (i, col) in meta.pk_columns.iter().enumerate() {
+                    constraint_catalogs.push(BASIN_CATALOG_NAME);
+                    constraint_schemas.push(DEFAULT_SCHEMA);
+                    constraint_names.push(pkname.clone());
+                    table_catalogs.push(BASIN_CATALOG_NAME);
+                    table_schemas.push(DEFAULT_SCHEMA);
+                    table_names.push(name.as_str().to_string());
+                    column_names.push(col.clone());
+                    ordinal_positions.push((i + 1) as i32);
+                    position_in_unique.push(None);
+                }
+            }
+
+            // FK local columns.
+            for fk in &meta.foreign_keys {
+                for (i, col) in fk.columns.iter().enumerate() {
+                    constraint_catalogs.push(BASIN_CATALOG_NAME);
+                    constraint_schemas.push(DEFAULT_SCHEMA);
+                    constraint_names.push(fk.name.clone());
+                    table_catalogs.push(BASIN_CATALOG_NAME);
+                    table_schemas.push(DEFAULT_SCHEMA);
+                    table_names.push(name.as_str().to_string());
+                    column_names.push(col.clone());
+                    ordinal_positions.push((i + 1) as i32);
+                    // Position of this local column's referenced peer
+                    // within the unique constraint it points at — same
+                    // index since we require FK column count to match
+                    // referenced PK column count.
+                    position_in_unique.push(Some((i + 1) as i32));
+                }
+            }
+        }
 
         let schema = Self::key_column_usage_schema();
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(Int32Array::from(Vec::<i32>::new())),
-            Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
+            Arc::new(StringArray::from(constraint_catalogs)),
+            Arc::new(StringArray::from(constraint_schemas)),
+            Arc::new(StringArray::from(constraint_names)),
+            Arc::new(StringArray::from(table_catalogs)),
+            Arc::new(StringArray::from(table_schemas)),
+            Arc::new(StringArray::from(table_names)),
+            Arc::new(StringArray::from(column_names)),
+            Arc::new(Int32Array::from(ordinal_positions)),
+            Arc::new(Int32Array::from(position_in_unique)),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("info_schema.key_column_usage build: {e}")))
@@ -1055,27 +1313,60 @@ impl InfoSchemaQuery {
     }
 
     /// Build `information_schema.referential_constraints` filtered to
-    /// `tenant`. Always empty in v0.1 (FOREIGN KEY queued).
+    /// `tenant`. One row per FOREIGN KEY. `update_rule` / `delete_rule`
+    /// reflect the FK's [`crate::metadata::RefAction`] mapped to PG's
+    /// action strings (`"NO ACTION"` / `"CASCADE"`). `match_option` is
+    /// always `"NONE"` — Basin doesn't model `MATCH PARTIAL` / `MATCH
+    /// FULL`. `unique_constraint_name` points at the referenced table's
+    /// PK constraint (`<ref_table>_pkey`) since v0.1 only allows FKs
+    /// against PKs.
     ///
-    /// Cross-tenant leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] for `tenant`.
+    /// Cross-tenant leak is a P0 invariant: only [`Catalog::list_tables`]
+    /// / [`Catalog::load_table`] for `tenant`.
     pub async fn referential_constraints(
         catalog: &dyn Catalog,
         tenant: &TenantId,
     ) -> Result<RecordBatch> {
-        let _ = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(tenant).await?;
+
+        let mut constraint_catalogs: Vec<&str> = Vec::new();
+        let mut constraint_schemas: Vec<&str> = Vec::new();
+        let mut constraint_names: Vec<String> = Vec::new();
+        let mut unique_catalogs: Vec<&str> = Vec::new();
+        let mut unique_schemas: Vec<&str> = Vec::new();
+        let mut unique_names: Vec<String> = Vec::new();
+        let mut match_options: Vec<&str> = Vec::new();
+        let mut update_rules: Vec<&'static str> = Vec::new();
+        let mut delete_rules: Vec<&'static str> = Vec::new();
+
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            for fk in &meta.foreign_keys {
+                let ref_table = TableName::new(fk.ref_table.clone())
+                    .map_err(|e| BasinError::internal(format!("FK ref_table {e}")))?;
+                constraint_catalogs.push(BASIN_CATALOG_NAME);
+                constraint_schemas.push(DEFAULT_SCHEMA);
+                constraint_names.push(fk.name.clone());
+                unique_catalogs.push(BASIN_CATALOG_NAME);
+                unique_schemas.push(DEFAULT_SCHEMA);
+                unique_names.push(pk_constraint_name(&ref_table));
+                match_options.push(MATCH_OPTION_NONE);
+                update_rules.push(ref_action_to_pg(fk.on_update));
+                delete_rules.push(ref_action_to_pg(fk.on_delete));
+            }
+        }
 
         let schema = Self::referential_constraints_schema();
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(constraint_catalogs)),
+            Arc::new(StringArray::from(constraint_schemas)),
+            Arc::new(StringArray::from(constraint_names)),
+            Arc::new(StringArray::from(unique_catalogs)),
+            Arc::new(StringArray::from(unique_schemas)),
+            Arc::new(StringArray::from(unique_names)),
+            Arc::new(StringArray::from(match_options)),
+            Arc::new(StringArray::from(update_rules)),
+            Arc::new(StringArray::from(delete_rules)),
         ];
         RecordBatch::try_new(schema, columns).map_err(|e| {
             BasinError::internal(format!("info_schema.referential_constraints build: {e}"))
@@ -1373,14 +1664,59 @@ const VIEW_FLAG_NO: &str = "NO";
 /// SQL standard. v0.2 will populate this from the auth subsystem.
 const SCHEMA_OWNER_PLACEHOLDER: &str = "";
 
-/// `information_schema.table_constraints.constraint_type` literal for a
-/// NOT NULL column constraint. PG-style spelling (`"NOT NULL"`).
+/// `information_schema.table_constraints.constraint_type` literals.
+/// PG-style spelling (`"PRIMARY KEY"`, `"FOREIGN KEY"`, `"CHECK"`,
+/// `"NOT NULL"`). PG's spec doesn't list `"NOT NULL"` here, but Basin
+/// follows the pragmatic PostgREST / pgAdmin convention of including
+/// it; the row carries `is_deferrable = NO` like the others.
 const CONSTRAINT_TYPE_NOT_NULL: &str = "NOT NULL";
+const CONSTRAINT_TYPE_PRIMARY_KEY: &str = "PRIMARY KEY";
+const CONSTRAINT_TYPE_FOREIGN_KEY: &str = "FOREIGN KEY";
+const CONSTRAINT_TYPE_CHECK: &str = "CHECK";
+
+/// `pg_constraint.contype` single-letter codes per PG docs. Basin emits
+/// `p`/`f`/`c`/`n`; `u` (unique-only) is reserved for v0.2 when UNIQUE
+/// constraints split out from PRIMARY KEY.
+const CONTYPE_PRIMARY_KEY: &str = "p";
+const CONTYPE_FOREIGN_KEY: &str = "f";
+const CONTYPE_CHECK: &str = "c";
+const CONTYPE_NOT_NULL: &str = "n";
+
+/// PG-style referential action string for
+/// `information_schema.referential_constraints.{update,delete}_rule`.
+fn ref_action_to_pg(action: crate::metadata::RefAction) -> &'static str {
+    match action {
+        crate::metadata::RefAction::NoAction => "NO ACTION",
+        crate::metadata::RefAction::Cascade => "CASCADE",
+    }
+}
+
 /// `is_deferrable` / `initially_deferred` value used across the
 /// constraint-introspection views. v0.1 has no deferrable constraints;
 /// these columns are non-nullable in the SQL standard so `"NO"` is the
 /// only valid encoding.
 const CONSTRAINT_NO: &str = "NO";
+
+/// `information_schema.referential_constraints.match_option`. PG default
+/// is `"NONE"`; Basin doesn't support `MATCH PARTIAL` / `MATCH FULL`.
+const MATCH_OPTION_NONE: &str = "NONE";
+
+/// Synthesise the PG-style PK constraint name (`<table>_pkey`).
+/// Documented contract: pinned by `pk_simple_unique_enforced` (the error
+/// message must mention `users_pkey`).
+fn pk_constraint_name(table: &TableName) -> String {
+    format!("{}_pkey", table.as_str())
+}
+
+/// 1-based column index within `schema`. Mirrors PG `pg_attribute.attnum`
+/// usage in `pg_constraint.conkey` (space-separated attnums).
+fn attnum_in_schema(schema: &Schema, column: &str) -> Option<i32> {
+    schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == column)
+        .map(|i| (i + 1) as i32)
+}
 
 /// `pg_depend.deptype` literal for a normal dependency edge. PG semantics:
 /// drop the referenced object cascades to the dependent. Basin v0.1 emits
@@ -1560,6 +1896,7 @@ fn pg_type_oid_for_arg(arg: SqlArgType) -> i64 {
         SqlArgType::TimestampTz => {
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
         }
+        SqlArgType::Timestamp => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
     };
     pg_type_oid_for_field(&Field::new("_", dt, false))
 }
@@ -1577,6 +1914,7 @@ fn pg_type_name_for_arg(arg: SqlArgType) -> &'static str {
         SqlArgType::Bytea => "bytea",
         SqlArgType::Date => "date",
         SqlArgType::TimestampTz => "timestamp with time zone",
+        SqlArgType::Timestamp => "timestamp without time zone",
     }
 }
 

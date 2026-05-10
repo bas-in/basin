@@ -1,8 +1,8 @@
 # Releasing Basin
 
 Basin uses a tag-driven release process. Pushing a `vX.Y.Z` tag triggers
-`.github/workflows/release.yml`, which builds prebuilt binaries for four
-targets and creates a GitHub Release with notes pulled from
+`.github/workflows/release.yml`, which builds prebuilt binaries for each
+supported target and creates a GitHub Release with notes pulled from
 `CHANGELOG.md`.
 
 ## Versioning
@@ -16,63 +16,86 @@ Post-1.0 we move to standard SemVer.
 
 ## Cut a release
 
-1. **Land all PRs** for the target version. CI on `main` should be green.
+### 1. Land all PRs
 
-2. **Update CHANGELOG.md.** Move everything in `[Unreleased]` to a new
-   `[X.Y.Z] - YYYY-MM-DD` section. Keep the `[Unreleased]` heading
-   empty for the next cycle. Update the link refs at the bottom.
+CI on `main` must be green.
 
-3. **Bump the workspace version** in `Cargo.toml`:
+### 2. Update `CHANGELOG.md`
 
-   ```toml
-   [workspace.package]
-   version = "0.X.Y"
-   ```
+Move everything in `[Unreleased]` to a new `[X.Y.Z] - YYYY-MM-DD`
+section. Keep the `[Unreleased]` heading with `_Nothing yet._`. Update
+the link refs at the bottom.
 
-   All workspace member crates use `version.workspace = true`, so this
-   single edit propagates.
+Keep entries scannable — short bullets, not paragraphs. The whole
+section gets rendered verbatim on the GitHub Releases page.
 
-4. **Refresh `Cargo.lock`** with the new version:
+### 3. Bump the workspace version
 
-   ```sh
-   cargo update --workspace
-   ```
+In `Cargo.toml`:
 
-5. **Sanity-check the build locally:**
+```toml
+[workspace.package]
+version = "0.X.Y"
+```
 
-   ```sh
-   cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets -- -D warnings
-   cargo test --workspace --no-fail-fast
-   cargo build --release -p basin-server -p basinctl
-   ```
+All workspace members use `version.workspace = true`, so this single
+edit propagates.
 
-6. **Commit the version bump:**
+### 4. Refresh `Cargo.lock`
 
-   ```sh
-   git add Cargo.toml Cargo.lock CHANGELOG.md
-   git commit -m "release: vX.Y.Z"
-   ```
+```sh
+cargo update --workspace
+```
 
-7. **Tag and push:**
+### 5. Sanity-check locally
 
-   ```sh
-   git tag vX.Y.Z
-   git push origin main
-   git push origin vX.Y.Z
-   ```
+These commands mirror what CI runs, so a green local run predicts a
+green CI run:
 
-8. **Watch the release workflow.** It builds binaries for:
-   - `x86_64-unknown-linux-gnu`
-   - `aarch64-unknown-linux-gnu`
-   - `x86_64-apple-darwin`
-   - `aarch64-apple-darwin`
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace --exclude basin-integration-tests --no-fail-fast
+cargo build --release -p basin-server -p basinctl
+```
 
-   Each archive includes `basin-server`, `basinctl`, README, LICENSE,
-   CHANGELOG. `.tar.gz.sha256` companion files for verification.
+Notes:
 
-9. **Edit the GitHub Release notes** if needed (the workflow seeds them
-   from CHANGELOG.md but you can polish before announcing).
+- Clippy runs in advisory mode (no `-D warnings`); only deny-by-default
+  lints (e.g. `clippy::approx_constant`) fail the build.
+- `basin-integration-tests` is excluded from the CI test surface —
+  those `viability_*` / `s3_scaling_*` cards each link a near-full
+  workspace and OOM free CI runners. Run them locally on demand:
+  ```sh
+  cargo test -p basin-integration-tests
+  ```
+
+### 6. Commit + tag + push
+
+```sh
+git add Cargo.toml Cargo.lock CHANGELOG.md
+git commit -m "release: vX.Y.Z"
+git tag vX.Y.Z
+git push origin main
+git push origin vX.Y.Z
+```
+
+### 7. Watch the release workflow
+
+It builds binaries for:
+
+- `x86_64-unknown-linux-gnu` (ubuntu-latest)
+- `aarch64-unknown-linux-gnu` (ubuntu-24.04-arm — native ARM runner)
+- `aarch64-apple-darwin` (macos-latest)
+
+Each archive contains `basin-server`, `basinctl`, README, LICENSE, and
+CHANGELOG. A `.tar.gz.sha256` companion ships for verification.
+
+### 8. Polish the GitHub Release
+
+The workflow seeds release notes from the matching `[X.Y.Z]` section
+in `CHANGELOG.md`. Polish on GitHub before announcing if needed —
+edits there don't loop back into `CHANGELOG.md`.
 
 ## Pre-release tags
 
@@ -82,12 +105,25 @@ testing before a stable cut.
 
 ## Hotfix release
 
-For urgent bug fixes off an existing release tag:
+For an urgent fix off an existing release tag:
 
-1. Branch from the release tag: `git checkout -b hotfix/0.X.Y vX.Y-1.Z`
+1. Branch from the release tag: `git checkout -b hotfix/0.X.Y vX.Y.Z-1`
 2. Cherry-pick or apply the fix
-3. Bump to `vX.Y-1.Z+1` (e.g. `v0.1.2 → v0.1.3`)
+3. Bump to the next patch (e.g. `v0.1.2 → v0.1.3`)
 4. Tag and push as above
+
+## Supported targets
+
+Current matrix (3 targets):
+
+| Target                       | Runner             | Notes                              |
+| ---------------------------- | ------------------ | ---------------------------------- |
+| `x86_64-unknown-linux-gnu`   | `ubuntu-latest`    | Default server target.             |
+| `aarch64-unknown-linux-gnu`  | `ubuntu-24.04-arm` | Native ARM runner; no Docker.      |
+| `aarch64-apple-darwin`       | `macos-latest`     | Apple Silicon. Runs under Rosetta on Intel Macs. |
+
+`x86_64-apple-darwin` (Intel Mac) was dropped — runner-hour cost vs.
+shrinking install base. Re-add if user demand surfaces.
 
 ## crates.io publish (optional)
 

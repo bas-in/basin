@@ -96,10 +96,13 @@ async fn select_pg_constraint_routes() {
         .await
         .unwrap();
 
-    // v0.1: pg_constraint returns zero rows (no FK / explicit PK / CHECK
-    // / UNIQUE surfaces yet).
+    // pg_constraint emits one row per constraint surface. Here the only
+    // declared constraint on `t` is `x NOT NULL`, so exactly one row
+    // (contype='n') is expected. This is the routing smoke test —
+    // populating-content invariants are pinned in
+    // `crates/basin-engine/tests/constraints.rs`.
     let batches = rows(&sess, "SELECT * FROM pg_catalog.pg_constraint").await;
-    assert_eq!(total_rows(&batches), 0);
+    assert_eq!(total_rows(&batches), 1);
 }
 
 #[tokio::test]

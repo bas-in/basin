@@ -39,7 +39,14 @@ pub enum SqlArgType {
     BigInt,
     Double,
     Boolean,
+    /// `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` — microsecond-precision
+    /// instant stamped to UTC.
     TimestampTz,
+    /// `TIMESTAMP` (no time zone) — microsecond-precision wall clock,
+    /// no zone string. Bridges to Arrow `Timestamp(Microsecond, None)`
+    /// and PG OID 1114. Distinct from [`Self::TimestampTz`] (OID 1184)
+    /// at the wire and OID level.
+    Timestamp,
     Date,
     Bytea,
 }
