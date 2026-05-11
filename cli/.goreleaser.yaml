@@ -171,6 +171,57 @@ brews:
     install: |
       bin.install "basin"
 
+# ── Scoop bucket (Windows) ───────────────────────────────────────────
+# Writes / updates basin.json in bas-in/scoop-bucket on every release.
+# Operators then `scoop bucket add bas-in https://github.com/bas-in/scoop-bucket`
+# followed by `scoop install basin` to get the Windows binary.
+# Disabled until the bucket repo exists + SCOOP_TAP_TOKEN is wired into
+# the release workflow — keep `skip_upload: auto` so a release with no
+# Windows builds (or before the bucket repo lands) doesn't fail.
+scoops:
+  - name: basin
+    repository:
+      owner: bas-in
+      name: scoop-bucket
+      branch: main
+    homepage: https://basin.run
+    description: Basin Cloud control plane CLI
+    license: Apache-2.0
+    skip_upload: auto
+
+# ── AUR (Arch User Repository) ───────────────────────────────────────
+# Publishes a `basin-bin` PKGBUILD to aur.archlinux.org on every release.
+# AUR uses SSH for the git push, so the release workflow needs an
+# `AUR_KEY` secret containing the private half of an SSH keypair whose
+# public half is registered on the maintainer's AUR account.
+# Operators on Arch / Manjaro / EndeavourOS / etc. then:
+#   yay -S basin-bin   (or `paru -S basin-bin`)
+# `package:` is shell run inside the PKGBUILD's `package()` function —
+# goreleaser drops the prebuilt linux-amd64 / linux-arm64 binary into
+# `$srcdir`, so a single `install` line is enough.
+# Disabled (`skip_upload: auto`) until the user (1) creates an AUR account,
+# (2) submits the empty `basin-bin` package once so the SSH git URL
+# exists, (3) wires `AUR_KEY` into the release workflow secrets.
+aurs:
+  - name: basin-bin
+    homepage: https://basin.run
+    description: Basin Cloud control plane CLI
+    maintainers:
+      - 'Basin Team <team@basin.run>'
+    license: Apache-2.0
+    private_key: '{{ .Env.AUR_KEY }}'
+    git_url: 'ssh://aur@aur.archlinux.org/basin-bin.git'
+    skip_upload: auto
+    provides:
+      - basin
+    conflicts:
+      - basin
+    package: |-
+      install -Dm755 "./basin" "${pkgdir}/usr/bin/basin"
+    commit_author:
+      name: goreleaserbot
+      email: bot@basin.run
+
 release:
   github:
     owner: bas-in
