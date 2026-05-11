@@ -1,4 +1,4 @@
-# @basin/basin-js
+# @bas-in/basin-js
 
 Isomorphic JavaScript / TypeScript client for [Basin](https://basin.run).
 Speaks **directly** to a deployed [`basin-engine`](https://github.com/bas-in/basin)
@@ -15,20 +15,32 @@ with a global `fetch`.
 ## Install
 
 ```sh
-npm install @basin/basin-js
-# or: pnpm add @basin/basin-js
-# or: bun add @basin/basin-js
+npm install @bas-in/basin-js
+# or: pnpm add @bas-in/basin-js
+# or: bun add @bas-in/basin-js
 ```
 
-Deno: `import { createClient } from "jsr:@basin/basin-js";` (ships from the
-same source via [JSR](https://jsr.io/@basin/basin-js); `jsr.json` is the
+Deno: `import { createClient } from "jsr:@bas-in/basin-js";` (ships from the
+same source via [JSR](https://jsr.io/@bas-in/basin-js); `jsr.json` is the
 companion manifest in this repo). Browser via CDN:
-`<script type="module" src="https://esm.sh/@basin/basin-js@0.1"></script>`.
+`<script type="module" src="https://esm.sh/@bas-in/basin-js@0.1"></script>`.
+
+### Self-host basin
+
+basin-js works against **any** basin engine — the cloud-managed regional
+deployments at `https://<region>.basin.run`, or a self-hosted engine you run
+yourself (`cargo run -p basin-server`, or the published container). As of
+2026-05-11, self-hosting needs **no external Postgres**: basin-auth (the
+open-source Rust auth service) defaults to running on the basin engine's own
+pgwire listener over loopback, so users / tenants / sessions / MFA / magic-
+link state lives on the engine itself. One process. Point `createClient` at
+the engine's HTTP base URL (`http://localhost:5434` by default) and the SDK
+behaves identically to talking to the managed cloud.
 
 ## Quickstart
 
 ```ts
-import { createClient } from "@basin/basin-js";
+import { createClient } from "@bas-in/basin-js";
 
 // BASIN_URL points at a deployed basin-engine — NOT basin-cloud.
 // Mint BASIN_ANON_KEY at https://basin.run/app/project/<ref>/api-keys
@@ -81,14 +93,66 @@ Full reference: <https://basin.run/docs/js-sdk>.
 | `basin.realtime` | `.channel(name).on(...).subscribe()` — **v0.2** |
 | `basin.functions`| `.invoke(slug, { body })` — **v0.2** |
 
+## Row Level Security and auth session functions
+
+After `signInWithPassword` (or any sign-in method), the query builder
+automatically attaches the JWT as `Authorization: Bearer <at>`. The engine
+exposes three SQL session functions you can use in RLS policies and queries:
+
+| Function | Returns | Description |
+|---|---|---|
+| `auth.uid()` | `uuid` | UUID of the signed-in user |
+| `auth.role()` | `text` | `'authenticated'` or `'anon'` |
+| `auth.jwt()` | `jsonb` | Full JWT claims |
+
+Enable RLS and create a policy during schema setup (run once):
+
+```sql
+ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "users see own rows" ON items
+  FOR ALL USING (owner_id = auth.uid());
+```
+
+After that, `basin.from('items').select('*')` automatically filters to the
+signed-in user's rows — no extra code needed:
+
+```ts
+await basin.auth.signInWithPassword({ email, password });
+
+// Returns only rows where owner_id = auth.uid()
+const { data, error } = await basin.from('items').select('*');
+```
+
+Anonymous requests (`auth.role() = 'anon'`) get `auth.uid() = null`.
+
+## API keys and pgwire connections
+
+**API key format:** `basin_{tenant_id}_{base64}`. The SDK forwards the
+key opaquely in the `apikey` header — no client-side parsing is done.
+Keys are minted at `https://basin.run/app/project/<ref>/api-keys`.
+
+**Direct pgwire connections** (advanced — for psql, DBeaver, migration
+tools, etc.) use the engine's pgwire listener (default port 5433):
+
+```
+# Session/JWT auth — pass the access token as the username:
+psql "postgres://<access_token>@<engine-host>:5433/basin"
+
+# API-key auth — username is {tenant_id}_{hex}, password is the full key:
+psql "postgres://{tenant_id}_{hex}:<api_key>@<engine-host>:5433/basin"
+```
+
+After connecting via pgwire, `auth.uid()` / `auth.role()` / `auth.jwt()`
+work identically to the REST path — the same RLS policies apply.
+
 ## Tree-shaking
 
 Sub-path imports for consumers who only want one namespace:
 
 ```ts
-import { AuthClient } from "@basin/basin-js/auth";
-import { PostgrestQueryBuilder } from "@basin/basin-js/postgrest";
-import { StorageClient } from "@basin/basin-js/storage";
+import { AuthClient } from "@bas-in/basin-js/auth";
+import { PostgrestQueryBuilder } from "@bas-in/basin-js/postgrest";
+import { StorageClient } from "@bas-in/basin-js/storage";
 ```
 
 ## License

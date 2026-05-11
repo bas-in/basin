@@ -1,5 +1,51 @@
 /**
- * Auth types — mirror the dashboard's `/auth/v1/*` envelopes.
+ * Auth types — mirror basin-auth's `/auth/v1/*` envelopes (served by the
+ * basin engine itself; as of 2026-05-11 basin-auth's catalog lives on
+ * the engine via loopback pgwire, not on basin-cloud or an external
+ * Postgres).
+ *
+ * ── SQL session functions ──────────────────────────────────────────────
+ *
+ * basin-auth injects three SQL functions into every authenticated
+ * connection. Use them in RLS policies or plain SELECT queries after a
+ * user is signed in:
+ *
+ *   auth.uid()   → uuid     — UUID of the currently authenticated user
+ *   auth.role()  → text     — 'authenticated' | 'anon'
+ *   auth.jwt()   → jsonb    — full JWT claims (sub, email, role, exp, …)
+ *
+ * RLS example (run once during schema setup):
+ *
+ * ```sql
+ * ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+ * CREATE POLICY "users see own rows" ON items
+ *   FOR ALL USING (owner_id = auth.uid());
+ * ```
+ *
+ * After `basin.auth.signInWithPassword(...)`, PostgREST picks up the
+ * session's `access_token` (attached automatically as `Authorization:
+ * Bearer <at>` by the query builder) and the engine evaluates
+ * `auth.uid()` as the signed-in user's UUID. Anonymous requests — those
+ * using only the anon `apikey` — get `auth.role() = 'anon'` and
+ * `auth.uid() = null`.
+ *
+ * ── pgwire connection strings ──────────────────────────────────────────
+ *
+ * If you connect to the engine's pgwire listener directly (port 5433
+ * by default on self-hosted), the username format is:
+ *
+ *   {tenant_id}_{hex}   — for API-key auth (pass the API key as password)
+ *   <access_token>      — for JWT / session auth (pass the JWT as username,
+ *                         password is ignored)
+ *
+ * The SDK itself never constructs pgwire connection strings — the engine
+ * returns them from the API and they are passed through opaquely.
+ *
+ * ── API key format ─────────────────────────────────────────────────────
+ *
+ * basin API keys have the format `basin_{tenant_id}_{base64}`. The SDK
+ * treats them as opaque strings and forwards them verbatim in the
+ * `apikey` header. No parsing or validation is performed client-side.
  */
 
 /** One of the 14 BYO-OAuth providers basin-cloud supports. */
@@ -145,4 +191,56 @@ export interface SignInWithMagicLinkInput {
   emailRedirectTo?: string;
   /** When true, only sign existing users in; reject unknown emails. */
   shouldCreateUser?: boolean;
+}
+
+export interface ConsumeMagicLinkInput {
+  /** The one-time token from the magic-link URL (query param `token`). */
+  token: string;
+}
+
+export interface VerifyEmailInput {
+  /** The one-time token from the email-verification link (`token` query param). */
+  token: string;
+}
+
+export interface RequestPasswordResetInput {
+  email: string;
+  /** URL the reset-link email points back to. */
+  emailRedirectTo?: string;
+}
+
+export interface ResetPasswordInput {
+  /** The one-time token from the reset-password email (`token` query param). */
+  token: string;
+  /** The new password to set. */
+  newPassword: string;
+}
+
+/**
+ * Information about how to authenticate against the engine's pgwire
+ * listener (port 5433 by default) and what session helpers are available
+ * in SQL after authentication.
+ *
+ * For most SDK users this is informational — `basin.auth.*` and
+ * `basin.from(...)` handle auth automatically. Direct pgwire connections
+ * are an advanced use case (e.g. running raw migrations, connecting via
+ * psql / DBeaver, or server-side connection pools).
+ *
+ * pgwire username formats:
+ *   - API-key auth:  username = `{tenant_id}_{hex}`, password = API key
+ *   - JWT/session:   username = access_token JWT, password is ignored
+ *
+ * After any authenticated connection, these SQL session functions
+ * are available:
+ *   - `auth.uid()`  → uuid   — UUID of the authenticated user
+ *   - `auth.role()` → text   — 'authenticated' | 'anon'
+ *   - `auth.jwt()`  → jsonb  — full JWT claims as JSONB
+ */
+export interface PgwireAuthInfo {
+  /** The access token from `AuthSession.access_token` — pass as the pgwire username. */
+  accessToken: string;
+  /** The engine pgwire host (default port 5433). */
+  host: string;
+  /** The database name (default `basin`). */
+  database?: string;
 }

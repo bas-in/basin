@@ -345,7 +345,19 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
     const headers: Record<string, string> = { ...this.#deps.headers };
 
     // RLS: attach the current session's bearer token when one exists.
-    // The anon `apikey` header stays — basin-rest reads both.
+    // The anon `apikey` header stays — basin-rest reads both (apikey
+    // identifies the project; bearer identifies the user for RLS).
+    //
+    // After a successful `basin.auth.signInWithPassword(...)`, the engine
+    // evaluates auth.uid() / auth.role() / auth.jwt() in SQL as the
+    // signed-in user's identity, which means RLS policies like:
+    //
+    //   CREATE POLICY "users see own rows" ON items
+    //     FOR ALL USING (owner_id = auth.uid());
+    //
+    // automatically filter rows for the signed-in user — no extra code
+    // needed on the query builder side beyond passing the bearer token.
+    // Unsigned / anon callers see auth.role() = 'anon' and auth.uid() = null.
     const session = this.#deps.auth.getSession();
     if (session?.access_token) {
       headers["Authorization"] = `Bearer ${session.access_token}`;

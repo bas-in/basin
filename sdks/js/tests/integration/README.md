@@ -1,6 +1,6 @@
 # Integration tests
 
-These tests exercise `@basin/basin-js` against a **live basin-engine** (not
+These tests exercise `@bas-in/basin-js` against a **live basin-engine** (not
 a mock fetch). They are gated behind three environment variables and skip
 silently when any are missing — that keeps PRs from forks green and stops
 CI noise for contributors who don't have a test project.
@@ -9,9 +9,9 @@ CI noise for contributors who don't have a test project.
 
 | Var | Example | Notes |
 |---|---|---|
-| `BASIN_TEST_PROJECT_REF` | `projref_01H...` | Identifies which basin-cloud project the engine belongs to. Used as the master gate (presence = "run these"). |
-| `BASIN_TEST_ENGINE_URL` | `https://basin-engine-dev.fly.dev` | The engine's public REST URL. Local: `http://localhost:5434`. |
-| `BASIN_TEST_ANON_KEY` | `eyJhbGciOi...` | Project anon key (signed by basin-cloud, trusted by the engine). Mint via `/app/project/<ref>/api-keys` in the dashboard. |
+| `BASIN_TEST_PROJECT_REF` | `projref_01H...` | Identifies which basin-cloud project the engine belongs to (or, for self-hosted, any stable tenant identifier — the engine doesn't care). Used as the master gate (presence = "run these"). |
+| `BASIN_TEST_ENGINE_URL` | `https://basin-engine-dev.fly.dev` | The basin engine's REST listener. For a self-hosted setup this is just the basin engine running locally — `http://localhost:5434` by default. basin-auth's `/auth/v1/*` surface is served by that same engine (basin-auth's catalog rides on the engine over loopback pgwire as of 2026-05-11), so the integration tests never need a separate auth host or an external Postgres URL. |
+| `BASIN_TEST_ANON_KEY` | `eyJhbGciOi...` | Project anon key trusted by the engine. For cloud-managed projects, mint via `/app/project/<ref>/api-keys` in the dashboard. For self-hosted, mint via the engine's local key tooling. |
 
 Optional, only consumed by tests that need them:
 

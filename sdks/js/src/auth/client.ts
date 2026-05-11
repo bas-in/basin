@@ -4,6 +4,13 @@
  * control plane (orgs / projects / billing / dashboard), basin-engine
  * is the data plane, and the SDK only ever speaks to the engine.
  *
+ * Architecture (as of 2026-05-11): the `/auth/v1/*` surface is served by
+ * basin-auth (open-source Rust). basin-auth's catalog — users, tenants,
+ * sessions, MFA factors, magic-link nonces — now lives on basin engine
+ * itself via loopback pgwire (`postgres://basin_auth@127.0.0.1:5433/basin`),
+ * not on basin-cloud and not on an external Postgres. The SDK's HTTP
+ * shape is unchanged; self-hosters need only run basin.
+ *
  * The engine routes (verified against basin/crates/basin-rest/src/server.rs):
  *  - POST /auth/v1/signup
  *  - POST /auth/v1/signin                  (was `/login` on the cloud)
@@ -29,10 +36,14 @@ import type {
   AuthChangeEvent,
   AuthSession,
   AuthUser,
+  ConsumeMagicLinkInput,
+  RequestPasswordResetInput,
+  ResetPasswordInput,
   SignInWithMagicLinkInput,
   SignInWithOAuthInput,
   SignInWithPasswordInput,
   SignUpInput,
+  VerifyEmailInput,
 } from "./types.js";
 
 interface AuthClientDeps {
@@ -357,6 +368,206 @@ export class AuthClient {
   }
 
   /**
+   * Consume a magic-link token and establish a session.
+   *
+   * The magic-link email contains a URL with a `token` query parameter.
+   * The SPA reads that token and calls this method to exchange it for a
+   * full session. On success, persists the session and fires `SIGNED_IN`.
+   *
+   * POSTs `POST /auth/v1/magic-link/consume` with `{token}` in the body.
+   *
+   * @example
+   * // In the SPA's magic-link callback route:
+   * const token = new URL(window.location.href).searchParams.get('token')!;
+   * const { data, error } = await basin.auth.consumeMagicLink({ token });
+   * if (error) return showError(error);
+   * router.push('/dashboard');
+   */
+  async consumeMagicLink(
+    input: ConsumeMagicLinkInput,
+  ): Promise<{ data: AuthSession | null; error: BasinError | null }> {
+    if (!input?.token) {
+      return {
+        data: null,
+        error: new BasinError(
+          "invalid_request",
+          "auth.consumeMagicLink requires a token",
+        ),
+      };
+    }
+    let res: Response;
+    try {
+      res = await this.#fetch(`${this.#url}/magic-link/consume`, {
+        method: "POST",
+        headers: this.#headers,
+        body: JSON.stringify({ token: input.token }),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError("network", networkErrorMessage(e)),
+      };
+    }
+    const parsed = await unwrapAuthBody(res);
+    if (parsed.kind === "error") return { data: null, error: parsed.error };
+    if (parsed.kind === "mfa") {
+      return {
+        data: null,
+        error: new BasinError(
+          "mfa_required",
+          "Two-factor verification required; complete via auth.mfa.verify()",
+          res.status,
+          { partial_token: parsed.partialToken },
+        ),
+      };
+    }
+    const session = mapLoginToSession(parsed.body);
+    if (!session) {
+      return {
+        data: null,
+        error: new BasinError(
+          "invalid_response",
+          "Magic-link consume succeeded but response is missing user or session fields",
+          res.status,
+        ),
+      };
+    }
+    await this.#persistSession(session);
+    return { data: session, error: null };
+  }
+
+  /**
+   * Verify a user's email address using a one-time token.
+   *
+   * The verification email contains a URL with a `token` query parameter.
+   * POSTs `POST /auth/v1/verify-email` with `{token}` in the body.
+   * On success the engine marks the user's email as confirmed.
+   *
+   * Note: this does NOT automatically sign the user in. If you want a
+   * session after email verification, call `signInWithPassword` afterwards.
+   *
+   * @example
+   * const token = new URL(window.location.href).searchParams.get('token')!;
+   * const { error } = await basin.auth.verifyEmail({ token });
+   * if (!error) router.push('/signin?verified=true');
+   */
+  async verifyEmail(
+    input: VerifyEmailInput,
+  ): Promise<{ data: null; error: BasinError | null }> {
+    if (!input?.token) {
+      return {
+        data: null,
+        error: new BasinError(
+          "invalid_request",
+          "auth.verifyEmail requires a token",
+        ),
+      };
+    }
+    let res: Response;
+    try {
+      res = await this.#fetch(`${this.#url}/verify-email`, {
+        method: "POST",
+        headers: this.#headers,
+        body: JSON.stringify({ token: input.token }),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError("network", networkErrorMessage(e)),
+      };
+    }
+    const parsed = await unwrapAuthBody(res);
+    if (parsed.kind === "error") return { data: null, error: parsed.error };
+    return { data: null, error: null };
+  }
+
+  /**
+   * Send a password-reset email to the supplied address.
+   *
+   * POSTs `POST /auth/v1/request-password-reset` with `{email}`. The
+   * engine always returns 202 Accepted regardless of whether the email
+   * is registered (non-enumeration design choice).
+   *
+   * @example
+   * await basin.auth.requestPasswordReset({ email: 'user@example.com' });
+   * // UI reads "If that address is registered, you'll get an email."
+   */
+  async requestPasswordReset(
+    input: RequestPasswordResetInput,
+  ): Promise<{ data: null; error: BasinError | null }> {
+    if (!input?.email) {
+      return {
+        data: null,
+        error: new BasinError(
+          "invalid_request",
+          "auth.requestPasswordReset requires email",
+        ),
+      };
+    }
+    let res: Response;
+    try {
+      res = await this.#fetch(`${this.#url}/request-password-reset`, {
+        method: "POST",
+        headers: this.#headers,
+        body: JSON.stringify({ email: input.email }),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError("network", networkErrorMessage(e)),
+      };
+    }
+    const parsed = await unwrapAuthBody(res);
+    if (parsed.kind === "error") return { data: null, error: parsed.error };
+    return { data: null, error: null };
+  }
+
+  /**
+   * Complete a password reset using the token from the reset email.
+   *
+   * POSTs `POST /auth/v1/reset-password` with `{token, new_password}`.
+   * On success the engine updates the user's password. The user must then
+   * call `signInWithPassword` to obtain a new session.
+   *
+   * @example
+   * const token = new URL(window.location.href).searchParams.get('token')!;
+   * const { error } = await basin.auth.resetPassword({
+   *   token,
+   *   newPassword: 'correct-horse-battery-staple',
+   * });
+   * if (!error) router.push('/signin?password_reset=true');
+   */
+  async resetPassword(
+    input: ResetPasswordInput,
+  ): Promise<{ data: null; error: BasinError | null }> {
+    if (!input?.token || !input?.newPassword) {
+      return {
+        data: null,
+        error: new BasinError(
+          "invalid_request",
+          "auth.resetPassword requires token and newPassword",
+        ),
+      };
+    }
+    let res: Response;
+    try {
+      res = await this.#fetch(`${this.#url}/reset-password`, {
+        method: "POST",
+        headers: this.#headers,
+        body: JSON.stringify({ token: input.token, new_password: input.newPassword }),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError("network", networkErrorMessage(e)),
+      };
+    }
+    const parsed = await unwrapAuthBody(res);
+    if (parsed.kind === "error") return { data: null, error: parsed.error };
+    return { data: null, error: null };
+  }
+
+  /**
    * Sign out — local-only.
    *
    * basin-engine has no server-side logout endpoint — sign-out is
@@ -395,9 +606,30 @@ export class AuthClient {
    * resolved — subscribe to `onAuthStateChange` and wait for
    * `INITIAL_SESSION` if you need to wait it out).
    *
+   * The session's `access_token` is a JWT automatically attached by the
+   * query builder as `Authorization: Bearer <at>` on every
+   * `basin.from(...)` call. This enables Row Level Security (RLS)
+   * policies that reference `auth.uid()` — the engine evaluates the JWT
+   * and makes the following SQL session functions available:
+   *
+   *   - `auth.uid()`   returns the UUID of the signed-in user
+   *   - `auth.role()`  returns `'authenticated'` (or `'anon'` without a session)
+   *   - `auth.jwt()`   returns the full JWT claims as JSONB
+   *
+   * For direct pgwire connections (advanced), pass `access_token` as the
+   * pgwire username — no password needed. API keys can be used instead:
+   * use `{tenant_id}_{hex}` as the username and the full API key as the
+   * password.
+   *
    * @example
    * const session = basin.auth.getSession();
    * if (!session) router.push('/login');
+   *
+   * @example
+   * // After sign-in, auth.uid() works in SQL queries via basin.from():
+   * // (RLS policy on the table must already reference auth.uid())
+   * const { data } = await basin.from('items').select('*');
+   * // Returns only rows where owner_id = auth.uid() if RLS is enabled.
    */
   getSession(): AuthSession | null {
     return this.#session;
@@ -406,6 +638,10 @@ export class AuthClient {
   /**
    * Read the current user synchronously. Equivalent to
    * `getSession()?.user ?? null`.
+   *
+   * The returned `user.id` matches what `auth.uid()` returns in SQL
+   * queries — useful for client-side filtering that mirrors your RLS
+   * policies.
    *
    * @example
    * const user = basin.auth.getUser();

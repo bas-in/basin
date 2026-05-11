@@ -1,5 +1,5 @@
 /**
- * @basin/basin-js — isomorphic client for the Basin platform.
+ * @bas-in/basin-js — isomorphic client for the Basin platform.
  *
  * Engine-direct: the SDK talks DIRECTLY to basin-engine (the OSS Rust
  * data plane) — never through basin-cloud. basin-cloud is the control
@@ -10,7 +10,7 @@
  *
  * Single entry point:
  *
- *   import { createClient } from '@basin/basin-js'
+ *   import { createClient } from '@bas-in/basin-js'
  *   const basin = createClient(BASIN_ENGINE_URL, BASIN_ANON_KEY)
  *
  * Namespaces exposed on the client: `auth`, `from()` (PostgREST-shaped
@@ -40,6 +40,11 @@ export type {
   SignInWithPasswordInput,
   SignInWithOAuthInput,
   SignInWithMagicLinkInput,
+  ConsumeMagicLinkInput,
+  VerifyEmailInput,
+  RequestPasswordResetInput,
+  ResetPasswordInput,
+  PgwireAuthInfo,
   MFAFactorType,
   MFAEnrollInput,
   MFAEnrollResult,

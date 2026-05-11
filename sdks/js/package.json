@@ -1,5 +1,5 @@
 {
-  "name": "@basin/basin-js",
+  "name": "@bas-in/basin-js",
   "version": "0.0.1",
   "description": "Isomorphic JavaScript / TypeScript client for the Basin platform. Auth, table queries, storage.",
   "type": "module",

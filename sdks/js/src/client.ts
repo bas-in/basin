@@ -106,14 +106,22 @@ export interface BasinClient {
  * control plane (dashboard / billing / org-management) and never
  * appears in the SDK's request path.
  *
- * @param engineURL — public origin of your basin-engine deployment.
- *                    For example `https://basin-engine.fly.dev`, or
- *                    `http://localhost:5434` for local dev
- *                    (`cargo run -p basin-server`). NOT a basin-cloud URL.
- * @param anonKey   — public anon API key (a JWT minted by basin-cloud's
- *                    dashboard at `/app/project/:ref/api-keys`, signed
- *                    with a key basin-engine trusts). Rotated via the
- *                    dashboard; safe to ship to browsers.
+ * @param engineURL — basin engine HTTP base URL. Could be the
+ *                    cloud-managed regional endpoint
+ *                    `https://<region>.basin.run`, or a self-hosted
+ *                    engine such as `http://localhost:5434`
+ *                    (`cargo run -p basin-server`). NOT a basin-cloud
+ *                    control-plane URL. Self-hosters don't need a
+ *                    separate Postgres — basin-auth's catalog lives on
+ *                    the engine itself over loopback pgwire as of
+ *                    2026-05-11.
+ * @param anonKey   — public anon API key. Format: `basin_{tenant_id}_{base64}`.
+ *                    Minted by basin-cloud's dashboard at
+ *                    `/app/project/:ref/api-keys`, signed with a key
+ *                    basin-engine trusts. Rotated via the dashboard; safe
+ *                    to ship to browsers. The SDK forwards this opaquely
+ *                    in the `apikey` header — no client-side parsing is
+ *                    performed.
  * @param options   — optional fetch / headers / storage overrides.
  */
 export function createClient(
@@ -126,7 +134,7 @@ export function createClient(
   const fetcher = options.fetch ?? globalThis.fetch;
   if (typeof fetcher !== "function") {
     throw new Error(
-      "@basin/basin-js: `fetch` is not available in this environment. " +
+      "@bas-in/basin-js: `fetch` is not available in this environment. " +
         "Pass `options.fetch` to createClient().",
     );
   }

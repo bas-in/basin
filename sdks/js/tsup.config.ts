@@ -1,7 +1,7 @@
 import { defineConfig } from "tsup";
 
 // Dual CJS + ESM build. Every namespace gets its own entry so consumers
-// can tree-shake (e.g. import only `@basin/basin-js/auth` in a pure
+// can tree-shake (e.g. import only `@bas-in/basin-js/auth` in a pure
 // auth bundle). The barrel `src/index.ts` re-exports everything for
 // the default import.
 export default defineConfig({

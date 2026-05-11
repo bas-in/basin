@@ -1,5 +1,12 @@
 /**
- * Integration: auth — live basin-engine.
+ * Integration: auth — live basin engine.
+ *
+ * These tests fire HTTP at the basin engine directly — no basin-cloud
+ * proxy is in the request path. basin-auth (the Rust OSS auth service
+ * exposing `/auth/v1/*`) is served by the engine itself, and as of
+ * 2026-05-11 its catalog lives on the engine over loopback pgwire, so a
+ * single `BASIN_TEST_ENGINE_URL` is the only host the suite needs to
+ * reach (no separate auth URL, no external Postgres).
  *
  * Skip-gated. See `tests/integration/README.md` for the required env vars
  * and project state. With the vars unset every `it` reports as skipped;

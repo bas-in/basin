@@ -1,5 +1,5 @@
 {
-  "name": "@basin/basin-js",
+  "name": "@bas-in/basin-js",
   "version": "0.0.0",
   "description": "Isomorphic JavaScript / TypeScript client for the Basin platform. Auth, table queries, storage. Engine-direct: talks to basin-engine over REST without round-tripping basin-cloud.",
   "license": "MIT",
