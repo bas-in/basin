@@ -7,6 +7,11 @@ protocol against a fresh `basin-server`. The numbers are protocol-level:
 if a pattern works here, the chance every ORM that funnels through
 `tokio-postgres` / `asyncpg` / `pgjdbc` works is high.
 
+> Building a TypeScript/JavaScript app against Basin? Prefer the typed
+> [`basin-js`](https://github.com/bas-in/basin-js) client over hand-rolled
+> pgwire — it talks engine-direct (auth + REST) and ships as
+> `jsr:@bas-in/basin-js` and `npm:@bas-in/basin-js`.
+
 This file is **survey-grade**. The agent's job was to find gaps, not
 patch them. Each failure has a one-line "next step" so a follow-up agent
 can pick the work up.

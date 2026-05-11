@@ -34,6 +34,19 @@ One architecture from a 10 MB hobbyist tenant to a 100 TB enterprise tenant. No 
 
 ---
 
+## Ecosystem
+
+Basin (this repo) is the data plane. Three sibling repos sit around it:
+
+- **[`bas-in/basin-cloud`](https://github.com/bas-in/basin-cloud)** — control plane and dashboard (Go + Vite/JSX SPA, Apache-2.0). Manages orgs, projects, billing, and the auth surface for the hosted dashboard; runs Basin engines on Fly Machines per project. Operators who want a managed UI, multi-project orchestration, and per-project engine URLs use it. Operators running a single self-hosted engine do not need it — basin-server alone is sufficient.
+- **[`bas-in/basin-cli`](https://github.com/bas-in/basin-cli)** — operator daily-driver (Go, Apache-2.0, stdlib-only). `basin login`, `basin projects list`, `basin sql run`, release artefacts are Sigstore-signed. Talks to basin-cloud's `/v1/*` API; not used against a standalone engine.
+- **[`bas-in/basin-js`](https://github.com/bas-in/basin-js)** — TypeScript SDK (MIT). Supabase-shaped `createClient(url, anonKey)` that talks **directly** to a Basin engine (pgwire + REST), not through basin-cloud. Browser, Node, Deno, Bun, Cloudflare Workers. Distributed as [`jsr:@bas-in/basin-js`](https://jsr.io/@bas-in/basin-js) and [`npm:@bas-in/basin-js`](https://www.npmjs.com/package/@bas-in/basin-js).
+- **Planned client SDKs** — basin-py, basin-rs, basin-go, basin-dart, basin-swift, basin-kotlin. All will follow the same engine-direct shape as basin-js.
+
+**Licensing rationale.** Server-side projects (basin engine, basin-cloud, basin-cli) are Apache-2.0 to carry the patent grant operators expect from infrastructure. Client SDKs (basin-js and future siblings) are MIT to match the norm of the SDK ecosystems they sit in (`npm`, `jsr`, `crates.io`, `pypi`, etc.) — friction-free linking from MIT or proprietary apps.
+
+---
+
 ## The numbers (vs Postgres 18, same workload, same hardware)
 
 ### Storage and query performance
