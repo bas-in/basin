@@ -286,6 +286,4 @@ pub mod split;
 pub use follower::{
     promote, FollowerConfig, FollowerShard, FollowerStats, LagTier, ReplicaRole, ShardFollower,
 };
-pub use split::{
-    CatchupReport, Epoch, LocalShardSplitter, ShardSplitter, SplitPlan,
-};
+pub use split::{CatchupReport, Epoch, LocalShardSplitter, ShardSplitter, SplitPlan};

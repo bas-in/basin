@@ -13,6 +13,6 @@
 pub mod rebalance;
 
 pub use rebalance::{
-    LoadMap, LocalRebalancer, MachineId, MachineLoad, MovePlan, MoveReason,
-    MoveReport, Rebalancer, ShardId, ShardLoad,
+    LoadMap, LocalRebalancer, MachineId, MachineLoad, MovePlan, MoveReason, MoveReport, Rebalancer,
+    ShardId, ShardLoad,
 };

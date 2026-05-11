@@ -174,8 +174,7 @@ impl S3LikeConfig {
             .or_else(|| std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| provider.default_region().to_string());
 
-        let access_key_id =
-            require_env_or("BASIN_STORAGE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")?;
+        let access_key_id = require_env_or("BASIN_STORAGE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")?;
         let secret_access_key =
             require_env_or("BASIN_STORAGE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")?;
         let session_token = std::env::var("BASIN_STORAGE_SESSION_TOKEN")
@@ -217,9 +216,7 @@ impl S3LikeConfig {
         // config to avoid silently leaking credentials over the wire.
         if let Some(ep) = &self.endpoint {
             if !ep.starts_with("https://") {
-                return Err(format!(
-                    "BASIN_STORAGE_ENDPOINT must be HTTPS (got {ep:?})"
-                ));
+                return Err(format!("BASIN_STORAGE_ENDPOINT must be HTTPS (got {ep:?})"));
             }
         }
 
@@ -392,7 +389,10 @@ mod tests {
         let cfg = S3LikeConfig::from_env().expect("from_env should succeed");
         assert_eq!(cfg.provider, Provider::Tigris);
         assert_eq!(cfg.bucket, "basin-engine-dev");
-        assert_eq!(cfg.endpoint.as_deref(), Some("https://fly.storage.tigris.dev"));
+        assert_eq!(
+            cfg.endpoint.as_deref(),
+            Some("https://fly.storage.tigris.dev")
+        );
         assert_eq!(cfg.region, "auto");
         assert_eq!(cfg.access_key_id, "tid_test");
         assert_eq!(cfg.secret_access_key, "tsec_test");
