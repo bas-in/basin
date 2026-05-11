@@ -1,0 +1,26 @@
+{
+  "name": "@basin/basin-js",
+  "version": "0.0.0",
+  "description": "Isomorphic JavaScript / TypeScript client for the Basin platform. Auth, table queries, storage. Engine-direct: talks to basin-engine over REST without round-tripping basin-cloud.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./auth": "./src/auth/index.ts",
+    "./postgrest": "./src/postgrest/index.ts",
+    "./storage": "./src/storage/index.ts",
+    "./realtime": "./src/realtime/index.ts",
+    "./functions": "./src/functions/index.ts"
+  },
+  "publish": {
+    "include": [
+      "src/**/*.ts",
+      "README.md",
+      "LICENSE",
+      "jsr.json"
+    ],
+    "exclude": [
+      "src/**/*.test.ts",
+      "tests/**/*"
+    ]
+  }
+}
