@@ -173,11 +173,17 @@ async fn rls_with_auth_uid_filters_per_user() {
 
     // 5. User A sees exactly 1 row.
     let a_rows = row_count(sess_a.execute("SELECT * FROM items").await.unwrap());
-    assert_eq!(a_rows, 1, "user A must see exactly 1 row under RLS; got {a_rows}");
+    assert_eq!(
+        a_rows, 1,
+        "user A must see exactly 1 row under RLS; got {a_rows}"
+    );
 
     // 6. User B sees exactly 1 row.
     let b_rows = row_count(sess_b.execute("SELECT * FROM items").await.unwrap());
-    assert_eq!(b_rows, 1, "user B must see exactly 1 row under RLS; got {b_rows}");
+    assert_eq!(
+        b_rows, 1,
+        "user B must see exactly 1 row under RLS; got {b_rows}"
+    );
 
     // 7. Anonymous sees 0 rows.
     let anon_rows = row_count(sess_anon.execute("SELECT * FROM items").await.unwrap());
@@ -214,7 +220,11 @@ async fn auth_uid_schema_form_equals_flat_form() {
         flat, schema_form,
         "auth_uid() and auth.uid() must return identical values"
     );
-    assert_eq!(flat, user_id.to_string(), "auth_uid must match the session user_id");
+    assert_eq!(
+        flat,
+        user_id.to_string(),
+        "auth_uid must match the session user_id"
+    );
 }
 
 /// `auth.uid()` returns NULL for anonymous sessions; `auth.role()` returns
@@ -234,7 +244,10 @@ async fn auth_uid_null_and_role_anon_for_anonymous_session() {
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .unwrap();
-            assert!(arr.is_null(0), "auth_uid() must be NULL for anonymous session");
+            assert!(
+                arr.is_null(0),
+                "auth_uid() must be NULL for anonymous session"
+            );
         }
         other => panic!("expected Rows, got {other:?}"),
     }
@@ -457,9 +470,7 @@ async fn rls_auth_uid_cte_cannot_bypass() {
         .await
         .unwrap();
     admin
-        .execute(
-            "CREATE POLICY own_note ON notes FOR ALL TO PUBLIC USING (owner_id = auth_uid())",
-        )
+        .execute("CREATE POLICY own_note ON notes FOR ALL TO PUBLIC USING (owner_id = auth_uid())")
         .await
         .unwrap();
 

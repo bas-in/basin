@@ -399,13 +399,7 @@ impl Engine {
         current_user: impl Into<String>,
         auth: AuthContext,
     ) -> Result<TenantSession> {
-        crate::session::open(
-            self.clone(),
-            tenant,
-            current_user.into(),
-            Arc::new(auth),
-        )
-        .await
+        crate::session::open(self.clone(), tenant, current_user.into(), Arc::new(auth)).await
     }
 }
 
@@ -459,11 +453,7 @@ impl AuthContext {
     /// object) to `auth.jwt()`. Called by the pgwire router after successfully
     /// verifying the bearer JWT; the context is then passed to
     /// [`Engine::open_session_with_auth`].
-    pub fn from_jwt(
-        user_id: Uuid,
-        role: impl Into<String>,
-        claims: serde_json::Value,
-    ) -> Self {
+    pub fn from_jwt(user_id: Uuid, role: impl Into<String>, claims: serde_json::Value) -> Self {
         Self {
             auth_uid: Some(user_id),
             auth_role: role.into(),
@@ -1895,7 +1885,10 @@ mod tests {
                     .downcast_ref::<arrow_array::StringArray>()
                     .unwrap();
                 // Anonymous session → NULL.
-                assert!(arr.is_null(0), "expected NULL for auth.uid() in anonymous session");
+                assert!(
+                    arr.is_null(0),
+                    "expected NULL for auth.uid() in anonymous session"
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1933,7 +1926,10 @@ mod tests {
                     .as_any()
                     .downcast_ref::<arrow_array::StringArray>()
                     .unwrap();
-                assert!(arr.is_null(0), "expected NULL for auth_jwt() in anonymous session");
+                assert!(
+                    arr.is_null(0),
+                    "expected NULL for auth_jwt() in anonymous session"
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1972,11 +1968,8 @@ mod tests {
     async fn auth_role_returns_authenticated_for_jwt_session() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let auth = AuthContext::from_jwt(
-            uuid::Uuid::new_v4(),
-            "authenticated",
-            serde_json::json!({}),
-        );
+        let auth =
+            AuthContext::from_jwt(uuid::Uuid::new_v4(), "authenticated", serde_json::json!({}));
         let sess = eng
             .open_session_with_auth(TenantId::new(), "alice", auth)
             .await

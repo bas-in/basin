@@ -10,9 +10,9 @@
 //! operation the flow modules need. There is no "execute arbitrary SQL"
 //! escape hatch — callers write to the trait, implementations write SQL.
 
-pub mod postgres;
 #[cfg(test)]
 pub mod conformance;
+pub mod postgres;
 
 use std::collections::HashMap;
 
@@ -93,18 +93,11 @@ pub trait AuthStore: Send + Sync {
     ) -> Result<UserId>;
 
     /// Look up a user by `(tenant, email)`. Returns `None` if not found.
-    async fn find_user_by_email(
-        &self,
-        tenant: &TenantId,
-        email: &str,
-    ) -> Result<Option<AuthUser>>;
+    async fn find_user_by_email(&self, tenant: &TenantId, email: &str) -> Result<Option<AuthUser>>;
 
     /// Look up a user by `(tenant, user_id)`. Returns `None` if not found.
-    async fn find_user_by_id(
-        &self,
-        tenant: &TenantId,
-        user_id: UserId,
-    ) -> Result<Option<AuthUser>>;
+    async fn find_user_by_id(&self, tenant: &TenantId, user_id: UserId)
+        -> Result<Option<AuthUser>>;
 
     /// Return any user (from any tenant) matching `email`. Used by the
     /// tenant-agnostic email-link flow to check existence before issuing a
@@ -163,11 +156,7 @@ pub trait AuthStore: Send + Sync {
     /// currently `NULL`. Returns the number of rows updated; `0` means the
     /// token was already consumed or never existed — both cases map to an
     /// error in the flow layer.
-    async fn consume_email_token(
-        &self,
-        tenant: &TenantId,
-        token_hash: &str,
-    ) -> Result<u64>;
+    async fn consume_email_token(&self, tenant: &TenantId, token_hash: &str) -> Result<u64>;
 
     // --- Revoked refresh tokens ---------------------------------------------
 
@@ -190,10 +179,7 @@ pub trait AuthStore: Send + Sync {
     ) -> Result<()>;
 
     /// Return all non-expired revocation rows for `user_id`.
-    async fn list_refresh_revocations(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<RefreshRevocationRow>>;
+    async fn list_refresh_revocations(&self, user_id: UserId) -> Result<Vec<RefreshRevocationRow>>;
 
     /// Insert (or update) the blanket-revoke sentinel for a user. The sentinel
     /// key is `BLANKET:<user_id>` and it is stored in the same

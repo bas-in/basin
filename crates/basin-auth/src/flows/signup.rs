@@ -36,7 +36,10 @@ pub(crate) async fn signup(
 
     let user_id = Uuid::new_v4();
 
-    inner.store.create_user(tenant, &email, &hashed, user_id).await
+    inner
+        .store
+        .create_user(tenant, &email, &hashed, user_id)
+        .await
 }
 
 pub(crate) async fn request_email_verification(

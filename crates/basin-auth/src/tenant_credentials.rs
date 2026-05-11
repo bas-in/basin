@@ -238,8 +238,12 @@ pub(crate) async fn rotate(inner: &Inner, pgwire_user: &str) -> Result<Connectio
         .tenant_id
         .parse()
         .map_err(|e| BasinError::internal(format!("tenant_credentials tenant parse: {e}")))?;
-    let connection_url =
-        build_connection_url(&inner.cfg.pgwire_public_host, pgwire_user, &secret, &row.dbname);
+    let connection_url = build_connection_url(
+        &inner.cfg.pgwire_public_host,
+        pgwire_user,
+        &secret,
+        &row.dbname,
+    );
     Ok(ConnectionInfo {
         tenant_id: tenant,
         pgwire_user: pgwire_user.to_owned(),
@@ -317,8 +321,9 @@ pub(crate) async fn migrate_legacy_credential(
             )));
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| BasinError::internal("migrate_legacy_credential: exhausted user retries")))
+    Err(last_err.unwrap_or_else(|| {
+        BasinError::internal("migrate_legacy_credential: exhausted user retries")
+    }))
 }
 
 #[cfg(test)]
@@ -486,7 +491,9 @@ mod tests {
 
     #[test]
     fn is_legacy_false_for_unrelated_string() {
-        assert!(!is_legacy_pgwire_user("01JBAS1NAVTH00000000000000_a1b2c3d4"));
+        assert!(!is_legacy_pgwire_user(
+            "01JBAS1NAVTH00000000000000_a1b2c3d4"
+        ));
         assert!(!is_legacy_pgwire_user("notatenantatall"));
     }
 }

@@ -23,7 +23,9 @@ use super::{
     ApiKeyRow, AuthMagicLinkRow, AuthStore, AuthUser, EmailTokenRow, MagicLinkEmailTokenRow,
     RefreshRevocationRow, TenantCredentialRow,
 };
-use crate::{api_keys::ApiKeyDescriptor, schema, tenant_credentials::TenantCredentialDescriptor, UserId};
+use crate::{
+    api_keys::ApiKeyDescriptor, schema, tenant_credentials::TenantCredentialDescriptor, UserId,
+};
 
 /// Postgres-backed auth store. Wraps a `tokio_postgres::Client` in a `Mutex`
 /// so it can be shared across async tasks without needing a connection pool
@@ -91,11 +93,7 @@ impl AuthStore for PostgresAuthStore {
         Ok(user_id)
     }
 
-    async fn find_user_by_email(
-        &self,
-        tenant: &TenantId,
-        email: &str,
-    ) -> Result<Option<AuthUser>> {
+    async fn find_user_by_email(&self, tenant: &TenantId, email: &str) -> Result<Option<AuthUser>> {
         let tenant_str = tenant.to_string();
         let client = self.client.lock().await;
         let row = client
@@ -178,9 +176,9 @@ impl AuthStore for PostgresAuthStore {
         if let Some(r) = row {
             let user_id: Uuid = r.get(0);
             let tenant_str: String = r.get(1);
-            let tenant: TenantId = tenant_str
-                .parse()
-                .map_err(|e| BasinError::internal(format!("latest_user_by_email tenant parse: {e}")))?;
+            let tenant: TenantId = tenant_str.parse().map_err(|e| {
+                BasinError::internal(format!("latest_user_by_email tenant parse: {e}"))
+            })?;
             Ok(Some((user_id, tenant)))
         } else {
             Ok(None)
@@ -327,11 +325,7 @@ impl AuthStore for PostgresAuthStore {
         }))
     }
 
-    async fn consume_email_token(
-        &self,
-        tenant: &TenantId,
-        token_hash: &str,
-    ) -> Result<u64> {
+    async fn consume_email_token(&self, tenant: &TenantId, token_hash: &str) -> Result<u64> {
         let tenant_str = tenant.to_string();
         let client = self.client.lock().await;
         let n = client
@@ -396,10 +390,7 @@ impl AuthStore for PostgresAuthStore {
         Ok(())
     }
 
-    async fn list_refresh_revocations(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<RefreshRevocationRow>> {
+    async fn list_refresh_revocations(&self, user_id: UserId) -> Result<Vec<RefreshRevocationRow>> {
         let client = self.client.lock().await;
         let rows = client
             .query(

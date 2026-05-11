@@ -68,7 +68,10 @@ pub(crate) async fn set(
 ) -> Result<()> {
     validate_key(key)?;
     validate_value(key, value)?;
-    inner.store.upsert_session_setting(tenant, user, key, value).await
+    inner
+        .store
+        .upsert_session_setting(tenant, user, key, value)
+        .await
 }
 
 pub(crate) async fn get_all(

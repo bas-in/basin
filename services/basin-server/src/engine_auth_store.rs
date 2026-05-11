@@ -149,9 +149,7 @@ impl EngineAuthStore {
         sess.close_statement(&handle).await;
         match result {
             ExecResult::Rows { schema, batches } => Ok((schema, batches)),
-            ExecResult::Empty { .. } => {
-                Ok((Arc::new(arrow_schema::Schema::empty()), Vec::new()))
-            }
+            ExecResult::Empty { .. } => Ok((Arc::new(arrow_schema::Schema::empty()), Vec::new())),
         }
     }
 }
@@ -408,11 +406,7 @@ impl AuthStore for EngineAuthStore {
         Ok(user_id)
     }
 
-    async fn find_user_by_email(
-        &self,
-        tenant: &TenantId,
-        email: &str,
-    ) -> Result<Option<AuthUser>> {
+    async fn find_user_by_email(&self, tenant: &TenantId, email: &str) -> Result<Option<AuthUser>> {
         let sql = format!(
             "SELECT user_id, email, password_hash, email_verified_at
              FROM {sch}_users
@@ -434,11 +428,7 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
-    async fn find_user_by_id(
-        &self,
-        tenant: &TenantId,
-        user_id: Uuid,
-    ) -> Result<Option<AuthUser>> {
+    async fn find_user_by_id(&self, tenant: &TenantId, user_id: Uuid) -> Result<Option<AuthUser>> {
         let sql = format!(
             "SELECT user_id, email, password_hash, email_verified_at
              FROM {sch}_users
@@ -446,10 +436,7 @@ impl AuthStore for EngineAuthStore {
             sch = self.sch()
         );
         let (_, batches) = self
-            .query_params(
-                &sql,
-                vec![p_uuid(user_id), p_text(tenant.to_string())],
-            )
+            .query_params(&sql, vec![p_uuid(user_id), p_text(tenant.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("find_user_by_id: {e}")))?;
         first_row_opt(&batches, |b, r| {
@@ -652,10 +639,7 @@ impl AuthStore for EngineAuthStore {
             sch = self.sch()
         );
         let (_, user_batches) = self
-            .query_params(
-                &sql_user,
-                vec![p_uuid(user_id), p_text(tenant.to_string())],
-            )
+            .query_params(&sql_user, vec![p_uuid(user_id), p_text(tenant.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("find_magic_link_email_token user: {e}")))?;
         let email = match first_row_opt(&user_batches, |b, r| {
@@ -824,11 +808,7 @@ impl AuthStore for EngineAuthStore {
         let (_, batches) = self
             .query_params(
                 &sql_select,
-                vec![
-                    p_text(tenant.to_string()),
-                    p_uuid(user_id),
-                    p_text(name),
-                ],
+                vec![p_text(tenant.to_string()), p_uuid(user_id), p_text(name)],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("insert_api_key select: {e}")))?;
@@ -895,10 +875,7 @@ impl AuthStore for EngineAuthStore {
                 sch = self.sch()
             );
             let (_, batches) = self
-                .query_params(
-                    &sql_exists,
-                    vec![p_i64(key_id), p_text(tenant.to_string())],
-                )
+                .query_params(&sql_exists, vec![p_i64(key_id), p_text(tenant.to_string())])
                 .await
                 .map_err(|e| BasinError::catalog(format!("revoke_api_key check: {e}")))?;
             let exists = batches.iter().any(|b| b.num_rows() > 0);
@@ -1136,9 +1113,7 @@ impl AuthStore for EngineAuthStore {
         all_rows(&batches, |b, r| {
             let t_str = get_text(b, r, 0).unwrap_or_default();
             let t: TenantId = t_str.parse().map_err(|e| {
-                BasinError::internal(format!(
-                    "list_legacy_tenant_credentials tenant parse: {e}"
-                ))
+                BasinError::internal(format!("list_legacy_tenant_credentials tenant parse: {e}"))
             })?;
             Ok((t, get_text(b, r, 1).unwrap_or_default()))
         })
@@ -1175,9 +1150,12 @@ impl AuthStore for EngineAuthStore {
              VALUES ($1, $2, $3)",
             sch = self.sch()
         );
-        self.exec_params(&sql, vec![p_text(email), p_text(token_hash), p_ts(expires_at)])
-            .await
-            .map_err(|e| BasinError::catalog(format!("insert_auth_magic_link: {e}")))?;
+        self.exec_params(
+            &sql,
+            vec![p_text(email), p_text(token_hash), p_ts(expires_at)],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("insert_auth_magic_link: {e}")))?;
         Ok(())
     }
 

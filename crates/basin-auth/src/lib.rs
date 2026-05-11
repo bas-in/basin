@@ -37,7 +37,7 @@ pub mod store;
 pub mod tenant_credentials;
 
 pub use store::AuthStore;
-pub use tenant_credentials::{ConnectionInfo, TenantCredentialDescriptor, is_legacy_pgwire_user};
+pub use tenant_credentials::{is_legacy_pgwire_user, ConnectionInfo, TenantCredentialDescriptor};
 pub mod email;
 pub mod jwt;
 pub mod password;
@@ -211,9 +211,10 @@ impl AuthService {
             });
             client
         };
-        let store: Arc<dyn AuthStore> = Arc::new(
-            store::postgres::PostgresAuthStore::new(client, cfg.catalog_schema.clone()),
-        );
+        let store: Arc<dyn AuthStore> = Arc::new(store::postgres::PostgresAuthStore::new(
+            client,
+            cfg.catalog_schema.clone(),
+        ));
         Self::with_store(cfg, store, mailer).await
     }
 
@@ -459,7 +460,10 @@ impl AuthService {
         if total == 0 {
             return Ok(0);
         }
-        tracing::info!(count = total, "legacy pgwire credentials found; rotating to new format");
+        tracing::info!(
+            count = total,
+            "legacy pgwire credentials found; rotating to new format"
+        );
         let mut migrated: u64 = 0;
         for (tenant, old_user) in legacy {
             match self.migrate_legacy_credential(&tenant, &old_user).await {
@@ -959,7 +963,9 @@ mod tests {
             let (raw_client, conn) = tokio_postgres::connect(PG_URL, tokio_postgres::NoTls)
                 .await
                 .unwrap();
-            tokio::spawn(async move { let _ = conn.await; });
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
             let schema = &svc.inner.cfg.catalog_schema;
             raw_client
                 .execute(
@@ -1313,7 +1319,11 @@ mod tests {
             .list_active_auth_magic_links()
             .await
             .unwrap();
-        assert_eq!(links.len(), 0, "no row should be inserted for an unknown email");
+        assert_eq!(
+            links.len(),
+            0,
+            "no row should be inserted for an unknown email"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

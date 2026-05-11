@@ -2415,9 +2415,7 @@ impl ScalarUDFImpl for AuthRoleUdf {
     #[allow(deprecated)]
     fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
         Ok(ColumnarValue::Scalar(
-            datafusion::scalar::ScalarValue::Utf8(Some(
-                self.auth_context.auth_role.clone(),
-            )),
+            datafusion::scalar::ScalarValue::Utf8(Some(self.auth_context.auth_role.clone())),
         ))
     }
 }
@@ -2456,7 +2454,9 @@ impl ScalarUDFImpl for AuthJwtUdf {
         match &self.auth_context.auth_claims {
             Some(claims) => {
                 let json_str = serde_json::to_string(claims).map_err(|e| {
-                    DataFusionError::Execution(format!("auth_jwt: claims serialization failed: {e}"))
+                    DataFusionError::Execution(format!(
+                        "auth_jwt: claims serialization failed: {e}"
+                    ))
                 })?;
                 Ok(ColumnarValue::Scalar(
                     datafusion::scalar::ScalarValue::Utf8(Some(json_str)),
