@@ -50,7 +50,7 @@ pub use functions::{
 pub use in_memory::InMemoryCatalog;
 pub use metadata::{
     CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
-    PolicyCommand, RefAction, SecondaryIndex, TableMetadata,
+    PolicyCommand, RefAction, SecondaryIndex, TableMetadata, UniqueConstraint,
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
@@ -574,12 +574,13 @@ pub trait Catalog: Send + Sync {
         Ok(())
     }
 
-    /// Phase 5.7 B1: declare a per-tenant secondary index on `(table, column)`.
+    /// Phase 5.7 B1: declare a per-tenant secondary index on `(table, columns)`.
     /// The catalog records the declaration; the storage reader materialises
     /// the physical (value → file/row_group/row) map lazily on first query.
-    /// Returns [`basin_common::BasinError::InvalidSchema`] if `column` is not
+    /// Returns [`basin_common::BasinError::InvalidSchema`] if any column is not
     /// in the table's schema, or [`basin_common::BasinError::Catalog`] if
-    /// `name` collides with an existing index on the same table.
+    /// `name` collides with an existing index on the same table (unless
+    /// `if_not_exists` is set, in which case the call is a no-op).
     /// Default impl returns `Internal("not implemented")` so the stub
     /// `RestCatalog` stays buildable; in-memory and Postgres backends
     /// override.
@@ -588,9 +589,10 @@ pub trait Catalog: Send + Sync {
         tenant: &TenantId,
         table: &TableName,
         name: &str,
-        column: &str,
+        columns: &[String],
+        if_not_exists: bool,
     ) -> Result<()> {
-        let _ = (tenant, table, name, column);
+        let _ = (tenant, table, name, columns, if_not_exists);
         Err(basin_common::BasinError::Internal(
             "create_index not implemented for this catalog backend".into(),
         ))
@@ -970,6 +972,23 @@ pub trait Catalog: Send + Sync {
         foreign_keys: Vec<metadata::ForeignKeyDef>,
     ) -> Result<()> {
         let _ = (tenant, table, pk_columns, check_constraints, foreign_keys);
+        Ok(())
+    }
+
+    /// Persist the UNIQUE-constraint list for `(tenant, table)`. Called
+    /// by `CREATE TABLE` after the table has been created (only when at
+    /// least one UNIQUE constraint was declared). An empty vector clears
+    /// the set. Stored as a separate call from `set_table_constraints`
+    /// to keep the latter's existing signature stable. Default impl is a
+    /// no-op so the stub `RestCatalog` stays buildable; the in-memory
+    /// backend overrides.
+    async fn set_unique_constraints(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        unique_constraints: Vec<metadata::UniqueConstraint>,
+    ) -> Result<()> {
+        let _ = (tenant, table, unique_constraints);
         Ok(())
     }
 }

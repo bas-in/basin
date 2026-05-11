@@ -49,6 +49,7 @@ use basin_common::{
     ChangeEventSink, EventSinkRegistry, Result, TableName, TenantCounterRegistry,
     TenantCountersSnapshot, TenantId,
 };
+use uuid::Uuid;
 
 /// Engine configuration.
 ///
@@ -352,7 +353,13 @@ impl Engine {
     /// session that way. To plumb a real principal through (e.g. from a
     /// pgwire handshake or JWT), use [`Engine::open_session_as`].
     pub async fn open_session(&self, tenant: TenantId) -> Result<TenantSession> {
-        crate::session::open(self.clone(), tenant, ANONYMOUS_USER.to_string()).await
+        crate::session::open(
+            self.clone(),
+            tenant,
+            ANONYMOUS_USER.to_string(),
+            Arc::new(AuthContext::anonymous()),
+        )
+        .await
     }
 
     /// Open a session bound to `tenant` and stamp `current_user` with the
@@ -362,12 +369,43 @@ impl Engine {
     ///
     /// `current_user` is purely consumed by the row-level-security predicate
     /// evaluator; the rest of the engine behaves identically regardless.
+    ///
+    /// Auth session functions (`auth.uid()` / `auth.role()` / `auth.jwt()`)
+    /// will return `NULL` / `'anon'` for sessions opened this way. To supply
+    /// JWT-derived claims, use [`Engine::open_session_with_auth`].
     pub async fn open_session_as(
         &self,
         tenant: TenantId,
         current_user: impl Into<String>,
     ) -> Result<TenantSession> {
-        crate::session::open(self.clone(), tenant, current_user.into()).await
+        crate::session::open(
+            self.clone(),
+            tenant,
+            current_user.into(),
+            Arc::new(AuthContext::anonymous()),
+        )
+        .await
+    }
+
+    /// Open a session bound to `tenant`, setting both the `current_user`
+    /// principal and the auth context used by `auth.uid()`, `auth.role()`,
+    /// and `auth.jwt()`. Called by the pgwire router when a JWT connection
+    /// is authenticated — the JWT claims are decoded and carried into the
+    /// session so RLS policies can reference them without re-verifying the
+    /// token on every query.
+    pub async fn open_session_with_auth(
+        &self,
+        tenant: TenantId,
+        current_user: impl Into<String>,
+        auth: AuthContext,
+    ) -> Result<TenantSession> {
+        crate::session::open(
+            self.clone(),
+            tenant,
+            current_user.into(),
+            Arc::new(auth),
+        )
+        .await
     }
 }
 
@@ -388,6 +426,48 @@ fn attach_reactor_sink(inner: &Arc<EngineInner>, catalog: Arc<dyn basin_catalog:
 /// not match an authenticated user's rows.
 pub const ANONYMOUS_USER: &str = "anonymous";
 
+/// Authentication context stamped onto a session at open time. Carries the
+/// claims needed to back `auth.uid()`, `auth.role()`, and `auth.jwt()` SQL
+/// functions (Supabase-compatible session functions). All fields are `None`
+/// / `"anon"` for unauthenticated sessions, matching the Supabase contract
+/// that `auth.uid()` returns `NULL` rather than erroring when no JWT is
+/// present.
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    /// UUID of the authenticated user (`sub` / `user_id` JWT claim). `None`
+    /// for anonymous/service connections.
+    pub auth_uid: Option<Uuid>,
+    /// Role string: `"authenticated"`, `"anon"`, or `"service_role"`.
+    pub auth_role: String,
+    /// Full JWT claims as a JSON value. `None` for non-JWT sessions.
+    pub auth_claims: Option<serde_json::Value>,
+}
+
+impl AuthContext {
+    /// Anonymous (unauthenticated) context — `auth.uid()` → NULL,
+    /// `auth.role()` → `'anon'`.
+    pub fn anonymous() -> Self {
+        Self {
+            auth_uid: None,
+            auth_role: "anon".to_string(),
+            auth_claims: None,
+        }
+    }
+
+    /// Authenticated context built from JWT claims.
+    pub fn from_jwt(
+        user_id: Uuid,
+        role: impl Into<String>,
+        claims: serde_json::Value,
+    ) -> Self {
+        Self {
+            auth_uid: Some(user_id),
+            auth_role: role.into(),
+            auth_claims: Some(claims),
+        }
+    }
+}
+
 /// A handle to the engine scoped to a single tenant. All [`execute`] calls
 /// run as this tenant; there is no reset / impersonate API by design.
 ///
@@ -399,6 +479,11 @@ pub struct TenantSession {
     /// open time and never mutated thereafter. Read by the RLS predicate
     /// rewriter; the rest of the engine ignores it.
     pub(crate) current_user: String,
+    /// Auth context for `auth.uid()` / `auth.role()` / `auth.jwt()` UDFs.
+    /// Captured once at session-open time by `register_auth_udfs`; only
+    /// accessed through the UDF closures thereafter (hence the allow).
+    #[allow(dead_code)]
+    pub(crate) auth_context: Arc<AuthContext>,
     pub(crate) ctx: datafusion::prelude::SessionContext,
     pub(crate) state: Arc<crate::session::SessionState>,
 }
@@ -1766,6 +1851,143 @@ mod tests {
                 assert_eq!(col_i64(&batches, "id"), vec![1]);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    // --- auth.uid() / auth.role() / auth.jwt() session functions ---
+
+    #[tokio::test]
+    async fn auth_uid_returns_null_for_anonymous_session() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        // `open_session` uses anonymous AuthContext.
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let res = sess.execute("SELECT auth_uid()").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let arr = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                assert!(arr.is_null(0), "expected NULL for anonymous auth_uid()");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_uid_schema_dot_form_works() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        // `auth.uid()` should be rewritten to `auth_uid()` before reaching the engine.
+        let res = sess.execute("SELECT auth.uid()").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let arr = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                // Anonymous session → NULL.
+                assert!(arr.is_null(0), "expected NULL for auth.uid() in anonymous session");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_role_returns_anon_for_anonymous_session() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let res = sess.execute("SELECT auth_role()").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let arr = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                assert_eq!(arr.value(0), "anon");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_jwt_returns_null_for_anonymous_session() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let res = sess.execute("SELECT auth_jwt()").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let arr = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                assert!(arr.is_null(0), "expected NULL for auth_jwt() in anonymous session");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_uid_returns_uuid_for_authenticated_session() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let user_id = uuid::Uuid::new_v4();
+        let auth = AuthContext::from_jwt(
+            user_id,
+            "authenticated",
+            serde_json::json!({"user_id": user_id.to_string()}),
+        );
+        let sess = eng
+            .open_session_with_auth(TenantId::new(), "alice", auth)
+            .await
+            .unwrap();
+        let res = sess.execute("SELECT auth_uid()").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let arr = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                assert!(!arr.is_null(0));
+                assert_eq!(arr.value(0), user_id.to_string());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_role_returns_authenticated_for_jwt_session() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let auth = AuthContext::from_jwt(
+            uuid::Uuid::new_v4(),
+            "authenticated",
+            serde_json::json!({}),
+        );
+        let sess = eng
+            .open_session_with_auth(TenantId::new(), "alice", auth)
+            .await
+            .unwrap();
+        let res = sess.execute("SELECT auth.role()").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let arr = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                assert_eq!(arr.value(0), "authenticated");
+            }
+            other => panic!("unexpected: {other:?}"),
         }
     }
 }

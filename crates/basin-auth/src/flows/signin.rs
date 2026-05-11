@@ -28,30 +28,11 @@ pub(crate) async fn signin(
     inner.email_limiter.check(&format!("signin:{email}"))?;
 
     let email = crate::normalise_email(email)?;
-    let tenant_str = tenant.to_string();
 
-    let client = inner.client.lock().await;
-    let row = client
-        .query_opt(
-            &format!(
-                "SELECT user_id, password_hash, email_verified_at
-                 FROM {sch}.users
-                 WHERE tenant_id = $1 AND email = $2",
-                sch = inner.schema()
-            ),
-            &[&tenant_str, &email],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("signin select: {e}")))?;
-    drop(client);
+    let row = inner.store.find_user_by_email(tenant, &email).await?;
 
     let (user_id, hash, verified) = match row {
-        Some(r) => {
-            let id: Uuid = r.get(0);
-            let h: String = r.get(1);
-            let v: Option<chrono::DateTime<Utc>> = r.get(2);
-            (Some(id), h, v)
-        }
+        Some(r) => (Some(r.user_id), r.password_hash, r.email_verified_at),
         None => (None, DUMMY_HASH.to_string(), None),
     };
 

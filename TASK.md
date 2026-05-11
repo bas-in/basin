@@ -61,6 +61,9 @@ See `README.md` "Try the PoC" for usage.
 - [x] `basin-storage`: read with predicate + projection pushdown
 - [x] `basin-storage`: pluggable `object_store` backend (local fs, S3, R2, GCS
       — backend is whatever `dyn ObjectStore` the caller passes)
+- [x] `basin-server`: runtime storage backend selection
+      (`BASIN_STORAGE_BACKEND=local|r2|s3|tigris`) for data files and WAL
+      object storage, with separate root prefixes for data and WAL.
 - [~] `basin-catalog`: Iceberg REST client (Lakekeeper-compatible)
       — trait shape locked, `RestCatalog` is a stub. Wire up in Phase 2/3.
 - [x] `basin-catalog`: atomic `append_data_files` commits, snapshot listing
@@ -75,8 +78,9 @@ See `README.md` "Try the PoC" for usage.
 
 ## Phase 2 — WAL service (2 months) — **v0.1 shipped**
 
-- [-] Pick Raft library — deferred to v0.2; v0.1 ships single-node WAL,
-      same `Wal` trait so the swap is a backend change
+- [-] Pick Raft library — openraft simulation is in-tree, but production
+      cross-process Raft WAL remains v0.2; v0.1 ships single-node/object-store
+      WAL behind the same `Wal` trait so the swap is a backend change
 - [x] `basin-wal`: file-backed single-node WAL, append keyed by
       `(tenant_id, partition)` with monotonic per-partition LSN
 - [x] Batched flush to object storage every 200 ms or 1 MB
@@ -280,9 +284,11 @@ this OSS roadmap.
 - [x] Postgres-backed user store, bcrypt password hashing, JWT
       issuance + verification (HS256), role/membership tables,
       `current_user`-aware tenant resolution.
-- [x] `JwtTenantResolver` auto-mounts on pgwire when
-      `BASIN_AUTH_ENABLED=1` (`services/basin-server/src/main.rs:298-307`);
-      JWT primary, static `BASIN_TENANTS` map as fallback.
+- [x] `JwtTenantResolver`, `ApiKeyTenantResolver`, and
+      `TenantCredentialsResolver` auto-mount on pgwire when
+      `BASIN_AUTH_ENABLED=1`; provisioned pgwire credentials are
+      bcrypt-validated and static `BASIN_TENANTS` users are limited to
+      auth bootstrap/internal use instead of accepting arbitrary passwords.
 - [x] REST endpoints for issue / verify / refresh.
 - [x] Email-link login — tenant-agnostic `auth_magic_links` table +
       `AuthService::{request,consume}_email_link`; REST endpoints
@@ -306,9 +312,18 @@ this OSS roadmap.
       invalidates the old password, list emits descriptors only.
       Cross-tenant isolation under per-tenant URLs is integration-tested
       (UNION + CTE bypass blocked); within-tenant RLS still applies.
-      `BASIN_TENANTS=alice=*` static-resolver back-compat preserved.
+      `BASIN_TENANTS=alice=*` remains a dev/bootstrap map when auth is
+      disabled, and no longer acts as a passwordless customer fallback when
+      auth is enabled.
       `BASIN_AUTH_PGWIRE_PUBLIC_HOST` env var configures the host:port
       embedded in the URL.
+- [x] Auth schema uniqueness now relies on real table metadata (`UNIQUE`
+      constraints plus catalog-persisted index declarations) instead of
+      app-side scans only; the engine enforces insert/update duplicates with
+      SQLSTATE `23505` semantics.
+- [x] Auth consume/refresh security flows avoid SQL transactions and
+      `FOR UPDATE`, using guarded single-statement updates so correctness
+      no longer depends on unsupported engine transaction semantics.
 - [x] Per-user session settings (timezone, language) read by the engine
       for `current_setting()` — `user_session_settings` table +
       `AuthService::{set,get}_session_setting{,s}` with hard-coded
@@ -323,6 +338,27 @@ this OSS roadmap.
       sentinel that invalidates every outstanding refresh JWT for that
       user. Stale rows are filtered out at lookup (`expires_at > now()`);
       a periodic GC daemon is deferred.
+- [ ] **Auth per-tenant schema** — migrate auth tables from reserved
+      internal tenant to each tenant's own storage namespace; provisioned
+      at tenant creation via `Engine::open_session_as`. See ADR 0013.
+- [ ] **`AuthStore` trait** — `basin-auth` defines trait + `PostgresAuthStore`;
+      `EngineAuthStore` lives in `basin-server` (passed as `Arc<dyn AuthStore>`).
+      `AuthService::with_store(cfg, Arc<dyn AuthStore>)` replaces `Mutex<Client>`.
+- [ ] **Self-routing credentials** — `pgwire_user` format → `{tenant_id}_{hex}`;
+      API keys embed tenant prefix. Removes global credential lookup table.
+- [ ] **Remove loopback startup** — delete `DeferredAuthResolver`,
+      `wait_for_pgwire_accept`, `INTERNAL_AUTH_TENANT_ID` static injection.
+      Auth starts before pgwire; `StackedTenantResolver` built directly.
+- [x] **`auth.uid()` / `auth.role()` / `auth.jwt()`** — SQL session functions
+      in the `auth` schema, set from JWT claims at connection time. Enables
+      Supabase-style `CREATE POLICY … USING (user_id = auth.uid())`.
+      Both `auth.uid()` (schema-dot) and `auth_uid()` (underscore) forms work;
+      the executor rewrites the schema-dot form before DataFusion sees it.
+      Anonymous sessions return `NULL` / `'anon'` matching Supabase behaviour.
+- [ ] **Conformance tests** — against `EngineAuthStore` and `PostgresAuthStore`
+      (skip PG if unavailable): user uniqueness per tenant, cross-tenant same
+      email, single-use tokens, refresh rotation, API key lifecycle,
+      self-routing credential parsing.
 
 ### basin-rest (PostgREST equivalent) — ADR 0006
 

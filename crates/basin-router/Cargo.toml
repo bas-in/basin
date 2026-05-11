@@ -11,6 +11,7 @@ basin-common.workspace = true
 basin-engine.workspace = true
 basin-pool.workspace = true
 basin-auth.workspace = true
+serde_json.workspace = true
 
 # Multi-statement simple-query messages (`tokio_postgres::batch_execute`,
 # `psql -f setup.sql`) need to be split into individual statements before

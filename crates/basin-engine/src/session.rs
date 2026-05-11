@@ -23,6 +23,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::AuthContext;
+
 use basin_catalog::{PartitionSpec, SnapshotId};
 use basin_common::{BasinError, Result, TableName, TenantId};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -83,11 +85,12 @@ impl SessionState {
     }
 }
 
-#[instrument(skip(engine, current_user), fields(tenant = %tenant))]
+#[instrument(skip(engine, current_user, auth_context), fields(tenant = %tenant))]
 pub(crate) async fn open(
     engine: Engine,
     tenant: TenantId,
     current_user: String,
+    auth_context: Arc<AuthContext>,
 ) -> Result<TenantSession> {
     // 1. Idempotent namespace.
     engine.config().catalog.create_namespace(&tenant).await?;
@@ -158,6 +161,12 @@ pub(crate) async fn open(
     // `to_char`/`to_timestamp` overrides that accept PG-style format strings
     // (`YYYY-MM-DD HH24:MI:SS`) on top of chrono syntax.
     crate::udf::register_pg_compat_udfs(&ctx);
+    // Auth session functions: `auth_uid()`, `auth_role()`, `auth_jwt()`.
+    // These read the per-session AuthContext stamped at open time so RLS
+    // policies can reference the authenticated user without re-verifying
+    // the JWT on every query. Must be registered after pg_compat to ensure
+    // we don't overwrite anything (names are distinct).
+    crate::udf::register_auth_udfs(&ctx, auth_context.clone());
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
@@ -184,6 +193,7 @@ pub(crate) async fn open(
         engine,
         tenant,
         current_user,
+        auth_context,
         ctx,
         state,
     })

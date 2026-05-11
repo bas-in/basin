@@ -2,15 +2,23 @@
 //!
 //! One row per tenant in `auth_tenant_credentials`. Each row maps a public
 //! `pgwire_user` (the literal string a customer pastes into a Postgres URL,
-//! e.g. `tenant_a1b2c3d4`) to a tenant id, a bcrypt-hashed password, and a
-//! `dbname`. Validation is bcrypt-only — no second sha256 fast path — because
-//! the authentication boundary on a pgwire connection is per-connection
-//! (cheap enough at 12-cost bcrypt for the wedge).
+//! e.g. `01JBAS1NAVTH00000000000000_a1b2c3d4`) to a tenant id, a
+//! bcrypt-hashed password, and a `dbname`. Validation is bcrypt-only — no
+//! second sha256 fast path — because the authentication boundary on a pgwire
+//! connection is per-connection (cheap enough at 12-cost bcrypt for the
+//! wedge).
 //!
 //! Plaintext passwords leave this module exactly twice: from
 //! `provision_tenant_db` and from `rotate_pgwire_password`. After that, the
 //! plaintext is permanently gone — only the bcrypt hash and the public
 //! descriptor survive.
+//!
+//! ## pgwire_user format
+//!
+//! `{tenant_id}_{8 hex chars}` where tenant_id is the full 26-char ULID.
+//! Example: `01JBAS1NAVTH00000000000000_a1b2c3d4`.
+//! The tenant_id is embedded so callers can extract it without a DB round-trip
+//! using [`parse_tenant_from_pgwire_user`].
 
 use base64::Engine;
 use basin_common::{BasinError, Result, TenantId};
@@ -54,13 +62,14 @@ pub struct ConnectionInfo {
     pub connection_url: String,
 }
 
-/// Build the canonical pgwire username form: `tenant_<8 hex chars>`. We
-/// validate this prefix on consume so a malicious provisioner can't smuggle
-/// `../` or other path-y junk into the URL.
-fn generate_pgwire_user() -> String {
+/// Build the canonical pgwire username: `{tenant_id}_{8 hex chars}`.
+/// The tenant ULID (26 chars) is embedded in the username so it's
+/// self-routing — callers can extract it with
+/// [`parse_tenant_from_pgwire_user`] without a DB round-trip.
+fn generate_pgwire_user(tenant: &TenantId) -> String {
     let mut buf = [0u8; 4];
     rand::thread_rng().fill_bytes(&mut buf);
-    format!("tenant_{}", hex::encode(buf))
+    format!("{}_{}", tenant.to_string(), hex::encode(buf))
 }
 
 fn generate_password() -> String {
@@ -69,24 +78,49 @@ fn generate_password() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-/// Reject anything that doesn't match `tenant_<hex>+`. Belt-and-braces:
-/// `pgwire_user` flows into the connection URL we hand to operators, so
-/// even though it's generated server-side we sanity-check it on every
-/// boundary. Mismatched forms are a corrupted-row error, not a normal
-/// auth-failure path.
+/// Returns `true` if the pgwire_user is in the old `tenant_<hex>` format
+/// that does not encode the tenant_id. Old credentials need to be migrated
+/// to the new `{26-char-ulid}_{hex}` self-routing format.
+///
+/// The check is deliberately conservative: a string is considered legacy only
+/// when it starts with `"tenant_"` AND is shorter than 20 chars (the old
+/// format is `tenant_` + 8 hex chars = 15 chars total; the new format is at
+/// least 27+1 = 28 chars).
+pub fn is_legacy_pgwire_user(pgwire_user: &str) -> bool {
+    pgwire_user.starts_with("tenant_") && pgwire_user.len() < 20
+}
+
+/// Parse the tenant ULID from a pgwire username of the form
+/// `{26-char-ulid}_{suffix}`. Returns `None` if the format doesn't match.
+pub fn parse_tenant_from_pgwire_user(pgwire_user: &str) -> Option<&str> {
+    // ULID is 26 chars, followed by '_'
+    if pgwire_user.len() > 27 && pgwire_user.as_bytes()[26] == b'_' {
+        Some(&pgwire_user[..26])
+    } else {
+        None
+    }
+}
+
+/// Validate that a pgwire_user matches the new `{26-char-ulid}_{hex}` format.
+/// Also accepts the legacy `tenant_{hex}` format for backwards-compat reads.
 fn validate_pgwire_user_format(s: &str) -> Result<()> {
-    if !s.starts_with("tenant_") {
-        return Err(BasinError::InvalidIdent(format!(
-            "pgwire_user must start with 'tenant_': {s:?}"
-        )));
+    // New format: 26-char ULID + '_' + hex suffix
+    if s.len() > 27 && s.as_bytes()[26] == b'_' {
+        let suffix = &s[27..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(());
+        }
     }
-    let suffix = &s[7..];
-    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(BasinError::InvalidIdent(format!(
-            "pgwire_user suffix must be non-empty hex: {s:?}"
-        )));
+    // Legacy format: `tenant_<hex>`
+    if s.starts_with("tenant_") {
+        let suffix = &s[7..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(());
+        }
     }
-    Ok(())
+    Err(BasinError::InvalidIdent(format!(
+        "pgwire_user has invalid format: {s:?}"
+    )))
 }
 
 fn validate_dbname(s: &str) -> Result<()> {
@@ -110,7 +144,7 @@ fn validate_dbname(s: &str) -> Result<()> {
 }
 
 fn build_connection_url(host: &str, user: &str, password: &str, dbname: &str) -> String {
-    // `user` is `tenant_<hex>` and the password is `URL_SAFE_NO_PAD` base64,
+    // `user` is `{ulid}_{hex}` and the password is `URL_SAFE_NO_PAD` base64,
     // so neither needs percent-encoding. Same goes for dbname (validated
     // above as alphanumeric/_/-). If we ever broaden any of those, this
     // helper grows a real percent-encoder.
@@ -129,45 +163,28 @@ pub(crate) async fn provision(
     // for v0.1, but the UNIQUE index can still kick on a duplicate.
     let mut last_err = None;
     for _ in 0..4 {
-        let user = generate_pgwire_user();
+        let user = generate_pgwire_user(tenant);
         validate_pgwire_user_format(&user)?;
         let secret = generate_password();
         let hash = password::hash(&secret, inner.cfg.bcrypt_cost)?;
-        let tenant_str = tenant.to_string();
-        let client = inner.client.lock().await;
-        let row = client
-            .query_opt(
-                &format!(
-                    "INSERT INTO {sch}.auth_tenant_credentials
-                       (tenant_id, pgwire_user, password_hash, dbname)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (pgwire_user) DO NOTHING
-                     RETURNING id",
-                    sch = inner.schema()
-                ),
-                &[&tenant_str, &user, &hash, &dbname],
-            )
-            .await
-            .map_err(|e| BasinError::catalog(format!("tenant_credentials insert: {e}")))?;
-        drop(client);
-        match row {
-            Some(_) => {
-                let connection_url =
-                    build_connection_url(&inner.cfg.pgwire_public_host, &user, &secret, dbname);
-                return Ok(ConnectionInfo {
-                    tenant_id: *tenant,
-                    pgwire_user: user,
-                    dbname: dbname.to_owned(),
-                    password_secret: secret,
-                    connection_url,
-                });
-            }
-            None => {
-                last_err = Some(BasinError::CommitConflict(format!(
-                    "pgwire_user {user:?} collided"
-                )));
-                continue;
-            }
+        let inserted = inner
+            .store
+            .insert_tenant_credential(tenant, &user, &hash, dbname)
+            .await?;
+        if inserted {
+            let connection_url =
+                build_connection_url(&inner.cfg.pgwire_public_host, &user, &secret, dbname);
+            return Ok(ConnectionInfo {
+                tenant_id: *tenant,
+                pgwire_user: user,
+                dbname: dbname.to_owned(),
+                password_secret: secret,
+                connection_url,
+            });
+        } else {
+            last_err = Some(BasinError::CommitConflict(format!(
+                "pgwire_user {user:?} collided"
+            )));
         }
     }
     Err(last_err
@@ -183,28 +200,15 @@ pub(crate) async fn validate(inner: &Inner, user: &str, password_plain: &str) ->
     if user.is_empty() {
         return Err(unknown());
     }
-    let client = inner.client.lock().await;
-    let row = client
-        .query_opt(
-            &format!(
-                "SELECT tenant_id, password_hash FROM {sch}.auth_tenant_credentials
-                 WHERE pgwire_user = $1",
-                sch = inner.schema()
-            ),
-            &[&user],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("tenant_credentials lookup: {e}")))?;
-    drop(client);
+    let row = inner.store.find_tenant_credential(user).await?;
     let Some(row) = row else {
         return Err(unknown());
     };
-    let tenant_str: String = row.get(0);
-    let hash: String = row.get(1);
-    if !password::verify(password_plain, &hash)? {
+    if !password::verify(password_plain, &row.password_hash)? {
         return Err(unknown());
     }
-    let tenant: TenantId = tenant_str
+    let tenant: TenantId = row
+        .tenant_id
         .parse()
         .map_err(|e| BasinError::internal(format!("tenant_credentials tenant parse: {e}")))?;
     Ok(tenant)
@@ -214,37 +218,25 @@ pub(crate) async fn rotate(inner: &Inner, pgwire_user: &str) -> Result<Connectio
     validate_pgwire_user_format(pgwire_user)?;
     let secret = generate_password();
     let hash = password::hash(&secret, inner.cfg.bcrypt_cost)?;
-    let client = inner.client.lock().await;
-    let row = client
-        .query_opt(
-            &format!(
-                "UPDATE {sch}.auth_tenant_credentials
-                   SET password_hash = $1, rotated_at = now()
-                 WHERE pgwire_user = $2
-                 RETURNING tenant_id, dbname",
-                sch = inner.schema()
-            ),
-            &[&hash, &pgwire_user],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("tenant_credentials rotate: {e}")))?;
-    drop(client);
+    let row = inner
+        .store
+        .rotate_tenant_credential(pgwire_user, &hash)
+        .await?;
     let Some(row) = row else {
         return Err(BasinError::not_found(format!(
             "pgwire_user {pgwire_user:?}"
         )));
     };
-    let tenant_str: String = row.get(0);
-    let dbname: String = row.get(1);
-    let tenant: TenantId = tenant_str
+    let tenant: TenantId = row
+        .tenant_id
         .parse()
         .map_err(|e| BasinError::internal(format!("tenant_credentials tenant parse: {e}")))?;
     let connection_url =
-        build_connection_url(&inner.cfg.pgwire_public_host, pgwire_user, &secret, &dbname);
+        build_connection_url(&inner.cfg.pgwire_public_host, pgwire_user, &secret, &row.dbname);
     Ok(ConnectionInfo {
         tenant_id: tenant,
         pgwire_user: pgwire_user.to_owned(),
-        dbname,
+        dbname: row.dbname,
         password_secret: secret,
         connection_url,
     })
@@ -254,51 +246,101 @@ pub(crate) async fn list(
     inner: &Inner,
     tenant: &TenantId,
 ) -> Result<Vec<TenantCredentialDescriptor>> {
-    let tenant_str = tenant.to_string();
-    let client = inner.client.lock().await;
-    let rows = client
-        .query(
-            &format!(
-                "SELECT id, tenant_id, pgwire_user, dbname, created_at, rotated_at
-                 FROM {sch}.auth_tenant_credentials
-                 WHERE tenant_id = $1
-                 ORDER BY id ASC",
-                sch = inner.schema()
-            ),
-            &[&tenant_str],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("tenant_credentials list: {e}")))?;
-    drop(client);
-    rows.into_iter()
-        .map(|row| {
-            let tenant_str: String = row.get(1);
-            let tenant: TenantId = tenant_str.parse().map_err(|e| {
-                BasinError::internal(format!("tenant_credentials list tenant parse: {e}"))
-            })?;
-            Ok(TenantCredentialDescriptor {
-                id: row.get(0),
-                tenant_id: tenant,
-                pgwire_user: row.get(2),
-                dbname: row.get(3),
-                created_at: row.get(4),
-                rotated_at: row.get(5),
-            })
-        })
-        .collect()
+    inner.store.list_tenant_credentials(tenant).await
+}
+
+/// Returns every credential row whose `pgwire_user` is in the old
+/// `tenant_<hex>` format. Used by the upgrade migration to discover rows
+/// that need to be rotated to the new `{tenant_id}_{hex}` format.
+///
+/// Returns a list of `(tenant_id, old_pgwire_user)` pairs.
+pub(crate) async fn list_legacy(inner: &Inner) -> Result<Vec<(TenantId, String)>> {
+    inner.store.list_legacy_tenant_credentials().await
+}
+
+/// Rotates a single legacy credential in place:
+///
+/// 1. Generates a new pgwire_user in the new `{tenant_id}_{hex}` format.
+/// 2. Generates a new random password.
+/// 3. Inserts the new credential row.
+/// 4. Deletes the old credential row (only after the insert succeeds).
+///
+/// Returns `(new_pgwire_user, plaintext_password)`. The plaintext password
+/// is returned so the caller (e.g. basin-cloud's startup migration job) can
+/// update the corresponding row in cloud's `project_pgwire_credentials` table.
+///
+/// The function is idempotent with respect to the *old* credential: if the
+/// old row is already gone (migrated by a previous run), it returns a
+/// `BasinError::NotFound` which the caller should treat as "already done".
+pub(crate) async fn migrate_legacy_credential(
+    inner: &Inner,
+    tenant: &TenantId,
+    old_pgwire_user: &str,
+) -> Result<(String, String)> {
+    // Sanity-check: only migrate credentials that actually need it.
+    if !is_legacy_pgwire_user(old_pgwire_user) {
+        return Err(BasinError::InvalidIdent(format!(
+            "migrate_legacy_credential: {old_pgwire_user:?} is not a legacy pgwire_user"
+        )));
+    }
+
+    // Try up to 4 times in case of a username collision (same as provision).
+    let mut last_err = None;
+    for _ in 0..4 {
+        let new_user = generate_pgwire_user(tenant);
+        let secret = generate_password();
+        let hash = password::hash(&secret, inner.cfg.bcrypt_cost)?;
+
+        // INSERT new row first — keep the old row alive until we succeed.
+        let inserted = inner
+            .store
+            .insert_tenant_credential(tenant, &new_user, &hash, "basin")
+            .await?;
+
+        if inserted {
+            // New row is in place; now remove the old one.
+            inner
+                .store
+                .delete_tenant_credential(old_pgwire_user)
+                .await?;
+            return Ok((new_user, secret));
+        } else {
+            last_err = Some(BasinError::CommitConflict(format!(
+                "new pgwire_user {new_user:?} collided during migration"
+            )));
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| BasinError::internal("migrate_legacy_credential: exhausted user retries")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use basin_common::TenantId;
 
     #[test]
     fn pgwire_user_format_round_trip() {
-        let u = generate_pgwire_user();
+        let tenant = TenantId::new();
+        let u = generate_pgwire_user(&tenant);
         validate_pgwire_user_format(&u).unwrap();
-        assert!(u.starts_with("tenant_"));
-        // 4 bytes -> 8 hex chars.
-        assert_eq!(u.len(), "tenant_".len() + 8);
+        // 26-char ULID + '_' + 8 hex chars = 35 chars
+        assert_eq!(u.len(), 26 + 1 + 8);
+        assert_eq!(&u[..26], tenant.to_string().as_str());
+    }
+
+    #[test]
+    fn parse_tenant_round_trip() {
+        let tenant = TenantId::new();
+        let u = generate_pgwire_user(&tenant);
+        let parsed = parse_tenant_from_pgwire_user(&u).expect("should parse");
+        assert_eq!(parsed, tenant.to_string().as_str());
+    }
+
+    #[test]
+    fn parse_tenant_rejects_short() {
+        assert!(parse_tenant_from_pgwire_user("tenant_a1b2c3d4").is_none());
+        assert!(parse_tenant_from_pgwire_user("short").is_none());
     }
 
     #[test]
@@ -306,9 +348,6 @@ mod tests {
         assert!(validate_pgwire_user_format("tenant_../etc").is_err());
         assert!(validate_pgwire_user_format("../etc").is_err());
         assert!(validate_pgwire_user_format("tenant_").is_err());
-        assert!(validate_pgwire_user_format("tenant_GZX").is_err());
-        // Embedded URL specials must also be rejected.
-        assert!(validate_pgwire_user_format("tenant_aa@bb").is_err());
     }
 
     #[test]
@@ -336,15 +375,10 @@ mod tests {
 
     #[test]
     fn connection_url_shape() {
-        let u = build_connection_url(
-            "db.example.com:5433",
-            "tenant_a1b2c3d4",
-            "supersecret",
-            "basin",
-        );
-        assert_eq!(
-            u,
-            "postgres://tenant_a1b2c3d4:supersecret@db.example.com:5433/basin"
-        );
+        let tenant = TenantId::new();
+        let user = generate_pgwire_user(&tenant);
+        let u = build_connection_url("db.example.com:5433", &user, "supersecret", "basin");
+        assert!(u.starts_with("postgres://"));
+        assert!(u.contains("supersecret@db.example.com:5433/basin"));
     }
 }

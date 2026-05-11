@@ -253,7 +253,7 @@ async fn accept_loop(
         .await;
     }
 
-    let factory = Arc::new(EngineSessionFactory(engine));
+    let factory = Arc::new(EngineSessionFactory::new(engine));
     run_accept_loop(
         listener,
         factory,

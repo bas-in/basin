@@ -35,27 +35,8 @@ pub(crate) async fn signup(
     let hashed = password::hash(password_raw, inner.cfg.bcrypt_cost)?;
 
     let user_id = Uuid::new_v4();
-    let tenant_str = tenant.to_string();
 
-    let client = inner.client.lock().await;
-    let inserted = client
-        .execute(
-            &format!(
-                "INSERT INTO {sch}.users (user_id, tenant_id, email, password_hash)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (tenant_id, email) DO NOTHING",
-                sch = inner.schema()
-            ),
-            &[&user_id, &tenant_str, &email, &hashed],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("signup insert: {e}")))?;
-    if inserted == 0 {
-        return Err(BasinError::CommitConflict(format!(
-            "user {email} already exists for tenant {tenant}"
-        )));
-    }
-    Ok(user_id)
+    inner.store.create_user(tenant, &email, &hashed, user_id).await
 }
 
 pub(crate) async fn request_email_verification(
@@ -65,123 +46,59 @@ pub(crate) async fn request_email_verification(
 ) -> Result<()> {
     let (raw, hash) = generate();
     let expires_at = Utc::now() + crate::ttl_or_default(VERIFY_TTL);
-    let tenant_str = tenant.to_string();
 
-    let client = inner.client.lock().await;
     // Pull email so we know where to send it. Fail closed if user is missing.
-    let row = client
-        .query_opt(
-            &format!(
-                "SELECT email FROM {sch}.users
-                 WHERE user_id = $1 AND tenant_id = $2",
-                sch = inner.schema()
-            ),
-            &[&user, &tenant_str],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("verify lookup: {e}")))?;
-    let Some(row) = row else {
+    let user_row = inner.store.find_user_by_id(tenant, user).await?;
+    let Some(user_row) = user_row else {
         return Err(BasinError::not_found(format!("user {user}")));
     };
-    let email: String = row.get(0);
 
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {sch}.email_tokens
-                   (token_hash, user_id, tenant_id, purpose, expires_at)
-                 VALUES ($1, $2, $3, $4, $5)",
-                sch = inner.schema()
-            ),
-            &[
-                &hash,
-                &user,
-                &tenant_str,
-                &EmailTokenPurpose::Verify.as_str(),
-                &expires_at,
-            ],
+    inner
+        .store
+        .insert_email_token(
+            tenant,
+            user,
+            &hash,
+            EmailTokenPurpose::Verify.as_str(),
+            expires_at,
         )
-        .await
-        .map_err(|e| BasinError::catalog(format!("verify insert: {e}")))?;
-    drop(client);
+        .await?;
 
     let mut out: Outbound = verify_template(&raw);
-    out.to = email;
+    out.to = user_row.email;
     inner.mailer.send(out).await?;
     Ok(())
 }
 
 pub(crate) async fn verify_email(inner: &Inner, tenant: &TenantId, raw_token: &str) -> Result<()> {
     let h = hash_token(raw_token);
-    let tenant_str = tenant.to_string();
 
-    let mut client = inner.client.lock().await;
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| BasinError::catalog(format!("verify begin: {e}")))?;
-
-    // Single round-trip: fetch the row and lock it. If consumed, expired, or
-    // wrong purpose / tenant, fail without touching anything.
-    let row = tx
-        .query_opt(
-            &format!(
-                "SELECT user_id, expires_at, consumed_at, purpose
-                 FROM {sch}.email_tokens
-                 WHERE token_hash = $1 AND tenant_id = $2
-                 FOR UPDATE",
-                sch = inner.schema()
-            ),
-            &[&h, &tenant_str],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("verify select: {e}")))?;
+    let row = inner.store.find_email_token(tenant, &h).await?;
     let Some(row) = row else {
         return Err(BasinError::not_found("invalid verification token"));
     };
-    let user_id: Uuid = row.get(0);
-    let expires_at: chrono::DateTime<Utc> = row.get(1);
-    let consumed_at: Option<chrono::DateTime<Utc>> = row.get(2);
-    let purpose: String = row.get(3);
 
-    if purpose != EmailTokenPurpose::Verify.as_str() {
+    if row.purpose != EmailTokenPurpose::Verify.as_str() {
         return Err(BasinError::InvalidIdent("token has wrong purpose".into()));
     }
-    if consumed_at.is_some() {
+    if row.consumed_at.is_some() {
         return Err(BasinError::InvalidIdent(
             "verification token already consumed".into(),
         ));
     }
-    if expires_at < Utc::now() {
+    if row.expires_at < Utc::now() {
         return Err(BasinError::InvalidIdent(
             "verification token expired".into(),
         ));
     }
 
-    tx.execute(
-        &format!(
-            "UPDATE {sch}.email_tokens SET consumed_at = now()
-             WHERE token_hash = $1",
-            sch = inner.schema()
-        ),
-        &[&h],
-    )
-    .await
-    .map_err(|e| BasinError::catalog(format!("verify mark consumed: {e}")))?;
+    let consumed = inner.store.consume_email_token(tenant, &h).await?;
+    if consumed == 0 {
+        return Err(BasinError::InvalidIdent(
+            "verification token already consumed".into(),
+        ));
+    }
 
-    tx.execute(
-        &format!(
-            "UPDATE {sch}.users SET email_verified_at = now()
-             WHERE user_id = $1 AND tenant_id = $2",
-            sch = inner.schema()
-        ),
-        &[&user_id, &tenant_str],
-    )
-    .await
-    .map_err(|e| BasinError::catalog(format!("verify mark user: {e}")))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| BasinError::catalog(format!("verify commit: {e}")))?;
+    inner.store.mark_email_verified(tenant, row.user_id).await?;
     Ok(())
 }

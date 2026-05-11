@@ -27,10 +27,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Schema};
-use basin_catalog::{Catalog, CheckConstraint, ForeignKeyDef, RefAction, TableMetadata};
+use basin_catalog::{
+    Catalog, CheckConstraint, ForeignKeyDef, RefAction, TableMetadata, UniqueConstraint,
+};
 use basin_common::{BasinError, Result, TableName, TenantId};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
@@ -137,6 +140,158 @@ pub(crate) async fn enforce_pk_on_insert(
     Ok(())
 }
 
+/// Reject the new batch if any row's UNIQUE-constraint tuple already
+/// exists in the table, OR if two rows in the same batch share a
+/// UNIQUE tuple.
+///
+/// NULL handling: PG's default `UNIQUE (...)` treats every NULL as
+/// distinct — any number of rows may have NULL in a UNIQUE column.
+/// We mirror that: rows with NULL in *any* UNIQUE column are skipped
+/// entirely from the comparison. (`NULLS NOT DISTINCT`, introduced
+/// in PG 15, is not modelled in v0.1.)
+///
+/// Cost note: same shape as `enforce_pk_on_insert` — one full scan
+/// of every data file per UNIQUE constraint per call. v0.2 (Phase 5.7
+/// B1) secondary indexes will replace the scan with a B-tree probe.
+/// For v0.1 the per-INSERT cost is `O(rows_in_table * unique_count +
+/// rows_in_batch * unique_count)`. basin-auth's targeted tables
+/// (users, sessions, api_keys, refresh_tokens, magic_links) stay in
+/// the thousands-to-low-millions range where the scan is fine.
+pub(crate) async fn enforce_unique_on_insert(
+    storage: &basin_storage::Storage,
+    tenant: &TenantId,
+    table: &TableName,
+    table_name_str: &str,
+    unique_constraints: &[UniqueConstraint],
+    batch: &RecordBatch,
+) -> Result<()> {
+    if unique_constraints.is_empty() || batch.num_rows() == 0 {
+        return Ok(());
+    }
+    for u in unique_constraints {
+        enforce_one_unique(
+            storage,
+            tenant,
+            table,
+            table_name_str,
+            &u.name,
+            &u.columns,
+            batch,
+            &[],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// UPDATE-side UNIQUE enforcement: same as `enforce_unique_on_insert`
+/// but excludes data files in `replaced_paths` from the
+/// existing-table scan (those files are being rewritten in this
+/// transaction so the rows they contain aren't really "still present").
+pub(crate) async fn enforce_unique_on_update(
+    storage: &basin_storage::Storage,
+    tenant: &TenantId,
+    table: &TableName,
+    table_name_str: &str,
+    unique_constraints: &[UniqueConstraint],
+    batches: &[RecordBatch],
+    replaced_paths: &[String],
+) -> Result<()> {
+    if unique_constraints.is_empty() {
+        return Ok(());
+    }
+    for u in unique_constraints {
+        for b in batches {
+            enforce_one_unique(
+                storage,
+                tenant,
+                table,
+                table_name_str,
+                &u.name,
+                &u.columns,
+                b,
+                replaced_paths,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Workhorse for both the INSERT and UPDATE flavours. Scans the
+/// (non-replaced) data files, then walks `batch` row-by-row checking
+/// for collisions both against the existing set and within the batch
+/// itself. NULL in any UNIQUE column makes the row exempt.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_one_unique(
+    storage: &basin_storage::Storage,
+    tenant: &TenantId,
+    table: &TableName,
+    table_name_str: &str,
+    constraint_name: &str,
+    columns: &[String],
+    batch: &RecordBatch,
+    replaced_paths: &[String],
+) -> Result<()> {
+    if columns.is_empty() || batch.num_rows() == 0 {
+        return Ok(());
+    }
+    let col_idx: Vec<usize> = columns
+        .iter()
+        .map(|c| {
+            batch.schema().index_of(c).map_err(|_| {
+                BasinError::internal(format!("UNIQUE column {c:?} missing from batch"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // 1. Existing-table scan (skip replaced files on UPDATE).
+    let replaced: std::collections::HashSet<&str> =
+        replaced_paths.iter().map(|s| s.as_str()).collect();
+    let data_files = storage.list_data_files_with_stats(tenant, table).await?;
+    let mut existing: std::collections::HashSet<Vec<String>> = Default::default();
+    for f in &data_files {
+        if replaced.contains(f.path.as_ref()) {
+            continue;
+        }
+        let mut stream = storage.read_file(tenant, &f.path).await?;
+        while let Some(rb) = stream.next().await {
+            let rb = rb?;
+            let rb_idx: Vec<usize> = columns
+                .iter()
+                .map(|c| {
+                    rb.schema().index_of(c).map_err(|_| {
+                        BasinError::internal(format!("UNIQUE column {c:?} missing from data file"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for row in 0..rb.num_rows() {
+                if let Some(k) = pk_tuple_for_row(&rb, &rb_idx, row)? {
+                    existing.insert(k);
+                }
+            }
+        }
+    }
+
+    // 2. Intra-batch + existing check.
+    let mut seen: std::collections::HashSet<Vec<String>> = Default::default();
+    for row in 0..batch.num_rows() {
+        // NULL in any column → row exempt (PG default).
+        let Some(k) = pk_tuple_for_row(batch, &col_idx, row)? else {
+            continue;
+        };
+        if existing.contains(&k) || !seen.insert(k.clone()) {
+            return Err(BasinError::UniqueViolation(format!(
+                "duplicate key value violates unique constraint \"{constraint_name}\" on \
+                 table \"{table_name_str}\": Key ({})=({}) already exists.",
+                columns.join(", "),
+                k.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Format a row's PK tuple as a Vec<String>. Returns None if any PK
 /// column is null (caller decides whether that's a violation; for PK
 /// columns it always is, for FK columns it makes the row exempt).
@@ -211,9 +366,24 @@ fn scalar_to_canonical_string(arr: &dyn Array, row: usize) -> Result<String> {
                 .ok_or_else(|| BasinError::internal("TimestampMicrosecondArray downcast"))?;
             Ok(a.value(row).to_string())
         }
+        // UUID columns land as `FixedSizeBinary(16)` (see
+        // `crate::types::arrow_data_type`). Canonicalise by formatting the
+        // 16 bytes back through `uuid::Uuid::from_bytes` so two PK rows
+        // with identical UUIDs hash to the same string regardless of byte
+        // ordering quirks.
+        DataType::FixedSizeBinary(16) => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| BasinError::internal("FixedSizeBinaryArray downcast"))?;
+            let bytes = a.value(row);
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(bytes);
+            Ok(uuid::Uuid::from_bytes(buf).hyphenated().to_string())
+        }
         other => Err(BasinError::InvalidSchema(format!(
             "PRIMARY KEY / FOREIGN KEY column type {other:?} is not supported in v0.1 (use \
-             BIGINT / INTEGER / SMALLINT / TEXT / BOOLEAN / TIMESTAMPTZ)"
+             BIGINT / INTEGER / SMALLINT / TEXT / BOOLEAN / TIMESTAMPTZ / UUID)"
         ))),
     }
 }

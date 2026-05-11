@@ -579,6 +579,30 @@ pub(crate) async fn exec_update(
             .await?;
         }
     }
+    // UNIQUE enforcement runs whenever the assignments touch ANY column
+    // in ANY UNIQUE constraint. We deliberately scope to "touches" — an
+    // UPDATE that only writes columns no UNIQUE constraint cares about
+    // can't introduce a duplicate, so we skip the table scan in the
+    // common case.
+    let assignments_touch_unique = meta.unique_constraints.iter().any(|u| {
+        u.columns.iter().any(|uc| {
+            assignments
+                .iter()
+                .any(|(idx, _)| meta.schema.field(*idx).name() == uc)
+        })
+    });
+    if assignments_touch_unique && !meta.unique_constraints.is_empty() {
+        crate::constraints::enforce_unique_on_update(
+            &sess.engine.config().storage,
+            &sess.tenant,
+            &table,
+            table.as_str(),
+            &meta.unique_constraints,
+            &replacement_batches,
+            &replaced_paths,
+        )
+        .await?;
+    }
 
     // Materialise audit rows from the same captured before/after pairs
     // before they're consumed by the event-builder.
@@ -1342,6 +1366,42 @@ fn literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<ScalarValu
                                 "bad RFC3339 timestamp {s:?} in SET {col}: {e}"
                             ))
                         })?
+                }
+                // `now()` / `current_timestamp` / `transaction_timestamp()`
+                // — match the set we accept on the INSERT side
+                // (`coerce_timestamp_micros` in `dml.rs`). Without this,
+                // `UPDATE t SET ts = now()` fails — which basin-auth's
+                // email-verify, magic-link, refresh-token-rotate, and
+                // password-reset flows all need.
+                Expr::Function(f) => {
+                    let fname = f
+                        .name
+                        .0
+                        .last()
+                        .map(|i| i.value.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let args_empty = match &f.args {
+                        sqlparser::ast::FunctionArguments::None => true,
+                        sqlparser::ast::FunctionArguments::List(list) => list.args.is_empty(),
+                        _ => false,
+                    };
+                    if !args_empty {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "UPDATE SET {col}: timestamp function {fname}(...) takes no args"
+                        )));
+                    }
+                    match fname.as_str() {
+                        "now"
+                        | "current_timestamp"
+                        | "transaction_timestamp"
+                        | "statement_timestamp"
+                        | "clock_timestamp" => chrono::Utc::now().timestamp_micros(),
+                        _ => {
+                            return Err(BasinError::InvalidSchema(format!(
+                                "UPDATE SET {col}: unsupported timestamp function {fname}()"
+                            )));
+                        }
+                    }
                 }
                 other => {
                     return Err(BasinError::InvalidSchema(format!(

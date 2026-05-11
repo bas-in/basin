@@ -21,7 +21,7 @@ use crate::enums::{self, EnumError, EnumTypeDef};
 use crate::functions::SqlFunctionDef;
 use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
-    TableMetadata,
+    TableMetadata, UniqueConstraint,
 };
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::reactors::{self, ReactorDef, ReactorError};
@@ -50,6 +50,7 @@ struct TableState {
     pk_columns: Vec<String>,
     check_constraints: Vec<CheckConstraint>,
     foreign_keys: Vec<ForeignKeyDef>,
+    unique_constraints: Vec<UniqueConstraint>,
 }
 
 impl TableState {
@@ -86,6 +87,7 @@ impl TableState {
             pk_columns: Vec::new(),
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
+            unique_constraints: Vec::new(),
         }
     }
 }
@@ -221,6 +223,7 @@ impl InMemoryCatalog {
             pk_columns: state.pk_columns.clone(),
             check_constraints: state.check_constraints.clone(),
             foreign_keys: state.foreign_keys.clone(),
+            unique_constraints: state.unique_constraints.clone(),
         }
     }
 }
@@ -494,6 +497,7 @@ impl Catalog for InMemoryCatalog {
                 pk_columns: src.pk_columns.clone(),
                 check_constraints: src.check_constraints.clone(),
                 foreign_keys: src.foreign_keys.clone(),
+                unique_constraints: src.unique_constraints.clone(),
             }
         };
 
@@ -669,31 +673,55 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name, column = %column))]
+    #[instrument(skip(self, unique_constraints), fields(tenant = %tenant, table = %table))]
+    async fn set_unique_constraints(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        unique_constraints: Vec<UniqueConstraint>,
+    ) -> Result<()> {
+        let state_arc = self.get_table(tenant, table).await?;
+        let mut state = state_arc.lock().await;
+        state.unique_constraints = unique_constraints;
+        Ok(())
+    }
+
+    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, name = %name))]
     async fn create_index(
         &self,
         tenant: &TenantId,
         table: &TableName,
         name: &str,
-        column: &str,
+        columns: &[String],
+        if_not_exists: bool,
     ) -> Result<()> {
         let state_arc = self.get_table(tenant, table).await?;
         let mut state = state_arc.lock().await;
+        if columns.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "create_index: column list cannot be empty".into(),
+            ));
+        }
         // Reject indexes on unknown columns up front: a lookup against a
         // missing column would silently always return empty results.
-        if state.schema.field_with_name(column).is_err() {
-            return Err(BasinError::InvalidSchema(format!(
-                "create_index: column {column:?} not in table {tenant}/{table} schema"
-            )));
+        for col in columns {
+            if state.schema.field_with_name(col).is_err() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "create_index: column {col:?} not in table {tenant}/{table} schema"
+                )));
+            }
         }
         if state.indexes.iter().any(|i| i.name == name) {
+            if if_not_exists {
+                return Ok(());
+            }
             return Err(BasinError::catalog(format!(
                 "create_index: {tenant}/{table}: index {name:?} already exists"
             )));
         }
         state.indexes.push(SecondaryIndex {
             name: name.to_string(),
-            column: column.to_string(),
+            columns: columns.to_vec(),
         });
         Ok(())
     }
@@ -1836,22 +1864,29 @@ mod tests {
         let pre = cat.load_table(&t, &tbl).await.unwrap();
         assert!(pre.indexes.is_empty());
 
-        cat.create_index(&t, &tbl, "ix_id", "id").await.unwrap();
+        cat.create_index(&t, &tbl, "ix_id", &["id".into()], false)
+            .await
+            .unwrap();
         let after = cat.load_table(&t, &tbl).await.unwrap();
         assert_eq!(after.indexes.len(), 1);
         assert_eq!(after.indexes[0].name, "ix_id");
-        assert_eq!(after.indexes[0].column, "id");
+        assert_eq!(after.indexes[0].columns, vec!["id".to_string()]);
 
         // Duplicate name on the same table is rejected.
         let err = cat
-            .create_index(&t, &tbl, "ix_id", "name")
+            .create_index(&t, &tbl, "ix_id", &["name".into()], false)
             .await
             .unwrap_err();
         assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
 
+        // IF NOT EXISTS swallows the duplicate.
+        cat.create_index(&t, &tbl, "ix_id", &["name".into()], true)
+            .await
+            .unwrap();
+
         // Unknown column is rejected with InvalidSchema.
         let err = cat
-            .create_index(&t, &tbl, "ix_bogus", "ghost_col")
+            .create_index(&t, &tbl, "ix_bogus", &["ghost_col".into()], false)
             .await
             .unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)), "got {err:?}");

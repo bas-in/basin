@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use basin_catalog::{CheckConstraint, ForeignKeyDef, PartitionSpec, RefAction};
+use basin_catalog::{CheckConstraint, ForeignKeyDef, PartitionSpec, RefAction, UniqueConstraint};
 use basin_common::{BasinError, Result};
 use sqlparser::ast::{
     ColumnDef, ColumnOption, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GeneratedAs,
@@ -43,6 +43,11 @@ pub(crate) struct ExtractedConstraints {
     /// catalog sequence named `<table>_<col>_seq`. The executor
     /// registers these after the table create succeeds.
     pub implicit_sequences: Vec<ImplicitSequence>,
+    /// UNIQUE constraints lifted out of column-level `col TYPE UNIQUE`
+    /// and table-level `UNIQUE (col1, col2)` clauses. Persisted onto
+    /// `TableMetadata::unique_constraints` via
+    /// `Catalog::set_unique_constraints` after the table is created.
+    pub uniques: Vec<UniqueConstraint>,
 }
 
 /// Inspect `sql` to decide whether the user wrote JSONB (or plain JSON;
@@ -157,16 +162,19 @@ pub(crate) fn schema_and_constraints_from_columns(
                     explicit_null.insert(col.name.value.to_ascii_lowercase());
                 }
                 // Column-level `PRIMARY KEY` / `UNIQUE`. PG / sqlparser
-                // collapse the two; v0.1 only accepts `is_primary == true`.
+                // collapse the two; we route `is_primary == true` to the
+                // PK column list and `is_primary == false` to the unique
+                // constraint set (synthesising a PG-shaped name).
                 ColumnOption::Unique { is_primary, .. } => {
-                    if !is_primary {
-                        return Err(BasinError::FeatureNotSupported(
-                            "UNIQUE column constraints are not supported in v0.1 (use PRIMARY KEY \
-                             for single-column uniqueness; multi-column UNIQUE is v0.2)"
-                                .into(),
-                        ));
+                    if *is_primary {
+                        col_pk_columns.push(col.name.value.clone());
+                    } else {
+                        let uname = format!("{table_name}_{}_key", col.name.value);
+                        extracted.uniques.push(UniqueConstraint {
+                            name: uname,
+                            columns: vec![col.name.value.clone()],
+                        });
                     }
-                    col_pk_columns.push(col.name.value.clone());
                 }
                 ColumnOption::Check(expr) => {
                     let name = format!("{table_name}_{}_check", col.name.value);
@@ -391,12 +399,33 @@ pub(crate) fn schema_and_constraints_from_columns(
                 let _ = name;
                 table_pk = columns.iter().map(|i| i.value.clone()).collect();
             }
-            TableConstraint::Unique { .. } => {
-                return Err(BasinError::FeatureNotSupported(
-                    "table-level UNIQUE constraints are not supported in v0.1 (multi-column \
-                     UNIQUE is v0.2)"
-                        .into(),
-                ));
+            TableConstraint::Unique { name, columns, .. } => {
+                if columns.is_empty() {
+                    return Err(BasinError::InvalidSchema(
+                        "UNIQUE: column list cannot be empty".into(),
+                    ));
+                }
+                let cols: Vec<String> = columns.iter().map(|i| i.value.clone()).collect();
+                // Reject duplicates inside the constraint's own column
+                // list — PG accepts this but it's almost always a typo
+                // and the dedup check on enforcement makes the dup a
+                // no-op anyway.
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for c in &cols {
+                    if !seen.insert(c.to_ascii_lowercase()) {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "UNIQUE: column {c:?} listed twice"
+                        )));
+                    }
+                }
+                let cname = match name {
+                    Some(n) => n.value.clone(),
+                    None => format!("{table_name}_{}_key", cols.join("_")),
+                };
+                extracted.uniques.push(UniqueConstraint {
+                    name: cname,
+                    columns: cols,
+                });
             }
             TableConstraint::ForeignKey {
                 name,
@@ -530,6 +559,32 @@ pub(crate) fn schema_and_constraints_from_columns(
     } else {
         Schema::new(fields)
     };
+
+    // Validate UNIQUE column references against the (final) schema.
+    // Duplicate constraint names across the table are rejected here too
+    // so the catalog's lookup-by-name stays unambiguous. PG names PK
+    // and UNIQUE constraints in the same namespace, so a collision
+    // between the auto-named `<table>_pkey` and a user-written
+    // `CONSTRAINT <table>_pkey UNIQUE (...)` is also a conflict.
+    if !extracted.uniques.is_empty() {
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for u in &extracted.uniques {
+            for c in &u.columns {
+                if schema.field_with_name(c).is_err() {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "UNIQUE constraint {:?}: column {c:?} is not in the table",
+                        u.name
+                    )));
+                }
+            }
+            if !seen_names.insert(u.name.to_ascii_lowercase()) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "duplicate constraint name {:?} on this table",
+                    u.name
+                )));
+            }
+        }
+    }
 
     extracted.pk_columns = pk_columns;
     Ok((schema, extracted))

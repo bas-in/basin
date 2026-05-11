@@ -28,7 +28,7 @@
 
 ## Why Basin
 
-Multi-tenant SaaS built on Postgres hits a wall: per-project pricing destroys the unit economics, RLS isolation is logical-only, audit-log retention costs more than the application revenue. Basin keeps the **Postgres wire protocol and SQL** your apps already speak, but stores every byte as ZSTD-compressed Parquet under a **per-tenant bucket prefix**. Idle tenants cost essentially nothing. Active tenants get sub-millisecond writes through a Raft-batched WAL. Tenant deletion is a prefix delete, not a `DELETE` cascade.
+Multi-tenant SaaS built on Postgres hits a wall: per-project pricing destroys the unit economics, RLS isolation is logical-only, audit-log retention costs more than the application revenue. Basin keeps the **Postgres wire protocol and SQL** your apps already speak, but stores every byte as ZSTD-compressed Parquet under a **per-tenant bucket prefix**. Idle tenants cost essentially nothing. Active tenants get low-latency writes through the WAL path. Tenant deletion is a prefix delete, not a `DELETE` cascade.
 
 One architecture from a 10 MB hobbyist tenant to a 100 TB enterprise tenant. No tier wall. No forced migrations. No "you've outgrown us" conversation.
 
@@ -105,24 +105,26 @@ explain why we think the test is fair. Decisions get logged in
 
 ## Quickstart
 
-Install basin, point it at a data dir, run. No external database, no separate
-catalog service — basin-server is self-contained.
+Install basin, point it at a data dir, run. No external object store is needed
+for local development.
 
 ```sh
 BASIN_DATA_DIR=/tmp/basin cargo run -p basin-server
 ```
 
 That gives you pgwire on `127.0.0.1:5433`, durable WAL + Parquet under
-`/tmp/basin/`, and the embedded Iceberg-style catalog. Connect with `psql`
-and start writing SQL.
+`/tmp/basin/`, and a volatile in-memory catalog for fast local iteration.
+Set `BASIN_CATALOG=postgres://...` for restart-safe metadata.
 
 The full production-shaped boot layers WAL, shard owner, connection pool,
-JWT auth, and REST in one process. basin-auth's catalog runs on the same
-engine via loopback pgwire — its reserved tenant entry (`basin_auth=<reserved-ulid>`)
-is auto-injected, so `BASIN_TENANTS` stays your application list:
+JWT auth, and REST in one process. basin-auth stores identity tables in
+each tenant's own storage (like Supabase's `auth` schema per project) —
+no reserved internal tenant, no loopback. `BASIN_TENANTS` stays your
+application list:
 
 ```sh
 BASIN_BIND=127.0.0.1:5433 \
+BASIN_CATALOG=postgres://postgres@127.0.0.1:5432/postgres \
 BASIN_DATA_DIR=/tmp/basin \
 BASIN_WAL_DIR=/tmp/basin/wal \
 BASIN_TENANTS='alice=*,bob=*' \
@@ -138,12 +140,21 @@ BASIN_ANALYTICAL_ENABLED=1 \
 cargo run -p basin-server
 ```
 
-Required vars: `BASIN_BIND`, `BASIN_DATA_DIR`, `BASIN_WAL_DIR`,
-`BASIN_TENANTS`, `BASIN_AUTH_ENABLED` (if you want auth). Everything else is
-optional. Operators who want basin-auth's identity tables on a separate OLTP
-store (durability isolation, blast-radius separation) can override the
-default loopback with `BASIN_AUTH_CATALOG_DSN` — see
-[`docs/deployment.md`](./docs/deployment.md#optional-external-auth-catalog).
+Required vars for production-shaped durability: `BASIN_BIND`,
+`BASIN_CATALOG=postgres://...`, `BASIN_DATA_DIR` or
+`BASIN_STORAGE_BACKEND`, `BASIN_WAL_DIR`, `BASIN_TENANTS`, and
+`BASIN_AUTH_ENABLED` (if you want auth). Everything else is optional.
+Operators who want basin-auth's identity tables on a separate external
+Postgres instance (blast-radius separation) can supply
+`BASIN_AUTH_CATALOG_DSN` as an optional override — this is not the
+default path; by default auth state lives in each tenant's own storage.
+See [`docs/deployment.md`](./docs/deployment.md#optional-external-auth-catalog).
+
+To run the same binary against object storage, set
+`BASIN_STORAGE_BACKEND=r2|s3|tigris` plus the S3-compatible endpoint, bucket,
+region, and credentials documented by `basin-storage`. If `BASIN_WAL_BACKEND`
+is unset, the WAL storage backend mirrors `BASIN_STORAGE_BACKEND`; set
+`BASIN_WAL_BACKEND=local` to keep WAL files on local disk.
 
 Connect with **any Postgres driver** — `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, your existing ORM:
 
@@ -191,16 +202,16 @@ Four layers, each with one job:
    Shard owners (stateful)    in-memory state for many tenants per process,
           │                   eviction on idle, lazy load from WAL + Parquet
           ▼
-   Regional WAL (Raft)        durable in milliseconds; flushes to S3 every ~200 ms
+   WAL                        durable append path; flushes to object storage
           │
           ▼
    Object storage + catalog   /tenants/{id}/... Parquet + Iceberg-style metadata
-                              local FS, S3, R2, GCS — same code, different bucket
+                              local FS, S3, R2, Tigris — same binary, different bucket
 ```
 
 The full architecture document is in [`docs/architecture.md`](./docs/architecture.md). Every "no" we've recorded is in [`docs/decisions/`](./docs/decisions/).
 
-**Built on:** Apache Arrow · Apache Iceberg (table format) · Apache Parquet · Apache DataFusion (SQL planner) · Tokio · pgwire-rs · openraft (planned for the WAL's distributed v0.2). Pure Rust, `#![forbid(unsafe_code)]` across every crate.
+**Built on:** Apache Arrow · Apache Iceberg (table format) · Apache Parquet · Apache DataFusion (SQL planner) · Tokio · pgwire-rs · openraft (single-process Raft WAL simulation today; cross-process distributed WAL is v0.2). Pure Rust, `#![forbid(unsafe_code)]` across every crate.
 
 ---
 
@@ -213,7 +224,7 @@ The full architecture document is in [`docs/architecture.md`](./docs/architectur
 - **Per-tenant isolation** — bucket prefix is the IAM boundary; 1,000-iter cross-tenant fuzz × 4 attack shapes finds zero leaks. RLS works through UNION + CTE shapes (P0 bypass found and fixed by the security suite this cycle).
 - **Per-tenant connection URLs (managed-Postgres feel)** — `POST /admin/v1/tenants` returns `postgres://<tenant_user>:<password>@host:5433/<db>`. Password is bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/tenants/{user}/rotate`. Cross-tenant isolation under per-tenant URLs is integration-tested; within-tenant RLS still applies.
 - **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation with reuse-detection blanket-revoke, email-link login, per-tenant API keys, per-user session settings) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`).
-- **Durable catalog** — self-contained Iceberg-style catalog backed by basin's own pgwire loopback; tables, snapshots, tenant credentials, and `basin-auth`'s `auth.users` / `auth.refresh_tokens` all survive process restart in one process. No separate database to provision. Catalog-level PITR (`rollback_to_snapshot`) and table fork (`fork_table`) shipped.
+- **Durable catalog** — Iceberg-style catalog backed by Postgres when `BASIN_CATALOG=postgres://...`; tables, snapshots, tenant credentials, and `basin-auth`'s identity tables survive process restart. The no-config local quickstart uses an in-memory catalog and is intentionally dev-only. Catalog-level PITR (`rollback_to_snapshot`) and table fork (`fork_table`) shipped.
 - **Cheap retention** — ZSTD-1 Parquet, 12.5× smaller than Postgres heap on audit-log data; A4 catalog `column_stats` skips footer fetches when the predicate prunes the file.
 - **Operations** — connection pooling, per-tenant pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-tenant counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
 
@@ -337,7 +348,7 @@ If your workload is **one of**:
 
 ## Keywords for search
 
-Basin is a **multi-tenant Postgres-compatible database** designed for **bucket-native object storage**, with **per-tenant isolation**, **native vector search** (HNSW), **ZSTD-compressed Parquet** storage, an **Apache Iceberg-style catalog**, a **Raft-backed WAL**, and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Turso**, **PlanetScale**, and **CockroachDB** for the multi-tenant SaaS, audit-log, and AI-agent platform use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.
+Basin is a **multi-tenant Postgres-compatible database** designed for **bucket-native object storage**, with **per-tenant isolation**, **native vector search** (HNSW), **ZSTD-compressed Parquet** storage, an **Apache Iceberg-style catalog**, a file-backed WAL with a Raft WAL simulation toward distributed v0.2, and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Turso**, **PlanetScale**, and **CockroachDB** for the multi-tenant SaaS, audit-log, and AI-agent platform use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.
 
 ---
 

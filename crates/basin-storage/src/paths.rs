@@ -70,6 +70,7 @@ pub(crate) fn data_file_key_in_tier(
 
 /// Prefix that all of one tenant+table's hot-tier data files live under.
 /// Used by listing.
+#[cfg(test)]
 pub(crate) fn table_data_prefix(
     root: Option<&ObjectPath>,
     tenant: &TenantId,
@@ -78,7 +79,7 @@ pub(crate) fn table_data_prefix(
     table_tier_prefix(root, tenant, table, Tier::Hot)
 }
 
-/// Tier-aware variant of [`table_data_prefix`].
+/// Prefix that all of one tenant+table's files in a storage tier live under.
 pub(crate) fn table_tier_prefix(
     root: Option<&ObjectPath>,
     tenant: &TenantId,

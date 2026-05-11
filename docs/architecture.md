@@ -99,7 +99,7 @@ the requesting tenant's prefix; this check is implemented at the
 | Layer        | Crate / service                | State          | Scaling axis             |
 | ------------ | ------------------------------ | -------------- | ------------------------ |
 | Router       | `basin-router`                 | none           | horizontal, behind LB    |
-| Auth         | `basin-auth`                   | none (state in catalog via loopback pgwire) | horizontal, peer of router |
+| Auth         | `basin-auth`                   | state in per-tenant `basin_auth.*` schema, accessed via `Engine::open_session_as` (in-process) | horizontal, peer of router |
 | REST         | `basin-rest`                   | none           | horizontal, peer of router |
 | Shard owner  | `basin-shard`                  | RAM, NVMe cache| (tenant, partition) hash |
 | WAL          | `basin-wal`                    | Raft log + S3  | one Raft group per region (or shard group) |
@@ -108,13 +108,21 @@ the requesting tenant's prefix; this check is implemented at the
 | Analytical   | `basin-analytical`             | none           | horizontal, off OLTP     |
 
 `basin-auth` is a peer crate of `basin-router`, not a separate service.
-It owns the `auth.*` schema under a reserved tenant (`basin_auth`,
-ULID auto-injected at startup) and reads / writes that schema through the
-same engine that serves application traffic, over a loopback pgwire
-connection inside the process. There is no second database, no second
-durability domain, no extra TCP hop. Operators who want auth state on an
-external OLTP store override the loopback with
-`BASIN_AUTH_CATALOG_DSN` — see [`deployment.md`](./deployment.md#optional-external-auth-catalog).
+Auth tables (`basin_auth_users`, `basin_auth_refresh_tokens`,
+`basin_auth_email_tokens`, etc.) are provisioned in **each tenant's own
+storage namespace** under a `basin_auth` schema prefix when the tenant is
+created — the same pattern Supabase uses with an `auth` schema inside
+every project's own Postgres database. There is no reserved internal
+tenant. The auth service accesses tenant auth state via
+`Engine::open_session_as(tenant_id, "basin_auth_service")` — in-process,
+no TCP connection, no loopback. Startup order is: engine → auth (with
+`EngineAuthStore`) → `StackedTenantResolver` → pgwire; there is no
+circular startup dependency. Operators who want auth state on a separate
+external Postgres instance (blast-radius isolation) can supply
+`BASIN_AUTH_CATALOG_DSN` as an optional override — see
+[`deployment.md`](./deployment.md#optional-external-auth-catalog).
+Operators reset basin-auth state via `basinctl reset-auth --yes`
+(see [`deployment.md`](./deployment.md#resetting-basin-auth-state)).
 
 ---
 
@@ -394,9 +402,9 @@ records the target shape so we don't paint ourselves into a corner.
   (S3 standard is 11 nines; that's the floor).
 - Catalog (Lakekeeper-compatible, basin-native) runs in-process on the
   shard owners, backed by the regional WAL + Parquet. No external
-  database is provisioned. `basin-auth` shares this same catalog over
-  loopback pgwire; identity state and table metadata live in one
-  durability domain by default.
+  database is provisioned. `basin-auth` stores identity tables in each
+  tenant's own storage namespace; auth state and table metadata share
+  the same durability domain by default.
 
 ### Multi-region (target)
 
@@ -408,10 +416,12 @@ records the target shape so we don't paint ourselves into a corner.
   semantics are documented per tenant SLA tier.
 - **Catalog replication.** Snapshot-and-pull of the embedded catalog
   between regions, replayed at the destination — same shape as WAL
-  segment shipping, no external service required. Operators who run
-  `BASIN_AUTH_CATALOG_DSN` against external Postgres can layer that
-  vendor's logical replication on the auth-catalog backend instead.
-  Decision recorded in Phase 6.
+  segment shipping, no external service required. Auth state replicates
+  naturally with each tenant's storage because it lives in the same
+  per-tenant namespace; no separate auth replication path is needed.
+  Operators who supply `BASIN_AUTH_CATALOG_DSN` (external Postgres
+  override) can layer that vendor's logical replication on the auth
+  backend instead. Decision recorded in Phase 6.
 - **Tenant migration** between regions runs as: drain to WAL, snapshot
   to S3, replicate, attach in the destination region, repoint placement.
   Downtime budget is seconds, not minutes.

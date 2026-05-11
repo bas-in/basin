@@ -907,6 +907,35 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
             }
         }
         Expr::Value(Value::Null) => Ok(None),
+        Expr::Function(f) => {
+            // `now()` / `current_timestamp` / `transaction_timestamp()` —
+            // zero-arg time-source functions. Used most commonly as
+            // `DEFAULT now()` on `TIMESTAMPTZ` columns; without this branch
+            // every INSERT into a table with such a default fails the
+            // moment the default is materialised by `apply_column_defaults`.
+            let fname = f
+                .name
+                .0
+                .last()
+                .map(|i| i.value.to_ascii_lowercase())
+                .unwrap_or_default();
+            let args_empty = match &f.args {
+                FunctionArguments::None => true,
+                FunctionArguments::List(list) => list.args.is_empty(),
+                _ => false,
+            };
+            match (fname.as_str(), args_empty) {
+                ("now", true)
+                | ("current_timestamp", true)
+                | ("transaction_timestamp", true)
+                | ("statement_timestamp", true)
+                | ("clock_timestamp", true) => Ok(Some(chrono::Utc::now().timestamp_micros())),
+                _ => Err(BasinError::InvalidSchema(format!(
+                    "unsupported TIMESTAMPTZ-producing function: {fname}({})",
+                    if args_empty { "" } else { "..." }
+                ))),
+            }
+        }
         other => Err(BasinError::InvalidSchema(format!(
             "expected TIMESTAMPTZ literal, got {other}"
         ))),

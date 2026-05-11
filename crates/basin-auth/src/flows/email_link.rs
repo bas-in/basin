@@ -20,7 +20,6 @@ use std::time::Duration;
 use basin_common::{BasinError, Result};
 use chrono::Utc;
 use rand::RngCore;
-use uuid::Uuid;
 
 use crate::email::{magic_link_template, Outbound};
 use crate::flows::signin::issue_tokens_for;
@@ -52,35 +51,17 @@ pub(crate) async fn request(inner: &Inner, email_raw: &str) -> Result<()> {
     let bcrypted = password::hash(&raw, inner.cfg.bcrypt_cost)?;
     let expires_at = Utc::now() + crate::ttl_or_default(MAGIC_LINK_TTL);
 
-    let client = inner.client.lock().await;
     // Only insert if a user with this email actually exists somewhere — but
     // we never tell the caller either way (204 + silence per OWASP).
-    let any_user = client
-        .query_opt(
-            &format!(
-                "SELECT 1 FROM {sch}.users WHERE email = $1 LIMIT 1",
-                sch = inner.schema()
-            ),
-            &[&email],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("magic_link user check: {e}")))?;
+    let any_user = inner.store.any_user_by_email(&email).await?;
     if any_user.is_none() {
         return Ok(());
     }
 
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {sch}.auth_magic_links (email, token_hash, expires_at)
-                 VALUES ($1, $2, $3)",
-                sch = inner.schema()
-            ),
-            &[&email, &bcrypted, &expires_at],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("magic_link insert: {e}")))?;
-    drop(client);
+    inner
+        .store
+        .insert_auth_magic_link(&email, &bcrypted, expires_at)
+        .await?;
 
     let mut out: Outbound = magic_link_template(&raw);
     out.to = email;
@@ -96,37 +77,15 @@ pub(crate) async fn consume(inner: &Inner, raw_token: &str) -> Result<Tokens> {
         return Err(BasinError::InvalidIdent("magic-link token is empty".into()));
     }
 
-    let mut client = inner.client.lock().await;
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| BasinError::catalog(format!("magic_link begin: {e}")))?;
-
     // bcrypt-verify is too expensive for index lookup. Instead: scan the
     // small set of unconsumed, unexpired rows and bcrypt-verify each.
     // 15-minute TTL keeps the working set tiny for normal traffic.
-    let candidates = tx
-        .query(
-            &format!(
-                "SELECT id, email, token_hash, expires_at, consumed_at
-                 FROM {sch}.auth_magic_links
-                 WHERE consumed_at IS NULL
-                   AND expires_at > now()
-                 FOR UPDATE",
-                sch = inner.schema()
-            ),
-            &[],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("magic_link scan: {e}")))?;
+    let candidates = inner.store.list_active_auth_magic_links().await?;
 
     let mut hit: Option<(i64, String)> = None;
     for row in candidates {
-        let id: i64 = row.get(0);
-        let email: String = row.get(1);
-        let h: String = row.get(2);
-        if password::verify(raw_token, &h)? {
-            hit = Some((id, email));
+        if password::verify(raw_token, &row.token_hash)? {
+            hit = Some((row.id, row.email));
             break;
         }
     }
@@ -134,59 +93,24 @@ pub(crate) async fn consume(inner: &Inner, raw_token: &str) -> Result<Tokens> {
         return Err(BasinError::InvalidIdent("invalid magic-link token".into()));
     };
 
-    tx.execute(
-        &format!(
-            "UPDATE {sch}.auth_magic_links SET consumed_at = now() WHERE id = $1",
-            sch = inner.schema()
-        ),
-        &[&id],
-    )
-    .await
-    .map_err(|e| BasinError::catalog(format!("magic_link consume: {e}")))?;
+    let updated = inner.store.consume_auth_magic_link(id).await?;
+    if updated == 0 {
+        return Err(BasinError::InvalidIdent(
+            "magic-link token already consumed".into(),
+        ));
+    }
 
     // v0.1: pick the most-recently-created user with this email. See the
     // module comment on the multi-tenant follow-up.
-    let user_row = tx
-        .query_opt(
-            &format!(
-                "SELECT user_id, tenant_id FROM {sch}.users
-                 WHERE email = $1
-                 ORDER BY created_at DESC
-                 LIMIT 1",
-                sch = inner.schema()
-            ),
-            &[&email],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("magic_link user lookup: {e}")))?;
-    let Some(row) = user_row else {
+    let user_row = inner.store.latest_user_by_email(&email).await?;
+    let Some((user_id, tenant)) = user_row else {
         return Err(BasinError::not_found("user for magic link"));
     };
-    let user_id: Uuid = row.get(0);
-    let tenant_str: String = row.get(1);
 
     // Possessing the inbox is also proof of email control — fold the
     // verification timestamp in.
-    tx.execute(
-        &format!(
-            "UPDATE {sch}.users
-             SET email_verified_at = COALESCE(email_verified_at, now())
-             WHERE user_id = $1",
-            sch = inner.schema()
-        ),
-        &[&user_id],
-    )
-    .await
-    .map_err(|e| BasinError::catalog(format!("magic_link mark verified: {e}")))?;
+    inner.store.mark_email_verified_by_user_id(user_id).await?;
 
-    tx.commit()
-        .await
-        .map_err(|e| BasinError::catalog(format!("magic_link commit: {e}")))?;
-    drop(client);
-
-    let tenant = tenant_str
-        .parse()
-        .map_err(|e| BasinError::internal(format!("magic_link tenant parse: {e}")))?;
     issue_tokens_for(inner, &tenant, user_id, &email).await
 }
 

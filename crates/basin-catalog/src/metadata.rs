@@ -52,17 +52,47 @@ pub struct Policy {
     pub with_check_expr: Option<String>,
 }
 
-/// Phase 5.7 B1: secondary index declaration. Records `(name, column)` for a
+/// Phase 5.7 B1: secondary index declaration. Records `(name, columns)` for a
 /// per-tenant per-table B-tree-shaped index. The physical map (value-bytes →
 /// (file, row_group, row)) is materialised lazily on first SELECT after a
 /// write; this struct is purely the catalog declaration.
 ///
-/// v0.1 supports single-column indexes only. v0.2 adds persistence to a
-/// per-tenant index file in object storage and (optionally) multi-column.
+/// Multi-column indexes are accepted at the SQL surface but materialised
+/// as metadata-only in v0.1 — queries still take a full scan. v0.2 wires
+/// the declaration through to basin-storage's secondary-index file format.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecondaryIndex {
     pub name: String,
-    pub column: String,
+    /// Columns the index keys on, in declaration order. Single-column indexes
+    /// land here as a one-element vec.
+    pub columns: Vec<String>,
+}
+
+/// One UNIQUE constraint attached to a table. Records the column list
+/// the engine enforces uniqueness over. Column-level `UNIQUE` derives a
+/// synthetic name (`<table>_<col>_key`, PG convention); table-level
+/// `UNIQUE (a, b)` uses the user-supplied `CONSTRAINT <name>` if given,
+/// otherwise `<table>_<col1>_<col2>_key`.
+///
+/// v0.1 enforces via a full-table scan on every INSERT / UPDATE — same
+/// cost shape as PRIMARY KEY enforcement. v0.2 will use the secondary
+/// index materialised from [`SecondaryIndex`] once that machinery lands
+/// in basin-storage.
+///
+/// NULL handling: PG's default `UNIQUE` treats NULL values as
+/// distinct — any number of rows may have NULL in a UNIQUE column.
+/// v0.1 matches this: rows with NULL in *any* UNIQUE column are
+/// excluded from the uniqueness check. `NULLS NOT DISTINCT` (PG 15+)
+/// is out of scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UniqueConstraint {
+    /// Auto-named `<table>_<col>_key` (column-level) or
+    /// `<table>_<col1>_<col2>_..._key` (table-level), unless the user
+    /// wrote `CONSTRAINT <name> UNIQUE (...)`.
+    pub name: String,
+    /// Columns the constraint enforces uniqueness across, in
+    /// declaration order.
+    pub columns: Vec<String>,
 }
 
 /// One CHECK constraint attached to a table. The predicate is stored as
@@ -339,6 +369,13 @@ pub struct TableMetadata {
     /// UPDATE of the *referenced* table (NO ACTION rejects when
     /// referring rows exist; CASCADE propagates).
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// UNIQUE constraints declared on this table (column-level and
+    /// table-level both land here). Enforced via full-table scan on
+    /// every INSERT / UPDATE — same cost shape as PRIMARY KEY in v0.1.
+    /// Empty when no UNIQUE constraint has been declared. v0.2 will
+    /// use the secondary index file format once basin-storage ships
+    /// it; today the scan is honest about its O(N) cost.
+    pub unique_constraints: Vec<UniqueConstraint>,
 }
 
 impl TableMetadata {

@@ -68,23 +68,7 @@ pub(crate) async fn set(
 ) -> Result<()> {
     validate_key(key)?;
     validate_value(key, value)?;
-    let tenant_str = tenant.to_string();
-    let client = inner.client.lock().await;
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {sch}.user_session_settings
-                   (tenant_id, user_id, key, value)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (tenant_id, user_id, key)
-                 DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                sch = inner.schema()
-            ),
-            &[&tenant_str, &user, &key, &value],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("session setting upsert: {e}")))?;
-    Ok(())
+    inner.store.upsert_session_setting(tenant, user, key, value).await
 }
 
 pub(crate) async fn get_all(
@@ -92,28 +76,7 @@ pub(crate) async fn get_all(
     tenant: &TenantId,
     user: UserId,
 ) -> Result<HashMap<String, String>> {
-    let tenant_str = tenant.to_string();
-    let client = inner.client.lock().await;
-    let rows = client
-        .query(
-            &format!(
-                "SELECT key, value
-                 FROM {sch}.user_session_settings
-                 WHERE tenant_id = $1 AND user_id = $2",
-                sch = inner.schema()
-            ),
-            &[&tenant_str, &user],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("session setting list: {e}")))?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let k: String = row.get(0);
-            let v: String = row.get(1);
-            (k, v)
-        })
-        .collect())
+    inner.store.list_session_settings(tenant, user).await
 }
 
 #[cfg(test)]

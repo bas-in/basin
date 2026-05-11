@@ -33,9 +33,11 @@
 
 pub mod api_keys;
 pub mod config;
+pub mod store;
 pub mod tenant_credentials;
 
-pub use tenant_credentials::{ConnectionInfo, TenantCredentialDescriptor};
+pub use store::AuthStore;
+pub use tenant_credentials::{ConnectionInfo, TenantCredentialDescriptor, is_legacy_pgwire_user};
 pub mod email;
 pub mod jwt;
 pub mod password;
@@ -61,8 +63,6 @@ use async_trait::async_trait;
 use basin_common::{BasinError, Result, TenantId};
 use chrono::{DateTime, Utc};
 use rustls::ClientConfig;
-use tokio::sync::Mutex;
-use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::instrument;
 use uuid::Uuid;
@@ -129,17 +129,11 @@ pub struct Tokens {
 /// Shared inner state. Cheap to wrap in `Arc` and clone.
 pub(crate) struct Inner {
     pub(crate) cfg: AuthConfig,
-    pub(crate) client: Mutex<Client>,
+    pub(crate) store: Arc<dyn AuthStore>,
     pub(crate) jwt: jwt::JwtKeys,
     pub(crate) mailer: Arc<dyn Mailer>,
     pub(crate) ip_limiter: rate_limit::PerKey,
     pub(crate) email_limiter: rate_limit::PerKey,
-}
-
-impl Inner {
-    pub(crate) fn schema(&self) -> &str {
-        &self.cfg.catalog_schema
-    }
 }
 
 /// Top-level auth handle. `Clone` is cheap; share across the engine, router,
@@ -215,13 +209,28 @@ impl AuthService {
             });
             client
         };
+        let store: Arc<dyn AuthStore> = Arc::new(
+            store::postgres::PostgresAuthStore::new(client, cfg.catalog_schema.clone()),
+        );
+        Self::with_store(cfg, store, mailer).await
+    }
+
+    /// Construct an `AuthService` with a pre-built `AuthStore`. Used by
+    /// `basin-server` to inject an `EngineAuthStore` that routes SQL through
+    /// basin engine's own executor — no separate Postgres connection needed.
+    pub async fn with_store(
+        cfg: AuthConfig,
+        store: Arc<dyn AuthStore>,
+        mailer: Arc<dyn Mailer>,
+    ) -> Result<Self> {
+        schema::validate_schema_ident(&cfg.catalog_schema)?;
         let jwt = jwt::JwtKeys::new(&cfg.jwt_secret);
         let ip_limiter = rate_limit::PerKey::per_minute(cfg.rate_limit_per_ip_per_min, "ip");
         let email_limiter = rate_limit::PerKey::per_minute(cfg.rate_limit_per_ip_per_min, "email");
         let svc = Self {
             inner: Arc::new(Inner {
                 cfg,
-                client: Mutex::new(client),
+                store,
                 jwt,
                 mailer,
                 ip_limiter,
@@ -235,8 +244,10 @@ impl AuthService {
     /// Run the idempotent `CREATE TABLE IF NOT EXISTS` migration. Safe to
     /// call repeatedly; first call is the only one that does work.
     pub async fn migrate(&self) -> Result<()> {
-        let client = self.inner.client.lock().await;
-        schema::run_migrations(&client, self.inner.schema()).await
+        self.inner
+            .store
+            .migrate(&self.inner.cfg.catalog_schema)
+            .await
     }
 
     // --- public flows -------------------------------------------------------
@@ -408,6 +419,65 @@ impl AuthService {
         tenant: &TenantId,
     ) -> Result<Vec<tenant_credentials::TenantCredentialDescriptor>> {
         tenant_credentials::list(&self.inner, tenant).await
+    }
+
+    /// Returns all credentials across all tenants that are in the legacy
+    /// `tenant_<hex>` format. Used by the upgrade migration to discover rows
+    /// that need to be rotated to the new `{tenant_id}_{hex}` format.
+    pub async fn list_legacy_credentials(&self) -> Result<Vec<(TenantId, String)>> {
+        tenant_credentials::list_legacy(&self.inner).await
+    }
+
+    /// Rotates a single credential from the legacy `tenant_<hex>` format to
+    /// the new `{tenant_id}_{hex}` format. Inserts the new credential row
+    /// first, then deletes the old row — safe to retry if interrupted.
+    ///
+    /// Returns `(new_pgwire_user, plaintext_password)`. The caller is
+    /// responsible for propagating the new credential to any downstream store
+    /// (e.g. basin-cloud's `project_pgwire_credentials` table).
+    pub async fn migrate_legacy_credential(
+        &self,
+        tenant: &TenantId,
+        old_pgwire_user: &str,
+    ) -> Result<(String, String)> {
+        tenant_credentials::migrate_legacy_credential(&self.inner, tenant, old_pgwire_user).await
+    }
+
+    /// Convenience method: lists all legacy credentials, rotates each one,
+    /// and returns the count of successfully migrated credentials. Failures
+    /// on individual credentials are logged but do not abort the batch —
+    /// partial progress is persisted so the next startup attempt continues
+    /// from where this one left off.
+    pub async fn migrate_legacy_credentials(&self) -> Result<u64> {
+        let legacy = self.list_legacy_credentials().await?;
+        let total = legacy.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        tracing::info!(count = total, "legacy pgwire credentials found; rotating to new format");
+        let mut migrated: u64 = 0;
+        for (tenant, old_user) in legacy {
+            match self.migrate_legacy_credential(&tenant, &old_user).await {
+                Ok((new_user, _plaintext)) => {
+                    tracing::info!(
+                        tenant = %tenant,
+                        old_pgwire_user = %old_user,
+                        new_pgwire_user = %new_user,
+                        "migrated legacy pgwire credential"
+                    );
+                    migrated += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tenant = %tenant,
+                        old_pgwire_user = %old_user,
+                        error = %e,
+                        "failed to migrate legacy pgwire credential; will retry on next startup"
+                    );
+                }
+            }
+        }
+        Ok(migrated)
     }
 
     // --- session settings ---------------------------------------------------
@@ -639,22 +709,16 @@ mod tests {
             .unwrap();
 
         // Spot check: row exists, hash isn't the plaintext.
-        let client = svc.inner.client.lock().await;
-        let row = client
-            .query_one(
-                &format!(
-                    "SELECT email, password_hash FROM {sch}.users WHERE user_id = $1",
-                    sch = svc.inner.schema()
-                ),
-                &[&user],
-            )
+        let user_row = svc
+            .inner
+            .store
+            .find_user_by_id(&t, user)
             .await
-            .unwrap();
-        let email: String = row.get(0);
-        let hash: String = row.get(1);
-        assert_eq!(email, "alice@example.com");
-        assert_ne!(hash, "longenoughpassword");
-        assert!(hash.starts_with("$2"));
+            .unwrap()
+            .expect("user must exist");
+        assert_eq!(user_row.email, "alice@example.com");
+        assert_ne!(user_row.password_hash, "longenoughpassword");
+        assert!(user_row.password_hash.starts_with("$2"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -883,19 +947,26 @@ mod tests {
         let token = last_token(&mailer);
 
         // Fake an expired email token by stamping `expires_at` in the past.
-        let client = svc.inner.client.lock().await;
-        client
-            .execute(
-                &format!(
-                    "UPDATE {sch}.email_tokens SET expires_at = now() - INTERVAL '1 hour'
-                     WHERE token_hash = $1",
-                    sch = svc.inner.schema()
-                ),
-                &[&tokens::hash_token(&token)],
-            )
-            .await
-            .unwrap();
-        drop(client);
+        // We need a direct Postgres connection for this raw UPDATE since the
+        // AuthStore trait doesn't expose a "backdate token" method (by design
+        // — no production code should need it).
+        {
+            let (raw_client, conn) = tokio_postgres::connect(PG_URL, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+            tokio::spawn(async move { let _ = conn.await; });
+            let schema = &svc.inner.cfg.catalog_schema;
+            raw_client
+                .execute(
+                    &format!(
+                        "UPDATE {schema}_email_tokens SET expires_at = now() - INTERVAL '1 hour'
+                         WHERE token_hash = $1"
+                    ),
+                    &[&tokens::hash_token(&token)],
+                )
+                .await
+                .unwrap();
+        }
 
         let err = svc.verify_email(&t, &token).await.unwrap_err();
         assert!(
@@ -1230,19 +1301,14 @@ mod tests {
         // No user exists for this address; the request must succeed (204
         // semantics on the wire) and not insert any DB row.
         svc.request_email_link("ghost@example.com").await.unwrap();
-        let client = svc.inner.client.lock().await;
-        let count: i64 = client
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*)::BIGINT FROM {sch}.auth_magic_links",
-                    sch = svc.inner.schema()
-                ),
-                &[],
-            )
+        // Verify no row was inserted: list_active_auth_magic_links should be empty.
+        let links = svc
+            .inner
+            .store
+            .list_active_auth_magic_links()
             .await
-            .unwrap()
-            .get(0);
-        assert_eq!(count, 0, "no row should be inserted for an unknown email");
+            .unwrap();
+        assert_eq!(links.len(), 0, "no row should be inserted for an unknown email");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

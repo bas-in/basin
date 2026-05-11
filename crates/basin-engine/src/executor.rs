@@ -228,6 +228,15 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         }
     }
 
+    // Rewrite `auth.uid()` / `auth.role()` / `auth.jwt()` to their
+    // underscore-namespaced UDF equivalents before handing SQL to sqlparser.
+    // DataFusion's SQL parser does not support schema-qualified function names
+    // in call position; this rewrite is safe (identifier-boundary checked)
+    // and always runs, even when auth is disabled — the UDFs simply return
+    // NULL/`'anon'` for unauthenticated sessions.
+    let sql = crate::udf::rewrite_auth_schema_functions(sql);
+    let sql = sql.as_str();
+
     // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
@@ -336,6 +345,16 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
 
     match stmt {
         Statement::CreateTable(ct) => exec_create_table(sess, ct, cluster_columns, lifecycle).await,
+        Statement::CreateIndex(ci) => exec_create_index(sess, ci).await,
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Index,
+            if_exists,
+            names,
+            cascade: _,
+            restrict: _,
+            purge: _,
+            temporary: _,
+        } => exec_drop_index(sess, if_exists, names).await,
         Statement::CreateView {
             name,
             query,
@@ -840,10 +859,195 @@ async fn exec_create_table(
             .await?;
     }
 
+    if !constraints.uniques.is_empty() {
+        sess.engine
+            .config()
+            .catalog
+            .set_unique_constraints(&sess.tenant, &table, constraints.uniques)
+            .await?;
+    }
+
     refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
 
     Ok(ExecResult::Empty {
         tag: "CREATE TABLE".into(),
+    })
+}
+
+/// `CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<col1>[, <col2>, ...])`.
+///
+/// v0.1 records the index in the catalog (per `TableMetadata::indexes`) but
+/// does NOT materialise any B-tree / sort-merge structure: every query on
+/// the indexed table still does a table scan. The catalog row exists so
+/// `information_schema.indexes` / `pg_index` introspection is honest about
+/// what's declared.
+//
+// TODO(v0.2): wire to basin-storage's secondary index file format. The
+// declaration shape here is already plural-column-aware so the storage
+// hop is a swap-in rather than a parser change.
+async fn exec_create_index(
+    sess: &TenantSession,
+    ci: sqlparser::ast::CreateIndex,
+) -> Result<ExecResult> {
+    use sqlparser::ast::{Expr, OrderByExpr};
+    // UNIQUE / CONCURRENTLY / INCLUDE / WHERE / WITH on the index are
+    // out of scope for v0.1; reject explicitly so the user knows
+    // their constraint isn't being silently enforced.
+    if ci.unique {
+        return Err(BasinError::FeatureNotSupported(
+            "CREATE UNIQUE INDEX is not supported in v0.1; declare UNIQUE on the table \
+             (`UNIQUE (col, ...)` at CREATE TABLE) for uniqueness enforcement"
+                .into(),
+        ));
+    }
+    if ci.concurrently {
+        return Err(BasinError::FeatureNotSupported(
+            "CREATE INDEX CONCURRENTLY is not supported in v0.1".into(),
+        ));
+    }
+    if !ci.include.is_empty() {
+        return Err(BasinError::FeatureNotSupported(
+            "CREATE INDEX ... INCLUDE (...) is not supported in v0.1".into(),
+        ));
+    }
+    if ci.predicate.is_some() {
+        return Err(BasinError::FeatureNotSupported(
+            "CREATE INDEX ... WHERE <predicate> (partial index) is not supported in v0.1".into(),
+        ));
+    }
+    if !ci.with.is_empty() {
+        return Err(BasinError::FeatureNotSupported(
+            "CREATE INDEX ... WITH (...) is not supported in v0.1".into(),
+        ));
+    }
+
+    let table_name = single_part_name(&ci.table_name)?;
+    let table = TableName::new(table_name)?;
+
+    // PG requires an index name; sqlparser accepts the omitted form
+    // (anonymous indexes). Mint a deterministic synthetic name when
+    // the user didn't write one: `<table>_<col1>_<col2>_idx`. The
+    // catalog still rejects duplicates against existing indexes, so
+    // anonymous CREATE INDEX twice in a row will collide unless
+    // `IF NOT EXISTS` was specified.
+    let index_name = match &ci.name {
+        Some(n) => single_part_name(n)?.to_string(),
+        None => {
+            // Build a fallback from the column list; resolved below.
+            String::new()
+        }
+    };
+
+    // Pull bare identifier columns out of the OrderByExpr list. ASC /
+    // DESC / NULLS FIRST / NULLS LAST are accepted (and ignored at this
+    // stage — v0.1 storage is order-agnostic).
+    let mut columns: Vec<String> = Vec::with_capacity(ci.columns.len());
+    for ob in &ci.columns {
+        let OrderByExpr { expr, .. } = ob;
+        match expr {
+            Expr::Identifier(ident) => columns.push(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
+                columns.push(parts[0].value.clone())
+            }
+            other => {
+                return Err(BasinError::FeatureNotSupported(format!(
+                    "CREATE INDEX expression columns are not supported in v0.1: {other}"
+                )));
+            }
+        }
+    }
+    if columns.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "CREATE INDEX: column list cannot be empty".into(),
+        ));
+    }
+
+    let index_name = if index_name.is_empty() {
+        format!("{}_{}_idx", table_name, columns.join("_"))
+    } else {
+        index_name
+    };
+
+    // Verify the table exists in this tenant before we touch the
+    // catalog's create_index entry point (it would surface NotFound
+    // otherwise; we'd rather a clear up-front error).
+    sess.engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, &table)
+        .await
+        .map_err(|e| match e {
+            BasinError::NotFound(_) => BasinError::InvalidSchema(format!(
+                "CREATE INDEX: table {table_name:?} does not exist in this tenant"
+            )),
+            other => other,
+        })?;
+
+    sess.engine
+        .config()
+        .catalog
+        .create_index(
+            &sess.tenant,
+            &table,
+            &index_name,
+            &columns,
+            ci.if_not_exists,
+        )
+        .await?;
+
+    Ok(ExecResult::Empty {
+        tag: "CREATE INDEX".into(),
+    })
+}
+
+/// `DROP INDEX [IF EXISTS] <name>`. Removes the catalog row only —
+/// there's nothing to physically tear down because v0.1 doesn't
+/// materialise any index file.
+async fn exec_drop_index(
+    sess: &TenantSession,
+    if_exists: bool,
+    names: Vec<sqlparser::ast::ObjectName>,
+) -> Result<ExecResult> {
+    if names.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "DROP INDEX requires at least one index name".into(),
+        ));
+    }
+    for n in &names {
+        let index_name = single_part_name(n)?;
+        // The catalog stores indexes per-table; we don't track a
+        // global (tenant, index-name) → table mapping. Scan every
+        // table in the tenant for a matching declaration.
+        let tables = sess
+            .engine
+            .config()
+            .catalog
+            .list_tables(&sess.tenant)
+            .await?;
+        let mut found = false;
+        for t in &tables {
+            let meta = sess
+                .engine
+                .config()
+                .catalog
+                .load_table(&sess.tenant, t)
+                .await?;
+            if meta.indexes.iter().any(|i| i.name == index_name) {
+                sess.engine
+                    .config()
+                    .catalog
+                    .drop_index(&sess.tenant, t, index_name)
+                    .await?;
+                found = true;
+                break;
+            }
+        }
+        if !found && !if_exists {
+            return Err(BasinError::NotFound(format!("index {index_name:?}")));
+        }
+    }
+    Ok(ExecResult::Empty {
+        tag: "DROP INDEX".into(),
     })
 }
 
@@ -955,6 +1159,15 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
                 &batch,
             )
             .await?;
+            crate::constraints::enforce_unique_on_insert(
+                &sess.engine.config().storage,
+                &sess.tenant,
+                &table,
+                table.as_str(),
+                &meta.unique_constraints,
+                &batch,
+            )
+            .await?;
             materialised_groups.push((pkey, batch));
         }
 
@@ -1028,6 +1241,15 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         &table,
         table.as_str(),
         &meta.pk_columns,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_unique_on_insert(
+        &sess.engine.config().storage,
+        &sess.tenant,
+        &table,
+        table.as_str(),
+        &meta.unique_constraints,
         &batch,
     )
     .await?;
@@ -1275,6 +1497,15 @@ async fn exec_insert_select(
         table,
         table.as_str(),
         &meta.pk_columns,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_unique_on_insert(
+        &sess.engine.config().storage,
+        &sess.tenant,
+        table,
+        table.as_str(),
+        &meta.unique_constraints,
         &batch,
     )
     .await?;

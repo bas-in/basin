@@ -69,42 +69,24 @@ pub(crate) async fn refresh(inner: &Inner, raw: &str) -> Result<Tokens> {
     }
 
     let blanket = blanket_key(claims.user_id);
-    let mut client = inner.client.lock().await;
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| BasinError::catalog(format!("refresh begin: {e}")))?;
 
     // Pull every revocation row for this user that's still relevant. Two
     // possible hits: an exact-jti revoke (this token was rotated already →
     // reuse), or a blanket sentinel (whole-user revoked).
-    let rows = tx
-        .query(
-            &format!(
-                "SELECT token_hash, revoked_at, expires_at
-                 FROM {sch}.auth_revoked_refresh_tokens
-                 WHERE user_id = $1 AND expires_at > now()",
-                sch = inner.schema()
-            ),
-            &[&claims.user_id],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("refresh revoke list: {e}")))?;
+    let rows = inner.store.list_refresh_revocations(claims.user_id).await?;
 
     let mut self_revoked_at: Option<DateTime<Utc>> = None;
     let mut blanket_revoked_at: Option<DateTime<Utc>> = None;
     let mut newest_revoked_at: Option<DateTime<Utc>> = None;
     for row in &rows {
-        let key: String = row.get(0);
-        let revoked_at: DateTime<Utc> = row.get(1);
-        if key == claims.jti {
-            self_revoked_at = Some(revoked_at);
-        } else if key == blanket {
-            blanket_revoked_at = Some(revoked_at);
+        if row.token_hash == claims.jti {
+            self_revoked_at = Some(row.revoked_at);
+        } else if row.token_hash == blanket {
+            blanket_revoked_at = Some(row.revoked_at);
         } else {
             newest_revoked_at = Some(match newest_revoked_at {
-                Some(prev) if prev > revoked_at => prev,
-                _ => revoked_at,
+                Some(prev) if prev > row.revoked_at => prev,
+                _ => row.revoked_at,
             });
         }
     }
@@ -123,23 +105,10 @@ pub(crate) async fn refresh(inner: &Inner, raw: &str) -> Result<Tokens> {
         // token. Revoke everything.
         let is_reuse = newest_revoked_at.is_some_and(|n| n > self_ts);
         if is_reuse {
-            tx.execute(
-                &format!(
-                    "INSERT INTO {sch}.auth_revoked_refresh_tokens
-                       (token_hash, user_id, revoked_at, expires_at)
-                     VALUES ($1, $2, now(), $3)
-                     ON CONFLICT (token_hash) DO UPDATE
-                       SET revoked_at = now(),
-                           expires_at = EXCLUDED.expires_at",
-                    sch = inner.schema()
-                ),
-                &[&blanket, &claims.user_id, &exp_dt],
-            )
-            .await
-            .map_err(|e| BasinError::catalog(format!("refresh blanket revoke: {e}")))?;
-            tx.commit()
-                .await
-                .map_err(|e| BasinError::catalog(format!("refresh blanket commit: {e}")))?;
+            inner
+                .store
+                .upsert_blanket_revocation(&blanket, claims.user_id, exp_dt)
+                .await?;
             tracing::warn!(
                 user_id = %claims.user_id,
                 "refresh-token reuse detected; blanket-revoking user"
@@ -150,23 +119,13 @@ pub(crate) async fn refresh(inner: &Inner, raw: &str) -> Result<Tokens> {
     }
 
     // Fresh, valid refresh → record this jti as rotated and issue a new pair.
-    tx.execute(
-        &format!(
-            "INSERT INTO {sch}.auth_revoked_refresh_tokens
-               (token_hash, user_id, revoked_at, expires_at)
-             VALUES ($1, $2, now(), $3)
-             ON CONFLICT (token_hash) DO NOTHING",
-            sch = inner.schema()
-        ),
-        &[&claims.jti, &claims.user_id, &exp_dt],
-    )
-    .await
-    .map_err(|e| BasinError::catalog(format!("refresh revoke old: {e}")))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| BasinError::catalog(format!("refresh commit: {e}")))?;
-    drop(client);
+    let inserted = inner
+        .store
+        .insert_refresh_revocation(&claims.jti, claims.user_id, exp_dt)
+        .await?;
+    if inserted == 0 {
+        return Err(BasinError::InvalidIdent("refresh token revoked".into()));
+    }
 
     issue_tokens_for(inner, &claims.tenant_id, claims.user_id, &claims.email).await
 }
@@ -180,20 +139,10 @@ pub(crate) async fn signout(inner: &Inner, raw: &str) -> Result<()> {
     let exp_dt = DateTime::<Utc>::from_timestamp(claims.exp, 0)
         .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
 
-    let client = inner.client.lock().await;
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {sch}.auth_revoked_refresh_tokens
-                   (token_hash, user_id, revoked_at, expires_at)
-                 VALUES ($1, $2, now(), $3)
-                 ON CONFLICT (token_hash) DO UPDATE SET revoked_at = now()",
-                sch = inner.schema()
-            ),
-            &[&claims.jti, &claims.user_id, &exp_dt],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("signout insert: {e}")))?;
+    inner
+        .store
+        .upsert_refresh_revocation(&claims.jti, claims.user_id, exp_dt)
+        .await?;
     Ok(())
 }
 
@@ -202,18 +151,7 @@ pub(crate) async fn signout(inner: &Inner, raw: &str) -> Result<()> {
 /// admin verb; runtime correctness is unaffected because every read filters
 /// `expires_at > now()`.
 #[allow(dead_code)]
-pub(crate) async fn purge_expired(inner: &Inner) -> Result<u64> {
-    let client = inner.client.lock().await;
-    let n = client
-        .execute(
-            &format!(
-                "DELETE FROM {sch}.auth_revoked_refresh_tokens
-                 WHERE expires_at < now()",
-                sch = inner.schema()
-            ),
-            &[],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("refresh gc: {e}")))?;
-    Ok(n)
+pub(crate) async fn purge_expired(_inner: &Inner) -> Result<u64> {
+    // TODO: expose a purge method on AuthStore when GC is wired up
+    Ok(0)
 }

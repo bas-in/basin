@@ -30,6 +30,10 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 mimalloc.workspace = true
 async-trait.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -32,7 +32,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use basin_common::Result;
 use basin_engine::{
-    BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema, TenantSession,
+    AuthContext, BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema,
+    TenantSession,
 };
 use futures::sink::{Sink, SinkExt};
 use pgwire::api::auth::{
@@ -1601,7 +1602,69 @@ pub(crate) trait SessionFactory: Send + Sync {
 }
 
 /// Bridge to `basin_engine::Engine`.
-pub(crate) struct EngineSessionFactory(pub basin_engine::Engine);
+///
+/// When `auth` is `Some`, the factory attempts to decode the `username`
+/// as a JWT on every new connection. If decoding succeeds the session is
+/// opened with the decoded `AuthContext` (populating `auth.uid()` /
+/// `auth.role()` / `auth.jwt()`). Non-JWT usernames (static resolver
+/// scenarios) fall back to an anonymous `AuthContext` gracefully.
+pub(crate) struct EngineSessionFactory {
+    pub engine: basin_engine::Engine,
+    /// Optional auth service for JWT decoding at session-open time.
+    pub auth: Option<Arc<basin_auth::AuthService>>,
+}
+
+impl EngineSessionFactory {
+    pub fn new(engine: basin_engine::Engine) -> Self {
+        Self { engine, auth: None }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_auth(engine: basin_engine::Engine, auth: Arc<basin_auth::AuthService>) -> Self {
+        Self {
+            engine,
+            auth: Some(auth),
+        }
+    }
+}
+
+/// Build an `AuthContext` from a pgwire `username` string, attempting JWT
+/// decoding when an `AuthService` is available. Returns `anonymous` context
+/// on any failure (wrong format, expired token, no auth service).
+fn auth_context_from_username(
+    username: &str,
+    auth: Option<&basin_auth::AuthService>,
+) -> AuthContext {
+    let Some(auth_svc) = auth else {
+        return AuthContext::anonymous();
+    };
+    // Strip optional `Bearer ` prefix — same as `JwtTenantResolver`.
+    let token = username.strip_prefix("Bearer ").unwrap_or(username);
+    match auth_svc.verify_jwt(token) {
+        Ok(claims) => {
+            // Role: first entry in `claims.roles`, or `"authenticated"` as default.
+            let role = claims
+                .roles
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "authenticated".to_string());
+            // Build the full claims JSON so `auth.jwt()` can return it.
+            let claims_json = serde_json::json!({
+                "sub": claims.user_id.to_string(),
+                "user_id": claims.user_id.to_string(),
+                "email": claims.email,
+                "roles": claims.roles,
+                "exp": claims.exp,
+                "iat": claims.iat,
+            });
+            AuthContext::from_jwt(claims.user_id, role, claims_json)
+        }
+        Err(_) => {
+            // Not a JWT or expired — anonymous context.
+            AuthContext::anonymous()
+        }
+    }
+}
 
 #[async_trait]
 impl SessionFactory for EngineSessionFactory {
@@ -1609,9 +1672,13 @@ impl SessionFactory for EngineSessionFactory {
     async fn open(
         &self,
         tenant: basin_common::TenantId,
-        _username: &str,
+        username: &str,
     ) -> Result<Arc<TenantSession>> {
-        let s = self.0.open_session(tenant).await?;
+        let auth_ctx = auth_context_from_username(username, self.auth.as_deref());
+        let s = self
+            .engine
+            .open_session_with_auth(tenant, username, auth_ctx)
+            .await?;
         Ok(Arc::new(s))
     }
 }

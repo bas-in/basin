@@ -273,6 +273,84 @@ catalog matures; it is not the default.
 
 ---
 
+## Resetting basin-auth state
+
+Because basin-auth's tables live inside the engine catalog (the loopback
+shape described above), wiping them does not require destroying the WAL or
+the application data tables — it is just a series of `DROP TABLE`s scoped
+to the `basin_auth_*` namespace. The `basinctl reset-auth` command bundles
+that into one safe call.
+
+**When to use it**
+
+- Local / CI / test environments that want a clean slate between runs.
+- Schema-incompat upgrades where the rebootstrap on next start needs to
+  run against an empty namespace (e.g. a column type changed and
+  idempotent `CREATE TABLE IF NOT EXISTS` won't re-shape an existing
+  table).
+- Recovering from a broken-state auth catalog (e.g. a botched manual
+  migration) without rebuilding the entire engine instance.
+
+**What it does**
+
+```sh
+# Wipe users, sessions, api keys, magic links, … but keep tenant-pgwire creds.
+basinctl reset-auth --yes
+
+# Same, but also clear the per-tenant pgwire-credentials table — this logs
+# every customer out of the pgwire endpoint until creds are re-issued.
+basinctl reset-auth --yes --include-tenant-creds
+
+# Point at a non-default engine endpoint.
+basinctl reset-auth --yes \
+  --engine-url postgres://basin_auth:basin_auth@10.0.0.7:5433/basin?sslmode=disable
+```
+
+The command refuses to run without `--yes`. It connects as the reserved
+`basin_auth` user (whose creds the static resolver maps via the
+auto-injected reserved tenant) and runs `DROP TABLE IF EXISTS` for each
+`basin_auth_*` table in child-before-parent order. By default the
+per-tenant pgwire-credentials table (`basin_auth_auth_tenant_credentials`)
+is left intact — pass `--include-tenant-creds` to drop it as well.
+
+**What it does not touch**
+
+- Application / customer data tables — only identifiers in the
+  `basin_auth_*` namespace are affected.
+- WAL segments, Iceberg snapshots, R2 buckets — there is no object-store
+  cleanup involved.
+- The reserved `basin_auth` tenant entry on the router — that is
+  auto-injected on every start.
+
+**After running**
+
+Restart `basin-server`. Boot calls `basin_auth::schema::run_migrations`
+which is idempotent and recreates the empty schema. There is no separate
+"init" step.
+
+**Verify the reset**
+
+```sh
+psql "postgres://basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable" \
+  -c "SELECT count(*) FROM basin_auth_users"
+# ERROR: relation "basin_auth_users" does not exist   (before restart)
+# 0                                                   (after restart)
+```
+
+Or, more thoroughly, list every surviving `basin_auth_*` table:
+
+```sh
+psql "$BASIN_AUTH_URL" -c "
+  SELECT table_name FROM information_schema.tables
+  WHERE table_name LIKE 'basin_auth_%'
+  ORDER BY table_name"
+```
+
+Pre-restart: empty result set. Post-restart: the 8 tables from
+`basin_auth::schema::run_migrations`.
+
+---
+
 ## References
 
 - [`architecture.md`](./architecture.md) — the four-layer system

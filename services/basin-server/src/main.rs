@@ -23,6 +23,17 @@
 //! BASIN_CATALOG_SCHEMA=basin_catalog                    # optional, default = basin_catalog
 //! ```
 //!
+//! Object storage is selected via `BASIN_STORAGE_BACKEND`:
+//!
+//! ```text
+//! BASIN_STORAGE_BACKEND=local                           # default; uses BASIN_DATA_DIR
+//! BASIN_STORAGE_BACKEND=r2|s3|tigris                    # S3-compatible object store
+//! BASIN_STORAGE_ROOT_PREFIX=warehouse                   # optional bucket sub-prefix
+//! ```
+//!
+//! S3-compatible backends use `BASIN_STORAGE_*` / AWS-compatible env vars parsed
+//! by `basin_storage::backends::r2::S3LikeConfig`.
+//!
 //! ## WAL + shard owner
 //!
 //! Two env vars gate the new WAL-acked write path:
@@ -30,6 +41,8 @@
 //! ```text
 //! BASIN_SHARD_ENABLED=1     # default 0; when 1, INSERTs route through basin-shard
 //! BASIN_WAL_DIR=/tmp/wal    # default ${BASIN_DATA_DIR}/wal
+//! BASIN_WAL_BACKEND=local   # optional; unset mirrors BASIN_STORAGE_BACKEND
+//! BASIN_WAL_ROOT_PREFIX=wal-archive # optional; defaults to BASIN_STORAGE_ROOT_PREFIX
 //! ```
 //!
 //! When `BASIN_SHARD_ENABLED=1`, the server opens a `basin-wal::Wal` rooted at
@@ -50,6 +63,24 @@
 //! BASIN_REST_ENABLED=1                     # default 0; start basin-rest (REQUIRES BASIN_AUTH_ENABLED=1)
 //! BASIN_REST_BIND=127.0.0.1:5434           # rest server bind addr; default 127.0.0.1:5434
 //! ```
+//!
+//! ## Auth storage backend
+//!
+//! When `BASIN_AUTH_ENABLED=1`, auth tables are stored in-process by default:
+//! the server builds an `EngineAuthStore` that runs SQL directly against the
+//! in-process `basin_engine::Engine` under the reserved
+//! `INTERNAL_AUTH_TENANT_ID`. This eliminates the loopback TCP round-trip and
+//! the chicken-and-egg startup ordering problem it caused.
+//!
+//! Operators who need auth stored in an external Postgres (Neon, RDS, etc.)
+//! can still override via `BASIN_AUTH_CATALOG_DSN`:
+//!
+//! ```text
+//! BASIN_AUTH_CATALOG_DSN=postgres://user:pass@host/dbname
+//! ```
+//!
+//! When that env var is set, the server falls back to `AuthService::connect`
+//! (outbound TCP, the old path) instead of `EngineAuthStore`.
 //!
 //! ## Analytical (DuckDB) path
 //!
@@ -91,24 +122,24 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::future::Future;
+mod engine_auth_store;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use basin_common::{
     telemetry::{init, LogFormat},
-    BasinError, TenantId,
+    TenantId,
 };
 use basin_router::{
-    ApiKeyTenantResolver, JwtTenantResolver, ServerConfig, StaticTenantResolver, TenantResolver,
-    TlsConfig,
+    ApiKeyTenantResolver, JwtTenantResolver, ServerConfig, StackedTenantResolver,
+    StaticTenantResolver, TenantCredentialsResolver, TenantResolver, TlsConfig,
 };
 use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
+use object_store::ObjectStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -129,8 +160,7 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("create data dir {}", cfg.data_dir.display()))?;
-    let fs = LocalFileSystem::new_with_prefix(&cfg.data_dir)
-        .with_context(|| format!("LocalFileSystem at {}", cfg.data_dir.display()))?;
+    let object_store = build_storage_object_store(&cfg)?;
 
     // Production cache defaults: disk + page cache ON unless explicitly
     // disabled. Knobs (in priority order, highest wins):
@@ -200,8 +230,8 @@ async fn main() -> Result<()> {
     );
 
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
-        object_store: Arc::new(fs),
-        root_prefix: None,
+        object_store,
+        root_prefix: cfg.storage_root_prefix.clone(),
         disk_cache,
         page_cache,
     });
@@ -228,14 +258,11 @@ async fn main() -> Result<()> {
         Arc<dyn basin_wal::Wal>,
     )> = None;
     let shard_for_engine: Option<basin_shard::Shard> = if cfg.shard_enabled {
-        std::fs::create_dir_all(&cfg.wal_dir)
-            .with_context(|| format!("create WAL dir {}", cfg.wal_dir.display()))?;
-        let wal_fs = LocalFileSystem::new_with_prefix(&cfg.wal_dir)
-            .with_context(|| format!("WAL LocalFileSystem at {}", cfg.wal_dir.display()))?;
+        let wal_store = build_wal_object_store(&cfg)?;
         let wal: Arc<dyn basin_wal::Wal> = Arc::new(
             basin_wal::LocalWal::open(basin_wal::WalConfig {
-                object_store: Arc::new(wal_fs),
-                root_prefix: None,
+                object_store: wal_store,
+                root_prefix: cfg.wal_root_prefix.clone(),
                 flush_interval: std::time::Duration::from_millis(200),
                 flush_max_bytes: 1024 * 1024,
             })
@@ -286,50 +313,97 @@ async fn main() -> Result<()> {
         engine
     };
 
-    // Build the static resolver from `BASIN_TENANTS`. We then ALWAYS
-    // auto-inject `basin_auth -> INTERNAL_AUTH_TENANT_ID` so basin-auth can
-    // authenticate as itself over the loopback pgwire catalog path — even
-    // when auth is off, the entry is harmless (basin-auth only uses it when
-    // it's actually starting up). The reserved entry is the seed that
-    // unblocks the chicken-and-egg in the auth-on case: basin-auth needs the
-    // listener up, the listener needs a resolver, the resolver needs an
-    // identity for basin-auth.
+    // Build the static resolver from `BASIN_TENANTS`.
     let mut static_resolver = StaticTenantResolver::default();
     for (user, tenant) in cfg.tenants {
         tracing::info!(%user, %tenant, "tenant registered");
         static_resolver = static_resolver.with_entry(user, tenant);
     }
-    let internal_auth_tenant: TenantId = basin_auth::INTERNAL_AUTH_TENANT_ID
-        .parse()
-        .map_err(|e| anyhow!("INTERNAL_AUTH_TENANT_ID is not a valid tenant id: {e}"))?;
-    static_resolver =
-        static_resolver.with_entry(basin_auth::INTERNAL_AUTH_USERNAME, internal_auth_tenant);
-    tracing::info!(
-        user = basin_auth::INTERNAL_AUTH_USERNAME,
-        tenant = %internal_auth_tenant,
-        "reserved system tenant auto-registered for basin-auth loopback"
-    );
 
-    // Resolver stack with a lazy auth slot. The listener has to come up
-    // BEFORE basin-auth's `connect()` runs (basin-auth's catalog now lives
-    // inside engine's own pgwire), so the resolver `ServerConfig` takes can't
-    // yet hold the `AuthService`. Instead we build a `DeferredAuthResolver`:
-    // a static-first resolver with a `OnceLock<Arc<AuthService>>` for JWT +
-    // API-key paths. Until the cell is filled, the resolver is just
-    // static. After basin-auth boots, we `set()` the cell and JWT clients
-    // start working — same final behaviour as the pre-loopback wiring.
-    let auth_slot: Arc<OnceLock<Arc<basin_auth::AuthService>>> = Arc::new(OnceLock::new());
-    let tenant_resolver: Arc<dyn TenantResolver> = Arc::new(DeferredAuthResolver {
-        static_resolver,
-        auth_slot: auth_slot.clone(),
-    });
-    if cfg.auth_enabled {
-        tracing::info!(
-            "pgwire resolver: JWT + API-key (deferred until basin-auth is up) + static (always)"
-        );
+    // --- optional auth service (built before the router) --------------------
+    //
+    // With `EngineAuthStore`, basin-auth no longer needs an outbound TCP
+    // connection back to our own pgwire listener. We can build the full
+    // AuthService in-process and hand the live resolvers directly to
+    // `StackedTenantResolver` before the pgwire router even binds.
+    //
+    // Fallback: when `BASIN_AUTH_CATALOG_DSN` is explicitly set, operators
+    // want auth stored in an external Postgres. In that case we fall back to
+    // `AuthService::connect` (the old outbound-TCP path). The pgwire listener
+    // is started before the connect in that case to keep the loopback option
+    // available, but for most deployments the in-process path is preferred.
+    let auth_service: Option<Arc<basin_auth::AuthService>> = if cfg.auth_enabled {
+        let auth_cfg = basin_auth::AuthConfig::from_env()
+            .context("BASIN_AUTH_ENABLED=1 but AuthConfig::from_env failed")?;
+
+        let has_external_dsn = auth_cfg.catalog_dsn.is_some();
+
+        let svc = if has_external_dsn {
+            // External Postgres path: connect outbound. The listener need not
+            // be up first because we're hitting a real PG, not ourselves.
+            tracing::info!("basin-auth: using external BASIN_AUTH_CATALOG_DSN (outbound Postgres)");
+            basin_auth::AuthService::connect(auth_cfg)
+                .await
+                .context("basin-auth connect (external DSN) failed")?
+        } else {
+            // In-process path: build EngineAuthStore backed by the engine we
+            // just constructed — no loopback TCP, no OnceLock, no race.
+            tracing::info!("basin-auth: using in-process EngineAuthStore (no loopback TCP)");
+            let internal_auth_tenant: TenantId = basin_auth::INTERNAL_AUTH_TENANT_ID
+                .parse()
+                .map_err(|e| anyhow!("INTERNAL_AUTH_TENANT_ID is not a valid tenant id: {e}"))?;
+            let auth_store = Arc::new(engine_auth_store::EngineAuthStore::new(
+                Arc::new(engine.clone()),
+                auth_cfg.catalog_schema.clone(),
+                internal_auth_tenant,
+            ));
+            let mailer: Arc<dyn basin_auth::Mailer> =
+                Arc::new(basin_auth::SmtpMailer::from_config(&auth_cfg.smtp)?);
+            basin_auth::AuthService::with_store(auth_cfg, auth_store, mailer)
+                .await
+                .context("basin-auth with_store (EngineAuthStore) failed")?
+        };
+
+        tracing::info!("basin-auth enabled");
+        Some(Arc::new(svc))
+    } else {
+        None
+    };
+
+    // Migrate legacy pgwire credentials to the new self-routing format.
+    // This is safe to run on every startup — `list_legacy_credentials`
+    // returns an empty list once all rows have been rotated, so subsequent
+    // runs are instant no-ops. Failures warn but do not abort startup:
+    // old-format credentials remain valid during the transition window.
+    if let Some(ref auth) = auth_service {
+        match auth.migrate_legacy_credentials().await {
+            Ok(n) if n > 0 => tracing::info!(
+                count = n,
+                "migrated legacy pgwire credentials to new self-routing format"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                "legacy credential migration failed — will retry on next startup"
+            ),
+        }
+    }
+
+    // Build the resolver stack. When auth is enabled we have a live
+    // AuthService right now (no deferred slot needed), so we wire up the
+    // full JWT + API-key + credentials + static stack immediately.
+    let tenant_resolver: Arc<dyn TenantResolver> = if let Some(ref auth) = auth_service {
+        tracing::info!("pgwire resolver: credentials + JWT + API-key + static");
+        Arc::new(StackedTenantResolver::new(vec![
+            Arc::new(TenantCredentialsResolver::new(auth.clone())),
+            Arc::new(JwtTenantResolver::new(auth.clone())),
+            Arc::new(ApiKeyTenantResolver::new(auth.clone())),
+            Arc::new(static_resolver),
+        ]))
     } else {
         tracing::info!("pgwire resolver: static (auth disabled)");
-    }
+        Arc::new(static_resolver)
+    };
 
     // --- optional connection pool ------------------------------------------
     //
@@ -356,11 +430,9 @@ async fn main() -> Result<()> {
         tracing::info!("pgwire TLS configured from BASIN_TLS_CERT_PATH/BASIN_TLS_KEY_PATH");
     }
 
-    // Spawn the pgwire router BEFORE basin-auth starts. basin-auth's catalog
-    // now lives inside basin engine's own pgwire (loopback DSN by default),
-    // so the listener must be `accept()`-able by the time `AuthService::
-    // connect()` runs.
-    let (router_tx, router_rx) = tokio::sync::oneshot::channel();
+    // Spawn the pgwire router. The resolver is fully wired with live auth
+    // resolvers (when auth is enabled) so JWT / API-key / credential clients
+    // work from the very first connection — no deferred slot needed.
     let server_cfg = ServerConfig {
         bind_addr: cfg.bind,
         engine: engine.clone(),
@@ -369,42 +441,10 @@ async fn main() -> Result<()> {
         shard_endpoints: None,
         tls,
     };
-    let router_bind = cfg.bind;
-
-    let router_join =
-        tokio::spawn(async move { basin_router::run_with_shutdown(server_cfg, router_rx).await });
-
-    // Wait until the pgwire listener is accept()-able. A short TCP probe loop
-    // is sufficient and avoids a deeper coupling with `basin-router::run`. 5s
-    // upper bound — anything slower means the bind itself failed and we want
-    // to surface that, not hang here.
-    wait_for_pgwire_accept(router_bind)
+    let router = basin_router::run_until_bound(server_cfg)
         .await
-        .context("pgwire listener never became accept-able")?;
-    tracing::info!(bind = %router_bind, "pgwire listener is accept-ready");
-
-    // --- optional auth service (now that pgwire is up) ---------------------
-    //
-    // basin-auth's default catalog DSN is the loopback `postgres://
-    // basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable` — engine's
-    // own pgwire. The `basin_auth` username resolves through the
-    // auto-injected static-tenant entry above. Operators can still override
-    // by setting `BASIN_AUTH_CATALOG_DSN` to an external Postgres.
-    let auth_service: Option<Arc<basin_auth::AuthService>> = if cfg.auth_enabled {
-        let auth_cfg = basin_auth::AuthConfig::from_env()
-            .context("BASIN_AUTH_ENABLED=1 but AuthConfig::from_env failed")?;
-        let svc = basin_auth::AuthService::connect(auth_cfg)
-            .await
-            .context("basin-auth connect failed")?;
-        tracing::info!("basin-auth enabled");
-        let arced = Arc::new(svc);
-        // Activate JWT + API-key paths now that AuthService is ready. `set`
-        // is idempotent — the slot is owned by us and only filled here.
-        let _ = auth_slot.set(arced.clone());
-        Some(arced)
-    } else {
-        None
-    };
+        .context("basin-router bind failed")?;
+    tracing::info!(bind = %router.local_addr, "pgwire listener is accept-ready");
 
     // --- optional REST listener --------------------------------------------
     //
@@ -429,7 +469,7 @@ async fn main() -> Result<()> {
     // Wait for Ctrl-C, then signal the router to stop.
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");
-    let _ = router_tx.send(());
+    let _ = router.shutdown.send(());
 
     // Tear down REST first so requests in flight don't survive past the
     // router; then the eviction loop; then router; then shard / WAL. The
@@ -445,7 +485,7 @@ async fn main() -> Result<()> {
         h.shutdown().await;
     }
 
-    let router_result = router_join.await.map_err(|e| anyhow!("router join: {e}"))?;
+    let router_result = router.join.await.map_err(|e| anyhow!("router join: {e}"))?;
 
     if let Some((_, bg, wal)) = shard_handles.take() {
         tracing::info!("draining shard background loops");
@@ -476,6 +516,8 @@ struct Cfg {
     rest_bind: SocketAddr,
     tenants: Vec<(String, TenantId)>,
     catalog: CatalogBackend,
+    storage_root_prefix: Option<ObjectPath>,
+    wal_root_prefix: Option<ObjectPath>,
 }
 
 enum CatalogBackend {
@@ -529,6 +571,9 @@ impl Cfg {
             return Err(anyhow!("BASIN_TENANTS produced no entries"));
         }
         let catalog = parse_catalog_env()?;
+        let storage_root_prefix = parse_object_prefix_env("BASIN_STORAGE_ROOT_PREFIX")?;
+        let wal_root_prefix = parse_object_prefix_env("BASIN_WAL_ROOT_PREFIX")?
+            .or_else(|| storage_root_prefix.clone());
         Ok(Self {
             bind,
             data_dir,
@@ -541,92 +586,9 @@ impl Cfg {
             rest_bind,
             tenants,
             catalog,
+            storage_root_prefix,
+            wal_root_prefix,
         })
-    }
-}
-
-/// Resolver that fronts a `StaticTenantResolver` with a lazily-populated
-/// `AuthService`-backed JWT + API-key path. While the slot is empty (during
-/// startup, before `basin_auth::AuthService::connect()` completes), the
-/// resolver behaves as if only the static map exists — exactly what we need
-/// for basin-auth's own loopback connect, which authenticates as the
-/// reserved `basin_auth` user. After the slot is filled, JWT and API-key
-/// clients on the same listener get the full stack.
-///
-/// Static-first resolver with a lazily-populated `AuthService` slot for the
-/// JWT + API-key paths. Before basin-auth boots, the auth slot is empty and
-/// the resolver behaves as static-only; once `connect()` succeeds the slot
-/// is `set()` and JWT clients start working.
-struct DeferredAuthResolver {
-    static_resolver: StaticTenantResolver,
-    auth_slot: Arc<OnceLock<Arc<basin_auth::AuthService>>>,
-}
-
-#[async_trait]
-impl TenantResolver for DeferredAuthResolver {
-    async fn resolve(&self, username: &str) -> basin_common::Result<TenantId> {
-        if let Some(auth) = self.auth_slot.get().cloned() {
-            let jwt = JwtTenantResolver::new(auth.clone());
-            if let Ok(t) = jwt.resolve(username).await {
-                return Ok(t);
-            }
-            let api_key = ApiKeyTenantResolver::new(auth);
-            if let Ok(t) = api_key.resolve(username).await {
-                return Ok(t);
-            }
-        }
-        self.static_resolver.resolve(username).await
-    }
-
-    async fn resolve_credentials(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> basin_common::Result<TenantId> {
-        if let Some(auth) = self.auth_slot.get().cloned() {
-            let jwt = JwtTenantResolver::new(auth.clone());
-            if let Ok(t) = jwt.resolve_credentials(username, password).await {
-                return Ok(t);
-            }
-            let api_key = ApiKeyTenantResolver::new(auth);
-            if let Ok(t) = api_key.resolve_credentials(username, password).await {
-                return Ok(t);
-            }
-        }
-        self.static_resolver
-            .resolve_credentials(username, password)
-            .await
-    }
-}
-
-/// Polls `127.0.0.1:<port>` until `connect()` succeeds, with 100ms backoff
-/// and a 5s deadline. Used to gate basin-auth's startup on the pgwire
-/// listener actually being ready to serve. `bind` may be an `INADDR_ANY`
-/// address (e.g. `0.0.0.0:5433`); we probe `127.0.0.1:<port>` because the
-/// loopback DSN basin-auth uses always targets `127.0.0.1`.
-async fn wait_for_pgwire_accept(bind: SocketAddr) -> Result<()> {
-    let port = bind.port();
-    let target: SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .context("build loopback probe address")?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match tokio::time::timeout(
-            Duration::from_millis(200),
-            tokio::net::TcpStream::connect(target),
-        )
-        .await
-        {
-            Ok(Ok(_)) => return Ok(()),
-            _ => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow!(
-                        "pgwire listener at {target} not accept-able after 5s"
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
     }
 }
 
@@ -677,4 +639,124 @@ fn parse_catalog_env() -> Result<CatalogBackend> {
     Err(anyhow!(
         "BASIN_CATALOG must be 'memory' or a postgres connection string, got {raw:?}"
     ))
+}
+
+fn build_storage_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
+    let backend = std::env::var("BASIN_STORAGE_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".to_string());
+
+    match backend.as_str() {
+        "local" => {
+            let fs = LocalFileSystem::new_with_prefix(&cfg.data_dir)
+                .with_context(|| format!("LocalFileSystem at {}", cfg.data_dir.display()))?;
+            tracing::info!(
+                backend = "local",
+                data_dir = %cfg.data_dir.display(),
+                root_prefix = ?cfg.storage_root_prefix,
+                "storage object-store backend configured",
+            );
+            Ok(Arc::new(fs))
+        }
+        "r2" | "s3" | "tigris" => {
+            let s3_cfg = basin_storage::backends::r2::S3LikeConfig::from_env()
+                .map_err(|e| anyhow!(e))
+                .context("load S3-compatible storage backend config")?;
+            let provider = format!("{:?}", s3_cfg.provider);
+            let bucket = s3_cfg.bucket.clone();
+            let endpoint = s3_cfg.endpoint.clone();
+            let region = s3_cfg.region.clone();
+            let store = s3_cfg
+                .build_object_store()
+                .map_err(|e| anyhow!(e))
+                .context("build S3-compatible storage object store")?;
+            tracing::info!(
+                backend,
+                provider,
+                bucket,
+                endpoint = endpoint.as_deref().unwrap_or("<aws-default>"),
+                region,
+                root_prefix = ?cfg.storage_root_prefix,
+                "storage object-store backend configured",
+            );
+            Ok(store)
+        }
+        other => Err(anyhow!(
+            "BASIN_STORAGE_BACKEND must be 'local', 'r2', 's3', or 'tigris', got {other:?}"
+        )),
+    }
+}
+
+fn build_wal_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
+    let backend = std::env::var("BASIN_WAL_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("BASIN_STORAGE_BACKEND")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "local".to_string());
+
+    match backend.as_str() {
+        "local" => {
+            std::fs::create_dir_all(&cfg.wal_dir)
+                .with_context(|| format!("create WAL dir {}", cfg.wal_dir.display()))?;
+            let fs = LocalFileSystem::new_with_prefix(&cfg.wal_dir)
+                .with_context(|| format!("WAL LocalFileSystem at {}", cfg.wal_dir.display()))?;
+            tracing::info!(
+                backend = "local",
+                wal_dir = %cfg.wal_dir.display(),
+                root_prefix = ?cfg.wal_root_prefix,
+                "WAL object-store backend configured",
+            );
+            Ok(Arc::new(fs))
+        }
+        "r2" | "s3" | "tigris" => {
+            let s3_cfg = basin_storage::backends::r2::S3LikeConfig::from_env()
+                .map_err(|e| anyhow!(e))
+                .context(
+                    "load S3-compatible WAL backend config; BASIN_WAL_BACKEND uses BASIN_STORAGE_* credentials",
+                )?;
+            let provider = format!("{:?}", s3_cfg.provider);
+            let bucket = s3_cfg.bucket.clone();
+            let endpoint = s3_cfg.endpoint.clone();
+            let region = s3_cfg.region.clone();
+            let store = s3_cfg
+                .build_object_store()
+                .map_err(|e| anyhow!(e))
+                .context("build S3-compatible WAL object store")?;
+            tracing::info!(
+                backend,
+                provider,
+                bucket,
+                endpoint = endpoint.as_deref().unwrap_or("<aws-default>"),
+                region,
+                root_prefix = ?cfg.wal_root_prefix,
+                "WAL object-store backend configured",
+            );
+            Ok(store)
+        }
+        other => Err(anyhow!(
+            "BASIN_WAL_BACKEND must be 'local', 'r2', 's3', or 'tigris', got {other:?}"
+        )),
+    }
+}
+
+fn parse_object_prefix_env(name: &str) -> Result<Option<ObjectPath>> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains("..") {
+        return Err(anyhow!("{name} must not contain '..' path segments"));
+    }
+    Ok(Some(ObjectPath::from(trimmed)))
 }

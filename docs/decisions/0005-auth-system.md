@@ -7,6 +7,35 @@
 - **Date:** 2026-05-01
 - **Tags:** scope, auth, smtp, related-to-0006, trigger-overridden
 
+## Amendment — 2026-05-11
+
+The architecture section below describes auth state living in a reserved
+internal tenant accessed via loopback pgwire. That model has been
+superseded. See **ADR 0013** for the full decision.
+
+Summary of what changed:
+
+- Auth tables (`basin_auth_users`, `basin_auth_refresh_tokens`, etc.)
+  live in **each tenant's own storage namespace** under a `basin_auth`
+  schema prefix, provisioned at tenant creation. There is no reserved
+  internal tenant (`INTERNAL_AUTH_TENANT_ID` is removed).
+- The auth service accesses tenant auth data via
+  `Engine::open_session_as(tenant_id, "basin_auth_service")` — in-process,
+  no TCP, no loopback pgwire connection.
+- `pgwire_user` credential format changes from `tenant_<random_hex>` to
+  `{tenant_id}_{random_hex}` so the 26-character ULID prefix
+  self-identifies the owning tenant; no global cross-tenant lookup table
+  is required.
+- API keys embed the same tenant prefix for self-routing.
+- `BASIN_AUTH_CATALOG_DSN` is now an **optional operator override** for
+  external Postgres (blast-radius separation), not the default path.
+- `DeferredAuthResolver`, `wait_for_pgwire_accept`, and the loopback
+  startup ceremony are removed. Startup order is: engine → auth
+  (with `EngineAuthStore`) → `StackedTenantResolver` → pgwire.
+
+The scope, features, SMTP requirements, v1 capabilities, and trigger
+conditions documented below are unchanged.
+
 ## Context
 
 The previous direction ([CAPABILITIES.md](../../CAPABILITIES.md), the

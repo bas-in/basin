@@ -1831,6 +1831,57 @@ mod tests {
         let r = rewrite_vector_operators("SELECT (a + b) <-> c FROM t");
         assert_eq!(r, "SELECT l2_distance((a + b), c) FROM t");
     }
+
+    // --- auth schema rewriter ---
+
+    #[test]
+    fn auth_uid_rewritten() {
+        let r = rewrite_auth_schema_functions("SELECT auth.uid()");
+        assert_eq!(r, "SELECT auth_uid()");
+    }
+
+    #[test]
+    fn auth_role_rewritten() {
+        let r = rewrite_auth_schema_functions("WHERE auth.role() = 'authenticated'");
+        assert_eq!(r, "WHERE auth_role() = 'authenticated'");
+    }
+
+    #[test]
+    fn auth_jwt_rewritten() {
+        let r = rewrite_auth_schema_functions("SELECT auth.jwt()");
+        assert_eq!(r, "SELECT auth_jwt()");
+    }
+
+    #[test]
+    fn auth_rewrite_case_insensitive() {
+        let r = rewrite_auth_schema_functions("SELECT AUTH.UID()");
+        assert_eq!(r, "SELECT auth_uid()");
+    }
+
+    #[test]
+    fn auth_rewrite_multiple_calls() {
+        let r = rewrite_auth_schema_functions(
+            "SELECT auth.uid(), auth.role() FROM t WHERE owner_id = auth.uid()",
+        );
+        assert_eq!(
+            r,
+            "SELECT auth_uid(), auth_role() FROM t WHERE owner_id = auth_uid()"
+        );
+    }
+
+    #[test]
+    fn auth_rewrite_leaves_prefix_alone() {
+        // `my_auth.uid()` should NOT be rewritten (identifier boundary guard).
+        let r = rewrite_auth_schema_functions("SELECT my_auth.uid()");
+        assert_eq!(r, "SELECT my_auth.uid()");
+    }
+
+    #[test]
+    fn auth_rewrite_leaves_suffix_alone() {
+        // `auth.uid_column` should NOT be rewritten (post-boundary guard).
+        let r = rewrite_auth_schema_functions("SELECT auth.uid_column FROM t");
+        assert_eq!(r, "SELECT auth.uid_column FROM t");
+    }
 }
 
 /// PG-shape `power(x, y)` — always returns `double precision` (Float64).
@@ -2197,4 +2248,222 @@ fn find_extract_second_from_end(s: &str, start: usize) -> Option<usize> {
         return None;
     }
     Some(after_from)
+}
+
+// ---------------------------------------------------------------------------
+// Auth schema-dot rewriter: auth.uid() → auth_uid(), etc.
+//
+// DataFusion's SQL parser does not support schema-qualified function names
+// in call position. We rewrite at the raw-SQL string level (before sqlparser
+// sees the text) so users can write the Supabase-canonical `auth.uid()` form
+// and have it reach the UDFs registered as `auth_uid` etc.
+//
+// The rewrite is exact-token-sensitive: `my_auth.uid()` or `auth.uidx()` are
+// left alone. Only the three canonical names are rewritten.
+// ---------------------------------------------------------------------------
+
+/// Rewrite `auth.uid()`, `auth.role()`, and `auth.jwt()` to their
+/// underscore-namespaced equivalents that DataFusion can call.
+///
+/// The rewrite is case-insensitive on the function names to match PG's
+/// identifier folding (`AUTH.UID()` → `auth_uid()`). The `auth.` prefix
+/// must be preceded by a non-identifier character (or be at the start of
+/// the string) so that column names like `my_auth.uid()` aren't touched.
+pub(crate) fn rewrite_auth_schema_functions(sql: &str) -> String {
+    const TARGETS: &[(&str, &str)] = &[
+        ("auth.uid", "auth_uid"),
+        ("auth.role", "auth_role"),
+        ("auth.jwt", "auth_jwt"),
+    ];
+    let mut out = sql.to_string();
+    for (schema_dot_name, replacement) in TARGETS {
+        // Scan `out` left-to-right, rewriting every occurrence that passes
+        // the identifier-boundary checks. We rebuild `lower` on each pass
+        // so the position arithmetic stays correct after replacements.
+        let mut scan_pos = 0usize;
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(rel_found) = lower[scan_pos..].find(schema_dot_name) else {
+                break;
+            };
+            let abs_start = scan_pos + rel_found;
+            let abs_end = abs_start + schema_dot_name.len();
+
+            // Identifier-boundary checks.
+            let pre_ok = abs_start == 0 || {
+                let prev = out.as_bytes()[abs_start - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'_')
+            };
+            let post_ok = abs_end >= out.len() || {
+                let next = out.as_bytes()[abs_end];
+                !(next.is_ascii_alphanumeric() || next == b'_')
+            };
+
+            if pre_ok && post_ok {
+                out.replace_range(abs_start..abs_end, replacement);
+                // Advance past the replacement text.
+                scan_pos = abs_start + replacement.len();
+            } else {
+                // Skip past this false match and keep scanning.
+                scan_pos = abs_start + 1;
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Auth session UDFs: auth_uid(), auth_role(), auth_jwt()
+//
+// These are Supabase-compatible session functions. Names use underscores
+// rather than dots because DataFusion's SQL parser doesn't support
+// schema-qualified function names in function-call position. The SQL
+// preprocessor in `sql_functions.rs` rewrites `auth.uid()` →
+// `auth_uid()`, etc., so both spellings work at the SQL layer.
+//
+// All three capture an `Arc<AuthContext>` at session-open time. The
+// implementation is purely a read of that captured context — no I/O,
+// no locks beyond the Arc.
+// ---------------------------------------------------------------------------
+
+use crate::AuthContext;
+
+/// Register the three auth session UDFs on `ctx`. The `auth_context` is
+/// captured by value (behind an `Arc`) into each UDF so they can be called
+/// from any thread DataFusion sends them to.
+pub(crate) fn register_auth_udfs(ctx: &SessionContext, auth_context: Arc<AuthContext>) {
+    ctx.register_udf(ScalarUDF::from(AuthUidUdf {
+        auth_context: auth_context.clone(),
+        signature: Signature::nullary(Volatility::Stable),
+    }));
+    ctx.register_udf(ScalarUDF::from(AuthRoleUdf {
+        auth_context: auth_context.clone(),
+        signature: Signature::nullary(Volatility::Stable),
+    }));
+    ctx.register_udf(ScalarUDF::from(AuthJwtUdf {
+        auth_context,
+        signature: Signature::nullary(Volatility::Stable),
+    }));
+}
+
+// --- auth_uid() -------------------------------------------------------------
+
+/// `auth_uid() -> Utf8` (nullable). Returns the UUID of the authenticated
+/// user as a text string (matching Postgres's UUID wire format), or NULL
+/// if the session is unauthenticated.
+#[derive(Debug)]
+struct AuthUidUdf {
+    auth_context: Arc<AuthContext>,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for AuthUidUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "auth_uid"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        // Nullable Utf8: NULL when unauthenticated, UUID string when auth'd.
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+        match &self.auth_context.auth_uid {
+            Some(uid) => {
+                let s = uid.to_string();
+                Ok(ColumnarValue::Scalar(
+                    datafusion::scalar::ScalarValue::Utf8(Some(s)),
+                ))
+            }
+            None => Ok(ColumnarValue::Scalar(
+                datafusion::scalar::ScalarValue::Utf8(None),
+            )),
+        }
+    }
+}
+
+// --- auth_role() ------------------------------------------------------------
+
+/// `auth_role() -> Utf8`. Returns the session role string: `'authenticated'`,
+/// `'anon'`, or `'service_role'`. Never NULL — unauthenticated sessions
+/// return `'anon'`.
+#[derive(Debug)]
+struct AuthRoleUdf {
+    auth_context: Arc<AuthContext>,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for AuthRoleUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "auth_role"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(
+            datafusion::scalar::ScalarValue::Utf8(Some(
+                self.auth_context.auth_role.clone(),
+            )),
+        ))
+    }
+}
+
+// --- auth_jwt() -------------------------------------------------------------
+
+/// `auth_jwt() -> Utf8` (nullable, JSON). Returns the full JWT claims as a
+/// JSON text value, or NULL if the session was not established via JWT.
+/// The value is a serialised JSON object matching the wire claims layout:
+/// `{ "user_id": "...", "email": "...", "roles": [...], "exp": ..., ... }`.
+#[derive(Debug)]
+struct AuthJwtUdf {
+    auth_context: Arc<AuthContext>,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for AuthJwtUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "auth_jwt"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        // Return Utf8 (JSON text). DataFusion doesn't have a native JSONB
+        // column type; downstream callers that need structured access can
+        // cast to Utf8 and use `json_get_*` builtins or extract at the
+        // application layer, matching how Supabase surfaces `auth.jwt()`.
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+        match &self.auth_context.auth_claims {
+            Some(claims) => {
+                let json_str = serde_json::to_string(claims).map_err(|e| {
+                    DataFusionError::Execution(format!("auth_jwt: claims serialization failed: {e}"))
+                })?;
+                Ok(ColumnarValue::Scalar(
+                    datafusion::scalar::ScalarValue::Utf8(Some(json_str)),
+                ))
+            }
+            None => Ok(ColumnarValue::Scalar(
+                datafusion::scalar::ScalarValue::Utf8(None),
+            )),
+        }
+    }
 }

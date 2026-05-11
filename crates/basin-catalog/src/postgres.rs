@@ -29,7 +29,8 @@ use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
 use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
 use crate::functions::SqlFunctionDef;
 use crate::metadata::{
-    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, TableMetadata,
+    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
+    TableMetadata, UniqueConstraint,
 };
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::reactors::{self, ReactorDef, ReactorError, ReactorOps};
@@ -220,6 +221,17 @@ impl PostgresCatalog {
             format!(
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS foreign_keys_json JSONB"
+            ),
+            // UNIQUE constraints and secondary-index declarations. Stored
+            // separately because uniqueness is enforced by the engine write
+            // path, while indexes are currently metadata/introspection only.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS unique_constraints_json JSONB"
+            ),
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS indexes_json JSONB"
             ),
             // Per-tenant SQL function definitions. One row per
             // (tenant, name); body is stored as raw SQL, args/return as
@@ -484,6 +496,7 @@ impl Catalog for PostgresCatalog {
             pk_columns: Vec::new(),
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
+            unique_constraints: Vec::new(),
         })
     }
 
@@ -502,7 +515,8 @@ impl Catalog for PostgresCatalog {
                             bloom_filter_columns_json, row_group_rows,
                             continuous_aggregate_json, cluster_columns_json,
                             home_region,
-                            pk_columns_json, check_constraints_json, foreign_keys_json
+                            pk_columns_json, check_constraints_json, foreign_keys_json,
+                            unique_constraints_json, indexes_json
                      FROM {sch}.tables
                      WHERE tenant_id = $1 AND table_name = $2"
                 ),
@@ -528,6 +542,8 @@ impl Catalog for PostgresCatalog {
         let pk_columns_json: Option<serde_json::Value> = row.get(13);
         let check_constraints_json: Option<serde_json::Value> = row.get(14);
         let foreign_keys_json: Option<serde_json::Value> = row.get(15);
+        let unique_constraints_json: Option<serde_json::Value> = row.get(16);
+        let indexes_json: Option<serde_json::Value> = row.get(17);
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
         let partition_spec = match partition_spec_json {
@@ -586,6 +602,16 @@ impl Catalog for PostgresCatalog {
                 .map_err(|e| BasinError::catalog(format!("deserialise foreign_keys: {e}")))?,
             None => Vec::new(),
         };
+        let unique_constraints: Vec<UniqueConstraint> = match unique_constraints_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise unique_constraints: {e}")))?,
+            None => Vec::new(),
+        };
+        let indexes: Vec<SecondaryIndex> = match indexes_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise indexes: {e}")))?,
+            None => Vec::new(),
+        };
 
         let snapshots = fetch_snapshots(&client, sch, &tenant_str, &table_str).await?;
         Ok(TableMetadata {
@@ -605,12 +631,11 @@ impl Catalog for PostgresCatalog {
             continuous_aggregate,
             cluster_columns,
             home_region,
-            // Phase 5.7 B1 (parallel agent) — indexes placeholder so the
-            // metadata struct stays buildable; B1 wires real reads.
-            indexes: Vec::new(),
+            indexes,
             pk_columns,
             check_constraints,
             foreign_keys,
+            unique_constraints,
         })
     }
 
@@ -1282,6 +1307,133 @@ impl Catalog for PostgresCatalog {
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_table_constraints: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, unique_constraints), fields(tenant = %tenant, table = %table))]
+    async fn set_unique_constraints(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        unique_constraints: Vec<UniqueConstraint>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let unique_json: Option<serde_json::Value> =
+            if unique_constraints.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&unique_constraints).map_err(|e| {
+                    BasinError::catalog(format!("serialise unique_constraints: {e}"))
+                })?)
+            };
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables
+                     SET unique_constraints_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &unique_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_unique_constraints: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, name = %name))]
+    async fn create_index(
+        &self,
+        tenant: &TenantId,
+        table: &TableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if columns.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "create_index: column list cannot be empty".into(),
+            ));
+        }
+
+        let mut meta = self.load_table(tenant, table).await?;
+        for col in columns {
+            if meta.schema.field_with_name(col).is_err() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "create_index: column {col:?} not in table {tenant}/{table} schema"
+                )));
+            }
+        }
+        if meta.indexes.iter().any(|i| i.name == name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(BasinError::catalog(format!(
+                "create_index: {tenant}/{table}: index {name:?} already exists"
+            )));
+        }
+        meta.indexes.push(SecondaryIndex {
+            name: name.to_string(),
+            columns: columns.to_vec(),
+        });
+        let indexes_json = serde_json::to_value(&meta.indexes)
+            .map_err(|e| BasinError::catalog(format!("serialise indexes: {e}")))?;
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables
+                     SET indexes_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &indexes_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("create_index: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
+    async fn drop_index(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
+        let mut meta = self.load_table(tenant, table).await?;
+        let before = meta.indexes.len();
+        meta.indexes.retain(|i| i.name != name);
+        if meta.indexes.len() == before {
+            return Err(BasinError::not_found(format!(
+                "index {name:?} on {tenant}/{table}"
+            )));
+        }
+        let indexes_json: Option<serde_json::Value> = if meta.indexes.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_value(&meta.indexes)
+                    .map_err(|e| BasinError::catalog(format!("serialise indexes: {e}")))?,
+            )
+        };
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables
+                     SET indexes_json = $3
+                     WHERE tenant_id = $1 AND table_name = $2"
+                ),
+                &[&tenant.to_string(), &table.to_string(), &indexes_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_index: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!("{tenant}/{table}")));
         }
@@ -3028,6 +3180,51 @@ mod tests {
 
         cat.drop_table(&a, &tbl).await.unwrap();
         cat.load_table(&b, &tbl).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unique_constraints_and_indexes_round_trip() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = TenantId::new();
+        let tbl = TableName::new("users").unwrap();
+
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        cat.set_unique_constraints(
+            &t,
+            &tbl,
+            vec![UniqueConstraint {
+                name: "users_name_key".into(),
+                columns: vec!["name".into()],
+            }],
+        )
+        .await
+        .unwrap();
+        cat.create_index(&t, &tbl, "users_name_idx", &["name".into()], false)
+            .await
+            .unwrap();
+
+        let loaded = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(
+            loaded.unique_constraints,
+            vec![UniqueConstraint {
+                name: "users_name_key".into(),
+                columns: vec!["name".into()],
+            }]
+        );
+        assert_eq!(
+            loaded.indexes,
+            vec![SecondaryIndex {
+                name: "users_name_idx".into(),
+                columns: vec!["name".into()],
+            }]
+        );
+
+        cat.drop_index(&t, &tbl, "users_name_idx").await.unwrap();
+        let loaded = cat.load_table(&t, &tbl).await.unwrap();
+        assert!(loaded.indexes.is_empty());
+        assert_eq!(loaded.unique_constraints[0].name, "users_name_key");
     }
 
     #[tokio::test]
