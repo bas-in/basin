@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 basin-common.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

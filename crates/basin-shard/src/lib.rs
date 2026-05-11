@@ -279,4 +279,13 @@ pub(crate) trait TenantHandleImpl: Send + Sync {
     fn tenant(&self) -> TenantId;
 }
 
+mod follower;
 mod in_process;
+pub mod split;
+
+pub use follower::{
+    promote, FollowerConfig, FollowerShard, FollowerStats, LagTier, ReplicaRole, ShardFollower,
+};
+pub use split::{
+    CatchupReport, Epoch, LocalShardSplitter, ShardSplitter, SplitPlan,
+};

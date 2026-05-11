@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backends;
 mod concurrency;
 mod data_file;
 mod disk_cache;
