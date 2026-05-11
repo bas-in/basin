@@ -7,8 +7,12 @@
 //!
 //! Today's contents:
 //!
-//! - [`r2`] — Cloudflare R2 + AWS S3 (same builder, different endpoint /
-//!   region defaults). Picked by `BASIN_STORAGE_BACKEND=r2` or `=s3`.
+//! - [`r2`] — Cloudflare R2 / Tigris / AWS S3 / MinIO etc. (same builder,
+//!   different endpoint / region defaults). Picked by
+//!   `BASIN_STORAGE_BACKEND=r2|s3|tigris`, or inferred from Fly's
+//!   `AWS_ENDPOINT_URL_S3` when no explicit backend is set. The config
+//!   type is `S3LikeConfig` (with `R2Config` retained as a
+//!   backward-compat alias).
 //!
 //! `local` and `memory` backends don't live here because they don't need
 //! configuration plumbing — `LocalFileSystem::new_with_prefix(path)` and
