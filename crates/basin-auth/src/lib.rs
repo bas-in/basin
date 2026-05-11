@@ -61,7 +61,9 @@ use async_trait::async_trait;
 use basin_common::{BasinError, Result, TenantId};
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, NoTls};
+use rustls::ClientConfig;
+use tokio_postgres::Client;
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -69,6 +71,21 @@ pub use crate::api_keys::{ApiKeyDescriptor, ApiKeySecret, IssuedApiKey};
 pub use crate::config::{AuthConfig, SmtpConfig, SmtpTls};
 pub use crate::email::{Mailer, Outbound, SmtpMailer, StubMailer};
 pub use crate::jwt::Claims;
+
+/// Idempotently installs aws-lc-rs as the process-wide rustls CryptoProvider.
+/// rustls 0.23 refuses to auto-pick when both `aws-lc-rs` and `ring` are
+/// enabled (which is our workspace state — pgwire/lettre/etc pull `ring`,
+/// basin-router pulls `aws-lc-rs`). Mirrors the same helper basin-router uses
+/// for its server-side TLS bootstrap so the choice is consistent.
+fn ensure_default_crypto_provider() {
+    use rustls::crypto::{aws_lc_rs, CryptoProvider};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Ignore the result: another crate (basin-router, pgwire's secure
+        // example path) may have installed a provider already — that's fine.
+        let _ = CryptoProvider::install_default(aws_lc_rs::default_provider());
+    });
+}
 
 /// Per-user identifier. UUID v4 for now; could move to ULID later, but the
 /// JWT consumers all parse strings so the wire format is what matters.
@@ -120,7 +137,26 @@ impl AuthService {
     /// wanting to wrap SMTP with extra logging.
     pub async fn connect_with_mailer(cfg: AuthConfig, mailer: Arc<dyn Mailer>) -> Result<Self> {
         schema::validate_schema_ident(&cfg.catalog_schema)?;
-        let (client, connection) = tokio_postgres::connect(&cfg.catalog_dsn, NoTls)
+        // rustls 0.23 requires *some* CryptoProvider be installed process-wide
+        // before `ClientConfig::builder()` is reached; both `aws-lc-rs` and
+        // `ring` are pulled in transitively by the workspace, so it can't
+        // auto-pick. basin-router installs aws-lc-rs at startup the same way;
+        // we mirror that here for the connect path that runs first when the
+        // auth service is the entry point. `install_default` is a no-op if a
+        // provider is already installed, so this stays safe under multi-init.
+        ensure_default_crypto_provider();
+        // Trust the Mozilla CA bundle from webpki-roots so this works against
+        // managed Postgres (Neon, RDS, Supabase, Crunchy) without depending on
+        // the container's system trust store. `MakeRustlsConnect` only engages
+        // when the server answers `S` to the SSLRequest, so plaintext-only
+        // Postgres (e.g. Fly intra-VPC PG) keeps working through this path.
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let tls = MakeRustlsConnect::new(tls_config);
+        let (client, connection) = tokio_postgres::connect(&cfg.catalog_dsn, tls)
             .await
             .map_err(|e| BasinError::catalog(format!("auth pg connect: {e}")))?;
         tokio::spawn(async move {

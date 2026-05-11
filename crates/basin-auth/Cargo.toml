@@ -26,9 +26,18 @@ jsonwebtoken.workspace = true
 bcrypt.workspace = true
 governor.workspace = true
 
-# Postgres-backed auth schema. NoTls only — production deployments will swap
-# this at the connect call site once the catalog crate does.
+# Postgres-backed auth schema. TLS via rustls so managed providers that
+# mandate `sslmode=require` (Neon, RDS, Supabase, Crunchy) work; the
+# `MakeRustlsConnect` connector falls through to plaintext when the server
+# answers `N` to the SSLRequest, so intra-VPC plaintext (e.g. Fly 6PN PG)
+# still works through the same call site.
 tokio-postgres = { workspace = true, features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+tokio-postgres-rustls = "0.13"
+# rustls 0.23 + aws-lc-rs to match the provider basin-router already installs
+# process-wide; webpki-roots ships the Mozilla trust bundle so we don't lean
+# on the host's system trust store inside slim container images.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
+webpki-roots = "1.0"
 
 # Crypto helpers: sha256 of opaque tokens before storing, constant-time
 # comparison via `subtle`, hex encoding for token wire format. All transitive
