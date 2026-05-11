@@ -68,9 +68,35 @@ use tracing::instrument;
 use uuid::Uuid;
 
 pub use crate::api_keys::{ApiKeyDescriptor, ApiKeySecret, IssuedApiKey};
-pub use crate::config::{AuthConfig, SmtpConfig, SmtpTls};
+pub use crate::config::{
+    AuthConfig, SmtpConfig, SmtpTls, DEFAULT_LOOPBACK_CATALOG_DSN, INTERNAL_AUTH_TENANT_ID,
+    INTERNAL_AUTH_USERNAME,
+};
 pub use crate::email::{Mailer, Outbound, SmtpMailer, StubMailer};
 pub use crate::jwt::Claims;
+
+/// True iff the DSN is a `postgres://` URL carrying `sslmode=disable`. In
+/// that case the loopback catalog path uses `NoTls` directly — building the
+/// rustls connector would be wasted work and would also drag in the
+/// process-wide CryptoProvider install for no reason.
+///
+/// The check is intentionally permissive: any `sslmode=disable` (with or
+/// without surrounding `&`/`?`) qualifies. Anything else falls back to the
+/// rustls connector so external managed-PG DSNs keep working.
+fn is_loopback_disable_tls(dsn: &str) -> bool {
+    if !(dsn.starts_with("postgres://") || dsn.starts_with("postgresql://")) {
+        return false;
+    }
+    // Parse the query string portion. Don't pull in `url` just for this; do a
+    // small bespoke walk that catches the two shapes we care about.
+    let Some(query_start) = dsn.find('?') else {
+        return false;
+    };
+    let query = &dsn[query_start + 1..];
+    query
+        .split('&')
+        .any(|kv| kv.eq_ignore_ascii_case("sslmode=disable"))
+}
 
 /// Idempotently installs aws-lc-rs as the process-wide rustls CryptoProvider.
 /// rustls 0.23 refuses to auto-pick when both `aws-lc-rs` and `ring` are
@@ -137,33 +163,58 @@ impl AuthService {
     /// wanting to wrap SMTP with extra logging.
     pub async fn connect_with_mailer(cfg: AuthConfig, mailer: Arc<dyn Mailer>) -> Result<Self> {
         schema::validate_schema_ident(&cfg.catalog_schema)?;
-        // rustls 0.23 requires *some* CryptoProvider be installed process-wide
-        // before `ClientConfig::builder()` is reached; both `aws-lc-rs` and
-        // `ring` are pulled in transitively by the workspace, so it can't
-        // auto-pick. basin-router installs aws-lc-rs at startup the same way;
-        // we mirror that here for the connect path that runs first when the
-        // auth service is the entry point. `install_default` is a no-op if a
-        // provider is already installed, so this stays safe under multi-init.
-        ensure_default_crypto_provider();
-        // Trust the Mozilla CA bundle from webpki-roots so this works against
-        // managed Postgres (Neon, RDS, Supabase, Crunchy) without depending on
-        // the container's system trust store. `MakeRustlsConnect` only engages
-        // when the server answers `S` to the SSLRequest, so plaintext-only
-        // Postgres (e.g. Fly intra-VPC PG) keeps working through this path.
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let tls = MakeRustlsConnect::new(tls_config);
-        let (client, connection) = tokio_postgres::connect(&cfg.catalog_dsn, tls)
-            .await
-            .map_err(|e| BasinError::catalog(format!("auth pg connect: {e}")))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!(error = %e, "basin-auth postgres driver exited");
-            }
-        });
+        let dsn = cfg.effective_dsn();
+
+        // Loopback path: when basin-auth's catalog lives inside basin engine's
+        // own pgwire on 127.0.0.1, the connection is plaintext (engine accepts
+        // unencrypted on loopback) and there's no point spinning up rustls.
+        // Detect by URL shape: `postgres://...sslmode=disable` short-circuits
+        // to `NoTls` — saves an unnecessary handshake. External Postgres still
+        // goes through the rustls path so managed PG (Neon, RDS, Supabase)
+        // keeps working when an operator opts back in via env override.
+        let client = if is_loopback_disable_tls(&dsn) {
+            let (client, connection) =
+                tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| BasinError::catalog(format!("auth pg connect: {e}")))?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!(error = %e, "basin-auth postgres driver exited");
+                }
+            });
+            client
+        } else {
+            // rustls 0.23 requires *some* CryptoProvider be installed
+            // process-wide before `ClientConfig::builder()` is reached; both
+            // `aws-lc-rs` and `ring` are pulled in transitively by the
+            // workspace, so it can't auto-pick. basin-router installs
+            // aws-lc-rs at startup the same way; we mirror that here for the
+            // connect path that runs first when the auth service is the entry
+            // point. `install_default` is a no-op if a provider is already
+            // installed, so this stays safe under multi-init.
+            ensure_default_crypto_provider();
+            // Trust the Mozilla CA bundle from webpki-roots so this works
+            // against managed Postgres (Neon, RDS, Supabase, Crunchy) without
+            // depending on the container's system trust store.
+            // `MakeRustlsConnect` only engages when the server answers `S` to
+            // the SSLRequest, so plaintext-only Postgres (e.g. Fly intra-VPC
+            // PG) keeps working through this path.
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let tls_config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let tls = MakeRustlsConnect::new(tls_config);
+            let (client, connection) = tokio_postgres::connect(&dsn, tls)
+                .await
+                .map_err(|e| BasinError::catalog(format!("auth pg connect: {e}")))?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!(error = %e, "basin-auth postgres driver exited");
+                }
+            });
+            client
+        };
         let jwt = jwt::JwtKeys::new(&cfg.jwt_secret);
         let ip_limiter = rate_limit::PerKey::per_minute(cfg.rate_limit_per_ip_per_min, "ip");
         let email_limiter = rate_limit::PerKey::per_minute(cfg.rate_limit_per_ip_per_min, "email");
@@ -518,7 +569,7 @@ mod tests {
             jwt_secret: vec![9u8; 32],
             token_ttl: Duration::from_secs(60),
             refresh_ttl: Duration::from_secs(86_400),
-            catalog_dsn: PG_URL.to_owned(),
+            catalog_dsn: Some(PG_URL.to_owned()),
             catalog_schema: schema.to_owned(),
             smtp: SmtpConfig {
                 host: "smtp.invalid".into(),

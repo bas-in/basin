@@ -99,11 +99,22 @@ the requesting tenant's prefix; this check is implemented at the
 | Layer        | Crate / service                | State          | Scaling axis             |
 | ------------ | ------------------------------ | -------------- | ------------------------ |
 | Router       | `basin-router`                 | none           | horizontal, behind LB    |
+| Auth         | `basin-auth`                   | none (state in catalog via loopback pgwire) | horizontal, peer of router |
+| REST         | `basin-rest`                   | none           | horizontal, peer of router |
 | Shard owner  | `basin-shard`                  | RAM, NVMe cache| (tenant, partition) hash |
 | WAL          | `basin-wal`                    | Raft log + S3  | one Raft group per region (or shard group) |
 | Storage      | `basin-storage`, `basin-catalog` | bucket + catalog | object storage         |
 | Placement    | `basin-placement`              | etcd / FDB     | quorum                   |
 | Analytical   | `basin-analytical`             | none           | horizontal, off OLTP     |
+
+`basin-auth` is a peer crate of `basin-router`, not a separate service.
+It owns the `auth.*` schema under a reserved tenant (`basin_auth`,
+ULID auto-injected at startup) and reads / writes that schema through the
+same engine that serves application traffic, over a loopback pgwire
+connection inside the process. There is no second database, no second
+durability domain, no extra TCP hop. Operators who want auth state on an
+external OLTP store override the loopback with
+`BASIN_AUTH_CATALOG_DSN` — see [`deployment.md`](./deployment.md#optional-external-auth-catalog).
 
 ---
 
@@ -381,8 +392,11 @@ records the target shape so we don't paint ourselves into a corner.
 - Shard owners and routers in the same region as the WAL.
 - Object storage is regional with whatever durability the provider gives
   (S3 standard is 11 nines; that's the floor).
-- Catalog (Lakekeeper) runs as a regional service backed by a regional
-  Postgres.
+- Catalog (Lakekeeper-compatible, basin-native) runs in-process on the
+  shard owners, backed by the regional WAL + Parquet. No external
+  database is provisioned. `basin-auth` shares this same catalog over
+  loopback pgwire; identity state and table metadata live in one
+  durability domain by default.
 
 ### Multi-region (target)
 
@@ -392,9 +406,12 @@ records the target shape so we don't paint ourselves into a corner.
 - **S3 cross-region replication** for the tenant prefix, enabling
   disaster recovery and failover. Replication is asynchronous; failover
   semantics are documented per tenant SLA tier.
-- **Catalog replication.** Either active-passive Postgres replication
-  behind Lakekeeper, or a catalog implementation chosen specifically for
-  multi-region. Decision recorded in Phase 6.
+- **Catalog replication.** Snapshot-and-pull of the embedded catalog
+  between regions, replayed at the destination — same shape as WAL
+  segment shipping, no external service required. Operators who run
+  `BASIN_AUTH_CATALOG_DSN` against external Postgres can layer that
+  vendor's logical replication on the auth-catalog backend instead.
+  Decision recorded in Phase 6.
 - **Tenant migration** between regions runs as: drain to WAL, snapshot
   to S3, replicate, attach in the destination region, repoint placement.
   Downtime budget is seconds, not minutes.

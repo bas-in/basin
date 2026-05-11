@@ -103,20 +103,29 @@ explain why we think the test is fair. Decisions get logged in
 
 ---
 
-## Quick tour
+## Quickstart
 
-Boot the server. The minimal config is one line; the full config layers in
-the WAL, shard owner, connection pool, JWT auth, and REST endpoint:
+Install basin, point it at a data dir, run. No external database, no separate
+catalog service — basin-server is self-contained.
 
 ```sh
-# Minimum viable basin-server (pgwire only, in-memory catalog):
-cargo run -p basin-server
+BASIN_DATA_DIR=/tmp/basin cargo run -p basin-server
+```
 
-# Production-shaped boot with everything wired together:
+That gives you pgwire on `127.0.0.1:5433`, durable WAL + Parquet under
+`/tmp/basin/`, and the embedded Iceberg-style catalog. Connect with `psql`
+and start writing SQL.
+
+The full production-shaped boot layers WAL, shard owner, connection pool,
+JWT auth, and REST in one process. basin-auth's catalog runs on the same
+engine via loopback pgwire — its reserved tenant entry (`basin_auth=<reserved-ulid>`)
+is auto-injected, so `BASIN_TENANTS` stays your application list:
+
+```sh
 BASIN_BIND=127.0.0.1:5433 \
 BASIN_DATA_DIR=/tmp/basin \
+BASIN_WAL_DIR=/tmp/basin/wal \
 BASIN_TENANTS='alice=*,bob=*' \
-BASIN_CATALOG=postgres://localhost:5432/postgres \
 BASIN_SHARD_ENABLED=1 \
 BASIN_POOL_ENABLED=1 \
 BASIN_AUTH_ENABLED=1 \
@@ -128,6 +137,13 @@ BASIN_REST_ENABLED=1 BASIN_REST_BIND=127.0.0.1:5434 \
 BASIN_ANALYTICAL_ENABLED=1 \
 cargo run -p basin-server
 ```
+
+Required vars: `BASIN_BIND`, `BASIN_DATA_DIR`, `BASIN_WAL_DIR`,
+`BASIN_TENANTS`, `BASIN_AUTH_ENABLED` (if you want auth). Everything else is
+optional. Operators who want basin-auth's identity tables on a separate OLTP
+store (durability isolation, blast-radius separation) can override the
+default loopback with `BASIN_AUTH_CATALOG_DSN` — see
+[`docs/deployment.md`](./docs/deployment.md#optional-external-auth-catalog).
 
 Connect with **any Postgres driver** — `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, your existing ORM:
 
@@ -197,7 +213,7 @@ The full architecture document is in [`docs/architecture.md`](./docs/architectur
 - **Per-tenant isolation** — bucket prefix is the IAM boundary; 1,000-iter cross-tenant fuzz × 4 attack shapes finds zero leaks. RLS works through UNION + CTE shapes (P0 bypass found and fixed by the security suite this cycle).
 - **Per-tenant connection URLs (managed-Postgres feel)** — `POST /admin/v1/tenants` returns `postgres://<tenant_user>:<password>@host:5433/<db>`. Password is bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/tenants/{user}/rotate`. Cross-tenant isolation under per-tenant URLs is integration-tested; within-tenant RLS still applies.
 - **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation with reuse-detection blanket-revoke, email-link login, per-tenant API keys, per-user session settings) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`).
-- **Durable catalog** — Postgres-backed; tables, snapshots, tenant credentials all survive process restart. Catalog-level PITR (`rollback_to_snapshot`) and table fork (`fork_table`) shipped.
+- **Durable catalog** — self-contained Iceberg-style catalog backed by basin's own pgwire loopback; tables, snapshots, tenant credentials, and `basin-auth`'s `auth.users` / `auth.refresh_tokens` all survive process restart in one process. No separate database to provision. Catalog-level PITR (`rollback_to_snapshot`) and table fork (`fork_table`) shipped.
 - **Cheap retention** — ZSTD-1 Parquet, 12.5× smaller than Postgres heap on audit-log data; A4 catalog `column_stats` skips footer fetches when the predicate prunes the file.
 - **Operations** — connection pooling, per-tenant pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-tenant counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
 
@@ -234,7 +250,7 @@ Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.m
 crates/
   basin-common      shared types, errors, telemetry
   basin-storage     Parquet + object_store under tenant prefixes
-  basin-catalog     Iceberg-style catalog (in-memory + Postgres-backed)
+  basin-catalog     Iceberg-style catalog (in-memory + engine-loopback durable)
   basin-wal         file-backed WAL (Raft-backed in v0.2)
   basin-shard       in-process shard owner with WAL → Parquet compactor
   basin-engine      DataFusion SQL execution, per-tenant sessions

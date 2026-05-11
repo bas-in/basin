@@ -46,7 +46,13 @@ pub struct AuthConfig {
     pub jwt_secret: Vec<u8>,
     pub token_ttl: Duration,
     pub refresh_ttl: Duration,
-    pub catalog_dsn: String,
+    /// Catalog DSN. `None` means "use the loopback default" — basin-auth will
+    /// connect through basin engine's own pgwire listener on `127.0.0.1` as
+    /// the reserved [`INTERNAL_AUTH_USERNAME`] user. That's the shape that
+    /// unblocks self-hosting basin without provisioning a separate Postgres.
+    /// Set this to an external `postgres://...` URL to keep using an outside
+    /// catalog DB (managed PG, RDS, Neon, etc.).
+    pub catalog_dsn: Option<String>,
     pub catalog_schema: String,
     pub smtp: SmtpConfig,
     pub bcrypt_cost: u32,
@@ -70,7 +76,44 @@ impl AuthConfig {
     pub fn is_email_enabled(&self) -> bool {
         self.email_enabled && !self.smtp.host.trim().is_empty()
     }
+
+    /// Resolve the catalog DSN to a concrete connection string.
+    ///
+    /// If `catalog_dsn` is `Some`, returns it verbatim. Otherwise returns the
+    /// loopback default that points at basin engine's own pgwire listener:
+    /// `postgres://basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable`.
+    ///
+    /// The loopback username [`INTERNAL_AUTH_USERNAME`] maps through the
+    /// auto-injected static-tenant entry to the reserved
+    /// [`INTERNAL_AUTH_TENANT_ID`]. Engine accepts plaintext socket on
+    /// loopback, so `sslmode=disable` is correct and a TLS handshake is
+    /// unnecessary.
+    pub fn effective_dsn(&self) -> String {
+        self.catalog_dsn
+            .clone()
+            .unwrap_or_else(|| DEFAULT_LOOPBACK_CATALOG_DSN.to_owned())
+    }
 }
+
+/// Reserved system tenant for basin-auth's own catalog. Used by basin-server
+/// to auto-inject the [`INTERNAL_AUTH_USERNAME`] → tenant mapping into the
+/// static resolver so basin-auth can authenticate as itself over the loopback
+/// pgwire path.
+///
+/// 26-char Crockford base-32 ULID (no I, L, O, U). Deterministic — the
+/// constant is the contract.
+pub const INTERNAL_AUTH_TENANT_ID: &str = "01JBAS1NAVTH00000000000000";
+
+/// Reserved pgwire username basin-auth uses when connecting back to basin
+/// engine over the loopback catalog path.
+pub const INTERNAL_AUTH_USERNAME: &str = "basin_auth";
+
+/// Default loopback catalog DSN. Used when `BASIN_AUTH_CATALOG_DSN` is unset
+/// and no explicit DSN was passed in code. The username matches
+/// [`INTERNAL_AUTH_USERNAME`] so basin-server's auto-injected static-tenant
+/// entry resolves it to [`INTERNAL_AUTH_TENANT_ID`].
+pub const DEFAULT_LOOPBACK_CATALOG_DSN: &str =
+    "postgres://basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable";
 
 impl AuthConfig {
     /// Reads env vars per ADR 0005. Returns a single structured error listing
@@ -155,8 +198,14 @@ impl AuthConfig {
             &mut invalid,
         );
 
-        let catalog_dsn = std::env::var("BASIN_AUTH_CATALOG_DSN")
-            .unwrap_or_else(|_| DEFAULT_CATALOG_DSN.to_owned());
+        // Catalog DSN is now optional. Unset or empty means "use the loopback
+        // default" (basin engine's own pgwire on 127.0.0.1:5433 via the
+        // reserved system tenant). Set this to keep using an external Postgres
+        // — e.g. a managed PG instance during migration off it.
+        let catalog_dsn = match std::env::var("BASIN_AUTH_CATALOG_DSN") {
+            Ok(s) if !s.trim().is_empty() => Some(s),
+            _ => None,
+        };
         let catalog_schema = std::env::var("BASIN_AUTH_CATALOG_SCHEMA")
             .unwrap_or_else(|_| DEFAULT_CATALOG_SCHEMA.to_owned());
         let from_name = std::env::var("BASIN_AUTH_EMAIL_FROM_NAME").ok();
@@ -269,7 +318,6 @@ const DEFAULT_BCRYPT_COST: u32 = 12;
 const DEFAULT_PASSWORD_MIN_LEN: usize = 10;
 const DEFAULT_RATE_LIMIT_PER_IP_PER_MIN: u32 = 20;
 const DEFAULT_CATALOG_SCHEMA: &str = "basin_auth";
-const DEFAULT_CATALOG_DSN: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 
 #[cfg(test)]
 mod tests {
@@ -381,5 +429,37 @@ mod tests {
         assert_eq!(parse_tls("Implicit").unwrap(), SmtpTls::Implicit);
         assert_eq!(parse_tls("NONE").unwrap(), SmtpTls::None);
         assert!(parse_tls("garbage").is_err());
+    }
+
+    /// `effective_dsn()` falls back to the loopback default when
+    /// `catalog_dsn` is `None`. This is the path basin-server takes when no
+    /// external Postgres is configured — basin-auth connects back through
+    /// basin engine's own pgwire on `127.0.0.1:5433`.
+    #[test]
+    fn effective_dsn_falls_back_to_loopback() {
+        let cfg = AuthConfig {
+            jwt_secret: vec![9u8; 32],
+            token_ttl: Duration::from_secs(60),
+            refresh_ttl: Duration::from_secs(60),
+            catalog_dsn: None,
+            catalog_schema: "basin_auth".into(),
+            smtp: SmtpConfig {
+                host: "smtp.invalid".into(),
+                port: 587,
+                username: "u".into(),
+                password: "p".into(),
+                from_email: "n@example.com".into(),
+                from_name: None,
+                tls: SmtpTls::StartTls,
+            },
+            bcrypt_cost: 4,
+            password_min_len: 10,
+            rate_limit_per_ip_per_min: 100,
+            email_enabled: true,
+            pgwire_public_host: "127.0.0.1:5433".into(),
+        };
+        assert_eq!(cfg.effective_dsn(), DEFAULT_LOOPBACK_CATALOG_DSN);
+        assert!(cfg.effective_dsn().contains("basin_auth:basin_auth"));
+        assert!(cfg.effective_dsn().contains("sslmode=disable"));
     }
 }

@@ -112,7 +112,7 @@ fn auth_cfg(schema: &str, pgwire_host: &str) -> AuthConfig {
         jwt_secret: vec![9u8; 32],
         token_ttl: Duration::from_secs(300),
         refresh_ttl: Duration::from_secs(86_400),
-        catalog_dsn: PG_URL.to_owned(),
+        catalog_dsn: Some(PG_URL.to_owned()),
         catalog_schema: schema.to_owned(),
         smtp: SmtpConfig {
             host: "smtp.invalid".into(),

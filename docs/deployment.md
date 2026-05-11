@@ -23,6 +23,24 @@ This doc is the practical "where do I put the bytes and which Fly/AWS region" gu
 
 ---
 
+## Required env vars (quickstart)
+
+basin-server is a single process. To deploy it you set:
+
+| Var | Purpose |
+|---|---|
+| `BASIN_BIND` | pgwire listener, e.g. `0.0.0.0:5433` |
+| `BASIN_DATA_DIR` | Parquet + catalog directory (durable volume) |
+| `BASIN_WAL_DIR` | WAL directory (durable volume, ideally NVMe) |
+| `BASIN_TENANTS` | Static tenant list, e.g. `acme=*,beta=*`. basin-auth's reserved entry `basin_auth=<reserved-ulid>` is auto-injected, so operators do not list it. |
+| `BASIN_AUTH_ENABLED=1` | Enables the auth subsystem (signup, JWT, refresh). Auth state lives in the embedded catalog over the loopback pgwire — no separate database. SMTP vars from [ADR 0005](./decisions/0005-auth-system.md) become required when this is on. |
+
+That is the full required surface for a single-region deploy. No external
+Postgres, no external catalog service. See `BASIN_BIND` / `BASIN_DATA_DIR`
+in [`../README.md`](../README.md) for the boot example.
+
+---
+
 ## Why shared-cluster, not instance-per-customer
 
 Supabase and Neon charge per project (~$25/mo each). They have to — Postgres is fundamentally bad at multi-tenancy:
@@ -111,7 +129,7 @@ Per-region resource shape, rough sizing for the first 1k–10k tenants:
 | Router | Fly Performance 1× × 2 (HA) | ~$30/mo. Stateless; scales linearly with connection count. |
 | Shard owners | Fly Performance 4× × 2 | ~$240/mo. Each handles ~5k tenants' working set. Add more as tenant count grows. |
 | R2 bucket | regional, public-bucket-disabled | Storage: $0.015/GB. Class A (writes): $4.50/M. Class B (reads): $0.36/M. **Egress: $0.** |
-| Postgres (catalog backend) | Fly PG (small) or Neon free tier | Catalog state: tenant list, table schemas, snapshot manifests, file refs. ~50 MB per 10k tenants. |
+| Catalog backend | none — embedded | Catalog state (tenant list, table schemas, snapshot manifests, file refs, plus `basin-auth`'s `auth.users` / `auth.refresh_tokens`) lives in the engine's own pgwire loopback, durable on the WAL volume. ~50 MB per 10k tenants. No external Postgres to provision. |
 | Optional: NVMe disk cache | Fly volume, 50 GB | Phase 5.7-A1 cache. ~$5/mo. Cuts cold S3 fetches from ~50 ms → ~100 µs. |
 
 **Total cost for one region with 10k tenants × 100 MB each, mostly cached:** ~$300–500/month all-in.
@@ -144,7 +162,7 @@ For cross-region **read replicas** ([ADR 0004](./decisions/0004-multi-region-rea
 | Piece | Effort |
 |---|---|
 | R2 cross-region replication (storage layer) | Flip a switch. Cloudflare ships this as a paid add-on. **No Basin code.** |
-| Catalog replication | Postgres logical replication if catalog backend = PG. Or snapshot-and-pull. ~1 week. |
+| Catalog replication | Snapshot-and-pull of the embedded catalog's WAL between regions, replayed at the destination. ~1 week. Operators who run `BASIN_AUTH_CATALOG_DSN` against external Postgres can layer logical replication on that backend instead. |
 | Replica role on basin-router | Read-only session marker. ~3 days. |
 | Snapshot freshness lag visibility | Stats endpoint + optional `READ AT SNAPSHOT <id>` SQL. ~3 days. |
 
@@ -168,7 +186,7 @@ This covers ~95% of B2B SaaS shapes (data residency + low local latency).
 ### Phase 2 — cross-region read replicas (when first paid customer asks)
 
 - Enable R2 cross-region replication for that tenant's bucket.
-- Replicate catalog state (PG logical or snapshot+pull).
+- Replicate catalog state (snapshot+pull of embedded catalog; PG logical only if operator opted into `BASIN_AUTH_CATALOG_DSN`).
 - Add `replica` role marker to basin-router; read-only sessions land on replicas.
 - Surface replica lag in stats and as a `WARNING` if stale > N seconds.
 
@@ -211,13 +229,47 @@ This mirrors what Snowflake and BigQuery do. Supabase / Neon's per-project prici
 
 - [ ] Fly.io app created in the region
 - [ ] R2 bucket created in the region
-- [ ] Postgres catalog database (Fly PG or external)
+- [ ] `BASIN_DATA_DIR` + `BASIN_WAL_DIR` volumes attached (the embedded catalog lives here — no external Postgres to provision)
 - [ ] DNS: `<region>.basin.example.com` → router fleet
 - [ ] Auth signing key (one global key OR per-region keys)
 - [ ] Monitoring: per-tenant ops/s, p50/p99, RAM, IO via OTLP
 - [ ] Backup: R2 versioning enabled (Iceberg snapshots are the data; no `pg_dump` needed)
 - [ ] Rate limit: per-tenant guard for compute and `basin-net` outbound HTTP
 - [ ] Disaster recovery: R2 bucket replication target (manual cross-region copy if Phase 2 not yet built)
+
+---
+
+## Optional: external auth catalog
+
+By default `basin-auth` stores `auth.users`, `auth.refresh_tokens`, and
+`auth.email_tokens` in the same engine catalog as application tables, over
+the loopback pgwire. One process, one durability domain, one backup target.
+That is the recommended shape for ≥ 99% of self-hosted deploys.
+
+Some operators prefer to keep identity tables on a separate OLTP store:
+durability isolation (a Basin engine crash that loses uncompacted WAL is
+recoverable; an `auth.users` corruption locks every customer out), tighter
+compliance scoping, or an existing managed Postgres they already operate.
+
+Set `BASIN_AUTH_CATALOG_DSN=postgres://...` to point the auth catalog at an
+external Postgres (Fly PG, RDS, Neon, self-managed — any pgwire-speaking
+backend works). When set:
+
+- Application tables continue to use the embedded catalog. Only the
+  `auth.*` namespace is redirected.
+- The external DB needs `CREATE` on its target schema; basin-auth runs the
+  same idempotent `schema.sql` it would otherwise run against the embedded
+  catalog.
+- The connection string is read at startup only. Rotating the password
+  requires a restart.
+- Engine crashes do not corrupt the external store. Outages on the external
+  store fail new logins fast (5xx from `/auth/v1/*`); existing JWTs keep
+  working until they expire.
+
+Trade-off: one more thing to back up, one more thing to monitor, one more
+network hop on signin (a few ms typically). The override exists because
+some prod workloads value durability separation while basin's engine
+catalog matures; it is not the default.
 
 ---
 

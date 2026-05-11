@@ -284,8 +284,10 @@ machine `M_src`, moving to `M_tgt`. The R2 bucket is shared.
    `Shard::flush_to_parquet()` (already exists). After this, R2 has
    every row that's been ACK'd up to time `t`.
 3. **Bring up `M_tgt`** — spawn a new Fly machine running the same
-   `basin-engine` binary, configured with the same R2 bucket and Neon
-   catalog. It comes up cold (no resident tenants).
+   `basin-engine` binary, configured with the same R2 bucket and the
+   shared placement-service endpoint. The embedded catalog is local to
+   the engine — `M_tgt` does not need a separate Postgres connection.
+   It comes up cold (no resident tenants).
 4. **Drain → quiesce `M_src`** — placement service flips the
    `(tenant, partition) → machine` mapping from `M_src` to `M_tgt`. New
    client connections route to `M_tgt`. In-flight connections on `M_src`
@@ -310,8 +312,11 @@ unaffected.
   files and the same WAL segments. The move is purely a "who owns the
   in-memory state" decision — no data copies.
 - **Catalog is the linearisation point.** Same as the split: the
-  placement-service flip is an atomic Neon catalog transaction
-  (`UPDATE shard_placement SET machine = $tgt WHERE shard_id = $id`).
+  placement-service flip is an atomic transaction against the
+  placement store (`UPDATE shard_placement SET machine = $tgt WHERE
+  shard_id = $id`). In v0.3 that store is `basin-placement`'s own
+  embedded catalog, accessed via loopback pgwire; operators who want
+  external durability can point placement at any pgwire backend.
   Writers see either old or new owner, never both.
 - **WAL replay is the catchup mechanism.** `M_tgt` doesn't need state
   transfer from `M_src`; it reconstructs state from R2. The cost is
@@ -449,7 +454,9 @@ shard mix on one box exceeds capacity):
 ### v0.3 — automatic rebalance
 
 - `basin-placement` grows a real `(shard_id) → machine_id` catalog
-  table (Postgres / Neon).
+  table backed by the embedded engine catalog (loopback pgwire); the
+  same `BASIN_AUTH_CATALOG_DSN`-shaped override exists for operators
+  who want this state on external Postgres.
 - `RemoteShardSplitter` runs the split protocol coordinated across
   multiple machines (the dual-write window is cluster-wide).
 - `RemoteRebalancer` polls metrics, generates plans, executes moves on

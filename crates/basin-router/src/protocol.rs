@@ -1545,11 +1545,14 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
                     .resolver
                     .resolve_credentials(&user, &password)
                     .await
-                    .map_err(|_| {
-                        // Uniform error — never leak whether the user
-                        // existed but the password was wrong vs the user
-                        // didn't exist. SQLSTATE 28P01 (`invalid_password`)
-                        // is the canonical Postgres code.
+                    .map_err(|e| {
+                        // SQLSTATE 28P01 (`invalid_password`) — the canonical
+                        // Postgres code. The underlying reason (user not
+                        // found vs. bcrypt mismatch vs. JWT expired) is logged
+                        // at WARN with the username so operators can debug
+                        // misrouted clients without exposing it to the
+                        // attacker on the wire.
+                        tracing::warn!(error = %e, %user, "pgwire auth rejected");
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "FATAL".to_owned(),
                             "28P01".to_owned(),

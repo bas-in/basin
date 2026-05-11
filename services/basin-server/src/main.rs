@@ -91,18 +91,22 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use basin_common::{
     telemetry::{init, LogFormat},
-    TenantId,
+    BasinError, TenantId,
 };
 use basin_router::{
-    ApiKeyTenantResolver, JwtTenantResolver, ServerConfig, StackedTenantResolver,
-    StaticTenantResolver, TenantResolver, TlsConfig,
+    ApiKeyTenantResolver, JwtTenantResolver, ServerConfig, StaticTenantResolver, TenantResolver,
+    TlsConfig,
 };
 use object_store::local::LocalFileSystem;
 
@@ -282,66 +286,55 @@ async fn main() -> Result<()> {
         engine
     };
 
+    // Build the static resolver from `BASIN_TENANTS`. We then ALWAYS
+    // auto-inject `basin_auth -> INTERNAL_AUTH_TENANT_ID` so basin-auth can
+    // authenticate as itself over the loopback pgwire catalog path — even
+    // when auth is off, the entry is harmless (basin-auth only uses it when
+    // it's actually starting up). The reserved entry is the seed that
+    // unblocks the chicken-and-egg in the auth-on case: basin-auth needs the
+    // listener up, the listener needs a resolver, the resolver needs an
+    // identity for basin-auth.
     let mut static_resolver = StaticTenantResolver::default();
     for (user, tenant) in cfg.tenants {
         tracing::info!(%user, %tenant, "tenant registered");
         static_resolver = static_resolver.with_entry(user, tenant);
     }
+    let internal_auth_tenant: TenantId = basin_auth::INTERNAL_AUTH_TENANT_ID
+        .parse()
+        .map_err(|e| anyhow!("INTERNAL_AUTH_TENANT_ID is not a valid tenant id: {e}"))?;
+    static_resolver =
+        static_resolver.with_entry(basin_auth::INTERNAL_AUTH_USERNAME, internal_auth_tenant);
+    tracing::info!(
+        user = basin_auth::INTERNAL_AUTH_USERNAME,
+        tenant = %internal_auth_tenant,
+        "reserved system tenant auto-registered for basin-auth loopback"
+    );
 
-    // --- optional auth service ---------------------------------------------
-    //
-    // Constructed before REST so the REST gate can require it. Built before
-    // the pool / router too because the pgwire resolver stack depends on it
-    // when `BASIN_AUTH_ENABLED=1`.
-    let auth_service: Option<Arc<basin_auth::AuthService>> = if cfg.auth_enabled {
-        let auth_cfg = basin_auth::AuthConfig::from_env()
-            .context("BASIN_AUTH_ENABLED=1 but AuthConfig::from_env failed")?;
-        let svc = basin_auth::AuthService::connect(auth_cfg)
-            .await
-            .context("basin-auth connect failed")?;
-        tracing::info!("basin-auth enabled");
-        Some(Arc::new(svc))
+    // Resolver stack with a lazy auth slot. The listener has to come up
+    // BEFORE basin-auth's `connect()` runs (basin-auth's catalog now lives
+    // inside engine's own pgwire), so the resolver `ServerConfig` takes can't
+    // yet hold the `AuthService`. Instead we build a `DeferredAuthResolver`:
+    // a static-first resolver with a `OnceLock<Arc<AuthService>>` for JWT +
+    // API-key paths. Until the cell is filled, the resolver is just
+    // static. After basin-auth boots, we `set()` the cell and JWT clients
+    // start working — same final behaviour as the pre-loopback wiring.
+    let auth_slot: Arc<OnceLock<Arc<basin_auth::AuthService>>> = Arc::new(OnceLock::new());
+    let tenant_resolver: Arc<dyn TenantResolver> = Arc::new(DeferredAuthResolver {
+        static_resolver,
+        auth_slot: auth_slot.clone(),
+    });
+    if cfg.auth_enabled {
+        tracing::info!(
+            "pgwire resolver: JWT + API-key (deferred until basin-auth is up) + static (always)"
+        );
     } else {
-        None
-    };
-
-    // Pgwire resolver: when auth is on, prefer JWT and fall back to the
-    // static map so existing `alice=*`-style demos keep working alongside
-    // JWT clients on the same listener. With auth off the static resolver
-    // is the only path — byte-identical to pre-auth behaviour.
-    let tenant_resolver: Arc<dyn TenantResolver> = match auth_service.as_ref() {
-        Some(auth) => {
-            tracing::info!("pgwire resolver: JWT (primary) + API-key + static (fallback)");
-            Arc::new(StackedTenantResolver::new(vec![
-                Arc::new(JwtTenantResolver::new(auth.clone())),
-                Arc::new(ApiKeyTenantResolver::new(auth.clone())),
-                Arc::new(static_resolver),
-            ]))
-        }
-        None => Arc::new(static_resolver),
-    };
-
-    // --- optional REST listener --------------------------------------------
-    //
-    // Per ADR 0006: REST requires AUTH. We refuse to bring up the HTTP
-    // listener without an `AuthService` — that combination is the largest
-    // data-leak class in this stack.
-    let mut rest_handle: Option<basin_rest::RunningRest> = None;
-    if cfg.rest_enabled {
-        let auth = auth_service.clone().ok_or_else(|| {
-            anyhow!("BASIN_REST_ENABLED=1 requires BASIN_AUTH_ENABLED=1 (per ADR 0006)")
-        })?;
-        let rest_cfg = basin_rest::RestConfig::new(cfg.rest_bind, engine.clone(), auth);
-        let svc = basin_rest::RestService::new(rest_cfg);
-        let running = svc
-            .run_until_bound()
-            .await
-            .map_err(|e| anyhow!("basin-rest bind failed: {e}"))?;
-        tracing::info!(bind = %running.local_addr, "basin-rest listening");
-        rest_handle = Some(running);
+        tracing::info!("pgwire resolver: static (auth disabled)");
     }
 
     // --- optional connection pool ------------------------------------------
+    //
+    // Built before the router so we can hand the pool into `ServerConfig`.
+    // Independent of basin-auth — the pool only depends on the engine.
     let mut eviction_handle: Option<basin_pool::EvictionHandle> = None;
     let pool: Option<Arc<basin_pool::SessionPool>> = if cfg.pool_enabled {
         let p = Arc::new(basin_pool::SessionPool::new(
@@ -363,22 +356,75 @@ async fn main() -> Result<()> {
         tracing::info!("pgwire TLS configured from BASIN_TLS_CERT_PATH/BASIN_TLS_KEY_PATH");
     }
 
-    // Run the router until Ctrl-C, then shut down the shard's background loops
-    // and close the WAL. Order matters: stop accepting writes (router exit),
-    // then drain compactions (shutdown), then close the WAL — that way no
-    // segment is mid-flush when the file handles drop.
+    // Spawn the pgwire router BEFORE basin-auth starts. basin-auth's catalog
+    // now lives inside basin engine's own pgwire (loopback DSN by default),
+    // so the listener must be `accept()`-able by the time `AuthService::
+    // connect()` runs.
     let (router_tx, router_rx) = tokio::sync::oneshot::channel();
     let server_cfg = ServerConfig {
         bind_addr: cfg.bind,
-        engine,
+        engine: engine.clone(),
         tenant_resolver,
         pool,
         shard_endpoints: None,
         tls,
     };
+    let router_bind = cfg.bind;
 
     let router_join =
         tokio::spawn(async move { basin_router::run_with_shutdown(server_cfg, router_rx).await });
+
+    // Wait until the pgwire listener is accept()-able. A short TCP probe loop
+    // is sufficient and avoids a deeper coupling with `basin-router::run`. 5s
+    // upper bound — anything slower means the bind itself failed and we want
+    // to surface that, not hang here.
+    wait_for_pgwire_accept(router_bind)
+        .await
+        .context("pgwire listener never became accept-able")?;
+    tracing::info!(bind = %router_bind, "pgwire listener is accept-ready");
+
+    // --- optional auth service (now that pgwire is up) ---------------------
+    //
+    // basin-auth's default catalog DSN is the loopback `postgres://
+    // basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable` — engine's
+    // own pgwire. The `basin_auth` username resolves through the
+    // auto-injected static-tenant entry above. Operators can still override
+    // by setting `BASIN_AUTH_CATALOG_DSN` to an external Postgres.
+    let auth_service: Option<Arc<basin_auth::AuthService>> = if cfg.auth_enabled {
+        let auth_cfg = basin_auth::AuthConfig::from_env()
+            .context("BASIN_AUTH_ENABLED=1 but AuthConfig::from_env failed")?;
+        let svc = basin_auth::AuthService::connect(auth_cfg)
+            .await
+            .context("basin-auth connect failed")?;
+        tracing::info!("basin-auth enabled");
+        let arced = Arc::new(svc);
+        // Activate JWT + API-key paths now that AuthService is ready. `set`
+        // is idempotent — the slot is owned by us and only filled here.
+        let _ = auth_slot.set(arced.clone());
+        Some(arced)
+    } else {
+        None
+    };
+
+    // --- optional REST listener --------------------------------------------
+    //
+    // Per ADR 0006: REST requires AUTH. We refuse to bring up the HTTP
+    // listener without an `AuthService` — that combination is the largest
+    // data-leak class in this stack.
+    let mut rest_handle: Option<basin_rest::RunningRest> = None;
+    if cfg.rest_enabled {
+        let auth = auth_service.clone().ok_or_else(|| {
+            anyhow!("BASIN_REST_ENABLED=1 requires BASIN_AUTH_ENABLED=1 (per ADR 0006)")
+        })?;
+        let rest_cfg = basin_rest::RestConfig::new(cfg.rest_bind, engine.clone(), auth);
+        let svc = basin_rest::RestService::new(rest_cfg);
+        let running = svc
+            .run_until_bound()
+            .await
+            .map_err(|e| anyhow!("basin-rest bind failed: {e}"))?;
+        tracing::info!(bind = %running.local_addr, "basin-rest listening");
+        rest_handle = Some(running);
+    }
 
     // Wait for Ctrl-C, then signal the router to stop.
     let _ = tokio::signal::ctrl_c().await;
@@ -496,6 +542,91 @@ impl Cfg {
             tenants,
             catalog,
         })
+    }
+}
+
+/// Resolver that fronts a `StaticTenantResolver` with a lazily-populated
+/// `AuthService`-backed JWT + API-key path. While the slot is empty (during
+/// startup, before `basin_auth::AuthService::connect()` completes), the
+/// resolver behaves as if only the static map exists — exactly what we need
+/// for basin-auth's own loopback connect, which authenticates as the
+/// reserved `basin_auth` user. After the slot is filled, JWT and API-key
+/// clients on the same listener get the full stack.
+///
+/// Static-first resolver with a lazily-populated `AuthService` slot for the
+/// JWT + API-key paths. Before basin-auth boots, the auth slot is empty and
+/// the resolver behaves as static-only; once `connect()` succeeds the slot
+/// is `set()` and JWT clients start working.
+struct DeferredAuthResolver {
+    static_resolver: StaticTenantResolver,
+    auth_slot: Arc<OnceLock<Arc<basin_auth::AuthService>>>,
+}
+
+#[async_trait]
+impl TenantResolver for DeferredAuthResolver {
+    async fn resolve(&self, username: &str) -> basin_common::Result<TenantId> {
+        if let Some(auth) = self.auth_slot.get().cloned() {
+            let jwt = JwtTenantResolver::new(auth.clone());
+            if let Ok(t) = jwt.resolve(username).await {
+                return Ok(t);
+            }
+            let api_key = ApiKeyTenantResolver::new(auth);
+            if let Ok(t) = api_key.resolve(username).await {
+                return Ok(t);
+            }
+        }
+        self.static_resolver.resolve(username).await
+    }
+
+    async fn resolve_credentials(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> basin_common::Result<TenantId> {
+        if let Some(auth) = self.auth_slot.get().cloned() {
+            let jwt = JwtTenantResolver::new(auth.clone());
+            if let Ok(t) = jwt.resolve_credentials(username, password).await {
+                return Ok(t);
+            }
+            let api_key = ApiKeyTenantResolver::new(auth);
+            if let Ok(t) = api_key.resolve_credentials(username, password).await {
+                return Ok(t);
+            }
+        }
+        self.static_resolver
+            .resolve_credentials(username, password)
+            .await
+    }
+}
+
+/// Polls `127.0.0.1:<port>` until `connect()` succeeds, with 100ms backoff
+/// and a 5s deadline. Used to gate basin-auth's startup on the pgwire
+/// listener actually being ready to serve. `bind` may be an `INADDR_ANY`
+/// address (e.g. `0.0.0.0:5433`); we probe `127.0.0.1:<port>` because the
+/// loopback DSN basin-auth uses always targets `127.0.0.1`.
+async fn wait_for_pgwire_accept(bind: SocketAddr) -> Result<()> {
+    let port = bind.port();
+    let target: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .context("build loopback probe address")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(target),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            _ => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "pgwire listener at {target} not accept-able after 5s"
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 }
 
