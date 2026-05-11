@@ -224,6 +224,17 @@ impl AuthConfig {
             return Err(BasinError::internal(msg));
         }
 
+        // Resolve per-region pgwire public host.
+        //
+        // Priority (highest wins):
+        //   1. BASIN_PGWIRE_REGION_HOSTS lookup for the current FLY_REGION
+        //   2. BASIN_AUTH_PGWIRE_PUBLIC_HOST (single-host fallback)
+        //   3. Hard-coded local dev default "127.0.0.1:5433"
+        //
+        // BASIN_PGWIRE_REGION_HOSTS format mirrors the Go backend:
+        //   jnb:jnb.db.basin.to,fra:fra.db.basin.to
+        let pgwire_public_host = resolve_pgwire_host();
+
         Ok(Self {
             jwt_secret,
             token_ttl,
@@ -245,8 +256,7 @@ impl AuthConfig {
             // SMTP host validated above as required, so email is always
             // enabled for env-built configs.
             email_enabled: true,
-            pgwire_public_host: std::env::var("BASIN_AUTH_PGWIRE_PUBLIC_HOST")
-                .unwrap_or_else(|_| "127.0.0.1:5433".to_owned()),
+            pgwire_public_host,
         })
     }
 }
@@ -309,6 +319,56 @@ fn optional_usize(var: &str, default: usize, invalid: &mut Vec<String>) -> usize
         },
         Err(_) => default,
     }
+}
+
+/// Resolve the pgwire public hostname to embed in connection URLs.
+///
+/// Resolution order:
+/// 1. If `BASIN_PGWIRE_REGION_HOSTS` is set, parse the `region:host` map and
+///    look up `FLY_REGION`. When a match is found, that host wins.
+/// 2. Fall back to `BASIN_AUTH_PGWIRE_PUBLIC_HOST` (single-host override).
+/// 3. Default to `127.0.0.1:5433` for local development.
+///
+/// Logs the resolved host at INFO level so operators can confirm the right
+/// region endpoint was picked at startup.
+fn resolve_pgwire_host() -> String {
+    // Try region-specific host first.
+    let region_map_raw = std::env::var("BASIN_PGWIRE_REGION_HOSTS").ok();
+    if let Some(ref map_str) = region_map_raw {
+        let fly_region = std::env::var("FLY_REGION").ok();
+        if let Some(ref region) = fly_region {
+            // Parse "jnb:jnb.db.basin.to,fra:fra.db.basin.to" into a lookup.
+            for entry in map_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some((r, h)) = entry.split_once(':') {
+                    if r.trim() == region.trim() {
+                        let host = h.trim().to_owned();
+                        tracing::info!(
+                            fly_region = %region,
+                            pgwire_public_host = %host,
+                            "pgwire public host resolved from BASIN_PGWIRE_REGION_HOSTS",
+                        );
+                        return host;
+                    }
+                }
+            }
+            // Region map was set but our region wasn't in it — warn and fall
+            // through so a single-host override or the default still works.
+            tracing::warn!(
+                fly_region = %region,
+                region_hosts = %map_str,
+                "FLY_REGION not found in BASIN_PGWIRE_REGION_HOSTS; falling back to BASIN_AUTH_PGWIRE_PUBLIC_HOST",
+            );
+        }
+    }
+
+    // Single-host fallback / local dev default.
+    let host = std::env::var("BASIN_AUTH_PGWIRE_PUBLIC_HOST")
+        .unwrap_or_else(|_| "127.0.0.1:5433".to_owned());
+    tracing::info!(
+        pgwire_public_host = %host,
+        "pgwire public host resolved from BASIN_AUTH_PGWIRE_PUBLIC_HOST (or default)",
+    );
+    host
 }
 
 const MIN_SECRET_BYTES: usize = 32;
