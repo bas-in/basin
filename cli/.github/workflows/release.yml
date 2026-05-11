@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  # Required for Sigstore keyless signing — cosign mints an OIDC
+  # token via this job's identity to sign release artefacts. The
+  # signing identity downstream verifiers pin against is
+  # `https://github.com/bas-in/basin-cli/.github/workflows/release.yml@refs/tags/<tag>`.
+  id-token: write
+  # Required so goreleaser's `dockers:` block can push the basin
+  # image to `ghcr.io/bas-in/basin:<tag>` + `:latest` via the
+  # default GITHUB_TOKEN. No PAT needed for same-org GHCR pushes.
+  packages: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+      # Install cosign so the goreleaser `signs:` block can shell out
+      # to it. Pinned to a stable major; the installer caches the
+      # binary so re-runs are fast.
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+      # buildx is required for the multi-arch docker manifest list —
+      # goreleaser's `dockers:` block uses `use: buildx`. The action
+      # also wires QEMU so amd64 + arm64 images can both build on the
+      # ubuntu-latest amd64 runner.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # Authenticate the runner to GHCR so `docker push
+      # ghcr.io/bas-in/basin:<tag>` succeeds. `packages: write`
+      # permission above lets the default GITHUB_TOKEN do this for
+      # any image namespace under the same org.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          # Default GITHUB_TOKEN can write to this repo's releases.
+          # GORELEASER_TAP_TOKEN is a fine-grained PAT scoped to
+          # `bas-in/homebrew-tap` so the brews: block can push the
+          # updated Formula/basin.rb. Set it in repo secrets.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_TAP_TOKEN: ${{ secrets.GORELEASER_TAP_TOKEN }}
