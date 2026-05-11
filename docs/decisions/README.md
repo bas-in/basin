@@ -59,3 +59,21 @@ table.
    "When a customer signs ≥ $50k/yr ARR contingent on this" is a trigger.
 5. **Link from `CAPABILITIES.md`** so the customer-facing description
    has a one-click route to the engineering reasoning.
+
+## Index
+
+| # | Title | Status | Summary |
+|---|---|---|---|
+| 0001 | Single-region only | Accepted | No cross-region 2PC; strong consistency deferred |
+| 0002 | No Postgres extensions | Accepted | Native Rust crates instead of upstream .so loading |
+| 0003 | Native vector search | Accepted | HNSW in-engine; no pg_vector wire-compat |
+| 0004 | Multi-region read replicas | Accepted | Eventual-consistent read replicas scoped for Phase 6 |
+| 0005 | Auth system | Accepted | basin-auth scope: signup, JWT, refresh, API keys, magic-link |
+| 0006 | REST API layer | Accepted | basin-rest: PostgREST-shaped, requires auth enabled |
+| 0007 | Connection pooling | Accepted | Native TenantSession cache; per-tenant cap; LRU eviction |
+| 0008 | Noisy-neighbor fairness | Accepted | EDF scheduler; priority by op-shape; p99 13.97 ms under load |
+| 0009 | Multi-region architecture | Accepted | One cluster per region; data-plane topology locked |
+| 0010 | Catalog replication | Accepted | Single-writer global Postgres + regional read replicas via logical replication |
+| 0011 | Cross-shard 2PC | Accepted | Deferred; locked architecturally; gated on customer demand |
+| 0012 | Change event primitive | Accepted | ChangeEventSink trait; declarative lifecycle + reactors replace PL/pgSQL triggers |
+| 0013 | Auth per-tenant schema | Accepted | Removes loopback pgwire; auth data in per-tenant storage; auth.uid/role/jwt |

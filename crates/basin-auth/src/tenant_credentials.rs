@@ -62,10 +62,11 @@ pub struct ConnectionInfo {
     pub connection_url: String,
 }
 
-/// Build the canonical pgwire username: `{tenant_id}_{8 hex chars}`.
-/// The tenant ULID (26 chars) is embedded in the username so it's
-/// self-routing — callers can extract it with
-/// [`parse_tenant_from_pgwire_user`] without a DB round-trip.
+/// Generate a pgwire username in the new ADR-0013 format:
+/// `{26-char-tenant-ulid}_{8 hex chars}`. The tenant ULID embedded in the
+/// username makes it self-routing — the pgwire auth handler can call
+/// [`parse_tenant_from_pgwire_user`] to resolve the tenant without a global
+/// DB lookup, even before the password has been verified.
 fn generate_pgwire_user(tenant: &TenantId) -> String {
     let mut buf = [0u8; 4];
     rand::thread_rng().fill_bytes(&mut buf);
@@ -78,20 +79,26 @@ fn generate_password() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-/// Returns `true` if the pgwire_user is in the old `tenant_<hex>` format
-/// that does not encode the tenant_id. Old credentials need to be migrated
-/// to the new `{26-char-ulid}_{hex}` self-routing format.
+/// Returns `true` if `pgwire_user` is in the pre-ADR-0013 `tenant_<hex>`
+/// format, which does not embed the tenant ULID and therefore requires a DB
+/// lookup to resolve the tenant. Credentials in this format must be migrated
+/// to the new `{26-char-ulid}_{hex}` format via
+/// [`migrate_legacy_credential`] before the self-routing path can be used.
 ///
-/// The check is deliberately conservative: a string is considered legacy only
-/// when it starts with `"tenant_"` AND is shorter than 20 chars (the old
-/// format is `tenant_` + 8 hex chars = 15 chars total; the new format is at
-/// least 27+1 = 28 chars).
+/// The check is deliberately conservative: only strings that start with
+/// `"tenant_"` AND are shorter than 20 chars are treated as legacy (the old
+/// format is `tenant_` + 8 hex chars = 15 chars; the new format is at least
+/// 28 chars).
 pub fn is_legacy_pgwire_user(pgwire_user: &str) -> bool {
     pgwire_user.starts_with("tenant_") && pgwire_user.len() < 20
 }
 
-/// Parse the tenant ULID from a pgwire username of the form
-/// `{26-char-ulid}_{suffix}`. Returns `None` if the format doesn't match.
+/// Extract the 26-character tenant ULID from a new-format pgwire username
+/// (`{26-char-ulid}_{suffix}`). This makes credential validation self-routing:
+/// the pgwire handler can identify the tenant from the username alone without a
+/// global DB lookup, enabling efficient per-tenant auth table access. Returns
+/// `None` for usernames that don't match the format (e.g. legacy `tenant_<hex>`
+/// credentials).
 pub fn parse_tenant_from_pgwire_user(pgwire_user: &str) -> Option<&str> {
     // ULID is 26 chars, followed by '_'
     if pgwire_user.len() > 27 && pgwire_user.as_bytes()[26] == b'_' {
@@ -380,5 +387,106 @@ mod tests {
         let u = build_connection_url("db.example.com:5433", &user, "supersecret", "basin");
         assert!(u.starts_with("postgres://"));
         assert!(u.contains("supersecret@db.example.com:5433/basin"));
+    }
+
+    // --- parse_tenant_from_pgwire_user: new comprehensive cases ---
+
+    #[test]
+    fn parse_tenant_valid_new_format() {
+        // Valid new format: exactly 26-char ULID + '_' + any suffix
+        let tenant = TenantId::new();
+        let tenant_str = tenant.to_string();
+        assert_eq!(tenant_str.len(), 26, "TenantId must be 26 chars");
+        let pgwire_user = format!("{tenant_str}_a1b2c3d4");
+        let parsed = parse_tenant_from_pgwire_user(&pgwire_user).expect("must parse new format");
+        assert_eq!(parsed, tenant_str.as_str());
+    }
+
+    #[test]
+    fn parse_tenant_requires_more_than_27_chars() {
+        // Exactly 27 chars (26 + '_' + nothing) → len == 27, not > 27 → None.
+        let tenant = TenantId::new();
+        let user_no_suffix = format!("{}_", tenant);
+        assert_eq!(user_no_suffix.len(), 27);
+        assert!(
+            parse_tenant_from_pgwire_user(&user_no_suffix).is_none(),
+            "need at least one char after the underscore"
+        );
+    }
+
+    #[test]
+    fn parse_tenant_old_legacy_format_returns_none() {
+        // Old `tenant_<hex>` format does not embed a 26-char ULID → None.
+        assert!(parse_tenant_from_pgwire_user("tenant_a1b2c3d4").is_none());
+    }
+
+    #[test]
+    fn parse_tenant_no_underscore_at_position_26_returns_none() {
+        // 26 chars with no underscore at all.
+        assert!(parse_tenant_from_pgwire_user("01JBAS1NAVTH00000000000000").is_none());
+        // 26 chars + non-underscore separator.
+        assert!(parse_tenant_from_pgwire_user("01JBAS1NAVTH00000000000000-suffix").is_none());
+    }
+
+    #[test]
+    fn parse_tenant_too_short_returns_none() {
+        assert!(parse_tenant_from_pgwire_user("abc_def").is_none());
+        assert!(parse_tenant_from_pgwire_user("").is_none());
+        assert!(parse_tenant_from_pgwire_user("_").is_none());
+    }
+
+    #[test]
+    fn parse_tenant_self_routing_invariant() {
+        // Every username generated by `generate_pgwire_user` must parse back
+        // to the exact tenant_id it was generated for.
+        for _ in 0..20 {
+            let tenant = TenantId::new();
+            let u = generate_pgwire_user(&tenant);
+            let parsed = parse_tenant_from_pgwire_user(&u).expect("generated user must parse");
+            assert_eq!(
+                parsed,
+                tenant.to_string().as_str(),
+                "self-routing invariant broken: generated={u:?} parsed={parsed:?}"
+            );
+        }
+    }
+
+    // --- is_legacy_pgwire_user ---
+
+    #[test]
+    fn is_legacy_true_for_tenant_hex_format() {
+        assert!(is_legacy_pgwire_user("tenant_a1b2c3d4"));
+        assert!(is_legacy_pgwire_user("tenant_deadbeef"));
+        // 15 chars total (7 + 8): shorter than 20 → legacy.
+        assert!(is_legacy_pgwire_user("tenant_00000000"));
+    }
+
+    #[test]
+    fn is_legacy_false_for_new_format() {
+        let tenant = TenantId::new();
+        let u = generate_pgwire_user(&tenant);
+        assert!(
+            !is_legacy_pgwire_user(&u),
+            "new-format user must not be flagged legacy: {u:?}"
+        );
+    }
+
+    #[test]
+    fn is_legacy_false_for_empty_string() {
+        assert!(!is_legacy_pgwire_user(""));
+    }
+
+    #[test]
+    fn is_legacy_false_for_long_tenant_prefix() {
+        // Starts with "tenant_" but is >= 20 chars (new-format collision unlikely
+        // but the boundary is what matters for migration correctness).
+        let long = "tenant_0000000000000"; // 7 + 13 = 20 chars
+        assert!(!is_legacy_pgwire_user(long), "length 20 is NOT legacy");
+    }
+
+    #[test]
+    fn is_legacy_false_for_unrelated_string() {
+        assert!(!is_legacy_pgwire_user("01JBAS1NAVTH00000000000000_a1b2c3d4"));
+        assert!(!is_legacy_pgwire_user("notatenantatall"));
     }
 }

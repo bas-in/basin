@@ -2328,9 +2328,10 @@ pub(crate) fn rewrite_auth_schema_functions(sql: &str) -> String {
 
 use crate::AuthContext;
 
-/// Register the three auth session UDFs on `ctx`. The `auth_context` is
-/// captured by value (behind an `Arc`) into each UDF so they can be called
-/// from any thread DataFusion sends them to.
+/// Register `auth_uid()`, `auth_role()`, and `auth_jwt()` on `ctx`.
+/// Each UDF captures an `Arc<AuthContext>` at session-open time so that
+/// evaluating any of the three functions is a pure read of already-resolved
+/// claims — zero per-query I/O or synchronisation overhead.
 pub(crate) fn register_auth_udfs(ctx: &SessionContext, auth_context: Arc<AuthContext>) {
     ctx.register_udf(ScalarUDF::from(AuthUidUdf {
         auth_context: auth_context.clone(),

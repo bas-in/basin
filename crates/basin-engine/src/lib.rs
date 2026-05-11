@@ -454,7 +454,11 @@ impl AuthContext {
         }
     }
 
-    /// Authenticated context built from JWT claims.
+    /// Build an authenticated context from decoded JWT claims. `user_id` maps
+    /// to `auth.uid()`, `role` to `auth.role()`, and `claims` (the full JSON
+    /// object) to `auth.jwt()`. Called by the pgwire router after successfully
+    /// verifying the bearer JWT; the context is then passed to
+    /// [`Engine::open_session_with_auth`].
     pub fn from_jwt(
         user_id: Uuid,
         role: impl Into<String>,

@@ -11,6 +11,8 @@
 //! escape hatch — callers write to the trait, implementations write SQL.
 
 pub mod postgres;
+#[cfg(test)]
+pub mod conformance;
 
 use std::collections::HashMap;
 
@@ -59,14 +61,23 @@ pub struct TenantCredentialRow {
 // The trait itself
 // ---------------------------------------------------------------------------
 
-/// High-level auth persistence operations. Implementations must be `Send +
-/// Sync` so they can be wrapped in `Arc` and shared across async tasks.
+/// Storage abstraction for basin-auth. The two concrete implementations are
+/// [`postgres::PostgresAuthStore`] (wraps an external `tokio_postgres::Client`,
+/// active when `BASIN_AUTH_CATALOG_DSN` is set) and `EngineAuthStore` in
+/// `basin-server` (routes SQL through the in-process Basin engine, the default
+/// path when no external DSN is configured).
 ///
 /// All methods return `crate::Result` (i.e. `basin_common::Result`). SQL
 /// errors are wrapped with [`basin_common::BasinError::catalog`].
+/// Implementations must be `Send + Sync` so they can be wrapped in `Arc` and
+/// shared across async tasks.
 #[async_trait]
 pub trait AuthStore: Send + Sync {
-    /// Run idempotent schema migrations. Called once at startup.
+    /// Run idempotent `CREATE TABLE / INDEX IF NOT EXISTS` DDL against `schema`
+    /// (used as a table-name prefix, e.g. `"basin_auth"` → `basin_auth_users`).
+    /// Safe to call on every startup; statements are no-ops when the objects
+    /// already exist. Called automatically by [`crate::AuthService::with_store`]
+    /// before the service is returned to callers.
     async fn migrate(&self, schema: &str) -> Result<()>;
 
     // --- Users --------------------------------------------------------------
@@ -148,9 +159,10 @@ pub trait AuthStore: Send + Sync {
         token_hash: &str,
     ) -> Result<Option<MagicLinkEmailTokenRow>>;
 
-    /// Mark a token consumed. Returns the number of rows updated (0 means
-    /// it was already consumed or didn't exist — both map to an error in the
-    /// flow).
+    /// Single-use atomic consume: sets `consumed_at = now()` only when it is
+    /// currently `NULL`. Returns the number of rows updated; `0` means the
+    /// token was already consumed or never existed — both cases map to an
+    /// error in the flow layer.
     async fn consume_email_token(
         &self,
         tenant: &TenantId,
@@ -183,8 +195,14 @@ pub trait AuthStore: Send + Sync {
         user_id: UserId,
     ) -> Result<Vec<RefreshRevocationRow>>;
 
-    /// Insert (or update) the blanket-revoke sentinel for a user. The
-    /// sentinel key is `BLANKET:<user_id>`.
+    /// Insert (or update) the blanket-revoke sentinel for a user. The sentinel
+    /// key is `BLANKET:<user_id>` and it is stored in the same
+    /// `auth_revoked_refresh_tokens` table as individual JTIs. When the refresh
+    /// flow detects a previously-rotated token being replayed (a token-theft
+    /// signal), it calls this to revoke *all* outstanding refresh tokens for the
+    /// user in one write — even tokens whose JTIs were never individually
+    /// recorded. The `list_refresh_revocations` response then contains this
+    /// sentinel; the refresh flow checks for it before accepting any token.
     async fn upsert_blanket_revocation(
         &self,
         blanket_key: &str,
@@ -301,7 +319,9 @@ pub trait AuthStore: Send + Sync {
     /// them for bcrypt verification in the flow layer.
     async fn list_active_auth_magic_links(&self) -> Result<Vec<AuthMagicLinkRow>>;
 
-    /// Mark an auth_magic_links row consumed by id.
+    /// Single-use atomic consume for the tenant-agnostic magic-link row.
+    /// Sets `consumed_at = now()` where `id = $1 AND consumed_at IS NULL`.
+    /// Returns the row count; `0` means already consumed (duplicate token use).
     async fn consume_auth_magic_link(&self, id: i64) -> Result<u64>;
 
     /// Mark `email_verified_at = COALESCE(email_verified_at, now())` for

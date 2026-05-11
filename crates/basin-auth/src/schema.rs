@@ -1,5 +1,9 @@
 //! Schema for the auth tables.
 //!
+//! Folded 2026-05-12 per ADR 0013: all intermediate ALTER/ADD/DROP steps
+//! and provisional v0.1 capability hedges collapsed into the authoritative
+//! CREATE TABLE definitions below.
+//!
 //! Mirrors the `PostgresCatalog` migration pattern: idempotent
 //! `CREATE TABLE IF NOT EXISTS` statements. Tests use a unique schema-prefix
 //! per run with a `Drop`-guard cleanup.
@@ -7,30 +11,22 @@
 //! # Dialect note: basin engine vs upstream Postgres
 //!
 //! This module historically targeted an external Postgres (Neon). The
-//! parallel basin-server boot-order change points it at basin engine's own
-//! pgwire on loopback. Basin engine claims Postgres-compatibility but its
-//! DDL surface (`basin-engine::executor`) is a strict subset:
+//! parallel basin-server boot-order change (v0.1.5) points it at basin
+//! engine's own pgwire on loopback. Basin engine's DDL surface differs from
+//! upstream Postgres in the following ways that affect this file:
 //!
-//! - No `CREATE SCHEMA` — there is no `Statement::CreateSchema` arm in the
-//!   executor; the catalog is single-namespace per tenant. We collapse the
-//!   notional schema into a `<schema>_<table>` table-name prefix instead so
-//!   different deployments (prod / test / unit) can still namespace-isolate.
+//! - No `CREATE SCHEMA` — the catalog is single-namespace per tenant. The
+//!   schema name is collapsed into a `<schema>_<table>` table-name prefix
+//!   so different deployments (prod / test / unit) can still
+//!   namespace-isolate. `auth_loopback_smoke.rs` is the safety net.
 //! - No schema-qualified table references — `single_part_name` in
 //!   `crates/basin-engine/src/executor.rs` rejects multi-part `ObjectName`s.
-//!   Every DDL identifier here is therefore a flat single-part name. Callers
-//!   (`flows/*.rs`, `api_keys.rs`, `tokens.rs`, …) emit `{sch}_<table>`
-//!   instead of `{sch}.<table>` so the same code can target either basin
-//!   engine (no namespaces) or — once that lands — schema-qualified
-//!   Postgres. `auth_loopback_smoke.rs` is the safety net.
-//! - `CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<cols>)` — supported
-//!   as of Phase 5.7 B1. v0.1 is metadata-only (no B-tree materialised yet;
-//!   queries still scan), but `IF NOT EXISTS` makes the bootstrap
-//!   idempotent. See `crates/basin-engine/tests/create_index.rs`.
-//! - Table-level `UNIQUE (col, ...)` and column-level `col TYPE UNIQUE` —
-//!   supported as of Phase 5.7 B1. v0.1 enforces via a full-table scan on
-//!   INSERT / UPDATE (same cost shape as PRIMARY KEY); v0.2 will use the
-//!   secondary-index file format. See `crates/basin-engine/tests/
-//!   unique_constraint.rs`.
+//!   Every DDL identifier here is a flat single-part name; callers emit
+//!   `{sch}_<table>` instead of `{sch}.<table>`.
+//! - `CREATE INDEX [IF NOT EXISTS]`, table-level `UNIQUE`, and column-level
+//!   `UNIQUE` — all supported as of Phase 5.7 B1. See
+//!   `crates/basin-engine/tests/create_index.rs` and
+//!   `crates/basin-engine/tests/unique_constraint.rs`.
 //! - `BIGSERIAL` / `SERIAL` / `SMALLSERIAL` — supported (see
 //!   `crates/basin-engine/tests/serial_type.rs`).
 //! - `UUID`, `TEXT`, `TIMESTAMPTZ`, `BIGINT`, `JSONB`, `BYTEA`, `BOOLEAN`,
@@ -91,10 +87,6 @@ pub(crate) fn validate_schema_ident(s: &str) -> Result<()> {
 /// of every table name. See the module docs for the rationale.
 pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
     validate_schema_ident(schema)?;
-
-    // TODO: revisit when basin supports `CREATE SCHEMA` — restore the
-    // explicit schema-create at the top so the catalog actually groups
-    // these tables under a namespace instead of leaning on a name prefix.
 
     let stmts = [
         // basin_auth_users: composite UNIQUE on (tenant_id, email) is the
@@ -211,20 +203,14 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
                 rotated_at    TIMESTAMPTZ
             )"
         ),
-        // Secondary indexes. v0.1 metadata-only (no B-tree materialised
-        // yet), but the declarations exist so introspection is honest and
-        // v0.2 can swap in the file-format-backed map without a caller
-        // change. Each index targets a hot lookup path:
-        //
-        //   - users (tenant_id, email): login lookup
+        // Secondary indexes — one per hot lookup path:
         //   - api_keys (key_hash): bearer-token verification
         //   - auth_magic_links (token_hash): consume-flow lookup
         //   - auth_revoked_refresh_tokens (user_id): reuse-detection sweep
         //   - auth_tenant_credentials (pgwire_user): pgwire startup auth
-        format!(
-            "CREATE INDEX IF NOT EXISTS {schema}_users_tenant_email \
-             ON {schema}_users (tenant_id, email)"
-        ),
+        //
+        // Note: users (tenant_id, email) is covered by the UNIQUE constraint
+        // on that table, which implies a unique index — no separate entry here.
         format!(
             "CREATE INDEX IF NOT EXISTS {schema}_api_keys_key_hash \
              ON {schema}_api_keys (key_hash)"

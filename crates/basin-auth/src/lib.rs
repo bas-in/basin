@@ -144,9 +144,11 @@ pub struct AuthService {
 }
 
 impl AuthService {
-    /// Connect using the configuration produced by `AuthConfig::from_env` (or
-    /// hand-built). Spawns the Postgres driver task and runs migrations
-    /// before returning.
+    /// External Postgres path: connects to the DSN in `BASIN_AUTH_CATALOG_DSN`
+    /// (or `cfg.catalog_dsn`), spawns the `tokio_postgres` driver task, and
+    /// runs migrations before returning. Use this when deploying with a
+    /// dedicated Postgres instance for auth state; for the default in-process
+    /// path use [`AuthService::with_store`] with an `EngineAuthStore`.
     pub async fn connect(cfg: AuthConfig) -> Result<Self> {
         let mailer: Arc<dyn Mailer> = Arc::new(SmtpMailer::from_config(&cfg.smtp)?);
         Self::connect_with_mailer(cfg, mailer).await
@@ -215,9 +217,11 @@ impl AuthService {
         Self::with_store(cfg, store, mailer).await
     }
 
-    /// Construct an `AuthService` with a pre-built `AuthStore`. Used by
-    /// `basin-server` to inject an `EngineAuthStore` that routes SQL through
-    /// basin engine's own executor — no separate Postgres connection needed.
+    /// Construct an `AuthService` using a caller-supplied [`AuthStore`]. This
+    /// is the in-process default path used by `basin-server`: it injects an
+    /// `EngineAuthStore` that routes all auth SQL through the Basin engine
+    /// directly — no `BASIN_AUTH_CATALOG_DSN` or TCP connection required.
+    /// Runs migrations against the store before returning.
     pub async fn with_store(
         cfg: AuthConfig,
         store: Arc<dyn AuthStore>,
@@ -443,11 +447,12 @@ impl AuthService {
         tenant_credentials::migrate_legacy_credential(&self.inner, tenant, old_pgwire_user).await
     }
 
-    /// Convenience method: lists all legacy credentials, rotates each one,
-    /// and returns the count of successfully migrated credentials. Failures
-    /// on individual credentials are logged but do not abort the batch —
-    /// partial progress is persisted so the next startup attempt continues
-    /// from where this one left off.
+    /// Startup migration: scans for all `tenant_<hex>`-format pgwire credentials
+    /// (pre-ADR-0013) and rotates each one to the new `{ulid}_{hex}` format that
+    /// encodes the tenant ULID for self-routing. Per-credential failures are
+    /// logged but do not abort the batch, so partial progress is persisted and
+    /// the next startup attempt resumes from where this one left off. Returns
+    /// the count of successfully migrated rows.
     pub async fn migrate_legacy_credentials(&self) -> Result<u64> {
         let legacy = self.list_legacy_credentials().await?;
         let total = legacy.len();

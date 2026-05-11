@@ -1,39 +1,34 @@
-//! `EngineAuthStore` — in-process implementation of [`basin_auth::store::AuthStore`].
+//! `EngineAuthStore` — the default in-process [`basin_auth::store::AuthStore`].
 //!
-//! Instead of opening an outbound TCP connection back to our own pgwire
-//! listener, `EngineAuthStore` calls [`basin_engine::Engine::open_session_as`]
-//! to get a [`basin_engine::TenantSession`] and executes SQL directly inside
-//! the engine process.
+//! Instead of opening an outbound TCP connection, every auth query is executed
+//! via [`basin_engine::Engine::open_session_as`]`(tenant_id,
+//! "basin_auth_service")`. Auth data lives in each tenant's own `basin_auth.*`
+//! schema (using the flat-table-name convention `{schema}_<table>`). No TCP
+//! connection or pgwire listener is needed.
 //!
 //! This eliminates the loopback bootstrap chicken-and-egg:
 //!
 //!  - Old: start pgwire listener → wait for bind → basin-auth connects back
 //!    over TCP → fill OnceLock → JWT/API-key paths live.
-//!  - New: build engine → build EngineAuthStore → build AuthService (via
-//!    `with_store`) → build StackedTenantResolver → start pgwire (JWT/API-key
-//!    active from first connection).
+//!  - New: build engine → build `EngineAuthStore` → build `AuthService` (via
+//!    [`basin_auth::AuthService::with_store`]) → build `StackedTenantResolver`
+//!    → start pgwire (JWT/API-key active from first connection).
 //!
-//! ## Tenant used for auth tables
+//! ## Known engine limitations / workarounds
 //!
-//! The auth infrastructure tables (`basin_auth_users`, etc.) are stored under
-//! [`basin_auth::INTERNAL_AUTH_TENANT_ID`] — the same well-known tenant the
-//! old loopback path used. All sessions are opened as `"basin_auth_service"` so
-//! RLS policies keyed on `current_user` can gate internal-service access
-//! separately from end-user connections.
+//! Two methods contain workarounds for current engine gaps:
+//!
+//! - **`find_magic_link_email_token`**: uses two sequential queries instead of
+//!   a JOIN because the engine does not yet support cross-table JOINs (tracked).
+//! - **`insert_api_key`**: uses INSERT followed by a SELECT instead of
+//!   `INSERT … RETURNING` because the engine does not yet support `RETURNING`
+//!   clauses (tracked).
 //!
 //! ## Parameter handling
 //!
-//! `TenantSession::prepare` / `bind` / `execute_bound` accept `ScalarParam`
-//! values. UUIDs and timestamps (which `tokio_postgres` handles natively) are
-//! serialised to `ScalarParam::Text` here — the engine's type-coercion layer
-//! accepts ISO-8601 / RFC3339 strings wherever `TIMESTAMPTZ` or `UUID` is
-//! expected.
-//!
-//! ## SQL compatibility
-//!
-//! The SQL here mirrors `PostgresAuthStore` exactly. Basin engine uses the
-//! same flat-table-name dialect (`{schema}_users`, no `CREATE SCHEMA`, etc.)
-//! described in `basin-auth/src/schema.rs`.
+//! UUIDs and timestamps are serialised to `ScalarParam::Text` (ISO-8601 /
+//! RFC3339) because the engine's type-coercion layer accepts those strings
+//! wherever `TIMESTAMPTZ` or `UUID` is expected.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -610,6 +605,9 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
+    /// Workaround: uses two sequential queries instead of a single JOIN because
+    /// the engine does not yet support cross-table JOINs. Fetches the email
+    /// token row first, then looks up the user's email by `user_id`.
     async fn find_magic_link_email_token(
         &self,
         tenant: &TenantId,
@@ -676,6 +674,9 @@ impl AuthStore for EngineAuthStore {
         }))
     }
 
+    /// Atomically mark a token as consumed by filtering on `consumed_at IS NULL`.
+    /// The single-row `UPDATE` is the serialisation point: concurrent callers
+    /// receive a row-count of 0 and are rejected by the flow layer.
     async fn consume_email_token(&self, tenant: &TenantId, token_hash: &str) -> Result<u64> {
         let sql = format!(
             "UPDATE {sch}_email_tokens SET consumed_at = now()
@@ -689,6 +690,9 @@ impl AuthStore for EngineAuthStore {
 
     // --- Revoked refresh tokens ---------------------------------------------
 
+    /// Record a revoked JTI. `ON CONFLICT DO NOTHING` makes this idempotent —
+    /// the refresh rotation path calls it once per rotation, but a retry or
+    /// duplicate delivery must not turn into an error.
     async fn insert_refresh_revocation(
         &self,
         jti: &str,
@@ -771,6 +775,10 @@ impl AuthStore for EngineAuthStore {
 
     // --- API keys -----------------------------------------------------------
 
+    /// Workaround: uses INSERT followed by a SELECT to recover `(id,
+    /// created_at)` because the engine does not yet support `RETURNING`
+    /// clauses. Returns `CommitConflict` if `(tenant, user, name)` already
+    /// exists.
     async fn insert_api_key(
         &self,
         tenant: &TenantId,
@@ -1040,6 +1048,8 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
+    /// Workaround: UPDATE followed by SELECT because the engine does not yet
+    /// support `RETURNING`. Returns `None` if `pgwire_user` is not found.
     async fn rotate_tenant_credential(
         &self,
         pgwire_user: &str,
@@ -1191,6 +1201,9 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
+    /// Atomically mark the tenant-agnostic magic-link row as consumed.
+    /// Mirrors the `consume_email_token` invariant: the `consumed_at IS NULL`
+    /// guard ensures single-use even under concurrent requests for the same link.
     async fn consume_auth_magic_link(&self, id: i64) -> Result<u64> {
         let sql = format!(
             "UPDATE {sch}_auth_magic_links

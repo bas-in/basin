@@ -338,15 +338,15 @@ this OSS roadmap.
       sentinel that invalidates every outstanding refresh JWT for that
       user. Stale rows are filtered out at lookup (`expires_at > now()`);
       a periodic GC daemon is deferred.
-- [ ] **Auth per-tenant schema** — migrate auth tables from reserved
+- [x] **Auth per-tenant schema** — migrate auth tables from reserved
       internal tenant to each tenant's own storage namespace; provisioned
       at tenant creation via `Engine::open_session_as`. See ADR 0013.
-- [ ] **`AuthStore` trait** — `basin-auth` defines trait + `PostgresAuthStore`;
+- [x] **`AuthStore` trait** — `basin-auth` defines trait + `PostgresAuthStore`;
       `EngineAuthStore` lives in `basin-server` (passed as `Arc<dyn AuthStore>`).
       `AuthService::with_store(cfg, Arc<dyn AuthStore>)` replaces `Mutex<Client>`.
-- [ ] **Self-routing credentials** — `pgwire_user` format → `{tenant_id}_{hex}`;
+- [x] **Self-routing credentials** — `pgwire_user` format → `{tenant_id}_{hex}`;
       API keys embed tenant prefix. Removes global credential lookup table.
-- [ ] **Remove loopback startup** — delete `DeferredAuthResolver`,
+- [x] **Remove loopback startup** — delete `DeferredAuthResolver`,
       `wait_for_pgwire_accept`, `INTERNAL_AUTH_TENANT_ID` static injection.
       Auth starts before pgwire; `StackedTenantResolver` built directly.
 - [x] **`auth.uid()` / `auth.role()` / `auth.jwt()`** — SQL session functions
@@ -355,6 +355,8 @@ this OSS roadmap.
       Both `auth.uid()` (schema-dot) and `auth_uid()` (underscore) forms work;
       the executor rewrites the schema-dot form before DataFusion sees it.
       Anonymous sessions return `NULL` / `'anon'` matching Supabase behaviour.
+      **Shipped. Supabase-compatible session functions. Both `auth.uid()` and
+      `auth_uid()` spellings work.**
 - [ ] **Conformance tests** — against `EngineAuthStore` and `PostgresAuthStore`
       (skip PG if unavailable): user uniqueness per tenant, cross-tenant same
       email, single-use tokens, refresh rotation, API key lifecycle,

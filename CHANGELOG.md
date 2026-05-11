@@ -10,7 +10,28 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- `auth.uid()`, `auth.role()`, `auth.jwt()` SQL session functions — Supabase-compatible;
+  usable in RLS policies (`CREATE POLICY … USING (owner_id = auth.uid())`). Both
+  `auth.uid()` and `auth_uid()` spellings work.
+- Per-tenant auth schema — auth data now lives in each tenant's own Basin storage
+  (like Supabase's `auth` schema per project). No reserved internal tenant, no loopback
+  pgwire connection. See ADR 0013.
+- Self-routing pgwire credentials — `pgwire_user` format now encodes `tenant_id` as a
+  26-char ULID prefix, enabling credential validation without a global cross-tenant lookup.
+- `AuthStore` trait — pluggable auth storage; `PostgresAuthStore` for external Postgres,
+  `EngineAuthStore` (default) for in-process Basin storage. Zero external dependencies
+  for open source deployments.
+
+### Changed
+- Basin-server startup order: auth initialises before pgwire (eliminates `DeferredAuthResolver`
+  and `wait_for_pgwire_accept` polling loop).
+- `BASIN_AUTH_CATALOG_DSN` is now an optional external Postgres override rather than the
+  default loopback path.
+
+### Migration
+- Existing `pgwire_user` credentials in the old `tenant_<hex>` format are automatically
+  rotated to the new `{tenant_id}_{hex}` format on first startup after upgrade.
 
 ## [0.1.3] - 2026-05-11
 

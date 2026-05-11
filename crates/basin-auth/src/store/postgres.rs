@@ -1,9 +1,14 @@
-//! `PostgresAuthStore` — `AuthStore` impl backed by `tokio_postgres::Client`.
+//! `PostgresAuthStore` — [`AuthStore`] impl backed by a `tokio_postgres::Client`.
 //!
-//! This is the production path. All SQL that was previously scattered across
-//! `flows/*.rs`, `api_keys.rs`, `session_settings.rs`, and
-//! `tenant_credentials.rs` now lives here. The flow modules call the trait
-//! methods; this implementation translates them into SQL.
+//! This is the external-Postgres path, active when `BASIN_AUTH_CATALOG_DSN` is
+//! set in the environment. Auth state is stored in a separate Postgres instance
+//! (or managed PG service such as Neon / RDS) in the schema named by
+//! `BASIN_AUTH_CATALOG_SCHEMA` (default `basin_auth`). The table names use the
+//! flat `{schema}_<table>` convention described in `schema.rs` so the same SQL
+//! works against both this implementation and `EngineAuthStore`.
+//!
+//! The client is wrapped in a `Mutex` so it can be shared across async tasks
+//! without a full connection pool in v0.1.
 
 use std::collections::HashMap;
 
