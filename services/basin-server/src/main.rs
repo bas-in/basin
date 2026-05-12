@@ -599,9 +599,36 @@ fn bool_env(name: &str) -> bool {
     )
 }
 
-/// Reads `BASIN_TLS_CERT_PATH` + `BASIN_TLS_KEY_PATH` and loads the PEM bytes.
-/// Both unset = no TLS; both set = TLS on; exactly one set = hard error.
+/// Loads TLS config from env. Priority:
+///   1. `BASIN_TLS_CERT_PEM` + `BASIN_TLS_KEY_PEM`  — raw PEM content in env vars (Fly secrets)
+///   2. `BASIN_TLS_CERT_PATH` + `BASIN_TLS_KEY_PATH` — file paths (original behaviour)
+///   3. Neither set → no TLS.
+/// Exactly one of a pair being set is a hard error.
 fn load_tls_from_env() -> Result<Option<Arc<TlsConfig>>> {
+    // Priority 1: inline PEM content from env vars.
+    let cert_pem_env = std::env::var("BASIN_TLS_CERT_PEM")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let key_pem_env = std::env::var("BASIN_TLS_KEY_PEM")
+        .ok()
+        .filter(|s| !s.is_empty());
+    match (cert_pem_env, key_pem_env) {
+        (Some(cert), Some(key)) => {
+            tracing::info!("pgwire TLS configured from BASIN_TLS_CERT_PEM/BASIN_TLS_KEY_PEM");
+            return Ok(Some(Arc::new(TlsConfig {
+                cert_pem: cert.into_bytes(),
+                key_pem: key.into_bytes(),
+            })));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(anyhow!(
+                "TLS half-configured: set both BASIN_TLS_CERT_PEM and BASIN_TLS_KEY_PEM, or neither"
+            ));
+        }
+    }
+
+    // Priority 2: file paths.
     let cert_path = std::env::var("BASIN_TLS_CERT_PATH")
         .ok()
         .filter(|s| !s.is_empty());
@@ -611,6 +638,7 @@ fn load_tls_from_env() -> Result<Option<Arc<TlsConfig>>> {
     match (cert_path, key_path) {
         (None, None) => Ok(None),
         (Some(cert), Some(key)) => {
+            tracing::info!("pgwire TLS configured from BASIN_TLS_CERT_PATH/BASIN_TLS_KEY_PATH");
             let cert_pem = std::fs::read(&cert)
                 .with_context(|| format!("read BASIN_TLS_CERT_PATH at {cert}"))?;
             let key_pem =

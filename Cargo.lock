@@ -817,7 +817,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "basin-analytical"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "basin-auth"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "basin-catalog"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow-array 54.2.1",
  "arrow-schema 54.3.1",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "basin-common"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "basin-cron"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "basin-cv"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "basin-engine"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "basin-geo"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "basin-common",
  "geo",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "basin-iceberg-rest"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow-schema 54.3.1",
  "async-trait",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "basin-integration-tests"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "basin-net"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "basin-placement"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "basin-common",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "basin-pool"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "basin-catalog",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "basin-rest"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "basin-router"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "basin-server"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "arrow-array 54.2.1",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "basin-shard"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "basin-storage"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes-gcm",
  "arrow 54.2.1",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "basin-trgm"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "basin-common",
  "serde",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "basin-vector"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow-array 54.2.1",
  "arrow-schema 54.3.1",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "basin-wal"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "basin-common",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "basin-webhooks"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-schema 54.3.1",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "basinctl"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "clap",
