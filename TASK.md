@@ -841,6 +841,28 @@ conditions in its "Trigger to revisit" section are met.
 - [ ] Bug bounty program before public beta
 - [ ] Security review at each phase boundary
 
+## Known v0.1 gaps — from production benchmark (2026-05-12)
+
+Discovered while running `basin-cloud/backend/cmd/neonbench` against a live
+basin-engine v0.1.5 deployment on Fly (`fra.db.basin.to`). The bench harness
+exercises CREATE/INSERT/SELECT/JOIN/GROUP BY/UPDATE/DROP against a 3-table
+schema with foreign keys. **What worked:** multi-row VALUES inserts (100
+rows in 907 ms), 2-table JOINs (400-500 ms), 3-table JOINs (215-900 ms),
+GROUP BY (220 ms), foreign-key enforcement on INSERT (`23503` rejected
+correctly), per-tenant pgwire credential auth, persistence across sessions.
+**What didn't:**
+
+- [ ] `BEGIN TRANSACTION READ WRITE` — driver-implicit tx around prepared-statement bulk inserts (`lib/pq`, JDBC, npgsql, …) rejected with `unsupported in PoC: BEGIN TRANSACTION READ WRITE` (SQLSTATE XX000). Tracked in Phase 5 single-shard transactions; see CAPABILITIES.md Transactions row.
+- [ ] `DROP TABLE [IF EXISTS]` — rejected with `unsupported in PoC: DROP TABLE …` (XX000). Pair with the transactions ship in Phase 5 since both share the catalog mutation path.
+- [ ] `CREATE TABLE IF NOT EXISTS` — clause is parsed but ignored; basin returns `catalog error: table … already exists` when the table exists. Make the planner respect `if_not_exists: true` on `Statement::CreateTable`.
+- [ ] `INSERT … ON CONFLICT DO NOTHING` / `DO UPDATE` — clause is parsed but **silently ignored** at execution; INSERT runs as if the clause weren't there. Worse than rejecting (drivers think conflict handling worked). Couples to Phase 5.7 B1 secondary indexes.
+- [ ] `UPDATE … SET col = <expression>` — RHS must be a literal or a single bind parameter; expressions like `col || 'literal'`, `col + 1`, or function calls error with `expected literal of type Utf8 …`. Engine planner needs to accept `Expr` in `Assignment.value`, not just `Value`.
+- [ ] `UPDATE … WHERE col IN (SELECT …)` / `WHERE EXISTS (SELECT …)` — subquery in WHERE rejected with `WHERE clause not representable in v0.1`. The DML mutate path doesn't lower `Expr::Subquery`.
+- [ ] `SELECT *` Arrow-projection error — fails on specific column-shape combinations (`BIGSERIAL PK + TEXT + TEXT UNIQUE + TIMESTAMPTZ DEFAULT now()`) with `expected '32' at position N; got 'M'`. Workaround is explicit-column SELECT. Root cause: type-OID encoding mismatch on the wire (Arrow → pgwire row description). Reproducer in the bench's `bench_users` shape.
+- [ ] `pg_catalog` UDFs psql uses for meta-commands — `pg_table_is_visible`, `pg_get_userbyid`, `pg_get_function_arguments`, `pg_get_indexdef`, etc. The 17 views in Phase 5.11.M ship but the helper UDFs don't, so `\dt` / `\d` / `\df` all error out. Pair with the next basin-trgm / basin-net SQL-surface ship since it's also a UDF-registry batch.
+
+Bench artefacts: the patched harness lives at `basin-cloud/backend/cmd/neonbench/main.go` (multi-row VALUES + literal-RHS UPDATE + best-effort DROP + per-table CREATE with "already exists" tolerated). The Postgres compat matrix in basin-cloud/src/pages/docs/PostgresCompat.jsx mirrors these gaps for end-users.
+
 ## Critical rules (from the brief — re-read before scope-creep)
 
 - Don't build Raft, the SQL parser, the table format, or the analytical engine.
