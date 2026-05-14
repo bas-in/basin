@@ -42,17 +42,17 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Schema, TimeUnit};
-use basin_catalog::DataFileRef;
-use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use basin_catalog::{Catalog, DataFileRef};
+use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName, TenantId};
 use basin_storage::{
     evaluate_compound, evaluate_compound_for_pruning, vector_index_segment_key_for_data_file,
     CompoundPredicate, DataFile, Predicate, PruneOutcome, ScalarValue, Storage,
 };
 use futures::StreamExt;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, ObjectName, TableFactor,
-    TableWithJoins, UnaryOperator, Value,
+    Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, ObjectName, SelectItem,
+    TableFactor, TableWithJoins, UnaryOperator, Value,
 };
 
 use crate::events::{
@@ -79,11 +79,9 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
             "DELETE ... USING not supported".into(),
         ));
     }
-    if delete.returning.is_some() {
-        return Err(BasinError::InvalidSchema(
-            "DELETE ... RETURNING not supported".into(),
-        ));
-    }
+    // RETURNING: we will collect matching rows before the commit and
+    // project them. Validated and stored here, applied after the loop.
+    let returning_items = delete.returning.as_deref();
 
     pre_mutation_flush(sess).await?;
 
@@ -122,7 +120,9 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
     };
 
     let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
-    let capture_events = sinks_attached(sess) || audit_table.is_some();
+    // Also capture rows when RETURNING is requested.
+    let needs_returning = returning_items.is_some();
+    let capture_events = sinks_attached(sess) || audit_table.is_some() || needs_returning;
 
     // Walk files: deletes can shortcut on AllMatch (drop the file outright).
     let mut deleted: usize = 0;
@@ -132,6 +132,8 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
     // Only allocated when sinks are attached. Holds (before_row, after=None)
     // pairs for every actually-deleted row.
     let mut event_payloads: Vec<RowChange> = Vec::new();
+    // Holds the full deleted batches (only populated when RETURNING requested).
+    let mut returning_batches: Vec<RecordBatch> = Vec::new();
 
     for f in &data_files {
         let outcome = file_outcome(pred.as_ref(), f, schema.as_ref());
@@ -142,8 +144,21 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
                 deleted += f.row_count as usize;
                 dropped_paths.push(f.path.as_ref().to_string());
                 if capture_events {
-                    capture_dropped_file(&storage, &sess.tenant, &f.path, &mut event_payloads)
-                        .await?;
+                    // Read the file once; used for event payloads AND
+                    // RETURNING collection (shared path).
+                    let file_batches =
+                        read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                    for b in &file_batches {
+                        for row in 0..b.num_rows() {
+                            event_payloads.push(RowChange {
+                                before: Some(build_row_json(b, row)?),
+                                after: None,
+                            });
+                        }
+                    }
+                    if needs_returning {
+                        returning_batches.extend(file_batches);
+                    }
                 }
             }
             (PruneOutcome::NoMatch, Some(_)) => {
@@ -169,11 +184,25 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
                 replaced_paths.push(f.path.as_ref().to_string());
                 replacement_batches.extend(kept);
                 if capture_events {
-                    for (b, row) in deleted_rows {
+                    for (b, row) in &deleted_rows {
                         event_payloads.push(RowChange {
-                            before: Some(build_row_json(&b, row)?),
+                            before: Some(build_row_json(b, *row)?),
                             after: None,
                         });
+                    }
+                    if needs_returning {
+                        // Reconstruct per-row batches for RETURNING from
+                        // the (batch, row_idx) pairs already materialised.
+                        for (b, row) in deleted_rows {
+                            let indices = arrow_array::Int64Array::from(vec![row as i64]);
+                            let taken = arrow_select::take::take_record_batch(&b, &indices)
+                                .map_err(|e| {
+                                    BasinError::internal(format!(
+                                        "DELETE RETURNING take row: {e}"
+                                    ))
+                                })?;
+                            returning_batches.push(taken);
+                        }
                     }
                 }
             }
@@ -309,6 +338,19 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
         Box::pin(sess.execute(&sql)).await?;
     }
 
+    // RETURNING: project the collected deleted rows and return them.
+    if let Some(items) = returning_items {
+        let projected = project_returning(returning_batches, items, schema.as_ref())?;
+        let result_schema = match projected.first() {
+            Some(b) => b.schema(),
+            None => Arc::new(schema_for_returning(schema.as_ref(), items)?),
+        };
+        return Ok(ExecResult::Rows {
+            schema: result_schema,
+            batches: projected,
+        });
+    }
+
     Ok(ExecResult::Empty {
         tag: format!("DELETE {deleted}"),
     })
@@ -367,9 +409,9 @@ pub(crate) async fn exec_update(
     let schema = meta.schema.clone();
     let storage = sess.engine.config().storage.clone();
 
-    // Resolve assignments to (column_index, scalar). Reject anything that
-    // isn't a single-column = literal pair: UPDATE ... SET col = col + 1
-    // requires expression evaluation we don't ship in v0.1.
+    // Resolve assignments to (column_index, AssignmentValue).
+    // Literals become Scalar; anything else (column refs, arithmetic,
+    // function calls) becomes DFExpr for DataFusion evaluation per-batch.
     let mut assignments = parse_assignments(&assignments, schema.as_ref())?;
     // AUTO_UPDATE injection: any column flagged on the schema that the
     // user didn't explicitly set gets a fresh `now()` micros value.
@@ -416,14 +458,18 @@ pub(crate) async fn exec_update(
             // AllMatch with predicate, or no predicate at all: every row is
             // matched. We still need the file's contents to apply SET.
             (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
+                let catalog = &sess.engine.config().catalog;
                 let (mut new_batches, before_batches) = if capture_events {
                     let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
-                    let news = apply_assignments_all(&befores, &assignments)?;
+                    let news =
+                        apply_assignments_all(catalog, &sess.tenant, &befores, &assignments)
+                            .await?;
                     (news, befores)
                 } else {
                     let news = read_and_apply_assignments(
-                        &storage,
+                        catalog,
                         &sess.tenant,
+                        &storage,
                         &f.path,
                         None,
                         &assignments,
@@ -436,7 +482,7 @@ pub(crate) async fn exec_update(
                     for b in new_batches {
                         rebuilt.push(
                             crate::generated_cols::materialise_generated_columns(
-                                &sess.engine.config().catalog,
+                                catalog,
                                 &sess.tenant,
                                 b,
                             )
@@ -458,6 +504,7 @@ pub(crate) async fn exec_update(
                 replacement_batches.extend(new_batches);
             }
             (PruneOutcome::Mixed, Some(p)) => {
+                let catalog = &sess.engine.config().catalog;
                 let (rows_matched, mut new_batches, before_batches, mask_per_batch) =
                     if capture_events {
                         let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
@@ -469,14 +516,18 @@ pub(crate) async fn exec_update(
                                 BasinError::internal(format!("update predicate eval: {e}"))
                             })?;
                             matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
-                            news.push(apply_assignments(b, &mask, &assignments)?);
+                            news.push(
+                                apply_assignments(catalog, &sess.tenant, b, &mask, &assignments)
+                                    .await?,
+                            );
                             masks.push(mask);
                         }
                         (matched, news, befores, masks)
                     } else {
                         let (matched, news) = read_and_apply_assignments_mixed(
-                            &storage,
+                            catalog,
                             &sess.tenant,
+                            &storage,
                             &f.path,
                             p,
                             &assignments,
@@ -637,6 +688,19 @@ pub(crate) async fn exec_update(
     })
 }
 
+/// Resolved SET-clause assignment for one column.
+///
+/// `Scalar` is the fast path for literal assignments (`SET col = 5`).
+/// `DFExpr` is the DataFusion path for expression assignments
+/// (`SET col = col + 1`, `SET col = now()`, etc.). The `sql_text` is
+/// the raw expression string handed to DataFusion as a `SELECT <sql_text>
+/// FROM <src>` projection.
+#[derive(Clone)]
+enum AssignmentValue {
+    Scalar(ScalarValue),
+    DFExpr { sql_text: String, col_type: DataType },
+}
+
 /// One captured row-level change, lazily materialised only when at
 /// least one [`ChangeEventSink`] is attached or `AUDIT TO` is configured.
 #[derive(Clone)]
@@ -687,28 +751,6 @@ fn build_events(
     out
 }
 
-/// DELETE / AllMatch path: read the file (which the no-sink path skips
-/// entirely) and emit one `before` per row. `after` is `None` for
-/// DELETE.
-async fn capture_dropped_file(
-    storage: &Storage,
-    tenant: &basin_common::TenantId,
-    path: &object_store::path::Path,
-    out: &mut Vec<RowChange>,
-) -> Result<()> {
-    let mut stream = storage.read_file(tenant, path).await?;
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        for row in 0..batch.num_rows() {
-            out.push(RowChange {
-                before: Some(build_row_json(&batch, row)?),
-                after: None,
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Like [`evaluate_and_partition_delete`] but also returns the matched
 /// rows (the ones being deleted). Each entry is `(batch, row_idx)` —
 /// the caller materialises JSON lazily.
@@ -757,14 +799,16 @@ async fn read_file_to_batches(
 
 /// AllMatch UPDATE: every row in `befores` is matched. Returns the
 /// post-SET batches.
-fn apply_assignments_all(
+async fn apply_assignments_all(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &TenantId,
     befores: &[RecordBatch],
-    assignments: &[(usize, ScalarValue)],
+    assignments: &[(usize, AssignmentValue)],
 ) -> Result<Vec<RecordBatch>> {
     let mut out = Vec::with_capacity(befores.len());
     for b in befores {
         let mask = BooleanArray::from(vec![true; b.num_rows()]);
-        out.push(apply_assignments(b, &mask, assignments)?);
+        out.push(apply_assignments(catalog, tenant, b, &mask, assignments).await?);
     }
     Ok(out)
 }
@@ -837,11 +881,12 @@ async fn evaluate_and_partition_delete(
 /// matched-row count externally — used in the AllMatch branch where
 /// every row is updated.
 async fn read_and_apply_assignments(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &TenantId,
     storage: &Storage,
-    tenant: &basin_common::TenantId,
     path: &object_store::path::Path,
     pred: Option<&CompoundPredicate>,
-    assignments: &[(usize, ScalarValue)],
+    assignments: &[(usize, AssignmentValue)],
 ) -> Result<Vec<RecordBatch>> {
     let mut stream = storage.read_file(tenant, path).await?;
     let mut out = Vec::new();
@@ -852,7 +897,7 @@ async fn read_and_apply_assignments(
                 .map_err(|e| BasinError::internal(format!("update predicate eval: {e}")))?,
             None => BooleanArray::from(vec![true; batch.num_rows()]),
         };
-        out.push(apply_assignments(&batch, &mask, assignments)?);
+        out.push(apply_assignments(catalog, tenant, &batch, &mask, assignments).await?);
     }
     Ok(out)
 }
@@ -862,11 +907,12 @@ async fn read_and_apply_assignments(
 /// where we need the count for the row tag and also have to detect the
 /// "stats said maybe but nothing actually matched" no-op case.
 async fn read_and_apply_assignments_mixed(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &TenantId,
     storage: &Storage,
-    tenant: &basin_common::TenantId,
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
-    assignments: &[(usize, ScalarValue)],
+    assignments: &[(usize, AssignmentValue)],
 ) -> Result<(usize, Vec<RecordBatch>)> {
     let mut stream = storage.read_file(tenant, path).await?;
     let mut matched = 0usize;
@@ -876,7 +922,7 @@ async fn read_and_apply_assignments_mixed(
         let mask = evaluate_compound(&batch, pred)
             .map_err(|e| BasinError::internal(format!("update predicate eval: {e}")))?;
         matched += mask.iter().filter(|b| matches!(b, Some(true))).count();
-        out.push(apply_assignments(&batch, &mask, assignments)?);
+        out.push(apply_assignments(catalog, tenant, &batch, &mask, assignments).await?);
     }
     Ok((matched, out))
 }
@@ -1142,13 +1188,20 @@ fn invert_mask(mask: &BooleanArray) -> BooleanArray {
 }
 
 /// Apply the parsed SET clause to one batch. Matched rows have their
-/// assigned columns swapped out for the literal value; unmatched rows pass
+/// assigned columns swapped out for the new value; unmatched rows pass
 /// through untouched. NULL mask entries are treated as unmatched (same
 /// rationale as `invert_mask`).
-fn apply_assignments(
+///
+/// For `AssignmentValue::Scalar` the assignment is synchronous.
+/// For `AssignmentValue::DFExpr` the expression is evaluated via DataFusion
+/// over the entire batch, producing a new column array, and then blended
+/// into matched rows only using `arrow_select::zip`.
+async fn apply_assignments(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &TenantId,
     batch: &RecordBatch,
     mask: &BooleanArray,
-    assignments: &[(usize, ScalarValue)],
+    assignments: &[(usize, AssignmentValue)],
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
     let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
@@ -1157,15 +1210,64 @@ fn apply_assignments(
         let assignment = assignments.iter().find(|(idx, _)| *idx == col_idx);
         let new_col = match assignment {
             None => original,
-            Some((_, scalar)) => {
+            Some((_, AssignmentValue::Scalar(scalar))) => {
                 let field = schema.field(col_idx);
                 build_assigned_column(field.data_type(), &original, mask, scalar)?
+            }
+            Some((_, AssignmentValue::DFExpr { sql_text, col_type })) => {
+                // Evaluate the expression against the full batch via DataFusion.
+                let computed = crate::generated_cols::eval_expression(
+                    catalog,
+                    tenant,
+                    batch,
+                    sql_text,
+                    col_type,
+                )
+                .await?;
+                // Blend: matched rows take the computed value, unmatched
+                // rows keep the original. Use the same sanitize_mask logic
+                // as generated_cols.
+                blend_by_mask(&original, &computed, mask)?
             }
         };
         new_columns.push(new_col);
     }
     RecordBatch::try_new(schema, new_columns)
         .map_err(|e| BasinError::internal(format!("rebuild batch after SET: {e}")))
+}
+
+/// Blend two arrays: take `new_col` at rows where `mask` is true, `orig`
+/// at rows where mask is false or null. Both arrays must be the same length.
+fn blend_by_mask(orig: &ArrayRef, new_col: &ArrayRef, mask: &BooleanArray) -> Result<ArrayRef> {
+    if orig.len() != new_col.len() || orig.len() != mask.len() {
+        return Err(BasinError::internal(format!(
+            "blend_by_mask length mismatch: orig={}, new={}, mask={}",
+            orig.len(),
+            new_col.len(),
+            mask.len()
+        )));
+    }
+    // Cast new_col to orig's type if needed (e.g. DataFusion may produce
+    // Int32 for an Int64 column).
+    let new_col_cast = if new_col.data_type() != orig.data_type() {
+        arrow::compute::cast(new_col, orig.data_type()).map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "UPDATE SET expression result type {:?} cannot be coerced to column type {:?}: {e}",
+                new_col.data_type(),
+                orig.data_type()
+            ))
+        })?
+    } else {
+        new_col.clone()
+    };
+    // Sanitise: treat null mask entries as false (keep original).
+    let mut sanitised = arrow_array::builder::BooleanBuilder::with_capacity(mask.len());
+    for i in 0..mask.len() {
+        sanitised.append_value(!mask.is_null(i) && mask.value(i));
+    }
+    let sanitised = sanitised.finish();
+    arrow_select::zip::zip(&sanitised, &new_col_cast, orig)
+        .map_err(|e| BasinError::internal(format!("blend_by_mask zip: {e}")))
 }
 
 /// Build a column where matched rows take the new scalar value and
@@ -1280,7 +1382,7 @@ fn build_assigned_column(
 fn parse_assignments(
     assignments: &[Assignment],
     schema: &Schema,
-) -> Result<Vec<(usize, ScalarValue)>> {
+) -> Result<Vec<(usize, AssignmentValue)>> {
     let mut out = Vec::with_capacity(assignments.len());
     for a in assignments {
         let col_name = match &a.target {
@@ -1304,10 +1406,88 @@ fn parse_assignments(
             )));
         }
         let dt = schema.field(idx).data_type().clone();
-        let scalar = literal_to_scalar(&a.value, &dt, &col_name)?;
-        out.push((idx, scalar));
+        // Try the fast literal path first. If the expression isn't a plain
+        // literal (e.g. `col + 1`, `now()`, `upper(name)`) fall through to
+        // the DataFusion expression-eval path.
+        let value = match try_literal_to_scalar(&a.value, &dt, &col_name) {
+            Some(scalar) => AssignmentValue::Scalar(scalar?),
+            None => {
+                // Non-literal expression: convert to SQL text for DataFusion.
+                let sql_text = a.value.to_string();
+                AssignmentValue::DFExpr { sql_text, col_type: dt }
+            }
+        };
+        out.push((idx, value));
     }
     Ok(out)
+}
+
+/// Try to parse `expr` as a plain literal for the fast scalar path.
+/// Returns `None` if the expression is not a literal (caller should use
+/// the DataFusion path). Returns `Some(Err)` if it looks like a literal
+/// but is malformed (e.g. bad numeric string).
+fn try_literal_to_scalar(
+    expr: &Expr,
+    dt: &DataType,
+    col: &str,
+) -> Option<Result<ScalarValue>> {
+    let (negated, inner) = peel_unary(expr);
+    match (dt, inner) {
+        (DataType::Int64, Expr::Value(Value::Number(s, _))) => {
+            let r = s
+                .parse::<i64>()
+                .map(|v| ScalarValue::Int64(if negated { -v } else { v }))
+                .map_err(|e| BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}")));
+            Some(r)
+        }
+        (DataType::Float64, Expr::Value(Value::Number(s, _))) => {
+            let r = s
+                .parse::<f64>()
+                .map(|v| ScalarValue::Float64(if negated { -v } else { v }))
+                .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")));
+            Some(r)
+        }
+        (DataType::Utf8, Expr::Value(Value::SingleQuotedString(s)))
+        | (DataType::Utf8, Expr::Value(Value::DoubleQuotedString(s)))
+        | (DataType::Utf8, Expr::Value(Value::EscapedStringLiteral(s)))
+        | (DataType::Utf8, Expr::Value(Value::NationalStringLiteral(s))) => {
+            if negated {
+                Some(Err(BasinError::InvalidSchema(format!(
+                    "cannot negate string literal in SET {col} = {expr}"
+                ))))
+            } else {
+                Some(Ok(ScalarValue::Utf8(s.clone())))
+            }
+        }
+        (DataType::Boolean, Expr::Value(Value::Boolean(b))) => {
+            if negated {
+                Some(Err(BasinError::InvalidSchema(format!(
+                    "cannot negate boolean literal in SET {col} = {expr}"
+                ))))
+            } else {
+                Some(Ok(ScalarValue::Boolean(*b)))
+            }
+        }
+        // Null literal — map to the appropriate typed null.
+        (_, Expr::Value(Value::Null)) => {
+            // We don't have typed nulls in ScalarValue yet; use a sentinel
+            // that `build_assigned_column` handles by inserting null.
+            // For now just fall through to DFExpr for nulls so we keep
+            // the match exhaustive without adding a new ScalarValue variant.
+            None
+        }
+        // Timestamp literals — delegate to the existing timestamp handler
+        // which already knows about now(), RFC3339 strings, etc.
+        (DataType::Timestamp(TimeUnit::Microsecond, _), _) => {
+            // Reuse the pre-existing literal_to_scalar for timestamps since
+            // that path is already comprehensive and handles now(), strings,
+            // numbers.
+            Some(literal_to_scalar(expr, dt, col))
+        }
+        // Anything else (column refs, binary ops, function calls, etc.)
+        // → DataFusion path.
+        _ => None,
+    }
 }
 
 /// Translate a SQL literal expression into a `ScalarValue` matching the
@@ -1672,11 +1852,14 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
     Ok(&name.0[0].value)
 }
 
-/// Append `(idx, ScalarValue::Int64(now_micros))` to `assignments` for any
-/// AUTO_UPDATE column on `schema` the user didn't already explicitly set.
+/// Append `(idx, AssignmentValue::Scalar(now_micros))` to `assignments` for
+/// any AUTO_UPDATE column on `schema` the user didn't already explicitly set.
 /// `now_micros` is captured once per UPDATE so every AUTO_UPDATE column
 /// stamped in the same statement gets the same timestamp.
-fn inject_auto_update_assignments(schema: &Schema, assignments: &mut Vec<(usize, ScalarValue)>) {
+fn inject_auto_update_assignments(
+    schema: &Schema,
+    assignments: &mut Vec<(usize, AssignmentValue)>,
+) {
     let now_micros = chrono::Utc::now().timestamp_micros();
     for (idx, field) in schema.fields().iter().enumerate() {
         if !crate::types::field_is_auto_update(field) {
@@ -1685,7 +1868,7 @@ fn inject_auto_update_assignments(schema: &Schema, assignments: &mut Vec<(usize,
         if assignments.iter().any(|(i, _)| *i == idx) {
             continue;
         }
-        assignments.push((idx, ScalarValue::Int64(now_micros)));
+        assignments.push((idx, AssignmentValue::Scalar(ScalarValue::Int64(now_micros))));
     }
 }
 
@@ -1733,7 +1916,7 @@ async fn exec_soft_delete(
         BasinError::internal(format!("soft-delete column {sd_col:?} missing from schema"))
     })?;
     let now_micros = chrono::Utc::now().timestamp_micros();
-    let assignments = vec![(sd_idx, ScalarValue::Int64(now_micros))];
+    let assignments = vec![(sd_idx, AssignmentValue::Scalar(ScalarValue::Int64(now_micros)))];
 
     // Compose the effective predicate: `<user-pred> AND <sd_col> IS NULL`.
     // Without the IS NULL guard a re-DELETE on already-soft-deleted rows
@@ -1774,8 +1957,10 @@ async fn exec_soft_delete(
         match outcome {
             PruneOutcome::NoMatch => {}
             PruneOutcome::AllMatch => {
+                let catalog = &sess.engine.config().catalog;
                 let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
-                let news = apply_assignments_all(&befores, &assignments)?;
+                let news =
+                    apply_assignments_all(catalog, &sess.tenant, &befores, &assignments).await?;
                 updated_total += f.row_count as usize;
                 replaced_paths.push(f.path.as_ref().to_string());
                 if capture_events {
@@ -1784,6 +1969,7 @@ async fn exec_soft_delete(
                 replacement_batches.extend(news);
             }
             PruneOutcome::Mixed => {
+                let catalog = &sess.engine.config().catalog;
                 let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
                 let mut masks = Vec::with_capacity(befores.len());
                 let mut news = Vec::with_capacity(befores.len());
@@ -1793,7 +1979,9 @@ async fn exec_soft_delete(
                         BasinError::internal(format!("soft-delete predicate eval: {e}"))
                     })?;
                     matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
-                    news.push(apply_assignments(b, &mask, &assignments)?);
+                    news.push(
+                        apply_assignments(catalog, &sess.tenant, b, &mask, &assignments).await?,
+                    );
                     masks.push(mask);
                 }
                 if matched == 0 {
@@ -1852,4 +2040,89 @@ async fn exec_soft_delete(
     Ok(ExecResult::Empty {
         tag: format!("DELETE {updated_total}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// RETURNING helpers
+// ---------------------------------------------------------------------------
+
+/// Project a list of batches according to `RETURNING` items. Supports:
+///   - `*` / `Wildcard` → all columns pass through
+///   - `col` / `UnnamedExpr(Identifier)` → select named columns only
+///
+/// Complex expressions in RETURNING (e.g. `id * 2`) are not supported in
+/// v0.1; they surface as `InvalidSchema`.
+fn project_returning(
+    batches: Vec<RecordBatch>,
+    items: &[SelectItem],
+    table_schema: &Schema,
+) -> Result<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Determine which column indices to project.
+    let col_indices = returning_column_indices(items, table_schema)?;
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let proj_schema = Arc::new(Schema::new(
+            col_indices
+                .iter()
+                .map(|&i| b.schema().field(i).clone())
+                .collect::<Vec<_>>(),
+        ));
+        let cols: Vec<ArrayRef> = col_indices.iter().map(|&i| b.column(i).clone()).collect();
+        let proj =
+            RecordBatch::try_new(proj_schema, cols).map_err(|e| {
+                BasinError::internal(format!("RETURNING project batch: {e}"))
+            })?;
+        out.push(proj);
+    }
+    Ok(out)
+}
+
+/// Build the projected schema for an empty RETURNING result.
+fn schema_for_returning(table_schema: &Schema, items: &[SelectItem]) -> Result<Schema> {
+    let col_indices = returning_column_indices(items, table_schema)?;
+    let fields: Vec<Field> = col_indices
+        .iter()
+        .map(|&i| table_schema.field(i).clone())
+        .collect();
+    Ok(Schema::new(fields))
+}
+
+/// Resolve `RETURNING` items to column indices into `table_schema`.
+fn returning_column_indices(items: &[SelectItem], schema: &Schema) -> Result<Vec<usize>> {
+    let mut indices = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                // `*` — return all columns.
+                indices.extend(0..schema.fields().len());
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                let name = &ident.value;
+                let idx = schema.index_of(name).map_err(|_| {
+                    BasinError::InvalidSchema(format!("RETURNING: unknown column {name:?}"))
+                })?;
+                indices.push(idx);
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(ident),
+                ..
+            } => {
+                let name = &ident.value;
+                let idx = schema.index_of(name).map_err(|_| {
+                    BasinError::InvalidSchema(format!("RETURNING: unknown column {name:?}"))
+                })?;
+                indices.push(idx);
+            }
+            other => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "RETURNING: unsupported item {other}; only * and plain column names are \
+                     supported"
+                )));
+            }
+        }
+    }
+    Ok(indices)
 }

@@ -67,8 +67,9 @@ pub(crate) async fn materialise_generated_columns(
 /// Evaluate `expr_text` over every row in `batch`. Returns an `ArrayRef`
 /// of the same length as `batch.num_rows()` whose data type matches
 /// `expected_dt` (cast if the projection's natural output type is wider
-/// or narrower).
-async fn eval_expression(
+/// or narrower). Exposed `pub(crate)` so the UPDATE expression-RHS path
+/// in `dml_mutate` can reuse it without duplicating the DataFusion setup.
+pub(crate) async fn eval_expression(
     catalog: &Arc<dyn Catalog>,
     tenant: &TenantId,
     batch: &RecordBatch,
