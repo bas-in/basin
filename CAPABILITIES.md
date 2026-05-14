@@ -67,7 +67,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `WHERE [NOT] EXISTS (subquery)` | ✅ | Both basic and correlated forms. Exercised by `tests/integration/tests/subquery_patterns.rs`. |
 | `WHERE col [NOT] IN (subquery)` | ✅ | Single-column IN/NOT IN against `SELECT col FROM …`. Exercised by `subquery_patterns.rs`. |
 | `WHERE (a, b) IN (SELECT a, b FROM …)` | ✅ | Row-constructor IN against subquery. Exercised by `subquery_patterns.rs`. |
-| `WHERE col op {ANY/ALL/SOME} (subquery)` | ✅ | Quantified subquery — `>`, `>=`, `=` etc. DataFusion-native. Exercised by `subquery_patterns.rs`. |
+| `WHERE col op {ANY/ALL/SOME} (subquery)` | 🛠 | Quantified subquery against a subquery operand is currently rejected by the DataFusion-44 SQL planner. `AnyOp` with non-`=` operator returns `not_impl_err!("AnyOp not supported by ExprPlanner")` (the only registered planner — `NestedFunctionPlanner` — handles `= ANY(array)` by rewriting to `array_has`, not subquery rhs). `AllOp` has no match arm in datafusion-sql 44 and falls through to `Unsupported ast node in sqltorel`. Rewriting `col = ANY (subquery)` → `col IN (subquery)` is the recommended workaround. Test scaffold + observed behaviour documented in `subquery_patterns.rs`. |
 | Scalar subqueries in `SELECT` / `WHERE` | ✅ | `SELECT (subquery)` projection and `WHERE col = (subquery)`. Correlated scalar subqueries may hit DataFusion physical-plan limits on `OuterReferenceColumn` for certain shapes. Exercised by `subquery_patterns.rs`. |
 | Derived tables — `FROM (SELECT …) AS sub` | ✅ | Sub-SELECT in FROM, including derived-table joins. Exercised by `subquery_patterns.rs`. |
 
