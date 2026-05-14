@@ -157,6 +157,9 @@ regex = "1"
 # Test-config file parsing for tests/integration/src/test_config.rs.
 # Tiny, well-maintained, default features off to keep build minimal.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# Real PostgreSQL 16 parser (libpg_query vendored). Used by ADR 0014 Phase 1
+# to parse and classify every incoming statement before sqlparser sees it.
+pg_query = "6"
 
 [profile.release]
 lto = false

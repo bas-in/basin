@@ -50,6 +50,11 @@ regex.workspace = true
 # `webhook_registry` module after the cycle-fix moved registry types out
 # of basin-webhooks.
 bitflags = "2"
+# Real PostgreSQL 16 parser (libpg_query vendored). ADR 0014 Phase 1 canonical
+# parser. Classifies every statement before sqlparser sees it; the noop-accept
+# dispatch intercepts admin/RBAC/FDW/transaction statements and returns an
+# empty result without touching the sqlparser pipeline.
+pg_query.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

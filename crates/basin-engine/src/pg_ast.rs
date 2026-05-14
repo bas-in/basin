@@ -111,6 +111,27 @@ pub enum StmtKind {
     Commit,
     Rollback,
     Savepoint,
+    // TRUNCATE — real operation (delete all rows + optionally restart seqs)
+    Truncate,
+    // Foreign Data Wrappers / Foreign tables (accept-only; Basin has no FDW execution)
+    CreateFdw,
+    DropFdw,
+    CreateForeignServer,
+    DropForeignServer,
+    CreateUserMapping,
+    DropUserMapping,
+    CreateForeignTable,
+    DropForeignTable,
+    ImportForeignSchema,
+    // Ownership / reassignment (accept-only)
+    ReassignOwned,
+    DropOwned,
+    // Default privileges (accept-only)
+    AlterDefaultPrivileges,
+    // Constraint deferrability (accept-only)
+    SetConstraints,
+    // Security labels (accept-only)
+    SecurityLabel,
     /// Anything we don't yet dispatch on. Routed to the existing
     /// sqlparser pipeline by the executor.
     Other,
@@ -173,6 +194,21 @@ impl StmtKind {
             StmtKind::Commit => "COMMIT",
             StmtKind::Rollback => "ROLLBACK",
             StmtKind::Savepoint => "SAVEPOINT",
+            StmtKind::Truncate => "TRUNCATE",
+            StmtKind::CreateFdw => "CREATE FOREIGN DATA WRAPPER",
+            StmtKind::DropFdw => "DROP FOREIGN DATA WRAPPER",
+            StmtKind::CreateForeignServer => "CREATE SERVER",
+            StmtKind::DropForeignServer => "DROP SERVER",
+            StmtKind::CreateUserMapping => "CREATE USER MAPPING",
+            StmtKind::DropUserMapping => "DROP USER MAPPING",
+            StmtKind::CreateForeignTable => "CREATE FOREIGN TABLE",
+            StmtKind::DropForeignTable => "DROP FOREIGN TABLE",
+            StmtKind::ImportForeignSchema => "IMPORT FOREIGN SCHEMA",
+            StmtKind::ReassignOwned => "REASSIGN OWNED",
+            StmtKind::DropOwned => "DROP OWNED",
+            StmtKind::AlterDefaultPrivileges => "ALTER DEFAULT PRIVILEGES",
+            StmtKind::SetConstraints => "SET CONSTRAINTS",
+            StmtKind::SecurityLabel => "SECURITY LABEL",
             StmtKind::Other => "<other>",
         }
     }
@@ -323,6 +359,29 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::CreateExtensionStmt(_) => StmtKind::CreateExtension,
         NodeEnum::CreateTrigStmt(_) => StmtKind::CreateTrigger,
 
+        NodeEnum::TruncateStmt(_) => StmtKind::Truncate,
+
+        // Foreign Data Wrappers / Foreign tables
+        NodeEnum::CreateFdwStmt(_) => StmtKind::CreateFdw,
+        NodeEnum::CreateForeignServerStmt(_) => StmtKind::CreateForeignServer,
+        NodeEnum::CreateUserMappingStmt(_) => StmtKind::CreateUserMapping,
+        NodeEnum::DropUserMappingStmt(_) => StmtKind::DropUserMapping,
+        NodeEnum::CreateForeignTableStmt(_) => StmtKind::CreateForeignTable,
+        NodeEnum::ImportForeignSchemaStmt(_) => StmtKind::ImportForeignSchema,
+
+        // Ownership / reassignment
+        NodeEnum::ReassignOwnedStmt(_) => StmtKind::ReassignOwned,
+        NodeEnum::DropOwnedStmt(_) => StmtKind::DropOwned,
+
+        // Default privileges
+        NodeEnum::AlterDefaultPrivilegesStmt(_) => StmtKind::AlterDefaultPrivileges,
+
+        // Constraint deferrability
+        NodeEnum::ConstraintsSetStmt(_) => StmtKind::SetConstraints,
+
+        // Security labels
+        NodeEnum::SecLabelStmt(_) => StmtKind::SecurityLabel,
+
         NodeEnum::TransactionStmt(s) => {
             use pg_query::protobuf::TransactionStmtKind as Tk;
             match Tk::try_from(s.kind) {
@@ -351,6 +410,9 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
                 Ok(O::ObjectSequence) => StmtKind::DropSequence,
                 Ok(O::ObjectPolicy) => StmtKind::DropPolicy,
                 Ok(O::ObjectTrigger) => StmtKind::DropTrigger,
+                Ok(O::ObjectFdw) => StmtKind::DropFdw,
+                Ok(O::ObjectForeignServer) => StmtKind::DropForeignServer,
+                Ok(O::ObjectForeignTable) => StmtKind::DropForeignTable,
                 _ => StmtKind::Other,
             }
         }

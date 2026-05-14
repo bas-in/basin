@@ -85,6 +85,53 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::VariableShow => Some(ExecResult::Empty {
             tag: "SHOW".into(),
         }),
+        // Foreign Data Wrappers / Foreign tables — accept-only; Basin has no FDW execution
+        StmtKind::CreateFdw => Some(ExecResult::Empty {
+            tag: "CREATE FOREIGN DATA WRAPPER".into(),
+        }),
+        StmtKind::DropFdw => Some(ExecResult::Empty {
+            tag: "DROP FOREIGN DATA WRAPPER".into(),
+        }),
+        StmtKind::CreateForeignServer => Some(ExecResult::Empty {
+            tag: "CREATE SERVER".into(),
+        }),
+        StmtKind::DropForeignServer => Some(ExecResult::Empty {
+            tag: "DROP SERVER".into(),
+        }),
+        StmtKind::CreateUserMapping => Some(ExecResult::Empty {
+            tag: "CREATE USER MAPPING".into(),
+        }),
+        StmtKind::DropUserMapping => Some(ExecResult::Empty {
+            tag: "DROP USER MAPPING".into(),
+        }),
+        StmtKind::CreateForeignTable => Some(ExecResult::Empty {
+            tag: "CREATE FOREIGN TABLE".into(),
+        }),
+        StmtKind::DropForeignTable => Some(ExecResult::Empty {
+            tag: "DROP FOREIGN TABLE".into(),
+        }),
+        StmtKind::ImportForeignSchema => Some(ExecResult::Empty {
+            tag: "IMPORT FOREIGN SCHEMA".into(),
+        }),
+        // Ownership / reassignment — accept-only
+        StmtKind::ReassignOwned => Some(ExecResult::Empty {
+            tag: "REASSIGN OWNED".into(),
+        }),
+        StmtKind::DropOwned => Some(ExecResult::Empty {
+            tag: "DROP OWNED".into(),
+        }),
+        // Default privileges — accept-only; real auth from auth.uid()/role()
+        StmtKind::AlterDefaultPrivileges => Some(ExecResult::Empty {
+            tag: "ALTER DEFAULT PRIVILEGES".into(),
+        }),
+        // Constraint deferrability — accept-only; Basin is auto-commit
+        StmtKind::SetConstraints => Some(ExecResult::Empty {
+            tag: "SET CONSTRAINTS".into(),
+        }),
+        // Security labels — accept-only
+        StmtKind::SecurityLabel => Some(ExecResult::Empty {
+            tag: "SECURITY LABEL".into(),
+        }),
         // Everything else is not in our accept set.
         _ => None,
     }

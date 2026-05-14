@@ -574,6 +574,10 @@ pub enum ExecResult {
 
 mod alter;
 mod analytical_route;
+pub mod noop_accept;
+pub mod pg_ast;
+pub mod pg_plan;
+mod truncate;
 mod constraints;
 mod convert;
 mod cost_check;
