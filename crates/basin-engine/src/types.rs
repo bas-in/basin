@@ -574,6 +574,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // and map it to the Arrow physical layout the rest of the engine
         // already understands: a `FixedSizeList<Float32>` of length N.
         //
+<<<<<<< HEAD
         // We also handle the full set of PG network / bit-string / money
         // types here; all ride on `Utf8` (or `Decimal128` for MONEY) with a
         // `BASIN_TYPE` field metadata marker so INSERT validation and the
@@ -581,6 +582,32 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         SqlDataType::Custom(name, modifiers) => {
             if name.0.len() != 1 {
                 return Err(BasinError::InvalidSchema(format!(
+=======
+        // FTS types: TSVECTOR and TSQUERY are stored as Utf8 in v0.1 (stub
+        // semantics — no real tokenisation).  The FTS UDFs in `fts_udf` all
+        // accept/return Utf8, so this mapping is consistent end-to-end.
+        SqlDataType::Custom(name, modifiers) => {
+            if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("vector") {
+                let dim = parse_vector_dim(modifiers)?;
+                // Child field is nullable=true to match what the Arrow
+                // builder helpers produce (`FixedSizeListArray::
+                // from_iter_primitive` defaults its child to nullable). The
+                // distinction is irrelevant in practice because vector(N) at
+                // the user level never carries per-element NULLs.
+                Ok(DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim,
+                ))
+            } else if name.0.len() == 1
+                && (name.0[0].value.eq_ignore_ascii_case("tsvector")
+                    || name.0[0].value.eq_ignore_ascii_case("tsquery"))
+                && modifiers.is_empty()
+            {
+                // Map TSVECTOR / TSQUERY to Utf8 (stub — no real FTS engine).
+                Ok(DataType::Utf8)
+            } else {
+                Err(BasinError::InvalidSchema(format!(
+>>>>>>> worktree-agent-aec15a16826dbb25b
                     "unsupported custom type: {name}"
                 )));
             }
