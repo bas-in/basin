@@ -177,6 +177,7 @@ pub(crate) async fn open(
     // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
     // jsonb_build_object, jsonb_build_array, to_jsonb, row_to_json,
     // array_to_json, and aggregate stubs (jsonb_agg, jsonb_object_agg).
+<<<<<<< HEAD
     // Extended JSON path, JSON conversion, and JSON operator UDFs.
     crate::jsonb_udf::register_jsonb_udfs(&ctx);
     // Interval arithmetic + time-zone shim UDFs (Phase bulk-interval-tz).
@@ -197,6 +198,9 @@ pub(crate) async fn open(
     // Phase 5.11.AGG: PG JSON aggregate UDAFs — json_agg, jsonb_agg,
     // json_object_agg, jsonb_object_agg.
     crate::pg_agg_udf::register_json_agg_udafs(&ctx);
+=======
+    crate::jsonb_udf::register_jsonb_udfs(&ctx);
+>>>>>>> worktree-agent-a0dfa4d615d91958d
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog

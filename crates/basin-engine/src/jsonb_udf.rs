@@ -241,6 +241,7 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(JsonbObjectAggStubUdf {
         signature: Signature::any(2, Volatility::Immutable),
     }));
+<<<<<<< HEAD
 
     // ---------------------------------------------------------------------------
     // JSON (non-jsonb) variants — accept Utf8 or LargeBinary
@@ -477,6 +478,8 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
         signature: Signature::any(1, Volatility::Immutable),
         name: "jsonb_to_recordset",
     }));
+=======
+>>>>>>> worktree-agent-a0dfa4d615d91958d
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,6 +1647,7 @@ impl ScalarUDFImpl for JsonbObjectAggStubUdf {
         )
     }
 }
+<<<<<<< HEAD
 
 // ---------------------------------------------------------------------------
 // Minimal jsonpath evaluator
@@ -2816,3 +2820,5 @@ fn parse_key_list(s: &str) -> Vec<String> {
             .collect()
     }
 }
+=======
+>>>>>>> worktree-agent-a0dfa4d615d91958d
