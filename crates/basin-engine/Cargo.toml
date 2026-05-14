@@ -48,6 +48,7 @@ bcrypt = { workspace = true }
 # `webhook_registry` module after the cycle-fix moved registry types out
 # of basin-webhooks.
 bitflags = "2"
+pg_query = "6.1.1"
 
 [dev-dependencies]
 tempfile.workspace = true

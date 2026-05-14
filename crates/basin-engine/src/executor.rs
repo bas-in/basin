@@ -161,6 +161,13 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return crate::cv_ddl::exec_drop_materialized_view(sess, &name, if_exists).await;
     }
 
+    // ALTER SEQUENCE [IF EXISTS] <name> [RESTART [WITH n]]: sqlparser 0.52
+    // has no AlterSequence AST node; textual pre-screen handles the full
+    // PG grammar.
+    if let Some(intent) = crate::seq_ddl::match_alter_sequence(sql)? {
+        return crate::seq_ddl::exec_alter_sequence(sess, intent).await;
+    }
+
     // CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] <name> [opt …] —
     // sqlparser 0.52 only parses one option per CREATE SEQUENCE
     // statement, so the full PG grammar (`START 100 INCREMENT 5 MINVALUE
