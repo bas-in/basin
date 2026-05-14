@@ -2468,3 +2468,195 @@ impl ScalarUDFImpl for AuthJwtUdf {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// JSON operator text rewriter
+// ---------------------------------------------------------------------------
+//
+// Postgres JSON/JSONB operators that DataFusion cannot parse as infix operators
+// are rewritten to UDF calls before the SQL reaches sqlparser/DataFusion.
+//
+// Mapping:
+//   j -> 'key'          →  json_get(j, 'key')
+//   j ->> 'key'         →  json_get_text(j, 'key')
+//   j #> '{a,b}'        →  json_path_extract(j, '{a,b}')
+//   j #>> '{a,b}'       →  json_path_extract_text(j, '{a,b}')
+//   j @> '{"a":1}'      →  jsonb_contains(j, '{"a":1}')   (JSON only)
+//   j <@ '{"a":1}'      →  jsonb_contained_by(j, '{"a":1}')
+//   j ? 'key'           →  jsonb_has_key(j, 'key')
+//   j ?& '{k1,k2}'      →  jsonb_has_all_keys(j, '{k1,k2}')
+//   j ?| '{k1,k2}'      →  jsonb_has_any_key(j, '{k1,k2}')
+//   j || '{"b":2}'      →  jsonb_concat(j, '{"b":2}')
+//   j @? '$.field'      →  jsonb_path_exists(j, '$.field')
+//
+// NOTE: `@>` for range types is already handled by DataFusion's range
+// operator support. The JSON-specific rewrite is triggered only when the
+// RHS looks like a JSON literal (starts with `{`, `[`, `'{"`, etc.).
+// This heuristic avoids collisions with range-type `@>`.
+//
+// LIMITATION: This is a textual rewrite; operators inside string literals
+// will also be rewritten. For ORM-generated queries this is acceptable.
+
+/// Rewrite JSON/JSONB infix operators to UDF calls.
+pub(crate) fn rewrite_json_operators(sql: &str) -> String {
+    // Handle @> specially — only when RHS token looks like a JSON literal
+    let mut s = rewrite_json_at_gt(sql);
+
+    // Handle || for JSON concat — only when RHS looks like JSON
+    s = rewrite_json_concat_op(&s);
+
+    // @? — jsonpath exists
+    s = rewrite_binary_op_to_fn(&s, "@?", "jsonb_path_exists");
+
+    // Operators ordered longest-first to avoid prefix collisions
+    for &(op, func) in &[
+        ("#>>", "json_path_extract_text"),
+        ("#>",  "json_path_extract"),
+        ("->>", "json_get_text"),
+        ("->",  "json_get"),
+        ("?&",  "jsonb_has_all_keys"),
+        ("?|",  "jsonb_has_any_key"),
+        ("?",   "jsonb_has_key"),
+        ("<@",  "jsonb_contained_by"),
+    ] {
+        s = rewrite_binary_op_to_fn(&s, op, func);
+    }
+    s
+}
+
+/// Rewrite `expr @> json_literal` to `jsonb_contains(expr, json_literal)`.
+fn rewrite_json_at_gt(s: &str) -> String {
+    let mut out = s.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let Some(rel) = out[search_from..].find("@>") else { break; };
+        let op_start = search_from + rel;
+        let op_end = op_start + 2;
+
+        // Look ahead past whitespace for RHS token — copy bytes to avoid borrow conflict
+        let rhs_looks_json = {
+            let bytes = out.as_bytes();
+            let mut j = op_end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+            j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'{' || bytes[j] == b'[')
+        };
+        if rhs_looks_json {
+            let (lhs_start, lhs_end) = extract_left_operand(&out, op_start);
+            let (rhs_start, rhs_end) = extract_right_operand(&out, op_end);
+            let lhs = out[lhs_start..lhs_end].to_string();
+            let rhs = out[rhs_start..rhs_end].to_string();
+            let replacement = format!("jsonb_contains({lhs}, {rhs})");
+            out.replace_range(lhs_start..rhs_end, &replacement);
+            search_from = lhs_start + replacement.len();
+        } else {
+            search_from = op_end;
+        }
+    }
+    out
+}
+
+/// Rewrite `expr || expr` to `jsonb_concat(expr, expr)` when RHS looks like JSON.
+fn rewrite_json_concat_op(s: &str) -> String {
+    let mut out = s.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let Some(rel) = out[search_from..].find("||") else { break; };
+        let op_start = search_from + rel;
+        let op_end = op_start + 2;
+        // Determine if RHS looks like JSON without holding a borrow into `out`
+        let rhs_is_json = {
+            let bytes = out.as_bytes();
+            let mut j = op_end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+            j < bytes.len() && (
+                bytes[j] == b'{'
+                || bytes[j] == b'['
+                || (bytes[j] == b'\'' && j + 1 < bytes.len()
+                    && (bytes[j+1] == b'{' || bytes[j+1] == b'[' || bytes[j+1] == b'"'))
+            )
+        };
+        if rhs_is_json {
+            let (lhs_start, lhs_end) = extract_left_operand(&out, op_start);
+            let (rhs_start, rhs_end) = extract_right_operand(&out, op_end);
+            let lhs = out[lhs_start..lhs_end].to_string();
+            let rhs = out[rhs_start..rhs_end].to_string();
+            let replacement = format!("jsonb_concat({lhs}, {rhs})");
+            out.replace_range(lhs_start..rhs_end, &replacement);
+            search_from = lhs_start + replacement.len();
+        } else {
+            search_from = op_end;
+        }
+    }
+    out
+}
+
+/// Generic rewriter: replace `lhs OP rhs` with `func(lhs, rhs)`.
+fn rewrite_binary_op_to_fn(sql: &str, op: &str, func: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let Some(rel) = s[search_from..].find(op) else { break; };
+        let op_start = search_from + rel;
+        let op_end = op_start + op.len();
+
+        // Boundary guard: previous char must not be alphanumeric/`_`/`#`/`?`/`@`/`<`/`>`
+        // (avoids matching inside a longer already-rewritten operator)
+        let prev_ok = op_start == 0 || {
+            let b = s.as_bytes()[op_start - 1];
+            !b.is_ascii_alphanumeric() && b != b'_' && b != b'#' && b != b'?' && b != b'@' && b != b'<' && b != b'>'
+        };
+        let next_ok = op_end >= s.len() || {
+            let b = s.as_bytes()[op_end];
+            !b.is_ascii_alphanumeric() && b != b'_' && b != b'>' && b != b'|' && b != b'&'
+        };
+
+        if !prev_ok || !next_ok {
+            search_from = op_end;
+            continue;
+        }
+
+        let (lhs_start, lhs_end) = extract_left_operand(&s, op_start);
+        let (rhs_start, rhs_end) = extract_right_operand(&s, op_end);
+        let lhs = s[lhs_start..lhs_end].to_string();
+        let rhs = s[rhs_start..rhs_end].to_string();
+        let replacement = format!("{func}({lhs}, {rhs})");
+        s.replace_range(lhs_start..rhs_end, &replacement);
+        search_from = lhs_start + replacement.len();
+    }
+    s
+}
+
+#[cfg(test)]
+mod json_op_rewrite_tests {
+    use super::rewrite_json_operators;
+
+    #[test]
+    fn test_arrow_op() {
+        let r = rewrite_json_operators("SELECT data -> 'key' FROM t");
+        assert!(r.contains("json_get(data, 'key')"), "got: {r}");
+    }
+
+    #[test]
+    fn test_double_arrow_op() {
+        let r = rewrite_json_operators("SELECT data ->> 'name' FROM t");
+        assert!(r.contains("json_get_text(data, 'name')"), "got: {r}");
+    }
+
+    #[test]
+    fn test_hash_arrow_op() {
+        let r = rewrite_json_operators("SELECT data #> '{a,b}' FROM t");
+        assert!(r.contains("json_path_extract(data, '{a,b}')"), "got: {r}");
+    }
+
+    #[test]
+    fn test_hash_double_arrow_op() {
+        let r = rewrite_json_operators("SELECT data #>> '{a,b}' FROM t");
+        assert!(r.contains("json_path_extract_text(data, '{a,b}')"), "got: {r}");
+    }
+
+    #[test]
+    fn test_has_key_op() {
+        let r = rewrite_json_operators("SELECT data ? 'foo' FROM t");
+        assert!(r.contains("jsonb_has_key(data, 'foo')"), "got: {r}");
+    }
+}

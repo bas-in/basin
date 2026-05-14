@@ -602,6 +602,7 @@ mod rls;
 mod seq_ddl;
 mod seq_udf;
 mod session;
+pub(crate) mod jsonb_udf;
 mod sql_functions;
 mod trgm_glue;
 mod type_ddl;
