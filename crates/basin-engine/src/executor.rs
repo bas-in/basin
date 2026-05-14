@@ -288,6 +288,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
     let rewritten = crate::udf::rewrite_vector_operators(sql);
+    // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
+    // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
+    // jsonpath exists) to UDF calls that DataFusion can evaluate.
+    let rewritten = crate::udf::rewrite_json_operators(&rewritten);
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
