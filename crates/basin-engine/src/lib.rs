@@ -499,6 +499,12 @@ impl TenantSession {
     #[tracing::instrument(skip(self, sql), fields(tenant=%self.tenant, sql=%sql.lines().next().unwrap_or("")))]
     pub async fn execute(&self, sql: &str) -> Result<ExecResult> {
         let started = std::time::Instant::now();
+        // Rewrite the `@@` tsvector-match operator to `tsvector_match_udf(lhs, rhs)`.
+        // DataFusion has no built-in handler for the `@@` binary operator; the rewrite
+        // replaces it with the registered stub UDF.  This runs before every other
+        // rewriter so that the operator is gone by the time sqlparser sees the SQL.
+        let sql_fts = crate::pg_ast::rewrite_tsvector_at_at(sql);
+        let sql = sql_fts.as_str();
         let result = crate::executor::execute(self, sql).await;
         // Bump the noisy-tenant rate estimator regardless of success: a
         // failed query still consumed I/O permits + planner time, which is
@@ -587,6 +593,7 @@ mod enum_ordinal;
 mod events;
 mod executor;
 mod fast_select;
+mod fts_udf;
 mod function_ddl;
 mod generated_cols;
 mod geo_glue;
@@ -594,6 +601,10 @@ mod info_schema_provider;
 mod lifecycle;
 mod net_glue;
 mod noisy_detector;
+mod noop_accept;
+pub mod pg_ast;
+mod pg_catalog_udf;
+mod pg_plan;
 mod prepared;
 mod procedure_ddl;
 pub mod reactor_ddl;
@@ -603,6 +614,7 @@ mod seq_ddl;
 mod seq_udf;
 mod session;
 mod sql_functions;
+mod string_dt_udf;
 mod trgm_glue;
 mod type_ddl;
 mod types;

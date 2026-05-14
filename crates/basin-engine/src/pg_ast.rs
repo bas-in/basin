@@ -359,6 +359,514 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
     }
 }
 
+/// Rewrite the `@@` tsvector-match operator to a `tsvector_match_udf(lhs, rhs)`
+/// function call before sqlparser / DataFusion see the SQL.
+///
+/// DataFusion has no built-in handler for the `@@` binary operator that
+/// PostgreSQL uses for full-text search (`tsvector @@ tsquery`).  Basin
+/// registers `tsvector_match_udf` as a stub UDF (always returns `true` for
+/// v0.1 — semantics deferred to `basin-fts`).  This function rewrites every
+/// bare `@@` occurrence in the SQL string to `tsvector_match_udf(lhs, rhs)`.
+///
+/// # Strategy
+///
+/// The rewrite is text-level rather than parse-tree-level.  The `@@` token
+/// cannot appear inside string literals (`'...'`) as anything other than two
+/// `@` characters, but to be safe we skip past single-quoted literals when
+/// scanning.  The token `@@@` (three `@`s) is *not* rewritten — it appears in
+/// test SQL as an intentionally invalid form and must remain unchanged.
+///
+/// The left-hand operand is extracted by walking backward from the `@@`
+/// position using the same brace-balanced algorithm as the vector-operator
+/// rewriter in `udf.rs`.  The right-hand operand is the balanced expression
+/// after the `@@`.
+pub fn rewrite_tsvector_at_at(sql: &str) -> String {
+    // Two-stage rewrite:
+    //   1. Strip `::tsvector` / `::tsquery` casts (Basin stores both as Utf8).
+    //      DataFusion's planner rejects these as unsupported cast targets.
+    //   2. Lower the `@@` operator to `tsvector_match_udf(lhs, rhs)`.
+    //
+    // The cast strip must happen BEFORE the `@@` rewrite so that the
+    // operand-capture logic sees a stripped (and thus shorter) operand to
+    // capture. Without this ordering the operand captures the bare value
+    // and the trailing `::type` becomes a syntax error.
+    let stripped = strip_fts_casts(sql);
+    if !stripped.contains("@@") {
+        return stripped;
+    }
+    let mut out = stripped;
+    loop {
+        // Find the next `@@` that is not part of `@@@`.
+        let Some(pos) = find_at_at(&out) else {
+            break;
+        };
+        let lhs_end = pos;
+        let rhs_start = pos + 2; // skip `@@`
+
+        let (lhs_from, lhs_to) = extract_left_operand_pg(&out, lhs_end);
+        let (rhs_from, rhs_to) = extract_right_operand_pg(&out, rhs_start);
+
+        let lhs = out[lhs_from..lhs_to].to_string();
+        let rhs = out[rhs_from..rhs_to].to_string();
+        let replacement = format!("tsvector_match_udf({lhs}, {rhs})");
+
+        out.replace_range(lhs_from..rhs_to, &replacement);
+        // No need to advance scan_pos — if there is another `@@` the loop
+        // finds it on the next iteration. The replacement text contains no
+        // `@@` so we cannot loop infinitely.
+    }
+    out
+}
+
+/// Strip `::tsvector` and `::tsquery` casts from expressions.
+///
+/// Basin stores both tsvector and tsquery as Utf8 internally (stub — no
+/// real tokenisation). DataFusion's planner doesn't recognise these as
+/// cast targets at expression level, so `'a fox'::tsvector` would fail
+/// with "Unsupported SQL type" before the executor even runs. Stripping
+/// the cast is safe because the source expression is already Utf8.
+///
+/// String literals, double-quoted identifiers, and SQL comments are
+/// honoured so we don't mangle text data or commented-out code.
+fn strip_fts_casts(sql: &str) -> String {
+    if !sql.contains("::") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        // Pass through single-quoted literals untouched.
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through double-quoted identifiers untouched.
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through `--` line comments.
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through `/* */` block comments.
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Look for `::tsvector` / `::tsquery`.
+        if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
+            // Peek the type name (alnum/`_`).
+            let mut j = i + 2;
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let name_start = j;
+            while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let name = &sql[name_start..j];
+            if name.eq_ignore_ascii_case("tsvector") || name.eq_ignore_ascii_case("tsquery") {
+                // Drop the `::<name>` entirely. Skip any trailing `(...)`
+                // type modifier (defensive — neither type takes a modifier
+                // today but PG allows e.g. `varchar(255)`).
+                let mut k = j;
+                while k < len && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < len && bytes[k] == b'(' {
+                    let mut depth = 1i32;
+                    k += 1;
+                    while k < len && depth > 0 {
+                        match bytes[k] {
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    i = k;
+                } else {
+                    i = j;
+                }
+                continue;
+            }
+        }
+        // Pass through one UTF-8 character (could be multi-byte).
+        let char_len = utf8_char_len(b);
+        let end = (i + char_len).min(len);
+        out.push_str(&sql[i..end]);
+        i = end;
+    }
+    out
+}
+
+/// Length in bytes of a UTF-8 codepoint given its lead byte.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        1 // continuation byte (defensive — shouldn't be the lead)
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Find the byte position of the first `@@` that is:
+///   1. Not part of `@@@` (three `@`s).
+///   2. Not inside a single-quoted string literal.
+///   3. Not inside a double-quoted identifier.
+///   4. Not inside an `--` line comment or `/* */` block comment.
+///
+/// Returns the position of the first `@` in the pair.
+fn find_at_at(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i + 1 < len {
+        // Skip single-quoted string literals.
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2; // `''` escape
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < len {
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip `--` line comments to end of line.
+        if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip `/* ... */` block comments (no nesting in v0.1).
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            continue;
+        }
+        if bytes[i] == b'@' && bytes[i + 1] == b'@' {
+            let preceding_at = i > 0 && bytes[i - 1] == b'@';
+            let following_at = i + 2 < len && bytes[i + 2] == b'@';
+            if !preceding_at && !following_at {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Walk backward from `end` (exclusive) to capture one operand token.
+/// Mirrors the logic in `udf::extract_left_operand` but lives here so we
+/// don't depend on the private `udf` helpers.
+///
+/// Handles, in order:
+///   * `)` — balanced paren group + preceding function-name identifier.
+///   * `'...'` single-quoted literal (with `''` escapes).
+///   * `"..."` double-quoted identifier.
+///   * identifier / number (alnum, `_`, `.`).
+///
+/// After capturing a base unit, walks back over any number of `::cast`
+/// suffixes (each followed by another base unit on the left).
+fn extract_left_operand_pg(s: &str, end: usize) -> (usize, usize) {
+    let bytes = s.as_bytes();
+    let mut i = end;
+    // Skip trailing whitespace.
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    let operand_end = i;
+    // Repeatedly capture one "unit", then if preceded by `::` keep going.
+    loop {
+        let new_i = capture_left_unit(bytes, i);
+        if new_i == i {
+            // Made no progress — bail out.
+            break;
+        }
+        i = new_i;
+        // Skip whitespace then check for `::`.
+        let mut j = i;
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        if j >= 2 && bytes[j - 1] == b':' && bytes[j - 2] == b':' {
+            // Consume the `::` and continue to capture the value on the
+            // left of the cast.
+            i = j - 2;
+            // Skip whitespace again before the next unit.
+            while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            continue;
+        }
+        break;
+    }
+    (i, operand_end)
+}
+
+/// Capture one "unit" walking backwards: paren-group + preceding identifier,
+/// quoted string, quoted identifier, or plain identifier / number.
+/// Returns the new (smaller) `i` after consumption. If no consumption is
+/// possible returns the input `i` unchanged.
+fn capture_left_unit(bytes: &[u8], i_in: usize) -> usize {
+    let mut i = i_in;
+    if i == 0 {
+        return i;
+    }
+    let last = bytes[i - 1];
+    if last == b')' {
+        // Balanced paren group. Track string literals so unbalanced parens
+        // inside `'...'` don't throw off the depth counter.
+        let mut depth = 1i32;
+        i -= 1;
+        while i > 0 && depth > 0 {
+            i -= 1;
+            match bytes[i] {
+                b')' => depth += 1,
+                b'(' => depth -= 1,
+                b'\'' => {
+                    // Walk back over the entire single-quoted literal.
+                    while i > 0 {
+                        i -= 1;
+                        if bytes[i] == b'\'' {
+                            // Could be the start, or part of an escape `''`.
+                            if i > 0 && bytes[i - 1] == b'\'' {
+                                i -= 1; // consume the escape pair
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Include a preceding identifier (function name), if any.
+        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.') {
+            i -= 1;
+        }
+    } else if last == b'\'' {
+        // Single-quoted literal — walk back to opening quote, honouring `''` escapes.
+        i -= 1;
+        while i > 0 {
+            i -= 1;
+            if bytes[i] == b'\'' {
+                if i > 0 && bytes[i - 1] == b'\'' {
+                    i -= 1; // consume `''` escape, keep going
+                    continue;
+                }
+                break;
+            }
+        }
+    } else if last == b'"' {
+        // Double-quoted identifier — walk back to opening quote.
+        i -= 1;
+        while i > 0 {
+            i -= 1;
+            if bytes[i] == b'"' {
+                break;
+            }
+        }
+    } else if last.is_ascii_alphanumeric() || last == b'_' || last == b'.' {
+        // Plain identifier / number.
+        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.') {
+            i -= 1;
+        }
+    }
+    i
+}
+
+/// Walk forward from `start` to capture one operand token.
+///
+/// After the base unit, consumes any number of trailing `::cast` suffixes
+/// (each followed by another base unit).
+fn extract_right_operand_pg(s: &str, start: usize) -> (usize, usize) {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = start;
+    // Skip leading whitespace.
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let operand_start = i;
+    loop {
+        let new_i = capture_right_unit(bytes, i);
+        if new_i == i {
+            break;
+        }
+        i = new_i;
+        // Look ahead for `::cast`.
+        let mut j = i;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j + 1 < len && bytes[j] == b':' && bytes[j + 1] == b':' {
+            i = j + 2;
+            while i < len && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    (operand_start, i)
+}
+
+/// Capture one "unit" walking forward from `i_in`. Returns the new `i`.
+fn capture_right_unit(bytes: &[u8], i_in: usize) -> usize {
+    let mut i = i_in;
+    let len = bytes.len();
+    if i >= len {
+        return i;
+    }
+    let first = bytes[i];
+    if first == b'(' {
+        // Balanced paren group — string-literal aware.
+        let mut depth = 1i32;
+        i += 1;
+        while i < len && depth > 0 {
+            match bytes[i] {
+                b'(' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                b'\'' => {
+                    // Skip single-quoted literal (with `''` escape).
+                    i += 1;
+                    while i < len {
+                        if bytes[i] == b'\'' {
+                            i += 1;
+                            if i < len && bytes[i] == b'\'' {
+                                i += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    } else if first == b'\'' {
+        // Single-quoted literal.
+        i += 1;
+        while i < len {
+            if bytes[i] == b'\'' {
+                i += 1;
+                if i < len && bytes[i] == b'\'' {
+                    i += 1; // escaped `''`
+                } else {
+                    break;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    } else if first == b'"' {
+        // Double-quoted identifier.
+        i += 1;
+        while i < len {
+            if bytes[i] == b'"' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+    } else if first.is_ascii_alphanumeric() || first == b'_' {
+        // Identifier / number (optional schema-qualified) with optional
+        // function-call argument list.
+        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') {
+            i += 1;
+        }
+        // Optional function-call args.
+        let mut j = i;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < len && bytes[j] == b'(' {
+            i = capture_right_unit(bytes, j);
+        }
+    }
+    i
+}
+
 /// Reject every top-level statement whose kind is in the "known but
 /// not yet shipped" set with SQLSTATE 0A000. Stops at the first
 /// unsupported statement. Returns `Ok(())` if every statement is
@@ -547,6 +1055,158 @@ mod tests {
             let tree = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
             reject_unsupported(&tree)
                 .unwrap_or_else(|e| panic!("{sql:?} should be allowed, got {e}"));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // rewrite_tsvector_at_at — text-level operator lowering
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rewrite_at_at_no_op_when_absent() {
+        let sql = "SELECT 1";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_at_at_basic_column_vs_call() {
+        let got = rewrite_tsvector_at_at("SELECT * FROM doc WHERE ts @@ to_tsquery('fox')");
+        assert_eq!(
+            got,
+            "SELECT * FROM doc WHERE tsvector_match_udf(ts, to_tsquery('fox'))"
+        );
+    }
+
+    #[test]
+    fn rewrite_at_at_paren_operands() {
+        // Both sides parenthesised.
+        let got =
+            rewrite_tsvector_at_at("SELECT (to_tsvector('a b')) @@ (to_tsquery('a')) FROM t");
+        assert_eq!(
+            got,
+            "SELECT tsvector_match_udf((to_tsvector('a b')), (to_tsquery('a'))) FROM t"
+        );
+    }
+
+    #[test]
+    fn rewrite_at_at_function_call_lhs_and_rhs() {
+        let got = rewrite_tsvector_at_at(
+            "SELECT to_tsvector('a b') @@ to_tsquery('english', 'a') AS m",
+        );
+        assert_eq!(
+            got,
+            "SELECT tsvector_match_udf(to_tsvector('a b'), to_tsquery('english', 'a')) AS m"
+        );
+    }
+
+    #[test]
+    fn rewrite_at_at_cast_lhs() {
+        // 'a quick fox'::tsvector @@ q
+        // The `::tsvector` cast is stripped (Basin stores tsvector as Utf8)
+        // before the @@ rewrite captures the operand.
+        let got = rewrite_tsvector_at_at(
+            "SELECT 'a quick fox'::tsvector @@ to_tsquery('fox')",
+        );
+        assert_eq!(
+            got,
+            "SELECT tsvector_match_udf('a quick fox', to_tsquery('fox'))"
+        );
+    }
+
+    #[test]
+    fn rewrite_at_at_cast_rhs() {
+        // `'fox'::tsquery` → `'fox'` after the cast strip.
+        let got = rewrite_tsvector_at_at(
+            "SELECT ts @@ 'fox'::tsquery FROM doc",
+        );
+        assert_eq!(
+            got,
+            "SELECT tsvector_match_udf(ts, 'fox') FROM doc"
+        );
+    }
+
+    #[test]
+    fn strip_fts_casts_preserves_other_casts() {
+        // Non-FTS casts (e.g. ::int, ::float) must NOT be stripped.
+        let sql = "SELECT '42'::int AS n";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn strip_fts_casts_in_string_literal_left_alone() {
+        // `::tsvector` inside a string literal is data.
+        let sql = "SELECT 'foo::tsvector' AS lit";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_at_at_multiple_in_one_statement() {
+        let got = rewrite_tsvector_at_at(
+            "SELECT * FROM t WHERE a @@ q1 OR b @@ q2",
+        );
+        assert_eq!(
+            got,
+            "SELECT * FROM t WHERE tsvector_match_udf(a, q1) OR tsvector_match_udf(b, q2)"
+        );
+    }
+
+    #[test]
+    fn rewrite_at_at_triple_at_passthrough() {
+        // `@@@` is not the FTS match operator; it must not be rewritten.
+        // It is allowed to fail at the parser, but the rewriter itself
+        // must leave the source text alone.
+        let sql = "SELECT a @@@ b FROM t";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_at_at_inside_string_literal_left_alone() {
+        // `@@` inside a single-quoted literal is data, not an operator.
+        let sql = "SELECT 'a @@ b' AS lit";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_at_at_inside_quoted_identifier_left_alone() {
+        let sql = "SELECT \"a@@b\" FROM t";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_at_at_inside_line_comment_left_alone() {
+        let sql = "SELECT 1 -- a @@ b\nFROM t";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_at_at_inside_block_comment_left_alone() {
+        let sql = "SELECT 1 /* a @@ b */ FROM t";
+        assert_eq!(rewrite_tsvector_at_at(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_at_at_qualified_column_lhs() {
+        let got = rewrite_tsvector_at_at(
+            "SELECT * FROM doc d WHERE d.ts @@ to_tsquery('fox')",
+        );
+        assert_eq!(
+            got,
+            "SELECT * FROM doc d WHERE tsvector_match_udf(d.ts, to_tsquery('fox'))"
+        );
+    }
+
+    #[test]
+    fn rewrite_at_at_does_not_rewrite_other_at_operators() {
+        // `<@`, `@>`, `?@`, `@?` etc. should all pass through.
+        let cases = [
+            "SELECT a <@ b FROM t",
+            "SELECT a @> b FROM t",
+            "SELECT a @? b FROM t",
+            "SELECT a ?@ b FROM t",
+            "SELECT @x FROM t",
+        ];
+        for sql in cases {
+            assert_eq!(rewrite_tsvector_at_at(sql), sql, "case: {sql}");
         }
     }
 }

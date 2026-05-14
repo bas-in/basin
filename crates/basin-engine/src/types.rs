@@ -282,6 +282,10 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form
         // and map it to the Arrow physical layout the rest of the engine
         // already understands: a `FixedSizeList<Float32>` of length N.
+        //
+        // FTS types: TSVECTOR and TSQUERY are stored as Utf8 in v0.1 (stub
+        // semantics — no real tokenisation).  The FTS UDFs in `fts_udf` all
+        // accept/return Utf8, so this mapping is consistent end-to-end.
         SqlDataType::Custom(name, modifiers) => {
             if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("vector") {
                 let dim = parse_vector_dim(modifiers)?;
@@ -294,6 +298,13 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                     Arc::new(Field::new("item", DataType::Float32, true)),
                     dim,
                 ))
+            } else if name.0.len() == 1
+                && (name.0[0].value.eq_ignore_ascii_case("tsvector")
+                    || name.0[0].value.eq_ignore_ascii_case("tsquery"))
+                && modifiers.is_empty()
+            {
+                // Map TSVECTOR / TSQUERY to Utf8 (stub — no real FTS engine).
+                Ok(DataType::Utf8)
             } else {
                 Err(BasinError::InvalidSchema(format!(
                     "unsupported custom type: {name}"

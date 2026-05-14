@@ -161,6 +161,11 @@ pub(crate) async fn open(
     // `to_char`/`to_timestamp` overrides that accept PG-style format strings
     // (`YYYY-MM-DD HH24:MI:SS`) on top of chrono syntax.
     crate::udf::register_pg_compat_udfs(&ctx);
+    // Full-text search stub UDFs: to_tsvector, to_tsquery, ts_rank, ts_headline,
+    // setweight, strip, tsvector_length, numnode, querytree, and
+    // tsvector_match_udf (the `@@`-operator substitute). All are stubs that
+    // return identity/zero/false values; real FTS is deferred to basin-fts.
+    crate::fts_udf::register_fts_udfs(&ctx);
     // Auth session functions: `auth_uid()`, `auth_role()`, `auth_jwt()`.
     // These read the per-session AuthContext stamped at open time so RLS
     // policies can reference the authenticated user without re-verifying

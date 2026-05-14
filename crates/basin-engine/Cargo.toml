@@ -26,6 +26,10 @@ parquet.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
 sqlparser.workspace = true
+# ADR 0014 Phase 1: libpg_query-based AST + statement classifier in
+# `crate::pg_ast`. Sits behind the `BASIN_PG_QUERY` env-gate today;
+# Phase 2 will make it the canonical SQL frontend.
+pg_query = { workspace = true }
 object_store.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -15,11 +15,14 @@
 //! - Integer-producing stubs (`length(tsvector)`) count whitespace-delimited
 //!   words as a cheap approximation.
 //! - `numnode(tsquery)` always returns `1`.
-//! - `tsvector_match(tsvector, tsquery)` always returns `false`.  The `@@`
-//!   infix operator cannot be rewritten from a ScalarUDF; callers that need
-//!   the `@@` operator must rewrite their query to call `tsvector_match(…)`
-//!   directly.  The operator itself continues to error — that is documented
-//!   and accepted behaviour for v0.1.
+//! - `tsvector_match(tsvector, tsquery)` always returns `false`.  Retained for
+//!   backward compatibility with explicit callers of the function name.
+//! - `tsvector_match_udf(tsvector, tsquery)` always returns `true`.  This is
+//!   the target of the `@@`-to-UDF rewrite in `pg_ast::rewrite_tsvector_at_at`:
+//!   every `lhs @@ rhs` in incoming SQL is lowered to
+//!   `tsvector_match_udf(lhs, rhs)` before sqlparser sees it.  Returning `true`
+//!   means the query produces rows (match-all stub); real FTS selectivity is
+//!   deferred to `basin-fts`.
 //!
 //! # When to un-stub
 //!
@@ -177,6 +180,23 @@ fn register_all(ctx: &SessionContext) {
     // This stub always returns `false` — v0.1 honesty, not a real match.
     ctx.register_udf(ScalarUDF::from(TsvectorMatchUdf {
         name: "tsvector_match".into(),
+        returns_true: false,
+        signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
+    }));
+
+    // ----------- tsvector_match_udf (operator-rewrite target) -----------
+    // This is the UDF that `pg_ast::rewrite_tsvector_at_at` rewrites `@@`
+    // into.  It accepts (tsvector, tsquery) — both stored as Utf8 — and
+    // returns `true` so that queries like
+    //   SELECT 'a quick fox'::tsvector @@ to_tsquery('english', 'fox')
+    // produce a result row rather than being silently filtered out.
+    // The v0.1 stub is "always match"; real selectivity is deferred to
+    // basin-fts.  The companion `tsvector_match` UDF (above) retains its
+    // `false` return so existing tests that explicitly test the negative
+    // case remain accurate.
+    ctx.register_udf(ScalarUDF::from(TsvectorMatchUdf {
+        name: "tsvector_match_udf".into(),
+        returns_true: true,
         signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
     }));
 
@@ -478,15 +498,25 @@ impl ScalarUDFImpl for TsHeadlineUdf {
 // ---------------------------------------------------------------------------
 // TsvectorMatchUdf — tsvector_match(tsvector, tsquery) -> bool
 //
-// Always returns `false`.  This is the v0.1 stand-in for the `@@` operator.
-// The `@@` infix operator cannot be surfaced from a ScalarUDF; callers that
-// write `doc_tsv @@ to_tsquery('fox')` will still get a planner error.
-// Rewrite such queries to `tsvector_match(doc_tsv, to_tsquery('fox'))`.
+// Two registrations share this implementation:
+//
+// * `tsvector_match`     — always returns `false`.  Retained for backward
+//   compatibility with callers that explicitly use the function name instead
+//   of the `@@` operator.
+// * `tsvector_match_udf` — always returns `true`.  This is the target of the
+//   `@@`-to-UDF rewrite in `pg_ast::rewrite_tsvector_at_at`.  Returning
+//   `true` means that a query like
+//     SELECT … WHERE ts_col @@ to_tsquery('english', 'fox')
+//   returns rows (the stub matches everything) rather than silently returning
+//   zero rows.  Real selectivity is deferred to `basin-fts`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct TsvectorMatchUdf {
     name: String,
+    /// `true` → return all-true column (match-all stub, used for `tsvector_match_udf`).
+    /// `false` → return all-false column (used for `tsvector_match`).
+    returns_true: bool,
     signature: Signature,
 }
 
@@ -506,7 +536,7 @@ impl ScalarUDFImpl for TsvectorMatchUdf {
     #[allow(deprecated)]
     fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
         let n = num_rows(args);
-        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![false; n]));
+        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![self.returns_true; n]));
         Ok(ColumnarValue::Array(arr))
     }
 }

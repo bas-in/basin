@@ -87,6 +87,8 @@ async fn eval_expression(
     crate::udf::register_distance_udfs(&ctx);
     crate::udf::register_pg_udfs(&ctx);
     crate::udf::register_pg_compat_udfs(&ctx);
+    // FTS stub UDFs — needed for GENERATED ALWAYS AS (to_tsvector(...) STORED) columns.
+    crate::fts_udf::register_fts_udfs(&ctx);
 
     // Cross the arrow-version bridge: the workspace batch becomes a
     // datafusion-arrow batch for the MemTable, and the projection's
