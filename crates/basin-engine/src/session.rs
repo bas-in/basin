@@ -167,6 +167,12 @@ pub(crate) async fn open(
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+    // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
+    // jsonb_strip_nulls, jsonb_path_query/exists/match, jsonb_object_keys,
+    // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
+    // jsonb_build_object, jsonb_build_array, to_jsonb, row_to_json,
+    // array_to_json, and aggregate stubs (jsonb_agg, jsonb_object_agg).
+    crate::jsonb_udf::register_jsonb_udfs(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
