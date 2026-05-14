@@ -1278,7 +1278,6 @@ macro_rules! simple_provider {
 // pg_catalog new views
 simple_provider!(PgDatabaseProvider, pg_database_schema, pg_database, "PgDatabaseProvider");
 simple_provider!(PgRolesProvider, pg_roles_schema, pg_roles, "PgRolesProvider");
-simple_provider!(PgViewsProvider, pg_views_schema, pg_views, "PgViewsProvider");
 simple_provider!(PgIndexesProvider, pg_indexes_schema, pg_indexes, "PgIndexesProvider");
 simple_provider!(PgTablesProvider, pg_tables_schema, pg_tables, "PgTablesProvider");
 simple_provider!(PgSettingsProvider, pg_settings_schema, pg_settings, "PgSettingsProvider");
@@ -1311,8 +1310,6 @@ simple_provider!(PgStatProgressVacuumProvider, pg_stat_progress_vacuum_schema, p
 simple_provider!(PgStatProgressCreateIndexProvider, pg_stat_progress_create_index_schema, pg_stat_progress_create_index, "PgStatProgressCreateIndexProvider");
 simple_provider!(PgStatProgressAnalyzeProvider, pg_stat_progress_analyze_schema, pg_stat_progress_analyze, "PgStatProgressAnalyzeProvider");
 // information_schema bulk views
-simple_provider!(CheckConstraintsProvider, check_constraints_schema, check_constraints, "CheckConstraintsProvider");
-simple_provider!(TriggersProvider, triggers_schema, triggers, "TriggersProvider");
 simple_provider!(UsagePrivilegesProvider, usage_privileges_schema, usage_privileges, "UsagePrivilegesProvider");
 simple_provider!(TablePrivilegesProvider, table_privileges_schema, table_privileges, "TablePrivilegesProvider");
 simple_provider!(ColumnPrivilegesProvider, column_privileges_schema, column_privileges, "ColumnPrivilegesProvider");

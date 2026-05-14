@@ -2868,40 +2868,6 @@ async fn exec_soft_delete(
 // RETURNING helpers
 // ---------------------------------------------------------------------------
 
-/// Project a list of batches according to `RETURNING` items. Supports:
-///   - `*` / `Wildcard` → all columns pass through
-///   - `col` / `UnnamedExpr(Identifier)` → select named columns only
-///
-/// Complex expressions in RETURNING (e.g. `id * 2`) are not supported in
-/// v0.1; they surface as `InvalidSchema`.
-fn project_returning(
-    batches: Vec<RecordBatch>,
-    items: &[SelectItem],
-    table_schema: &Schema,
-) -> Result<Vec<RecordBatch>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Determine which column indices to project.
-    let col_indices = returning_column_indices(items, table_schema)?;
-    let mut out = Vec::with_capacity(batches.len());
-    for b in batches {
-        let proj_schema = Arc::new(Schema::new(
-            col_indices
-                .iter()
-                .map(|&i| b.schema().field(i).clone())
-                .collect::<Vec<_>>(),
-        ));
-        let cols: Vec<ArrayRef> = col_indices.iter().map(|&i| b.column(i).clone()).collect();
-        let proj =
-            RecordBatch::try_new(proj_schema, cols).map_err(|e| {
-                BasinError::internal(format!("RETURNING project batch: {e}"))
-            })?;
-        out.push(proj);
-    }
-    Ok(out)
-}
-
 /// Build the projected schema for an empty RETURNING result.
 fn schema_for_returning(table_schema: &Schema, items: &[SelectItem]) -> Result<Schema> {
     let col_indices = returning_column_indices(items, table_schema)?;

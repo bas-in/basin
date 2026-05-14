@@ -245,37 +245,18 @@ pub(crate) async fn open(
     // `localtime`/`localtimestamp` stubs, `make_time`/`make_timestamp`/
     // `make_interval`, `width_bucket`, `to_number`.
     crate::pg_scalar_aliases::register_pg_scalar_aliases(&ctx);
-    // Gap-filler string + datetime UDFs: `split_part`, `format`, `quote_ident`,
-    // `quote_literal`, `regexp_match`, `regexp_split_to_array`, `chr`, `ascii`,
-    // `translate`, `btrim`, `ltrim`, `rtrim`, `convert_from`/`to`, `isfinite`.
-    crate::string_dt_udf::register_string_dt_udfs(&ctx);
     // pg_catalog stub UDFs for psql `\dt` / `\d`-family meta-commands.
     crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
-    // Full-text search stub UDFs: `to_tsvector`, `to_tsquery`, `ts_rank`, etc.
-    crate::fts_udf::register_fts_udfs(&ctx);
     // Phase 5.11.AGG: PG JSON aggregate UDAFs — json_agg, jsonb_agg,
     // json_object_agg, jsonb_object_agg.
     crate::pg_agg_udf::register_json_agg_udafs(&ctx);
-    crate::jsonb_udf::register_jsonb_udfs(&ctx);
     // Range type constructors + accessors + predicates. Registered per-session
     // like the other UDFs; cost is O(Arc clones).
     crate::range_udf::register_range_udfs(&ctx);
-    // Phase 5.11.N: pg_catalog scalar stubs — pg_table_is_visible,
-    // pg_get_userbyid, format_type, current_schema(), etc.  These are the
-    // functions psql's \dt / \d-family meta-queries probe; registering them
-    // as constant-returning stubs is enough for psql to plan and execute
-    // without "Invalid function" errors.
-    crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
     // P10: supplemental datetime + array UDFs — overlaps, cast_infinity_timestamp,
     // array_dims. Registered after pg_compat so name collisions resolve in
     // favour of the more-specific implementations above.
     crate::datetime_extras::register_datetime_extras(&ctx);
-    // FTS stub UDFs: to_tsvector, to_tsquery, plainto_tsquery,
-    // phraseto_tsquery, websearch_to_tsquery, ts_rank, ts_rank_cd,
-    // ts_headline, setweight, strip, tsvector_length, numnode, querytree.
-    // These are stubs only — no inverted index; rank functions return 0.0,
-    // text-conversion functions echo their text argument.
-    crate::fts_udf::register_fts_udfs(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog

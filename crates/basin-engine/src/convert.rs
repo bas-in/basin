@@ -24,11 +24,9 @@ use arrow_schema as ws_schema;
 use arrow_schema::IntervalUnit as WsIntervalUnit;
 use arrow_schema::TimeUnit as WsTimeUnit;
 // Buffer types used when constructing workspace-side ListArrays.
-use arrow_buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer, ScalarBuffer};
-// arrow_buffer (v54) provides the cross-version-safe buffer primitives we
-// need to rebuild WS List/LargeList arrays from raw offset and null data.
-use arrow_buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer,
-                   ScalarBuffer as WsScalarBuffer};
+use arrow::buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer, ScalarBuffer};
+use arrow::buffer::ScalarBuffer as WsScalarBuffer;
+use arrow::array::BooleanBufferBuilder as WsBooleanBufferBuilder;
 
 // DataFusion-side (v53) imports.
 use datafusion::arrow::array as df_array;
@@ -1116,7 +1114,7 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                     ws_child_field.is_nullable(),
                 ));
                 let null_buffer: Option<WsNullBuffer> = if df_list.nulls().is_some() {
-                    let mut b = arrow_buffer::BooleanBufferBuilder::new(df_list.len());
+                    let mut b = WsBooleanBufferBuilder::new(df_list.len());
                     for k in 0..df_list.len() {
                         b.append(!df_list.is_null(k));
                     }

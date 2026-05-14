@@ -111,21 +111,6 @@ pub enum StmtKind {
     CreateTrigger,
     DropTrigger,
     // Transaction control (syntactic-accept-only; Basin is auto-commit)
-    // Async notification (unsupported in v0.1)
-    Listen,
-    Notify,
-    // Prepared / cursor (unsupported in v0.1)
-    Prepare,
-    Execute,
-    Deallocate,
-    DeclareCursor,
-    Fetch,
-    Close,
-    // Extension / trigger (unsupported in v0.1)
-    CreateExtension,
-    CreateTrigger,
-    DropTrigger,
-    // Transaction control (unsupported in v0.1 — Basin is auto-commit)
     BeginTransaction,
     Commit,
     Rollback,

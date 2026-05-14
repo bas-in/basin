@@ -18,13 +18,6 @@ use sqlparser::ast::TimezoneInfo;
 pub const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 pub const BASIN_TYPE_JSONB: &str = "JSONB";
 pub const BASIN_TYPE_UUID: &str = "UUID";
-/// Logical-type marker for PG `TSVECTOR` columns. The Arrow physical type
-/// is `Utf8` — the column stores text (stub; no real lexeme tokenisation).
-/// The metadata flag lets the schema layer distinguish a TSVECTOR column
-/// from a plain TEXT column when round-tripping DDL metadata.
-pub const BASIN_TYPE_TSVECTOR: &str = "TSVECTOR";
-/// Logical-type marker for PG `TSQUERY` columns. Same physical type (`Utf8`)
-/// and same stub semantics as `TSVECTOR`.
 /// Logical type marker for `TSVECTOR` columns. The Arrow physical type is
 /// `Utf8`; this marker tells downstream layers (pgwire encoder, info_schema)
 /// to advertise the appropriate PG OID rather than the plain-text OID.
@@ -60,16 +53,6 @@ pub const BASIN_TYPE_VARBIT_PREFIX: &str = "VARBIT";
 /// guarantees (`-92233720368547758.08` to `+92233720368547758.07`).
 pub const BASIN_TYPE_MONEY: &str = "MONEY";
 
-// Network address types — stored as UTF-8 text with a metadata marker so the
-// pgwire encoder can advertise the correct OID and the REST layer can validate
-// format.
-pub const BASIN_TYPE_INET: &str = "INET";
-pub const BASIN_TYPE_CIDR: &str = "CIDR";
-pub const BASIN_TYPE_MACADDR: &str = "MACADDR";
-pub const BASIN_TYPE_MACADDR8: &str = "MACADDR8";
-
-// Money type — Arrow Decimal128(19,2); marker so the encoder emits OID 790.
-pub const BASIN_TYPE_MONEY: &str = "MONEY";
 
 // XML — UTF-8 text with marker for OID 142.
 pub const BASIN_TYPE_XML: &str = "XML";
