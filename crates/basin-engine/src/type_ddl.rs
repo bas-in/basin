@@ -107,12 +107,24 @@ pub(crate) async fn resolve_user_type_columns(
             continue;
         }
         let name = &obj.0[0].value;
-        // `vector(N)` / `JSONB` / `UUID` are recognised by
-        // `arrow_data_type`; we must not shadow them. Skip the
-        // built-in custom-keyword set so unmodified `arrow_data_type`
+        // `vector(N)` / `JSONB` / `UUID` and all network/bit-string/money
+        // types are recognised by `arrow_data_type`; we must not shadow them.
+        // Skip the built-in custom-keyword set so unmodified `arrow_data_type`
         // logic stays canonical.
         let lc = name.to_ascii_lowercase();
-        if lc == "vector" || lc == "jsonb" || lc == "uuid" {
+        if matches!(
+            lc.as_str(),
+            "vector"
+                | "jsonb"
+                | "uuid"
+                | "inet"
+                | "cidr"
+                | "macaddr"
+                | "macaddr8"
+                | "money"
+                | "bit"
+                | "varbit"
+        ) {
             continue;
         }
         if let Some(def) = catalog.lookup_enum_type(tenant, name).await {

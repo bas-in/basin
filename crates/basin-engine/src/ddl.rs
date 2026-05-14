@@ -12,9 +12,9 @@ use sqlparser::ast::{
 
 use crate::lifecycle::CreateTableLifecycle;
 use crate::types::{
-    arrow_data_type, serial_kind, BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY,
-    BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_JSONB,
-    BASIN_TYPE_KEY, BASIN_TYPE_UUID,
+    arrow_data_type, basin_type_marker, serial_kind, BASIN_AUDIT_TABLE_KEY,
+    BASIN_AUTO_UPDATE_KEY, BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY,
+    BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_UUID,
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -345,6 +345,12 @@ pub(crate) fn schema_and_constraints_from_columns(
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_JSONB.to_string());
         } else if is_uuid_sql(&col.data_type) {
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_UUID.to_string());
+        } else if let Some(marker) = basin_type_marker(&col.data_type) {
+            // Network types (INET, CIDR, MACADDR, MACADDR8), bit-string types
+            // (BIT(n), VARBIT(n)), and MONEY all ride on Utf8 / Decimal128 at
+            // the Arrow level. The marker is what INSERT validation and the
+            // pgwire encoder key off to apply the correct semantics.
+            md.insert(BASIN_TYPE_KEY.to_string(), marker);
         }
         if let Some(expr_text) = generated_expr.as_ref() {
             md.insert(BASIN_GENERATED_AS.to_string(), expr_text.clone());

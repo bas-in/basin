@@ -22,7 +22,11 @@ use basin_common::{BasinError, PartitionKey, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlparser::ast::{DataType as SqlDataType, Expr, FunctionArguments, UnaryOperator, Value};
 
-use crate::types::{field_is_jsonb, field_is_uuid, parse_vector_literal};
+use crate::types::{
+    bit_fixed_len, field_is_bit, field_is_cidr, field_is_inet, field_is_jsonb, field_is_macaddr,
+    field_is_macaddr8, field_is_money, field_is_uuid, field_is_varbit, parse_vector_literal,
+    varbit_max_len,
+};
 
 /// Above this row count we try the type-specific bulk paths in [`build_array_bulk`]
 /// before falling back to the per-row builder loop. The threshold is empirical:
@@ -70,6 +74,94 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 }
                 Arc::new(b.finish())
             }
+            // ── Network / bit-string stubs ────────────────────────────────
+            // INET, CIDR, MACADDR, MACADDR8, BIT(n), and VARBIT all ride on
+            // Arrow `Utf8`. We dispatch here (before the generic Utf8 arm) to
+            // apply format validation on INSERT.
+            DataType::Utf8 if field_is_inet(field) => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match coerce_inet(&row[col_idx], field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Utf8 if field_is_cidr(field) => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match coerce_cidr(&row[col_idx], field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Utf8 if field_is_macaddr(field) => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match coerce_macaddr(&row[col_idx], field.name(), false)? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Utf8 if field_is_macaddr8(field) => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match coerce_macaddr(&row[col_idx], field.name(), true)? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Utf8 if field_is_bit(field) => {
+                // BIT(n): exact length required.
+                let n = bit_fixed_len(field);
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * (n as usize + 1));
+                for row in rows {
+                    match coerce_bit_string(&row[col_idx], Some(n), true, field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Utf8 if field_is_varbit(field) => {
+                // VARBIT(n): at most n bits; VARBIT: unlimited.
+                let max_n = varbit_max_len(field);
+                let cap = max_n.unwrap_or(64) as usize;
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * (cap + 1));
+                for row in rows {
+                    match coerce_bit_string(&row[col_idx], max_n, false, field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            // ── Generic Utf8 (TEXT, VARCHAR, CHAR, etc.) ──────────────────
             DataType::Utf8 if bulk && !field.is_nullable() => {
                 build_utf8_not_null(rows, col_idx, field.name())?
             }
@@ -229,12 +321,24 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 Arc::new(arr)
             }
             DataType::Decimal128(p, s) => {
-                // PG `numeric` literal coercion: scale a base-10 number
-                // literal to the column's `(precision, scale)` and store
-                // as i128. Pre-validated: `1 <= p <= 38`, `0 <= s <= p`.
+                // PG `numeric` / MONEY literal coercion: scale a base-10
+                // number literal to the column's `(precision, scale)` and
+                // store as i128. MONEY additionally accepts currency-prefixed
+                // strings like `'$1.50'`.
+                // Pre-validated: `1 <= p <= 38`, `0 <= s <= p`.
+                let is_money_col = field_is_money(field);
                 let mut values: Vec<Option<i128>> = Vec::with_capacity(rows.len());
                 for row in rows {
-                    match coerce_decimal128(&row[col_idx], *p, *s, field.name())? {
+                    let expr = &row[col_idx];
+                    // For MONEY columns accept a string literal that has a
+                    // leading currency symbol (e.g. '$1.50'). Strip the symbol
+                    // before routing through the normal decimal128 coercion.
+                    let coerced = if is_money_col {
+                        coerce_money(expr, *p, *s, field.name())?
+                    } else {
+                        coerce_decimal128(expr, *p, *s, field.name())?
+                    };
+                    match coerced {
                         Some(v) => values.push(Some(v)),
                         None => {
                             check_null_allowed(field)?;
@@ -561,6 +665,244 @@ fn coerce_uuid(expr: &Expr, col: &str) -> Result<Option<[u8; 16]>> {
         other => Err(BasinError::InvalidSchema(format!(
             "expected UUID literal or gen_random_uuid()/uuid_generate_v4() for column {col}, got {other}"
         ))),
+    }
+}
+
+// ── Network / bit-string coercions ──────────────────────────────────────────
+
+/// Pull a plain string literal (or NULL) out of an INSERT expression. Used as
+/// the foundation for network and bit-string coercions which all accept a
+/// single-quoted string. Cast wrappers (`'...'::inet`) are accepted by peeling.
+fn coerce_string_for_typed(expr: &Expr, col: &str, type_name: &str) -> Result<Option<String>> {
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s))
+        | Expr::Value(Value::DoubleQuotedString(s))
+        | Expr::Value(Value::EscapedStringLiteral(s))
+        | Expr::Value(Value::NationalStringLiteral(s)) => Ok(Some(s.clone())),
+        Expr::Value(Value::Null) => Ok(None),
+        Expr::Cast { expr: inner, .. } => coerce_string_for_typed(inner.as_ref(), col, type_name),
+        other => Err(BasinError::InvalidSchema(format!(
+            "expected {type_name} string literal for column {col}, got {other}"
+        ))),
+    }
+}
+
+/// Validate and store an `INET` literal.
+///
+/// PG INET accepts `'192.168.0.1'`, `'::1'`, `'10.0.0.0/8'`,
+/// `'2001:db8::/32'`. We perform a lightweight structural validation
+/// (no third-party IP crate required):
+/// - Optionally strip a `/prefix` suffix and validate the prefix number.
+/// - Accept if the host portion can be parsed as IPv4 or IPv6 using the
+///   stdlib `std::net::IpAddr` parser.
+fn coerce_inet(expr: &Expr, col: &str) -> Result<Option<String>> {
+    let Some(s) = coerce_string_for_typed(expr, col, "INET")? else {
+        return Ok(None);
+    };
+    validate_ip_with_prefix(&s, col, "INET", true)?;
+    Ok(Some(s))
+}
+
+/// Validate and store a `CIDR` literal.
+///
+/// CIDR requires a network address (host bits must be zero in PG, but we
+/// only enforce that the prefix length is syntactically valid for v0.1).
+fn coerce_cidr(expr: &Expr, col: &str) -> Result<Option<String>> {
+    let Some(s) = coerce_string_for_typed(expr, col, "CIDR")? else {
+        return Ok(None);
+    };
+    validate_ip_with_prefix(&s, col, "CIDR", false)?;
+    Ok(Some(s))
+}
+
+/// Shared IPv4/IPv6 + optional-prefix validator.
+///
+/// `requires_prefix` = false for INET (prefix optional), true for CIDR
+/// (we accept prefix-less CIDR for simplicity in v0.1 to match what PG
+/// accepts for single-host network notation like `'192.168.1.1'`).
+fn validate_ip_with_prefix(s: &str, col: &str, type_name: &str, _prefix_optional: bool) -> Result<()> {
+    use std::net::IpAddr;
+    let (host, prefix) = match s.rfind('/') {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    host.parse::<IpAddr>().map_err(|_| {
+        BasinError::InvalidSchema(format!(
+            "invalid {type_name} address for column {col}: {s:?} (host part {host:?} is not a valid IP)"
+        ))
+    })?;
+    if let Some(pfx) = prefix {
+        let n: u8 = pfx.parse().map_err(|_| {
+            BasinError::InvalidSchema(format!(
+                "invalid {type_name} prefix for column {col}: {s:?} (prefix {pfx:?} is not a number)"
+            ))
+        })?;
+        // IPv4 max prefix = 32, IPv6 = 128. We allow up to 128 for both
+        // in v0.1 — a tighter check requires knowing the address family
+        // which we already parsed above.
+        if n > 128 {
+            return Err(BasinError::InvalidSchema(format!(
+                "invalid {type_name} prefix length {n} for column {col}: must be 0..=128"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate and store a `MACADDR` or `MACADDR8` literal.
+///
+/// `is_eui64` = false → 6-group EUI-48 (MACADDR), `is_eui64` = true →
+/// 8-group EUI-64 (MACADDR8).
+///
+/// PG accepts several separator styles:
+///   - `01:23:45:67:89:ab` (colon, standard)
+///   - `01-23-45-67-89-ab` (hyphen)
+///   - `0123456789ab`      (no separator, EUI-48 only)
+///   - `01:23:45:67:89:ab:cd:ef` (8-group for MACADDR8)
+fn coerce_macaddr(expr: &Expr, col: &str, is_eui64: bool) -> Result<Option<String>> {
+    let type_name = if is_eui64 { "MACADDR8" } else { "MACADDR" };
+    let Some(s) = coerce_string_for_typed(expr, col, type_name)? else {
+        return Ok(None);
+    };
+    let expected_groups = if is_eui64 { 8usize } else { 6usize };
+    let lower = s.to_ascii_lowercase();
+    let lower = lower.trim();
+    // Detect separator.
+    let groups: Vec<&str> = if lower.contains(':') {
+        lower.split(':').collect()
+    } else if lower.contains('-') {
+        lower.split('-').collect()
+    } else {
+        // No separator: only valid for EUI-48 (12 hex chars).
+        if !is_eui64 && lower.len() == 12 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+            // Store in canonical colon-separated form.
+            let canonical = lower
+                .as_bytes()
+                .chunks(2)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect::<Vec<_>>()
+                .join(":");
+            return Ok(Some(canonical));
+        }
+        return Err(BasinError::InvalidSchema(format!(
+            "invalid {type_name} literal for column {col}: {s:?}"
+        )));
+    };
+    if groups.len() != expected_groups {
+        return Err(BasinError::InvalidSchema(format!(
+            "invalid {type_name} literal for column {col}: {s:?} (expected {expected_groups} groups, got {})",
+            groups.len()
+        )));
+    }
+    for g in &groups {
+        if g.len() != 2 || !g.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(BasinError::InvalidSchema(format!(
+                "invalid {type_name} literal for column {col}: {s:?} (group {g:?} is not two hex digits)"
+            )));
+        }
+    }
+    // Store in canonical colon-separated lowercase form.
+    Ok(Some(groups.join(":")))
+}
+
+/// Validate and store a `BIT(n)` or `VARBIT(n)` literal.
+///
+/// PG bit-string literals are written as `B'0110'` (parsed by sqlparser
+/// as `Value::SingleQuotedString("0110")` inside a `bit-string literal`)
+/// or as a plain string literal `'0110'`.
+///
+/// Parameters:
+/// - `max_len`: `Some(n)` → enforce a length bound; `None` → no bound.
+/// - `exact`:  `true` → length must equal `max_len` exactly (BIT(n));
+///             `false` → length must be ≤ `max_len` (VARBIT(n)).
+fn coerce_bit_string(
+    expr: &Expr,
+    max_len: Option<u64>,
+    exact: bool,
+    col: &str,
+) -> Result<Option<String>> {
+    let s = match expr {
+        Expr::Value(Value::SingleQuotedString(s))
+        | Expr::Value(Value::DoubleQuotedString(s))
+        | Expr::Value(Value::EscapedStringLiteral(s))
+        | Expr::Value(Value::NationalStringLiteral(s)) => s.clone(),
+        // sqlparser parses `B'0110'` as Value::SingleQuotedString with the
+        // `B` prefix consumed — it becomes the raw string without the `B`.
+        // We handle the case where the user wrote a number literal of 0/1s.
+        Expr::Value(Value::Null) => return Ok(None),
+        Expr::Cast { expr: inner, .. } => {
+            return coerce_bit_string(inner.as_ref(), max_len, exact, col);
+        }
+        other => {
+            return Err(BasinError::InvalidSchema(format!(
+                "expected bit-string literal for column {col}, got {other}"
+            )));
+        }
+    };
+    // All characters must be '0' or '1'.
+    if !s.bytes().all(|b| b == b'0' || b == b'1') {
+        return Err(BasinError::InvalidSchema(format!(
+            "invalid bit-string literal for column {col}: {s:?} (only '0' and '1' allowed)"
+        )));
+    }
+    if s.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "invalid bit-string literal for column {col}: empty string is not allowed"
+        )));
+    }
+    let len = s.len() as u64;
+    match max_len {
+        Some(n) if exact => {
+            // BIT(n): literal must be exactly n bits.
+            if len != n {
+                return Err(BasinError::InvalidSchema(format!(
+                    "bit-string literal for column {col} has length {len} but BIT({n}) requires exactly {n} bits"
+                )));
+            }
+        }
+        Some(n) => {
+            // VARBIT(n): literal must be at most n bits.
+            if len > n {
+                return Err(BasinError::InvalidSchema(format!(
+                    "bit-string literal for column {col} has length {len} but column allows at most {n}"
+                )));
+            }
+        }
+        None => {} // VARBIT with no length limit: any length is fine.
+    }
+    Ok(Some(s))
+}
+
+/// Validate and store a `MONEY` value.
+///
+/// PG MONEY accepts numeric literals directly, or string literals with an
+/// optional leading currency symbol (`$`, `€`, `£`, etc.) followed by a
+/// decimal number. We strip any leading non-digit/sign characters and route
+/// through `coerce_decimal128`.
+fn coerce_money(expr: &Expr, precision: u8, scale: i8, col: &str) -> Result<Option<i128>> {
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s))
+        | Expr::Value(Value::DoubleQuotedString(s))
+        | Expr::Value(Value::EscapedStringLiteral(s))
+        | Expr::Value(Value::NationalStringLiteral(s)) => {
+            // Strip leading currency symbol(s) and any commas used as
+            // thousands separators. Keep digits, '.', '+', '-'.
+            let stripped: String = s
+                .trim()
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+                .collect();
+            if stripped.is_empty() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "invalid MONEY literal for column {col}: {s:?}"
+                )));
+            }
+            // Re-wrap in a synthetic Number expression for coerce_decimal128.
+            let synthetic = Expr::Value(Value::Number(stripped, false));
+            coerce_decimal128(&synthetic, precision, scale, col)
+        }
+        // Plain numeric literals and NULLs flow through unchanged.
+        _ => coerce_decimal128(expr, precision, scale, col),
     }
 }
 

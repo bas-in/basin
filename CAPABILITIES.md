@@ -81,7 +81,14 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `TIMESTAMPTZ` | ✅ | Arrow `Timestamp(Microsecond, "UTC")` |
 | `TIMESTAMP` (without time zone) | ✅ | Arrow `Timestamp(Microsecond, None)`; pgwire OID 1114; surfaces in `information_schema.columns.data_type` as `"timestamp without time zone"` |
 | `NUMERIC` / `DECIMAL` | ✅ | Arrow `Decimal128(p, s)` (1 ≤ p ≤ 38, 0 ≤ s ≤ p). DDL accepts `NUMERIC`, `NUMERIC(p)`, `NUMERIC(p, s)`, `DECIMAL(...)` synonym. Wire format: text only (binary numeric encoding is varlena-shaped and deferred to v0.2; lenient drivers handle text fine). pgwire OID 1700; `information_schema.columns.data_type` = `"numeric"`. |
-| `INTERVAL`, `MONEY`, `XML`, geometric (LINESTRING/POLYGON) | 🚫 | |
+| `MONEY` | ✅ | Arrow `Decimal128(20, 2)` + field metadata `BASIN_TYPE=MONEY`. Accepts numeric literals and currency-prefixed strings (`'$1.50'`). PG arithmetic semantics deferred to v0.2. |
+| `INET` | ✅ | Arrow `Utf8` + `BASIN_TYPE=INET`. Accepts IPv4/IPv6 host addresses with optional `/prefix` (`'192.168.1.0/24'`, `'::1'`). Structural validation on INSERT. |
+| `CIDR` | ✅ | Arrow `Utf8` + `BASIN_TYPE=CIDR`. Same format as INET; subnet operators (`<<`, `>>=`, `inet_same_family`) deferred to v0.2. |
+| `MACADDR` | ✅ | Arrow `Utf8` + `BASIN_TYPE=MACADDR`. Accepts colon-separated (`01:23:45:67:89:ab`), hyphen-separated, and compact (no-separator) EUI-48 forms. Stored in canonical colon-separated lowercase. |
+| `MACADDR8` | ✅ | Arrow `Utf8` + `BASIN_TYPE=MACADDR8`. Accepts 8-group EUI-64 addresses in colon or hyphen form. Stored in canonical colon-separated lowercase. |
+| `BIT(n)` | ✅ | Arrow `Utf8` + `BASIN_TYPE=BIT(n)`. Fixed-length bit string of exactly `n` '0'/'1' characters. Exact-length enforcement on INSERT. |
+| `BIT VARYING(n)` / `VARBIT(n)` | ✅ | Arrow `Utf8` + `BASIN_TYPE=VARBIT(n)`. Variable-length bit string up to `n` bits. Bare `VARBIT` (no length) is unbounded. |
+| `INTERVAL`, `XML`, geometric (LINESTRING/POLYGON) | 🚫 | |
 
 ## Multi-tenancy
 
