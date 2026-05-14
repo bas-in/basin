@@ -213,6 +213,33 @@ the corresponding `ScalarUDF`s and parse the relevant `WITH (…)` options.
 | API-key tokens (long-lived, revocable) | ✅ | `POST /auth/v1/api-keys` issues; `GET` lists; `DELETE` revokes. sha256 lookup + bcrypt verify; `Authorization: Bearer <key>` works on REST and (via `ApiKeyTenantResolver`) pgwire. |
 | Real PostgREST (Haskell) sitting in front of Basin | 🚫 | needs `pg_catalog` / `information_schema` — 2–4 month slog with ongoing maintenance. Building basin-rest natively is ~3 weeks instead. |
 
+## Syntactic-accept-only statements
+
+The following SQL statements are **parsed and accepted** by Basin but are **not
+enforced** — they succeed silently rather than being rejected with an error.
+Real access control comes from `auth.uid()` and `auth.role()` per
+[ADR 0005](./docs/decisions/0005-auth-uid-role.md) and
+[ADR 0013](./docs/decisions/0013-auth-per-tenant-schema.md).
+
+| Statement | Command-complete tag | Notes |
+|---|---|---|
+| `VACUUM [FULL] [table]` | `VACUUM` | Basin storage compacts via lifecycle rules, not `VACUUM`. |
+| `ANALYZE [table]` | `ANALYZE` | Statistics live in DataFusion's adaptive planner, not `pg_statistic`. |
+| `CLUSTER [table]` | `CLUSTER` | Clustering is declared via `CLUSTER BY` in `CREATE TABLE`. |
+| `LOCK TABLE … IN … MODE` | `LOCK TABLE` | Basin is optimistic / append-only; no row-level lock manager. |
+| `COMMENT ON … IS '…'` | `COMMENT` | Not stored; accepted for tooling compatibility. |
+| `EXPLAIN [ANALYZE] <query>` | (single-row result set) | Returns a message noting full EXPLAIN support is v0.2+. |
+| `CREATE ROLE name [WITH …]` | `CREATE ROLE` | Basin uses JWT roles from `auth.role()`; no server-side role catalogue. |
+| `DROP ROLE name` | `DROP ROLE` | Same as above. |
+| `ALTER ROLE name …` | `ALTER ROLE` | Same as above. |
+| `GRANT priv ON obj TO role` | `GRANT` | No privilege table; use RLS policies for access control. |
+| `REVOKE priv ON obj FROM role` | `REVOKE` | Same as above. |
+| `SET [LOCAL] name = value` | `SET` | GUC variables are not persisted across statements. |
+| `SHOW name` | `SHOW` | Returns empty OK (not the variable value). Exception: `SHOW TABLES` returns the real table list. |
+
+This set lets migration scripts and ORM schema generators run cleanly against
+Basin without choking on administrative SQL they emit unconditionally.
+
 ## Comparison shape vs Supabase / Neon / Postgres
 
 See [`docs/deployment.md`](./docs/deployment.md) for the production cloud

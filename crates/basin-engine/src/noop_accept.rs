@@ -80,11 +80,22 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::Revoke => Some(ExecResult::Empty {
             tag: "REVOKE".into(),
         }),
-        // Session-variable control
+        // Session-variable control.
+        // `SET search_path = …`, `RESET role`, etc. are no-op accepted.
         StmtKind::VariableSet => Some(ExecResult::Empty { tag: "SET".into() }),
-        StmtKind::VariableShow => Some(ExecResult::Empty {
-            tag: "SHOW".into(),
-        }),
+        // `SHOW search_path`, `SHOW all`, etc. are no-op accepted.
+        // IMPORTANT: `SHOW TABLES` is Basin's extension command that returns
+        // a real result set (sqlparser handles it). Do NOT intercept it here;
+        // return None so it falls through to the existing SHOW TABLES handler.
+        StmtKind::VariableShow => {
+            let trimmed = sql.trim().to_ascii_uppercase();
+            let trimmed = trimmed.trim_end_matches(';').trim_end();
+            if trimmed == "SHOW TABLES" {
+                None
+            } else {
+                Some(ExecResult::Empty { tag: "SHOW".into() })
+            }
+        }
         // Everything else is not in our accept set.
         _ => None,
     }

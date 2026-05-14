@@ -594,6 +594,9 @@ mod info_schema_provider;
 mod lifecycle;
 mod net_glue;
 mod noisy_detector;
+// ADR 0014 Phase 1: libpg_query-based parse + statement classifier.
+pub mod pg_ast;
+pub(crate) mod noop_accept;
 mod prepared;
 mod procedure_ddl;
 pub mod reactor_ddl;

@@ -152,6 +152,10 @@ clap = { version = "4", features = ["derive"] }
 # version (0.8.x). Bumping to 0.9 changes `gen_range` semantics, which
 # would invalidate every published cold-p99 baseline.
 rand = "0.8"
+# libpg_query — the real PostgreSQL parser, vendored as a Rust crate (ADR
+# 0014). Only basin-engine uses it today; at workspace level so the crate
+# version stays in sync. 6.x tracks PG 16 grammar.
+pg_query = "6"
 # Regex engine used by regexp_match / regexp_split_to_array UDFs in basin-engine.
 regex = "1"
 # Test-config file parsing for tests/integration/src/test_config.rs.
