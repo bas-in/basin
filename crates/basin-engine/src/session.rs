@@ -192,6 +192,7 @@ pub(crate) async fn open(
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
     // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
     // jsonb_strip_nulls, jsonb_path_query/exists/match, jsonb_object_keys,
     // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
@@ -234,6 +235,12 @@ pub(crate) async fn open(
     // without "Invalid function" errors.
     crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
 >>>>>>> worktree-agent-a64ea2ae9a44cffbc
+=======
+    // P10: supplemental datetime + array UDFs — overlaps, cast_infinity_timestamp,
+    // array_dims. Registered after pg_compat so name collisions resolve in
+    // favour of the more-specific implementations above.
+    crate::datetime_extras::register_datetime_extras(&ctx);
+>>>>>>> worktree-agent-a675cd26807f9dc6b
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
