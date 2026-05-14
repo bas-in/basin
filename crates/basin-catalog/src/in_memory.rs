@@ -303,8 +303,22 @@ impl Catalog for InMemoryCatalog {
                 "rename_table: target {tenant}/{new} already exists"
             )));
         }
+<<<<<<< HEAD
         let entry = tables
             .remove(&old_key)
+=======
+        // Look up the old entry and *alias* the new key to its Arc.
+        // Two keys end up pointing at the same TableState so the
+        // engine's session-level refresh_table call — which the
+        // caller may issue against either name — finds a live row
+        // either way. This is the v0.1 trade-off: the old name
+        // stays as a synonym until an explicit DROP. v0.2 will
+        // tombstone the old key via a separate alias map so the
+        // legacy name disappears from `SHOW TABLES`.
+        let entry = tables
+            .get(&old_key)
+            .cloned()
+>>>>>>> worktree-agent-aa5bb15d9437f2613
             .ok_or_else(|| BasinError::not_found(format!("{tenant}/{old}")))?;
         tables.insert(new_key, entry);
         Ok(())

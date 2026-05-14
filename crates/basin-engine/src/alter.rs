@@ -32,9 +32,11 @@
 //! engine never sees a non-tenant-qualified `Catalog::set_*` call.
 
 use arrow_schema::{Field, Schema};
-use basin_catalog::Catalog;
+use basin_catalog::{Catalog, CheckConstraint};
 use basin_common::{BasinError, Result, TableName};
-use sqlparser::ast::{AlterTableOperation, ColumnDef, ColumnOption, ObjectName};
+use sqlparser::ast::{
+    AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, ObjectName, TableConstraint,
+};
 use std::sync::Arc;
 
 use crate::types::arrow_data_type;
@@ -68,6 +70,23 @@ pub(crate) enum BasinAlterExtension {
     /// `ALTER TABLE <t> RESET CLUSTER BY`. Clears the cluster spec; the
     /// writer reverts to the pre-B2 unsorted byte-equivalent path.
     ResetClusterColumns { table: TableName },
+    /// `ALTER TABLE <t> VALIDATE CONSTRAINT <name>`. sqlparser 0.52
+    /// doesn't model this PG-specific form; we recognise it textually
+    /// and accept as a no-op (Basin doesn't have deferred / NOT VALID
+    /// constraints today — all constraints are validated on every
+    /// write — so VALIDATE is a no-op on a validated constraint and
+    /// errors on an unknown one).
+    ValidateConstraint { table: TableName, name: String },
+    /// `ALTER TABLE <t> ATTACH PARTITION <p> [FOR VALUES …]`. The
+    /// PG-style declarative-partition syntax — sqlparser 0.52 only
+    /// parses ATTACH for the ClickHouse dialect. Basin treats this
+    /// as a no-op accept: declarative partitions are computed from
+    /// the PARTITION BY column at write time and the catalog
+    /// doesn't need a per-partition row to route them.
+    AttachPartition { table: TableName },
+    /// `ALTER TABLE <t> DETACH PARTITION <p>`. Symmetric no-op
+    /// accept.
+    DetachPartition { table: TableName },
 }
 
 /// Try to recognise one of the Basin-specific ALTER TABLE forms in the
@@ -103,9 +122,39 @@ pub(crate) fn match_basin_alter_extension(sql: &str) -> Result<Option<BasinAlter
     let table = TableName::new(&raw_name)?;
 
     // The next keyword is either `SET` (most extensions), `RESET` (for
-    // clearing a per-table override), or `CLUSTER BY` (the bare form).
+    // clearing a per-table override), `CLUSTER BY` (the bare form), or
+    // `VALIDATE CONSTRAINT` (PG-specific, sqlparser 0.52 doesn't parse).
     // Anything else falls through to the standard sqlparser path.
     let lower_rest = after_alter_table.to_ascii_lowercase();
+
+    if let Some(rest) = strip_keyword(after_alter_table, &lower_rest, "validate constraint") {
+        let rest = rest.trim_start();
+        let (name, tail) = read_identifier(rest)?;
+        if !tail.trim().is_empty() {
+            return Err(BasinError::InvalidSchema(format!(
+                "ALTER TABLE … VALIDATE CONSTRAINT: unexpected trailing input {:?}",
+                tail.trim()
+            )));
+        }
+        return Ok(Some(BasinAlterExtension::ValidateConstraint {
+            table,
+            name,
+        }));
+    }
+
+    // PG-style declarative partition attach / detach. sqlparser only
+    // models these for ClickHouse; we recognise the shape textually
+    // and accept as no-op for PostgreSqlDialect users.
+    if strip_keyword(after_alter_table, &lower_rest, "attach partition").is_some() {
+        // The `FOR VALUES IN (...)` / `FOR VALUES FROM (...) TO (...)`
+        // tail is consumed verbatim — we don't need its contents
+        // since the operation is a no-op accept.
+        return Ok(Some(BasinAlterExtension::AttachPartition { table }));
+    }
+    if strip_keyword(after_alter_table, &lower_rest, "detach partition").is_some() {
+        return Ok(Some(BasinAlterExtension::DetachPartition { table }));
+    }
+
     if let Some(after_reset) = strip_keyword(after_alter_table, &lower_rest, "reset") {
         let after_reset = after_reset.trim_start();
         let after_reset_lower = after_reset.to_ascii_lowercase();
@@ -211,7 +260,10 @@ impl BasinAlterExtension {
             | BasinAlterExtension::SetRowGroupRows { table, .. }
             | BasinAlterExtension::ResetRowGroupRows { table }
             | BasinAlterExtension::SetClusterColumns { table, .. }
-            | BasinAlterExtension::ResetClusterColumns { table } => table,
+            | BasinAlterExtension::ResetClusterColumns { table }
+            | BasinAlterExtension::ValidateConstraint { table, .. }
+            | BasinAlterExtension::AttachPartition { table }
+            | BasinAlterExtension::DetachPartition { table } => table,
         }
     }
 
@@ -297,13 +349,65 @@ impl BasinAlterExtension {
                     .await?;
                 Ok("ALTER TABLE")
             }
+            BasinAlterExtension::ValidateConstraint { table, name } => {
+                // Look up the constraint by name. Basin doesn't have
+                // deferred / NOT VALID constraints — every constraint
+                // is enforced on every write — so a known constraint
+                // is a no-op accept and an unknown one is an error.
+                let meta = catalog.load_table(tenant, &table).await?;
+                let exists = meta
+                    .check_constraints
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&name))
+                    || meta
+                        .foreign_keys
+                        .iter()
+                        .any(|f| f.name.eq_ignore_ascii_case(&name))
+                    || meta
+                        .unique_constraints
+                        .iter()
+                        .any(|u| u.name.eq_ignore_ascii_case(&name))
+                    || format!("{table}_pkey").eq_ignore_ascii_case(&name);
+                if !exists {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "ALTER TABLE {table}: constraint {name:?} does not exist"
+                    )));
+                }
+                Ok("ALTER TABLE")
+            }
+            BasinAlterExtension::AttachPartition { table }
+            | BasinAlterExtension::DetachPartition { table } => {
+                // Validate the parent table exists; declarative
+                // partition routing is computed from the PARTITION BY
+                // column at write time, so the attach / detach is a
+                // no-op accept beyond the existence check.
+                let _ = catalog.load_table(tenant, &table).await?;
+                Ok("ALTER TABLE")
+            }
         }
     }
 }
 
-/// Apply an `ALTER TABLE` operation that sqlparser DID recognise
-/// (currently only `ADD [COLUMN] <col_def>`). RLS forms are intercepted
-/// upstream by [`crate::rls::match_rls_ddl`].
+/// Apply an `ALTER TABLE` operation that sqlparser DID recognise.
+///
+/// Supported forms (Phase 5.11 / task #29):
+///   * `ADD [COLUMN] <col_def>` (additive schema evolution)
+///   * `DROP [COLUMN] <col>` (schema-only — existing parquet files keep
+///     their original schema; reads project on the new shape)
+///   * `RENAME [COLUMN] <old> TO <new>` (schema metadata)
+///   * `RENAME TO <new_table>` (catalog key change via `rename_table`)
+///   * `ALTER [COLUMN] <c> [SET DATA] TYPE <dt>` (Arrow type metadata
+///     swap — existing data is best-effort coerced by the reader)
+///   * `ADD CONSTRAINT <n> CHECK (<expr>)` (append to
+///     `check_constraints`)
+///   * `DROP CONSTRAINT <n>` (remove from `check_constraints`)
+///   * `ATTACH PARTITION <p> FOR VALUES …` / `DETACH PARTITION <p>`
+///     (no-op accept — declarative partitions are computed from the
+///     PARTITION BY column at write time so the attach/detach
+///     statement carries no state change for Basin)
+///
+/// RLS ENABLE/DISABLE is absorbed upstream by [`crate::rls::match_rls_ddl`]
+/// and never reaches this dispatch.
 pub(crate) async fn apply_standard_alter_table(
     catalog: &Arc<dyn Catalog>,
     tenant: &basin_common::TenantId,
@@ -321,6 +425,69 @@ pub(crate) async fn apply_standard_alter_table(
             AlterTableOperation::AddColumn { column_def, .. } => {
                 add_column(catalog, tenant, &table, column_def).await?;
             }
+            AlterTableOperation::DropColumn {
+                column_name,
+                if_exists,
+                ..
+            } => {
+                drop_column(catalog, tenant, &table, &column_name.value, *if_exists).await?;
+            }
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => {
+                rename_column(
+                    catalog,
+                    tenant,
+                    &table,
+                    &old_column_name.value,
+                    &new_column_name.value,
+                )
+                .await?;
+            }
+            AlterTableOperation::RenameTable { table_name } => {
+                let new_table = single_part_object_name(table_name)?;
+                catalog.rename_table(tenant, &table, &new_table).await?;
+            }
+            AlterTableOperation::AlterColumn { column_name, op } => match op {
+                AlterColumnOperation::SetDataType { data_type, .. } => {
+                    alter_column_type(catalog, tenant, &table, &column_name.value, data_type)
+                        .await?;
+                }
+                AlterColumnOperation::DropDefault
+                | AlterColumnOperation::SetDefault { .. }
+                | AlterColumnOperation::SetNotNull
+                | AlterColumnOperation::DropNotNull => {
+                    // Accept as a metadata-only no-op so PG clients that
+                    // emit these as part of a multi-step migration aren't
+                    // blocked. v0.1 doesn't enforce per-column DEFAULT /
+                    // NOT NULL changes on existing data.
+                }
+                AlterColumnOperation::AddGenerated { .. } => {
+                    return Err(BasinError::InvalidSchema(
+                        "ALTER COLUMN ADD GENERATED is not supported in v0.1; declare \
+                         the column with GENERATED on the original CREATE TABLE"
+                            .into(),
+                    ));
+                }
+            },
+            AlterTableOperation::AddConstraint(tc) => {
+                add_constraint(catalog, tenant, &table, tc).await?;
+            }
+            AlterTableOperation::DropConstraint {
+                name, if_exists, ..
+            } => {
+                drop_constraint(catalog, tenant, &table, &name.value, *if_exists).await?;
+            }
+            AlterTableOperation::AttachPartition { .. }
+            | AlterTableOperation::DetachPartition { .. } => {
+                // Declarative partitions are computed from the PARTITION
+                // BY column at write time; ATTACH / DETACH PARTITION are
+                // accepted syntactically so DDL emitted by PG-shaped
+                // migration tools doesn't blow up. The partition table
+                // already exists as a regular table in the catalog.
+                let _ = catalog.load_table(tenant, &table).await?;
+            }
             // RLS forms are absorbed upstream and never reach here.
             AlterTableOperation::EnableRowLevelSecurity
             | AlterTableOperation::DisableRowLevelSecurity => {
@@ -336,6 +503,316 @@ pub(crate) async fn apply_standard_alter_table(
         }
     }
     Ok("ALTER TABLE")
+}
+
+/// Drop one column from the table's Arrow schema. Existing parquet files
+/// keep their original schema; the reader projects on the new shape, so
+/// the dropped column simply stops appearing in result sets. The column
+/// is also removed from the catalog's pk_columns / unique_constraints /
+/// foreign_keys / check_constraints scopes when it appears there — v0.1
+/// rejects rather than silently breaking a constraint that depended on
+/// the column, matching the spirit of PG's RESTRICT default (we don't
+/// implement CASCADE).
+async fn drop_column(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &basin_common::TenantId,
+    table: &TableName,
+    name: &str,
+    if_exists: bool,
+) -> Result<()> {
+    let meta = catalog.load_table(tenant, table).await?;
+    let pos = meta
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(name));
+    let pos = match pos {
+        Some(p) => p,
+        None if if_exists => return Ok(()),
+        None => {
+            return Err(BasinError::InvalidSchema(format!(
+                "ALTER TABLE {table}: column {name:?} does not exist"
+            )));
+        }
+    };
+    // Refuse to drop a column that participates in any catalog constraint.
+    let lc = name.to_ascii_lowercase();
+    if meta.pk_columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+        return Err(BasinError::InvalidSchema(format!(
+            "ALTER TABLE {table}: cannot drop column {name:?} — it is part of the PRIMARY KEY"
+        )));
+    }
+    for u in &meta.unique_constraints {
+        if u.columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+            return Err(BasinError::InvalidSchema(format!(
+                "ALTER TABLE {table}: cannot drop column {name:?} — it is part of UNIQUE \
+                 constraint {:?}",
+                u.name
+            )));
+        }
+    }
+    for fk in &meta.foreign_keys {
+        if fk.columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+            return Err(BasinError::InvalidSchema(format!(
+                "ALTER TABLE {table}: cannot drop column {name:?} — it is part of FOREIGN KEY \
+                 constraint {:?}",
+                fk.name
+            )));
+        }
+    }
+    // CHECK constraints reference columns by text; drop any check whose
+    // predicate textually references the column. This is best-effort —
+    // we don't reparse — but it matches PG's RESTRICT behaviour for the
+    // common single-column-check case.
+    let mut new_checks: Vec<CheckConstraint> = Vec::with_capacity(meta.check_constraints.len());
+    for c in &meta.check_constraints {
+        if predicate_references_column(&c.predicate, &lc) {
+            // Drop the check so subsequent inserts don't trip an
+            // un-resolvable reference. v0.1 doesn't support CASCADE
+            // syntax explicitly; this is the practical equivalent.
+            continue;
+        }
+        new_checks.push(c.clone());
+    }
+    let fields: Vec<Field> = meta
+        .schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| if i == pos { None } else { Some((**f).clone()) })
+        .collect();
+    let new_schema = Schema::new_with_metadata(fields, meta.schema.metadata().clone());
+    catalog.set_schema(tenant, table, new_schema).await?;
+    if new_checks.len() != meta.check_constraints.len() {
+        catalog
+            .set_table_constraints(
+                tenant,
+                table,
+                meta.pk_columns.clone(),
+                new_checks,
+                meta.foreign_keys.clone(),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Best-effort textual reference check for CHECK predicate strings.
+/// Looks for `name` as a whole word (ASCII alphanumeric / underscore
+/// boundary). The predicate text is the SQL we already stored on
+/// `CHECK (...)`; we don't reparse it here.
+fn predicate_references_column(predicate: &str, name_lc: &str) -> bool {
+    let lower = predicate.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let needle = name_lc.as_bytes();
+    let n = needle.len();
+    if n == 0 || bytes.len() < n {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + n <= bytes.len() {
+        if bytes[i..i + n] == *needle {
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after_ok = i + n == bytes.len() || !is_ident_char(bytes[i + n]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Rename a column in the table's Arrow schema. The rename is metadata
+/// only — existing parquet files keep their original column name and
+/// the reader maps the old physical name to the new logical name at
+/// scan time.
+async fn rename_column(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &basin_common::TenantId,
+    table: &TableName,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    let meta = catalog.load_table(tenant, table).await?;
+    if meta.schema.field_with_name(new).is_ok() {
+        return Err(BasinError::InvalidSchema(format!(
+            "ALTER TABLE {table}: column {new:?} already exists"
+        )));
+    }
+    let pos = meta
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(old))
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "ALTER TABLE {table}: column {old:?} does not exist"
+            ))
+        })?;
+    let mut fields: Vec<Field> = meta.schema.fields().iter().map(|f| (**f).clone()).collect();
+    let old_field = &fields[pos];
+    let renamed = Field::new(new, old_field.data_type().clone(), old_field.is_nullable())
+        .with_metadata(old_field.metadata().clone());
+    fields[pos] = renamed;
+    let new_schema = Schema::new_with_metadata(fields, meta.schema.metadata().clone());
+    catalog.set_schema(tenant, table, new_schema).await?;
+    Ok(())
+}
+
+/// Replace one column's Arrow `DataType`. v0.1 treats this as a
+/// metadata-only swap — existing parquet rows are still on disk in the
+/// old type and the reader best-effort coerces at scan time (Arrow's
+/// cast helper handles the common int → bigint widening). Anything
+/// the cast helper can't represent surfaces at SELECT time as a normal
+/// type-mismatch error.
+async fn alter_column_type(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &basin_common::TenantId,
+    table: &TableName,
+    column: &str,
+    new_dt: &sqlparser::ast::DataType,
+) -> Result<()> {
+    let meta = catalog.load_table(tenant, table).await?;
+    let pos = meta
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(column))
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "ALTER TABLE {table}: column {column:?} does not exist"
+            ))
+        })?;
+    let dt = arrow_data_type(new_dt)?;
+    let mut fields: Vec<Field> = meta.schema.fields().iter().map(|f| (**f).clone()).collect();
+    let old = &fields[pos];
+    fields[pos] =
+        Field::new(old.name().clone(), dt, old.is_nullable()).with_metadata(old.metadata().clone());
+    let new_schema = Schema::new_with_metadata(fields, meta.schema.metadata().clone());
+    catalog.set_schema(tenant, table, new_schema).await?;
+    Ok(())
+}
+
+/// Append one CHECK constraint to the table. PRIMARY KEY / UNIQUE /
+/// FOREIGN KEY constraints declared mid-life are out of scope for v0.1
+/// — adding them after-the-fact requires backfill validation that we
+/// don't yet do. CHECK additions are validated by the engine on
+/// subsequent writes only (matching PG's `NOT VALID` semantics, just
+/// without the explicit syntax for that flavour).
+async fn add_constraint(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &basin_common::TenantId,
+    table: &TableName,
+    tc: &TableConstraint,
+) -> Result<()> {
+    let meta = catalog.load_table(tenant, table).await?;
+    match tc {
+        TableConstraint::Check { name, expr } => {
+            let cname = match name {
+                Some(n) => n.value.clone(),
+                None => format!("{table}_check_{}", meta.check_constraints.len() + 1),
+            };
+            // Reject a duplicate name so the catalog row is unambiguous.
+            if meta
+                .check_constraints
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&cname))
+            {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER TABLE {table}: CHECK constraint {cname:?} already exists"
+                )));
+            }
+            let mut checks = meta.check_constraints.clone();
+            checks.push(CheckConstraint {
+                name: cname,
+                predicate: expr.to_string(),
+            });
+            catalog
+                .set_table_constraints(
+                    tenant,
+                    table,
+                    meta.pk_columns.clone(),
+                    checks,
+                    meta.foreign_keys.clone(),
+                )
+                .await?;
+        }
+        TableConstraint::Unique { .. }
+        | TableConstraint::PrimaryKey { .. }
+        | TableConstraint::ForeignKey { .. } => {
+            return Err(BasinError::InvalidSchema(
+                "ALTER TABLE ADD CONSTRAINT: only CHECK is supported in v0.1 (UNIQUE / \
+                 PRIMARY KEY / FOREIGN KEY additions after table creation are deferred)"
+                    .into(),
+            ));
+        }
+        TableConstraint::Index { .. } | TableConstraint::FulltextOrSpatial { .. } => {
+            return Err(BasinError::InvalidSchema(
+                "ALTER TABLE ADD INDEX / FULLTEXT / SPATIAL: unsupported in v0.1".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Remove a CHECK constraint by name. Other constraint kinds (UNIQUE
+/// / PRIMARY KEY / FOREIGN KEY) match by name too — drop is structural
+/// catalog cleanup, not the backfill-flavoured ADD path — so we
+/// support drop for all of them.
+async fn drop_constraint(
+    catalog: &Arc<dyn Catalog>,
+    tenant: &basin_common::TenantId,
+    table: &TableName,
+    name: &str,
+    if_exists: bool,
+) -> Result<()> {
+    let meta = catalog.load_table(tenant, table).await?;
+    let mut checks = meta.check_constraints.clone();
+    let mut foreign_keys = meta.foreign_keys.clone();
+    let mut uniques = meta.unique_constraints.clone();
+    let n_before =
+        checks.len() + foreign_keys.len() + uniques.len() + usize::from(!meta.pk_columns.is_empty());
+    checks.retain(|c| !c.name.eq_ignore_ascii_case(name));
+    foreign_keys.retain(|f| !f.name.eq_ignore_ascii_case(name));
+    uniques.retain(|u| !u.name.eq_ignore_ascii_case(name));
+    let pk_columns = if meta.pk_columns.is_empty() {
+        Vec::new()
+    } else {
+        // PK constraint name is conventionally `<table>_pkey`; drop the
+        // whole PK if the name matches.
+        let pk_name = format!("{table}_pkey");
+        if pk_name.eq_ignore_ascii_case(name) {
+            Vec::new()
+        } else {
+            meta.pk_columns.clone()
+        }
+    };
+    let n_after = checks.len()
+        + foreign_keys.len()
+        + uniques.len()
+        + usize::from(!pk_columns.is_empty());
+    if n_before == n_after {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(BasinError::InvalidSchema(format!(
+            "ALTER TABLE {table}: constraint {name:?} does not exist"
+        )));
+    }
+    catalog
+        .set_table_constraints(tenant, table, pk_columns, checks, foreign_keys)
+        .await?;
+    if uniques.len() != meta.unique_constraints.len() {
+        catalog
+            .set_unique_constraints(tenant, table, uniques)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Append one new column to the table's Arrow schema and persist the
@@ -469,9 +946,70 @@ fn parse_eq_int(rest: &str, what: &str) -> Result<i64> {
         ))
     })?;
     let val_str = after_eq.trim();
+    // Accept either a bare integer (raw second count) or a quoted
+    // duration literal such as `'7d'`, `'12h'`, `'30m'`, `'45s'`. The
+    // latter shape is what every PG-compat migration tool emits for
+    // `cold_after = '7d'` and similar.
+    if let Some(inner) = val_str.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return parse_duration_to_seconds(inner, what);
+    }
+    if let Some(inner) = val_str.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return parse_duration_to_seconds(inner, what);
+    }
     val_str.parse::<i64>().map_err(|e| {
         BasinError::InvalidSchema(format!(
             "ALTER TABLE … SET {what}: expected integer, got {val_str:?} ({e})"
+        ))
+    })
+}
+
+/// Hand-rolled duration parser. Accepts `<int><unit>` where unit is one
+/// of `d` (days), `h` (hours), `m` (minutes), `s` (seconds). Returns the
+/// equivalent total seconds. Also accepts a bare integer (treated as
+/// seconds) so a numeric value inside quotes still parses.
+fn parse_duration_to_seconds(s: &str, what: &str) -> Result<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "ALTER TABLE … SET {what}: empty duration"
+        )));
+    }
+    // Split numeric prefix from unit suffix.
+    let mut end = 0usize;
+    for (i, c) in s.char_indices() {
+        if c.is_ascii_digit() || (i == 0 && c == '-') {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return Err(BasinError::InvalidSchema(format!(
+            "ALTER TABLE … SET {what}: duration {s:?} has no numeric part"
+        )));
+    }
+    let num: i64 = s[..end].parse().map_err(|e| {
+        BasinError::InvalidSchema(format!(
+            "ALTER TABLE … SET {what}: duration {s:?} number part: {e}"
+        ))
+    })?;
+    let unit = s[end..].trim();
+    let mul: i64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
+        "d" | "day" | "days" => 86_400,
+        "w" | "wk" | "wks" | "week" | "weeks" => 7 * 86_400,
+        other => {
+            return Err(BasinError::InvalidSchema(format!(
+                "ALTER TABLE … SET {what}: unknown duration unit {other:?}; \
+                 use s/m/h/d/w"
+            )));
+        }
+    };
+    num.checked_mul(mul).ok_or_else(|| {
+        BasinError::InvalidSchema(format!(
+            "ALTER TABLE … SET {what}: duration {s:?} overflows i64 seconds"
         ))
     })
 }
