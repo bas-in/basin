@@ -586,6 +586,7 @@ mod dml_mutate;
 mod enum_ordinal;
 mod events;
 mod executor;
+mod explain;
 mod fast_select;
 mod function_ddl;
 mod generated_cols;

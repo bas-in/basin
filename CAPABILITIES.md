@@ -37,6 +37,11 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `INSERT … VALUES` (single + multi-row) | ✅ | string-quoted vector / JSONB / UUID literals supported |
 | `SELECT` with `WHERE` (single table) | ✅ | DataFusion-planned; predicate pushdown to Parquet |
 | `SHOW TABLES` | ✅ | per-tenant scoped |
+| `EXPLAIN <stmt>` | ✅ | returns DataFusion logical plan as a PG-shaped `QUERY PLAN` column (one row per plan node). Tested by `tests/integration/tests/explain.rs`. |
+| `EXPLAIN ANALYZE <stmt>` | ✅ | executes the inner query and collects runtime statistics; plan + timing returned in `QUERY PLAN` rows. |
+| `EXPLAIN VERBOSE <stmt>` | ✅ | verbose logical plan with per-column output schema detail. |
+| `EXPLAIN (FORMAT JSON) <stmt>` | ✅ | single `QUERY PLAN` row containing a JSON array of `{plan_type, plan}` objects — matches PG's `EXPLAIN (FORMAT JSON)` cell shape. |
+| `EXPLAIN (ANALYZE, VERBOSE) <stmt>` | ✅ | combined flags via PG options-list syntax. |
 | `ORDER BY` / `LIMIT` | ✅ | full DataFusion support |
 | Joins (single-shard) | 🛠 | DataFusion handles them; not yet exercised in tests |
 | `UPDATE` / `DELETE` | ✅ | Copy-on-write Iceberg v2. Single-scan partition; `replace_data_files` with optimistic concurrency on both catalog backends; physical deletion of replaced Parquet files. |
