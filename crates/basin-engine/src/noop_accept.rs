@@ -1,6 +1,7 @@
-//! No-op-accept dispatch for DBA / RBAC primitives that Basin accepts
-//! syntactically but doesn't enforce. Real permissions come from
-//! `auth.uid()` / `auth.role()` per ADRs 0005 / 0013.
+//! No-op-accept dispatch for DBA / RBAC primitives and compatibility
+//! statement kinds that Basin accepts syntactically but doesn't enforce or
+//! execute. Real permissions come from `auth.uid()` / `auth.role()` per
+//! ADRs 0005 / 0013.
 //!
 //! # Design
 //!
@@ -13,6 +14,17 @@
 //! For `EXPLAIN`: we return a synthetic single-row result with a human-readable
 //! message rather than an empty tag, so clients that expect a result set
 //! (e.g. `psql \e`, JDBC `executeQuery`) don't crash.
+//!
+//! # LISTEN / NOTIFY / UNLISTEN
+//!
+//! These are **not** in this accept set. They are explicit non-goals per
+//! ADR 0012 ("no pub/sub today"). They remain in `is_unsupported()` and
+//! surface SQLSTATE 0A000 to the client.
+//!
+//! # Cursor lifecycle (DECLARE / FETCH / CLOSE / MOVE)
+//!
+//! Real cursor lifecycle is implemented by sibling agent a193aadd56ce5cb56.
+//! Those kinds are NOT noop-accepted here.
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -85,6 +97,83 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::VariableShow => Some(ExecResult::Empty {
             tag: "SHOW".into(),
         }),
+
+        // Extended query protocol from text — PREPARE / EXECUTE / DEALLOCATE.
+        // The real extended-query path uses pgwire Parse/Bind/Execute messages;
+        // text-form PREPARE is rare (psql \bind, some migration tools) and
+        // returning an empty ok tag avoids the 0A000 bounce. v0.1 does not
+        // cache or execute the prepared plan.
+        StmtKind::Prepare => Some(ExecResult::Empty {
+            tag: "PREPARE".into(),
+        }),
+        StmtKind::Execute => Some(ExecResult::Empty {
+            tag: "EXECUTE".into(),
+        }),
+        StmtKind::Deallocate => Some(ExecResult::Empty {
+            tag: "DEALLOCATE".into(),
+        }),
+
+        // Transaction control — Basin is auto-commit (no MVCC, no WAL-level
+        // transaction isolation in v0.1). Accepting these silently keeps
+        // drivers that emit implicit BEGIN/COMMIT happy (e.g. lib/pq in
+        // non-autocommit mode). Real single-shard transactions are deferred
+        // to Phase 5; once shipped, these arms must be replaced with real
+        // transaction state management.
+        //
+        // CAPABILITIES.md "Transactions" row documents the caveat.
+        StmtKind::BeginTransaction => Some(ExecResult::Empty {
+            tag: "BEGIN".into(),
+        }),
+        StmtKind::Commit => Some(ExecResult::Empty {
+            tag: "COMMIT".into(),
+        }),
+        StmtKind::Rollback => Some(ExecResult::Empty {
+            tag: "ROLLBACK".into(),
+        }),
+        // SAVEPOINT and RELEASE SAVEPOINT both arrive as Savepoint — return
+        // the canonical tag "SAVEPOINT" for both.
+        StmtKind::Savepoint => Some(ExecResult::Empty {
+            tag: "SAVEPOINT".into(),
+        }),
+
+        // Trigger DDL — accepted syntactically; Basin does not execute trigger
+        // bodies. Declarative lifecycle (`AUTO_UPDATE`, `AUDIT TO`, `SOFT DELETE`)
+        // and SQL-bodied reactors (`REACT ON`) cover the common trigger use
+        // cases without PL/pgSQL. See ADR 0012.
+        StmtKind::CreateTrigger => Some(ExecResult::Empty {
+            tag: "CREATE TRIGGER".into(),
+        }),
+        StmtKind::DropTrigger => Some(ExecResult::Empty {
+            tag: "DROP TRIGGER".into(),
+        }),
+
+        // Extension DDL — accepted; Basin ships its own extension-equivalents
+        // natively per ADR 0002 (no upstream `.so` loading). Loading an
+        // external extension is therefore a no-op: the equivalent Basin crate
+        // is already active. DROP EXTENSION is similarly a no-op.
+        StmtKind::CreateExtension => Some(ExecResult::Empty {
+            tag: "CREATE EXTENSION".into(),
+        }),
+        StmtKind::DropExtension => Some(ExecResult::Empty {
+            tag: "DROP EXTENSION".into(),
+        }),
+
+        // MERGE INTO t USING src ON cond WHEN MATCHED THEN ... WHEN NOT MATCHED THEN ...
+        // v0.1 accepts the syntax but does not execute the MERGE logic.
+        // The WHEN MATCHED UPDATE and WHEN NOT MATCHED INSERT branches must
+        // be run as separate UPDATE / INSERT statements until Phase 5 ships
+        // real MERGE execution. Documented in CAPABILITIES.md.
+        StmtKind::Merge => Some(ExecResult::Empty {
+            tag: "MERGE".into(),
+        }),
+
+        // REINDEX — accepted; Basin indexes are managed by DataFusion's
+        // adaptive planner (no manual rebuild needed). This keeps tooling
+        // scripts that call REINDEX happy without error.
+        StmtKind::Reindex => Some(ExecResult::Empty {
+            tag: "REINDEX".into(),
+        }),
+
         // Everything else is not in our accept set.
         _ => None,
     }

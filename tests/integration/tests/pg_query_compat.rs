@@ -193,6 +193,10 @@ fn assert_rejected(sql: &str) {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// LISTEN / NOTIFY / UNLISTEN — remain in is_unsupported(); rejected with 0A000
+// ──────────────────────────────────────────────────────────────────────────────
+
 #[test]
 fn listen_is_rejected() {
     assert_rejected("LISTEN ch1");
@@ -204,60 +208,123 @@ fn notify_is_rejected() {
 }
 
 #[test]
-fn prepare_is_rejected() {
-    assert_rejected("PREPARE stmt AS SELECT 1");
+fn unlisten_is_rejected() {
+    assert_rejected("UNLISTEN ch1");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Noop-accepted statements — reject_unsupported passes them through (Ok)
+// because they are intercepted by noop_accept::try_accept_as_noop before
+// reject_unsupported runs in the executor. Testing here proves the pg_ast
+// classification is correct; end-to-end acceptance is proven in
+// tests/integration/tests/noop_accept.rs.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn prepare_is_noop_accepted() {
+    // Previously rejected with 0A000; now in noop_accept set.
+    assert_allowed("PREPARE stmt AS SELECT 1");
 }
 
 #[test]
-fn declare_cursor_is_rejected() {
-    assert_rejected("DECLARE c CURSOR FOR SELECT 1");
+fn execute_is_noop_accepted() {
+    assert_allowed("EXECUTE stmt");
 }
 
 #[test]
-fn lock_table_is_rejected() {
-    assert_rejected("LOCK TABLE t");
+fn deallocate_is_noop_accepted() {
+    assert_allowed("DEALLOCATE stmt");
 }
 
 #[test]
-fn vacuum_is_rejected() {
-    assert_rejected("VACUUM");
+fn begin_is_noop_accepted() {
+    // Basin is auto-commit; BEGIN is silently accepted.
+    assert_allowed("BEGIN");
 }
 
 #[test]
-fn analyze_is_rejected() {
-    assert_rejected("ANALYZE");
+fn commit_is_noop_accepted() {
+    assert_allowed("COMMIT");
 }
 
 #[test]
-fn cluster_is_rejected() {
-    assert_rejected("CLUSTER t");
+fn rollback_is_noop_accepted() {
+    assert_allowed("ROLLBACK");
 }
 
 #[test]
-fn create_extension_is_rejected() {
-    assert_rejected("CREATE EXTENSION pgcrypto");
+fn savepoint_is_noop_accepted() {
+    assert_allowed("SAVEPOINT sp1");
 }
 
 #[test]
-fn begin_is_rejected() {
-    assert_rejected("BEGIN");
-}
-
-#[test]
-fn commit_is_rejected() {
-    assert_rejected("COMMIT");
-}
-
-#[test]
-fn rollback_is_rejected() {
-    assert_rejected("ROLLBACK");
-}
-
-#[test]
-fn create_trigger_is_rejected() {
-    assert_rejected(
+fn create_trigger_is_noop_accepted() {
+    // Basin does not execute trigger bodies; syntactic accept keeps tooling
+    // scripts from bouncing with 0A000. See ADR 0012.
+    assert_allowed(
         "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
     );
+}
+
+#[test]
+fn drop_trigger_is_noop_accepted() {
+    assert_allowed("DROP TRIGGER trg ON t");
+}
+
+#[test]
+fn create_extension_is_noop_accepted() {
+    // Basin ships its own extension-equivalents natively (ADR 0002); loading
+    // an external extension is a no-op.
+    assert_allowed("CREATE EXTENSION pgcrypto");
+}
+
+#[test]
+fn drop_extension_is_noop_accepted() {
+    assert_allowed("DROP EXTENSION pgcrypto");
+}
+
+#[test]
+fn lock_table_is_noop_accepted() {
+    // Accepted by noop_accept since sibling agent a0f45b8b.
+    assert_allowed("LOCK TABLE t");
+}
+
+#[test]
+fn vacuum_is_noop_accepted() {
+    assert_allowed("VACUUM");
+}
+
+#[test]
+fn analyze_is_noop_accepted() {
+    assert_allowed("ANALYZE");
+}
+
+#[test]
+fn cluster_is_noop_accepted() {
+    assert_allowed("CLUSTER t");
+}
+
+#[test]
+fn merge_is_noop_accepted() {
+    // MERGE INTO … USING … WHEN MATCHED / NOT MATCHED accepted in v0.1;
+    // not executed (see noop_accept.rs and CAPABILITIES.md).
+    assert_allowed(
+        "MERGE INTO t USING src ON t.id = src.id \
+         WHEN MATCHED THEN UPDATE SET val = src.val \
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (src.id, src.val)",
+    );
+}
+
+#[test]
+fn reindex_is_noop_accepted() {
+    assert_allowed("REINDEX TABLE t");
+}
+
+#[test]
+fn declare_cursor_is_noop_accepted() {
+    // Cursor lifecycle is handled by sibling agent a193aadd (real impl) or
+    // falls through. Either way it is no longer in is_unsupported().
+    assert_allowed("DECLARE c CURSOR FOR SELECT 1");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -47,7 +47,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `SELECT … AS OF SNAPSHOT n` / `AS OF TIMESTAMP ts` (time-travel) | ◻️ | Routing design lives in [`docs/architecture.md`](./docs/architecture.md) §7 — any `AS OF` clause forces the analytical path because shard owners only hold the current state. Parser support deferred to `basin-analytical` v0.2. |
 | `CREATE POLICY` (RLS) | ✅ | predicate injection at logical-plan layer; cross-tenant leak invariant verified |
 | `information_schema` + `pg_catalog` views (17) | ✅ | Phase 5.11.M complete. Shipped: `information_schema.tables`/`columns`/`routines`/`views`/`schemata`/`table_constraints`/`key_column_usage`/`referential_constraints` + `pg_catalog.pg_class`/`pg_attribute`/`pg_namespace`/`pg_proc`/`pg_type`/`pg_constraint`/`pg_index`/`pg_depend`/`pg_authid`. PostgREST / pgAdmin / Prisma / Sequelize / SQLAlchemy startup-query compat verified by `tests/integration/tests/postgrest_pgadmin_compat.rs` and `tests/integration/tests/orm_compat.rs`. `pg_constraint` / `table_constraints` / `key_column_usage` / `referential_constraints` populate with real PK/CHECK/FK rows from the constraint-enforcement work. `pg_depend` surfaces continuous-matview → source-table edges + function → arg/return type edges. `pg_authid` surfaces the calling tenant as a single role. `pg_index` populates when 5.7 B1 secondary indexes ship. |
-| Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ◻️ | single-shard only when shipped. Drivers that implicitly send `BEGIN TRANSACTION READ WRITE` around prepared-statement bulk inserts (e.g. `lib/pq` with `tx.PrepareContext` → `stmt.ExecContext` loop) get rejected with `unsupported in PoC: BEGIN TRANSACTION READ WRITE`. Rewrite as multi-row `INSERT … VALUES (a,b),(c,d),…` until Phase 5. |
+| Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | 🛠 | Basin is auto-commit in v0.1 (no MVCC, no WAL-level transaction isolation). `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` are now **syntactically accepted** (return the expected PG command tag, no error) so drivers that emit implicit transaction wrappers no longer bounce with SQLSTATE 0A000. **No isolation is provided**: mutations within a "transaction" apply immediately. Real single-shard transactions are Phase 5 work. |
 | `DROP TABLE [IF EXISTS]` | ◻️ | rejected with `unsupported in PoC: DROP TABLE …` (SQLSTATE XX000). DDL drop ships in Phase 5 alongside transactions. Use the dashboard's Tables editor (`/v1/projects/:ref/tables/:name` DELETE on the cloud) until then. |
 | `CREATE TABLE IF NOT EXISTS` | 🛠 | the `IF NOT EXISTS` clause is parsed but **not honoured**; basin returns `catalog error: table … already exists` when the table exists. Wrap in a per-table existence check or swallow the "already exists" error script-side. Idempotent CREATE ships in Phase 5. |
 | `INSERT … ON CONFLICT DO {NOTHING,UPDATE}` | 🛠 | clause is parsed but **silently ignored** in v0.1 — the INSERT runs as if the ON CONFLICT clause weren't there. Real conflict handling lands when secondary indexes ship (Phase 5.7 B1). |
@@ -61,6 +61,47 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | User-defined functions (`CREATE FUNCTION … LANGUAGE sql`) | 🛠 | **Reframed away from PL/pgSQL per [ADR 0012](./docs/decisions/0012-change-event-primitive.md).** Basin's path is `LANGUAGE sql` functions, planning-time inlined into the call site (same trick PG uses for `LANGUAGE sql`). Catalog API (`Catalog::register_sql_function`) + planner inliner ✅ shipped (Phase 5.11.D foundations); `CREATE FUNCTION` SQL surface ✅ shipped (5.11.D). `RETURNS TABLE(col1 type1, …)` ✅ shipped (5.11.E) — table-position calls are inlined as derived sub-queries with `LATERAL` emitted when call-site args reference outer columns. `CALL` procedures (5.11.F) extend the same machinery. Out of scope: PL/pgSQL with `IF`/`LOOP`/variables, `EXCEPTION` blocks, cursor-driven loops; PG `RETURNS SETOF type` (single-column SRF; deferred to v0.2 if it surfaces). |
 | `CREATE PROCEDURE` / `CALL` / `DROP PROCEDURE` | ✅ | Phase 5.11.F. `LANGUAGE sql` only (`LANGUAGE plpgsql` rejected with SQLSTATE 0A000 per ADR 0012). Multi-statement body — body statements drawn from `INSERT` / `UPDATE` / `DELETE` / `SELECT` / `CREATE TABLE` / `DROP TABLE`; nested `CALL` rejected at registration in v0.1. Call-site arguments substituted into the body before each statement runs through the standard engine pipeline (RLS rewrites, sequence rewrite, function inliner all apply). Sequential best-effort execution: a mid-procedure failure leaves prior statements committed — single-shard transactions land in Phase 5 and will tighten this. `CREATE PROCEDURE` recognised via textual pre-screen (sqlparser 0.52's native `Statement::CreateProcedure` parses only T-SQL `AS BEGIN … END`); `CALL` and `DROP PROCEDURE` use sqlparser's native AST nodes. |
 | PG built-in functions (string, date/time, math, JSONB) | ✅ | Phase 5.11.A shipped via `basin-engine`'s ScalarUDF registry. Pre-existing: `digest`, `encode`/`decode`, `crypt`, `gen_random_uuid`, `gen_salt`, vector ops. New in 5.11.A: `now`, `current_timestamp`, `current_date`, `date_trunc`, `age` (returns native `interval`), `extract` (sub-second precision for `second` via Float64), `to_char` / `to_timestamp` (PG format strings, not chrono), `lower`/`upper`/`substring`/`trim`/`length`/`position`/`replace`/`regexp_replace`/`||`, `abs`/`ceil`/`floor`/`round`/`power` (always Float8)/`sqrt`/`mod`/`%`, `coalesce`/`nullif`/`greatest`/`least`/`is distinct from`. JSONB operators (`->`/`->>`/`#>`/`@>` etc) via DataFusion's JSON support. 6 PG-divergence cases reconciled; one residual flagged: Float64 vs PG `numeric` for sub-ULP `extract(second)` (closes when the Decimal128 arrow-bridge ships). |
+
+## Syntactic-accept-only statements
+
+Statements in this table are parsed with the real Postgres parser (libpg_query,
+ADR 0014 Phase 1) and **accepted syntactically** — Basin returns the expected
+Postgres command-complete tag without executing the underlying operation. This
+keeps connection-time tooling and admin scripts from bouncing with SQLSTATE
+0A000. Actual enforcement / execution is noted per row.
+
+| Statement form | Command tag returned | Caveat / when real execution ships |
+|---|---|---|
+| `VACUUM` | `VACUUM` | Basin uses DataFusion's adaptive planner; no manual maintenance needed. |
+| `ANALYZE [table]` | `ANALYZE` | Same as VACUUM — no-op. |
+| `CLUSTER [table]` | `CLUSTER` | Physical clustering is via `ALTER TABLE … CLUSTER BY`; CLUSTER SQL form is a no-op. |
+| `LOCK TABLE … [IN … MODE]` | `LOCK TABLE` | Basin is optimistic-concurrency; row-level locks not implemented in v0.1. |
+| `COMMENT ON … IS …` | `COMMENT` | No catalog mutation; annotation-only. |
+| `EXPLAIN [ANALYZE] …` | rows | Returns a synthetic plan row so clients expecting a result set don't error. No DataFusion plan formatter in v0.1. |
+| `CREATE ROLE` / `DROP ROLE` / `ALTER ROLE` | `CREATE ROLE` / `DROP ROLE` / `ALTER ROLE` | Real auth from `auth.uid()` / `auth.role()` per ADRs 0005 / 0013. |
+| `GRANT … TO …` | `GRANT` | RBAC not enforced; real access control via RLS policies. |
+| `REVOKE … FROM …` | `REVOKE` | Same as GRANT. |
+| `SET [LOCAL] name = …` | `SET` | Session variable not persisted; variables used by the engine read from connection claims or env. |
+| `SHOW name` | `SHOW` | Returns empty tag; not backed by a real GUC store in v0.1. |
+| `PREPARE name AS …` | `PREPARE` | Text-form PREPARE. Real prepared-statement path uses pgwire Parse/Bind/Execute. v0.1 does not cache or execute the plan. |
+| `EXECUTE name` | `EXECUTE` | Text-form EXECUTE; same caveat as PREPARE. |
+| `DEALLOCATE [ALL \| name]` | `DEALLOCATE` | No-op for text-form prepared statements. |
+| `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` | `BEGIN` | Basin is auto-commit; no isolation provided. Real single-shard transactions are Phase 5. |
+| `COMMIT` | `COMMIT` | See BEGIN. |
+| `ROLLBACK` | `ROLLBACK` | See BEGIN. Mutations within the "transaction" already applied; no rollback occurs. |
+| `SAVEPOINT name` / `RELEASE SAVEPOINT name` | `SAVEPOINT` | See BEGIN. |
+| `ROLLBACK TO SAVEPOINT name` | `ROLLBACK` | See BEGIN; data already committed. |
+| `CREATE TRIGGER … EXECUTE FUNCTION …` | `CREATE TRIGGER` | Basin does not execute PL/pgSQL trigger bodies. Use declarative lifecycle columns (`AUTO_UPDATE`, `AUDIT TO`, `SOFT DELETE`) or SQL-bodied reactors (`REACT ON`) instead — see ADR 0012. |
+| `DROP TRIGGER name ON table` | `DROP TRIGGER` | No-op (trigger was never registered). |
+| `CREATE EXTENSION [IF NOT EXISTS] name` | `CREATE EXTENSION` | Basin ships extension-equivalents natively (ADR 0002): pgcrypto → built-in UDFs, uuid-ossp → native UUID, pg_vector → native vector(N), PostGIS subset → basin-geo, pg_trgm → basin-trgm. Loading an external `.so` is structurally blocked. |
+| `DROP EXTENSION name` | `DROP EXTENSION` | No-op; Basin equivalents are always active. |
+| `MERGE INTO t USING src ON … WHEN MATCHED … WHEN NOT MATCHED …` | `MERGE` | Accepted syntactically in v0.1; MERGE logic is **not executed**. Run the WHEN MATCHED UPDATE and WHEN NOT MATCHED INSERT branches as separate UPDATE / INSERT statements until Phase 5. |
+| `REINDEX { TABLE \| INDEX \| SCHEMA \| DATABASE } …` | `REINDEX` | Basin indexes are managed by DataFusion's adaptive planner; no manual rebuild needed. |
+
+**Not** in this accept set (still rejected with SQLSTATE 0A000):
+
+- `LISTEN channel` / `NOTIFY channel` / `UNLISTEN channel` — explicit non-goals per ADR 0012. The pub/sub wire protocol is not on the roadmap.
+- Cursor lifecycle (`DECLARE CURSOR` / `FETCH` / `CLOSE`) — real implementation shipped by sibling agent (a193aadd). If that agent has not landed, these remain 0A000.
 
 ## Types
 

@@ -154,6 +154,10 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 # Regex engine used by regexp_match / regexp_split_to_array UDFs in basin-engine.
 regex = "1"
+# libpg_query bindings — real Postgres 15 parser used by ADR 0014 Phase 1.
+# Pinned to 6.x; the 5→6 bump adds PG15 grammar (MERGE, JSONB subscript,
+# etc.) without changing the protobuf API shape we depend on.
+pg_query = "6"
 # Test-config file parsing for tests/integration/src/test_config.rs.
 # Tiny, well-maintained, default features off to keep build minimal.
 toml = { version = "0.8", default-features = false, features = ["parse"] }

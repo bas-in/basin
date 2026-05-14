@@ -50,6 +50,9 @@ regex.workspace = true
 # `webhook_registry` module after the cycle-fix moved registry types out
 # of basin-webhooks.
 bitflags = "2"
+# ADR 0014 Phase 1: libpg_query (the real Postgres 15 parser) used for
+# statement-kind classification and the noop-accept intercept layer.
+pg_query.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
