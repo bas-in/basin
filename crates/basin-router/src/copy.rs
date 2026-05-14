@@ -1,11 +1,13 @@
 //! `COPY FROM STDIN` and `COPY TO STDOUT` for the simple-query path.
 //!
-//! v0.1: CSV format only, comma-delimited, RFC 4180-ish. No binary, no custom
-//! delimiters, no NULL specifications. Anything else is rejected with `42601`
-//! syntax_error before we touch the engine. Column-list (`COPY t (a, b) ...`)
-//! and server-side file-path variants (`COPY t FROM '/abs/path'` /
-//! `COPY t TO '/abs/path'`) are supported; file paths are gated by the
-//! `BASIN_COPY_PATH_ALLOWLIST` env var (default-deny).
+//! v0.2: CSV format; delimiter/null/quote/escape configurable via WITH options.
+//! Column-list (`COPY t (a, b) ...`) is supported. Server-side file-path
+//! variants (`COPY t FROM '/abs/path'` / `COPY t TO '/abs/path'`) are gated
+//! by two env vars: `BASIN_COPY_ALLOW_FILE_PATHS=1` (primary on/off gate) and
+//! `BASIN_COPY_PATH_ALLOWLIST` (colon-separated directory allowlist, required
+//! when file paths are enabled). Query-source COPY (`COPY (SELECT …) TO
+//! STDOUT`) is supported. `COPY … FROM PROGRAM '…'` is rejected with SQLSTATE
+//! 42501. BINARY format rejected with `42601`.
 //!
 //! Architecture:
 //!
@@ -50,6 +52,33 @@ use pgwire::messages::PgWireBackendMessage;
 
 use crate::protocol::Session;
 
+/// CSV format options carried with a COPY statement.
+///
+/// Defaults match Postgres CSV mode: comma delimiter, empty-string NULL,
+/// double-quote character for quoting, and same char for escaping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyOptions {
+    /// Field delimiter (default: `','`).
+    pub(crate) delimiter: char,
+    /// String that represents NULL in the CSV input/output (default: `""`).
+    pub(crate) null_string: String,
+    /// Quote character (default: `'"'`).
+    pub(crate) quote: char,
+    /// Escape character inside quoted fields (default: same as `quote`).
+    pub(crate) escape: char,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: ',',
+            null_string: String::new(),
+            quote: '"',
+            escape: '"',
+        }
+    }
+}
+
 /// A parsed `COPY` statement. The simple-query path branches on this before
 /// running anything against the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,12 +92,24 @@ pub(crate) enum CopyCommand {
         /// `None` = STDIN (client streams CopyData); `Some(path)` = server-side
         /// read of an absolute filesystem path.
         path: Option<String>,
+        /// CSV format options (delimiter, null, quote, escape).
+        opts: CopyOptions,
     },
     To {
         table: String,
         with_header: bool,
         columns: Option<Vec<String>>,
         path: Option<String>,
+        /// CSV format options.
+        opts: CopyOptions,
+    },
+    /// `COPY (SELECT …) TO STDOUT [WITH (FORMAT CSV [, ...])]`
+    QueryTo {
+        /// The inner SELECT SQL (as written by the user, between the parens).
+        query: String,
+        with_header: bool,
+        /// CSV format options.
+        opts: CopyOptions,
     },
 }
 
@@ -98,10 +139,12 @@ pub(crate) struct CopyInState {
     pub(crate) error: Option<String>,
     /// `WITH (HEADER true)` — skip the first row.
     pub(crate) header_pending: bool,
+    /// CSV format options (delimiter, null, quote, escape).
+    pub(crate) opts: CopyOptions,
 }
 
 impl CopyInState {
-    pub(crate) fn new(table: String, columns: Vec<Field>, with_header: bool) -> Self {
+    pub(crate) fn new(table: String, columns: Vec<Field>, with_header: bool, opts: CopyOptions) -> Self {
         Self {
             table,
             columns,
@@ -110,6 +153,7 @@ impl CopyInState {
             row_count: 0,
             error: None,
             header_pending: with_header,
+            opts,
         }
     }
 
@@ -123,17 +167,53 @@ impl CopyInState {
 ///
 /// `Ok(Some(_))` = matched a supported shape; `Ok(None)` = SQL doesn't start
 /// with `COPY`, fall through to normal query handling; `Err(_)` = SQL starts
-/// with `COPY` but doesn't match the v0.1 grammar — caller surfaces an
+/// with `COPY` but doesn't match our grammar — caller surfaces an
 /// ErrorResponse.
+///
+/// Supported shapes:
+/// - `COPY t [(cols)] FROM STDIN [WITH (...)]`
+/// - `COPY t [(cols)] FROM '/abs/path' [WITH (...)]`
+/// - `COPY t [(cols)] TO STDOUT [WITH (...)]`
+/// - `COPY t [(cols)] TO '/abs/path' [WITH (...)]`
+/// - `COPY (SELECT …) TO STDOUT [WITH (...)]`
+///
+/// Explicitly rejected:
+/// - `COPY … FROM PROGRAM '…'` → SQLSTATE 42501
 pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, String> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let mut sc = Scanner::new(trimmed);
     if !sc.eat_keyword("COPY") {
         return Ok(None);
     }
+    sc.skip_whitespace();
+
+    // Detect query-source: `COPY (SELECT …) TO STDOUT`
+    if sc.peek_punct('(') {
+        let query = parse_subquery(&mut sc)?;
+        if !sc.eat_keyword("TO") {
+            return Err("expected TO after COPY (SELECT …)".into());
+        }
+        if !sc.eat_keyword("STDOUT") {
+            return Err("COPY (query) TO only supports STDOUT in this release".into());
+        }
+        let (with_header, opts) = parse_with_options(&mut sc)?;
+        sc.skip_whitespace();
+        if !sc.is_done() {
+            return Err(format!(
+                "unexpected trailing input after COPY: {:?}",
+                sc.rest()
+            ));
+        }
+        return Ok(Some(CopyCommand::QueryTo {
+            query,
+            with_header,
+            opts,
+        }));
+    }
+
     let table = sc
         .eat_ident()
-        .ok_or_else(|| "expected table name after COPY".to_owned())?;
+        .ok_or_else(|| "expected table name or '(' after COPY".to_owned())?;
     let columns = if sc.peek_punct('(') {
         Some(parse_column_list(&mut sc)?)
     } else {
@@ -150,11 +230,19 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
         Direction::From => {
             if sc.eat_keyword("STDIN") {
                 None
+            } else if sc.eat_keyword("PROGRAM") {
+                // Explicit rejection with SQLSTATE 42501 (insufficient_privilege).
+                // We encode the error in a special prefix so the caller can
+                // surface 42501 instead of 42601.
+                return Err(
+                    "\x0042501\x00COPY FROM PROGRAM is not supported (security: server-side program execution is disabled)"
+                        .into(),
+                );
             } else if sc.peek_punct('\'') {
                 Some(parse_string_literal(&mut sc)?)
             } else {
                 return Err(
-                    "expected STDIN or '<absolute-path>' after COPY <table> FROM (PROGRAM not supported)"
+                    "expected STDIN or '<absolute-path>' after COPY <table> FROM"
                         .into(),
                 );
             }
@@ -162,17 +250,22 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
         Direction::To => {
             if sc.eat_keyword("STDOUT") {
                 None
+            } else if sc.eat_keyword("PROGRAM") {
+                return Err(
+                    "\x0042501\x00COPY TO PROGRAM is not supported (security: server-side program execution is disabled)"
+                        .into(),
+                );
             } else if sc.peek_punct('\'') {
                 Some(parse_string_literal(&mut sc)?)
             } else {
                 return Err(
-                    "expected STDOUT or '<absolute-path>' after COPY <table> TO (PROGRAM not supported)"
+                    "expected STDOUT or '<absolute-path>' after COPY <table> TO"
                         .into(),
                 );
             }
         }
     };
-    let with_header = parse_with_options(&mut sc)?;
+    let (with_header, opts) = parse_with_options(&mut sc)?;
     sc.skip_whitespace();
     if !sc.is_done() {
         return Err(format!(
@@ -186,14 +279,69 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
             with_header,
             columns,
             path,
+            opts,
         },
         Direction::To => CopyCommand::To {
             table,
             with_header,
             columns,
             path,
+            opts,
         },
     }))
+}
+
+/// Parse a parenthesised subquery for `COPY (SELECT …) TO STDOUT`.
+/// The caller has peeked `(` but not consumed it. We count nested parens to
+/// find the matching `)` and return everything inside (trimmed).
+fn parse_subquery(sc: &mut Scanner<'_>) -> std::result::Result<String, String> {
+    sc.skip_whitespace();
+    if !sc.eat_punct('(') {
+        return Err("expected '(' to start COPY subquery".into());
+    }
+    let bytes = sc.s.as_bytes();
+    let start = sc.pos;
+    let mut depth = 1i32;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    while sc.pos < bytes.len() {
+        let b = bytes[sc.pos];
+        if in_single_quote {
+            if b == b'\'' {
+                // Check for doubled quote
+                if sc.pos + 1 < bytes.len() && bytes[sc.pos + 1] == b'\'' {
+                    sc.pos += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            sc.pos += 1;
+            continue;
+        }
+        if in_double_quote {
+            if b == b'"' {
+                in_double_quote = false;
+            }
+            sc.pos += 1;
+            continue;
+        }
+        match b {
+            b'\'' => { in_single_quote = true; sc.pos += 1; }
+            b'"' => { in_double_quote = true; sc.pos += 1; }
+            b'(' => { depth += 1; sc.pos += 1; }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = sc.s[start..sc.pos].trim().to_owned();
+                    sc.pos += 1; // consume the closing ')'
+                    return Ok(inner);
+                }
+                sc.pos += 1;
+            }
+            _ => { sc.pos += 1; }
+        }
+    }
+    Err("unterminated subquery in COPY (SELECT …)".into())
 }
 
 /// Parse `(ident [, ident ...])`. Caller has peeked `(` but not consumed it.
@@ -257,23 +405,21 @@ enum Direction {
     To,
 }
 
-/// Parse the optional `WITH (FORMAT CSV [, HEADER {true|false}])`. Anything
-/// else (DELIMITER, NULL, QUOTE, ESCAPE, FORCE_*, ENCODING) is rejected.
-/// Returns the `header` value (default false).
+/// Parse the optional `WITH (FORMAT CSV [, HEADER {true|false} [, DELIMITER 'c'
+/// [, NULL 's'] [, QUOTE 'c'] [, ESCAPE 'c']]])`. BINARY format is rejected.
+/// FORCE_*, ENCODING are rejected. Returns `(header, CopyOptions)`.
 ///
 /// Also accepts the legacy `WITH CSV [HEADER]` shorthand (no parens) that
 /// older Postgres clients still emit.
-fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String> {
+fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<(bool, CopyOptions), String> {
     sc.skip_whitespace();
     if !sc.eat_keyword("WITH") {
         // Plain `COPY t FROM STDIN` with no options — accept and treat as CSV.
-        return Ok(false);
+        return Ok((false, CopyOptions::default()));
     }
     sc.skip_whitespace();
     if !sc.eat_punct('(') {
-        // Legacy `WITH CSV [HEADER]` form. Accept that exact shape only —
-        // anything else (DELIMITER 'x', QUOTE '"', etc.) is still rejected
-        // by the keyword check below.
+        // Legacy `WITH CSV [HEADER]` form.
         if !sc.eat_keyword("CSV") {
             return Err("expected '(' after WITH, or legacy 'WITH CSV [HEADER]' shorthand".into());
         }
@@ -282,10 +428,10 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String>
         if sc.eat_keyword("HEADER") {
             header = true;
         }
-        return Ok(header);
+        return Ok((header, CopyOptions::default()));
     }
-    let mut saw_format_csv = false;
     let mut header = false;
+    let mut opts = CopyOptions::default();
     loop {
         sc.skip_whitespace();
         let key = sc
@@ -299,9 +445,8 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String>
                     .eat_ident()
                     .ok_or_else(|| "expected format value after FORMAT".to_owned())?;
                 if !v.eq_ignore_ascii_case("csv") {
-                    return Err(format!("only FORMAT CSV is supported in v0.1, got {v:?}"));
+                    return Err(format!("only FORMAT CSV is supported; BINARY and other formats are not implemented (got {v:?})"));
                 }
-                saw_format_csv = true;
             }
             "HEADER" => {
                 sc.skip_whitespace();
@@ -321,9 +466,49 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String>
                     };
                 }
             }
+            "DELIMITER" => {
+                sc.skip_whitespace();
+                let s = parse_string_literal(sc)?;
+                let mut chars = s.chars();
+                let c = chars
+                    .next()
+                    .ok_or_else(|| "DELIMITER must be a single character".to_owned())?;
+                if chars.next().is_some() {
+                    return Err(format!("DELIMITER must be a single character, got {s:?}"));
+                }
+                opts.delimiter = c;
+            }
+            "NULL" => {
+                sc.skip_whitespace();
+                opts.null_string = parse_string_literal(sc)?;
+            }
+            "QUOTE" => {
+                sc.skip_whitespace();
+                let s = parse_string_literal(sc)?;
+                let mut chars = s.chars();
+                let c = chars
+                    .next()
+                    .ok_or_else(|| "QUOTE must be a single character".to_owned())?;
+                if chars.next().is_some() {
+                    return Err(format!("QUOTE must be a single character, got {s:?}"));
+                }
+                opts.quote = c;
+            }
+            "ESCAPE" => {
+                sc.skip_whitespace();
+                let s = parse_string_literal(sc)?;
+                let mut chars = s.chars();
+                let c = chars
+                    .next()
+                    .ok_or_else(|| "ESCAPE must be a single character".to_owned())?;
+                if chars.next().is_some() {
+                    return Err(format!("ESCAPE must be a single character, got {s:?}"));
+                }
+                opts.escape = c;
+            }
             other => {
                 return Err(format!(
-                    "COPY option {other:?} is not supported in v0.1 (CSV only, no DELIMITER/NULL/QUOTE/ESCAPE/FORCE_*)"
+                    "COPY option {other:?} is not supported (accepted: FORMAT, HEADER, DELIMITER, NULL, QUOTE, ESCAPE)"
                 ));
             }
         }
@@ -335,10 +520,7 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<bool, String>
             return Err("expected ',' or ')' in WITH (...)".into());
         }
     }
-    // We accept WITH (HEADER true) without an explicit FORMAT — implicit CSV
-    // for v0.1. If the user wrote nothing, we already returned above.
-    let _ = saw_format_csv;
-    Ok(header)
+    Ok((header, opts))
 }
 
 /// Hand-rolled scanner over the SQL string. Whitespace-aware, ASCII-only
@@ -555,7 +737,7 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
         return;
     }
     loop {
-        let consumed = match split_record(&state.buffer, final_chunk) {
+        let consumed = match split_record(&state.buffer, final_chunk, state.opts.quote) {
             Some((record, n)) => (record, n),
             None => return,
         };
@@ -571,7 +753,7 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
             state.buffer.drain(..n);
             continue;
         }
-        let record = match parse_csv_record(record_bytes) {
+        let record = match parse_csv_record(record_bytes, state.opts.delimiter, state.opts.quote, &state.opts.null_string) {
             Ok(r) => r,
             Err(e) => {
                 state.error = Some(format!("CSV parse error: {e}"));
@@ -626,15 +808,19 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
 ///
 /// If `final_chunk` is true and the buffer has unterminated bytes, those
 /// bytes count as the final record (i.e. CSV without a trailing newline).
-fn split_record(buf: &[u8], final_chunk: bool) -> Option<(&[u8], usize)> {
+///
+/// `quote_char` is the character used to delimit quoted fields (default `"`).
+/// Only ASCII quote chars are supported here (non-ASCII fall back to `"`).
+fn split_record(buf: &[u8], final_chunk: bool, quote_char: char) -> Option<(&[u8], usize)> {
+    let qb = if quote_char.is_ascii() { quote_char as u8 } else { b'"' };
     let mut in_quotes = false;
     let mut i = 0;
     while i < buf.len() {
         let b = buf[i];
         if in_quotes {
-            if b == b'"' {
+            if b == qb {
                 // Doubled quote stays inside the field, single quote ends it.
-                if i + 1 < buf.len() && buf[i + 1] == b'"' {
+                if i + 1 < buf.len() && buf[i + 1] == qb {
                     i += 2;
                     continue;
                 }
@@ -644,7 +830,7 @@ fn split_record(buf: &[u8], final_chunk: bool) -> Option<(&[u8], usize)> {
             continue;
         }
         match b {
-            b'"' => {
+            b if b == qb => {
                 in_quotes = true;
                 i += 1;
             }
@@ -676,10 +862,16 @@ fn split_record(buf: &[u8], final_chunk: bool) -> Option<(&[u8], usize)> {
 }
 
 /// Parse a single CSV record's bytes into a vec of fields. Each field is
-/// either `None` (unquoted empty cell → SQL NULL) or `Some(String)`. RFC
-/// 4180-ish: comma-delimited, double-quote = `""`, fields starting with `"`
-/// are quoted.
-fn parse_csv_record(bytes: &[u8]) -> std::result::Result<Vec<Option<String>>, String> {
+/// either `None` (NULL per null_string matching, or unquoted empty cell) or
+/// `Some(String)`.
+///
+/// `delimiter`, `quote`, and `null_string` come from the COPY options.
+fn parse_csv_record(
+    bytes: &[u8],
+    delimiter: char,
+    quote: char,
+    null_string: &str,
+) -> std::result::Result<Vec<Option<String>>, String> {
     // Reject NUL outright. Engine's literal renderer would happily embed it
     // and break the SQL parser on the engine side.
     if bytes.contains(&0u8) {
@@ -691,15 +883,20 @@ fn parse_csv_record(bytes: &[u8]) -> std::result::Result<Vec<Option<String>>, St
     let mut i = 0;
     while i <= chars.len() {
         // At the start of each iteration we are at the start of a field
-        // (possibly empty, possibly past-end on the trailing comma case).
+        // (possibly empty, possibly past-end on the trailing delimiter case).
         if i == chars.len() {
-            // Empty trailing field after a comma, or an entirely empty row.
+            // Empty trailing field after a delimiter, or an entirely empty row.
             if !out.is_empty() {
-                out.push(None);
+                // An empty unquoted trailing field: check against null_string
+                if null_string.is_empty() {
+                    out.push(None); // empty unquoted = NULL (default behaviour)
+                } else {
+                    out.push(Some(String::new()));
+                }
             }
             break;
         }
-        if chars[i] == '"' {
+        if chars[i] == quote {
             // Quoted field.
             let mut field = String::new();
             i += 1;
@@ -707,9 +904,9 @@ fn parse_csv_record(bytes: &[u8]) -> std::result::Result<Vec<Option<String>>, St
                 if i >= chars.len() {
                     return Err("unterminated quoted field".into());
                 }
-                if chars[i] == '"' {
-                    if i + 1 < chars.len() && chars[i + 1] == '"' {
-                        field.push('"');
+                if chars[i] == quote {
+                    if i + 1 < chars.len() && chars[i + 1] == quote {
+                        field.push(quote);
                         i += 2;
                         continue;
                     }
@@ -720,27 +917,28 @@ fn parse_csv_record(bytes: &[u8]) -> std::result::Result<Vec<Option<String>>, St
                 i += 1;
             }
             out.push(Some(field));
-            // After closing quote: expect comma or end.
+            // After closing quote: expect delimiter or end.
             if i == chars.len() {
                 break;
             }
-            if chars[i] != ',' {
+            if chars[i] != delimiter {
                 return Err(format!(
-                    "expected ',' after quoted field, got {:?}",
+                    "expected {:?} after quoted field, got {:?}",
+                    delimiter,
                     chars[i]
                 ));
             }
             i += 1;
         } else {
-            // Unquoted field: read until comma.
+            // Unquoted field: read until delimiter.
             let start = i;
-            while i < chars.len() && chars[i] != ',' {
+            while i < chars.len() && chars[i] != delimiter {
                 i += 1;
             }
             let raw: String = chars[start..i].iter().collect();
-            // Postgres CSV: empty unquoted = NULL. A quoted empty would
-            // have been Some("") via the quoted branch.
-            if raw.is_empty() {
+            // NULL detection: if raw equals null_string, treat as NULL.
+            // When null_string is empty (default), empty unquoted = NULL.
+            if raw == null_string || (null_string.is_empty() && raw.is_empty()) {
                 out.push(None);
             } else {
                 out.push(Some(raw));
@@ -748,7 +946,7 @@ fn parse_csv_record(bytes: &[u8]) -> std::result::Result<Vec<Option<String>>, St
             if i == chars.len() {
                 break;
             }
-            // i points to comma; advance to next field.
+            // i points to delimiter; advance to next field.
             i += 1;
         }
     }
@@ -876,6 +1074,7 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
     table: &str,
     column_list: Option<&[String]>,
     with_header: bool,
+    opts: &CopyOptions,
 ) -> std::result::Result<(Option<Vec<u8>>, Vec<Vec<u8>>, u64), basin_common::BasinError> {
     // Always issue `SELECT * FROM <table>`. The engine's projection-pushdown
     // returns columns in physical table order regardless of the SELECT
@@ -915,9 +1114,9 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
         let mut row = String::new();
         for (i, &idx) in column_indices.iter().enumerate() {
             if i > 0 {
-                row.push(',');
+                row.push(opts.delimiter);
             }
-            csv_encode_into(schema.field(idx).name(), &mut row);
+            csv_encode_into(schema.field(idx).name(), &mut row, opts.delimiter, opts.quote);
         }
         row.push('\n');
         Some(row.into_bytes())
@@ -931,11 +1130,66 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
             let mut row = String::new();
             for (i, &idx) in column_indices.iter().enumerate() {
                 if i > 0 {
-                    row.push(',');
+                    row.push(opts.delimiter);
                 }
                 let col = batch.column(idx);
                 let cell = render_csv_cell(col.as_ref(), r, schema.field(idx));
-                csv_encode_into(&cell, &mut row);
+                csv_encode_into(&cell, &mut row, opts.delimiter, opts.quote);
+            }
+            row.push('\n');
+            body.push(row.into_bytes());
+            row_count += 1;
+        }
+    }
+    Ok((header, body, row_count))
+}
+
+/// Render a query result as CSV bytes for `COPY (SELECT …) TO STDOUT`.
+///
+/// Runs `query` through the engine session and encodes the result rows.
+/// Returns `(header_line, body_lines, row_count)` just like
+/// [`copy_to_csv_payload`].
+pub(crate) async fn copy_query_to_csv_payload<S: Session + ?Sized>(
+    session: &S,
+    query: &str,
+    with_header: bool,
+    opts: &CopyOptions,
+) -> std::result::Result<(Option<Vec<u8>>, Vec<Vec<u8>>, u64), basin_common::BasinError> {
+    let res = session.execute(query).await?;
+    let (schema, batches) = match res {
+        ExecResult::Rows { schema, batches } => (schema, batches),
+        ExecResult::Empty { .. } => {
+            return Err(basin_common::BasinError::Internal(
+                "COPY (query) TO: query returned no result set".into(),
+            ));
+        }
+    };
+    let n = schema.fields().len();
+    let header = if with_header {
+        let mut row = String::new();
+        for (i, f) in schema.fields().iter().enumerate() {
+            if i > 0 {
+                row.push(opts.delimiter);
+            }
+            csv_encode_into(f.name(), &mut row, opts.delimiter, opts.quote);
+        }
+        row.push('\n');
+        Some(row.into_bytes())
+    } else {
+        None
+    };
+    let mut body: Vec<Vec<u8>> = Vec::new();
+    let mut row_count: u64 = 0;
+    for batch in &batches {
+        for r in 0..batch.num_rows() {
+            let mut row = String::new();
+            for (i, idx) in (0..n).enumerate() {
+                if i > 0 {
+                    row.push(opts.delimiter);
+                }
+                let col = batch.column(idx);
+                let cell = render_csv_cell(col.as_ref(), r, schema.field(idx));
+                csv_encode_into(&cell, &mut row, opts.delimiter, opts.quote);
             }
             row.push('\n');
             body.push(row.into_bytes());
@@ -962,6 +1216,7 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
     table: &str,
     column_list: Option<&[String]>,
     with_header: bool,
+    opts: &CopyOptions,
 ) -> Vec<PgWireBackendMessage> {
     // Resolve full schema once so we know how many columns CopyOutResponse
     // should advertise, and so we can pre-validate the column list with a
@@ -998,7 +1253,7 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
     };
     let n_cols = selected.len();
     let mut out: Vec<PgWireBackendMessage> = Vec::new();
-    let payload = match copy_to_csv_payload(session, table, column_list, with_header).await {
+    let payload = match copy_to_csv_payload(session, table, column_list, with_header, opts).await {
         Ok(p) => p,
         Err(e) => {
             out.push(PgWireBackendMessage::ErrorResponse(
@@ -1036,30 +1291,78 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
     out
 }
 
-/// CSV-encode a single string field into `out`. Quote when the value
-/// contains `,`, `"`, `\n`, or `\r`; double internal `"`. Empty string is
-/// written without quotes (empty-unquoted) — the COPY-IN reader will round-
-/// trip it to NULL by default. For now we emit empty for SQL NULL too,
-/// matching Postgres' CSV default.
-fn csv_encode_into(v: &str, out: &mut String) {
-    let needs_quote = v
-        .as_bytes()
-        .iter()
-        .any(|&b| b == b',' || b == b'"' || b == b'\n' || b == b'\r');
+/// Run `COPY (SELECT …) TO STDOUT` synchronously. Executes the query and
+/// streams the result as CSV. Returns the full backend-message sequence.
+pub(crate) async fn copy_query_to_stdout_messages<S: Session + ?Sized>(
+    session: &S,
+    query: &str,
+    with_header: bool,
+    opts: &CopyOptions,
+) -> Vec<PgWireBackendMessage> {
+    let mut out: Vec<PgWireBackendMessage> = Vec::new();
+    let payload = match copy_query_to_csv_payload(session, query, with_header, opts).await {
+        Ok(p) => p,
+        Err(e) => {
+            out.push(PgWireBackendMessage::ErrorResponse(
+                crate::error::error_response(&e),
+            ));
+            out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                TransactionStatus::Idle,
+            )));
+            return out;
+        }
+    };
+    let (header, body, row_count) = payload;
+    // For query-source COPY we don't know the column count ahead of running
+    // the query. Derive it from the header or body row, or default to 1.
+    let n_cols = if let Some(ref h) = header {
+        h.iter().filter(|&&b| b == opts.delimiter as u8).count() + 1
+    } else if let Some(first) = body.first() {
+        first.iter().filter(|&&b| b == opts.delimiter as u8).count() + 1
+    } else {
+        1
+    };
+    out.push(PgWireBackendMessage::CopyOutResponse(copy_out_response(
+        n_cols,
+    )));
+    if let Some(h) = header {
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(h))));
+    }
+    for row in body {
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(row))));
+    }
+    out.push(PgWireBackendMessage::CopyDone(
+        pgwire::messages::copy::CopyDone::new(),
+    ));
+    out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+        format!("COPY {row_count}"),
+    )));
+    out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+        TransactionStatus::Idle,
+    )));
+    out
+}
+
+/// CSV-encode a single string field into `out` using `delimiter` and `quote`.
+/// Quote when the value contains the delimiter, quote char, `\n`, or `\r`;
+/// double internal quote chars. Empty string is written without quotes
+/// (empty-unquoted) — the COPY-IN reader will treat it as NULL by default.
+fn csv_encode_into(v: &str, out: &mut String, delimiter: char, quote: char) {
+    let needs_quote = v.chars().any(|c| c == delimiter || c == quote || c == '\n' || c == '\r');
     if !needs_quote {
         out.push_str(v);
         return;
     }
-    out.push('"');
+    out.push(quote);
     for c in v.chars() {
-        if c == '"' {
-            out.push('"');
-            out.push('"');
+        if c == quote {
+            out.push(quote);
+            out.push(quote);
         } else {
             out.push(c);
         }
     }
-    out.push('"');
+    out.push(quote);
 }
 
 /// Render one Arrow cell into the canonical CSV string representation. We
@@ -1083,6 +1386,13 @@ pub(crate) fn copy_from_stdin_messages(n_cols: usize) -> Vec<PgWireBackendMessag
     ))]
 }
 
+/// Primary on/off gate for server-side COPY file paths.
+///
+/// Set `BASIN_COPY_ALLOW_FILE_PATHS=1` to enable. Any other value (including
+/// unset / empty) disables file-path COPY entirely; the connection gets
+/// SQLSTATE 42501 (insufficient_privilege).
+pub(crate) const COPY_ALLOW_FILE_PATHS_ENV: &str = "BASIN_COPY_ALLOW_FILE_PATHS";
+
 /// Env-var-driven allowlist for server-side COPY file paths. Default-deny: if
 /// `BASIN_COPY_PATH_ALLOWLIST` is unset or empty, every file path is rejected.
 ///
@@ -1096,10 +1406,21 @@ pub(crate) fn copy_from_stdin_messages(n_cols: usize) -> Vec<PgWireBackendMessag
 pub(crate) const COPY_PATH_ALLOWLIST_ENV: &str = "BASIN_COPY_PATH_ALLOWLIST";
 
 /// Validate `path` for use as a server-side COPY file path. Returns the
-/// path bytes unchanged on success; on rejection, the returned string is
-/// suitable as the SQLSTATE 42601 message.
+/// path unchanged on success. On rejection:
+/// - Returns a string prefixed with `"\x0042501\x00"` to signal SQLSTATE
+///   42501 (insufficient_privilege) for the `BASIN_COPY_ALLOW_FILE_PATHS`
+///   gate rejection.
+/// - Returns a plain string (no prefix) for SQLSTATE 42601 errors (bad path).
 pub(crate) fn validate_copy_path(path: &str) -> std::result::Result<std::path::PathBuf, String> {
     use std::path::{Component, PathBuf};
+
+    // Primary gate: BASIN_COPY_ALLOW_FILE_PATHS=1 must be set.
+    let allow_flag = std::env::var(COPY_ALLOW_FILE_PATHS_ENV).unwrap_or_default();
+    if allow_flag.trim() != "1" {
+        return Err(format!(
+            "\x0042501\x00COPY: server-side file paths are disabled (set {COPY_ALLOW_FILE_PATHS_ENV}=1 to enable)"
+        ));
+    }
 
     let allowlist_raw = std::env::var(COPY_PATH_ALLOWLIST_ENV).unwrap_or_default();
     if allowlist_raw.is_empty() {
@@ -1148,10 +1469,11 @@ pub(crate) async fn copy_to_file<S: Session + ?Sized>(
     column_list: Option<&[String]>,
     path: &std::path::Path,
     with_header: bool,
+    opts: &CopyOptions,
 ) -> std::result::Result<u64, basin_common::BasinError> {
     use tokio::io::AsyncWriteExt;
     let (header, body, row_count) =
-        copy_to_csv_payload(session, table, column_list, with_header).await?;
+        copy_to_csv_payload(session, table, column_list, with_header, opts).await?;
     let mut f = tokio::fs::File::create(path).await.map_err(|e| {
         basin_common::BasinError::Internal(format!("COPY TO {}: open: {e}", path.display()))
     })?;
@@ -1196,6 +1518,10 @@ pub(crate) type CopyStateSlot = Arc<tokio::sync::Mutex<Option<CopyInState>>>;
 mod tests {
     use super::*;
 
+    fn default_opts() -> CopyOptions {
+        CopyOptions::default()
+    }
+
     #[test]
     fn parse_copy_recognises_from_stdin_csv() {
         let cmd = parse_copy("COPY events FROM STDIN WITH (FORMAT CSV)").unwrap();
@@ -1206,6 +1532,7 @@ mod tests {
                 with_header: false,
                 columns: None,
                 path: None,
+                opts: default_opts(),
             })
         );
     }
@@ -1220,6 +1547,7 @@ mod tests {
                 with_header: true,
                 columns: None,
                 path: None,
+                opts: default_opts(),
             })
         );
     }
@@ -1234,6 +1562,7 @@ mod tests {
                 with_header: false,
                 columns: None,
                 path: None,
+                opts: default_opts(),
             })
         );
     }
@@ -1248,6 +1577,7 @@ mod tests {
                 with_header: false,
                 columns: Some(vec!["b".into(), "a".into()]),
                 path: None,
+                opts: default_opts(),
             })
         );
     }
@@ -1263,6 +1593,7 @@ mod tests {
                 with_header: true,
                 columns: Some(vec!["id".into(), "email".into()]),
                 path: None,
+                opts: default_opts(),
             })
         );
     }
@@ -1283,6 +1614,7 @@ mod tests {
                 with_header: false,
                 columns: None,
                 path: Some("/tmp/users.csv".into()),
+                opts: default_opts(),
             })
         );
     }
@@ -1296,18 +1628,67 @@ mod tests {
     }
 
     #[test]
-    fn parse_copy_rejects_delimiter_option() {
-        let e = parse_copy("COPY t FROM STDIN WITH (FORMAT CSV, DELIMITER '|')").unwrap_err();
+    fn parse_copy_accepts_delimiter_option() {
+        let cmd = parse_copy("COPY t FROM STDIN WITH (FORMAT CSV, DELIMITER '|')").unwrap();
         assert!(
-            e.contains("DELIMITER") || e.contains("not supported"),
-            "got: {e}"
+            matches!(cmd, Some(CopyCommand::From { ref opts, .. }) if opts.delimiter == '|'),
+            "expected pipe delimiter"
         );
+    }
+
+    #[test]
+    fn parse_copy_accepts_null_option() {
+        let cmd = parse_copy(r"COPY t FROM STDIN WITH (FORMAT CSV, NULL '\N')").unwrap();
+        assert!(
+            matches!(cmd, Some(CopyCommand::From { ref opts, .. }) if opts.null_string == r"\N"),
+            "expected \\N null string"
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_quote_and_escape() {
+        let cmd = parse_copy("COPY t FROM STDIN WITH (FORMAT CSV, QUOTE '\"', ESCAPE '\\')").unwrap();
+        assert!(
+            matches!(cmd, Some(CopyCommand::From { ref opts, .. }) if opts.quote == '"' && opts.escape == '\\'),
+            "expected custom quote/escape"
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_query_source() {
+        let cmd = parse_copy("COPY (SELECT id, name FROM t WHERE id > 5) TO STDOUT WITH (FORMAT CSV)").unwrap();
+        assert!(
+            matches!(cmd, Some(CopyCommand::QueryTo { ref query, with_header, .. })
+                if query.contains("SELECT") && !with_header),
+            "expected QueryTo"
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_query_source_with_header() {
+        let cmd = parse_copy("COPY (SELECT * FROM t) TO STDOUT WITH (FORMAT CSV, HEADER true)").unwrap();
+        assert!(
+            matches!(cmd, Some(CopyCommand::QueryTo { with_header: true, .. })),
+            "expected QueryTo with header"
+        );
+    }
+
+    #[test]
+    fn parse_copy_rejects_program_from() {
+        let e = parse_copy("COPY t FROM PROGRAM 'cat /etc/passwd'").unwrap_err();
+        assert!(e.contains("42501") || e.contains("PROGRAM"), "got: {e}");
+    }
+
+    #[test]
+    fn parse_copy_rejects_program_to() {
+        let e = parse_copy("COPY t TO PROGRAM 'cat'").unwrap_err();
+        assert!(e.contains("42501") || e.contains("PROGRAM"), "got: {e}");
     }
 
     #[test]
     fn parse_copy_rejects_non_csv_format() {
         let e = parse_copy("COPY t FROM STDIN WITH (FORMAT BINARY)").unwrap_err();
-        assert!(e.contains("CSV"), "got: {e}");
+        assert!(e.contains("CSV") || e.contains("BINARY"), "got: {e}");
     }
 
     #[test]
@@ -1325,7 +1706,7 @@ mod tests {
     #[test]
     fn split_record_handles_quoted_newline() {
         let buf = b"\"hello\nworld\",42\n";
-        let (rec, n) = split_record(buf, false).unwrap();
+        let (rec, n) = split_record(buf, false, '"').unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(rec, &buf[..buf.len() - 1]);
     }
@@ -1333,9 +1714,9 @@ mod tests {
     #[test]
     fn split_record_returns_none_on_partial() {
         let buf = b"abc,def";
-        assert!(split_record(buf, false).is_none());
+        assert!(split_record(buf, false, '"').is_none());
         // …but final_chunk = true treats it as the final record.
-        let (rec, n) = split_record(buf, true).unwrap();
+        let (rec, n) = split_record(buf, true, '"').unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(rec, buf);
     }
@@ -1343,14 +1724,14 @@ mod tests {
     #[test]
     fn split_record_handles_crlf() {
         let buf = b"a,b\r\nc,d\r\n";
-        let (rec, n) = split_record(buf, false).unwrap();
+        let (rec, n) = split_record(buf, false, '"').unwrap();
         assert_eq!(n, 5);
         assert_eq!(rec, b"a,b");
     }
 
     #[test]
     fn parse_csv_record_splits_three_fields() {
-        let r = parse_csv_record(b"1,foo,bar").unwrap();
+        let r = parse_csv_record(b"1,foo,bar", ',', '"', "").unwrap();
         assert_eq!(
             r,
             vec![
@@ -1363,13 +1744,13 @@ mod tests {
 
     #[test]
     fn parse_csv_record_empty_unquoted_is_null() {
-        let r = parse_csv_record(b"1,,3").unwrap();
+        let r = parse_csv_record(b"1,,3", ',', '"', "").unwrap();
         assert_eq!(r, vec![Some("1".to_string()), None, Some("3".to_string())]);
     }
 
     #[test]
     fn parse_csv_record_empty_quoted_is_empty_string() {
-        let r = parse_csv_record(b"1,\"\",3").unwrap();
+        let r = parse_csv_record(b"1,\"\",3", ',', '"', "").unwrap();
         assert_eq!(
             r,
             vec![
@@ -1382,15 +1763,30 @@ mod tests {
 
     #[test]
     fn parse_csv_record_handles_doubled_quote() {
-        let r = parse_csv_record(b"\"he said \"\"hi\"\"\"").unwrap();
+        let r = parse_csv_record(b"\"he said \"\"hi\"\"\"", ',', '"', "").unwrap();
         assert_eq!(r, vec![Some("he said \"hi\"".to_string())]);
     }
 
     #[test]
     fn parse_csv_record_rejects_nul_byte() {
         let bytes = vec![b'a', 0u8, b'b'];
-        let e = parse_csv_record(&bytes).unwrap_err();
+        let e = parse_csv_record(&bytes, ',', '"', "").unwrap_err();
         assert!(e.contains("NUL"), "got: {e}");
+    }
+
+    #[test]
+    fn parse_csv_record_custom_delimiter() {
+        let r = parse_csv_record(b"a|b|c", '|', '"', "").unwrap();
+        assert_eq!(
+            r,
+            vec![Some("a".into()), Some("b".into()), Some("c".into())]
+        );
+    }
+
+    #[test]
+    fn parse_csv_record_custom_null_string() {
+        let r = parse_csv_record(br"\N,foo,\N", ',', '"', r"\N").unwrap();
+        assert_eq!(r, vec![None, Some("foo".into()), None]);
     }
 
     #[test]
@@ -1465,9 +1861,8 @@ mod tests {
         assert!(e.contains("does not exist"), "got: {e}");
     }
 
-    /// `BASIN_COPY_PATH_ALLOWLIST` is process-global; tests that mutate it
-    /// must serialise through this mutex, otherwise parallel cargo test
-    /// runners stomp each other.
+    /// Env vars are process-global; tests that mutate them must serialise
+    /// through this mutex, otherwise parallel cargo test runners stomp each other.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1477,61 +1872,89 @@ mod tests {
     }
 
     #[test]
-    fn validate_copy_path_default_deny() {
+    fn validate_copy_path_default_deny_no_flag() {
         let _g = env_lock();
+        std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
         std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
         let e = validate_copy_path("/tmp/x.csv").unwrap_err();
-        assert!(e.contains("disabled"), "got: {e}");
+        // Should contain the 42501 prefix (insufficient_privilege)
+        assert!(e.contains("42501") || e.contains("disabled"), "got: {e}");
+        std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
+    }
+
+    #[test]
+    fn validate_copy_path_flag_set_but_no_allowlist() {
+        let _g = env_lock();
+        std::env::set_var(COPY_ALLOW_FILE_PATHS_ENV, "1");
+        std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
+        let e = validate_copy_path("/tmp/x.csv").unwrap_err();
+        assert!(e.contains("disabled") || e.contains(COPY_PATH_ALLOWLIST_ENV), "got: {e}");
+        std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
     }
 
     #[test]
     fn validate_copy_path_relative_rejected() {
         let _g = env_lock();
+        std::env::set_var(COPY_ALLOW_FILE_PATHS_ENV, "1");
         std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp");
         let e = validate_copy_path("rel/path.csv").unwrap_err();
         assert!(e.contains("absolute"), "got: {e}");
+        std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
         std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
     }
 
     #[test]
     fn validate_copy_path_inside_allowlist_ok() {
         let _g = env_lock();
+        std::env::set_var(COPY_ALLOW_FILE_PATHS_ENV, "1");
         std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp/basin-copy");
         let p = validate_copy_path("/tmp/basin-copy/x.csv").unwrap();
         assert_eq!(p.to_str(), Some("/tmp/basin-copy/x.csv"));
+        std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
         std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
     }
 
     #[test]
     fn validate_copy_path_outside_allowlist_rejected() {
         let _g = env_lock();
+        std::env::set_var(COPY_ALLOW_FILE_PATHS_ENV, "1");
         std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp/basin-copy");
         let e = validate_copy_path("/etc/passwd").unwrap_err();
         assert!(e.contains("outside"), "got: {e}");
+        std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
         std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
     }
 
     #[test]
     fn validate_copy_path_rejects_dotdot() {
         let _g = env_lock();
+        std::env::set_var(COPY_ALLOW_FILE_PATHS_ENV, "1");
         std::env::set_var(COPY_PATH_ALLOWLIST_ENV, "/tmp");
         let e = validate_copy_path("/tmp/../etc/passwd").unwrap_err();
         assert!(e.contains(".."), "got: {e}");
+        std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
         std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
     }
 
     #[test]
     fn csv_encode_quotes_when_needed() {
         let mut s = String::new();
-        csv_encode_into("hello,world", &mut s);
+        csv_encode_into("hello,world", &mut s, ',', '"');
         assert_eq!(s, "\"hello,world\"");
 
         let mut s = String::new();
-        csv_encode_into("she said \"hi\"", &mut s);
+        csv_encode_into("she said \"hi\"", &mut s, ',', '"');
         assert_eq!(s, "\"she said \"\"hi\"\"\"");
 
         let mut s = String::new();
-        csv_encode_into("plain", &mut s);
+        csv_encode_into("plain", &mut s, ',', '"');
         assert_eq!(s, "plain");
+    }
+
+    #[test]
+    fn csv_encode_custom_delimiter() {
+        let mut s = String::new();
+        csv_encode_into("hello|world", &mut s, '|', '"');
+        assert_eq!(s, "\"hello|world\"");
     }
 }

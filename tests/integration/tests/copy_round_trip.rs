@@ -8,8 +8,8 @@
 //!    sees 1000.
 //! 2. CSV export round-trips: 100 rows inserted the normal way → `copy_out`
 //!    streams CSV bytes that parse back to 100 rows.
-//! 3. The COPY parser rejects unsupported variants (DELIMITER, BINARY,
-//!    column lists) cleanly without desyncing the connection.
+//! 3. The COPY parser rejects unsupported variants (BINARY format) cleanly
+//!    without desyncing the connection.
 //! 4. `COPY ... WITH (HEADER true)` round-trips.
 
 use std::collections::HashMap;
@@ -235,12 +235,11 @@ async fn copy_rejects_unsupported_variants_without_desync() {
     // the exact wording — tokio-postgres' top-level `Display` only emits
     // "db error: <SQLSTATE> ..."; assert the SQLSTATE 42601.
     //
-    // Note: column-list and file-path variants are now SUPPORTED — they're
-    // covered in `copy_extensions.rs`. The only ones still rejected are
-    // BINARY format and custom DELIMITER.
+    // Note: column-list / file-path / DELIMITER / NULL / QUOTE / ESCAPE
+    // variants are now SUPPORTED — they're covered in `copy_extensions.rs`
+    // and `copy_extras.rs`. BINARY format is still rejected.
     for sql in [
         "COPY t FROM STDIN WITH (FORMAT BINARY)",
-        "COPY t FROM STDIN WITH (DELIMITER '|')",
     ] {
         let err = client
             .simple_query(sql)
