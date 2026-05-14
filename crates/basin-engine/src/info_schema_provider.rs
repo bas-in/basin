@@ -1450,7 +1450,6 @@ pub(crate) fn register_info_schema_providers(
         Arc::new(PgAuthidProvider::new(catalog.clone(), tenant)?);
     pg_catalog_schema.register_table("pg_authid".to_string(), pg_authid_provider)?;
 
-<<<<<<< HEAD
     // Bulk catalog expansion: pg_catalog additions
     // Bulk catalog expansion: pg_catalog base views (agent-bulk-catalog-views pattern)
     let pg_database_provider: Arc<dyn TableProvider> =
@@ -1600,12 +1599,10 @@ pub(crate) fn register_info_schema_providers(
     let user_mapping_options_provider: Arc<dyn TableProvider> =
         Arc::new(UserMappingOptionsProvider::new(catalog, tenant)?);
     info_schema.register_table("user_mapping_options".to_string(), user_mapping_options_provider)?;
-=======
     // pg_catalog.pg_views: plain views + continuous matviews.
     let pg_views_provider: Arc<dyn TableProvider> =
         Arc::new(PgViewsProvider::new(catalog, tenant)?);
     pg_catalog_schema.register_table("pg_views".to_string(), pg_views_provider)?;
->>>>>>> worktree-agent-agent-bulk-views-joindml
 
     Ok(())
 }

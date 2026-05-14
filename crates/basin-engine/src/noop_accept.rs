@@ -97,7 +97,6 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::VariableShow => Some(ExecResult::Empty {
             tag: "SHOW".into(),
         }),
-<<<<<<< HEAD
         // Foreign Data Wrappers / Foreign tables — accept-only; Basin has no FDW execution
         StmtKind::CreateFdw => Some(ExecResult::Empty {
             tag: "CREATE FOREIGN DATA WRAPPER".into(),
@@ -145,7 +144,6 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::SecurityLabel => Some(ExecResult::Empty {
             tag: "SECURITY LABEL".into(),
         }),
-=======
 
         // Extended query protocol from text — PREPARE / EXECUTE / DEALLOCATE.
         // The real extended-query path uses pgwire Parse/Bind/Execute messages;
@@ -223,7 +221,6 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
             tag: "REINDEX".into(),
         }),
 
->>>>>>> worktree-agent-agent-bulk-noop-accept
         // Everything else is not in our accept set.
         _ => None,
     }

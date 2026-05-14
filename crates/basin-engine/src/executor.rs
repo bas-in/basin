@@ -288,12 +288,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
     let rewritten = crate::udf::rewrite_vector_operators(sql);
-<<<<<<< HEAD
     // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.
     let rewritten = crate::udf::rewrite_json_operators(&rewritten);
-=======
     // Rewrite PostgreSQL POSIX regex operators (`~`, `!~`, `~*`, `!~*`) to
     // `regexp_like(…)` calls DataFusion accepts; expand `BETWEEN SYMMETRIC`;
     // rewrite array containment / overlap operators (`@>`, `<@`, `&&`) for
@@ -301,13 +299,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
     let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
     let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
->>>>>>> worktree-agent-agent-bulk-pg-operators
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
     let rewritten = crate::udf::rewrite_extract_second(&rewritten);
-<<<<<<< HEAD
-<<<<<<< HEAD
     // Rewrite `expr AT TIME ZONE 'tz'` to `at_time_zone(expr, 'tz')` so
     // DataFusion's sqlparser sees a regular function call instead of the
     // AT TIME ZONE infix operator, which it may not handle for all types.
@@ -316,15 +311,11 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // `extract_epoch_from_interval(interval_expr)` — DataFusion's built-in
     // `EXTRACT(EPOCH FROM x)` handles timestamps but not interval values.
     let rewritten = crate::interval_tz_udf::rewrite_extract_epoch_interval(&rewritten);
-=======
     // Rewrite `every(...)` → `bool_and(...)` — PG alias for the same aggregate.
     let rewritten = crate::pg_scalar_aliases::rewrite_every_to_bool_and(&rewritten);
->>>>>>> worktree-agent-agent-bulk-pg-scalar-fns
-=======
     // Rewrite PG aggregate name aliases that DataFusion exposes under a
     // different name: `variance(x)` → `var(x)`, `every(x)` → `bool_and(x)`.
     let rewritten = crate::udf::rewrite_pg_agg_aliases(&rewritten);
->>>>>>> worktree-agent-agent-bulk-pg-aggregates
     // User-defined `LANGUAGE sql` function inlining. The rewriter is a
     // no-op for tenants with no registered functions and for statements
     // that contain no function calls at all (the cheap pre-gate runs

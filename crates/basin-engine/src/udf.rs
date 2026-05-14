@@ -2923,7 +2923,6 @@ impl ScalarUDFImpl for AuthJwtUdf {
     }
 }
 
-<<<<<<< HEAD
 // ---------------------------------------------------------------------------
 // JSON operator text rewriter
 // ---------------------------------------------------------------------------
@@ -3005,7 +3004,6 @@ fn rewrite_json_at_gt(s: &str) -> String {
             search_from = lhs_start + replacement.len();
         } else {
             search_from = op_end;
-=======
 // ── PG aggregate alias rewriter ───────────────────────────────────────────────
 
 /// Rewrite PostgreSQL aggregate function aliases to DataFusion equivalents.
@@ -3060,12 +3058,10 @@ pub(crate) fn rewrite_pg_agg_aliases(sql: &str) -> String {
                 }
             }
             scan_pos = abs_start + 1;
->>>>>>> worktree-agent-agent-bulk-pg-aggregates
         }
     }
     out
 }
-<<<<<<< HEAD
 
 /// Rewrite `expr || expr` to `jsonb_concat(expr, expr)` when RHS looks like JSON.
 fn rewrite_json_concat_op(s: &str) -> String {
@@ -3172,5 +3168,3 @@ mod json_op_rewrite_tests {
         assert!(r.contains("jsonb_has_key(data, 'foo')"), "got: {r}");
     }
 }
-=======
->>>>>>> worktree-agent-agent-bulk-pg-aggregates

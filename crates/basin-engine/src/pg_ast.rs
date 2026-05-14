@@ -115,7 +115,6 @@ pub enum StmtKind {
     Commit,
     Rollback,
     Savepoint,
-<<<<<<< HEAD
     // TRUNCATE — real operation (delete all rows + optionally restart seqs)
     Truncate,
     // Foreign Data Wrappers / Foreign tables (accept-only; Basin has no FDW execution)
@@ -137,14 +136,12 @@ pub enum StmtKind {
     SetConstraints,
     // Security labels (accept-only)
     SecurityLabel,
-=======
     // MERGE INTO … USING … ON … WHEN MATCHED / NOT MATCHED
     // (syntactic-accept-only in v0.1; see noop_accept.rs)
     Merge,
     // REINDEX — Basin indexes managed by DataFusion's adaptive planner
     // (syntactic-accept-only; see noop_accept.rs)
     Reindex,
->>>>>>> worktree-agent-agent-bulk-noop-accept
     /// Anything we don't yet dispatch on. Routed to the existing
     /// sqlparser pipeline by the executor.
     Other,
@@ -209,7 +206,6 @@ impl StmtKind {
             StmtKind::Commit => "COMMIT",
             StmtKind::Rollback => "ROLLBACK",
             StmtKind::Savepoint => "SAVEPOINT",
-<<<<<<< HEAD
             StmtKind::Truncate => "TRUNCATE",
             StmtKind::CreateFdw => "CREATE FOREIGN DATA WRAPPER",
             StmtKind::DropFdw => "DROP FOREIGN DATA WRAPPER",
@@ -225,10 +221,8 @@ impl StmtKind {
             StmtKind::AlterDefaultPrivileges => "ALTER DEFAULT PRIVILEGES",
             StmtKind::SetConstraints => "SET CONSTRAINTS",
             StmtKind::SecurityLabel => "SECURITY LABEL",
-=======
             StmtKind::Merge => "MERGE",
             StmtKind::Reindex => "REINDEX",
->>>>>>> worktree-agent-agent-bulk-noop-accept
             StmtKind::Other => "<other>",
         }
     }
@@ -422,13 +416,10 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
                 Ok(O::ObjectSequence) => StmtKind::DropSequence,
                 Ok(O::ObjectPolicy) => StmtKind::DropPolicy,
                 Ok(O::ObjectTrigger) => StmtKind::DropTrigger,
-<<<<<<< HEAD
                 Ok(O::ObjectFdw) => StmtKind::DropFdw,
                 Ok(O::ObjectForeignServer) => StmtKind::DropForeignServer,
                 Ok(O::ObjectForeignTable) => StmtKind::DropForeignTable,
-=======
                 Ok(O::ObjectExtension) => StmtKind::DropExtension,
->>>>>>> worktree-agent-agent-bulk-noop-accept
                 _ => StmtKind::Other,
             }
         }
