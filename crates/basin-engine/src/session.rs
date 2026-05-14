@@ -21,7 +21,7 @@
 //! The `register_object_store` call is the single switch point.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::AuthContext;
 
@@ -72,12 +72,19 @@ pub(crate) struct SessionState {
     /// sequence". Empty until the session's first `nextval`; consulted
     /// by the SQL-string sequence rewriter on every `currval` call.
     pub(crate) sequence_cache: Arc<crate::seq_udf::SessionSequenceCache>,
+<<<<<<< HEAD
     /// Per-session open-cursor registry. `DECLARE … CURSOR FOR …`
     /// materialises the SELECT result and stores it here under the cursor
     /// name; `FETCH` / `MOVE` advance the position; `CLOSE` removes the
     /// entry.  All cursors are destroyed when the session is dropped
     /// (`CursorRegistry` holds no external state).
     pub(crate) cursors: crate::cursor::CursorRegistry,
+=======
+    /// Per-session schema registry and search_path. `"public"` is always
+    /// present. Updated by `CREATE SCHEMA` / `DROP SCHEMA` /
+    /// `SET search_path`. See `crate::schema_ddl::SchemaState`.
+    pub(crate) schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
+>>>>>>> worktree-agent-a47826201518b8712
 }
 
 impl SessionState {
@@ -87,7 +94,11 @@ impl SessionState {
             prepared: crate::prepared::PreparedRegistry::new(),
             has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
             sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
+<<<<<<< HEAD
             cursors: crate::cursor::CursorRegistry::new(),
+=======
+            schema_state: Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default())),
+>>>>>>> worktree-agent-a47826201518b8712
         }
     }
 }
