@@ -283,6 +283,28 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(tenant = %tenant, old = %old, new = %new))]
+    async fn rename_table(
+        &self,
+        tenant: &TenantId,
+        old: &TableName,
+        new: &TableName,
+    ) -> Result<()> {
+        let old_key = (*tenant, old.clone());
+        let new_key = (*tenant, new.clone());
+        let mut tables = self.tables.lock().await;
+        if tables.contains_key(&new_key) {
+            return Err(BasinError::catalog(format!(
+                "rename_table: target {tenant}/{new} already exists"
+            )));
+        }
+        let entry = tables
+            .remove(&old_key)
+            .ok_or_else(|| BasinError::not_found(format!("{tenant}/{old}")))?;
+        tables.insert(new_key, entry);
+        Ok(())
+    }
+
     #[instrument(skip(self), fields(tenant = %tenant))]
     async fn list_tables(&self, tenant: &TenantId) -> Result<Vec<TableName>> {
         let tables = self.tables.lock().await;

@@ -44,6 +44,8 @@ md-5 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 bcrypt = { workspace = true }
+# Regex engine for regexp_match / regexp_split_to_array UDFs.
+regex.workspace = true
 # `WebhookOps` (5.11.I) is a bitflags struct stored on the engine-local
 # `webhook_registry` module after the cycle-fix moved registry types out
 # of basin-webhooks.

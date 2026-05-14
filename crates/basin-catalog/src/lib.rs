@@ -116,6 +116,26 @@ pub trait Catalog: Send + Sync {
     /// time-travel / point-in-time-restore in Phase 6).
     async fn drop_table(&self, tenant: &TenantId, table: &TableName) -> Result<()>;
 
+    /// Rename `(tenant, old)` to `(tenant, new)`. Used by
+    /// `ALTER TABLE … RENAME TO`. The table's identity (snapshot history,
+    /// constraints, partition spec, etc.) is preserved — only the key
+    /// changes. Returns [`basin_common::BasinError::NotFound`] if `old`
+    /// does not exist for `tenant`, [`basin_common::BasinError::Catalog`]
+    /// if `new` is already taken. Default impl returns
+    /// `Internal("not implemented")` so the stub `RestCatalog` stays
+    /// buildable; in-memory and Postgres backends override.
+    async fn rename_table(
+        &self,
+        tenant: &TenantId,
+        old: &TableName,
+        new: &TableName,
+    ) -> Result<()> {
+        let _ = (tenant, old, new);
+        Err(basin_common::BasinError::Internal(
+            "rename_table not implemented for this catalog backend".into(),
+        ))
+    }
+
     /// Tables visible to `tenant`. By construction this is *only* `tenant`'s
     /// tables — there is no cross-tenant variant in this trait.
     async fn list_tables(&self, tenant: &TenantId) -> Result<Vec<TableName>>;

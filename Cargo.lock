@@ -981,6 +981,7 @@ dependencies = [
  "md-5 0.10.6",
  "object_store",
  "parquet 54.2.1",
+ "regex",
  "serde",
  "serde_json",
  "sha1",
