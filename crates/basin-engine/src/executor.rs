@@ -359,33 +359,41 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             name,
             query,
             materialized,
+            or_replace,
             ..
         } => {
-            if !materialized {
-                return Err(BasinError::internal(
-                    "CREATE VIEW (non-materialised) is not supported in v0.1; \
-                     use CREATE MATERIALIZED VIEW ... WITH (basin.continuous, ...)",
-                ));
-            }
-            let view_name = single_part_name(&name)?.to_string();
-            let opts = cv_options.unwrap_or_default();
-            if !opts.continuous {
-                return Err(BasinError::InvalidSchema(
-                    "CREATE MATERIALIZED VIEW requires WITH (basin.continuous, \
-                     refresh_interval = '<duration>')"
-                        .into(),
-                ));
-            }
-            let interval = opts.refresh_interval_secs.ok_or_else(|| {
-                BasinError::InvalidSchema(
-                    "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
-                     requires refresh_interval = '<duration>'"
-                        .into(),
+            if materialized {
+                // Continuous-aggregate path (existing behaviour).
+                let view_name = single_part_name(&name)?.to_string();
+                let opts = cv_options.unwrap_or_default();
+                if !opts.continuous {
+                    return Err(BasinError::InvalidSchema(
+                        "CREATE MATERIALIZED VIEW requires WITH (basin.continuous, \
+                         refresh_interval = '<duration>')"
+                            .into(),
+                    ));
+                }
+                let interval = opts.refresh_interval_secs.ok_or_else(|| {
+                    BasinError::InvalidSchema(
+                        "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
+                         requires refresh_interval = '<duration>'"
+                            .into(),
+                    )
+                })?;
+                let source_sql = query.to_string();
+                crate::cv_ddl::exec_create_materialized_view(
+                    sess,
+                    &view_name,
+                    &source_sql,
+                    interval,
                 )
-            })?;
-            let source_sql = query.to_string();
-            crate::cv_ddl::exec_create_materialized_view(sess, &view_name, &source_sql, interval)
                 .await
+            } else {
+                // Plain view path (new).
+                let view_name = single_part_name(&name)?.to_string();
+                let query_sql = query.to_string();
+                crate::view_ddl::exec_create_view(sess, &view_name, &query_sql, or_replace).await
+            }
         }
         Statement::CreateFunction {
             or_replace,
@@ -487,6 +495,24 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             purge: _,
             temporary: _,
         } => crate::seq_ddl::exec_drop_sequence(sess, if_exists, &names).await,
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::View,
+            if_exists,
+            names,
+            cascade: _,
+            restrict: _,
+            purge: _,
+            temporary: _,
+        } => {
+            // DROP VIEW supports dropping a single view per statement.
+            if names.len() != 1 {
+                return Err(BasinError::InvalidSchema(
+                    "DROP VIEW: exactly one view name expected".into(),
+                ));
+            }
+            let name = single_part_name(&names[0])?.to_string();
+            crate::view_ddl::exec_drop_view(sess, &name, if_exists).await
+        }
         Statement::Insert(ins) => exec_insert(sess, ins).await,
         Statement::Query(_) => {
             // Analytical routing happens before the point-query fast path so
@@ -526,7 +552,18 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             // RLS off see the fast path exactly as before — same one-`bool`
             // catalog read the existing path already pays.
             if let Some(plan) = match_simple_select(&stmt) {
-                if !table_has_rls(sess, &plan.table).await?
+                // Skip the fast path when the "table" is actually a plain view:
+                // the fast path reads Parquet directly and would fail with NotFound.
+                // The full DataFusion path (exec_select below) rewrites view refs.
+                let is_view = sess
+                    .engine
+                    .config()
+                    .catalog
+                    .lookup_view(&sess.tenant, plan.table.as_str())
+                    .await
+                    .is_some();
+                if !is_view
+                    && !table_has_rls(sess, &plan.table).await?
                     && !table_has_soft_delete(sess, &plan.table).await?
                 {
                     return execute_simple_select(sess, plan).await;
@@ -1898,6 +1935,21 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
         )
         .await?;
     }
+
+    // View-reference rewriting: replace any reference to a known plain view
+    // in the SQL's FROM / JOIN clauses with an inline subquery so DataFusion
+    // sees a derived table rather than an unknown table name. This is a
+    // no-op when the tenant has no registered views.
+    let view_rewritten_owned;
+    let sql = if let Some(rewritten) =
+        crate::view_ddl::rewrite_view_refs(sess.engine.config().catalog.as_ref(), &sess.tenant, sql)
+            .await?
+    {
+        view_rewritten_owned = rewritten;
+        view_rewritten_owned.as_str()
+    } else {
+        sql
+    };
 
     let mut df = sess
         .ctx

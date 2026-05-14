@@ -28,6 +28,7 @@ use crate::reactors::{self, ReactorDef, ReactorError};
 use crate::sequences::{advance_one, SequenceDef, SequenceError, SequenceState};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::tenant_storage_config::TenantStorageConfig;
+use crate::views::ViewDef;
 use crate::Catalog;
 
 /// One table's mutable state. The per-table mutex serializes commits so
@@ -144,6 +145,9 @@ pub struct InMemoryCatalog {
     /// per-tenant cost stays `O(bytes)` with no per-tenant heavy
     /// resource. Cleared in `drop_namespace`.
     tenant_storage_config: Mutex<HashMap<TenantId, TenantStorageConfig>>,
+    /// Per-tenant plain-view definitions (`CREATE VIEW … AS SELECT …`).
+    /// Same shape as `sql_functions`: keyed by `(TenantId, lower-name)`.
+    views: Mutex<HashMap<(TenantId, String), ViewDef>>,
 }
 
 /// Aggregate reactor state. The seq counter assigns each newly-
@@ -185,6 +189,7 @@ impl InMemoryCatalog {
             domains: Mutex::new(HashMap::new()),
             procedures: Mutex::new(HashMap::new()),
             tenant_storage_config: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1196,6 +1201,42 @@ impl Catalog for InMemoryCatalog {
     ) -> Result<Option<TenantStorageConfig>> {
         let map = self.tenant_storage_config.lock().await;
         Ok(map.get(tenant).cloned())
+    }
+
+    async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {
+        let key = (def.tenant, def.name.to_ascii_lowercase());
+        let mut map = self.views.lock().await;
+        if !or_replace && map.contains_key(&key) {
+            return Err(BasinError::Catalog(format!(
+                "view {:?} already exists",
+                def.name
+            )));
+        }
+        map.insert(key, def);
+        Ok(())
+    }
+
+    async fn drop_view(&self, tenant: &TenantId, name: &str, if_exists: bool) -> Result<()> {
+        let key = (*tenant, name.to_ascii_lowercase());
+        let mut map = self.views.lock().await;
+        if map.remove(&key).is_none() && !if_exists {
+            return Err(BasinError::NotFound(format!("view {name:?} does not exist")));
+        }
+        Ok(())
+    }
+
+    async fn lookup_view(&self, tenant: &TenantId, name: &str) -> Option<ViewDef> {
+        let key = (*tenant, name.to_ascii_lowercase());
+        let map = self.views.lock().await;
+        map.get(&key).cloned()
+    }
+
+    async fn list_views(&self, tenant: &TenantId) -> Vec<ViewDef> {
+        let map = self.views.lock().await;
+        map.iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, v)| v.clone())
+            .collect()
     }
 }
 

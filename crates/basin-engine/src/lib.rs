@@ -609,6 +609,7 @@ mod types;
 mod udf;
 mod vector_planner;
 mod vector_search;
+mod view_ddl;
 pub mod webhook_ddl;
 pub mod webhook_registry;
 

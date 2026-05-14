@@ -697,6 +697,67 @@ impl TableProvider for InfoSchemaViewsProvider {
     }
 }
 
+/// `TableProvider` for `pg_catalog.pg_views` filtered to the calling tenant.
+/// Surfaces both plain views (`CREATE VIEW`) and continuous materialized views.
+pub(crate) struct PgViewsProvider {
+    catalog: Arc<dyn Catalog>,
+    tenant: TenantId,
+    schema: DfSchemaRef,
+}
+
+impl std::fmt::Debug for PgViewsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgViewsProvider")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PgViewsProvider {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+        let ws_schema = InfoSchemaQuery::pg_views_schema();
+        let df_schema = schema_ws_to_df(ws_schema.as_ref())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(Self {
+            catalog,
+            tenant,
+            schema: Arc::new(df_schema),
+        })
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgViewsProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> DfSchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let ws_batch = InfoSchemaQuery::pg_views(self.catalog.as_ref(), &self.tenant)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let partitions = vec![vec![df_batch]];
+        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(Arc::new(exec))
+    }
+}
+
 /// `TableProvider` for `information_schema.schemata` filtered to the
 /// calling tenant. v0.1 emits exactly one row (`"public"`).
 pub(crate) struct InfoSchemaSchemataProvider {
@@ -1252,8 +1313,13 @@ pub(crate) fn register_info_schema_providers(
         Arc::new(PgDependProvider::new(catalog.clone(), tenant)?);
     pg_catalog_schema.register_table("pg_depend".to_string(), pg_depend_provider)?;
     let pg_authid_provider: Arc<dyn TableProvider> =
-        Arc::new(PgAuthidProvider::new(catalog, tenant)?);
+        Arc::new(PgAuthidProvider::new(catalog.clone(), tenant)?);
     pg_catalog_schema.register_table("pg_authid".to_string(), pg_authid_provider)?;
+
+    // pg_catalog.pg_views: plain views + continuous matviews.
+    let pg_views_provider: Arc<dyn TableProvider> =
+        Arc::new(PgViewsProvider::new(catalog, tenant)?);
+    pg_catalog_schema.register_table("pg_views".to_string(), pg_views_provider)?;
 
     Ok(())
 }

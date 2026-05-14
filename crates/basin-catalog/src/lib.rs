@@ -38,6 +38,7 @@ mod rest;
 mod sequences;
 mod snapshot;
 mod tenant_storage_config;
+mod views;
 
 use async_trait::async_trait;
 use basin_common::{ChangeOp, Result, TableName, TenantId};
@@ -53,6 +54,7 @@ pub use metadata::{
     PolicyCommand, RefAction, SecondaryIndex, TableMetadata, UniqueConstraint,
 };
 pub use postgres::PostgresCatalog;
+pub use views::ViewDef;
 pub use procedures::{ProcedureError, SqlProcedureDef};
 pub use reactors::{ReactorDef, ReactorError, ReactorOps};
 pub use rest::RestCatalog;
@@ -1010,5 +1012,53 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         let _ = (tenant, table, unique_constraints);
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Plain views (CREATE VIEW … AS SELECT …)
+    // -------------------------------------------------------------------------
+
+    /// Register (or replace) a plain SQL view definition for `tenant`.
+    ///
+    /// `CREATE VIEW v AS <sql>` calls this with `or_replace = false`;
+    /// `CREATE OR REPLACE VIEW v AS <sql>` calls it with `or_replace = true`.
+    ///
+    /// With `or_replace = false`, returns
+    /// [`basin_common::BasinError::Catalog`] when a view with that name
+    /// already exists (same convention as `create_table` / `create_sequence`).
+    ///
+    /// Default impl: `Internal("not implemented")`.
+    async fn register_view(&self, def: views::ViewDef, or_replace: bool) -> Result<()> {
+        let _ = (def, or_replace);
+        Err(basin_common::BasinError::Internal(
+            "register_view not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a previously-registered plain view. Returns
+    /// [`basin_common::BasinError::NotFound`] if no view with that name
+    /// exists and `if_exists = false`. With `if_exists = true` the call is
+    /// a no-op when the view is absent.
+    ///
+    /// Default impl: `Internal("not implemented")`.
+    async fn drop_view(&self, tenant: &TenantId, name: &str, if_exists: bool) -> Result<()> {
+        let _ = (tenant, name, if_exists);
+        Err(basin_common::BasinError::Internal(
+            "drop_view not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a registered plain view by `(tenant, name)`. Returns `None`
+    /// when the view does not exist. Default impl: `None`.
+    async fn lookup_view(&self, tenant: &TenantId, name: &str) -> Option<views::ViewDef> {
+        let _ = (tenant, name);
+        None
+    }
+
+    /// List every plain view registered for `tenant`. Order is unspecified.
+    /// Default impl: empty.
+    async fn list_views(&self, tenant: &TenantId) -> Vec<views::ViewDef> {
+        let _ = tenant;
+        Vec::new()
     }
 }

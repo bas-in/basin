@@ -880,14 +880,16 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `information_schema.views` filtered to `tenant`'s
-    /// continuous materialized views. Same `list_tables` + `load_table`
-    /// pattern as [`Self::pg_class`]; we filter to tables whose
-    /// `continuous_aggregate` is `Some(_)` and pull the SELECT body out
-    /// of `CvDef::query_sql`.
+    /// Build `information_schema.views` filtered to `tenant`.
     ///
-    /// Cross-tenant leak is a P0 invariant: only [`Catalog::list_tables`]
-    /// / [`Catalog::load_table`] for `tenant` are consulted.
+    /// Returns one row per:
+    /// - Plain view registered via `CREATE VIEW … AS SELECT …`
+    ///   ([`Catalog::list_views`]).
+    /// - Continuous materialized view (`CREATE MATERIALIZED VIEW … WITH
+    ///   (basin.continuous, …)`) — same as before.
+    ///
+    /// Cross-tenant leak is a P0 invariant: only APIs scoped to `tenant`
+    /// are consulted.
     pub async fn views(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
         let names = catalog.list_tables(tenant).await?;
 
@@ -899,10 +901,9 @@ impl InfoSchemaQuery {
         let mut updatables: Vec<&str> = Vec::new();
         let mut insertables: Vec<&str> = Vec::new();
 
+        // 1. Continuous materialized views (existing path).
         for name in &names {
             let meta = catalog.load_table(tenant, name).await?;
-            // Filter to matviews (continuous aggregates) — same boundary
-            // `pg_class.relkind == 'm'` uses.
             let Some(cv) = meta.continuous_aggregate.as_ref() else {
                 continue;
             };
@@ -910,6 +911,18 @@ impl InfoSchemaQuery {
             schemas.push(DEFAULT_SCHEMA);
             table_names.push(name.as_str().to_string());
             definitions.push(cv.query_sql.clone());
+            check_options.push(VIEW_CHECK_OPTION_NONE);
+            updatables.push(VIEW_FLAG_NO);
+            insertables.push(VIEW_FLAG_NO);
+        }
+
+        // 2. Plain views registered via CREATE VIEW.
+        let plain_views = catalog.list_views(tenant).await;
+        for v in plain_views {
+            catalogs.push(BASIN_CATALOG_NAME);
+            schemas.push(DEFAULT_SCHEMA);
+            table_names.push(v.name.clone());
+            definitions.push(v.query_sql.clone());
             check_options.push(VIEW_CHECK_OPTION_NONE);
             updatables.push(VIEW_FLAG_NO);
             insertables.push(VIEW_FLAG_NO);
@@ -927,6 +940,70 @@ impl InfoSchemaQuery {
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("info_schema.views build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_views
+    // -----------------------------------------------------------------------
+
+    /// Schema for `pg_catalog.pg_views` rows.
+    ///
+    /// | column      | type | notes                              |
+    /// |-------------|------|------------------------------------|
+    /// | schemaname  | TEXT | always `"public"`                  |
+    /// | viewname    | TEXT | the view name                      |
+    /// | viewowner   | TEXT | `""` placeholder (v0.2 wires auth) |
+    /// | definition  | TEXT | the stored SELECT body             |
+    pub fn pg_views_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("schemaname", DataType::Utf8, false),
+            Field::new("viewname", DataType::Utf8, false),
+            Field::new("viewowner", DataType::Utf8, false),
+            Field::new("definition", DataType::Utf8, false),
+        ]))
+    }
+
+    /// Build `pg_catalog.pg_views` filtered to `tenant`. One row per plain
+    /// view registered via `CREATE VIEW … AS SELECT …` plus one row per
+    /// continuous materialized view.
+    pub async fn pg_views(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+
+        let mut schema_names: Vec<&str> = Vec::new();
+        let mut view_names: Vec<String> = Vec::new();
+        let mut owners: Vec<&str> = Vec::new();
+        let mut definitions: Vec<String> = Vec::new();
+
+        // Continuous materialized views.
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            let Some(cv) = meta.continuous_aggregate.as_ref() else {
+                continue;
+            };
+            schema_names.push(DEFAULT_SCHEMA);
+            view_names.push(name.as_str().to_string());
+            owners.push("");
+            definitions.push(cv.query_sql.clone());
+        }
+
+        // Plain views.
+        let plain_views = catalog.list_views(tenant).await;
+        for v in plain_views {
+            schema_names.push(DEFAULT_SCHEMA);
+            view_names.push(v.name.clone());
+            owners.push("");
+            definitions.push(v.query_sql.clone());
+        }
+
+        let schema = Self::pg_views_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(schema_names)),
+            Arc::new(StringArray::from(view_names)),
+            Arc::new(StringArray::from(owners)),
+            Arc::new(StringArray::from(definitions)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_views build: {e}")))
     }
 
     /// Schema for `information_schema.schemata` rows.
