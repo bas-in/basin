@@ -245,6 +245,9 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
     let rewritten = crate::udf::rewrite_extract_second(&rewritten);
+    // Rewrite PG aggregate name aliases that DataFusion exposes under a
+    // different name: `variance(x)` → `var(x)`, `every(x)` → `bool_and(x)`.
+    let rewritten = crate::udf::rewrite_pg_agg_aliases(&rewritten);
     // User-defined `LANGUAGE sql` function inlining. The rewriter is a
     // no-op for tenants with no registered functions and for statements
     // that contain no function calls at all (the cheap pre-gate runs

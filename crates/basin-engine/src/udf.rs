@@ -2468,3 +2468,62 @@ impl ScalarUDFImpl for AuthJwtUdf {
         }
     }
 }
+
+// ── PG aggregate alias rewriter ───────────────────────────────────────────────
+
+/// Rewrite PostgreSQL aggregate function aliases to DataFusion equivalents.
+///
+/// Mappings applied (case-insensitive, word-boundary-safe):
+///   `variance(…)` → `var(…)`       (DF primary name is "var"; aliases include "var_samp")
+///   `every(…)`    → `bool_and(…)`  (PG synonym; DF has no alias for this)
+///
+/// The rewrite fires before DataFusion's SQL planner so users can write
+/// standard PostgreSQL aggregate names in their queries.
+pub(crate) fn rewrite_pg_agg_aliases(sql: &str) -> String {
+    // Each entry: (name_without_paren, replacement_name_with_open_paren)
+    const TARGETS: &[(&str, &str)] = &[
+        ("variance", "var("),
+        ("every", "bool_and("),
+    ];
+    let mut out = sql.to_string();
+    for (from_name, to_with_paren) in TARGETS {
+        let mut scan_pos = 0usize;
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(rel_found) = lower[scan_pos..].find(from_name) else {
+                break;
+            };
+            let abs_start = scan_pos + rel_found;
+            let abs_end = abs_start + from_name.len();
+
+            // Identifier-boundary check before the name
+            let pre_ok = abs_start == 0 || {
+                let prev = out.as_bytes()[abs_start - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'_')
+            };
+            // Identifier-boundary check after the name
+            let post_char_ok = abs_end >= out.len() || {
+                let next = out.as_bytes()[abs_end];
+                // Must be followed by '(' or whitespace (not another identifier char)
+                next == b'(' || next == b' ' || next == b'\t' || next == b'\n' || next == b'\r'
+            };
+
+            if pre_ok && post_char_ok {
+                // Find the first '(' at or after abs_end
+                let maybe_paren = out[abs_end..].find('(').map(|p| abs_end + p);
+                if let Some(paren_pos) = maybe_paren {
+                    // Only rewrite if only whitespace between name and '('
+                    let between = &out[abs_end..paren_pos];
+                    if between.chars().all(char::is_whitespace) {
+                        let replace_end = paren_pos + 1; // consume the '(' too
+                        out.replace_range(abs_start..replace_end, to_with_paren);
+                        scan_pos = abs_start + to_with_paren.len();
+                        continue;
+                    }
+                }
+            }
+            scan_pos = abs_start + 1;
+        }
+    }
+    out
+}
