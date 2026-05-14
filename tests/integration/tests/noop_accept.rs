@@ -31,7 +31,6 @@ use std::sync::Arc;
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
 use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
-use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -41,11 +40,6 @@ use tempfile::TempDir;
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn open_engine() -> (TempDir, Engine) {
-// ---------------------------------------------------------------------------
-// Test harness
-// ---------------------------------------------------------------------------
-
-async fn open_session() -> (TempDir, basin_engine::TenantSession) {
     let dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let storage = Storage::new(StorageConfig {
@@ -63,8 +57,14 @@ async fn open_session() -> (TempDir, basin_engine::TenantSession) {
     (dir, engine)
 }
 
-async fn open_session(engine: &Engine) -> TenantSession {
+async fn open_session_with_engine(engine: &Engine) -> TenantSession {
     engine.open_session(TenantId::new()).await.unwrap()
+}
+
+async fn open_session() -> (TempDir, TenantSession) {
+    let (dir, engine) = open_engine().await;
+    let sess = open_session_with_engine(&engine).await;
+    (dir, sess)
 }
 
 /// Assert that `sql` executes without error and returns an empty tag matching
@@ -93,7 +93,7 @@ async fn assert_noop(sess: &TenantSession, sql: &str, expected_tag: &str) {
 #[tokio::test]
 async fn prepare_text_form_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     // Text-form PREPARE — rare (some migration tools use it). The real
     // extended-query path uses pgwire Parse/Bind/Execute messages.
     assert_noop(&sess, "PREPARE my_stmt AS SELECT 1", "PREPARE").await;
@@ -102,21 +102,21 @@ async fn prepare_text_form_is_accepted() {
 #[tokio::test]
 async fn execute_text_form_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "EXECUTE my_stmt", "EXECUTE").await;
 }
 
 #[tokio::test]
 async fn deallocate_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "DEALLOCATE my_stmt", "DEALLOCATE").await;
 }
 
 #[tokio::test]
 async fn deallocate_all_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "DEALLOCATE ALL", "DEALLOCATE").await;
 }
 
@@ -130,42 +130,42 @@ async fn begin_is_accepted() {
     // implicit BEGIN/COMMIT (e.g. lib/pq in non-autocommit mode) from
     // bouncing with 0A000.
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "BEGIN", "BEGIN").await;
 }
 
 #[tokio::test]
 async fn begin_transaction_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "BEGIN TRANSACTION", "BEGIN").await;
 }
 
 #[tokio::test]
 async fn start_transaction_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "START TRANSACTION", "BEGIN").await;
 }
 
 #[tokio::test]
 async fn commit_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "COMMIT", "COMMIT").await;
 }
 
 #[tokio::test]
 async fn rollback_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "ROLLBACK", "ROLLBACK").await;
 }
 
 #[tokio::test]
 async fn savepoint_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "SAVEPOINT my_sp", "SAVEPOINT").await;
 }
 
@@ -174,14 +174,14 @@ async fn release_savepoint_is_accepted() {
     // RELEASE SAVEPOINT also arrives as TransactionStmt / RELEASE kind;
     // the StmtKind::Savepoint arm covers both SAVEPOINT and RELEASE.
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "RELEASE SAVEPOINT my_sp", "SAVEPOINT").await;
 }
 
 #[tokio::test]
 async fn rollback_to_savepoint_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "ROLLBACK TO SAVEPOINT my_sp", "ROLLBACK").await;
 }
 
@@ -196,7 +196,7 @@ async fn create_trigger_is_accepted() {
     // common trigger use cases. CREATE TRIGGER is accepted syntactically so
     // migration scripts don't bounce.
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(
         &sess,
         "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
@@ -208,7 +208,7 @@ async fn create_trigger_is_accepted() {
 #[tokio::test]
 async fn drop_trigger_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "DROP TRIGGER trg ON t", "DROP TRIGGER").await;
 }
 
@@ -224,14 +224,14 @@ async fn create_extension_is_accepted() {
     // basin-engine UDFs, uuid-ossp → native UUID, pg_vector → native
     // vector(N), PostGIS subset → basin-geo, pg_trgm → basin-trgm, etc.).
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "CREATE EXTENSION IF NOT EXISTS pgcrypto", "CREATE EXTENSION").await;
 }
 
 #[tokio::test]
 async fn drop_extension_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "DROP EXTENSION pgcrypto", "DROP EXTENSION").await;
 }
 
@@ -246,7 +246,7 @@ async fn merge_basic_is_accepted() {
     // WHEN MATCHED UPDATE and WHEN NOT MATCHED INSERT branches as separate
     // UPDATE / INSERT statements until Phase 5 ships real MERGE execution.
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(
         &sess,
         "MERGE INTO target t \
@@ -261,7 +261,7 @@ async fn merge_basic_is_accepted() {
 #[tokio::test]
 async fn merge_matched_only_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(
         &sess,
         "MERGE INTO t USING s ON t.id = s.id \
@@ -281,14 +281,14 @@ async fn reindex_table_is_accepted() {
     // manual rebuild is needed. REINDEX is accepted so tooling scripts
     // (e.g. pg_restore with REINDEX DATABASE) don't bounce.
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "REINDEX TABLE t", "REINDEX").await;
 }
 
 #[tokio::test]
 async fn reindex_index_is_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     assert_noop(&sess, "REINDEX INDEX idx", "REINDEX").await;
 }
 
@@ -301,7 +301,7 @@ async fn listen_is_still_rejected_with_0a000() {
     // LISTEN is an explicit non-goal per ADR 0012 and must NOT be in the
     // noop-accept set. This test proves it was not accidentally accepted.
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     let err = sess
         .execute("LISTEN my_channel")
         .await
@@ -316,7 +316,7 @@ async fn listen_is_still_rejected_with_0a000() {
 #[tokio::test]
 async fn notify_is_still_rejected_with_0a000() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     let err = sess
         .execute("NOTIFY my_channel")
         .await
@@ -331,7 +331,7 @@ async fn notify_is_still_rejected_with_0a000() {
 #[tokio::test]
 async fn unlisten_is_still_rejected_with_0a000() {
     let (_dir, engine) = open_engine().await;
-    let sess = open_session(&engine).await;
+    let sess = open_session_with_engine(&engine).await;
     let err = sess
         .execute("UNLISTEN my_channel")
         .await
@@ -341,8 +341,6 @@ async fn unlisten_is_still_rejected_with_0a000() {
         msg.contains("0A000") || msg.contains("not supported"),
         "expected 0A000 rejection for UNLISTEN, got: {msg}"
     );
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
-    (dir, sess)
 }
 
 /// Assert that `sql` executes without error and returns `ExecResult::Empty`.

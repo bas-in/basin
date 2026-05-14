@@ -37,9 +37,9 @@ async fn make_engine() -> (Engine, TenantId) {
     let engine = Engine::new(EngineConfig {
         storage,
         catalog,
-        ..Default::default()
+        shard: None,
     });
-    let tenant = TenantId::new_v4();
+    let tenant = TenantId::new();
     let sess = engine.open_session(tenant).await.expect("open_session");
     sess.execute("CREATE TABLE t (id BIGINT, data JSONB)")
         .await

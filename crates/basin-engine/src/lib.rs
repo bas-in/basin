@@ -345,6 +345,12 @@ impl Engine {
         self.inner.vector_routing_count.load(Ordering::Relaxed)
     }
 
+    /// Number of statements routed through the pg_query / pg_plan path.
+    /// Stub: returns 0 until the counter is wired up.
+    pub fn pg_plan_routing_count(&self) -> u64 {
+        0
+    }
+
     /// Open a session bound to `tenant`. The catalog namespace is created on
     /// demand if it does not yet exist.
     ///

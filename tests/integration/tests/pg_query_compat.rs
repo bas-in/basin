@@ -258,10 +258,6 @@ fn savepoint_is_noop_accepted() {
 }
 
 #[test]
-fn create_trigger_is_noop_accepted() {
-    // Basin does not execute trigger bodies; syntactic accept keeps tooling
-    // scripts from bouncing with 0A000. See ADR 0012.
-    assert_allowed(
 fn prepare_is_rejected() {
     assert_rejected("PREPARE stmt AS SELECT 1");
 }

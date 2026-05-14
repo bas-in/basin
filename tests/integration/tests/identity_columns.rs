@@ -33,7 +33,6 @@
 
 use std::sync::Arc;
 
-use arrow_array::Int64Array;
 use arrow_array::{Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
