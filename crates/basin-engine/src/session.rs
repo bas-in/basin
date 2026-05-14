@@ -72,6 +72,12 @@ pub(crate) struct SessionState {
     /// sequence". Empty until the session's first `nextval`; consulted
     /// by the SQL-string sequence rewriter on every `currval` call.
     pub(crate) sequence_cache: Arc<crate::seq_udf::SessionSequenceCache>,
+    /// Per-session open-cursor registry. `DECLARE … CURSOR FOR …`
+    /// materialises the SELECT result and stores it here under the cursor
+    /// name; `FETCH` / `MOVE` advance the position; `CLOSE` removes the
+    /// entry.  All cursors are destroyed when the session is dropped
+    /// (`CursorRegistry` holds no external state).
+    pub(crate) cursors: crate::cursor::CursorRegistry,
 }
 
 impl SessionState {
@@ -81,6 +87,7 @@ impl SessionState {
             prepared: crate::prepared::PreparedRegistry::new(),
             has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
             sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
+            cursors: crate::cursor::CursorRegistry::new(),
         }
     }
 }

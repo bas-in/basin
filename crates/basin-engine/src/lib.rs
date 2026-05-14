@@ -574,6 +574,7 @@ pub enum ExecResult {
 
 mod alter;
 mod analytical_route;
+mod cursor;
 mod constraints;
 mod convert;
 mod cost_check;
