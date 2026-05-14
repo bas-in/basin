@@ -39,6 +39,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `SHOW TABLES` | ✅ | per-tenant scoped |
 | `ORDER BY` / `LIMIT` | ✅ | full DataFusion support |
 | Joins (single-shard) | 🛠 | DataFusion handles them; not yet exercised in tests |
+| `LATERAL` subqueries / joins | ✅ | `FROM t, LATERAL (SELECT …) sub`, `CROSS JOIN LATERAL (…)`, `LEFT JOIN LATERAL (…) ON true`. Non-correlated shapes execute end-to-end via DataFusion 44. Correlated `OuterReferenceColumn` (WHERE inside LATERAL references outer column) is logical-planned but not yet physical-executed in DataFusion 44. Exercised by `tests/integration/tests/lateral_joins.rs`. |
 | `UPDATE` / `DELETE` | ✅ | Copy-on-write Iceberg v2. Single-scan partition; `replace_data_files` with optimistic concurrency on both catalog backends; physical deletion of replaced Parquet files. |
 | `ALTER TABLE` | ✅ | `ADD COLUMN`, `SET cold_after`, `SET cold_age_column`, `SET BLOOM FILTERS ON`, `SET row_group_rows`, `RESET row_group_rows`, `CLUSTER BY (...)`, `RESET CLUSTER BY`, `ENABLE/DISABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `DROP POLICY` |
 | `GENERATED ALWAYS AS (expr) STORED` columns | ✅ | Phase 5.11.K. Expression evaluated on INSERT and re-evaluated on every UPDATE row. Direct writes rejected with SQLSTATE 42601. VIRTUAL deferred to v0.2. Self-reference rejected at registration. |

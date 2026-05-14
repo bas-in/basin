@@ -25,6 +25,7 @@
 //! - UPDATE / DELETE                      -> covered elsewhere: tests/integration/tests/viability_update_delete.rs
 //! - ALTER TABLE                          -> covered elsewhere: tests/integration/tests/viability_alter_table.rs
 //! - CREATE POLICY (RLS)                  -> covered elsewhere: tests/integration/tests/viability_rls_basic.rs
+//! - LATERAL subqueries / joins           -> covered elsewhere: tests/integration/tests/lateral_joins.rs
 //! - Prepared statements + parameter bind -> covered elsewhere: tests/integration/tests/poc_extended_smoke.rs
 //!
 //! ## Types
