@@ -2638,6 +2638,46 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
+    async fn list_sequences(&self, tenant: &TenantId) -> Vec<SequenceDef> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT name, start_value, increment, min_value, max_value, cache_size, cycle \
+                     FROM {sch}.sequences \
+                     WHERE tenant_id = $1"
+                ),
+                &[&tenant.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .map(|row| {
+                let name: String = row.get(0);
+                let start: i64 = row.get(1);
+                let increment: i64 = row.get(2);
+                let min_value: i64 = row.get(3);
+                let max_value: i64 = row.get(4);
+                let cache_size_pg: i64 = row.get(5);
+                let cycle: bool = row.get(6);
+                SequenceDef {
+                    tenant: *tenant,
+                    name,
+                    start,
+                    increment,
+                    min_value,
+                    max_value,
+                    cache_size: cache_size_pg.max(0) as u64,
+                    cycle,
+                }
+            })
+            .collect()
+    }
+
     #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
     async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
         procedures::validate_new(&def).map_err(procedure_err_to_basin)?;

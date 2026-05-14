@@ -1135,6 +1135,15 @@ impl Catalog for InMemoryCatalog {
             .collect()
     }
 
+    #[instrument(skip(self), fields(tenant = %tenant))]
+    async fn list_sequences(&self, tenant: &TenantId) -> Vec<SequenceDef> {
+        let map = self.sequences.lock().await;
+        map.iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, entry)| entry.def.clone())
+            .collect()
+    }
+
     #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
     async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
         procedures::validate_new(&def).map_err(procedure_err_to_basin)?;

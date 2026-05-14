@@ -901,6 +901,12 @@ pub trait Catalog: Send + Sync {
         Vec::new()
     }
 
+    /// List every sequence registered for `tenant`. Default impl: empty.
+    async fn list_sequences(&self, tenant: &TenantId) -> Vec<SequenceDef> {
+        let _ = tenant;
+        Vec::new()
+    }
+
     /// Register a `LANGUAGE sql` user-defined procedure. The catalog
     /// stores the definition verbatim; the engine reparses the body
     /// (and re-substitutes call-site arguments into each statement) on
