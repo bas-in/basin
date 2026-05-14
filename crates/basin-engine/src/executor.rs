@@ -7,7 +7,9 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{DataFileRef, TableMetadata};
 use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName};
 use basin_storage::WriteOptions;
-use sqlparser::ast::{ObjectName, SetExpr, Statement};
+use sqlparser::ast::{
+    AssignmentTarget, ConflictTarget, ObjectName, OnConflictAction, OnInsert, SetExpr, Statement,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -1055,6 +1057,28 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     let name = single_part_name(&ins.table_name)?;
     let table = TableName::new(name)?;
 
+    // --- DEFAULT VALUES: source is None and columns list is empty -----------
+    // `INSERT INTO t DEFAULT VALUES` — build a single all-NULL row then let
+    // `apply_column_defaults` stamp defaults on every non-generated column.
+    if ins.source.is_none() {
+        return exec_insert_default_values(sess, ins).await;
+    }
+
+    // --- ON CONFLICT DO UPDATE pre-check ------------------------------------
+    // If the statement has ON CONFLICT (col) DO UPDATE SET …, check whether
+    // the conflict column already has that value and route to UPDATE if so.
+    if let Some(OnInsert::OnConflict(ref on_conflict)) = ins.on {
+        if let OnConflictAction::DoUpdate(_) = &on_conflict.action {
+            if let Some(result) =
+                try_on_conflict_do_update(sess, &table, &ins, on_conflict).await?
+            {
+                return Ok(result);
+            }
+            // result is None means no conflict was found — fall through to
+            // the normal INSERT path.
+        }
+    }
+
     // Pull literal rows out of `INSERT ... VALUES (...)`. Subquery inserts
     // (`INSERT ... SELECT ...`) are routed through `exec_insert_select`
     // below; the body is materialised into VALUES-shaped rows.
@@ -1317,6 +1341,14 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 
+    // RETURNING: if the caller asked for RETURNING *, return the inserted batch.
+    if ins.returning.is_some() {
+        return Ok(ExecResult::Rows {
+            schema: batch.schema(),
+            batches: vec![batch],
+        });
+    }
+
     Ok(ExecResult::Empty {
         tag: format!("INSERT 0 {row_count}"),
     })
@@ -1550,6 +1582,273 @@ async fn exec_insert_select(
         tag: format!("INSERT 0 {row_count}"),
     })
 }
+
+// ---------------------------------------------------------------------------
+// INSERT DEFAULT VALUES
+// ---------------------------------------------------------------------------
+
+/// Handle `INSERT INTO t DEFAULT VALUES`.
+///
+/// Builds a single all-NULL row then applies every non-generated column's
+/// DEFAULT expression. Columns without a DEFAULT stay NULL (which will fail
+/// NOT NULL enforcement in `batch_from_rows` if the column is NOT NULL, giving
+/// the user a clean error rather than a silent bad insert).
+async fn exec_insert_default_values(
+    sess: &TenantSession,
+    ins: sqlparser::ast::Insert,
+) -> Result<ExecResult> {
+    use sqlparser::ast::{Expr, Value};
+
+    let name = single_part_name(&ins.table_name)?;
+    let table = TableName::new(name)?;
+
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, &table)
+        .await?;
+    let schema = meta.schema.clone();
+
+    // Build one all-NULL row spanning all schema columns.
+    let mut row: Vec<Expr> = schema
+        .fields()
+        .iter()
+        .map(|_| Expr::Value(Value::Null))
+        .collect();
+
+    // Apply defaults to every non-generated column (treat all as unmentioned).
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        if crate::types::field_is_generated(field).is_some() {
+            continue;
+        }
+        let Some(default_text) = crate::types::field_default_text(field) else {
+            continue;
+        };
+        let expr = crate::seq_ddl::evaluate_default_expression(sess, default_text).await?;
+        row[col_idx] = expr;
+    }
+
+    let rows = vec![row];
+    let batch = batch_from_rows(schema.clone(), &rows)?;
+    let batch = crate::generated_cols::materialise_generated_columns(
+        &sess.engine.config().catalog,
+        &sess.tenant,
+        batch,
+    )
+    .await?;
+    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.tenant, &batch)
+        .await?;
+    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.tenant, &batch)
+        .await?;
+    crate::constraints::enforce_check_constraints(
+        table.as_str(),
+        meta.schema.as_ref(),
+        &meta.check_constraints,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_fk_on_insert(
+        &sess.engine.config().catalog,
+        &sess.engine.config().storage,
+        &sess.tenant,
+        table.as_str(),
+        &meta.foreign_keys,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_pk_on_insert(
+        &sess.engine.config().storage,
+        &sess.tenant,
+        &table,
+        table.as_str(),
+        &meta.pk_columns,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_unique_on_insert(
+        &sess.engine.config().storage,
+        &sess.tenant,
+        &table,
+        table.as_str(),
+        &meta.unique_constraints,
+        &batch,
+    )
+    .await?;
+
+    let row_count = batch.num_rows();
+    let part = PartitionKey::default_key();
+    let opts = write_options_for(&meta);
+
+    let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
+    let df = sess
+        .engine
+        .config()
+        .storage
+        .write_batch_with_options(&sess.tenant, &table, &part, &batch, &opts)
+        .await?;
+    let file_ref = DataFileRef {
+        path: df.path.as_ref().to_string(),
+        size_bytes: df.size_bytes,
+        row_count: df.row_count,
+        column_stats: df.column_stats.clone(),
+    };
+
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    dispatch_pre_commit(&sess.engine, &events).await?;
+    commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
+    dispatch_post_commit(&sess.engine, events);
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
+
+    if ins.returning.is_some() {
+        return Ok(ExecResult::Rows {
+            schema: batch.schema(),
+            batches: vec![batch],
+        });
+    }
+    Ok(ExecResult::Empty {
+        tag: format!("INSERT 0 {row_count}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// INSERT … ON CONFLICT (col) DO UPDATE SET …
+// ---------------------------------------------------------------------------
+
+/// Pre-check strategy for ON CONFLICT DO UPDATE (upsert).
+///
+/// Returns `Some(result)` if the conflict row was found and an UPDATE was
+/// applied. Returns `Ok(None)` when no conflict exists, so the caller falls
+/// through to a plain INSERT.
+async fn try_on_conflict_do_update(
+    sess: &TenantSession,
+    table: &TableName,
+    ins: &sqlparser::ast::Insert,
+    on_conflict: &sqlparser::ast::OnConflict,
+) -> Result<Option<ExecResult>> {
+    use sqlparser::ast::OnConflictAction;
+
+    let do_update = match &on_conflict.action {
+        OnConflictAction::DoUpdate(u) => u,
+        OnConflictAction::DoNothing => return Ok(None),
+    };
+
+    // Extract the conflict column(s). We support the `(col)` form for v0.1.
+    let conflict_cols: Vec<String> = match &on_conflict.conflict_target {
+        Some(ConflictTarget::Columns(idents)) => {
+            idents.iter().map(|i| i.value.clone()).collect()
+        }
+        _ => {
+            // No explicit target — skip upsert pre-check; fall through to
+            // plain INSERT (which will surface a constraint error if needed).
+            return Ok(None);
+        }
+    };
+    if conflict_cols.is_empty() {
+        return Ok(None);
+    }
+
+    // Resolve the inserted row to get the conflict-column value(s).
+    let source = match ins.source.as_ref() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let rows_raw = match source.body.as_ref() {
+        SetExpr::Values(v) => &v.rows,
+        _ => return Ok(None),
+    };
+    if rows_raw.is_empty() {
+        return Ok(None);
+    }
+    // Only handle the single-row case for v0.1 upsert.
+    // Multi-row upserts fall through to the normal INSERT path which will
+    // surface a constraint error on conflict.
+    if rows_raw.len() != 1 {
+        return Ok(None);
+    }
+
+    // Build the WHERE clause for the existence check.
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, table)
+        .await?;
+    let schema = meta.schema.clone();
+
+    // Expand the row to schema-width so we can look up conflict-col positions.
+    let mut rows_expanded = expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
+    apply_column_defaults(sess, schema.as_ref(), &ins.columns, &mut rows_expanded).await?;
+
+    // Build WHERE conflict_col = value AND ... for the pre-check SELECT.
+    let mut where_parts: Vec<String> = Vec::with_capacity(conflict_cols.len());
+    for col_name in &conflict_cols {
+        let col_idx = schema.index_of(col_name).map_err(|_| {
+            BasinError::InvalidSchema(format!("ON CONFLICT: unknown column {col_name:?}"))
+        })?;
+        let col_expr = &rows_expanded[0][col_idx];
+        where_parts.push(format!("{} = {}", col_name, col_expr));
+    }
+    let where_clause = where_parts.join(" AND ");
+
+    // Run the existence check.
+    let check_sql = format!(
+        "SELECT 1 FROM {} WHERE {}",
+        table.as_str(),
+        where_clause
+    );
+    let exists = match sess.ctx.sql(&check_sql).await {
+        Ok(df) => {
+            let batches = df.collect().await.map_err(|e| {
+                BasinError::internal(format!("ON CONFLICT existence check execute: {e}"))
+            })?;
+            batches.iter().any(|b| b.num_rows() > 0)
+        }
+        Err(_) => {
+            // Table may be empty (no parquet file yet) → no conflict.
+            false
+        }
+    };
+
+    if !exists {
+        return Ok(None); // No conflict — let the caller do a normal INSERT.
+    }
+
+    // Conflict found. Build and execute an UPDATE.
+    let set_parts: Vec<String> = do_update
+        .assignments
+        .iter()
+        .map(|a| {
+            let col = match &a.target {
+                AssignmentTarget::ColumnName(n) => n
+                    .0
+                    .last()
+                    .map(|i| i.value.clone())
+                    .unwrap_or_default(),
+                AssignmentTarget::Tuple(_) => String::new(),
+            };
+            format!("{col} = {}", a.value)
+        })
+        .collect();
+    if set_parts.iter().any(|s| s.starts_with(" =")) {
+        return Err(BasinError::InvalidSchema(
+            "ON CONFLICT DO UPDATE: malformed assignment".into(),
+        ));
+    }
+    let update_sql = format!(
+        "UPDATE {} SET {} WHERE {}",
+        table.as_str(),
+        set_parts.join(", "),
+        where_clause
+    );
+    let result = Box::pin(sess.execute(&update_sql)).await?;
+    Ok(Some(result))
+}
+
+// ---------------------------------------------------------------------------
+// Existing helpers (expand_insert_rows, apply_column_defaults, …)
+// ---------------------------------------------------------------------------
 
 /// Translate `INSERT INTO t (col_subset) VALUES (...)` into a list of
 /// schema-width rows by reordering the user's values to match the

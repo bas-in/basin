@@ -55,6 +55,144 @@ use sqlparser::ast::{
     TableWithJoins, UnaryOperator, Value,
 };
 
+// ---------------------------------------------------------------------------
+// Subquery-IN resolution
+// ---------------------------------------------------------------------------
+
+/// Walk an `Expr` tree and replace any `Expr::InSubquery { ... }` nodes with
+/// an equivalent `Expr::InList { ... }` by executing the inner SELECT through
+/// the session's DataFusion context and extracting the first column.
+///
+/// This is the v0.1 strategy for `WHERE col IN (SELECT id FROM t)`:
+/// materialise the sub-select first (cheap on small tables), then treat the
+/// result as a literal list and feed it through the normal predicate path.
+/// The function is recursive so nested AND/OR containing IN-subqueries work
+/// too.
+pub(crate) async fn resolve_subqueries_in_expr(
+    sess: &TenantSession,
+    expr: Expr,
+) -> Result<Expr> {
+    match expr {
+        Expr::InSubquery {
+            expr: col_expr,
+            subquery,
+            negated,
+        } => {
+            let sql = subquery.to_string();
+            let df = sess.ctx.sql(&sql).await.map_err(|e| {
+                BasinError::internal(format!("IN (SELECT …) – plan failed: {e}"))
+            })?;
+            let df_batches = df.collect().await.map_err(|e| {
+                BasinError::internal(format!("IN (SELECT …) – execute failed: {e}"))
+            })?;
+            // Convert from DataFusion's internal arrow version to the workspace
+            // arrow version so the column type-check in `arrow_col_value_to_expr`
+            // sees the correct trait object.
+            let mut list: Vec<Expr> = Vec::new();
+            for df_batch in &df_batches {
+                if df_batch.num_columns() == 0 {
+                    continue;
+                }
+                let batch = crate::convert::batch_df_to_ws(df_batch)?;
+                let col = batch.column(0);
+                for i in 0..col.len() {
+                    if col.is_null(i) {
+                        continue; // NULL IN (…) never matches; skip
+                    }
+                    let lit = arrow_col_value_to_expr(col.as_ref(), i)?;
+                    list.push(lit);
+                }
+            }
+            Ok(Expr::InList {
+                expr: col_expr,
+                list,
+                negated,
+            })
+        }
+        // Combinators: recurse into children.
+        Expr::BinaryOp { left, op, right } => {
+            let left = Box::new(Box::pin(resolve_subqueries_in_expr(sess, *left)).await?);
+            let right = Box::new(Box::pin(resolve_subqueries_in_expr(sess, *right)).await?);
+            Ok(Expr::BinaryOp { left, op, right })
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let inner = Box::new(Box::pin(resolve_subqueries_in_expr(sess, *inner)).await?);
+            Ok(Expr::UnaryOp { op, expr: inner })
+        }
+        Expr::Nested(inner) => {
+            let inner = Box::new(Box::pin(resolve_subqueries_in_expr(sess, *inner)).await?);
+            Ok(Expr::Nested(inner))
+        }
+        // All other forms are already representable – pass through.
+        other => Ok(other),
+    }
+}
+
+/// Convert a single cell from an Arrow array column into a sqlparser `Expr`
+/// literal. Supports Int64, Utf8, Float64, Boolean.
+fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Expr> {
+    use arrow_array::{Float64Array, Int64Array, StringArray};
+    use arrow_schema::DataType as Dt;
+    match col.data_type() {
+        Dt::Int64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| BasinError::internal("expected Int64Array"))?
+                .value(i);
+            if v < 0 {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Value(Value::Number(
+                        (-v).to_string(),
+                        false,
+                    ))),
+                })
+            } else {
+                Ok(Expr::Value(Value::Number(v.to_string(), false)))
+            }
+        }
+        Dt::Utf8 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| BasinError::internal("expected StringArray"))?
+                .value(i);
+            Ok(Expr::Value(Value::SingleQuotedString(v.to_string())))
+        }
+        Dt::Float64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| BasinError::internal("expected Float64Array"))?
+                .value(i);
+            if v < 0.0 {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Value(Value::Number(
+                        (-v).to_string(),
+                        false,
+                    ))),
+                })
+            } else {
+                Ok(Expr::Value(Value::Number(v.to_string(), false)))
+            }
+        }
+        Dt::Boolean => {
+            use arrow_array::BooleanArray;
+            let v = col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| BasinError::internal("expected BooleanArray"))?
+                .value(i);
+            Ok(Expr::Value(Value::Boolean(v)))
+        }
+        other => Err(BasinError::InvalidSchema(format!(
+            "IN (SELECT …): column type {other:?} cannot be used as IN list element"
+        ))),
+    }
+}
+
 use crate::events::{
     build_row_json, dispatch_post_commit, dispatch_pre_commit, make_event, registry_has_any,
 };
@@ -64,7 +202,14 @@ use crate::{ExecResult, TenantSession};
 
 pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<ExecResult> {
     let table = single_table_from_delete(&delete)?;
-    let predicate_expr = delete.selection.as_ref();
+    // Resolve any IN (SELECT …) subqueries in the WHERE clause to literal
+    // lists before parsing. This must happen before `pre_mutation_flush` so
+    // the subquery SELECT sees the most-recently-committed rows.
+    let resolved_selection: Option<Expr> = match delete.selection {
+        None => None,
+        Some(e) => Some(resolve_subqueries_in_expr(sess, e).await?),
+    };
+    let predicate_expr = resolved_selection.as_ref();
 
     // Refuse the easy-foot-gun multi-table DELETE / DELETE with USING for now
     // — they're not on the v0.1 surface and silently picking one would risk
@@ -355,6 +500,13 @@ pub(crate) async fn exec_update(
         }
     };
     let table = TableName::new(table_name)?;
+
+    // Resolve any IN (SELECT …) subqueries to literal lists before the flush
+    // so the subquery SELECT sees the committed state.
+    let selection = match selection {
+        None => None,
+        Some(e) => Some(resolve_subqueries_in_expr(sess, e).await?),
+    };
 
     pre_mutation_flush(sess).await?;
 
