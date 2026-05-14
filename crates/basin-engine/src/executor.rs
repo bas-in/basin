@@ -307,6 +307,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
     let rewritten = crate::udf::rewrite_extract_second(&rewritten);
 <<<<<<< HEAD
+<<<<<<< HEAD
     // Rewrite `expr AT TIME ZONE 'tz'` to `at_time_zone(expr, 'tz')` so
     // DataFusion's sqlparser sees a regular function call instead of the
     // AT TIME ZONE infix operator, which it may not handle for all types.
@@ -319,6 +320,11 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // Rewrite `every(...)` → `bool_and(...)` — PG alias for the same aggregate.
     let rewritten = crate::pg_scalar_aliases::rewrite_every_to_bool_and(&rewritten);
 >>>>>>> worktree-agent-agent-bulk-pg-scalar-fns
+=======
+    // Rewrite PG aggregate name aliases that DataFusion exposes under a
+    // different name: `variance(x)` → `var(x)`, `every(x)` → `bool_and(x)`.
+    let rewritten = crate::udf::rewrite_pg_agg_aliases(&rewritten);
+>>>>>>> worktree-agent-agent-bulk-pg-aggregates
     // User-defined `LANGUAGE sql` function inlining. The rewriter is a
     // no-op for tenants with no registered functions and for statements
     // that contain no function calls at all (the cheap pre-gate runs

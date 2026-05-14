@@ -168,6 +168,7 @@ pub(crate) async fn open(
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
 <<<<<<< HEAD
+<<<<<<< HEAD
     // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
     // jsonb_strip_nulls, jsonb_path_query/exists/match, jsonb_object_keys,
     // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
@@ -192,6 +193,11 @@ pub(crate) async fn open(
     // Full-text search stub UDFs: `to_tsvector`, `to_tsquery`, `ts_rank`, etc.
     crate::fts_udf::register_fts_udfs(&ctx);
 >>>>>>> worktree-agent-agent-bulk-pg-scalar-fns
+=======
+    // Phase 5.11.AGG: PG JSON aggregate UDAFs — json_agg, jsonb_agg,
+    // json_object_agg, jsonb_object_agg.
+    crate::pg_agg_udf::register_json_agg_udafs(&ctx);
+>>>>>>> worktree-agent-agent-bulk-pg-aggregates
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
