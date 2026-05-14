@@ -23,6 +23,10 @@ use arrow_array::Array as _;
 use arrow_schema as ws_schema;
 use arrow_schema::IntervalUnit as WsIntervalUnit;
 use arrow_schema::TimeUnit as WsTimeUnit;
+// arrow_buffer (v54) provides the cross-version-safe buffer primitives we
+// need to rebuild WS List/LargeList arrays from raw offset and null data.
+use arrow_buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer,
+                   ScalarBuffer as WsScalarBuffer};
 
 // DataFusion-side (v53) imports.
 use datafusion::arrow::array as df_array;
@@ -30,6 +34,22 @@ use datafusion::arrow::array::Array as _;
 use datafusion::arrow::datatypes as df_schema;
 use datafusion::arrow::datatypes::IntervalUnit as DfIntervalUnit;
 use datafusion::arrow::datatypes::TimeUnit as DfTimeUnit;
+
+fn intervalunit_ws_to_df(u: &WsIntervalUnit) -> DfIntervalUnit {
+    match u {
+        WsIntervalUnit::YearMonth => DfIntervalUnit::YearMonth,
+        WsIntervalUnit::DayTime => DfIntervalUnit::DayTime,
+        WsIntervalUnit::MonthDayNano => DfIntervalUnit::MonthDayNano,
+    }
+}
+
+fn intervalunit_df_to_ws(u: &DfIntervalUnit) -> WsIntervalUnit {
+    match u {
+        DfIntervalUnit::YearMonth => WsIntervalUnit::YearMonth,
+        DfIntervalUnit::DayTime => WsIntervalUnit::DayTime,
+        DfIntervalUnit::MonthDayNano => WsIntervalUnit::MonthDayNano,
+    }
+}
 
 fn timeunit_ws_to_df(u: &WsTimeUnit) -> DfTimeUnit {
     match u {
@@ -106,9 +126,23 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
             df_schema::DataType::Timestamp(timeunit_ws_to_df(unit), tz.clone())
         }
         ws_schema::DataType::Decimal128(p, s) => df_schema::DataType::Decimal128(*p, *s),
-        ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano) => {
-            df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano)
-        }
+        ws_schema::DataType::UInt64 => df_schema::DataType::UInt64,
+        ws_schema::DataType::Interval(u) => df_schema::DataType::Interval(intervalunit_ws_to_df(u)),
+        ws_schema::DataType::Duration(u) => df_schema::DataType::Duration(timeunit_ws_to_df(u)),
+        ws_schema::DataType::List(child) => df_schema::DataType::List(Arc::new(
+            df_schema::Field::new(
+                child.name().clone(),
+                data_type_ws_to_df(child.data_type())?,
+                child.is_nullable(),
+            ),
+        )),
+        ws_schema::DataType::LargeList(child) => df_schema::DataType::LargeList(Arc::new(
+            df_schema::Field::new(
+                child.name().clone(),
+                data_type_ws_to_df(child.data_type())?,
+                child.is_nullable(),
+            ),
+        )),
         ws_schema::DataType::FixedSizeList(child, n) => df_schema::DataType::FixedSizeList(
             Arc::new(df_schema::Field::new(
                 child.name().clone(),
@@ -143,9 +177,25 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
             ws_schema::DataType::Timestamp(timeunit_df_to_ws(unit), tz.clone())
         }
         df_schema::DataType::Decimal128(p, s) => ws_schema::DataType::Decimal128(*p, *s),
-        df_schema::DataType::Interval(DfIntervalUnit::MonthDayNano) => {
-            ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano)
+        df_schema::DataType::UInt64 => ws_schema::DataType::UInt64,
+        df_schema::DataType::Interval(u) => {
+            ws_schema::DataType::Interval(intervalunit_df_to_ws(u))
         }
+        df_schema::DataType::Duration(u) => ws_schema::DataType::Duration(timeunit_df_to_ws(u)),
+        df_schema::DataType::List(child) => ws_schema::DataType::List(Arc::new(
+            ws_schema::Field::new(
+                child.name().clone(),
+                data_type_df_to_ws(child.data_type())?,
+                child.is_nullable(),
+            ),
+        )),
+        df_schema::DataType::LargeList(child) => ws_schema::DataType::LargeList(Arc::new(
+            ws_schema::Field::new(
+                child.name().clone(),
+                data_type_df_to_ws(child.data_type())?,
+                child.is_nullable(),
+            ),
+        )),
         df_schema::DataType::FixedSizeList(child, n) => ws_schema::DataType::FixedSizeList(
             Arc::new(ws_schema::Field::new(
                 child.name().clone(),
@@ -445,6 +495,180 @@ pub(crate) fn batch_ws_to_df(batch: &ws_array::RecordBatch) -> Result<df_array::
                             field.name()
                         ))
                     })?;
+                Arc::new(arr)
+            }
+            df_schema::DataType::UInt64 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::UInt64Array>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected UInt64Array for {}", field.name()))
+                    })?;
+                let vals: Vec<Option<u64>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(df_array::UInt64Array::from(vals))
+            }
+            df_schema::DataType::Duration(unit) => {
+                use datafusion::arrow::array::types::{
+                    DurationMicrosecondType as DfDurMicros,
+                    DurationMillisecondType as DfDurMilli,
+                    DurationNanosecondType as DfDurNanos, DurationSecondType as DfDurSec,
+                };
+                let vals: Vec<Option<i64>> = match unit {
+                    DfTimeUnit::Second => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::DurationSecondArray>()
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected DurationSecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    DfTimeUnit::Millisecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::DurationMillisecondArray>()
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected DurationMillisecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    DfTimeUnit::Microsecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::DurationMicrosecondArray>()
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected DurationMicrosecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    DfTimeUnit::Nanosecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<ws_array::DurationNanosecondArray>()
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected DurationNanosecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                };
+                let dt = df_schema::DataType::Duration(*unit);
+                let arr: Arc<dyn df_array::Array> = match unit {
+                    DfTimeUnit::Second => {
+                        Arc::new(df_array::PrimitiveArray::<DfDurSec>::from(vals).with_data_type(dt))
+                    }
+                    DfTimeUnit::Millisecond => Arc::new(
+                        df_array::PrimitiveArray::<DfDurMilli>::from(vals).with_data_type(dt),
+                    ),
+                    DfTimeUnit::Microsecond => Arc::new(
+                        df_array::PrimitiveArray::<DfDurMicros>::from(vals).with_data_type(dt),
+                    ),
+                    DfTimeUnit::Nanosecond => Arc::new(
+                        df_array::PrimitiveArray::<DfDurNanos>::from(vals).with_data_type(dt),
+                    ),
+                };
+                arr
+            }
+            df_schema::DataType::List(child_field) => {
+                // src is a WS ListArray; child values are WS-typed.
+                // Cross-version boundary: offsets and nulls must be rebuilt
+                // on the DF side from raw values.
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::ListArray>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected ListArray for {}", field.name()))
+                    })?;
+                // Convert child values (WS-typed) to DF-typed via a single-column batch.
+                let ws_child_type = data_type_df_to_ws(child_field.data_type())?;
+                let ws_child_schema = Arc::new(ws_schema::Schema::new(vec![ws_schema::Field::new(
+                    child_field.name().clone(),
+                    ws_child_type,
+                    child_field.is_nullable(),
+                )]));
+                let child_batch = ws_array::RecordBatch::try_new(
+                    ws_child_schema,
+                    vec![s.values().clone()],
+                )
+                .map_err(|e| BasinError::internal(format!("ListArray child batch: {e}")))?;
+                let child_df_batch = batch_ws_to_df(&child_batch)?;
+                let df_child_arr = child_df_batch.column(0).clone();
+                // Rebuild DF offsets from raw i32 values (cross-version safe).
+                let raw_offsets: Vec<i32> = s.offsets().iter().copied().collect();
+                let df_offsets = datafusion::arrow::buffer::OffsetBuffer::new(
+                    datafusion::arrow::buffer::ScalarBuffer::from(raw_offsets),
+                );
+                // Rebuild nulls from raw bits (cross-version safe).
+                let df_nulls = s.nulls().map(|nb| {
+                    let bools: Vec<bool> = (0..nb.len()).map(|i| nb.is_valid(i)).collect();
+                    datafusion::arrow::buffer::NullBuffer::from(bools)
+                });
+                let arr = df_array::ListArray::new(
+                    Arc::new((**child_field).clone()),
+                    df_offsets,
+                    df_child_arr,
+                    df_nulls,
+                );
+                Arc::new(arr)
+            }
+            df_schema::DataType::LargeList(child_field) => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<ws_array::LargeListArray>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected LargeListArray for {}",
+                            field.name()
+                        ))
+                    })?;
+                let ws_child_type = data_type_df_to_ws(child_field.data_type())?;
+                let ws_child_schema = Arc::new(ws_schema::Schema::new(vec![ws_schema::Field::new(
+                    child_field.name().clone(),
+                    ws_child_type,
+                    child_field.is_nullable(),
+                )]));
+                let child_batch = ws_array::RecordBatch::try_new(
+                    ws_child_schema,
+                    vec![s.values().clone()],
+                )
+                .map_err(|e| BasinError::internal(format!("LargeListArray child batch: {e}")))?;
+                let child_df_batch = batch_ws_to_df(&child_batch)?;
+                let df_child_arr = child_df_batch.column(0).clone();
+                let raw_offsets: Vec<i64> = s.offsets().iter().copied().collect();
+                let df_offsets = datafusion::arrow::buffer::OffsetBuffer::new(
+                    datafusion::arrow::buffer::ScalarBuffer::from(raw_offsets),
+                );
+                let df_nulls = s.nulls().map(|nb| {
+                    let bools: Vec<bool> = (0..nb.len()).map(|i| nb.is_valid(i)).collect();
+                    datafusion::arrow::buffer::NullBuffer::from(bools)
+                });
+                let arr = df_array::LargeListArray::new(
+                    Arc::new((**child_field).clone()),
+                    df_offsets,
+                    df_child_arr,
+                    df_nulls,
+                );
                 Arc::new(arr)
             }
             other => {
@@ -826,6 +1050,167 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 >(rows, *n);
                 Arc::new(arr)
             }
+            ws_schema::DataType::UInt64 => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::UInt64Array>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected UInt64Array for {}", field.name()))
+                    })?;
+                let vals: Vec<Option<u64>> = (0..s.len())
+                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                    .collect();
+                Arc::new(ws_array::UInt64Array::from(vals))
+            }
+            ws_schema::DataType::Duration(unit) => {
+                use arrow_array::types::{
+                    DurationMicrosecondType as WsDurMicros,
+                    DurationMillisecondType as WsDurMilli,
+                    DurationNanosecondType as WsDurNanos, DurationSecondType as WsDurSec,
+                };
+                use datafusion::arrow::array::DurationMicrosecondArray as DfDurMicros;
+                use datafusion::arrow::array::DurationMillisecondArray as DfDurMilli;
+                use datafusion::arrow::array::DurationNanosecondArray as DfDurNanos;
+                use datafusion::arrow::array::DurationSecondArray as DfDurSec;
+                let vals: Vec<Option<i64>> = match unit {
+                    WsTimeUnit::Second => {
+                        let s = src.as_any().downcast_ref::<DfDurSec>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected DurationSecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    WsTimeUnit::Millisecond => {
+                        let s = src.as_any().downcast_ref::<DfDurMilli>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected DurationMillisecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    WsTimeUnit::Microsecond => {
+                        let s = src.as_any().downcast_ref::<DfDurMicros>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected DurationMicrosecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    WsTimeUnit::Nanosecond => {
+                        let s = src.as_any().downcast_ref::<DfDurNanos>().ok_or_else(|| {
+                            BasinError::internal(format!(
+                                "expected DurationNanosecondArray for {}",
+                                field.name()
+                            ))
+                        })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                };
+                let dt = ws_schema::DataType::Duration(*unit);
+                let arr: Arc<dyn ws_array::Array> = match unit {
+                    WsTimeUnit::Second => Arc::new(
+                        ws_array::PrimitiveArray::<WsDurSec>::from(vals).with_data_type(dt),
+                    ),
+                    WsTimeUnit::Millisecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsDurMilli>::from(vals).with_data_type(dt),
+                    ),
+                    WsTimeUnit::Microsecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsDurMicros>::from(vals).with_data_type(dt),
+                    ),
+                    WsTimeUnit::Nanosecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsDurNanos>::from(vals).with_data_type(dt),
+                    ),
+                };
+                arr
+            }
+            ws_schema::DataType::List(ws_child_field) => {
+                // src is a DF ListArray; child values are DF-typed.
+                // Cross-version boundary: rebuild offsets and nulls on the WS side.
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::ListArray>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!("expected ListArray for {}", field.name()))
+                    })?;
+                let df_child_type = data_type_ws_to_df(ws_child_field.data_type())?;
+                let df_child_schema = Arc::new(df_schema::Schema::new(vec![df_schema::Field::new(
+                    ws_child_field.name().clone(),
+                    df_child_type,
+                    ws_child_field.is_nullable(),
+                )]));
+                let child_df_batch =
+                    df_array::RecordBatch::try_new(df_child_schema, vec![s.values().clone()])
+                        .map_err(|e| {
+                            BasinError::internal(format!("ListArray child batch: {e}"))
+                        })?;
+                let child_ws_batch = batch_df_to_ws(&child_df_batch)?;
+                let ws_child_arr = child_ws_batch.column(0).clone();
+                // Rebuild WS offsets from raw i32 values (cross-version safe).
+                let raw_offsets: Vec<i32> = s.offsets().iter().copied().collect();
+                let ws_offsets =
+                    WsOffsetBuffer::new(WsScalarBuffer::from(raw_offsets));
+                let ws_nulls = s.nulls().map(|nb| {
+                    let bools: Vec<bool> = (0..nb.len()).map(|i| nb.is_valid(i)).collect();
+                    WsNullBuffer::from(bools)
+                });
+                let arr = ws_array::ListArray::new(
+                    Arc::new((**ws_child_field).clone()),
+                    ws_offsets,
+                    ws_child_arr,
+                    ws_nulls,
+                );
+                Arc::new(arr)
+            }
+            ws_schema::DataType::LargeList(ws_child_field) => {
+                let s = src
+                    .as_any()
+                    .downcast_ref::<df_array::LargeListArray>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected LargeListArray for {}",
+                            field.name()
+                        ))
+                    })?;
+                let df_child_type = data_type_ws_to_df(ws_child_field.data_type())?;
+                let df_child_schema = Arc::new(df_schema::Schema::new(vec![df_schema::Field::new(
+                    ws_child_field.name().clone(),
+                    df_child_type,
+                    ws_child_field.is_nullable(),
+                )]));
+                let child_df_batch =
+                    df_array::RecordBatch::try_new(df_child_schema, vec![s.values().clone()])
+                        .map_err(|e| {
+                            BasinError::internal(format!("LargeListArray child batch: {e}"))
+                        })?;
+                let child_ws_batch = batch_df_to_ws(&child_df_batch)?;
+                let ws_child_arr = child_ws_batch.column(0).clone();
+                let raw_offsets: Vec<i64> = s.offsets().iter().copied().collect();
+                let ws_offsets =
+                    WsOffsetBuffer::new(WsScalarBuffer::from(raw_offsets));
+                let ws_nulls = s.nulls().map(|nb| {
+                    let bools: Vec<bool> = (0..nb.len()).map(|i| nb.is_valid(i)).collect();
+                    WsNullBuffer::from(bools)
+                });
+                let arr = ws_array::LargeListArray::new(
+                    Arc::new((**ws_child_field).clone()),
+                    ws_offsets,
+                    ws_child_arr,
+                    ws_nulls,
+                );
+                Arc::new(arr)
+            }
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "cannot translate column {} of type {other:?}",
@@ -837,4 +1222,283 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
     }
     ws_array::RecordBatch::try_new(target_schema, columns)
         .map_err(|e| BasinError::internal(format!("rebuild ws batch: {e}")))
+}
+
+// ─── Unit tests ──────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{
+        Array, BooleanArray, Int32Array, Int64Array, ListArray, StringArray, UInt64Array,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    // Helper: build a WS schema + batch with one column of the given type.
+    fn ws_batch_one_col(
+        name: &str,
+        dt: DataType,
+        arr: Arc<dyn arrow_array::Array>,
+    ) -> ws_array::RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, dt, true)]));
+        ws_array::RecordBatch::try_new(schema, vec![arr]).expect("ws batch")
+    }
+
+    // ── schema conversion: UInt64 ─────────────────────────────────────────────
+
+    #[test]
+    fn test_schema_uint64_roundtrip() {
+        let ws_schema =
+            ws_schema::Schema::new(vec![ws_schema::Field::new("n", ws_schema::DataType::UInt64, true)]);
+        let df_schema = schema_ws_to_df(&ws_schema).expect("ws→df");
+        assert_eq!(
+            df_schema.field(0).data_type(),
+            &datafusion::arrow::datatypes::DataType::UInt64
+        );
+        let ws2 = schema_df_to_ws(&df_schema).expect("df→ws");
+        assert_eq!(ws2.field(0).data_type(), &ws_schema::DataType::UInt64);
+    }
+
+    // ── schema conversion: Duration(Second) ──────────────────────────────────
+
+    #[test]
+    fn test_schema_duration_roundtrip() {
+        let ws_schema = ws_schema::Schema::new(vec![ws_schema::Field::new(
+            "d",
+            ws_schema::DataType::Duration(ws_schema::TimeUnit::Second),
+            true,
+        )]);
+        let df_schema = schema_ws_to_df(&ws_schema).expect("ws→df");
+        assert_eq!(
+            df_schema.field(0).data_type(),
+            &datafusion::arrow::datatypes::DataType::Duration(
+                datafusion::arrow::datatypes::TimeUnit::Second
+            )
+        );
+        let ws2 = schema_df_to_ws(&df_schema).expect("df→ws");
+        assert_eq!(
+            ws2.field(0).data_type(),
+            &ws_schema::DataType::Duration(ws_schema::TimeUnit::Second)
+        );
+    }
+
+    // ── schema conversion: List<Int32> ────────────────────────────────────────
+
+    #[test]
+    fn test_schema_list_int32_roundtrip() {
+        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Int32, true));
+        let ws_schema = ws_schema::Schema::new(vec![ws_schema::Field::new(
+            "arr",
+            ws_schema::DataType::List(inner),
+            true,
+        )]);
+        let df_schema = schema_ws_to_df(&ws_schema).expect("ws→df");
+        let ws2 = schema_df_to_ws(&df_schema).expect("df→ws");
+        assert_eq!(ws_schema, ws2);
+    }
+
+    // ── schema conversion: List<Utf8> ─────────────────────────────────────────
+
+    #[test]
+    fn test_schema_list_utf8_roundtrip() {
+        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Utf8, true));
+        let ws_schema = ws_schema::Schema::new(vec![ws_schema::Field::new(
+            "tags",
+            ws_schema::DataType::List(inner),
+            true,
+        )]);
+        let df_schema = schema_ws_to_df(&ws_schema).expect("ws→df");
+        let ws2 = schema_df_to_ws(&df_schema).expect("df→ws");
+        assert_eq!(ws_schema, ws2);
+    }
+
+    // ── batch roundtrip: UInt64 ───────────────────────────────────────────────
+
+    #[test]
+    fn test_batch_uint64_roundtrip() {
+        let vals: Vec<Option<u64>> = vec![Some(0), Some(u64::MAX), None, Some(42)];
+        let arr = Arc::new(ws_array::UInt64Array::from(vals.clone()));
+        let batch = ws_batch_one_col("n", ws_schema::DataType::UInt64, arr);
+
+        let df_batch = batch_ws_to_df(&batch).expect("ws→df");
+        let ws_batch2 = batch_df_to_ws(&df_batch).expect("df→ws");
+
+        let out = ws_batch2
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::UInt64Array>()
+            .expect("UInt64Array");
+        assert_eq!(out.len(), 4);
+        assert!(out.is_null(2));
+        assert_eq!(out.value(0), 0);
+        assert_eq!(out.value(1), u64::MAX);
+        assert_eq!(out.value(3), 42);
+    }
+
+    // ── batch roundtrip: Duration(Second) ────────────────────────────────────
+
+    #[test]
+    fn test_batch_duration_second_roundtrip() {
+        let vals: Vec<Option<i64>> = vec![Some(86400), None, Some(-3600)];
+        let arr: Arc<dyn ws_array::Array> = Arc::new(ws_array::DurationSecondArray::from(vals));
+        let batch = ws_batch_one_col(
+            "d",
+            ws_schema::DataType::Duration(ws_schema::TimeUnit::Second),
+            arr,
+        );
+
+        let df_batch = batch_ws_to_df(&batch).expect("ws→df");
+        let ws_batch2 = batch_df_to_ws(&df_batch).expect("df→ws");
+
+        let out = ws_batch2
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::DurationSecondArray>()
+            .expect("DurationSecondArray");
+        assert_eq!(out.len(), 3);
+        assert!(out.is_null(1));
+        assert_eq!(out.value(0), 86400);
+        assert_eq!(out.value(2), -3600);
+    }
+
+    // ── batch roundtrip: List<Int32> ─────────────────────────────────────────
+
+    #[test]
+    fn test_batch_list_int32_roundtrip() {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        // row 0: [1, 2, 3]
+        builder.values().append_value(1);
+        builder.values().append_value(2);
+        builder.values().append_value(3);
+        builder.append(true);
+        // row 1: null list
+        builder.append(false);
+        // row 2: [42]
+        builder.values().append_value(42);
+        builder.append(true);
+        let arr = Arc::new(builder.finish());
+
+        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Int32, true));
+        let batch = ws_batch_one_col("arr", ws_schema::DataType::List(inner), arr);
+
+        let df_batch = batch_ws_to_df(&batch).expect("ws→df");
+        let ws_batch2 = batch_df_to_ws(&df_batch).expect("df→ws");
+
+        let out = ws_batch2
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::ListArray>()
+            .expect("ListArray");
+        assert_eq!(out.len(), 3);
+        assert!(out.is_null(1));
+        let row0 = out.value(0);
+        let row0_ints = row0.as_any().downcast_ref::<Int32Array>().expect("i32");
+        assert_eq!(row0_ints.values(), &[1, 2, 3]);
+        let row2 = out.value(2);
+        let row2_ints = row2.as_any().downcast_ref::<Int32Array>().expect("i32");
+        assert_eq!(row2_ints.values(), &[42]);
+    }
+
+    // ── batch roundtrip: List<Utf8> ──────────────────────────────────────────
+
+    #[test]
+    fn test_batch_list_utf8_roundtrip() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        // row 0: ["a", "b"]
+        builder.values().append_value("a");
+        builder.values().append_value("b");
+        builder.append(true);
+        // row 1: []
+        builder.append(true);
+        // row 2: ["hello"]
+        builder.values().append_value("hello");
+        builder.append(true);
+        let arr = Arc::new(builder.finish());
+
+        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Utf8, true));
+        let batch = ws_batch_one_col("tags", ws_schema::DataType::List(inner), arr);
+
+        let df_batch = batch_ws_to_df(&batch).expect("ws→df");
+        let ws_batch2 = batch_df_to_ws(&df_batch).expect("df→ws");
+
+        let out = ws_batch2
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::ListArray>()
+            .expect("ListArray");
+        assert_eq!(out.len(), 3);
+        let row0 = out.value(0);
+        let row0_strs = row0.as_any().downcast_ref::<StringArray>().expect("str");
+        assert_eq!(row0_strs.value(0), "a");
+        assert_eq!(row0_strs.value(1), "b");
+        let row2 = out.value(2);
+        let row2_strs = row2.as_any().downcast_ref::<StringArray>().expect("str");
+        assert_eq!(row2_strs.value(0), "hello");
+    }
+
+    // ── batch roundtrip: df→ws direction for UInt64 ───────────────────────────
+    // (Most tests above go ws→df→ws; this one starts from the df side.)
+
+    #[test]
+    fn test_batch_df_to_ws_uint64() {
+        use datafusion::arrow::array::UInt64Array as DfUInt64Array;
+        use datafusion::arrow::datatypes::{DataType as DfDataType, Field as DfField,
+                                           Schema as DfSchema};
+
+        let df_schema = Arc::new(DfSchema::new(vec![DfField::new("n", DfDataType::UInt64, true)]));
+        let vals: Vec<Option<u64>> = vec![Some(1), Some(2), None];
+        let arr = Arc::new(DfUInt64Array::from(vals));
+        let df_batch = datafusion::arrow::array::RecordBatch::try_new(df_schema, vec![arr as _])
+            .expect("df batch");
+
+        let ws_batch = batch_df_to_ws(&df_batch).expect("df→ws");
+        let out = ws_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::UInt64Array>()
+            .expect("UInt64Array");
+        assert_eq!(out.len(), 3);
+        assert!(out.is_null(2));
+        assert_eq!(out.value(0), 1);
+        assert_eq!(out.value(1), 2);
+    }
+
+    // ── batch roundtrip: df→ws direction for Duration(Second) ─────────────────
+
+    #[test]
+    fn test_batch_df_to_ws_duration_second() {
+        use datafusion::arrow::array::{
+            RecordBatch as DfRecordBatch,
+            types::DurationSecondType,
+            PrimitiveArray as DfPrimArray,
+        };
+        use datafusion::arrow::datatypes::{
+            DataType as DfDataType, Field as DfField, Schema as DfSchema,
+            TimeUnit as DfTimeUnit,
+        };
+
+        let df_schema = Arc::new(DfSchema::new(vec![DfField::new(
+            "d",
+            DfDataType::Duration(DfTimeUnit::Second),
+            true,
+        )]));
+        let vals: Vec<Option<i64>> = vec![Some(3600), None, Some(-60)];
+        let arr: Arc<dyn datafusion::arrow::array::Array> =
+            Arc::new(DfPrimArray::<DurationSecondType>::from(vals)
+                .with_data_type(DfDataType::Duration(DfTimeUnit::Second)));
+        let df_batch = DfRecordBatch::try_new(df_schema, vec![arr]).expect("df batch");
+
+        let ws_batch = batch_df_to_ws(&df_batch).expect("df→ws");
+        let out = ws_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::DurationSecondArray>()
+            .expect("DurationSecondArray");
+        assert_eq!(out.len(), 3);
+        assert!(out.is_null(1));
+        assert_eq!(out.value(0), 3600);
+        assert_eq!(out.value(2), -60);
+    }
 }

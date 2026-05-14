@@ -179,6 +179,19 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ToTimestampPgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
+    // PG `to_date(text, format)` — parses a date string with a PG-style
+    // format picture and returns `Date32`. Covers `to_date('2024-01-15',
+    // 'YYYY-MM-DD')` and other common date-parsing patterns.
+    ctx.register_udf(ScalarUDF::from(ToDatePgUdf {
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+    }));
+    // PG `to_number(text, format)` — converts a formatted numeric string to
+    // `Float64`. Handles thousands separators (`,`/`G`) and decimal point
+    // (`D`) in the format picture. Covers `to_number('1,234.56', '9,999.99')`
+    // and similar patterns used by PG-targeted ORMs / reporting tools.
+    ctx.register_udf(ScalarUDF::from(ToNumberPgUdf {
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+    }));
     // PG-shape `power(x, y)` — always returns Float64. Overrides
     // DataFusion's default `power`, which returns Int64 for two integer
     // inputs and trips up downstream callers expecting `double precision`
@@ -1797,6 +1810,285 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
         let arr = TimestampNanosecondArray::from(out);
         Ok(ColumnarValue::Array(Arc::new(arr)))
     }
+}
+
+// ─── to_date(text, format) ────────────────────────────────────────────────────
+
+/// PG `to_date(text, format)` — parses a date string using a PG-style format
+/// and returns `Date32` (days since epoch 1970-01-01). The format is translated
+/// to chrono via the same `pg_format_to_chrono` mapping used by `to_char` /
+/// `to_timestamp`.
+///
+/// Example: `to_date('2024-01-15', 'YYYY-MM-DD')` → the Date32 value for 2024-01-15.
+#[derive(Debug)]
+struct ToDatePgUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ToDatePgUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_date"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Date32)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("to_date expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let txt = args[0].clone().into_array(n)?;
+        let fmt = args[1].clone().into_array(n)?;
+        let txt = txt
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_date: arg 1 must be Utf8".into()))?;
+        let fmt = fmt
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_date: arg 2 must be Utf8".into()))?;
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let mut out: Vec<Option<i32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if txt.is_null(i) || fmt.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let chrono_fmt = pg_format_to_chrono(fmt.value(i));
+            let parsed = chrono::NaiveDate::parse_from_str(txt.value(i), &chrono_fmt)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "to_date: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
+                        txt.value(i),
+                        fmt.value(i),
+                        chrono_fmt
+                    ))
+                })?;
+            let days = parsed.signed_duration_since(epoch).num_days() as i32;
+            out.push(Some(days));
+        }
+        Ok(ColumnarValue::Array(Arc::new(Date32Array::from(out))))
+    }
+}
+
+// ─── to_number(text, format) ─────────────────────────────────────────────────
+
+/// PG `to_number(text, format)` — converts a formatted numeric string to
+/// `Float64` (matching PG's `numeric` output type for the v0.1 text path).
+///
+/// PG format picture characters relevant to numeric: `9` (digit), `0` (digit
+/// with leading zero), `.` (decimal point), `,` (thousands separator), `G`
+/// (locale group separator, treated as `,`), `D` (locale decimal point,
+/// treated as `.`), `S`/`MI`/`PR` (sign indicators — stripped). All other
+/// characters in the format picture act as literal separators and are skipped
+/// in the input string.
+///
+/// We implement a simplified but PG-compatible subset: strip all non-digit,
+/// non-sign, non-decimal-point characters guided by the format string, then
+/// parse the result as `f64`. This covers the most common patterns
+/// (`'999,999.99'`, `'9G999D99'`, `'FM9990.009'`, etc.).
+///
+/// Example: `to_number('1,234.56', '9,999.99')` → 1234.56.
+#[derive(Debug)]
+struct ToNumberPgUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ToNumberPgUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_number"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("to_number expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let txt = args[0].clone().into_array(n)?;
+        let fmt = args[1].clone().into_array(n)?;
+        let txt = txt
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_number: arg 1 must be Utf8".into()))?;
+        let fmt = fmt
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_number: arg 2 must be Utf8".into()))?;
+        let mut out: Vec<Option<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if txt.is_null(i) || fmt.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let parsed = parse_pg_number(txt.value(i), fmt.value(i)).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "to_number: failed to parse {:?} with format {:?}: {e}",
+                    txt.value(i),
+                    fmt.value(i)
+                ))
+            })?;
+            out.push(Some(parsed));
+        }
+        Ok(ColumnarValue::Array(Arc::new(Float64Array::from(out))))
+    }
+}
+
+/// Parse a PG-formatted numeric string to f64.
+///
+/// Strategy: walk the format string to determine which characters in the
+/// input are separators (to be skipped) vs digit/sign/decimal characters
+/// (to be kept). This handles thousands separators (`,` / `G`) and decimal
+/// points (`.` / `D`) correctly regardless of locale picture.
+fn parse_pg_number(input: &str, fmt: &str) -> Result<f64, String> {
+    // Strip the `FM` fill-mode prefix if present.
+    let fmt = if fmt.to_ascii_uppercase().starts_with("FM") {
+        &fmt[2..]
+    } else {
+        fmt
+    };
+
+    // Collect whether each format position is a "separator" (thousands comma,
+    // literal text) vs a "value" character (digit, decimal, sign).
+    // We don't need a bijective mapping — we just need to know which input
+    // characters to drop. The simplest approach: build a cleaned numeric
+    // string by keeping only digits, leading/trailing sign, and the first `.`
+    // or `D`-mapped position.
+    //
+    // Walk both strings in parallel; when the format char is `,` or `G` we
+    // skip the corresponding input char (if it is `,`); otherwise we keep it.
+    let fmt_chars: Vec<char> = fmt.chars().collect();
+    let inp_chars: Vec<char> = input.trim().chars().collect();
+
+    let mut cleaned = String::with_capacity(inp_chars.len());
+    let mut fi = 0usize; // format index
+    let mut ii = 0usize; // input index
+    let mut has_decimal = false;
+
+    // Scan for a leading sign in input before the loop.
+    if ii < inp_chars.len() && (inp_chars[ii] == '-' || inp_chars[ii] == '+') {
+        cleaned.push(inp_chars[ii]);
+        ii += 1;
+        // Skip leading sign characters in format.
+        while fi < fmt_chars.len()
+            && matches!(fmt_chars[fi], 'S' | 's' | '+' | '-')
+        {
+            fi += 1;
+        }
+    }
+
+    while fi < fmt_chars.len() && ii < inp_chars.len() {
+        let fc = fmt_chars[fi];
+        let ic = inp_chars[ii];
+
+        match fc.to_ascii_uppercase() {
+            // Thousands separator / group separator → skip the matching input char.
+            ',' | 'G' => {
+                if ic == ',' || ic == '.' {
+                    ii += 1; // consume the separator from input
+                }
+                fi += 1;
+            }
+            // Decimal point.
+            '.' | 'D' => {
+                if !has_decimal {
+                    cleaned.push('.');
+                    has_decimal = true;
+                }
+                if ic == '.' || ic == ',' {
+                    ii += 1; // consume
+                }
+                fi += 1;
+            }
+            // Digit placeholder.
+            '9' | '0' => {
+                if ic.is_ascii_digit() {
+                    cleaned.push(ic);
+                    ii += 1;
+                } else if ic == '-' || ic == '+' {
+                    // trailing sign (MI/PR style)
+                    cleaned.push(ic);
+                    ii += 1;
+                }
+                fi += 1;
+            }
+            // Sign indicators: S, MI, PL, PR — consume from both sides.
+            'S' | 'M' | 'P' => {
+                if ic == '-' || ic == '+' || ic == '<' || ic == '>' {
+                    if ic == '<' || ic == '-' {
+                        cleaned.insert(0, '-');
+                    }
+                    ii += 1;
+                }
+                // Skip the multi-char token (MI, PR, etc.)
+                let rest: String = fmt_chars[fi..].iter().collect();
+                let skip = if rest.to_ascii_uppercase().starts_with("MI")
+                    || rest.to_ascii_uppercase().starts_with("PL")
+                    || rest.to_ascii_uppercase().starts_with("PR")
+                {
+                    2
+                } else {
+                    1
+                };
+                fi += skip;
+            }
+            // Literal character — skip corresponding input char if it matches.
+            _ => {
+                if ic == fc {
+                    ii += 1;
+                }
+                fi += 1;
+            }
+        }
+    }
+
+    // Any remaining input digits (input longer than format).
+    while ii < inp_chars.len() {
+        let ic = inp_chars[ii];
+        if ic.is_ascii_digit() {
+            cleaned.push(ic);
+        } else if ic == '.' && !has_decimal {
+            cleaned.push('.');
+            has_decimal = true;
+        } else if (ic == '-' || ic == '+') && cleaned.is_empty() {
+            cleaned.push(ic);
+        }
+        ii += 1;
+    }
+
+    if cleaned.is_empty() || cleaned == "-" || cleaned == "+" {
+        return Err(format!("no numeric content found in {input:?}"));
+    }
+    cleaned.parse::<f64>().map_err(|e| format!("parse error: {e}"))
 }
 
 #[cfg(test)]

@@ -1249,6 +1249,8 @@ fn is_reserved_function_name(name: &str) -> bool {
         "age",
         "to_char",
         "to_timestamp",
+        "to_date",
+        "to_number",
         "power",
         // DataFusion built-ins customers may surprise themselves with.
         "coalesce",

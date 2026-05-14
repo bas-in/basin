@@ -20,6 +20,7 @@ futures.workspace = true
 async-trait.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
+arrow-buffer.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 parquet.workspace = true
