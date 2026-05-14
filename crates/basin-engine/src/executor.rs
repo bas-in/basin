@@ -114,6 +114,13 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
 
+    // MOVE <direction> [FROM|IN] <cursor> — sqlparser 0.52 has no
+    // Statement::Move AST node.  Pre-screen textually and dispatch before
+    // sqlparser even sees the SQL.
+    if let Some(intent) = crate::cursor::match_move_sql(sql) {
+        return exec_cursor_move(sess, intent).await;
+    }
+
     // REFRESH MATERIALIZED VIEW <name> [WITH (full = true)] — sqlparser
     // has no AST node for REFRESH, so we recognise the full statement
     // textually and dispatch. `force_full` toggles the v0.1 opt-out from
@@ -760,6 +767,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             crate::dml_mutate::exec_update(sess, table, assignments, from, selection, returning)
                 .await
         }
+        // ----- Cursor lifecycle ----- //
+        Statement::Declare { stmts } => exec_declare(sess, stmts).await,
+        Statement::Fetch { name, direction, .. } => exec_fetch(sess, &name.value, direction).await,
+        Statement::Close { cursor } => exec_close(sess, cursor).await,
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     }
 }
@@ -2591,4 +2602,110 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
         )));
     }
     Ok(&name.0[0].value)
+}
+
+// ---------------------------------------------------------------------------
+// Cursor lifecycle handlers
+// ---------------------------------------------------------------------------
+
+/// Execute `DECLARE <name> [SCROLL | NO SCROLL] CURSOR [WITH HOLD] FOR <query>`.
+///
+/// The backing SELECT is materialised immediately into the session's cursor
+/// registry.  WITH HOLD is silently accepted but not implemented (cursors die
+/// with the session regardless).
+async fn exec_declare(
+    sess: &TenantSession,
+    stmts: Vec<sqlparser::ast::Declare>,
+) -> Result<ExecResult> {
+    use sqlparser::ast::DeclareType;
+
+    for decl in stmts {
+        // We only handle CURSOR declarations.
+        if !matches!(decl.declare_type, Some(DeclareType::Cursor)) {
+            return Err(BasinError::internal(
+                "DECLARE: only CURSOR declarations are supported in v0.1".to_string(),
+            ));
+        }
+        let name = decl
+            .names
+            .first()
+            .ok_or_else(|| BasinError::internal("DECLARE: missing cursor name".to_string()))?
+            .value
+            .clone();
+
+        // sqlparser 0.52 puts the SELECT query in `for_query` (Box<Query>)
+        // for `DECLARE c CURSOR FOR SELECT …`. The `assignment` field uses
+        // `Box<Expr>` and is for variable-assignment forms, not cursor FOR.
+        let query = decl.for_query.ok_or_else(|| {
+            BasinError::internal("DECLARE CURSOR: missing FOR <query>".to_string())
+        })?;
+
+        // Execute the SELECT to materialise the result set.
+        let select_sql = query.to_string();
+        let result = exec_select(sess, &select_sql, false).await?;
+        // An empty result (0 rows) is valid — declare with the schema.
+        let (schema, batches) = match result {
+            ExecResult::Rows { schema, batches } => (schema, batches),
+            ExecResult::Empty { .. } => (Arc::new(Schema::empty()), vec![]),
+        };
+        sess.state
+            .cursors
+            .declare(name, schema, batches)
+            .await?;
+    }
+    Ok(ExecResult::Empty {
+        tag: "DECLARE".into(),
+    })
+}
+
+/// Execute `FETCH [direction] FROM <cursor>`.
+async fn exec_fetch(
+    sess: &TenantSession,
+    cursor_name: &str,
+    direction: sqlparser::ast::FetchDirection,
+) -> Result<ExecResult> {
+    let dir = crate::cursor::CursorDirection::from_sqlparser(&direction)?;
+    let (schema, batches) = sess
+        .state
+        .cursors
+        .apply(cursor_name, dir, true)
+        .await?;
+    Ok(ExecResult::Rows { schema, batches })
+}
+
+/// Execute `CLOSE <cursor>` (or `CLOSE ALL`).
+async fn exec_close(
+    sess: &TenantSession,
+    cursor: sqlparser::ast::CloseCursor,
+) -> Result<ExecResult> {
+    use sqlparser::ast::CloseCursor;
+    match cursor {
+        CloseCursor::All => {
+            // Close all — not trivially implementable without exposing the
+            // registry's internals; for v0.1 we surface a helpful error.
+            return Err(BasinError::internal(
+                "CLOSE ALL is not supported in v0.1; close cursors individually".to_string(),
+            ));
+        }
+        CloseCursor::Specific { name } => {
+            sess.state.cursors.close(&name.value).await?;
+        }
+    }
+    Ok(ExecResult::Empty {
+        tag: "CLOSE".into(),
+    })
+}
+
+/// Execute `MOVE <direction> [FROM|IN] <cursor>`.
+async fn exec_cursor_move(
+    sess: &TenantSession,
+    intent: crate::cursor::MoveIntent,
+) -> Result<ExecResult> {
+    sess.state
+        .cursors
+        .apply(&intent.cursor_name, intent.direction, false)
+        .await?;
+    Ok(ExecResult::Empty {
+        tag: "MOVE".into(),
+    })
 }
