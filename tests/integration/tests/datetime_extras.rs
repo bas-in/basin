@@ -277,27 +277,29 @@ async fn array_dims_1d() {
 
 // ── MULTI-DIM ARRAY ROUND-TRIP ────────────────────────────────────────────────
 
-/// `SELECT '{{1,2},{3,4}}'::int[][]` must plan and execute without error.
-/// The List(List(Int32)) → workspace-side conversion path in convert.rs must
-/// handle this cleanly.
+/// `SELECT ARRAY[[1,2],[3,4]]` must plan and execute without error.
+/// The List(List(Int64)) → workspace-side conversion path in convert.rs must
+/// handle this cleanly.  We use DataFusion's native ARRAY[[...]] constructor
+/// rather than the PG `'{{1,2},{3,4}}'::int[][]` string-cast syntax (which
+/// DataFusion does not support for nested arrays).
 #[tokio::test]
 async fn multi_dim_array_cast_executes() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(TenantId::new()).await.unwrap();
 
-    // This exercises the multi-dim array path through DataFusion → ws bridge.
+    // Use ARRAY[[...]] constructor — DataFusion produces List(List(Int64)).
     let res = sess
-        .execute("SELECT '{{1,2},{3,4}}'::int[][]")
+        .execute("SELECT ARRAY[[1,2],[3,4]]")
         .await;
     // We only require that it executes without panicking/returning Err.
-    // The result type is List(List(Int32)) — exact column format is
-    // asserted by the convert.rs List arms we added.
+    // The result type is List(List(Int64)) — the convert.rs List arms handle
+    // this recursively.
     match res {
         Ok(ExecResult::Rows { batches, .. }) => {
             assert!(!batches.is_empty(), "expected at least one batch");
             assert!(batches[0].num_rows() >= 1);
         }
         Ok(other) => panic!("unexpected non-rows result: {other:?}"),
-        Err(e) => panic!("multi-dim array cast failed: {e}"),
+        Err(e) => panic!("multi-dim array literal failed: {e}"),
     }
 }
