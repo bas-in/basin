@@ -34,11 +34,8 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let raw_sql = sql;
 
     // Phase 5.8: Basin-specific ALTER TABLE extensions (`SET cold_after`,
-    // `SET cold_age_column`, `SET BLOOM FILTERS ON (...)`) that sqlparser
-    // 0.52 doesn't model. Pre-screen the raw SQL before sqlparser sees
-    // it; on a match we route to the catalog mutator directly. Anything
-    // else (including standard ALTER TABLE forms) returns Ok(None) and
-    // falls through.
+    // `SET cold_age_column`, `SET BLOOM FILTERS ON (...)`, `CLUSTER BY`,
+    // `RESET CLUSTER BY`).
     if let Some(ext) = crate::alter::match_basin_alter_extension(sql)? {
         let table = ext.table().clone();
         let tag = ext
@@ -49,10 +46,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
 
-    // REFRESH MATERIALIZED VIEW <name> [WITH (full = true)] — sqlparser
-    // has no AST node for REFRESH, so we recognise the full statement
-    // textually and dispatch. `force_full` toggles the v0.1 opt-out from
-    // incremental refresh.
+    // REFRESH MATERIALIZED VIEW <name> [ WITH (full = true) ].
     if let Some((name, force_full)) = crate::cv_ddl::match_refresh_materialized_view(sql)? {
         return crate::cv_ddl::exec_refresh_materialized_view(sess, &name, force_full).await;
     }
@@ -88,9 +82,8 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return crate::procedure_ddl::exec_create_procedure(sess, &name, args, &body).await;
     }
 
-    // 5.11.I — `ALTER TABLE … SUBSCRIBE WEBHOOK …`. sqlparser 0.52's
-    // ALTER TABLE AST has no SUBSCRIBE arm; the matcher in
-    // `crate::webhook_ddl` recognises the full shape textually.
+    // 5.11.I — `ALTER TABLE … SUBSCRIBE WEBHOOK …`. libpg_query rejects
+    // `SUBSCRIBE` outright.
     if let Some(intent) = crate::webhook_ddl::match_alter_table_subscribe_webhook(sql)? {
         crate::webhook_ddl::exec_subscribe_webhook(
             intent,
@@ -103,8 +96,8 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         });
     }
 
-    // 5.11.I — `ALTER TABLE … UNSUBSCRIBE WEBHOOK <name>`. Same rationale
-    // as the SUBSCRIBE arm above.
+    // 5.11.I — `ALTER TABLE … UNSUBSCRIBE WEBHOOK <name>`. libpg_query
+    // rejects `UNSUBSCRIBE` outright.
     if let Some(intent) = crate::webhook_ddl::match_alter_table_unsubscribe_webhook(sql)? {
         crate::webhook_ddl::exec_unsubscribe_webhook(
             intent,
@@ -117,11 +110,9 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         });
     }
 
-    // 5.11.C — `ALTER TABLE … REACT ON … EXECUTE <body>`. The body matcher
-    // returns `None` when the statement is the C2 constraint-shaped form
-    // (which the next arm handles), so the dispatch order is:
-    //   body matcher first → `None` for constraint shape →
-    //   constraint matcher → DROP REACTOR.
+    // 5.11.C — `ALTER TABLE … REACT ON … EXECUTE <body>`. libpg_query
+    // rejects `REACT` outright. The body matcher returns `None` for the
+    // constraint-shaped form (handled by the next arm).
     if let Some(intent) = crate::reactor_ddl::match_alter_table_react_on(sql)? {
         crate::reactor_ddl::exec_react_on(intent, &sess.tenant, &sess.engine.config().catalog)
             .await?;
@@ -143,8 +134,8 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         });
     }
 
-    // 5.11.C — `DROP REACTOR <name> ON <table>`. sqlparser has no
-    // `DROP REACTOR` AST node.
+    // 5.11.C — `DROP REACTOR <name> ON <table>`. libpg_query rejects
+    // `REACTOR` outright.
     if let Some(intent) = crate::reactor_ddl::match_drop_reactor(sql)? {
         crate::reactor_ddl::exec_drop_reactor(intent, &sess.tenant, &sess.engine.config().catalog)
             .await?;
@@ -155,19 +146,15 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
 
     // DROP MATERIALIZED VIEW [IF EXISTS] <name> — sqlparser's DROP parser
     // does not recognise MATERIALIZED VIEW, so we handle the full
-    // statement before sqlparser sees it. DROP TABLE / DROP VIEW return
-    // None and fall through to sqlparser's standard path.
+    // statement before sqlparser sees it.
     if let Some((name, if_exists)) = crate::cv_ddl::match_drop_materialized_view(sql)? {
         return crate::cv_ddl::exec_drop_materialized_view(sess, &name, if_exists).await;
     }
 
     // CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] <name> [opt …] —
     // sqlparser 0.52 only parses one option per CREATE SEQUENCE
-    // statement, so the full PG grammar (`START 100 INCREMENT 5 MINVALUE
-    // 1 MAXVALUE 1000 CACHE 1 NO CYCLE`) fails at the second option.
-    // The textual matcher claims any CREATE SEQUENCE shape; the
-    // single-option AST-driven path remains as a fallback for SQL we
-    // somehow miss here.
+    // statement, so the full PG grammar fails at the second option. The
+    // textual matcher claims any CREATE SEQUENCE shape.
     if let Some(intent) = crate::seq_ddl::match_create_sequence(sql)? {
         return crate::seq_ddl::exec_create_sequence_pre_screen(sess, intent).await;
     }
@@ -199,6 +186,18 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // INCLUDE DELETED on SELECT is the soft-delete opt-out.
     let (select_stripped, include_deleted) = extract_select_include_deleted(sql);
     let sql = select_stripped.as_str();
+
+    // `INSERT INTO t [...] OVERRIDING { SYSTEM | USER } VALUE VALUES (...)`
+    // — sqlparser 0.52 doesn't recognise the clause; we lift it out
+    // textually and stash the kind on the session state for
+    // `exec_insert` to consume. No-op for any statement that isn't
+    // INSERT (or where the clause isn't present).
+    let (overriding_stripped, overriding_kind) = crate::dml::extract_insert_overriding(sql)?;
+    if let Some(kind) = overriding_kind {
+        crate::session::set_pending_overriding(&sess.state, kind);
+    }
+    let overriding_owned = overriding_stripped;
+    let sql = overriding_owned.as_str();
 
     // Auto-route `ORDER BY <vec_col> <op> <lit> LIMIT k` to the HNSW fast
     // path BEFORE the operator-to-UDF rewrite below. Once `<->` becomes
@@ -1084,12 +1083,40 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     let schema = meta.schema.clone();
     let row_count = rows_raw.len();
 
+    // Pick up any `OVERRIDING { SYSTEM | USER } VALUE` clause the
+    // textual pre-screen in `execute()` stashed for us. `take_pending`
+    // is take-once: a stale value from a prior statement on this
+    // session can't leak into the next INSERT.
+    let overriding = crate::session::take_pending_overriding(&sess.state);
+    // Enforce IDENTITY semantics on the user-written column list
+    // *before* we expand to full-width rows. ALWAYS columns reject
+    // user-supplied values unless `OVERRIDING SYSTEM VALUE` is set;
+    // BY DEFAULT columns accept them unconditionally (and the
+    // `OVERRIDING USER VALUE` clause forces them back to nextval —
+    // handled in `apply_identity_columns` below).
+    enforce_identity_insert_columns(schema.as_ref(), &ins.columns, overriding)?;
     // Reject direct writes to generated columns + expand `INSERT INTO t
     // (col_subset) VALUES ...` into full schema-width rows with NULL in
     // unmentioned columns. Generated columns are NULL'd here too;
     // `materialise_generated_columns` overwrites them once the per-row
     // batch is built.
     let mut rows_expanded = expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
+    // Fill IDENTITY columns. Three cases:
+    //   * User omitted the column      → fill from nextval.
+    //   * Column is BY DEFAULT and
+    //     OVERRIDING USER VALUE is set → discard user literal, fill
+    //                                    from nextval.
+    //   * Otherwise (column supplied,
+    //     no OVERRIDING USER VALUE,
+    //     ALWAYS already gated above)  → leave the user's value.
+    apply_identity_columns(
+        sess,
+        schema.as_ref(),
+        &ins.columns,
+        overriding,
+        &mut rows_expanded,
+    )
+    .await?;
     // Substitute column-level DEFAULT expressions for omitted columns.
     // For columns with `BASIN_COLUMN_DEFAULT` metadata that the user did
     // not explicitly write, evaluate the default text (which routes any
@@ -1714,6 +1741,172 @@ async fn apply_column_defaults(
         for row in rows.iter_mut() {
             let expr = crate::seq_ddl::evaluate_default_expression(sess, default_text).await?;
             row[col_idx] = expr;
+        }
+    }
+    Ok(())
+}
+
+/// Gate IDENTITY-column writes on the `OVERRIDING { SYSTEM | USER }
+/// VALUE` clause. Called *before* `expand_insert_rows` so a user-listed
+/// `INSERT INTO t (id, name) VALUES (...)` where `id` is `GENERATED
+/// ALWAYS AS IDENTITY` fails up front rather than after the row builder
+/// processes the literal. Only the user's *explicit* column list is
+/// inspected — the `INSERT INTO t VALUES (...)` form (no column list)
+/// lands every position, so an IDENTITY ALWAYS column written this way
+/// is also gated (PG-shape).
+fn enforce_identity_insert_columns(
+    schema: &Schema,
+    insert_columns: &[sqlparser::ast::Ident],
+    overriding: Option<crate::session::OverridingKind>,
+) -> Result<()> {
+    use crate::session::OverridingKind;
+    use crate::types::{field_identity_mode, IdentityMode};
+    let always_with_value_is_error = !matches!(overriding, Some(OverridingKind::System));
+    if insert_columns.is_empty() {
+        // `INSERT INTO t VALUES (...)` — the user supplies a value for
+        // every column (or relies on `expand_insert_rows` to NULL-fill
+        // generated cols). If the table has an IDENTITY ALWAYS column
+        // and we don't have OVERRIDING SYSTEM VALUE, reject.
+        if always_with_value_is_error {
+            for f in schema.fields() {
+                if let Some(IdentityMode::Always) = field_identity_mode(f) {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "cannot insert a non-DEFAULT value into column {:?} (GENERATED ALWAYS AS \
+                         IDENTITY); use OVERRIDING SYSTEM VALUE to override",
+                        f.name()
+                    )));
+                }
+            }
+        }
+        return Ok(());
+    }
+    // Explicit column list — only the listed columns get user values.
+    let mut by_name = std::collections::HashMap::with_capacity(schema.fields().len());
+    for (i, f) in schema.fields().iter().enumerate() {
+        by_name.insert(f.name().to_ascii_lowercase(), i);
+    }
+    for c in insert_columns {
+        let idx = match by_name.get(&c.value.to_ascii_lowercase()) {
+            Some(&i) => i,
+            // Unknown columns are caught downstream with a better
+            // error; just skip here so we don't double-report.
+            None => continue,
+        };
+        if let Some(IdentityMode::Always) = field_identity_mode(schema.field(idx)) {
+            if always_with_value_is_error {
+                return Err(BasinError::InvalidSchema(format!(
+                    "cannot insert a non-DEFAULT value into column {:?} (GENERATED ALWAYS AS \
+                     IDENTITY); use OVERRIDING SYSTEM VALUE to override",
+                    schema.field(idx).name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fill IDENTITY columns by routing through the per-tenant sequence.
+/// Three cases:
+///   * Column is omitted from the user's INSERT column list (or the
+///     user wrote no column list and the table has IDENTITY columns
+///     intermixed with generated ones — `expand_insert_rows` flagged
+///     those positions with `NULL`): fill from nextval.
+///   * Column is in the user's column list AND mode is BY DEFAULT AND
+///     OVERRIDING USER VALUE is set: discard the user's literal, fill
+///     from nextval (matches PG-shape: USER VALUE means "use the
+///     identity sequence, not the user value").
+///   * Otherwise: leave the user's value (the `ALWAYS` gate already
+///     enforced `OVERRIDING SYSTEM VALUE` in
+///     `enforce_identity_insert_columns`).
+async fn apply_identity_columns(
+    sess: &TenantSession,
+    schema: &Schema,
+    insert_columns: &[sqlparser::ast::Ident],
+    overriding: Option<crate::session::OverridingKind>,
+    rows: &mut [Vec<sqlparser::ast::Expr>],
+) -> Result<()> {
+    use crate::session::OverridingKind;
+    use crate::types::{field_identity_mode, field_identity_sequence, IdentityMode};
+    use sqlparser::ast::{Expr, Value};
+
+    let mut mentioned = vec![false; schema.fields().len()];
+    let mut by_name = std::collections::HashMap::with_capacity(schema.fields().len());
+    for (i, f) in schema.fields().iter().enumerate() {
+        by_name.insert(f.name().to_ascii_lowercase(), i);
+    }
+    if !insert_columns.is_empty() {
+        for c in insert_columns {
+            if let Some(&idx) = by_name.get(&c.value.to_ascii_lowercase()) {
+                mentioned[idx] = true;
+            }
+        }
+    } else {
+        // Empty insert_columns: see `expand_insert_rows` — every
+        // non-generated field is "mentioned" (the user supplied a value
+        // in declaration order). Generated and identity columns are
+        // intermixed in that branch only when generated cols exist;
+        // otherwise the contract is "one value per declared column" and
+        // the user supplied each.
+        let has_gen = schema
+            .fields()
+            .iter()
+            .any(|f| crate::types::field_is_generated(f).is_some());
+        if has_gen {
+            for (i, f) in schema.fields().iter().enumerate() {
+                if crate::types::field_is_generated(f).is_some() {
+                    // Generated cols get filled by
+                    // `materialise_generated_columns`; the user did
+                    // not supply a value for them. Leave `mentioned`
+                    // as false so identity-aware filling stays
+                    // disabled for those slots.
+                    mentioned[i] = false;
+                } else {
+                    mentioned[i] = true;
+                }
+            }
+        } else {
+            for v in mentioned.iter_mut() {
+                *v = true;
+            }
+        }
+    }
+
+    let user_value_override = matches!(overriding, Some(OverridingKind::User));
+
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let Some(mode) = field_identity_mode(field) else {
+            continue;
+        };
+        let Some(seq_name) = field_identity_sequence(field) else {
+            // Identity tagged but no sequence — shouldn't happen, but
+            // safer to skip than panic.
+            continue;
+        };
+        // Decide whether this column's slot gets filled from nextval
+        // for this row. Three triggers:
+        //   * Column was omitted from the INSERT.
+        //   * OVERRIDING USER VALUE on a BY DEFAULT column.
+        //   * `INSERT INTO t VALUES (...)` with no column list AND
+        //     this slot was filled with `NULL` by `expand_insert_rows`
+        //     (i.e. the column was treated as "user did not supply").
+        //     We don't currently exercise that branch (no IDENTITY +
+        //     generated col mixed-table tests), but route it for
+        //     PG-correctness.
+        let omitted = !mentioned[col_idx];
+        let force_via_user_override =
+            matches!(mode, IdentityMode::ByDefault) && user_value_override && mentioned[col_idx];
+        if !omitted && !force_via_user_override {
+            continue;
+        }
+        // Fetch one nextval per row. The shared catalog instance
+        // serialises concurrent calls across sessions.
+        let catalog = &sess.engine.config().catalog;
+        for row in rows.iter_mut() {
+            let next = catalog.nextval(&sess.tenant, seq_name).await?;
+            sess.state.sequence_cache.record(sess.tenant, seq_name, next).await;
+            // BIGINT-shaped literal. The row builder coerces this
+            // through the standard Int64 path.
+            row[col_idx] = Expr::Value(Value::Number(next.to_string(), false));
         }
     }
     Ok(())

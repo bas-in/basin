@@ -68,7 +68,7 @@ pub(crate) async fn materialise_generated_columns(
 /// of the same length as `batch.num_rows()` whose data type matches
 /// `expected_dt` (cast if the projection's natural output type is wider
 /// or narrower).
-async fn eval_expression(
+pub(crate) async fn eval_expression(
     catalog: &Arc<dyn Catalog>,
     tenant: &TenantId,
     batch: &RecordBatch,
@@ -197,7 +197,11 @@ pub(crate) async fn materialise_generated_columns_masked(
 /// Build a column that takes its value from `new_col` at matched rows
 /// and from `orig` at unmatched / null-mask rows. Both inputs must share
 /// the same `DataType` and length.
-fn merge_by_mask(orig: &ArrayRef, new_col: &ArrayRef, mask: &BooleanArray) -> Result<ArrayRef> {
+pub(crate) fn merge_by_mask(
+    orig: &ArrayRef,
+    new_col: &ArrayRef,
+    mask: &BooleanArray,
+) -> Result<ArrayRef> {
     if orig.len() != new_col.len() || orig.len() != mask.len() {
         return Err(BasinError::internal(format!(
             "merge_by_mask length mismatch: orig={}, new={}, mask={}",
