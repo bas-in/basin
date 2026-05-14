@@ -174,6 +174,8 @@ pub(crate) async fn open(
     // array_to_json, and aggregate stubs (jsonb_agg, jsonb_object_agg).
     // Extended JSON path, JSON conversion, and JSON operator UDFs.
     crate::jsonb_udf::register_jsonb_udfs(&ctx);
+    // Interval arithmetic + time-zone shim UDFs (Phase bulk-interval-tz).
+    crate::interval_tz_udf::register_interval_tz_udfs(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
