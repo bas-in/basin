@@ -10,7 +10,7 @@
 //! - `COPY t (unknown) FROM STDIN` rejected with 42601.
 //! - `COPY t (b, a) TO STDOUT` — column-list export ordering.
 //! - `COPY t TO '/tmp/...'` / `COPY t FROM '/tmp/...'` — server-side file
-//!   paths gated by `BASIN_COPY_PATH_ALLOWLIST`.
+//!   paths gated by `BASIN_COPY_ALLOW_FILE_PATHS=1` + `BASIN_COPY_PATH_ALLOWLIST`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -90,7 +90,7 @@ async fn connect(addr: SocketAddr) -> tokio_postgres::Client {
     client
 }
 
-/// `BASIN_COPY_PATH_ALLOWLIST` is process-global. Tests that mutate it must
+/// Env vars for file-path COPY are process-global. Tests that mutate them must
 /// serialise through this lock to avoid stomping each other.
 fn copy_path_env_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
@@ -278,6 +278,7 @@ async fn copy_to_file_path_writes_csv() {
     let client = connect(server.addr).await;
 
     let scratch = TempDir::new().unwrap();
+    std::env::set_var("BASIN_COPY_ALLOW_FILE_PATHS", "1");
     std::env::set_var(
         "BASIN_COPY_PATH_ALLOWLIST",
         scratch.path().to_str().unwrap(),
@@ -309,6 +310,7 @@ async fn copy_to_file_path_writes_csv() {
     assert_eq!(lines.len(), 6, "1 header + 5 rows");
     assert_eq!(lines[0], "id,name");
 
+    std::env::remove_var("BASIN_COPY_ALLOW_FILE_PATHS");
     std::env::remove_var("BASIN_COPY_PATH_ALLOWLIST");
 }
 
@@ -319,6 +321,7 @@ async fn copy_to_file_path_relative_rejected() {
     let client = connect(server.addr).await;
 
     let scratch = TempDir::new().unwrap();
+    std::env::set_var("BASIN_COPY_ALLOW_FILE_PATHS", "1");
     std::env::set_var(
         "BASIN_COPY_PATH_ALLOWLIST",
         scratch.path().to_str().unwrap(),
@@ -341,6 +344,7 @@ async fn copy_to_file_path_relative_rejected() {
         dbe.message()
     );
 
+    std::env::remove_var("BASIN_COPY_ALLOW_FILE_PATHS");
     std::env::remove_var("BASIN_COPY_PATH_ALLOWLIST");
 }
 
@@ -350,7 +354,8 @@ async fn copy_to_file_path_outside_allowlist_rejected() {
     let server = start_server().await;
     let client = connect(server.addr).await;
 
-    // Allowlist unset entirely → default-deny.
+    // Primary gate unset → SQLSTATE 42501 (insufficient_privilege).
+    std::env::remove_var("BASIN_COPY_ALLOW_FILE_PATHS");
     std::env::remove_var("BASIN_COPY_PATH_ALLOWLIST");
 
     client
@@ -363,16 +368,18 @@ async fn copy_to_file_path_outside_allowlist_rejected() {
         .await
         .expect_err("expected error");
     let dbe = err.as_db_error().expect("DbError");
-    assert_eq!(dbe.code().code(), "42601");
+    // 42501 = insufficient_privilege (primary gate disabled)
+    assert_eq!(dbe.code().code(), "42501");
     assert!(
         dbe.message().contains("disabled"),
         "msg should mention default-deny: {}",
         dbe.message()
     );
 
-    // Now flip the allowlist on but to a different directory; same path
-    // should still be rejected as 'outside allowlist'.
+    // Enable the primary gate, but only with allowlist pointing elsewhere;
+    // path outside allowlist → still rejected (42601).
     let scratch = TempDir::new().unwrap();
+    std::env::set_var("BASIN_COPY_ALLOW_FILE_PATHS", "1");
     std::env::set_var(
         "BASIN_COPY_PATH_ALLOWLIST",
         scratch.path().to_str().unwrap(),
@@ -388,6 +395,7 @@ async fn copy_to_file_path_outside_allowlist_rejected() {
         "msg should mention 'outside': {}",
         dbe.message()
     );
+    std::env::remove_var("BASIN_COPY_ALLOW_FILE_PATHS");
     std::env::remove_var("BASIN_COPY_PATH_ALLOWLIST");
 }
 
@@ -398,6 +406,7 @@ async fn copy_from_file_path_round_trips() {
     let client = connect(server.addr).await;
 
     let scratch = TempDir::new().unwrap();
+    std::env::set_var("BASIN_COPY_ALLOW_FILE_PATHS", "1");
     std::env::set_var(
         "BASIN_COPY_PATH_ALLOWLIST",
         scratch.path().to_str().unwrap(),
@@ -445,5 +454,6 @@ async fn copy_from_file_path_round_trips() {
     let n: &str = row.get(0);
     assert_eq!(n, "name-2");
 
+    std::env::remove_var("BASIN_COPY_ALLOW_FILE_PATHS");
     std::env::remove_var("BASIN_COPY_PATH_ALLOWLIST");
 }

@@ -655,7 +655,8 @@ where
             // ("unexpected message"). Failing at Parse short-circuits before
             // Bind/Execute is ever sent.
             if let Err(emsg) = validate_copy_at_parse(session, &cmd).await {
-                let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), emsg);
+                let (sqlstate, message) = decode_copy_error(&emsg);
+                let info = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
                 return vec![PgWireBackendMessage::ErrorResponse(info.into())];
             }
             let mut g = state.lock().await;
@@ -666,8 +667,9 @@ where
             return vec![PgWireBackendMessage::ParseComplete(ParseComplete::new())];
         }
         Ok(None) => {}
-        Err(msg) => {
-            let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
+        Err(emsg) => {
+            let (sqlstate, message) = decode_copy_error(&emsg);
+            let info = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
             return vec![PgWireBackendMessage::ErrorResponse(info.into())];
         }
     }
@@ -697,6 +699,9 @@ where
 /// Bind/Execute, which keeps the wire-protocol exchange clean (no
 /// CopyFail+Sync follow-up from tokio-postgres' CopyInReceiver). For STDIN/
 /// STDOUT-only commands without a column list this is a no-op.
+///
+/// `PROGRAM` and file-path-gate errors are encoded in the returned string with
+/// a `"\x0042501\x00"` prefix to signal SQLSTATE 42501 to the caller.
 async fn validate_copy_at_parse<S>(
     session: &S,
     cmd: &crate::copy::CopyCommand,
@@ -704,37 +709,64 @@ async fn validate_copy_at_parse<S>(
 where
     S: Session + ?Sized,
 {
-    let (table, columns, path, is_from) = match cmd {
+    match cmd {
+        crate::copy::CopyCommand::QueryTo { .. } => {
+            // Query-source COPY: no table/column validation at parse time.
+            return Ok(());
+        }
         crate::copy::CopyCommand::From {
             table,
             columns,
             path,
             ..
-        } => (table.as_str(), columns.as_deref(), path.as_deref(), true),
+        } => {
+            if let Some(p) = path {
+                crate::copy::validate_copy_path(p)?;
+            }
+            if columns.is_some() {
+                let table_cols = crate::copy::resolve_table_columns(session, table)
+                    .await
+                    .map_err(|e| format!("COPY: {e}"))?;
+                if table_cols.is_empty() {
+                    return Err(format!("COPY: cannot resolve schema of {table:?}"));
+                }
+                crate::copy::select_copy_in_columns(table, &table_cols, columns.as_deref())?;
+            }
+        }
         crate::copy::CopyCommand::To {
             table,
             columns,
             path,
             ..
-        } => (table.as_str(), columns.as_deref(), path.as_deref(), false),
-    };
-    if let Some(p) = path {
-        crate::copy::validate_copy_path(p)?;
-    }
-    if columns.is_some() {
-        let table_cols = crate::copy::resolve_table_columns(session, table)
-            .await
-            .map_err(|e| format!("COPY: {e}"))?;
-        if table_cols.is_empty() {
-            return Err(format!("COPY: cannot resolve schema of {table:?}"));
-        }
-        if is_from {
-            crate::copy::select_copy_in_columns(table, &table_cols, columns)?;
-        } else {
-            crate::copy::select_copy_out_columns(table, &table_cols, columns)?;
+        } => {
+            if let Some(p) = path {
+                crate::copy::validate_copy_path(p)?;
+            }
+            if columns.is_some() {
+                let table_cols = crate::copy::resolve_table_columns(session, table)
+                    .await
+                    .map_err(|e| format!("COPY: {e}"))?;
+                if table_cols.is_empty() {
+                    return Err(format!("COPY: cannot resolve schema of {table:?}"));
+                }
+                crate::copy::select_copy_out_columns(table, &table_cols, columns.as_deref())?;
+            }
         }
     }
     Ok(())
+}
+
+/// Decode an error string that may carry a `"\x0042501\x00<msg>"` prefix
+/// emitted by `parse_copy` / `validate_copy_path` for SQLSTATE 42501 errors.
+/// Returns `(sqlstate, message)`.
+fn decode_copy_error(msg: &str) -> (&str, &str) {
+    if let Some(rest) = msg.strip_prefix('\x00') {
+        // Format: "<sqlstate>\x00<message>"
+        if let Some(idx) = rest.find('\x00') {
+            return (&rest[..idx], &rest[idx + 1..]);
+        }
+    }
+    ("42601", msg)
 }
 
 async fn handle_bind<S>(
@@ -1092,6 +1124,7 @@ where
             with_header,
             columns,
             path,
+            opts,
         } => {
             let table_cols = match crate::copy::resolve_table_columns(session, &table).await {
                 Ok(c) if !c.is_empty() => c,
@@ -1118,7 +1151,7 @@ where
                     return ExecuteOutcome::error_info(info);
                 }
             };
-            let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header);
+            let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header, opts);
             if let Some(list) = columns.clone() {
                 state = state.with_column_list(list);
             }
@@ -1126,8 +1159,9 @@ where
             if let Some(p) = path {
                 let resolved = match crate::copy::validate_copy_path(&p) {
                     Ok(pb) => pb,
-                    Err(msg) => {
-                        let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
+                    Err(emsg) => {
+                        let (sqlstate, message) = decode_copy_error(&emsg);
+                        let info = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
                         return ExecuteOutcome::error_info(info);
                     }
                 };
@@ -1161,12 +1195,14 @@ where
             with_header,
             columns,
             path,
+            opts,
         } => {
             if let Some(p) = path {
                 let resolved = match crate::copy::validate_copy_path(&p) {
                     Ok(pb) => pb,
-                    Err(msg) => {
-                        let info = ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), msg);
+                    Err(emsg) => {
+                        let (sqlstate, message) = decode_copy_error(&emsg);
+                        let info = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
                         return ExecuteOutcome::error_info(info);
                     }
                 };
@@ -1176,6 +1212,7 @@ where
                     columns.as_deref(),
                     &resolved,
                     with_header,
+                    &opts,
                 )
                 .await
                 {
@@ -1197,6 +1234,7 @@ where
                 &table,
                 columns.as_deref(),
                 with_header,
+                &opts,
             )
             .await;
             if matches!(msgs.last(), Some(PgWireBackendMessage::ReadyForQuery(_))) {
@@ -1206,6 +1244,29 @@ where
             // validation against the engine's resolved schema failed)
             // surface that as an error outcome so the framework flips
             // the connection into AwaitingSync.
+            let errored = matches!(msgs.first(), Some(PgWireBackendMessage::ErrorResponse(_)));
+            ExecuteOutcome {
+                messages: msgs,
+                start_copy_in: None,
+                is_error: errored,
+            }
+        }
+        crate::copy::CopyCommand::QueryTo {
+            query,
+            with_header,
+            opts,
+        } => {
+            // Run the subquery and stream the result as CSV to STDOUT.
+            let mut msgs = crate::copy::copy_query_to_stdout_messages(
+                session,
+                &query,
+                with_header,
+                &opts,
+            )
+            .await;
+            if matches!(msgs.last(), Some(PgWireBackendMessage::ReadyForQuery(_))) {
+                msgs.pop();
+            }
             let errored = matches!(msgs.first(), Some(PgWireBackendMessage::ErrorResponse(_)));
             ExecuteOutcome {
                 messages: msgs,
@@ -1885,15 +1946,16 @@ impl<S: Session + 'static> SimpleQueryHandler for BasinSimpleQueryHandlerSlot<S>
                 return self.handle_copy(client, session, cmd).await;
             }
             Ok(None) => {}
-            Err(msg) => {
+            Err(emsg) => {
                 if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
                     return Err(PgWireError::NotReadyForQuery);
                 }
                 client.set_state(PgWireConnectionState::QueryInProgress);
+                let (sqlstate, message) = decode_copy_error(&emsg);
                 let info = pgwire::error::ErrorInfo::new(
                     "ERROR".to_owned(),
-                    "42601".to_owned(), // syntax_error
-                    msg,
+                    sqlstate.to_owned(),
+                    message.to_owned(),
                 );
                 client
                     .feed(PgWireBackendMessage::ErrorResponse(info.into()))
@@ -1955,6 +2017,7 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                 with_header,
                 columns,
                 path,
+                opts,
             } => {
                 let table_cols = match crate::copy::resolve_table_columns(session.as_ref(), &table)
                     .await
@@ -1987,18 +2050,19 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                         return finish_copy_error(client, info.into()).await;
                     }
                 };
-                let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header);
+                let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header, opts);
                 if let Some(list) = columns.clone() {
                     state = state.with_column_list(list);
                 }
                 if let Some(p) = path {
                     let resolved = match crate::copy::validate_copy_path(&p) {
                         Ok(pb) => pb,
-                        Err(msg) => {
+                        Err(emsg) => {
+                            let (sqlstate, message) = decode_copy_error(&emsg);
                             let info = pgwire::error::ErrorInfo::new(
                                 "ERROR".to_owned(),
-                                "42601".to_owned(),
-                                msg,
+                                sqlstate.to_owned(),
+                                message.to_owned(),
                             );
                             return finish_copy_error(client, info.into()).await;
                         }
@@ -2050,15 +2114,17 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                 with_header,
                 columns,
                 path,
+                opts,
             } => {
                 if let Some(p) = path {
                     let resolved = match crate::copy::validate_copy_path(&p) {
                         Ok(pb) => pb,
-                        Err(msg) => {
+                        Err(emsg) => {
+                            let (sqlstate, message) = decode_copy_error(&emsg);
                             let info = pgwire::error::ErrorInfo::new(
                                 "ERROR".to_owned(),
-                                "42601".to_owned(),
-                                msg,
+                                sqlstate.to_owned(),
+                                message.to_owned(),
                             );
                             return finish_copy_error(client, info.into()).await;
                         }
@@ -2069,6 +2135,7 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                         columns.as_deref(),
                         &resolved,
                         with_header,
+                        &opts,
                     )
                     .await
                     {
@@ -2099,6 +2166,26 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                     &table,
                     columns.as_deref(),
                     with_header,
+                    &opts,
+                )
+                .await
+                {
+                    client.feed(m).await?;
+                }
+                client.flush().await?;
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                Ok(())
+            }
+            crate::copy::CopyCommand::QueryTo {
+                query,
+                with_header,
+                opts,
+            } => {
+                for m in crate::copy::copy_query_to_stdout_messages(
+                    session.as_ref(),
+                    &query,
+                    with_header,
+                    &opts,
                 )
                 .await
                 {
