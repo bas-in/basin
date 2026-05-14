@@ -1135,6 +1135,110 @@ impl TableProvider for PgAuthidProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Macro to reduce boilerplate for simple catalog-view providers
+// ---------------------------------------------------------------------------
+
+/// Generate a simple `TableProvider` struct that calls one `InfoSchemaQuery`
+/// method pair (`${name}_schema` / `${name}`).
+macro_rules! simple_provider {
+    ($struct_name:ident, $query_schema:ident, $query_fn:ident, $debug_name:literal) => {
+        pub(crate) struct $struct_name {
+            catalog: Arc<dyn Catalog>,
+            tenant: TenantId,
+            schema: DfSchemaRef,
+        }
+
+        impl std::fmt::Debug for $struct_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct($debug_name)
+                    .field("tenant", &self.tenant)
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl $struct_name {
+            pub(crate) fn new(
+                catalog: Arc<dyn Catalog>,
+                tenant: TenantId,
+            ) -> DfResult<Self> {
+                let ws_schema = InfoSchemaQuery::$query_schema();
+                let df_schema = schema_ws_to_df(ws_schema.as_ref())
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(Self {
+                    catalog,
+                    tenant,
+                    schema: Arc::new(df_schema),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl TableProvider for $struct_name {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn schema(&self) -> DfSchemaRef {
+                Arc::clone(&self.schema)
+            }
+
+            fn table_type(&self) -> TableType {
+                TableType::Base
+            }
+
+            async fn scan(
+                &self,
+                _state: &dyn Session,
+                projection: Option<&Vec<usize>>,
+                _filters: &[Expr],
+                _limit: Option<usize>,
+            ) -> DfResult<Arc<dyn ExecutionPlan>> {
+                let ws_batch = InfoSchemaQuery::$query_fn(
+                    self.catalog.as_ref(),
+                    &self.tenant,
+                )
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let df_batch = batch_ws_to_df(&ws_batch)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let partitions = vec![vec![df_batch]];
+                let exec = MemoryExec::try_new(
+                    &partitions,
+                    Arc::clone(&self.schema),
+                    projection.cloned(),
+                )?;
+                Ok(Arc::new(exec))
+            }
+        }
+    };
+}
+
+// pg_catalog new views
+simple_provider!(PgDatabaseProvider, pg_database_schema, pg_database, "PgDatabaseProvider");
+simple_provider!(PgRolesProvider, pg_roles_schema, pg_roles, "PgRolesProvider");
+simple_provider!(PgViewsProvider, pg_views_schema, pg_views, "PgViewsProvider");
+simple_provider!(PgIndexesProvider, pg_indexes_schema, pg_indexes, "PgIndexesProvider");
+simple_provider!(PgTablesProvider, pg_tables_schema, pg_tables, "PgTablesProvider");
+simple_provider!(PgSettingsProvider, pg_settings_schema, pg_settings, "PgSettingsProvider");
+simple_provider!(PgExtensionProvider, pg_extension_schema, pg_extension, "PgExtensionProvider");
+simple_provider!(PgDescriptionProvider, pg_description_schema, pg_description, "PgDescriptionProvider");
+simple_provider!(PgStatUserTablesProvider, pg_stat_user_tables_schema, pg_stat_user_tables, "PgStatUserTablesProvider");
+simple_provider!(PgStatUserIndexesProvider, pg_stat_user_indexes_schema, pg_stat_user_indexes, "PgStatUserIndexesProvider");
+simple_provider!(PgLocksProvider, pg_locks_schema, pg_locks, "PgLocksProvider");
+simple_provider!(PgStatActivityProvider, pg_stat_activity_schema, pg_stat_activity, "PgStatActivityProvider");
+
+// information_schema new views
+simple_provider!(CheckConstraintsProvider, check_constraints_schema, check_constraints, "CheckConstraintsProvider");
+simple_provider!(TriggersProvider, triggers_schema, triggers, "TriggersProvider");
+simple_provider!(SequencesProvider, sequences_schema, sequences, "SequencesProvider");
+simple_provider!(DomainsProvider, domains_schema, domains, "DomainsProvider");
+simple_provider!(ParametersProvider, parameters_schema, parameters, "ParametersProvider");
+simple_provider!(RoleTableGrantsProvider, role_table_grants_schema, role_table_grants, "RoleTableGrantsProvider");
+simple_provider!(UserDefinedTypesProvider, user_defined_types_schema, user_defined_types, "UserDefinedTypesProvider");
+simple_provider!(ColumnDomainUsageProvider, column_domain_usage_schema, column_domain_usage, "ColumnDomainUsageProvider");
+simple_provider!(ColumnUdtUsageProvider, column_udt_usage_schema, column_udt_usage, "ColumnUdtUsageProvider");
+
 /// Register `information_schema.tables` and `pg_catalog.pg_class` with the
 /// session's default catalog (`datafusion`). Must be called once per
 /// session, before the listing tables are pre-registered, so the schemas
@@ -1252,8 +1356,75 @@ pub(crate) fn register_info_schema_providers(
         Arc::new(PgDependProvider::new(catalog.clone(), tenant)?);
     pg_catalog_schema.register_table("pg_depend".to_string(), pg_depend_provider)?;
     let pg_authid_provider: Arc<dyn TableProvider> =
-        Arc::new(PgAuthidProvider::new(catalog, tenant)?);
+        Arc::new(PgAuthidProvider::new(catalog.clone(), tenant)?);
     pg_catalog_schema.register_table("pg_authid".to_string(), pg_authid_provider)?;
+
+    // Bulk catalog expansion: pg_catalog additions
+    let pg_database_provider: Arc<dyn TableProvider> =
+        Arc::new(PgDatabaseProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_database".to_string(), pg_database_provider)?;
+    let pg_roles_provider: Arc<dyn TableProvider> =
+        Arc::new(PgRolesProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_roles".to_string(), pg_roles_provider)?;
+    let pg_views_provider: Arc<dyn TableProvider> =
+        Arc::new(PgViewsProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_views".to_string(), pg_views_provider)?;
+    let pg_indexes_provider: Arc<dyn TableProvider> =
+        Arc::new(PgIndexesProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_indexes".to_string(), pg_indexes_provider)?;
+    let pg_tables_provider: Arc<dyn TableProvider> =
+        Arc::new(PgTablesProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_tables".to_string(), pg_tables_provider)?;
+    let pg_settings_provider: Arc<dyn TableProvider> =
+        Arc::new(PgSettingsProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_settings".to_string(), pg_settings_provider)?;
+    let pg_extension_provider: Arc<dyn TableProvider> =
+        Arc::new(PgExtensionProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_extension".to_string(), pg_extension_provider)?;
+    let pg_description_provider: Arc<dyn TableProvider> =
+        Arc::new(PgDescriptionProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_description".to_string(), pg_description_provider)?;
+    let pg_stat_user_tables_provider: Arc<dyn TableProvider> =
+        Arc::new(PgStatUserTablesProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_stat_user_tables".to_string(), pg_stat_user_tables_provider)?;
+    let pg_stat_user_indexes_provider: Arc<dyn TableProvider> =
+        Arc::new(PgStatUserIndexesProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_stat_user_indexes".to_string(), pg_stat_user_indexes_provider)?;
+    let pg_locks_provider: Arc<dyn TableProvider> =
+        Arc::new(PgLocksProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_locks".to_string(), pg_locks_provider)?;
+    let pg_stat_activity_provider: Arc<dyn TableProvider> =
+        Arc::new(PgStatActivityProvider::new(catalog.clone(), tenant)?);
+    pg_catalog_schema.register_table("pg_stat_activity".to_string(), pg_stat_activity_provider)?;
+
+    // Bulk catalog expansion: information_schema additions
+    let check_constraints_provider: Arc<dyn TableProvider> =
+        Arc::new(CheckConstraintsProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("check_constraints".to_string(), check_constraints_provider)?;
+    let triggers_provider: Arc<dyn TableProvider> =
+        Arc::new(TriggersProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("triggers".to_string(), triggers_provider)?;
+    let sequences_provider: Arc<dyn TableProvider> =
+        Arc::new(SequencesProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("sequences".to_string(), sequences_provider)?;
+    let domains_provider: Arc<dyn TableProvider> =
+        Arc::new(DomainsProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("domains".to_string(), domains_provider)?;
+    let parameters_provider: Arc<dyn TableProvider> =
+        Arc::new(ParametersProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("parameters".to_string(), parameters_provider)?;
+    let role_table_grants_provider: Arc<dyn TableProvider> =
+        Arc::new(RoleTableGrantsProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("role_table_grants".to_string(), role_table_grants_provider)?;
+    let user_defined_types_provider: Arc<dyn TableProvider> =
+        Arc::new(UserDefinedTypesProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("user_defined_types".to_string(), user_defined_types_provider)?;
+    let column_domain_usage_provider: Arc<dyn TableProvider> =
+        Arc::new(ColumnDomainUsageProvider::new(catalog.clone(), tenant)?);
+    info_schema.register_table("column_domain_usage".to_string(), column_domain_usage_provider)?;
+    let column_udt_usage_provider: Arc<dyn TableProvider> =
+        Arc::new(ColumnUdtUsageProvider::new(catalog, tenant)?);
+    info_schema.register_table("column_udt_usage".to_string(), column_udt_usage_provider)?;
 
     Ok(())
 }

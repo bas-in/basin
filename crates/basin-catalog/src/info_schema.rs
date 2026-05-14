@@ -1555,6 +1555,1176 @@ impl InfoSchemaQuery {
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_authid build: {e}")))
     }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_database  (one row — the current tenant's logical db)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_database_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int64, false),
+            Field::new("datname", DataType::Utf8, false),
+            Field::new("datdba", DataType::Int64, false),
+            Field::new("encoding", DataType::Int32, false),
+            Field::new("datcollate", DataType::Utf8, false),
+            Field::new("datctype", DataType::Utf8, false),
+            Field::new("datistemplate", DataType::Boolean, false),
+            Field::new("datallowconn", DataType::Boolean, false),
+            Field::new("datconnlimit", DataType::Int32, false),
+        ]))
+    }
+
+    pub async fn pg_database(_catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{tenant}").as_bytes());
+        let dba_oid = role_oid_for(tenant);
+        let schema = Self::pg_database_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![db_oid])),
+            Arc::new(StringArray::from(vec!["basin"])),
+            Arc::new(Int64Array::from(vec![dba_oid])),
+            Arc::new(Int32Array::from(vec![6])), // UTF8
+            Arc::new(StringArray::from(vec!["en_US.UTF-8"])),
+            Arc::new(StringArray::from(vec!["en_US.UTF-8"])),
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(Int32Array::from(vec![-1])),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_database build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_roles  (alias to pg_authid with public columns)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_roles_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int64, false),
+            Field::new("rolname", DataType::Utf8, false),
+            Field::new("rolsuper", DataType::Boolean, false),
+            Field::new("rolinherit", DataType::Boolean, false),
+            Field::new("rolcreaterole", DataType::Boolean, false),
+            Field::new("rolcreatedb", DataType::Boolean, false),
+            Field::new("rolcanlogin", DataType::Boolean, false),
+            Field::new("rolreplication", DataType::Boolean, false),
+            Field::new("rolconnlimit", DataType::Int32, false),
+            Field::new("rolvaliduntil", DataType::Utf8, true),
+        ]))
+    }
+
+    pub async fn pg_roles(_catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let oid = role_oid_for(tenant);
+        let rolname = tenant.to_string();
+        let schema = Self::pg_roles_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![oid])),
+            Arc::new(StringArray::from(vec![rolname])),
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(Int32Array::from(vec![-1])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_roles build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_views  (views per tenant — matviews only in v0.1)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_views_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("schemaname", DataType::Utf8, false),
+            Field::new("viewname", DataType::Utf8, false),
+            Field::new("viewowner", DataType::Utf8, false),
+            Field::new("definition", DataType::Utf8, true),
+        ]))
+    }
+
+    pub async fn pg_views(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let mut schemas: Vec<&str> = Vec::new();
+        let mut viewnames: Vec<String> = Vec::new();
+        let mut owners: Vec<String> = Vec::new();
+        let mut defs: Vec<Option<String>> = Vec::new();
+        let owner = tenant.to_string();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            if meta.continuous_aggregate.is_some() {
+                schemas.push(DEFAULT_SCHEMA);
+                viewnames.push(name.as_str().to_string());
+                owners.push(owner.clone());
+                defs.push(None);
+            }
+        }
+        let schema = Self::pg_views_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(schemas)),
+            Arc::new(StringArray::from(viewnames)),
+            Arc::new(StringArray::from(owners)),
+            Arc::new(StringArray::from(defs)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_views build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_indexes  (denormalised index info)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_indexes_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("schemaname", DataType::Utf8, false),
+            Field::new("tablename", DataType::Utf8, false),
+            Field::new("indexname", DataType::Utf8, false),
+            Field::new("tablespace", DataType::Utf8, true),
+            Field::new("indexdef", DataType::Utf8, true),
+        ]))
+    }
+
+    /// Returns one row per index in the tenant's tables. v0.1 only carries
+    /// PRIMARY KEY constraints; each PK produces one `<table>_pkey` row.
+    pub async fn pg_indexes(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let mut schemas: Vec<&str> = Vec::new();
+        let mut tablenames: Vec<String> = Vec::new();
+        let mut indexnames: Vec<String> = Vec::new();
+        let mut tablespaces: Vec<Option<String>> = Vec::new();
+        let mut indexdefs: Vec<Option<String>> = Vec::new();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            if !meta.pk_columns.is_empty() {
+                schemas.push(DEFAULT_SCHEMA);
+                tablenames.push(name.as_str().to_string());
+                indexnames.push(format!("{}_pkey", name.as_str()));
+                tablespaces.push(None);
+                let cols = meta.pk_columns.join(", ");
+                indexdefs.push(Some(format!(
+                    "CREATE UNIQUE INDEX {}_pkey ON {} ({})",
+                    name.as_str(), name.as_str(), cols
+                )));
+            }
+        }
+        let schema = Self::pg_indexes_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(schemas)),
+            Arc::new(StringArray::from(tablenames)),
+            Arc::new(StringArray::from(indexnames)),
+            Arc::new(StringArray::from(tablespaces)),
+            Arc::new(StringArray::from(indexdefs)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_indexes build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_tables  (denormalised table info)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_tables_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("schemaname", DataType::Utf8, false),
+            Field::new("tablename", DataType::Utf8, false),
+            Field::new("tableowner", DataType::Utf8, false),
+            Field::new("tablespace", DataType::Utf8, true),
+            Field::new("hasindexes", DataType::Boolean, false),
+            Field::new("hasrules", DataType::Boolean, false),
+            Field::new("hastriggers", DataType::Boolean, false),
+            Field::new("rowsecurity", DataType::Boolean, false),
+        ]))
+    }
+
+    pub async fn pg_tables(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let mut schemas: Vec<&str> = Vec::new();
+        let mut tablenames: Vec<String> = Vec::new();
+        let mut owners: Vec<String> = Vec::new();
+        let mut tablespaces: Vec<Option<String>> = Vec::new();
+        let mut hasindexes: Vec<bool> = Vec::new();
+        let mut hasrules: Vec<bool> = Vec::new();
+        let mut hastriggers: Vec<bool> = Vec::new();
+        let mut rowsecurity: Vec<bool> = Vec::new();
+        let owner = tenant.to_string();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            // Only base tables (not matviews) appear in pg_tables
+            if meta.continuous_aggregate.is_none() {
+                schemas.push(DEFAULT_SCHEMA);
+                tablenames.push(name.as_str().to_string());
+                owners.push(owner.clone());
+                tablespaces.push(None);
+                hasindexes.push(!meta.pk_columns.is_empty());
+                hasrules.push(false);
+                hastriggers.push(false);
+                rowsecurity.push(meta.rls_enabled);
+            }
+        }
+        let schema = Self::pg_tables_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(schemas)),
+            Arc::new(StringArray::from(tablenames)),
+            Arc::new(StringArray::from(owners)),
+            Arc::new(StringArray::from(tablespaces)),
+            Arc::new(BooleanArray::from(hasindexes)),
+            Arc::new(BooleanArray::from(hasrules)),
+            Arc::new(BooleanArray::from(hastriggers)),
+            Arc::new(BooleanArray::from(rowsecurity)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_tables build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_settings  (GUC variables — static defaults)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_settings_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("setting", DataType::Utf8, false),
+            Field::new("unit", DataType::Utf8, true),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("short_desc", DataType::Utf8, false),
+            Field::new("extra_desc", DataType::Utf8, true),
+            Field::new("context", DataType::Utf8, false),
+            Field::new("vartype", DataType::Utf8, false),
+            Field::new("source", DataType::Utf8, false),
+            Field::new("min_val", DataType::Utf8, true),
+            Field::new("max_val", DataType::Utf8, true),
+            Field::new("enumvals", DataType::Utf8, true),
+            Field::new("boot_val", DataType::Utf8, true),
+            Field::new("reset_val", DataType::Utf8, true),
+            Field::new("sourcefile", DataType::Utf8, true),
+            Field::new("sourceline", DataType::Int32, true),
+            Field::new("pending_restart", DataType::Boolean, false),
+        ]))
+    }
+
+    pub async fn pg_settings(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+        // A minimal GUC list that ORMs and admin tools commonly probe.
+        // Tuple: (name, setting, unit, category, short_desc, context, vartype, source, min, max, boot, reset)
+        let rows: &[(&str, &str, Option<&str>, &str, &str, &str, &str, &str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
+            ("server_version", "15.0", None, "Preset Options", "Shows the server version.", "internal", "string", "default", None, None, Some("15.0"), Some("15.0")),
+            ("server_version_num", "150000", None, "Preset Options", "Shows the server version as an integer.", "internal", "integer", "default", Some("0"), Some("2147483647"), Some("150000"), Some("150000")),
+            ("max_connections", "100", None, "Connections and Authentication / Connection Settings", "Sets the maximum number of concurrent connections.", "postmaster", "integer", "default", Some("1"), Some("262143"), Some("100"), Some("100")),
+            ("TimeZone", "UTC", None, "Client Connection Defaults / Locale and Formatting", "Sets the time zone for displaying and interpreting time stamps.", "user", "string", "default", None, None, Some("UTC"), Some("UTC")),
+            ("client_encoding", "UTF8", None, "Client Connection Defaults / Locale and Formatting", "Sets the client's character set encoding.", "user", "string", "default", None, None, Some("UTF8"), Some("UTF8")),
+            ("standard_conforming_strings", "on", None, "Version and Platform Compatibility / Previous PostgreSQL Versions", "Causes '...' strings to treat backslashes literally.", "user", "bool", "default", None, None, Some("on"), Some("on")),
+            ("search_path", "public", None, "Client Connection Defaults / Statement Behavior", "Sets the schema search order for names that are not schema-qualified.", "user", "string", "default", None, None, Some("public"), Some("public")),
+            ("default_transaction_isolation", "read committed", None, "Client Connection Defaults / Statement Behavior", "Sets the transaction isolation level of each new transaction.", "user", "enum", "default", None, None, Some("read committed"), Some("read committed")),
+        ];
+        let schema = Self::pg_settings_schema();
+        let n = rows.len();
+        let mut names = Vec::with_capacity(n);
+        let mut settings = Vec::with_capacity(n);
+        let mut units: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut categories = Vec::with_capacity(n);
+        let mut short_descs = Vec::with_capacity(n);
+        let mut extra_descs: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut contexts = Vec::with_capacity(n);
+        let mut vartypes = Vec::with_capacity(n);
+        let mut sources = Vec::with_capacity(n);
+        let mut min_vals: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut max_vals: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut enumvals: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut boot_vals: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut reset_vals: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut sourcefiles: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut sourcelines: Vec<Option<i32>> = Vec::with_capacity(n);
+        let mut pending: Vec<bool> = Vec::with_capacity(n);
+        for (name, setting, unit, category, short_desc, context, vartype, source, min, max, boot, reset) in rows {
+            names.push(*name);
+            settings.push(*setting);
+            units.push(*unit);
+            categories.push(*category);
+            short_descs.push(*short_desc);
+            extra_descs.push(None);
+            contexts.push(*context);
+            vartypes.push(*vartype);
+            sources.push(*source);
+            min_vals.push(*min);
+            max_vals.push(*max);
+            enumvals.push(None);
+            boot_vals.push(*boot);
+            reset_vals.push(*reset);
+            sourcefiles.push(None);
+            sourcelines.push(None);
+            pending.push(false);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(settings)),
+            Arc::new(StringArray::from(units)),
+            Arc::new(StringArray::from(categories)),
+            Arc::new(StringArray::from(short_descs)),
+            Arc::new(StringArray::from(extra_descs)),
+            Arc::new(StringArray::from(contexts)),
+            Arc::new(StringArray::from(vartypes)),
+            Arc::new(StringArray::from(sources)),
+            Arc::new(StringArray::from(min_vals)),
+            Arc::new(StringArray::from(max_vals)),
+            Arc::new(StringArray::from(enumvals)),
+            Arc::new(StringArray::from(boot_vals)),
+            Arc::new(StringArray::from(reset_vals)),
+            Arc::new(StringArray::from(sourcefiles)),
+            Arc::new(Int32Array::from(sourcelines)),
+            Arc::new(BooleanArray::from(pending)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_settings build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_extension  (installed extensions — empty stub)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_extension_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int64, false),
+            Field::new("extname", DataType::Utf8, false),
+            Field::new("extowner", DataType::Int64, false),
+            Field::new("extnamespace", DataType::Int64, false),
+            Field::new("extrelocatable", DataType::Boolean, false),
+            Field::new("extversion", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn pg_extension(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+        let schema = Self::pg_extension_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(BooleanArray::from(Vec::<bool>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_extension build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_description  (object comments — empty stub)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_description_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("objoid", DataType::Int64, false),
+            Field::new("classoid", DataType::Int64, false),
+            Field::new("objsubid", DataType::Int32, false),
+            Field::new("description", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn pg_description(
+        _catalog: &dyn Catalog,
+        _tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        let schema = Self::pg_description_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_description build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_stat_user_tables  (basic row/scan count stubs)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_stat_user_tables_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("relid", DataType::Int64, false),
+            Field::new("schemaname", DataType::Utf8, false),
+            Field::new("relname", DataType::Utf8, false),
+            Field::new("seq_scan", DataType::Int64, false),
+            Field::new("seq_tup_read", DataType::Int64, false),
+            Field::new("idx_scan", DataType::Int64, true),
+            Field::new("idx_tup_fetch", DataType::Int64, true),
+            Field::new("n_tup_ins", DataType::Int64, false),
+            Field::new("n_tup_upd", DataType::Int64, false),
+            Field::new("n_tup_del", DataType::Int64, false),
+            Field::new("n_live_tup", DataType::Int64, false),
+            Field::new("n_dead_tup", DataType::Int64, false),
+        ]))
+    }
+
+    pub async fn pg_stat_user_tables(
+        catalog: &dyn Catalog,
+        tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let mut relids: Vec<i64> = Vec::new();
+        let mut schemas: Vec<&str> = Vec::new();
+        let mut relnames: Vec<String> = Vec::new();
+        let mut seq_scans: Vec<i64> = Vec::new();
+        let mut seq_tup_reads: Vec<i64> = Vec::new();
+        let mut idx_scans: Vec<Option<i64>> = Vec::new();
+        let mut idx_tup_fetchs: Vec<Option<i64>> = Vec::new();
+        let mut n_ins: Vec<i64> = Vec::new();
+        let mut n_upd: Vec<i64> = Vec::new();
+        let mut n_del: Vec<i64> = Vec::new();
+        let mut n_live: Vec<i64> = Vec::new();
+        let mut n_dead: Vec<i64> = Vec::new();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            let row_count = meta
+                .current()
+                .map(|s| s.data_files.iter().map(|f| f.row_count).sum::<u64>())
+                .unwrap_or(0) as i64;
+            relids.push(table_oid(tenant, name));
+            schemas.push(DEFAULT_SCHEMA);
+            relnames.push(name.as_str().to_string());
+            seq_scans.push(0);
+            seq_tup_reads.push(0);
+            idx_scans.push(Some(0));
+            idx_tup_fetchs.push(Some(0));
+            n_ins.push(row_count);
+            n_upd.push(0);
+            n_del.push(0);
+            n_live.push(row_count);
+            n_dead.push(0);
+        }
+        let schema = Self::pg_stat_user_tables_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(relids)),
+            Arc::new(StringArray::from(schemas)),
+            Arc::new(StringArray::from(relnames)),
+            Arc::new(Int64Array::from(seq_scans)),
+            Arc::new(Int64Array::from(seq_tup_reads)),
+            Arc::new(Int64Array::from(idx_scans)),
+            Arc::new(Int64Array::from(idx_tup_fetchs)),
+            Arc::new(Int64Array::from(n_ins)),
+            Arc::new(Int64Array::from(n_upd)),
+            Arc::new(Int64Array::from(n_del)),
+            Arc::new(Int64Array::from(n_live)),
+            Arc::new(Int64Array::from(n_dead)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_stat_user_tables build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_stat_user_indexes  (basic scan count stubs)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_stat_user_indexes_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("relid", DataType::Int64, false),
+            Field::new("indexrelid", DataType::Int64, false),
+            Field::new("schemaname", DataType::Utf8, false),
+            Field::new("relname", DataType::Utf8, false),
+            Field::new("indexrelname", DataType::Utf8, false),
+            Field::new("idx_scan", DataType::Int64, false),
+            Field::new("idx_tup_read", DataType::Int64, false),
+            Field::new("idx_tup_fetch", DataType::Int64, false),
+        ]))
+    }
+
+    pub async fn pg_stat_user_indexes(
+        catalog: &dyn Catalog,
+        tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let mut relids: Vec<i64> = Vec::new();
+        let mut indexrelids: Vec<i64> = Vec::new();
+        let mut schemas: Vec<&str> = Vec::new();
+        let mut relnames: Vec<String> = Vec::new();
+        let mut indexrelnames: Vec<String> = Vec::new();
+        let mut idx_scans: Vec<i64> = Vec::new();
+        let mut idx_tup_reads: Vec<i64> = Vec::new();
+        let mut idx_tup_fetchs: Vec<i64> = Vec::new();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            if !meta.pk_columns.is_empty() {
+                let idx_name = format!("{}_pkey", name.as_str());
+                let idx_oid = fnv1a_64_to_positive_i64(
+                    format!("basin.pg_index:{tenant}:{idx_name}").as_bytes(),
+                );
+                relids.push(table_oid(tenant, name));
+                indexrelids.push(idx_oid);
+                schemas.push(DEFAULT_SCHEMA);
+                relnames.push(name.as_str().to_string());
+                indexrelnames.push(idx_name);
+                idx_scans.push(0);
+                idx_tup_reads.push(0);
+                idx_tup_fetchs.push(0);
+            }
+        }
+        let schema = Self::pg_stat_user_indexes_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(relids)),
+            Arc::new(Int64Array::from(indexrelids)),
+            Arc::new(StringArray::from(schemas)),
+            Arc::new(StringArray::from(relnames)),
+            Arc::new(StringArray::from(indexrelnames)),
+            Arc::new(Int64Array::from(idx_scans)),
+            Arc::new(Int64Array::from(idx_tup_reads)),
+            Arc::new(Int64Array::from(idx_tup_fetchs)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_stat_user_indexes build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_locks  (empty — Basin is optimistic)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_locks_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("locktype", DataType::Utf8, true),
+            Field::new("database", DataType::Int64, true),
+            Field::new("relation", DataType::Int64, true),
+            Field::new("page", DataType::Int32, true),
+            Field::new("tuple", DataType::Int16, true),
+            Field::new("virtualxid", DataType::Utf8, true),
+            Field::new("transactionid", DataType::Int64, true),
+            Field::new("classid", DataType::Int64, true),
+            Field::new("objid", DataType::Int64, true),
+            Field::new("objsubid", DataType::Int16, true),
+            Field::new("virtualtransaction", DataType::Utf8, true),
+            Field::new("pid", DataType::Int32, true),
+            Field::new("mode", DataType::Utf8, true),
+            Field::new("granted", DataType::Boolean, true),
+            Field::new("fastpath", DataType::Boolean, true),
+        ]))
+    }
+
+    pub async fn pg_locks(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+        let schema = Self::pg_locks_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+            Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
+            Arc::new(Int16Array::from(Vec::<Option<i16>>::new())),
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+            Arc::new(Int16Array::from(Vec::<Option<i16>>::new())),
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())),
+            Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_locks build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_stat_activity  (current sessions — just this session)
+    // -----------------------------------------------------------------------
+
+    pub fn pg_stat_activity_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("datid", DataType::Int64, true),
+            Field::new("datname", DataType::Utf8, true),
+            Field::new("pid", DataType::Int32, false),
+            Field::new("usesysid", DataType::Int64, true),
+            Field::new("usename", DataType::Utf8, true),
+            Field::new("application_name", DataType::Utf8, true),
+            Field::new("client_addr", DataType::Utf8, true),
+            Field::new("state", DataType::Utf8, true),
+            Field::new("query", DataType::Utf8, true),
+            Field::new("wait_event_type", DataType::Utf8, true),
+            Field::new("wait_event", DataType::Utf8, true),
+        ]))
+    }
+
+    pub async fn pg_stat_activity(
+        _catalog: &dyn Catalog,
+        tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{tenant}").as_bytes());
+        let role_oid = role_oid_for(tenant);
+        let schema = Self::pg_stat_activity_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(db_oid)])),
+            Arc::new(StringArray::from(vec![Some("basin")])),
+            Arc::new(Int32Array::from(vec![0i32])),
+            Arc::new(Int64Array::from(vec![Some(role_oid)])),
+            Arc::new(StringArray::from(vec![Some(tenant.to_string())])),
+            Arc::new(StringArray::from(vec![Some("basin")])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec![Some("active")])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_stat_activity build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.check_constraints
+    // -----------------------------------------------------------------------
+
+    pub fn check_constraints_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("constraint_catalog", DataType::Utf8, false),
+            Field::new("constraint_schema", DataType::Utf8, false),
+            Field::new("constraint_name", DataType::Utf8, false),
+            Field::new("check_clause", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn check_constraints(
+        catalog: &dyn Catalog,
+        tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let mut constraint_catalogs: Vec<&str> = Vec::new();
+        let mut constraint_schemas: Vec<&str> = Vec::new();
+        let mut constraint_names: Vec<String> = Vec::new();
+        let mut check_clauses: Vec<String> = Vec::new();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            let arrow_schema = &meta.schema;
+            for field in arrow_schema.fields() {
+                // Basin encodes CHECK constraints as field metadata
+                if let Some(check) = field.metadata().get("BASIN_CHECK") {
+                    let constraint_name =
+                        format!("{}_{}_check", name.as_str(), field.name());
+                    constraint_catalogs.push(BASIN_CATALOG_NAME);
+                    constraint_schemas.push(DEFAULT_SCHEMA);
+                    constraint_names.push(constraint_name);
+                    check_clauses.push(check.clone());
+                }
+            }
+        }
+        let schema = Self::check_constraints_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(constraint_catalogs)),
+            Arc::new(StringArray::from(constraint_schemas)),
+            Arc::new(StringArray::from(constraint_names)),
+            Arc::new(StringArray::from(check_clauses)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.check_constraints build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.triggers  (empty — Basin doesn't execute triggers)
+    // -----------------------------------------------------------------------
+
+    pub fn triggers_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("trigger_catalog", DataType::Utf8, false),
+            Field::new("trigger_schema", DataType::Utf8, false),
+            Field::new("trigger_name", DataType::Utf8, false),
+            Field::new("event_manipulation", DataType::Utf8, false),
+            Field::new("event_object_catalog", DataType::Utf8, false),
+            Field::new("event_object_schema", DataType::Utf8, false),
+            Field::new("event_object_table", DataType::Utf8, false),
+            Field::new("action_order", DataType::Int64, false),
+            Field::new("action_condition", DataType::Utf8, true),
+            Field::new("action_statement", DataType::Utf8, false),
+            Field::new("action_orientation", DataType::Utf8, false),
+            Field::new("action_timing", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn triggers(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+        let schema = Self::triggers_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.triggers build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.sequences  (real, from catalog sequences)
+    // -----------------------------------------------------------------------
+
+    pub fn sequences_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("sequence_catalog", DataType::Utf8, false),
+            Field::new("sequence_schema", DataType::Utf8, false),
+            Field::new("sequence_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("numeric_precision", DataType::Int32, false),
+            Field::new("numeric_precision_radix", DataType::Int32, false),
+            Field::new("numeric_scale", DataType::Int32, false),
+            Field::new("start_value", DataType::Utf8, false),
+            Field::new("minimum_value", DataType::Utf8, false),
+            Field::new("maximum_value", DataType::Utf8, false),
+            Field::new("increment", DataType::Utf8, false),
+            Field::new("cycle_option", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn sequences(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let seqs = catalog.list_sequences(tenant).await;
+        let mut seq_catalogs: Vec<&str> = Vec::new();
+        let mut seq_schemas: Vec<&str> = Vec::new();
+        let mut seq_names: Vec<String> = Vec::new();
+        let mut data_types: Vec<&str> = Vec::new();
+        let mut num_precisions: Vec<i32> = Vec::new();
+        let mut num_precision_radixes: Vec<i32> = Vec::new();
+        let mut num_scales: Vec<i32> = Vec::new();
+        let mut start_values: Vec<String> = Vec::new();
+        let mut min_values: Vec<String> = Vec::new();
+        let mut max_values: Vec<String> = Vec::new();
+        let mut increments: Vec<String> = Vec::new();
+        let mut cycle_options: Vec<&str> = Vec::new();
+        for seq in &seqs {
+            seq_catalogs.push(BASIN_CATALOG_NAME);
+            seq_schemas.push(DEFAULT_SCHEMA);
+            seq_names.push(seq.name.clone());
+            data_types.push("bigint");
+            num_precisions.push(64);
+            num_precision_radixes.push(2);
+            num_scales.push(0);
+            start_values.push(seq.start.to_string());
+            min_values.push(seq.min_value.to_string());
+            max_values.push(seq.max_value.to_string());
+            increments.push(seq.increment.to_string());
+            cycle_options.push(if seq.cycle { "YES" } else { "NO" });
+        }
+        let schema = Self::sequences_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(seq_catalogs)),
+            Arc::new(StringArray::from(seq_schemas)),
+            Arc::new(StringArray::from(seq_names)),
+            Arc::new(StringArray::from(data_types)),
+            Arc::new(Int32Array::from(num_precisions)),
+            Arc::new(Int32Array::from(num_precision_radixes)),
+            Arc::new(Int32Array::from(num_scales)),
+            Arc::new(StringArray::from(start_values)),
+            Arc::new(StringArray::from(min_values)),
+            Arc::new(StringArray::from(max_values)),
+            Arc::new(StringArray::from(increments)),
+            Arc::new(StringArray::from(cycle_options)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.sequences build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.domains  (real, from catalog domains)
+    // -----------------------------------------------------------------------
+
+    pub fn domains_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("domain_catalog", DataType::Utf8, false),
+            Field::new("domain_schema", DataType::Utf8, false),
+            Field::new("domain_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("character_maximum_length", DataType::Int32, true),
+            Field::new("character_octet_length", DataType::Int32, true),
+            Field::new("numeric_precision", DataType::Int32, true),
+            Field::new("numeric_precision_radix", DataType::Int32, true),
+            Field::new("numeric_scale", DataType::Int32, true),
+            Field::new("datetime_precision", DataType::Int32, true),
+            Field::new("domain_default", DataType::Utf8, true),
+            Field::new("udt_catalog", DataType::Utf8, false),
+            Field::new("udt_schema", DataType::Utf8, false),
+            Field::new("udt_name", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn domains(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let doms = catalog.list_domains(tenant).await;
+        let mut dom_catalogs: Vec<&str> = Vec::new();
+        let mut dom_schemas: Vec<&str> = Vec::new();
+        let mut dom_names: Vec<String> = Vec::new();
+        let mut data_types: Vec<String> = Vec::new();
+        let mut char_max_lengths: Vec<Option<i32>> = Vec::new();
+        let mut char_octet_lengths: Vec<Option<i32>> = Vec::new();
+        let mut num_precisions: Vec<Option<i32>> = Vec::new();
+        let mut num_precision_radixes: Vec<Option<i32>> = Vec::new();
+        let mut num_scales: Vec<Option<i32>> = Vec::new();
+        let mut datetime_precisions: Vec<Option<i32>> = Vec::new();
+        let mut dom_defaults: Vec<Option<String>> = Vec::new();
+        let mut udt_catalogs: Vec<&str> = Vec::new();
+        let mut udt_schemas: Vec<&str> = Vec::new();
+        let mut udt_names: Vec<String> = Vec::new();
+        for dom in &doms {
+            let type_name = pg_type_name_for_arg(dom.base_type);
+            dom_catalogs.push(BASIN_CATALOG_NAME);
+            dom_schemas.push(DEFAULT_SCHEMA);
+            dom_names.push(dom.name.clone());
+            data_types.push(type_name.to_string());
+            char_max_lengths.push(None);
+            char_octet_lengths.push(None);
+            num_precisions.push(None);
+            num_precision_radixes.push(None);
+            num_scales.push(None);
+            datetime_precisions.push(None);
+            dom_defaults.push(None);
+            udt_catalogs.push(BASIN_CATALOG_NAME);
+            udt_schemas.push(PG_CATALOG_SCHEMA);
+            udt_names.push(type_name.to_string());
+        }
+        let schema = Self::domains_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(dom_catalogs)),
+            Arc::new(StringArray::from(dom_schemas)),
+            Arc::new(StringArray::from(dom_names)),
+            Arc::new(StringArray::from(data_types)),
+            Arc::new(Int32Array::from(char_max_lengths)),
+            Arc::new(Int32Array::from(char_octet_lengths)),
+            Arc::new(Int32Array::from(num_precisions)),
+            Arc::new(Int32Array::from(num_precision_radixes)),
+            Arc::new(Int32Array::from(num_scales)),
+            Arc::new(Int32Array::from(datetime_precisions)),
+            Arc::new(StringArray::from(dom_defaults)),
+            Arc::new(StringArray::from(udt_catalogs)),
+            Arc::new(StringArray::from(udt_schemas)),
+            Arc::new(StringArray::from(udt_names)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.domains build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.parameters  (function/procedure parameters)
+    // -----------------------------------------------------------------------
+
+    pub fn parameters_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("specific_catalog", DataType::Utf8, false),
+            Field::new("specific_schema", DataType::Utf8, false),
+            Field::new("specific_name", DataType::Utf8, false),
+            Field::new("ordinal_position", DataType::Int32, false),
+            Field::new("parameter_mode", DataType::Utf8, false),
+            Field::new("is_result", DataType::Utf8, false),
+            Field::new("as_locator", DataType::Utf8, false),
+            Field::new("parameter_name", DataType::Utf8, true),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("character_maximum_length", DataType::Int32, true),
+            Field::new("character_octet_length", DataType::Int32, true),
+            Field::new("numeric_precision", DataType::Int32, true),
+            Field::new("numeric_precision_radix", DataType::Int32, true),
+            Field::new("numeric_scale", DataType::Int32, true),
+            Field::new("datetime_precision", DataType::Int32, true),
+            Field::new("udt_catalog", DataType::Utf8, true),
+            Field::new("udt_schema", DataType::Utf8, true),
+            Field::new("udt_name", DataType::Utf8, true),
+        ]))
+    }
+
+    pub async fn parameters(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+        let functions = catalog.list_sql_functions(tenant).await;
+        let procedures = catalog.list_procedures(tenant).await;
+        let mut specific_catalogs: Vec<&str> = Vec::new();
+        let mut specific_schemas: Vec<&str> = Vec::new();
+        let mut specific_names: Vec<String> = Vec::new();
+        let mut ordinal_positions: Vec<i32> = Vec::new();
+        let mut parameter_modes: Vec<&str> = Vec::new();
+        let mut is_results: Vec<&str> = Vec::new();
+        let mut as_locators: Vec<&str> = Vec::new();
+        let mut parameter_names: Vec<Option<String>> = Vec::new();
+        let mut data_types: Vec<String> = Vec::new();
+        let mut char_max_lengths: Vec<Option<i32>> = Vec::new();
+        let mut char_octet_lengths: Vec<Option<i32>> = Vec::new();
+        let mut num_precisions: Vec<Option<i32>> = Vec::new();
+        let mut num_precision_radixes: Vec<Option<i32>> = Vec::new();
+        let mut num_scales: Vec<Option<i32>> = Vec::new();
+        let mut datetime_precisions: Vec<Option<i32>> = Vec::new();
+        let mut udt_catalogs: Vec<Option<&str>> = Vec::new();
+        let mut udt_schemas: Vec<Option<&str>> = Vec::new();
+        let mut udt_names: Vec<Option<String>> = Vec::new();
+
+        for func in &functions {
+            for (i, arg) in func.args.iter().enumerate() {
+                let type_name = pg_type_name_for_arg(arg.data_type);
+                specific_catalogs.push(BASIN_CATALOG_NAME);
+                specific_schemas.push(DEFAULT_SCHEMA);
+                specific_names.push(func.name.clone());
+                ordinal_positions.push((i + 1) as i32);
+                parameter_modes.push("IN");
+                is_results.push("NO");
+                as_locators.push("NO");
+                parameter_names.push(Some(arg.name.clone()));
+                data_types.push(type_name.to_string());
+                char_max_lengths.push(None);
+                char_octet_lengths.push(None);
+                num_precisions.push(None);
+                num_precision_radixes.push(None);
+                num_scales.push(None);
+                datetime_precisions.push(None);
+                udt_catalogs.push(None);
+                udt_schemas.push(None);
+                udt_names.push(None);
+            }
+        }
+        for proc in &procedures {
+            for (i, arg) in proc.args.iter().enumerate() {
+                let type_name = pg_type_name_for_arg(arg.data_type);
+                specific_catalogs.push(BASIN_CATALOG_NAME);
+                specific_schemas.push(DEFAULT_SCHEMA);
+                specific_names.push(proc.name.clone());
+                ordinal_positions.push((i + 1) as i32);
+                parameter_modes.push("IN");
+                is_results.push("NO");
+                as_locators.push("NO");
+                parameter_names.push(Some(arg.name.clone()));
+                data_types.push(type_name.to_string());
+                char_max_lengths.push(None);
+                char_octet_lengths.push(None);
+                num_precisions.push(None);
+                num_precision_radixes.push(None);
+                num_scales.push(None);
+                datetime_precisions.push(None);
+                udt_catalogs.push(None);
+                udt_schemas.push(None);
+                udt_names.push(None);
+            }
+        }
+        let schema = Self::parameters_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(specific_catalogs)),
+            Arc::new(StringArray::from(specific_schemas)),
+            Arc::new(StringArray::from(specific_names)),
+            Arc::new(Int32Array::from(ordinal_positions)),
+            Arc::new(StringArray::from(parameter_modes)),
+            Arc::new(StringArray::from(is_results)),
+            Arc::new(StringArray::from(as_locators)),
+            Arc::new(StringArray::from(parameter_names)),
+            Arc::new(StringArray::from(data_types)),
+            Arc::new(Int32Array::from(char_max_lengths)),
+            Arc::new(Int32Array::from(char_octet_lengths)),
+            Arc::new(Int32Array::from(num_precisions)),
+            Arc::new(Int32Array::from(num_precision_radixes)),
+            Arc::new(Int32Array::from(num_scales)),
+            Arc::new(Int32Array::from(datetime_precisions)),
+            Arc::new(StringArray::from(udt_catalogs)),
+            Arc::new(StringArray::from(udt_schemas)),
+            Arc::new(StringArray::from(udt_names)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.parameters build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.role_table_grants  (empty/calling-tenant-only)
+    // -----------------------------------------------------------------------
+
+    pub fn role_table_grants_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("grantor", DataType::Utf8, true),
+            Field::new("grantee", DataType::Utf8, false),
+            Field::new("table_catalog", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("privilege_type", DataType::Utf8, false),
+            Field::new("is_grantable", DataType::Utf8, false),
+            Field::new("with_hierarchy", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn role_table_grants(
+        _catalog: &dyn Catalog,
+        _tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        let schema = Self::role_table_grants_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.role_table_grants build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.user_defined_types  (alias to pg_type user types)
+    // -----------------------------------------------------------------------
+
+    pub fn user_defined_types_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("user_defined_type_catalog", DataType::Utf8, false),
+            Field::new("user_defined_type_schema", DataType::Utf8, false),
+            Field::new("user_defined_type_name", DataType::Utf8, false),
+            Field::new("user_defined_type_category", DataType::Utf8, false),
+            Field::new("is_instantiable", DataType::Utf8, false),
+            Field::new("is_final", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn user_defined_types(
+        catalog: &dyn Catalog,
+        tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        // Include enum types and domains as user-defined types
+        let enums = catalog.list_enum_types(tenant).await;
+        let doms = catalog.list_domains(tenant).await;
+        let mut udt_catalogs: Vec<&str> = Vec::new();
+        let mut udt_schemas: Vec<&str> = Vec::new();
+        let mut udt_names: Vec<String> = Vec::new();
+        let mut udt_categories: Vec<&str> = Vec::new();
+        let mut is_instantiables: Vec<&str> = Vec::new();
+        let mut is_finals: Vec<&str> = Vec::new();
+        for e in &enums {
+            udt_catalogs.push(BASIN_CATALOG_NAME);
+            udt_schemas.push(DEFAULT_SCHEMA);
+            udt_names.push(e.name.clone());
+            udt_categories.push("ENUM");
+            is_instantiables.push("YES");
+            is_finals.push("YES");
+        }
+        for d in &doms {
+            udt_catalogs.push(BASIN_CATALOG_NAME);
+            udt_schemas.push(DEFAULT_SCHEMA);
+            udt_names.push(d.name.clone());
+            udt_categories.push("DISTINCT");
+            is_instantiables.push("YES");
+            is_finals.push("YES");
+        }
+        let schema = Self::user_defined_types_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(udt_catalogs)),
+            Arc::new(StringArray::from(udt_schemas)),
+            Arc::new(StringArray::from(udt_names)),
+            Arc::new(StringArray::from(udt_categories)),
+            Arc::new(StringArray::from(is_instantiables)),
+            Arc::new(StringArray::from(is_finals)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.user_defined_types build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.column_domain_usage  (domain columns)
+    // -----------------------------------------------------------------------
+
+    pub fn column_domain_usage_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("domain_catalog", DataType::Utf8, false),
+            Field::new("domain_schema", DataType::Utf8, false),
+            Field::new("domain_name", DataType::Utf8, false),
+            Field::new("table_catalog", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn column_domain_usage(
+        catalog: &dyn Catalog,
+        tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        let names = catalog.list_tables(tenant).await?;
+        let mut domain_catalogs: Vec<&str> = Vec::new();
+        let mut domain_schemas: Vec<&str> = Vec::new();
+        let mut domain_names: Vec<String> = Vec::new();
+        let mut table_catalogs: Vec<&str> = Vec::new();
+        let mut table_schemas: Vec<&str> = Vec::new();
+        let mut table_names: Vec<String> = Vec::new();
+        let mut column_names: Vec<String> = Vec::new();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            let arrow_schema = &meta.schema;
+            for field in arrow_schema.fields() {
+                if let Some(domain_name) = field.metadata().get("BASIN_DOMAIN") {
+                    domain_catalogs.push(BASIN_CATALOG_NAME);
+                    domain_schemas.push(DEFAULT_SCHEMA);
+                    domain_names.push(domain_name.clone());
+                    table_catalogs.push(BASIN_CATALOG_NAME);
+                    table_schemas.push(DEFAULT_SCHEMA);
+                    table_names.push(name.as_str().to_string());
+                    column_names.push(field.name().clone());
+                }
+            }
+        }
+        let schema = Self::column_domain_usage_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(domain_catalogs)),
+            Arc::new(StringArray::from(domain_schemas)),
+            Arc::new(StringArray::from(domain_names)),
+            Arc::new(StringArray::from(table_catalogs)),
+            Arc::new(StringArray::from(table_schemas)),
+            Arc::new(StringArray::from(table_names)),
+            Arc::new(StringArray::from(column_names)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.column_domain_usage build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // information_schema.column_udt_usage  (columns with user-defined types)
+    // -----------------------------------------------------------------------
+
+    pub fn column_udt_usage_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("udt_catalog", DataType::Utf8, false),
+            Field::new("udt_schema", DataType::Utf8, false),
+            Field::new("udt_name", DataType::Utf8, false),
+            Field::new("table_catalog", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+        ]))
+    }
+
+    pub async fn column_udt_usage(
+        catalog: &dyn Catalog,
+        tenant: &TenantId,
+    ) -> Result<RecordBatch> {
+        // Reuse column_domain_usage data — domain columns also count as UDT usage
+        let names = catalog.list_tables(tenant).await?;
+        let mut udt_catalogs: Vec<&str> = Vec::new();
+        let mut udt_schemas: Vec<&str> = Vec::new();
+        let mut udt_names: Vec<String> = Vec::new();
+        let mut table_catalogs: Vec<&str> = Vec::new();
+        let mut table_schemas: Vec<&str> = Vec::new();
+        let mut table_names: Vec<String> = Vec::new();
+        let mut column_names: Vec<String> = Vec::new();
+        for name in &names {
+            let meta = catalog.load_table(tenant, name).await?;
+            let arrow_schema = &meta.schema;
+            for field in arrow_schema.fields() {
+                if let Some(domain_name) = field.metadata().get("BASIN_DOMAIN") {
+                    udt_catalogs.push(BASIN_CATALOG_NAME);
+                    udt_schemas.push(DEFAULT_SCHEMA);
+                    udt_names.push(domain_name.clone());
+                    table_catalogs.push(BASIN_CATALOG_NAME);
+                    table_schemas.push(DEFAULT_SCHEMA);
+                    table_names.push(name.as_str().to_string());
+                    column_names.push(field.name().clone());
+                }
+            }
+        }
+        let schema = Self::column_udt_usage_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(udt_catalogs)),
+            Arc::new(StringArray::from(udt_schemas)),
+            Arc::new(StringArray::from(udt_names)),
+            Arc::new(StringArray::from(table_catalogs)),
+            Arc::new(StringArray::from(table_schemas)),
+            Arc::new(StringArray::from(table_names)),
+            Arc::new(StringArray::from(column_names)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.column_udt_usage build: {e}")))
+    }
 }
 
 /// Database-level `table_catalog` value reported by
