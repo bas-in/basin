@@ -612,6 +612,365 @@ fn read_signed_int<'a>(s: &'a str, opt_name: &str) -> Result<(i64, &'a str)> {
     Ok((n, &rest[i..]))
 }
 
+// ==========================================================================
+// ALTER SEQUENCE — text-based pre-screen
+// ==========================================================================
+
+/// Recognised intent for `ALTER SEQUENCE [IF EXISTS] <name> [opt …]`.
+/// The option set mirrors [`CreateSequenceIntent`] but all fields are
+/// `Option`-wrapped because any single option may be absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AlterSequenceIntent {
+    pub if_exists: bool,
+    pub name: String,
+    pub options: Vec<SequenceOption>,
+}
+
+/// Recognise `ALTER SEQUENCE [IF EXISTS] <name> [opt …]` textually.
+///
+/// sqlparser 0.52 has no `Statement::AlterSequence` AST node; this
+/// pre-screen handles the full PG grammar, routing to
+/// [`exec_alter_sequence`]. Returns `Ok(None)` for any statement that
+/// doesn't start with `ALTER SEQUENCE`.
+pub(crate) fn match_alter_sequence(sql: &str) -> Result<Option<AlterSequenceIntent>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if !starts_with_kw(trimmed, "ALTER") {
+        return Ok(None);
+    }
+    let after_alter = skip_word(trimmed).trim_start();
+    if !starts_with_kw(after_alter, "SEQUENCE") {
+        return Ok(None);
+    }
+    let after_seq = skip_word(after_alter).trim_start();
+    // Optional `IF EXISTS`.
+    let (after_if, if_exists) = if starts_with_kw(after_seq, "IF") {
+        let after_if = skip_word(after_seq).trim_start();
+        if !starts_with_kw(after_if, "EXISTS") {
+            return Err(BasinError::InvalidSchema(
+                "ALTER SEQUENCE IF: expected EXISTS".into(),
+            ));
+        }
+        (skip_word(after_if).trim_start(), true)
+    } else {
+        (after_seq, false)
+    };
+    let (name, after_name) = read_simple_identifier(after_if)?;
+    // Parse options — same set as CREATE SEQUENCE.
+    let mut rest = after_name.trim_start();
+    let mut options: Vec<SequenceOption> = Vec::new();
+    while !rest.is_empty() {
+        if starts_with_kw(rest, "START") {
+            let after = skip_word(rest).trim_start();
+            let after = if starts_with_kw(after, "WITH") {
+                skip_word(after).trim_start()
+            } else {
+                after
+            };
+            let (n, next) = read_signed_int(after, "START")?;
+            options.push(SequenceOption::Start(n));
+            rest = next.trim_start();
+        } else if starts_with_kw(rest, "RESTART") {
+            // `RESTART [WITH] <n>` — same semantics as `setval(seq, n, false)`
+            // (arms the sequence so the next nextval returns n).  Stored as
+            // a `Start` option; `exec_alter_sequence` applies it via setval.
+            let after = skip_word(rest).trim_start();
+            let after = if starts_with_kw(after, "WITH") {
+                skip_word(after).trim_start()
+            } else {
+                after
+            };
+            // Peek: if the next token is a number, read it; otherwise
+            // RESTART without a value means "restart at the sequence's
+            // original start value" — we encode that as Start(i64::MIN)
+            // as a sentinel (exec_alter_sequence recognises this).
+            let first_byte = after.bytes().next();
+            if first_byte.map(|b| b.is_ascii_digit() || b == b'-' || b == b'+').unwrap_or(false) {
+                let (n, next) = read_signed_int(after, "RESTART")?;
+                options.push(SequenceOption::Start(n));
+                rest = next.trim_start();
+            } else {
+                // `RESTART` without value → restart at original START.
+                // Encode as `i64::MIN` sentinel; exec layer handles it.
+                options.push(SequenceOption::Start(i64::MIN));
+                rest = after.trim_start();
+            }
+        } else if starts_with_kw(rest, "INCREMENT") {
+            let after = skip_word(rest).trim_start();
+            let after = if starts_with_kw(after, "BY") {
+                skip_word(after).trim_start()
+            } else {
+                after
+            };
+            let (n, next) = read_signed_int(after, "INCREMENT")?;
+            options.push(SequenceOption::Increment(n));
+            rest = next.trim_start();
+        } else if starts_with_kw(rest, "MINVALUE") {
+            let after = skip_word(rest).trim_start();
+            let (n, next) = read_signed_int(after, "MINVALUE")?;
+            options.push(SequenceOption::MinValue(Some(n)));
+            rest = next.trim_start();
+        } else if starts_with_kw(rest, "MAXVALUE") {
+            let after = skip_word(rest).trim_start();
+            let (n, next) = read_signed_int(after, "MAXVALUE")?;
+            options.push(SequenceOption::MaxValue(Some(n)));
+            rest = next.trim_start();
+        } else if starts_with_kw(rest, "CACHE") {
+            let after = skip_word(rest).trim_start();
+            let (n, next) = read_signed_int(after, "CACHE")?;
+            options.push(SequenceOption::Cache(n));
+            rest = next.trim_start();
+        } else if starts_with_kw(rest, "CYCLE") {
+            options.push(SequenceOption::Cycle(false));
+            rest = skip_word(rest).trim_start();
+        } else if starts_with_kw(rest, "NO") {
+            let after = skip_word(rest).trim_start();
+            if starts_with_kw(after, "MINVALUE") {
+                options.push(SequenceOption::MinValue(None));
+                rest = skip_word(after).trim_start();
+            } else if starts_with_kw(after, "MAXVALUE") {
+                options.push(SequenceOption::MaxValue(None));
+                rest = skip_word(after).trim_start();
+            } else if starts_with_kw(after, "CYCLE") {
+                options.push(SequenceOption::Cycle(true));
+                rest = skip_word(after).trim_start();
+            } else {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER SEQUENCE: expected MINVALUE / MAXVALUE / CYCLE after NO, got {:?}",
+                    after.chars().take(16).collect::<String>()
+                )));
+            }
+        } else if starts_with_kw(rest, "OWNED") {
+            // `OWNED BY table.column` — accepted but ignored (v0.1 has no
+            // column-ownership concept). Skip the next token (table.col or NONE).
+            let after = skip_word(rest).trim_start();
+            if starts_with_kw(after, "BY") {
+                rest = skip_word(skip_word(after).trim_start()).trim_start();
+            } else {
+                rest = after;
+            }
+        } else {
+            return Err(BasinError::InvalidSchema(format!(
+                "ALTER SEQUENCE: unrecognised token {:?}",
+                rest.chars().take(16).collect::<String>()
+            )));
+        }
+    }
+    Ok(Some(AlterSequenceIntent {
+        if_exists,
+        name,
+        options,
+    }))
+}
+
+/// Execute `ALTER SEQUENCE [IF EXISTS] <name> [opt …]`.
+///
+/// In v0.1 we apply only `RESTART [WITH n]` (via `setval`) and
+/// `OWNED BY` (ignored). Full `INCREMENT BY` / `MINVALUE` / `MAXVALUE`
+/// / `CACHE` / `CYCLE` changes would require the catalog to replace the
+/// stored `SequenceDef` — a v0.2 operation once the iceberg-backed
+/// catalog supports atomic def updates. For now those options are
+/// parsed and validated but produce a clear "not yet supported" error.
+pub(crate) async fn exec_alter_sequence(
+    sess: &TenantSession,
+    intent: AlterSequenceIntent,
+) -> Result<ExecResult> {
+    let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
+
+    // Check existence before applying any option.
+    let def = catalog
+        .lookup_sequence(&sess.tenant, &intent.name)
+        .await;
+    if def.is_none() {
+        if intent.if_exists {
+            return Ok(ExecResult::Empty {
+                tag: "ALTER SEQUENCE".into(),
+            });
+        }
+        return Err(BasinError::not_found(format!(
+            "sequence {:?} does not exist",
+            intent.name
+        )));
+    }
+    let def = def.unwrap();
+
+    for opt in &intent.options {
+        match opt {
+            SequenceOption::Start(n) => {
+                // `RESTART [WITH n]` — restart the sequence at `n`.
+                // Sentinel `i64::MIN` means "restart at original start".
+                let restart_at = if *n == i64::MIN { def.start } else { *n };
+                // setval(seq, restart_at, false) arms the sequence so the
+                // next nextval returns exactly restart_at.
+                catalog
+                    .setval(&sess.tenant, &intent.name, restart_at, false)
+                    .await?;
+            }
+            SequenceOption::Increment(_)
+            | SequenceOption::MinValue(_)
+            | SequenceOption::MaxValue(_)
+            | SequenceOption::Cache(_)
+            | SequenceOption::Cycle(_) => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER SEQUENCE {}: changing {:?} requires a catalog def-update path \
+                     not yet implemented; use DROP + CREATE SEQUENCE to change sequence \
+                     parameters in v0.1",
+                    intent.name,
+                    match opt {
+                        SequenceOption::Increment(_) => "INCREMENT",
+                        SequenceOption::MinValue(_) => "MINVALUE",
+                        SequenceOption::MaxValue(_) => "MAXVALUE",
+                        SequenceOption::Cache(_) => "CACHE",
+                        SequenceOption::Cycle(_) => "CYCLE",
+                        SequenceOption::Start(_) => unreachable!(),
+                    }
+                )));
+            }
+        }
+    }
+
+    Ok(ExecResult::Empty {
+        tag: "ALTER SEQUENCE".into(),
+    })
+}
+
+// ==========================================================================
+// pg_query AST-based matcher (alongside the textual one above)
+// ==========================================================================
+
+/// AST-based matcher for
+/// `CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] <name> [option …]`.
+///
+/// libpg_query parses this natively as
+/// [`pg_query::protobuf::CreateSeqStmt`]. Each sequence option arrives
+/// as a `DefElem` node in `options` with `defname` equal to one of
+/// `start`, `increment`, `minvalue`, `maxvalue`, `cache`, or `cycle`.
+/// The `cycle` option carries a `Boolean` arg (`false` for `CYCLE`,
+/// `true` for `NO CYCLE` — matching sqlparser's `Cycle(no)` convention).
+///
+/// Returns `Some(CreateSequenceIntent)` on a successful match; `None` is
+/// never returned (the caller already knows this is a `CreateSeqStmt`),
+/// but the signature is `Option` so agent 5's integration layer can
+/// normalise the matcher shape.
+pub(crate) fn match_create_sequence_ast(
+    stmt: &pg_query::protobuf::CreateSeqStmt,
+) -> Result<Option<CreateSequenceIntent>> {
+    use pg_query::NodeEnum;
+
+    let seq_rel = stmt.sequence.as_ref().ok_or_else(|| {
+        BasinError::InvalidSchema("CREATE SEQUENCE: missing sequence relation in AST".into())
+    })?;
+    if seq_rel.relname.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "CREATE SEQUENCE: empty sequence name".into(),
+        ));
+    }
+    let name = seq_rel.relname.clone();
+    // TEMPORARY sequences: relpersistence == 't' in PG's internal encoding.
+    let temporary = seq_rel.relpersistence == "t";
+    let if_not_exists = stmt.if_not_exists;
+
+    let mut options: Vec<SequenceOption> = Vec::new();
+    for node in &stmt.options {
+        let Some(NodeEnum::DefElem(de)) = node.node.as_ref() else {
+            continue;
+        };
+        let arg_node = de.arg.as_deref();
+        match de.defname.as_str() {
+            "start" => {
+                let n = int_from_node(arg_node, "START")?;
+                options.push(SequenceOption::Start(n));
+            }
+            "increment" => {
+                let n = int_from_node(arg_node, "INCREMENT")?;
+                options.push(SequenceOption::Increment(n));
+            }
+            "minvalue" => {
+                if let Some(arg) = arg_node {
+                    let n = int_from_node(Some(arg), "MINVALUE")?;
+                    options.push(SequenceOption::MinValue(Some(n)));
+                } else {
+                    // `NO MINVALUE` is represented as a DefElem with no arg.
+                    options.push(SequenceOption::MinValue(None));
+                }
+            }
+            "maxvalue" => {
+                if let Some(arg) = arg_node {
+                    let n = int_from_node(Some(arg), "MAXVALUE")?;
+                    options.push(SequenceOption::MaxValue(Some(n)));
+                } else {
+                    options.push(SequenceOption::MaxValue(None));
+                }
+            }
+            "cache" => {
+                let n = int_from_node(arg_node, "CACHE")?;
+                options.push(SequenceOption::Cache(n));
+            }
+            "cycle" => {
+                // PG AST: `boolval` is whether the sequence *cycles*.
+                //   boolval=true  → CYCLE  → sqlparser Cycle(no=false)
+                //   boolval=false → NO CYCLE → sqlparser Cycle(no=true)
+                // Default (no arg): treat as NO CYCLE (false).
+                let cycles = bool_from_node(arg_node).unwrap_or(false);
+                let no = !cycles; // sqlparser: no=true means NO CYCLE
+                options.push(SequenceOption::Cycle(no));
+            }
+            other => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "CREATE SEQUENCE: unrecognised option {other:?} in AST"
+                )));
+            }
+        }
+    }
+
+    Ok(Some(CreateSequenceIntent {
+        temporary,
+        if_not_exists,
+        name,
+        options,
+    }))
+}
+
+/// Extract an `i64` from an AST `Node`. Accepts `Integer` nodes directly.
+/// `arg_node` is `None` when the DefElem has no value (e.g. `NO MINVALUE`).
+fn int_from_node(arg: Option<&pg_query::protobuf::Node>, opt: &str) -> Result<i64> {
+    use pg_query::NodeEnum;
+    let node = arg.ok_or_else(|| {
+        BasinError::InvalidSchema(format!("CREATE SEQUENCE {opt}: missing value"))
+    })?;
+    match node.node.as_ref() {
+        Some(NodeEnum::Integer(i)) => Ok(i.ival as i64),
+        Some(NodeEnum::AConst(ac)) => {
+            use pg_query::protobuf::a_const::Val;
+            match ac.val.as_ref() {
+                Some(Val::Ival(i)) => Ok(i.ival as i64),
+                _ => Err(BasinError::InvalidSchema(format!(
+                    "CREATE SEQUENCE {opt}: expected integer constant"
+                ))),
+            }
+        }
+        _ => Err(BasinError::InvalidSchema(format!(
+            "CREATE SEQUENCE {opt}: expected integer node"
+        ))),
+    }
+}
+
+/// Extract a `bool` from an AST `Node`. Returns `None` when arg is absent
+/// or not a Boolean node.
+fn bool_from_node(arg: Option<&pg_query::protobuf::Node>) -> Option<bool> {
+    use pg_query::NodeEnum;
+    match arg?.node.as_ref()? {
+        NodeEnum::Boolean(b) => Some(b.boolval),
+        NodeEnum::AConst(ac) => {
+            use pg_query::protobuf::a_const::Val;
+            match ac.val.as_ref()? {
+                Val::Boolval(b) => Some(b.boolval),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,5 +1237,60 @@ mod tests {
         let mut def = SequenceDef::with_defaults(TenantId::new(), "foo".to_string());
         let err = apply_options(&mut def, &sequence_options).unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
+    }
+
+    // --- AST-based matcher tests ------------------------------------------
+
+    #[test]
+    fn ast_match_create_sequence_full_options() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse(
+            "CREATE SEQUENCE foo START 100 INCREMENT BY 5 MINVALUE 1 MAXVALUE 9999 NO CYCLE",
+        )
+        .unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateSeqStmt(ref css) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateSeqStmt");
+        };
+        let intent = match_create_sequence_ast(css).unwrap().unwrap();
+        assert_eq!(intent.name, "foo");
+        assert!(!intent.temporary);
+        assert!(!intent.if_not_exists);
+        assert_eq!(
+            intent.options,
+            vec![
+                SequenceOption::Start(100),
+                SequenceOption::Increment(5),
+                SequenceOption::MinValue(Some(1)),
+                SequenceOption::MaxValue(Some(9999)),
+                SequenceOption::Cycle(true), // NO CYCLE → no = true
+            ]
+        );
+    }
+
+    #[test]
+    fn ast_match_create_sequence_if_not_exists() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("CREATE SEQUENCE IF NOT EXISTS foo").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateSeqStmt(ref css) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateSeqStmt");
+        };
+        let intent = match_create_sequence_ast(css).unwrap().unwrap();
+        assert_eq!(intent.name, "foo");
+        assert!(intent.if_not_exists);
+        assert!(intent.options.is_empty());
+    }
+
+    #[test]
+    fn ast_match_create_sequence_negative_increment() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("CREATE SEQUENCE foo INCREMENT -1").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateSeqStmt(ref css) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateSeqStmt");
+        };
+        let intent = match_create_sequence_ast(css).unwrap().unwrap();
+        assert_eq!(intent.options, vec![SequenceOption::Increment(-1)]);
     }
 }

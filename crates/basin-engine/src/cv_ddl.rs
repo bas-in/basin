@@ -1371,6 +1371,236 @@ fn source_table_hint(source_sql: &str) -> Option<String> {
     None
 }
 
+// ==========================================================================
+// pg_query AST-based matchers  (alongside the textual ones above)
+// ==========================================================================
+
+/// Intent produced by [`match_create_materialized_view_ast`]. Carries the
+/// materialised view name, the deparsed source SQL, and the parsed Basin
+/// WITH options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateMatViewIntent {
+    /// Bare table name (single-part, no schema qualifier).
+    pub name: String,
+    /// The `AS <select_query>` body, reconstructed by deparsing the parsed
+    /// query node back to SQL text.
+    pub source_sql: String,
+    /// Basin-specific `WITH (...)` options extracted from `into.options`.
+    pub options: CvOptions,
+}
+
+/// AST-based matcher for `REFRESH MATERIALIZED VIEW <name>`.
+///
+/// libpg_query parses this as [`pg_query::protobuf::RefreshMatViewStmt`].
+/// Note: Basin's custom `WITH (full = true)` extension is **not** valid
+/// PG syntax and therefore cannot be parsed by libpg_query — only the
+/// plain `REFRESH MATERIALIZED VIEW <name>` form is matched here, so
+/// `force_full` is always `false`. Callers that need to detect
+/// `WITH (full = true)` should use the textual
+/// [`match_refresh_materialized_view`] pre-screen instead.
+///
+/// Returns `(name, force_full)`.
+pub(crate) fn match_refresh_materialized_view_ast(
+    stmt: &pg_query::protobuf::RefreshMatViewStmt,
+) -> Result<(String, bool)> {
+    let rel = stmt.relation.as_ref().ok_or_else(|| {
+        BasinError::InvalidSchema(
+            "REFRESH MATERIALIZED VIEW: missing relation in AST".into(),
+        )
+    })?;
+    if rel.relname.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "REFRESH MATERIALIZED VIEW: empty relation name".into(),
+        ));
+    }
+    // PG's native REFRESH MATERIALIZED VIEW has no `WITH (full=true)` option.
+    // The `concurrent` flag (REFRESH MATERIALIZED VIEW CONCURRENTLY) is not
+    // the same as Basin's `force_full`; we leave force_full = false here.
+    Ok((rel.relname.clone(), false))
+}
+
+/// AST-based matcher for `DROP MATERIALIZED VIEW [IF EXISTS] <name>`.
+///
+/// libpg_query routes this as a [`pg_query::protobuf::DropStmt`] with
+/// `remove_type == ObjectType::ObjectMatview`. Returns
+/// `Some((name, if_exists))` when the DropStmt targets a materialized view;
+/// `None` when it targets something else (the caller falls through to the
+/// next handler).
+pub(crate) fn match_drop_materialized_view_ast(
+    stmt: &pg_query::protobuf::DropStmt,
+) -> Result<Option<(String, bool)>> {
+    use pg_query::protobuf::ObjectType;
+    if stmt.remove_type != ObjectType::ObjectMatview as i32 {
+        return Ok(None);
+    }
+    // For DROP MATERIALIZED VIEW the name lives at objects[0] as a List
+    // whose first item is a String node.
+    let name = drop_stmt_first_name(&stmt.objects).ok_or_else(|| {
+        BasinError::InvalidSchema("DROP MATERIALIZED VIEW: could not extract name from AST".into())
+    })?;
+    Ok(Some((name, stmt.missing_ok)))
+}
+
+/// AST-based matcher for
+/// `CREATE MATERIALIZED VIEW <name> [WITH (basin.continuous, refresh_interval = '<dur>')] AS <query>`.
+///
+/// libpg_query parses this as a
+/// [`pg_query::protobuf::CreateTableAsStmt`] with
+/// `objtype == ObjectType::ObjectMatview`. The Basin-specific `WITH (...)`
+/// options live on `into.options` as `DefElem` nodes.
+///
+/// Returns `Some(CreateMatViewIntent)` when `objtype` is `ObjectMatview`;
+/// `None` when the `CreateTableAsStmt` targets something else.
+pub(crate) fn match_create_materialized_view_ast(
+    stmt: &pg_query::protobuf::CreateTableAsStmt,
+) -> Result<Option<CreateMatViewIntent>> {
+    use pg_query::protobuf::ObjectType;
+    if stmt.objtype != ObjectType::ObjectMatview as i32 {
+        return Ok(None);
+    }
+    let into = stmt.into.as_deref().ok_or_else(|| {
+        BasinError::InvalidSchema("CREATE MATERIALIZED VIEW: missing INTO clause in AST".into())
+    })?;
+    let rel = into.rel.as_ref().ok_or_else(|| {
+        BasinError::InvalidSchema("CREATE MATERIALIZED VIEW: missing relation in INTO clause".into())
+    })?;
+    if rel.relname.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "CREATE MATERIALIZED VIEW: empty view name".into(),
+        ));
+    }
+    let name = rel.relname.clone();
+
+    // Extract the source SQL by deparsing the query node back to text.
+    let query_node = stmt.query.as_deref().ok_or_else(|| {
+        BasinError::InvalidSchema("CREATE MATERIALIZED VIEW: missing query in AST".into())
+    })?;
+    let source_sql = deparse_node_as_stmt(query_node).map_err(|e| {
+        BasinError::InvalidSchema(format!(
+            "CREATE MATERIALIZED VIEW: failed to reconstruct source SQL: {e}"
+        ))
+    })?;
+
+    // Extract Basin-specific options from `into.options` (DefElem list).
+    let options = parse_into_cv_options(&into.options)?;
+
+    Ok(Some(CreateMatViewIntent {
+        name,
+        source_sql,
+        options,
+    }))
+}
+
+/// Extract Basin CV options (`basin.continuous`, `refresh_interval`) from
+/// the `INTO` clause's option list. The option list contains `DefElem`
+/// nodes; `basin.continuous` arrives as
+/// `DefElem { defnamespace: "basin", defname: "continuous", arg: None }`
+/// and `refresh_interval` as
+/// `DefElem { defname: "refresh_interval", arg: String("5m") }`.
+fn parse_into_cv_options(options: &[pg_query::protobuf::Node]) -> Result<CvOptions> {
+    use pg_query::NodeEnum;
+    let mut continuous = false;
+    let mut refresh_interval_secs: Option<u64> = None;
+    for node in options {
+        let Some(NodeEnum::DefElem(de)) = node.node.as_ref() else {
+            continue;
+        };
+        // `basin.continuous` → defnamespace="basin", defname="continuous", no arg.
+        // Also accept bare `continuous` (defnamespace empty).
+        let ns = de.defnamespace.to_ascii_lowercase();
+        let name = de.defname.to_ascii_lowercase();
+        if name == "continuous" && (ns.is_empty() || ns == "basin") {
+            continuous = true;
+            continue;
+        }
+        if name == "refresh_interval" && (ns.is_empty() || ns == "basin") {
+            let arg = de.arg.as_deref().ok_or_else(|| {
+                BasinError::InvalidSchema(
+                    "CREATE MATERIALIZED VIEW: refresh_interval missing value".into(),
+                )
+            })?;
+            let val_str = str_from_node(arg).ok_or_else(|| {
+                BasinError::InvalidSchema(
+                    "CREATE MATERIALIZED VIEW: refresh_interval must be a string literal".into(),
+                )
+            })?;
+            refresh_interval_secs = Some(parse_duration_secs(&val_str)?);
+            continue;
+        }
+        // Unknown option — reject so a typo doesn't silently become a regular matview.
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE MATERIALIZED VIEW: unsupported option {:?}",
+            de.defname
+        )));
+    }
+    Ok(CvOptions {
+        continuous,
+        refresh_interval_secs,
+    })
+}
+
+/// Extract the string value from a `String` node, or `None` if the node
+/// is some other type.
+fn str_from_node(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::NodeEnum;
+    match node.node.as_ref()? {
+        NodeEnum::String(s) => Some(s.sval.clone()),
+        NodeEnum::AConst(ac) => {
+            use pg_query::protobuf::a_const::Val;
+            match ac.val.as_ref()? {
+                Val::Sval(s) => Some(s.sval.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// For a `DROP` statement, extract the first name from the objects list.
+/// The objects list for `DROP MATERIALIZED VIEW foo` is:
+///   `[ List { items: [ String("foo") ] } ]`
+fn drop_stmt_first_name(objects: &[pg_query::protobuf::Node]) -> Option<String> {
+    use pg_query::NodeEnum;
+    let first = objects.first()?;
+    match first.node.as_ref()? {
+        // DROP MATVIEW / DROP DOMAIN: objects[0] is a List([String(name)])
+        NodeEnum::List(list) => {
+            let item = list.items.first()?;
+            match item.node.as_ref()? {
+                NodeEnum::String(s) => Some(s.sval.clone()),
+                _ => None,
+            }
+        }
+        // Some DROP forms wrap directly in a String node.
+        NodeEnum::String(s) => Some(s.sval.clone()),
+        _ => None,
+    }
+}
+
+/// Deparse a statement-level `Node` (e.g., a `SelectStmt`) back to its
+/// SQL text by wrapping it in a synthetic `ParseResult` and calling
+/// `pg_query::deparse`.
+///
+/// libpg_query's C deparser asserts that `ParseResult::version` matches
+/// the linked `PG_VERSION_NUM`. We can't read that constant directly
+/// (the `bindings` module is private), so we bootstrap the version by
+/// parsing a trivial `SELECT 1` and reusing its `version` field.
+pub(crate) fn deparse_node_as_stmt(
+    node: &pg_query::protobuf::Node,
+) -> std::result::Result<String, pg_query::Error> {
+    let version = pg_query::parse("SELECT 1")?.protobuf.version;
+    let raw_stmt = pg_query::protobuf::RawStmt {
+        stmt: Some(Box::new(node.clone())),
+        stmt_location: 0,
+        stmt_len: 0,
+    };
+    let parse_result = pg_query::protobuf::ParseResult {
+        version,
+        stmts: vec![raw_stmt],
+    };
+    pg_query::deparse(&parse_result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1484,5 +1714,81 @@ mod tests {
             Some("orders".to_string())
         );
         assert_eq!(source_table_hint("SELECT 1"), None);
+    }
+
+    // --- AST-based matcher tests ------------------------------------------
+
+    #[test]
+    fn ast_match_refresh_materialized_view_simple() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("REFRESH MATERIALIZED VIEW mv").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::RefreshMatViewStmt(ref rms) = stmt.node.as_ref().unwrap() else {
+            panic!("expected RefreshMatViewStmt");
+        };
+        let (name, force_full) = match_refresh_materialized_view_ast(rms).unwrap();
+        assert_eq!(name, "mv");
+        assert!(!force_full);
+    }
+
+    #[test]
+    fn ast_match_refresh_materialized_view_with_full_does_not_parse() {
+        // Basin's custom WITH (full=true) is not valid PG syntax — ensure
+        // libpg_query rejects it so callers must use the textual pre-screen.
+        let result = pg_query::parse("REFRESH MATERIALIZED VIEW mv WITH (full = true)");
+        assert!(result.is_err(), "expected parse failure for Basin-only syntax");
+    }
+
+    #[test]
+    fn ast_match_drop_materialized_view_if_exists() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("DROP MATERIALIZED VIEW IF EXISTS mv").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::DropStmt(ref ds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected DropStmt");
+        };
+        let result = match_drop_materialized_view_ast(ds).unwrap();
+        assert_eq!(result, Some(("mv".to_string(), true)));
+    }
+
+    #[test]
+    fn ast_match_drop_materialized_view_no_if_exists() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("DROP MATERIALIZED VIEW mv").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::DropStmt(ref ds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected DropStmt");
+        };
+        let result = match_drop_materialized_view_ast(ds).unwrap();
+        assert_eq!(result, Some(("mv".to_string(), false)));
+    }
+
+    #[test]
+    fn ast_match_drop_table_returns_none() {
+        use pg_query::NodeEnum;
+        // DROP TABLE must NOT be matched by the matview matcher.
+        let r = pg_query::parse("DROP TABLE foo").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::DropStmt(ref ds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected DropStmt");
+        };
+        let result = match_drop_materialized_view_ast(ds).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn ast_match_create_materialized_view_no_options() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("CREATE MATERIALIZED VIEW mv AS SELECT 1").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateTableAsStmt(ref ctas) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateTableAsStmt");
+        };
+        let intent = match_create_materialized_view_ast(ctas).unwrap().unwrap();
+        assert_eq!(intent.name, "mv");
+        assert!(!intent.options.continuous);
+        assert!(intent.options.refresh_interval_secs.is_none());
+        // Source SQL should round-trip as a SELECT.
+        assert!(intent.source_sql.to_ascii_uppercase().contains("SELECT"));
     }
 }

@@ -262,6 +262,7 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(crate::seq_udf::NextvalUdf::default()));
     ctx.register_udf(ScalarUDF::from(crate::seq_udf::CurrvalUdf::default()));
     ctx.register_udf(ScalarUDF::from(crate::seq_udf::SetvalUdf::default()));
+    ctx.register_udf(ScalarUDF::from(crate::seq_udf::LastvalUdf::default()));
 }
 
 #[derive(Clone, Copy, Debug)]

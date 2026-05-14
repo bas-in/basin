@@ -842,6 +842,324 @@ fn single_part_object_name(name: &ObjectName) -> Result<String> {
     Ok(name.0[0].value.clone())
 }
 
+// ==========================================================================
+// pg_query AST-based matchers (alongside the textual ones above)
+// ==========================================================================
+
+/// Intent produced by [`match_create_type_enum_ast`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateEnumIntent {
+    /// Bare type name (single-part, no schema qualifier).
+    pub name: String,
+    /// Ordered list of enum label values.
+    pub labels: Vec<String>,
+}
+
+/// AST-based matcher for `ALTER TYPE <name> ADD VALUE '<label>'`.
+///
+/// libpg_query parses this natively as
+/// [`pg_query::protobuf::AlterEnumStmt`]. `type_name` is a list of
+/// `String` nodes; `new_val` carries the new label text.
+///
+/// Returns `(type_name, new_label)`.
+pub(crate) fn match_alter_type_add_value_ast(
+    stmt: &pg_query::protobuf::AlterEnumStmt,
+) -> Result<(String, String)> {
+    use pg_query::NodeEnum;
+    let type_name = stmt
+        .type_name
+        .first()
+        .and_then(|n| match n.node.as_ref()? {
+            NodeEnum::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(
+                "ALTER TYPE ADD VALUE: could not extract type name from AST".into(),
+            )
+        })?;
+    if stmt.new_val.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "ALTER TYPE ADD VALUE: empty value in AST".into(),
+        ));
+    }
+    Ok((type_name, stmt.new_val.clone()))
+}
+
+/// AST-based matcher for
+/// `CREATE DOMAIN <name> AS <base_type> [CHECK (<predicate>)]`.
+///
+/// libpg_query parses this natively as
+/// [`pg_query::protobuf::CreateDomainStmt`]. `domainname` holds the name
+/// as a list of `String` nodes; `type_name.names` encodes the base type
+/// (e.g., `["pg_catalog", "int4"]` for `INT`); `constraints` holds any
+/// `CHECK` constraints.
+///
+/// Returns `(name, base_type, optional_check_predicate)`.
+pub(crate) fn match_create_domain_ast(
+    stmt: &pg_query::protobuf::CreateDomainStmt,
+) -> Result<(String, SqlArgType, Option<String>)> {
+    use pg_query::NodeEnum;
+
+    // Extract the domain name.
+    let name = stmt
+        .domainname
+        .first()
+        .and_then(|n| match n.node.as_ref()? {
+            NodeEnum::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(
+                "CREATE DOMAIN: could not extract domain name from AST".into(),
+            )
+        })?;
+
+    // Extract the base type by mapping the pg_catalog type name.
+    let type_name_ast = stmt.type_name.as_ref().ok_or_else(|| {
+        BasinError::InvalidSchema("CREATE DOMAIN: missing type_name in AST".into())
+    })?;
+    let base_type = pg_type_name_to_sql_arg(type_name_ast)?;
+
+    // Extract any CHECK constraint predicate.
+    let check = extract_check_predicate(&stmt.constraints)?;
+
+    Ok((name, base_type, check))
+}
+
+/// AST-based matcher for `DROP DOMAIN [IF EXISTS] <name>`.
+///
+/// libpg_query routes this as a [`pg_query::protobuf::DropStmt`] with
+/// `remove_type == ObjectType::ObjectDomain`. Returns
+/// `Some((name, if_exists))` for domain drops; `None` for other DROP forms.
+pub(crate) fn match_drop_domain_ast(
+    stmt: &pg_query::protobuf::DropStmt,
+) -> Result<Option<(String, bool)>> {
+    use pg_query::protobuf::ObjectType;
+    if stmt.remove_type != ObjectType::ObjectDomain as i32 {
+        return Ok(None);
+    }
+    let name = drop_stmt_first_name_type(&stmt.objects).ok_or_else(|| {
+        BasinError::InvalidSchema("DROP DOMAIN: could not extract name from AST".into())
+    })?;
+    Ok(Some((name, stmt.missing_ok)))
+}
+
+/// AST-based matcher for `CREATE TYPE <name> AS ENUM ('label1', …)`.
+///
+/// libpg_query parses this natively as
+/// [`pg_query::protobuf::CreateEnumStmt`]. `type_name` is a list of
+/// `String` nodes; `vals` is a list of `String` nodes for the labels.
+///
+/// Returns `Some(CreateEnumIntent)`.
+pub(crate) fn match_create_type_enum_ast(
+    stmt: &pg_query::protobuf::CreateEnumStmt,
+) -> Result<Option<CreateEnumIntent>> {
+    use pg_query::NodeEnum;
+
+    let name = stmt
+        .type_name
+        .first()
+        .and_then(|n| match n.node.as_ref()? {
+            NodeEnum::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(
+                "CREATE TYPE AS ENUM: could not extract type name from AST".into(),
+            )
+        })?;
+
+    if stmt.vals.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "CREATE TYPE … AS ENUM requires at least one label".into(),
+        ));
+    }
+    let mut labels = Vec::with_capacity(stmt.vals.len());
+    for node in &stmt.vals {
+        match node.node.as_ref() {
+            Some(NodeEnum::String(s)) => labels.push(s.sval.clone()),
+            _ => {
+                return Err(BasinError::InvalidSchema(
+                    "CREATE TYPE AS ENUM: unexpected label node type in AST".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(Some(CreateEnumIntent { name, labels }))
+}
+
+/// Convert a pg_query `TypeName` (from `CreateDomainStmt.type_name`) to the
+/// catalog's `SqlArgType`. The `names` list contains pg_catalog-qualified
+/// names like `["pg_catalog", "int4"]`; we look at the last element.
+fn pg_type_name_to_sql_arg(tn: &pg_query::protobuf::TypeName) -> Result<SqlArgType> {
+    use pg_query::NodeEnum;
+    // The last element is the actual type name; the earlier ones are the
+    // schema qualifier (`pg_catalog`).
+    let last_name: String = tn
+        .names
+        .iter()
+        .rev()
+        .find_map(|n| match n.node.as_ref()? {
+            NodeEnum::String(s) if s.sval != "pg_catalog" => Some(s.sval.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            tn.names.last().and_then(|n| match n.node.as_ref()? {
+                NodeEnum::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+        })
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(
+                "CREATE DOMAIN: cannot determine base type from AST TypeName".into(),
+            )
+        })?;
+
+    match last_name.as_str() {
+        "int2" | "smallint" => Ok(SqlArgType::Int),
+        "int4" | "int" | "integer" => Ok(SqlArgType::Int),
+        "int8" | "bigint" => Ok(SqlArgType::BigInt),
+        "text" | "varchar" | "bpchar" | "char" => Ok(SqlArgType::Text),
+        "bool" | "boolean" => Ok(SqlArgType::Boolean),
+        "float4" | "float8" | "numeric" | "real" | "double" => Ok(SqlArgType::Double),
+        "bytea" => Ok(SqlArgType::Bytea),
+        "date" => Ok(SqlArgType::Date),
+        "timestamptz" | "timestamp with time zone" => Ok(SqlArgType::TimestampTz),
+        "timestamp" | "timestamp without time zone" => Ok(SqlArgType::Timestamp),
+        other => Err(BasinError::InvalidSchema(format!(
+            "CREATE DOMAIN: unsupported base type {other:?} in AST"
+        ))),
+    }
+}
+
+/// Extract the first `CHECK` constraint's raw expression as a SQL string.
+///
+/// libpg_query's C deparser does not directly support expression-level
+/// nodes (it dispatches on statement-level node types). To recover the
+/// CHECK predicate text we wrap our raw_expr Constraint inside a
+/// synthetic `CreateDomainStmt` (which the deparser DOES support),
+/// deparse the whole thing, then extract the predicate substring
+/// between `CHECK (` and the matching `)`.
+///
+/// Returns `None` when there are no CHECK constraints.
+fn extract_check_predicate(
+    constraints: &[pg_query::protobuf::Node],
+) -> Result<Option<String>> {
+    use pg_query::NodeEnum;
+    use pg_query::protobuf::ConstrType;
+
+    for node in constraints {
+        let Some(NodeEnum::Constraint(c)) = node.node.as_ref() else {
+            continue;
+        };
+        if c.contype != ConstrType::ConstrCheck as i32 {
+            continue;
+        }
+        if c.raw_expr.is_none() {
+            continue;
+        }
+        // Build a minimal synthetic CREATE DOMAIN __t AS int <our check>
+        // and deparse the whole thing, then extract the CHECK body.
+        let pred_sql = deparse_check_via_synthetic_domain(node).map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "CREATE DOMAIN: failed to deparse CHECK predicate: {e}"
+            ))
+        })?;
+        return Ok(Some(pred_sql));
+    }
+    Ok(None)
+}
+
+/// Reconstruct the CHECK predicate text by wrapping the Constraint node
+/// in a synthetic `CREATE DOMAIN __t AS int <check>` parse result and
+/// asking libpg_query's deparser to render it. The deparser supports
+/// `CreateDomainStmt` natively; we then extract the substring inside
+/// the rendered `CHECK (...)` clause.
+fn deparse_check_via_synthetic_domain(
+    constraint_node: &pg_query::protobuf::Node,
+) -> std::result::Result<String, pg_query::Error> {
+    // Parse a known-good template to get a fully-shaped CreateDomainStmt
+    // (correct version, all required defaults populated by libpg_query),
+    // then mutate its constraints list to hold ours.
+    let template = pg_query::parse("CREATE DOMAIN __t AS int CHECK (true)")?;
+    let mut pr = template.protobuf;
+    // Replace the template's constraint with our real one.
+    if let Some(raw_stmt) = pr.stmts.first_mut() {
+        if let Some(stmt) = raw_stmt.stmt.as_mut() {
+            if let Some(pg_query::NodeEnum::CreateDomainStmt(ref mut cds)) = stmt.node.as_mut() {
+                cds.constraints = vec![constraint_node.clone()];
+            }
+        }
+    }
+    let sql = pg_query::deparse(&pr)?;
+    // Extract the substring between `CHECK (` and the matching `)`.
+    Ok(extract_check_body(&sql).unwrap_or(sql))
+}
+
+/// Locate `CHECK (...)` in deparsed CREATE DOMAIN SQL and return the
+/// body between the parens. Falls back to `None` when the pattern isn't
+/// found (caller uses the whole string as a last resort).
+fn extract_check_body(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let check_start = lower.find("check")?;
+    // Skip past "check" and any whitespace to find the '('.
+    let mut idx = check_start + "check".len();
+    let bytes = sql.as_bytes();
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= bytes.len() || bytes[idx] != b'(' {
+        return None;
+    }
+    let open = idx;
+    let mut depth = 1i32;
+    let mut j = open + 1;
+    while j < bytes.len() && depth > 0 {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return Some(sql[open + 1..j].trim().to_string());
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Extract the first name from a `DropStmt.objects` list for type/domain
+/// drops. PG's parser emits different shapes depending on the object
+/// kind:
+///   * `DROP DOMAIN d` → `[ TypeName { names: [ String("d") ] } ]`
+///   * `DROP TYPE  t` → `[ TypeName { names: [ String("t") ] } ]`
+///   * `DROP TABLE x` → `[ List { items: [ String("x") ] } ]`
+/// We handle both shapes plus a bare `String` fallback.
+fn drop_stmt_first_name_type(objects: &[pg_query::protobuf::Node]) -> Option<String> {
+    use pg_query::NodeEnum;
+    let first = objects.first()?;
+    match first.node.as_ref()? {
+        NodeEnum::TypeName(tn) => {
+            // Take the last String node in `names` (skip schema qualifiers).
+            tn.names.iter().rev().find_map(|n| match n.node.as_ref()? {
+                NodeEnum::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+        }
+        NodeEnum::List(list) => {
+            let item = list.items.first()?;
+            match item.node.as_ref()? {
+                NodeEnum::String(s) => Some(s.sval.clone()),
+                _ => None,
+            }
+        }
+        NodeEnum::String(s) => Some(s.sval.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,5 +1242,115 @@ mod tests {
     fn match_drop_domain_non_match_returns_none() {
         let r = match_drop_domain("DROP TABLE t").unwrap();
         assert!(r.is_none());
+    }
+
+    // --- AST-based matcher tests ------------------------------------------
+
+    #[test]
+    fn ast_match_alter_type_add_value_basic() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("ALTER TYPE order_status ADD VALUE 'refunded'").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::AlterEnumStmt(ref aes) = stmt.node.as_ref().unwrap() else {
+            panic!("expected AlterEnumStmt");
+        };
+        let (type_name, label) = match_alter_type_add_value_ast(aes).unwrap();
+        assert_eq!(type_name, "order_status");
+        assert_eq!(label, "refunded");
+    }
+
+    #[test]
+    fn ast_match_create_domain_no_check() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("CREATE DOMAIN d AS TEXT").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateDomainStmt(ref cds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateDomainStmt");
+        };
+        let (name, base, check) = match_create_domain_ast(cds).unwrap();
+        assert_eq!(name, "d");
+        assert_eq!(base, SqlArgType::Text);
+        assert!(check.is_none());
+    }
+
+    #[test]
+    fn ast_match_create_domain_int_with_check() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("CREATE DOMAIN d AS INT CHECK (VALUE > 0)").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateDomainStmt(ref cds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateDomainStmt");
+        };
+        let (name, base, check) = match_create_domain_ast(cds).unwrap();
+        assert_eq!(name, "d");
+        assert_eq!(base, SqlArgType::Int);
+        // The CHECK predicate should contain the expression (exact form
+        // depends on deparse output, but must mention the comparison).
+        let pred = check.expect("should have CHECK predicate");
+        assert!(pred.contains('>') || pred.contains("value"), "pred={pred:?}");
+    }
+
+    #[test]
+    fn ast_match_drop_domain_if_exists() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("DROP DOMAIN IF EXISTS d CASCADE").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::DropStmt(ref ds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected DropStmt");
+        };
+        let result = match_drop_domain_ast(ds).unwrap();
+        assert_eq!(result, Some(("d".to_string(), true)));
+    }
+
+    #[test]
+    fn ast_match_drop_domain_basic() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("DROP DOMAIN d").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::DropStmt(ref ds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected DropStmt");
+        };
+        let result = match_drop_domain_ast(ds).unwrap();
+        assert_eq!(result, Some(("d".to_string(), false)));
+    }
+
+    #[test]
+    fn ast_match_drop_domain_returns_none_for_drop_table() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("DROP TABLE t").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::DropStmt(ref ds) = stmt.node.as_ref().unwrap() else {
+            panic!("expected DropStmt");
+        };
+        let result = match_drop_domain_ast(ds).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn ast_match_create_type_enum_basic() {
+        use pg_query::NodeEnum;
+        let r =
+            pg_query::parse("CREATE TYPE order_status AS ENUM ('pending', 'paid', 'cancelled')")
+                .unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateEnumStmt(ref ces) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateEnumStmt");
+        };
+        let intent = match_create_type_enum_ast(ces).unwrap().unwrap();
+        assert_eq!(intent.name, "order_status");
+        assert_eq!(intent.labels, vec!["pending", "paid", "cancelled"]);
+    }
+
+    #[test]
+    fn ast_match_create_type_enum_single_label() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("CREATE TYPE t AS ENUM ('x')").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::CreateEnumStmt(ref ces) = stmt.node.as_ref().unwrap() else {
+            panic!("expected CreateEnumStmt");
+        };
+        let intent = match_create_type_enum_ast(ces).unwrap().unwrap();
+        assert_eq!(intent.name, "t");
+        assert_eq!(intent.labels, vec!["x"]);
     }
 }

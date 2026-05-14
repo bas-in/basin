@@ -45,6 +45,11 @@ use tokio::sync::Mutex;
 /// semantics ("currval is not yet defined for this session" until the
 /// session calls `nextval`).
 ///
+/// Also tracks the globally-last sequence name advanced in this session
+/// so `lastval()` can retrieve it (PG: `lastval` returns the last value
+/// returned by `nextval` in the current session, regardless of which
+/// sequence name was used).
+///
 /// One instance is owned by each [`crate::session::SessionState`] and
 /// shared with the rewriter via the [`SequenceContext`] passed at SQL
 /// rewrite time.
@@ -56,18 +61,40 @@ pub(crate) struct SessionSequenceCache {
     /// cross-tenant session (admin tools, etc.) is sound; in the v0.1
     /// per-tenant `TenantSession` shape there's only ever one tenant
     /// per cache instance.
-    inner: Mutex<std::collections::HashMap<(TenantId, String), i64>>,
+    inner: Mutex<SessionSequenceCacheInner>,
+}
+
+#[derive(Default, Debug)]
+struct SessionSequenceCacheInner {
+    /// Per-sequence last-value map.
+    values: std::collections::HashMap<(TenantId, String), i64>,
+    /// Most recent `(tenant, seq_name, value)` for `lastval()`.
+    last: Option<(TenantId, String, i64)>,
 }
 
 impl SessionSequenceCache {
     pub(crate) async fn record(&self, tenant: TenantId, name: &str, value: i64) {
         let mut g = self.inner.lock().await;
-        g.insert((tenant, name.to_string()), value);
+        g.values.insert((tenant, name.to_string()), value);
+        g.last = Some((tenant, name.to_string(), value));
     }
 
     pub(crate) async fn get(&self, tenant: TenantId, name: &str) -> Option<i64> {
         let g = self.inner.lock().await;
-        g.get(&(tenant, name.to_string())).copied()
+        g.values.get(&(tenant, name.to_string())).copied()
+    }
+
+    /// Return the value from the most recent `nextval` call in this session,
+    /// across all sequences. PG SQLSTATE 55000 when no `nextval` has been
+    /// called yet.
+    pub(crate) async fn lastval(&self, tenant: TenantId) -> Result<i64> {
+        let g = self.inner.lock().await;
+        match &g.last {
+            Some((t, _, v)) if *t == tenant => Ok(*v),
+            _ => Err(BasinError::Catalog(
+                "55000: lastval is not yet defined in this session".into(),
+            )),
+        }
     }
 }
 
@@ -193,6 +220,45 @@ impl ScalarUDFImpl for SetvalUdf {
     }
 }
 
+/// Tombstone UDF for `lastval() -> bigint`. Always errors on invocation;
+/// the pre-execution rewriter is the load-bearing path (same pattern as
+/// `NextvalUdf` / `CurrvalUdf` / `SetvalUdf`). `lastval()` takes no
+/// arguments so its signature is a zero-argument volatile scalar.
+#[derive(Debug)]
+pub(crate) struct LastvalUdf {
+    signature: Signature,
+}
+
+impl Default for LastvalUdf {
+    fn default() -> Self {
+        Self {
+            signature: Signature::nullary(Volatility::Volatile),
+        }
+    }
+}
+
+impl ScalarUDFImpl for LastvalUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "lastval"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        exec_err!(
+            "lastval: call was not resolved by the pre-execution rewriter; \
+             this is an internal error — please report it"
+        )
+    }
+}
+
 /// Tag for which kind of sequence call the rewriter saw. The
 /// `setval` advance flag is parsed out of the call's third argument
 /// (defaulting to `true`) by [`parse_seq_args`] rather than being
@@ -202,6 +268,9 @@ enum SeqCall {
     Nextval,
     Currval,
     Setval,
+    /// `lastval()` — no arguments; returns the value from the last
+    /// `nextval` call in this session, regardless of which sequence.
+    Lastval,
 }
 
 /// Rewrite every `nextval('seq')`, `currval('seq')`, and `setval('seq',
@@ -269,6 +338,14 @@ struct ParsedSeqArgs {
 fn parse_seq_args(args_text: &str, kind: SeqCall) -> Option<ParsedSeqArgs> {
     let parts = split_top_level_args(args_text);
     let parts: Vec<&str> = parts.iter().map(|s| s.trim()).collect();
+    // `lastval()` takes no arguments.
+    if matches!(kind, SeqCall::Lastval) {
+        return Some(ParsedSeqArgs {
+            name: String::new(),
+            value: None,
+            advance: None,
+        });
+    }
     let want = match kind {
         SeqCall::Nextval | SeqCall::Currval => 1,
         SeqCall::Setval => {
@@ -278,6 +355,7 @@ fn parse_seq_args(args_text: &str, kind: SeqCall) -> Option<ParsedSeqArgs> {
             }
             parts.len()
         }
+        SeqCall::Lastval => unreachable!("handled above"),
     };
     if parts.len() != want {
         return None;
@@ -401,6 +479,7 @@ async fn dispatch_sequence_call(
             }
             Ok(v)
         }
+        SeqCall::Lastval => ctx.session_cache.lastval(ctx.tenant).await,
     }
 }
 
@@ -421,6 +500,8 @@ fn find_first_sequence_call(s: &str) -> Option<(SeqCall, usize, usize, String)> 
             (7, SeqCall::Currval)
         } else if matches_keyword(lb, idx, b"setval") {
             (6, SeqCall::Setval)
+        } else if matches_keyword(lb, idx, b"lastval") {
+            (7, SeqCall::Lastval)
         } else {
             idx += 1;
             continue;
