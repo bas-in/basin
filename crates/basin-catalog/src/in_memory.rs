@@ -303,8 +303,6 @@ impl Catalog for InMemoryCatalog {
                 "rename_table: target {tenant}/{new} already exists"
             )));
         }
-        let entry = tables
-            .remove(&old_key)
         // Look up the old entry and *alias* the new key to its Arc.
         // Two keys end up pointing at the same TableState so the
         // engine's session-level refresh_table call — which the

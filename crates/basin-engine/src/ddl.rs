@@ -129,6 +129,9 @@ fn basin_type_marker_for(sql: &sqlparser::ast::DataType) -> Option<&'static str>
         Some(BASIN_TYPE_TSTZRANGE)
     } else {
         None
+    }
+}
+
 /// Returns `true` if the SQL column type is `TSVECTOR`. The Arrow physical
 /// type is `Utf8`; the `BASIN_TYPE=TSVECTOR` marker on the field tells
 /// downstream layers to advertise PG OID 3614.

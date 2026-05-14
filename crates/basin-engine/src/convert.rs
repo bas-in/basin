@@ -1131,6 +1131,7 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                     null_buffer,
                 );
                 Arc::new(ws_list)
+            }
             ws_schema::DataType::UInt64 => {
                 let s = src
                     .as_any()

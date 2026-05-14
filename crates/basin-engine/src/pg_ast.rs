@@ -251,10 +251,6 @@ impl StmtKind {
     ///
     /// LISTEN / NOTIFY / UNLISTEN are explicit non-goals per ADR 0012 and
     /// remain here — they surface 0A000 intentionally.
-    pub fn is_unsupported(&self) -> bool {
-        matches!(
-            self,
-            StmtKind::Listen | StmtKind::Notify | StmtKind::Unlisten
     /// rejected by [`reject_unsupported`]. Centralised so the executor
     /// and the test suite stay in sync.
     pub fn is_unsupported(&self) -> bool {
@@ -1087,13 +1083,6 @@ mod tests {
 
     #[test]
     fn reject_unsupported_blocks_each_kind() {
-        // Only LISTEN / NOTIFY / UNLISTEN remain in `is_unsupported()`.
-        // Everything else that was previously here has been moved to the
-        // syntactic-accept (noop) set in `noop_accept::try_accept_as_noop`.
-        let cases = [
-            ("LISTEN ch", "LISTEN"),
-            ("NOTIFY ch", "NOTIFY"),
-            ("UNLISTEN ch", "UNLISTEN"),
         // Every kind in `is_unsupported()` must produce a
         // FeatureNotSupported with SQLSTATE 0A000.
         let cases = [

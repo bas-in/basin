@@ -38,6 +38,7 @@ mod rest;
 mod sequences;
 mod snapshot;
 mod tenant_storage_config;
+mod views;
 
 use async_trait::async_trait;
 use basin_common::{ChangeOp, Result, TableName, TenantId};
@@ -59,6 +60,7 @@ pub use rest::RestCatalog;
 pub use sequences::SequenceDef;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 pub use tenant_storage_config::TenantStorageConfig;
+pub use views::ViewDef;
 
 /// One row in the project-wide snapshot timeline returned by
 /// [`Catalog::list_snapshots_project_wide`]. Carries enough context (table,
@@ -1016,5 +1018,36 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         let _ = (tenant, table, unique_constraints);
         Ok(())
+    }
+
+    /// Register or replace a plain-view definition. Default impl returns
+    /// `Internal("not implemented")` so the stub `RestCatalog` stays buildable;
+    /// the in-memory backend overrides.
+    async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {
+        let _ = (def, or_replace);
+        Err(basin_common::BasinError::Internal(
+            "register_view not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a plain-view definition. Default impl returns
+    /// `Internal("not implemented")`.
+    async fn drop_view(&self, tenant: &TenantId, name: &str, if_exists: bool) -> Result<()> {
+        let _ = (tenant, name, if_exists);
+        Err(basin_common::BasinError::Internal(
+            "drop_view not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a single view by (tenant, name). Default impl returns `None`.
+    async fn lookup_view(&self, tenant: &TenantId, name: &str) -> Option<ViewDef> {
+        let _ = (tenant, name);
+        None
+    }
+
+    /// List all views for `tenant`. Default impl returns an empty vec.
+    async fn list_views(&self, tenant: &TenantId) -> Vec<ViewDef> {
+        let _ = tenant;
+        vec![]
     }
 }

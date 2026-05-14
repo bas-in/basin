@@ -227,6 +227,8 @@ pub(crate) fn bit_fixed_len(field: &arrow_schema::Field) -> u64 {
     inner
         .parse::<u64>()
         .expect("BIT(n) metadata must contain a valid integer")
+}
+
 /// Convenience helper to read the `BASIN_TYPE` marker from a field's metadata.
 /// Used by the pgwire encoder and REST layer to distinguish logical sub-types
 /// that share the same Arrow physical type (e.g. INET vs CIDR vs MACADDR all
@@ -599,9 +601,6 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // types here; all ride on `Utf8` (or `Decimal128` for MONEY) with a
         // `BASIN_TYPE` field metadata marker so INSERT validation and the
         // pgwire encoder can recover the logical type.
-        SqlDataType::Custom(name, modifiers) => {
-            if name.0.len() != 1 {
-                return Err(BasinError::InvalidSchema(format!(
         // FTS types: TSVECTOR and TSQUERY are stored as Utf8 in v0.1 (stub
         // semantics — no real tokenisation).  The FTS UDFs in `fts_udf` all
         // accept/return Utf8, so this mapping is consistent end-to-end.

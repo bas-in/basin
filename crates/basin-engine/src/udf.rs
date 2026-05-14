@@ -209,6 +209,7 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
             ],
             Volatility::Immutable,
         ),
+    }));
     // PG `to_date(text, format)` — parses a date string with a PG-style
     // format picture and returns `Date32`. Covers `to_date('2024-01-15',
     // 'YYYY-MM-DD')` and other common date-parsing patterns.
@@ -1953,11 +1954,6 @@ struct ToDatePgUdf {
 }
 
 impl ScalarUDFImpl for ToDatePgUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "to_date" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Date32) }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1977,7 +1973,6 @@ impl ScalarUDFImpl for ToDatePgUdf {
         }
         let n = args
             .iter()
-            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
             .filter_map(|a| match a {
                 ColumnarValue::Array(arr) => Some(arr.len()),
                 _ => None,
@@ -2288,36 +2283,6 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
     };
 
     Ok(result)
-        let txt = txt
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("to_date: arg 1 must be Utf8".into()))?;
-        let fmt = fmt
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("to_date: arg 2 must be Utf8".into()))?;
-        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        let mut out: Vec<Option<i32>> = Vec::with_capacity(n);
-        for i in 0..n {
-            if txt.is_null(i) || fmt.is_null(i) {
-                out.push(None);
-                continue;
-            }
-            let chrono_fmt = pg_format_to_chrono(fmt.value(i));
-            let parsed = chrono::NaiveDate::parse_from_str(txt.value(i), &chrono_fmt)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "to_date: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
-                        txt.value(i),
-                        fmt.value(i),
-                        chrono_fmt
-                    ))
-                })?;
-            let days = parsed.signed_duration_since(epoch).num_days() as i32;
-            out.push(Some(days));
-        }
-        Ok(ColumnarValue::Array(Arc::new(Date32Array::from(out))))
-    }
 }
 
 // ─── to_number(text, format) ─────────────────────────────────────────────────
@@ -3277,6 +3242,11 @@ fn rewrite_json_at_gt(s: &str) -> String {
             search_from = lhs_start + replacement.len();
         } else {
             search_from = op_end;
+        }
+    }
+    out
+}
+
 // ── PG aggregate alias rewriter ───────────────────────────────────────────────
 
 /// Rewrite PostgreSQL aggregate function aliases to DataFusion equivalents.

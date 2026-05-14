@@ -1711,47 +1711,6 @@ impl InfoSchemaQuery {
     }
 
     // -----------------------------------------------------------------------
-    // pg_catalog.pg_views  (views per tenant — matviews only in v0.1)
-    // pg_catalog.pg_views
-    // -----------------------------------------------------------------------
-
-    pub fn pg_views_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("schemaname", DataType::Utf8, false),
-            Field::new("viewname", DataType::Utf8, false),
-            Field::new("viewowner", DataType::Utf8, false),
-            Field::new("definition", DataType::Utf8, true),
-        ]))
-    }
-
-    pub async fn pg_views(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
-        let mut schemas: Vec<&str> = Vec::new();
-        let mut viewnames: Vec<String> = Vec::new();
-        let mut owners: Vec<String> = Vec::new();
-        let mut defs: Vec<Option<String>> = Vec::new();
-        let owner = tenant.to_string();
-        for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
-            if meta.continuous_aggregate.is_some() {
-                schemas.push(DEFAULT_SCHEMA);
-                viewnames.push(name.as_str().to_string());
-                owners.push(owner.clone());
-                defs.push(None);
-            }
-        }
-        let schema = Self::pg_views_schema();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(schemas)),
-            Arc::new(StringArray::from(viewnames)),
-            Arc::new(StringArray::from(owners)),
-            Arc::new(StringArray::from(defs)),
-        ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_views build: {e}")))
-    }
-
-    // -----------------------------------------------------------------------
     // pg_catalog.pg_indexes  (denormalised index info)
     // pg_catalog.pg_indexes
     // -----------------------------------------------------------------------
@@ -1936,57 +1895,12 @@ impl InfoSchemaQuery {
             sourcelines.push(None);
             pending.push(false);
         }
-        // Minimal static GUC rows that ORMs and admin tools commonly probe.
-        let rows: &[(&str, &str, Option<&str>, &str, &str, &str, &str, &str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
-            ("server_version", "15.0", None, "Preset Options", "Shows the server version.", "internal", "string", "default", None, None, Some("15.0"), Some("15.0")),
-            ("server_version_num", "150000", None, "Preset Options", "Shows the server version as an integer.", "internal", "integer", "default", Some("0"), Some("2147483647"), Some("150000"), Some("150000")),
-            ("max_connections", "100", None, "Connections and Authentication", "Sets the maximum number of concurrent connections.", "postmaster", "integer", "default", Some("1"), Some("262143"), Some("100"), Some("100")),
-            ("TimeZone", "UTC", None, "Client Connection Defaults / Locale and Formatting", "Sets the time zone.", "user", "string", "default", None, None, Some("UTC"), Some("UTC")),
-            ("client_encoding", "UTF8", None, "Client Connection Defaults / Locale and Formatting", "Sets the client character set encoding.", "user", "string", "default", None, None, Some("UTF8"), Some("UTF8")),
-            ("standard_conforming_strings", "on", None, "Version and Platform Compatibility", "Causes '...' strings to treat backslashes literally.", "user", "bool", "default", None, None, Some("on"), Some("on")),
-            ("search_path", "public", None, "Client Connection Defaults", "Sets the schema search order.", "user", "string", "default", None, None, Some("public"), Some("public")),
-            ("integer_datetimes", "on", None, "Preset Options", "Datetimes are integer based.", "internal", "bool", "default", None, None, Some("on"), Some("on")),
-        ];
-        let schema = Self::pg_settings_schema();
-        let mut names: Vec<&str> = Vec::new();
-        let mut settings: Vec<&str> = Vec::new();
-        let mut units: Vec<Option<&str>> = Vec::new();
-        let mut categories: Vec<&str> = Vec::new();
-        let mut descs: Vec<&str> = Vec::new();
-        let mut extra_descs: Vec<Option<&str>> = Vec::new();
-        let mut contexts: Vec<&str> = Vec::new();
-        let mut vartypes: Vec<&str> = Vec::new();
-        let mut sources: Vec<&str> = Vec::new();
-        let mut min_vals: Vec<Option<&str>> = Vec::new();
-        let mut max_vals: Vec<Option<&str>> = Vec::new();
-        let mut enumvalss: Vec<Option<&str>> = Vec::new();
-        let mut boot_vals: Vec<Option<&str>> = Vec::new();
-        let mut reset_vals: Vec<Option<&str>> = Vec::new();
-        for (name, setting, unit, cat, desc, ctx, vt, src, min, max, boot, reset) in rows {
-            names.push(name);
-            settings.push(setting);
-            units.push(*unit);
-            categories.push(cat);
-            descs.push(desc);
-            extra_descs.push(None);
-            contexts.push(ctx);
-            vartypes.push(vt);
-            sources.push(src);
-            min_vals.push(*min);
-            max_vals.push(*max);
-            enumvalss.push(None);
-            boot_vals.push(*boot);
-            reset_vals.push(*reset);
-        }
-        let n = rows.len() as i32;
-        let _ = n;
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(names)),
             Arc::new(StringArray::from(settings)),
             Arc::new(StringArray::from(units)),
             Arc::new(StringArray::from(categories)),
             Arc::new(StringArray::from(short_descs)),
-            Arc::new(StringArray::from(descs)),
             Arc::new(StringArray::from(extra_descs)),
             Arc::new(StringArray::from(contexts)),
             Arc::new(StringArray::from(vartypes)),
@@ -1999,12 +1913,6 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(sourcefiles)),
             Arc::new(Int32Array::from(sourcelines)),
             Arc::new(BooleanArray::from(pending)),
-            Arc::new(StringArray::from(enumvalss)),
-            Arc::new(StringArray::from(boot_vals)),
-            Arc::new(StringArray::from(reset_vals)),
-            Arc::new(StringArray::from(vec![None::<&str>; rows.len()])),
-            Arc::new(arrow_array::Int32Array::from(vec![None::<i32>; rows.len()])),
-            Arc::new(BooleanArray::from(vec![false; rows.len()])),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_settings build: {e}")))
@@ -2163,30 +2071,6 @@ impl InfoSchemaQuery {
     }
 
     // -----------------------------------------------------------------------
-    // pg_catalog.pg_stat_user_indexes  (basic scan count stubs)
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![None::<i64>; n])),
-            Arc::new(Int64Array::from(vec![None::<i64>; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(StringArray::from(vec![None::<&str>; n])),
-            Arc::new(StringArray::from(vec![None::<&str>; n])),
-            Arc::new(StringArray::from(vec![None::<&str>; n])),
-            Arc::new(StringArray::from(vec![None::<&str>; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-        ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_user_tables build: {e}")))
-    }
-
-    // -----------------------------------------------------------------------
     // pg_catalog.pg_stat_user_indexes  (scan-count stubs)
     // -----------------------------------------------------------------------
 
@@ -2246,44 +2130,6 @@ impl InfoSchemaQuery {
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_stat_user_indexes build: {e}")))
-    }
-
-    // -----------------------------------------------------------------------
-    // pg_catalog.pg_locks  (empty — Basin is optimistic)
-        let mut idxrelids: Vec<i64> = Vec::new();
-        let mut schemas: Vec<&str> = Vec::new();
-        let mut relnames: Vec<String> = Vec::new();
-        let mut idxnames: Vec<String> = Vec::new();
-        for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
-            if !meta.pk_columns.is_empty() {
-                let relid = fnv1a_64_to_positive_i64(
-                    format!("basin.pg_class:{tenant}:{}", name.as_str()).as_bytes(),
-                );
-                let idxid = fnv1a_64_to_positive_i64(
-                    format!("basin.pg_index:{tenant}:{}_pkey", name.as_str()).as_bytes(),
-                );
-                relids.push(relid);
-                idxrelids.push(idxid);
-                schemas.push(DEFAULT_SCHEMA);
-                relnames.push(name.as_str().to_string());
-                idxnames.push(format!("{}_pkey", name.as_str()));
-            }
-        }
-        let n = relids.len();
-        let schema = Self::pg_stat_user_indexes_schema();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(relids)),
-            Arc::new(Int64Array::from(idxrelids)),
-            Arc::new(StringArray::from(schemas)),
-            Arc::new(StringArray::from(relnames)),
-            Arc::new(StringArray::from(idxnames)),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-        ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_user_indexes build: {e}")))
     }
 
     // -----------------------------------------------------------------------
@@ -2884,16 +2730,6 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(constraint_schemas)),
             Arc::new(StringArray::from(constraint_names)),
             Arc::new(StringArray::from(check_clauses)),
-        _catalog: &dyn Catalog,
-        _tenant: &TenantId,
-    ) -> Result<RecordBatch> {
-        // Basin v0.1 does not enforce CHECK constraints at the SQL layer.
-        let schema = Self::check_constraints_schema();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("information_schema.check_constraints build: {e}")))
@@ -3211,6 +3047,19 @@ impl InfoSchemaQuery {
     // -----------------------------------------------------------------------
 
     pub fn role_table_grants_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("grantor", DataType::Utf8, true),
+            Field::new("grantee", DataType::Utf8, false),
+            Field::new("table_catalog", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("privilege_type", DataType::Utf8, false),
+            Field::new("is_grantable", DataType::Utf8, false),
+            Field::new("with_hierarchy", DataType::Utf8, false),
+        ]))
+    }
+
+    // -----------------------------------------------------------------------
     // information_schema.usage_privileges  (always-allow for calling tenant)
     // -----------------------------------------------------------------------
 
@@ -3269,6 +3118,20 @@ impl InfoSchemaQuery {
         _tenant: &TenantId,
     ) -> Result<RecordBatch> {
         let schema = Self::role_table_grants_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("information_schema.role_table_grants build: {e}")))
+    }
+
     pub async fn table_privileges(
         catalog: &dyn Catalog,
         tenant: &TenantId,
@@ -3415,7 +3278,11 @@ impl InfoSchemaQuery {
             Field::new("domain_catalog", DataType::Utf8, false),
             Field::new("domain_schema", DataType::Utf8, false),
             Field::new("domain_name", DataType::Utf8, false),
-            .map_err(|e| BasinError::internal(format!("information_schema.column_privileges build: {e}")))
+            Field::new("table_catalog", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+        ]))
     }
 
     // -----------------------------------------------------------------------
@@ -3430,6 +3297,8 @@ impl InfoSchemaQuery {
             Field::new("table_schema", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
             Field::new("column_name", DataType::Utf8, false),
+            Field::new("privilege_type", DataType::Utf8, false),
+            Field::new("is_grantable", DataType::Utf8, false),
         ]))
     }
 
@@ -3530,9 +3399,6 @@ impl InfoSchemaQuery {
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("information_schema.column_udt_usage build: {e}")))
-            Field::new("privilege_type", DataType::Utf8, false),
-            Field::new("is_grantable", DataType::Utf8, false),
-        ]))
     }
 
     pub async fn role_column_grants(

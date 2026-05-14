@@ -80,20 +80,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
                 return Ok(result);
             }
         }
-    // ADR 0014 Phase 1: parse with libpg_query; intercept no-op-accept kinds
-    // (VACUUM, GRANT, SET, COMMENT, …) before the textual pre-screens run.
-    // Dispatch order inside this block:
-    //   1. noop_accept  — syntactic-accept-only (returns Ok immediately)
-    //   2. reject_unsupported — SQLSTATE 0A000 for truly unsupported kinds
-    // If pg_query fails to parse (Basin extension syntax), the whole block
-    // is skipped and the textual pre-screens below take over.
-    if let Ok(tree) = crate::pg_ast::parse(sql) {
-        if let Some(node) = tree.stmts().next() {
-            let kind = crate::pg_ast::stmt_kind(node);
-            if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, raw_sql) {
-                return Ok(result);
-            }
-        }
         crate::pg_ast::reject_unsupported(&tree)?;
     }
 
@@ -711,6 +697,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             }
             let name = single_part_name(&names[0])?.to_string();
             crate::view_ddl::exec_drop_view(sess, &name, if_exists).await
+        }
         // ── Schema DDL ──────────────────────────────────────────────────
         Statement::CreateSchema {
             schema_name,
