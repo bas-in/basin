@@ -33,6 +33,53 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // doesn't know our UDFs.
     let raw_sql = sql;
 
+    // ADR 0014 Phase 1: parse with the real PostgreSQL parser first.
+    // This lets us:
+    //   1. Intercept noop-accept statements (VACUUM, ANALYZE, CLUSTER, LOCK,
+    //      COMMENT, EXPLAIN, RBAC primitives, FDWs, ownership, etc.) and return
+    //      immediately — sqlparser never sees them.
+    //   2. Reject explicitly-unsupported statements (LISTEN, NOTIFY, UNLISTEN)
+    //      with SQLSTATE 0A000 before sqlparser sees them.
+    //   3. Route TRUNCATE to its real implementation.
+    // On pg_query parse failure we fall through to sqlparser, which will
+    // produce its own error. Both errors will surface as
+    // BasinError::InvalidSchema (SQLSTATE 42601) to the client.
+    if let Ok(tree) = crate::pg_ast::parse(sql) {
+        // Collect statement kinds so we can dispatch before sqlparser.
+        let kinds: Vec<_> = tree
+            .stmts()
+            .map(|n| crate::pg_ast::stmt_kind(n))
+            .collect();
+
+        // Reject LISTEN/NOTIFY/UNLISTEN — not on the roadmap (ADR 0012 / pub/sub).
+        for kind in &kinds {
+            use crate::pg_ast::StmtKind;
+            if matches!(kind, StmtKind::Listen | StmtKind::Notify) {
+                return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                    "{} is not supported (SQLSTATE 0A000)",
+                    kind.as_label()
+                )));
+            }
+        }
+
+        // Noop-accept dispatch: for single-statement SQL only (the common case).
+        // Multi-statement bodies are split by the router before reaching execute().
+        if kinds.len() == 1 {
+            let kind = kinds[0];
+
+            // TRUNCATE is a real operation — delete all rows.
+            if matches!(kind, crate::pg_ast::StmtKind::Truncate) {
+                return crate::truncate::exec_truncate(sess, &tree).await;
+            }
+
+            if let Some(result) =
+                crate::noop_accept::try_accept_as_noop(kind, sql)
+            {
+                return Ok(result);
+            }
+        }
+    }
+
     // Phase 5.8: Basin-specific ALTER TABLE extensions (`SET cold_after`,
     // `SET cold_age_column`, `SET BLOOM FILTERS ON (...)`) that sqlparser
     // 0.52 doesn't model. Pre-screen the raw SQL before sqlparser sees
