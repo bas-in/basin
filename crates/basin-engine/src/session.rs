@@ -21,7 +21,7 @@
 //! The `register_object_store` call is the single switch point.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::AuthContext;
 
@@ -72,6 +72,10 @@ pub(crate) struct SessionState {
     /// sequence". Empty until the session's first `nextval`; consulted
     /// by the SQL-string sequence rewriter on every `currval` call.
     pub(crate) sequence_cache: Arc<crate::seq_udf::SessionSequenceCache>,
+    /// Per-session schema registry and search_path. `"public"` is always
+    /// present. Updated by `CREATE SCHEMA` / `DROP SCHEMA` /
+    /// `SET search_path`. See `crate::schema_ddl::SchemaState`.
+    pub(crate) schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
 }
 
 impl SessionState {
@@ -81,6 +85,7 @@ impl SessionState {
             prepared: crate::prepared::PreparedRegistry::new(),
             has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
             sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
+            schema_state: Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default())),
         }
     }
 }

@@ -57,6 +57,13 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return crate::cv_ddl::exec_refresh_materialized_view(sess, &name, force_full).await;
     }
 
+    // ALTER SCHEMA <old> RENAME TO <new>: sqlparser 0.52 has no AlterSchema
+    // AST node, so we recognise the full statement textually before sqlparser
+    // sees it. Must be checked before ALTER FUNCTION (both start with ALTER).
+    if let Some((old, new)) = crate::schema_ddl::match_alter_schema_rename(sql) {
+        return crate::schema_ddl::exec_alter_schema_rename(sess, &old, &new).await;
+    }
+
     // ALTER FUNCTION <name>(<args>) RENAME TO <new>: sqlparser 0.52 has no
     // AlterFunction AST node, so we recognise the full statement textually
     // and dispatch to the catalog rename helper.
@@ -487,6 +494,57 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             purge: _,
             temporary: _,
         } => crate::seq_ddl::exec_drop_sequence(sess, if_exists, &names).await,
+        // ── Schema DDL ──────────────────────────────────────────────────
+        Statement::CreateSchema {
+            schema_name,
+            if_not_exists,
+        } => crate::schema_ddl::exec_create_schema(sess, schema_name, if_not_exists).await,
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Schema,
+            if_exists,
+            names,
+            cascade,
+            restrict: _,
+            purge: _,
+            temporary: _,
+        } => crate::schema_ddl::exec_drop_schema(sess, &names, if_exists, cascade).await,
+        // ── SET search_path ─────────────────────────────────────────────
+        Statement::SetVariable {
+            local: _,
+            hivevar: _,
+            variables,
+            value,
+        } => {
+            // Only handle `SET search_path = …`; forward everything else
+            // as a silent no-op so ORM migrations that emit PG-specific
+            // SET statements (client_encoding, standard_conforming_strings,
+            // etc.) don't hard-fail. This mirrors the PG wire protocol
+            // server behaviour where un-recognised SET parameters are
+            // accepted silently at the session level.
+            // `variables` is `OneOrManyWithParens<ObjectName>`.
+            // Each `ObjectName` holds `Vec<Ident>`; join with `.` to get the
+            // full variable name (e.g. `search_path`).
+            let var_name = variables
+                .iter()
+                .next()
+                .map(|obj_name: &ObjectName| {
+                    obj_name
+                        .0
+                        .iter()
+                        .map(|i| i.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                        .to_ascii_lowercase()
+                })
+                .unwrap_or_default();
+
+            if var_name == "search_path" {
+                crate::schema_ddl::exec_set_search_path(sess, &value)
+            } else {
+                // Silently accept unknown SET variables.
+                Ok(ExecResult::Empty { tag: "SET".into() })
+            }
+        }
         Statement::Insert(ins) => exec_insert(sess, ins).await,
         Statement::Query(_) => {
             // Analytical routing happens before the point-query fast path so
@@ -535,6 +593,22 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             exec_select(sess, sql, include_deleted).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
+        // ── SHOW search_path ─────────────────────────────────────────────
+        Statement::ShowVariable { variable } => {
+            let var_name = variable
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join("_")
+                .to_ascii_lowercase();
+            if var_name == "search_path" {
+                crate::schema_ddl::exec_show_search_path(sess)
+            } else {
+                // Silently return empty for other SHOW <var> forms so
+                // ORM startup queries don't hard-fail.
+                Ok(ExecResult::Empty { tag: "SHOW".into() })
+            }
+        }
         Statement::AlterTable {
             name, operations, ..
         } => exec_alter_table(sess, name, operations).await,
@@ -1899,9 +1973,19 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
         .await?;
     }
 
+    // Strip schema qualifiers (`schema.table` → `table`) before DataFusion
+    // sees the SQL. DataFusion uses its own catalog hierarchy; Basin's tables
+    // are all registered in the flat default namespace, so `schema.table`
+    // would be misrouted as a DataFusion catalog-schema lookup.
+    let sql_stripped = crate::schema_ddl::strip_schema_qualifiers_for_session(
+        sql,
+        &sess.state.schema_state,
+    );
+    let sql_for_df = sql_stripped.as_str();
+
     let mut df = sess
         .ctx
-        .sql(sql)
+        .sql(sql_for_df)
         .await
         .map_err(|e| BasinError::internal(format!("plan: {e}")))?;
 
@@ -2346,13 +2430,22 @@ async fn exec_show_tables(sess: &TenantSession) -> Result<ExecResult> {
     })
 }
 
-/// Pull a bare table name out of a sqlparser `ObjectName`. Schema-qualified
-/// names are out of scope for the PoC.
+/// Pull a bare table name out of a sqlparser `ObjectName`.
+///
+/// Accepts both bare names (`t`) and schema-qualified names (`myschema.t`).
+/// The schema qualifier is stripped: Basin's flat per-tenant model stores all
+/// tables in a single catalog namespace. Callers that need to validate the
+/// schema against the session's schema registry should call
+/// `crate::schema_ddl::table_name_from_object` instead.
 fn single_part_name(name: &ObjectName) -> Result<&str> {
-    if name.0.len() != 1 {
-        return Err(BasinError::InvalidIdent(format!(
-            "schema-qualified table names not supported in PoC: {name}"
-        )));
+    match name.0.len() {
+        1 => Ok(&name.0[0].value),
+        2 => {
+            // schema.table — drop the schema prefix and return the table name.
+            Ok(&name.0[1].value)
+        }
+        _ => Err(BasinError::InvalidIdent(format!(
+            "table name must have at most one schema qualifier: {name}"
+        ))),
     }
-    Ok(&name.0[0].value)
 }
