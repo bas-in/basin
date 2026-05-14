@@ -245,6 +245,14 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
     let rewritten = crate::udf::rewrite_extract_second(&rewritten);
+    // Rewrite `expr AT TIME ZONE 'tz'` to `at_time_zone(expr, 'tz')` so
+    // DataFusion's sqlparser sees a regular function call instead of the
+    // AT TIME ZONE infix operator, which it may not handle for all types.
+    let rewritten = crate::interval_tz_udf::rewrite_at_time_zone(&rewritten);
+    // Rewrite `EXTRACT(EPOCH FROM interval_expr)` to
+    // `extract_epoch_from_interval(interval_expr)` — DataFusion's built-in
+    // `EXTRACT(EPOCH FROM x)` handles timestamps but not interval values.
+    let rewritten = crate::interval_tz_udf::rewrite_extract_epoch_interval(&rewritten);
     // User-defined `LANGUAGE sql` function inlining. The rewriter is a
     // no-op for tenants with no registered functions and for statements
     // that contain no function calls at all (the cheap pre-gate runs

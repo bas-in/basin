@@ -591,6 +591,7 @@ mod function_ddl;
 mod generated_cols;
 mod geo_glue;
 mod info_schema_provider;
+mod interval_tz_udf;
 mod lifecycle;
 mod net_glue;
 mod noisy_detector;

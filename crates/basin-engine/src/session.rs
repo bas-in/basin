@@ -167,6 +167,8 @@ pub(crate) async fn open(
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+    // Interval arithmetic + time-zone shim UDFs (Phase bulk-interval-tz).
+    crate::interval_tz_udf::register_interval_tz_udfs(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
