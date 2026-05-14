@@ -28,10 +28,10 @@ use basin_vector::{cosine_distance as v_cosine, dot_product as v_dot, l2_distanc
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
 use datafusion::arrow::array::types::IntervalMonthDayNano;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
-    FixedSizeListArray, Float32Array, Float64Array, Int64Array, IntervalMonthDayNanoArray,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date32Builder, FixedSizeBinaryArray,
+    FixedSizeListArray, Float32Array, Float64Array, Int32Builder, Int64Array,
+    IntervalMonthDayNanoArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
@@ -152,6 +152,9 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
             Volatility::Immutable,
         ),
     }));
+    // to_char — one combined UDF covering timestamp, date, and numeric inputs.
+    // Registering a single UDF avoids the DataFusion registry overwrite that
+    // would occur if two UDFs share the same name.
     ctx.register_udf(ScalarUDF::from(ToCharPgUdf {
         signature: Signature::one_of(
             vec![
@@ -172,12 +175,40 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
                     DataType::Utf8,
                 ]),
                 TypeSignature::Exact(vec![DataType::Date32, DataType::Utf8]),
+                // Numeric overloads.
+                TypeSignature::Exact(vec![DataType::Float64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Float32, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int16, DataType::Utf8]),
             ],
             Volatility::Immutable,
         ),
     }));
     ctx.register_udf(ScalarUDF::from(ToTimestampPgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+    }));
+    // to_date(text, format) → Date32
+    ctx.register_udf(ScalarUDF::from(ToDatePgUdf {
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+    }));
+    // convert(bytea, src_encoding, dst_encoding) → bytea
+    ctx.register_udf(ScalarUDF::from(ConvertBytesUdf {
+        signature: Signature::exact(
+            vec![DataType::Binary, DataType::Utf8, DataType::Utf8],
+            Volatility::Immutable,
+        ),
+    }));
+    // length(text | bytea) → int4 — unified overload replacing DF's text-only
+    // builtin. For Utf8 counts Unicode codepoints; for Binary counts bytes.
+    ctx.register_udf(ScalarUDF::from(LengthPgUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Binary]),
+            ],
+            Volatility::Immutable,
+        ),
     }));
     // PG-shape `power(x, y)` — always returns Float64. Overrides
     // DataFusion's default `power`, which returns Int64 for two integer
@@ -1303,19 +1334,26 @@ fn getrandom_fill(buf: &mut [u8]) {
 /// Translate PG-style date/time format directives to chrono's strftime form.
 ///
 /// Recognised PG directives: `YYYY`, `YY`, `MM`, `DD`, `HH24`, `HH12`, `HH`,
-/// `MI`, `SS`, `AM`, `PM`, `Day`, `Mon`, `MS`, `US`. Anything else is passed
-/// through verbatim. Chrono `%X` directives are passed through verbatim too,
-/// which keeps callers using chrono syntax working unchanged.
+/// `MI`, `SS`, `AM`, `PM`, `Day`, `Mon`, `MS`, `US`, `TZ`, `Month`, `DY`,
+/// `CC`, `Q`, `W`, `IW`, `J`. `FM` prefix is consumed/stripped (fill-mode).
+/// Anything else is passed through verbatim. Chrono `%X` directives are passed
+/// through verbatim too, which keeps callers using chrono syntax working
+/// unchanged.
 fn pg_format_to_chrono(fmt: &str) -> String {
     // Order matters: longest match first so `YYYY` wins over `YY`, and
-    // `HH24` over `HH`.
+    // `HH24` over `HH`.  `FM` (fill-mode) prefix is stripped — chrono
+    // output is already compact.
     const REPL: &[(&str, &str)] = &[
         ("YYYY", "%Y"),
         ("YY", "%y"),
+        ("Month", "%B"),
+        ("MONTH", "%B"),
         ("Mon", "%b"),
         ("MON", "%b"),
         ("Day", "%A"),
         ("DAY", "%A"),
+        ("DY", "%a"),
+        ("dy", "%a"),
         ("MM", "%m"),
         ("DD", "%d"),
         ("HH24", "%H"),
@@ -1329,11 +1367,30 @@ fn pg_format_to_chrono(fmt: &str) -> String {
         ("PM", "%p"),
         ("am", "%P"),
         ("pm", "%P"),
+        ("TZ", "%Z"),
+        ("tz", "%Z"),
+        // CC (century) and Q (quarter) and W (week-in-month) are rendered
+        // via post-process escapes that chrono doesn't have natively; we
+        // use private placeholders that ToCharPgUdf replaces after the
+        // chrono format step.  They must appear *before* any single-char
+        // patterns that could shadow them.
+        ("CC", "\x01CC\x01"),
+        ("Q", "\x01Q\x01"),
+        ("W", "\x01W\x01"),
+        ("IW", "%V"),
+        ("WW", "%U"),
+        ("J", "\x01J\x01"),
     ];
     let mut out = String::with_capacity(fmt.len());
     let bytes = fmt.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // Strip `FM` (fill-mode) prefix — chrono output is compact by default.
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"FM" {
+            i += 2;
+            continue;
+        }
+
         // Pass through chrono `%X` directives unchanged so chrono-style
         // callers remain bit-identical.
         if bytes[i] == b'%' && i + 1 < bytes.len() {
@@ -1358,6 +1415,43 @@ fn pg_format_to_chrono(fmt: &str) -> String {
         }
     }
     out
+}
+
+/// Post-process a chrono-formatted string by substituting Basin-private
+/// placeholders (`\x01CC\x01`, `\x01Q\x01`, `\x01W\x01`, `\x01J\x01`) with
+/// computed values derived from the source `NaiveDateTime`.
+fn pg_format_postprocess(s: String, dt: chrono::NaiveDateTime) -> String {
+    use chrono::Datelike;
+    if !s.contains('\x01') {
+        return s;
+    }
+    let year = dt.year();
+    let month = dt.month();
+    let day = dt.day();
+
+    // Century: year 2001-2100 → CC=21.
+    let cc = ((year - 1) / 100) + 1;
+    // Quarter: 1-4.
+    let q = ((month - 1) / 3) + 1;
+    // Week-in-month: ceil(day/7).
+    let w = ((day - 1) / 7) + 1;
+    // Julian day number (days since Jan 1, 4713 BC = JD 0). The Unix epoch
+    // is JD 2440588.
+    let julian = {
+        let epoch_jd: i64 = 2_440_588;
+        let days_since_epoch = dt.signed_duration_since(
+            chrono::NaiveDateTime::new(
+                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            ),
+        ).num_days();
+        epoch_jd + days_since_epoch
+    };
+
+    s.replace("\x01CC\x01", &format!("{cc:02}"))
+     .replace("\x01Q\x01", &format!("{q}"))
+     .replace("\x01W\x01", &format!("{w}"))
+     .replace("\x01J\x01", &format!("{julian}"))
 }
 
 #[derive(Debug)]
@@ -1703,23 +1797,49 @@ impl ScalarUDFImpl for ToCharPgUdf {
             })
             .max()
             .unwrap_or(1);
-        let ts = args[0].clone().into_array(n)?;
-        let fmt = args[1].clone().into_array(n)?;
-        let fmt = fmt
+        let val_arr = args[0].clone().into_array(n)?;
+        let fmt_arr = args[1].clone().into_array(n)?;
+        let fmt = fmt_arr
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Execution("to_char: arg 2 must be Utf8".into()))?;
+
+        // Dispatch on the first argument type.
+        let is_numeric = matches!(
+            val_arr.data_type(),
+            DataType::Float64 | DataType::Float32 | DataType::Int64 | DataType::Int32 | DataType::Int16
+        );
+
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
-        for i in 0..n {
-            if fmt.is_null(i) {
-                out.push(None);
-                continue;
+        if is_numeric {
+            // Numeric picture formatting path.
+            let val_f64 = datafusion::arrow::compute::cast(&val_arr, &DataType::Float64)
+                .map_err(|e| DataFusionError::Execution(format!("to_char(numeric): {e}")))?;
+            let val_f64 = val_f64.as_any().downcast_ref::<Float64Array>()
+                .ok_or_else(|| DataFusionError::Execution("to_char(numeric): cast to Float64 failed".into()))?;
+            for i in 0..n {
+                if val_f64.is_null(i) || fmt.is_null(i) {
+                    out.push(None);
+                    continue;
+                }
+                out.push(Some(format_numeric_pg(fmt.value(i), val_f64.value(i))?));
             }
-            let chrono_fmt = pg_format_to_chrono(fmt.value(i));
-            let dt = ts_array_to_naive(&ts, i)?;
-            match dt {
-                Some(dt) => out.push(Some(dt.format(&chrono_fmt).to_string())),
-                None => out.push(None),
+        } else {
+            // Datetime formatting path.
+            for i in 0..n {
+                if fmt.is_null(i) {
+                    out.push(None);
+                    continue;
+                }
+                let chrono_fmt = pg_format_to_chrono(fmt.value(i));
+                let dt = ts_array_to_naive(&val_arr, i)?;
+                match dt {
+                    Some(dt) => {
+                        let raw = dt.format(&chrono_fmt).to_string();
+                        out.push(Some(pg_format_postprocess(raw, dt)));
+                    }
+                    None => out.push(None),
+                }
             }
         }
         Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
@@ -1797,6 +1917,340 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
         let arr = TimestampNanosecondArray::from(out);
         Ok(ColumnarValue::Array(Arc::new(arr)))
     }
+}
+
+// ---------------------------------------------------------------------------
+// to_date(text, format) → Date32
+// ---------------------------------------------------------------------------
+//
+// Parses a date string using a PG-format string (same mapping as to_timestamp)
+// and returns a Date32 (days since Unix epoch 1970-01-01).
+
+#[derive(Debug)]
+struct ToDatePgUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ToDatePgUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "to_date" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Date32) }
+
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("to_date expects 2 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
+            .max()
+            .unwrap_or(1);
+        let txt = args[0].clone().into_array(n)?;
+        let fmt = args[1].clone().into_array(n)?;
+        let txt = txt.as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_date: arg 1 must be Utf8".into()))?;
+        let fmt = fmt.as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("to_date: arg 2 must be Utf8".into()))?;
+
+        let mut out = Date32Builder::with_capacity(n);
+        for i in 0..n {
+            if txt.is_null(i) || fmt.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let chrono_fmt = pg_format_to_chrono(fmt.value(i));
+            // Try date-only first, then full datetime.
+            let date = chrono::NaiveDate::parse_from_str(txt.value(i), &chrono_fmt)
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(txt.value(i), &chrono_fmt)
+                        .map(|dt| dt.date())
+                })
+                .map_err(|e| DataFusionError::Execution(format!(
+                    "to_date: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
+                    txt.value(i), fmt.value(i), chrono_fmt
+                )))?;
+            // Days since Unix epoch.
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let days = (date - epoch).num_days() as i32;
+            out.append_value(days);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// convert(bytea, src_encoding text, dst_encoding text) → bytea
+// ---------------------------------------------------------------------------
+//
+// PG's three-argument `convert`. In v0.1 we support UTF-8 ↔ UTF-8 only
+// (encoding names accepted but bytes returned unchanged). Non-UTF-8 encoding
+// conversions raise an Execution error explaining the limitation.
+
+#[derive(Debug)]
+struct ConvertBytesUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ConvertBytesUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "convert" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Binary) }
+
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 3 {
+            return exec_err!("convert expects 3 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
+            .max()
+            .unwrap_or(1);
+        let bytes_arr = args[0].clone().into_array(n)?;
+        let src_arr = args[1].clone().into_array(n)?;
+        let dst_arr = args[2].clone().into_array(n)?;
+
+        let bytes = bytes_arr.as_any().downcast_ref::<BinaryArray>()
+            .ok_or_else(|| DataFusionError::Execution("convert: arg 1 must be Binary".into()))?;
+        let src = src_arr.as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("convert: arg 2 must be Utf8".into()))?;
+        let dst = dst_arr.as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("convert: arg 3 must be Utf8".into()))?;
+
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if bytes.is_null(i) || src.is_null(i) || dst.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            // In v0.1: UTF-8 → UTF-8 is a no-op byte copy; anything else is
+            // unsupported. Normalize the names to lower-case for comparison.
+            let src_enc = src.value(i).to_ascii_lowercase();
+            let dst_enc = dst.value(i).to_ascii_lowercase();
+            let is_utf8 = |s: &str| matches!(s, "utf8" | "utf-8" | "unicode");
+            if is_utf8(&src_enc) && is_utf8(&dst_enc) {
+                out.push(Some(bytes.value(i).to_vec()));
+            } else {
+                return exec_err!(
+                    "convert: non-UTF-8 encoding conversion ({src_enc} → {dst_enc}) \
+                     is not supported in Basin v0.1; use UTF-8"
+                );
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(BinaryArray::from_iter(
+            out.iter().map(|o| o.as_deref()),
+        ))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// length(bytea | text) → int4
+// ---------------------------------------------------------------------------
+//
+// PG has two overloads: `length(text)` (character count) and `length(bytea)`
+// (byte count).  DataFusion's built-in only covers Utf8; registering a new
+// `length` UDF with `Exact([Binary])` would **overwrite** the built-in and
+// break text-length calls.
+//
+// Solution: register a unified UDF that accepts both Utf8 and Binary inputs.
+// For Utf8 it counts Unicode codepoints (matching PG + DF's prior behaviour);
+// for Binary it counts bytes (PG's `length(bytea)` semantics).
+
+#[derive(Debug)]
+struct LengthPgUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for LengthPgUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "length" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int32) }
+
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 1 {
+            return exec_err!("length expects 1 argument, got {}", args.len());
+        }
+        let n = match &args[0] { ColumnarValue::Array(arr) => arr.len(), _ => 1 };
+        let arr = args[0].clone().into_array(n)?;
+        let mut out = Int32Builder::with_capacity(n);
+        match arr.data_type() {
+            DataType::Binary => {
+                let bytes = arr.as_any().downcast_ref::<BinaryArray>().unwrap();
+                for i in 0..n {
+                    if bytes.is_null(i) { out.append_null(); }
+                    else { out.append_value(bytes.value(i).len() as i32); }
+                }
+            }
+            DataType::Utf8 => {
+                let strings = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..n {
+                    if strings.is_null(i) { out.append_null(); }
+                    else { out.append_value(strings.value(i).chars().count() as i32); }
+                }
+            }
+            other => return exec_err!("length: unsupported type {other:?}"),
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// to_char(numeric, format) — numeric formatting
+// ---------------------------------------------------------------------------
+//
+// PG's numeric to_char supports a rich picture string. In v0.1 we implement
+// the most common directives:
+//   9 / 0     — digit placeholder (0 forces leading zero)
+//   .         — decimal point
+//   ,         — thousands separator (position in template only)
+//   G / D     — locale group/decimal (mapped to , and . in C locale)
+//   S         — sign (+ or -)
+//   $         — currency literal prefix
+//   EEEE      — scientific notation
+//   XX / XXX  — hex (upper-case)
+//   FM        — fill mode (suppress leading/trailing spaces and zeros)
+//
+// The result is padded with spaces on the left like real PG unless FM is set.
+
+fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
+    // Detect FM prefix.
+    let (fm, tpl) = if template.starts_with("FM") || template.starts_with("fm") {
+        (true, &template[2..])
+    } else {
+        (false, template)
+    };
+
+    // Detect hex format (XX / XXX / XXXX …).
+    let hex_upper = tpl.chars().all(|c| c == 'X' || c == 'x');
+    if hex_upper && !tpl.is_empty() {
+        let width = tpl.len();
+        let v = value as i64;
+        let s = format!("{v:0>width$X}", width = width, v = v.unsigned_abs() as u64);
+        let s = if fm { s.trim_start_matches('0').to_string() } else { s };
+        return Ok(s);
+    }
+
+    // Detect scientific notation (EEEE).
+    if tpl.to_uppercase().contains("EEEE") {
+        let before_e = &tpl[..tpl.to_uppercase().find("EEEE").unwrap()];
+        let decimal_digits = before_e.chars().filter(|&c| c == '9' || c == '0').count();
+        let frac_digits = before_e.find('.').map(|p| {
+            before_e[p+1..].chars().filter(|&c| c == '9' || c == '0').count()
+        }).unwrap_or(0);
+        let _ = decimal_digits; // suppress warning
+        let s = format!("{value:.frac_digits$e}");
+        // Normalise Rust's `e` form to PG's `e+NN` form.
+        let s = if let Some(pos) = s.find('e') {
+            let (mant, exp_part) = s.split_at(pos);
+            let exp_str = &exp_part[1..];
+            let exp_val: i32 = exp_str.parse().unwrap_or(0);
+            format!("{mant}e+{exp_val:02}")
+        } else {
+            s
+        };
+        return Ok(s);
+    }
+
+    // General numeric picture.
+    // Split template at decimal point.
+    let (int_tpl, frac_tpl) = if let Some(dot) = tpl.find('.') {
+        (&tpl[..dot], &tpl[dot+1..])
+    } else {
+        (tpl, "")
+    };
+
+    // Count frac digits from template.
+    let frac_digits = frac_tpl.chars().filter(|&c| c == '9' || c == '0').count();
+
+    // Determine sign.
+    let has_sign_directive = int_tpl.contains('S') || int_tpl.contains('s');
+    let sign = if value < 0.0 { "-" } else if has_sign_directive { "+" } else { "" };
+    let abs_val = value.abs();
+
+    // Round value to frac_digits.
+    let factor = 10f64.powi(frac_digits as i32);
+    let rounded = (abs_val * factor).round() / factor;
+
+    // Split into integer and fractional parts.
+    let int_part = rounded.trunc() as i64;
+    let frac_part = if frac_digits > 0 {
+        let f = ((rounded - rounded.trunc()) * factor).round() as u64;
+        format!("{f:0>frac_digits$}", frac_digits = frac_digits)
+    } else {
+        String::new()
+    };
+
+    // Format integer part, inserting group separators where `G` or `,` appears.
+    // Build the int digits.
+    let int_str = format!("{int_part}");
+    let int_digits: Vec<char> = int_str.chars().collect();
+
+    // Determine positions of group separators from the template.
+    // Walk the integer-part template right-to-left to find `,` / `G` positions
+    // (counting only digit-placeholder positions).
+    let int_tpl_chars: Vec<char> = int_tpl.chars().collect();
+    let digit_positions: Vec<usize> = int_tpl_chars.iter().enumerate()
+        .filter(|(_, c)| **c == '9' || **c == '0')
+        .map(|(i, _)| i)
+        .collect();
+
+    // Count digit slots to the left of each separator.
+    let total_digit_slots = digit_positions.len();
+
+    // Build output integer with separators.
+    let mut int_result = String::new();
+    let need_digits = int_digits.len();
+    // Pad with spaces if template has more digit slots than value digits.
+    let pad_count = if total_digit_slots > need_digits { total_digit_slots - need_digits } else { 0 };
+
+    // Determine which digit-slot indices (from left) have a separator after them.
+    // Walk through template left-to-right, tracking digit slot index.
+    let mut digit_slot = 0usize;
+    let mut sep_after_slot: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &tpl_idx in &int_tpl_chars.iter().enumerate()
+        .filter(|(_, c)| **c == '9' || **c == '0' || **c == ',' || **c == 'G' || **c == 'g' || **c == 'S' || **c == 's' || **c == '$')
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>()
+    {
+        let c = int_tpl_chars[tpl_idx];
+        if c == '9' || c == '0' {
+            digit_slot += 1;
+        } else if (c == ',' || c == 'G' || c == 'g') && digit_slot > 0 {
+            sep_after_slot.insert(digit_slot - 1);
+        }
+    }
+
+    // Build integer portion with appropriate padding.
+    if !fm {
+        int_result.push_str(&" ".repeat(pad_count));
+    }
+    int_result.push_str(sign);
+    // Check for $ in template.
+    if int_tpl.contains('$') {
+        int_result.push('$');
+    }
+
+    for (idx, d) in int_digits.iter().enumerate() {
+        // Insert separator before this digit if needed.
+        let slot_from_left = pad_count + idx;
+        if sep_after_slot.contains(&(slot_from_left.wrapping_sub(1))) && idx > 0 {
+            int_result.push(',');
+        }
+        int_result.push(*d);
+    }
+
+    let result = if frac_digits > 0 {
+        format!("{int_result}.{frac_part}")
+    } else {
+        int_result
+    };
+
+    Ok(result)
 }
 
 #[cfg(test)]
