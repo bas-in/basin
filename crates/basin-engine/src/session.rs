@@ -167,6 +167,19 @@ pub(crate) async fn open(
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+    // Phase 5.11.B: extended PG scalar inventory — `ceiling`/`sign` aliases,
+    // `clock_timestamp`/`transaction_timestamp`/`statement_timestamp`/
+    // `localtime`/`localtimestamp` stubs, `make_time`/`make_timestamp`/
+    // `make_interval`, `width_bucket`, `to_number`.
+    crate::pg_scalar_aliases::register_pg_scalar_aliases(&ctx);
+    // Gap-filler string + datetime UDFs: `split_part`, `format`, `quote_ident`,
+    // `quote_literal`, `regexp_match`, `regexp_split_to_array`, `chr`, `ascii`,
+    // `translate`, `btrim`, `ltrim`, `rtrim`, `convert_from`/`to`, `isfinite`.
+    crate::string_dt_udf::register_string_dt_udfs(&ctx);
+    // pg_catalog stub UDFs for psql `\dt` / `\d`-family meta-commands.
+    crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
+    // Full-text search stub UDFs: `to_tsvector`, `to_tsquery`, `ts_rank`, etc.
+    crate::fts_udf::register_fts_udfs(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
