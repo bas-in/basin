@@ -588,6 +588,7 @@ mod events;
 mod executor;
 mod fast_select;
 mod function_ddl;
+mod index_extras;
 mod generated_cols;
 mod geo_glue;
 mod info_schema_provider;

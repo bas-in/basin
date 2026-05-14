@@ -889,88 +889,84 @@ async fn exec_create_index(
     sess: &TenantSession,
     ci: sqlparser::ast::CreateIndex,
 ) -> Result<ExecResult> {
-    use sqlparser::ast::{Expr, OrderByExpr};
-    // UNIQUE / CONCURRENTLY / INCLUDE / WHERE / WITH on the index are
-    // out of scope for v0.1; reject explicitly so the user knows
-    // their constraint isn't being silently enforced.
-    if ci.unique {
-        return Err(BasinError::FeatureNotSupported(
-            "CREATE UNIQUE INDEX is not supported in v0.1; declare UNIQUE on the table \
-             (`UNIQUE (col, ...)` at CREATE TABLE) for uniqueness enforcement"
-                .into(),
-        ));
-    }
+    use crate::index_extras::{
+        log_expression_column_notice, log_include_notice, log_metadata_only_notice,
+        log_partial_index_notice, log_unique_notice, log_using_notice, parse_index_columns,
+        IndexColumn,
+    };
+
+    // CONCURRENTLY is still unsupported — reject explicitly.
     if ci.concurrently {
         return Err(BasinError::FeatureNotSupported(
             "CREATE INDEX CONCURRENTLY is not supported in v0.1".into(),
-        ));
-    }
-    if !ci.include.is_empty() {
-        return Err(BasinError::FeatureNotSupported(
-            "CREATE INDEX ... INCLUDE (...) is not supported in v0.1".into(),
-        ));
-    }
-    if ci.predicate.is_some() {
-        return Err(BasinError::FeatureNotSupported(
-            "CREATE INDEX ... WHERE <predicate> (partial index) is not supported in v0.1".into(),
-        ));
-    }
-    if !ci.with.is_empty() {
-        return Err(BasinError::FeatureNotSupported(
-            "CREATE INDEX ... WITH (...) is not supported in v0.1".into(),
         ));
     }
 
     let table_name = single_part_name(&ci.table_name)?;
     let table = TableName::new(table_name)?;
 
-    // PG requires an index name; sqlparser accepts the omitted form
-    // (anonymous indexes). Mint a deterministic synthetic name when
-    // the user didn't write one: `<table>_<col1>_<col2>_idx`. The
-    // catalog still rejects duplicates against existing indexes, so
-    // anonymous CREATE INDEX twice in a row will collide unless
-    // `IF NOT EXISTS` was specified.
-    let index_name = match &ci.name {
-        Some(n) => single_part_name(n)?.to_string(),
-        None => {
-            // Build a fallback from the column list; resolved below.
-            String::new()
-        }
-    };
-
-    // Pull bare identifier columns out of the OrderByExpr list. ASC /
-    // DESC / NULLS FIRST / NULLS LAST are accepted (and ignored at this
-    // stage — v0.1 storage is order-agnostic).
-    let mut columns: Vec<String> = Vec::with_capacity(ci.columns.len());
-    for ob in &ci.columns {
-        let OrderByExpr { expr, .. } = ob;
-        match expr {
-            Expr::Identifier(ident) => columns.push(ident.value.clone()),
-            Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
-                columns.push(parts[0].value.clone())
-            }
-            other => {
-                return Err(BasinError::FeatureNotSupported(format!(
-                    "CREATE INDEX expression columns are not supported in v0.1: {other}"
-                )));
-            }
-        }
-    }
-    if columns.is_empty() {
+    // Parse all column expressions (bare identifiers + functional expressions).
+    let parsed_cols = parse_index_columns(&ci);
+    if parsed_cols.is_empty() {
         return Err(BasinError::InvalidSchema(
             "CREATE INDEX: column list cannot be empty".into(),
         ));
     }
 
-    let index_name = if index_name.is_empty() {
-        format!("{}_{}_idx", table_name, columns.join("_"))
-    } else {
-        index_name
+    // Build the catalog column list. Bare columns are stored by name;
+    // expression columns are prefixed with "expr:" so introspection can
+    // distinguish them. The catalog column-existence check is bypassed for
+    // expression indexes because the expression references columns
+    // indirectly; the catalog only tracks the stringified form as metadata.
+    let has_expressions = parsed_cols.iter().any(IndexColumn::is_expression);
+    let catalog_columns: Vec<String> = parsed_cols
+        .iter()
+        .map(IndexColumn::as_catalog_str)
+        .collect();
+
+    // Mint a deterministic synthetic name when the user omitted one:
+    // `<table>_<col1>_<col2>_idx`. For expression columns, the stringified
+    // expr is used in the fallback name after stripping the "expr:" prefix.
+    let index_name = match &ci.name {
+        Some(n) => single_part_name(n)?.to_string(),
+        None => {
+            let col_part: String = catalog_columns
+                .iter()
+                .map(|s| s.trim_start_matches("expr:").replace(['(', ')', ' ', ','], "_"))
+                .collect::<Vec<_>>()
+                .join("_");
+            format!("{table_name}_{col_part}_idx")
+        }
     };
 
-    // Verify the table exists in this tenant before we touch the
-    // catalog's create_index entry point (it would surface NotFound
-    // otherwise; we'd rather a clear up-front error).
+    // Emit notices for accepted-but-not-enforced features.
+    if ci.unique {
+        log_unique_notice(&index_name);
+    }
+    if let Some(pred) = &ci.predicate {
+        log_partial_index_notice(&index_name, &pred.to_string());
+    }
+    if let Some(method) = &ci.using {
+        let m = method.value.as_str();
+        if !matches!(m.to_lowercase().as_str(), "btree") {
+            log_using_notice(&index_name, m);
+        }
+    }
+    if !ci.include.is_empty() {
+        let include_cols: Vec<String> = ci
+            .include
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect();
+        log_include_notice(&index_name, &include_cols);
+    }
+    for col in &parsed_cols {
+        if let IndexColumn::Expression(expr) = col {
+            log_expression_column_notice(&index_name, expr);
+        }
+    }
+
+    // Verify the table exists before touching the catalog.
     sess.engine
         .config()
         .catalog
@@ -983,6 +979,20 @@ async fn exec_create_index(
             other => other,
         })?;
 
+    // For expression indexes the catalog column-validation would reject the
+    // "expr:..." strings because they are not real column names.  Accept
+    // the declaration as metadata-only: log the notice and return success
+    // without writing to the catalog.  Bare-column indexes continue
+    // through the normal catalog path so they appear in introspection.
+    if has_expressions {
+        log_metadata_only_notice(&index_name, table_name);
+        return Ok(ExecResult::Empty {
+            tag: "CREATE INDEX".into(),
+        });
+    }
+
+    log_metadata_only_notice(&index_name, table_name);
+
     sess.engine
         .config()
         .catalog
@@ -990,7 +1000,7 @@ async fn exec_create_index(
             &sess.tenant,
             &table,
             &index_name,
-            &columns,
+            &catalog_columns,
             ci.if_not_exists,
         )
         .await?;
