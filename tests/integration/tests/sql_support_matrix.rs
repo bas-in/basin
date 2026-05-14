@@ -2150,6 +2150,136 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
+    // ── PG-specific operators ─────────────────────────────────────────────────
+    // Comparison / null-handling
+    ("PG/Operators", "SELECT 1 IS DISTINCT FROM 2", &[], &[]),
+    ("PG/Operators", "SELECT 1 IS NOT DISTINCT FROM 1", &[], &[]),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id IS NULL",
+        &["CREATE TABLE t (id INT)", "INSERT INTO t VALUES (NULL)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id IS NOT NULL",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id BETWEEN 1 AND 10",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (5)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id NOT BETWEEN 1 AND 10",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (20)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id BETWEEN SYMMETRIC 10 AND 1",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (5)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id NOT BETWEEN SYMMETRIC 10 AND 1",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (50)"],
+        &["DROP TABLE t"],
+    ),
+    // POSIX regex operators
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE name ~ '^a'",
+        &[
+            "CREATE TABLE t (id INT NOT NULL, name TEXT)",
+            "INSERT INTO t VALUES (1, 'abc')",
+        ],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE name !~ '^z'",
+        &[
+            "CREATE TABLE t (id INT NOT NULL, name TEXT)",
+            "INSERT INTO t VALUES (1, 'abc')",
+        ],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE name ~* '^A'",
+        &[
+            "CREATE TABLE t (id INT NOT NULL, name TEXT)",
+            "INSERT INTO t VALUES (1, 'abc')",
+        ],
+        &["DROP TABLE t"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE name !~* '^Z'",
+        &[
+            "CREATE TABLE t (id INT NOT NULL, name TEXT)",
+            "INSERT INTO t VALUES (1, 'abc')",
+        ],
+        &["DROP TABLE t"],
+    ),
+    // Array operators
+    ("PG/Operators", "SELECT ARRAY[1,2] || ARRAY[3,4]", &[], &[]),
+    ("PG/Operators", "SELECT ARRAY[1,2,3] @> ARRAY[1,2]", &[], &[]),
+    ("PG/Operators", "SELECT ARRAY[1,2] <@ ARRAY[1,2,3]", &[], &[]),
+    ("PG/Operators", "SELECT ARRAY[1,2] && ARRAY[2,3]", &[], &[]),
+    // Quantified subquery (ANY / ALL / SOME)
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id = ANY (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id > ALL (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (10)",
+            "INSERT INTO u VALUES (1), (2)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id = SOME (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    // Bitwise operators — DataFusion supports these natively in arithmetic
+    ("PG/Operators", "SELECT 5 & 3", &[], &[]),
+    ("PG/Operators", "SELECT 5 | 3", &[], &[]),
+    ("PG/Operators", "SELECT 5 # 3", &[], &[]),
+    ("PG/Operators", "SELECT ~5", &[], &[]),
+    ("PG/Operators", "SELECT 1 << 3", &[], &[]),
+    ("PG/Operators", "SELECT 8 >> 2", &[], &[]),
+    // OVERLAPS — shipped by datetime-extras agent; verify present
+    (
+        "PG/Operators",
+        "SELECT (NOW(), NOW() + INTERVAL '1 hour') OVERLAPS (NOW() + INTERVAL '30 minutes', NOW() + INTERVAL '90 minutes')",
+        &[],
+        &[],
+    ),
     // ── Row-level locking ────────────────────────────────────────────────────
     (
         "SELECT/Locking",

@@ -288,10 +288,20 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
     let rewritten = crate::udf::rewrite_vector_operators(sql);
+<<<<<<< HEAD
     // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.
     let rewritten = crate::udf::rewrite_json_operators(&rewritten);
+=======
+    // Rewrite PostgreSQL POSIX regex operators (`~`, `!~`, `~*`, `!~*`) to
+    // `regexp_like(…)` calls DataFusion accepts; expand `BETWEEN SYMMETRIC`;
+    // rewrite array containment / overlap operators (`@>`, `<@`, `&&`) for
+    // array-typed operands. See `pg_operators` for the full operator table.
+    let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
+    let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
+    let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
+>>>>>>> worktree-agent-agent-bulk-pg-operators
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
