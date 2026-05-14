@@ -167,6 +167,12 @@ pub(crate) async fn open(
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+    // Phase 5.11.N: pg_catalog scalar stubs — pg_table_is_visible,
+    // pg_get_userbyid, format_type, current_schema(), etc.  These are the
+    // functions psql's \dt / \d-family meta-queries probe; registering them
+    // as constant-returning stubs is enough for psql to plan and execute
+    // without "Invalid function" errors.
+    crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog

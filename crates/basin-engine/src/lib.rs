@@ -607,6 +607,7 @@ mod trgm_glue;
 mod type_ddl;
 mod types;
 mod udf;
+pub(crate) mod pg_catalog_udf;
 mod vector_planner;
 mod vector_search;
 pub mod webhook_ddl;
