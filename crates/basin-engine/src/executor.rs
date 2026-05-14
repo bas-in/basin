@@ -33,6 +33,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // doesn't know our UDFs.
     let raw_sql = sql;
 
+<<<<<<< HEAD
     // ADR 0014 Phase 1: parse with the real PostgreSQL parser first.
     // This lets us:
     //   1. Intercept noop-accept statements (VACUUM, ANALYZE, CLUSTER, LOCK,
@@ -78,6 +79,23 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
                 return Ok(result);
             }
         }
+=======
+    // ADR 0014 Phase 1: parse with libpg_query; intercept no-op-accept kinds
+    // (VACUUM, GRANT, SET, COMMENT, …) before the textual pre-screens run.
+    // Dispatch order inside this block:
+    //   1. noop_accept  — syntactic-accept-only (returns Ok immediately)
+    //   2. reject_unsupported — SQLSTATE 0A000 for truly unsupported kinds
+    // If pg_query fails to parse (Basin extension syntax), the whole block
+    // is skipped and the textual pre-screens below take over.
+    if let Ok(tree) = crate::pg_ast::parse(sql) {
+        if let Some(node) = tree.stmts().next() {
+            let kind = crate::pg_ast::stmt_kind(node);
+            if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, raw_sql) {
+                return Ok(result);
+            }
+        }
+        crate::pg_ast::reject_unsupported(&tree)?;
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
     }
 
     // Phase 5.8: Basin-specific ALTER TABLE extensions (`SET cold_after`,

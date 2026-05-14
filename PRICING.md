@@ -1,12 +1,21 @@
 # Pricing
 
 Basin is **Apache-2.0** and free to self-host forever. The pricing below is for
+<<<<<<< HEAD
 the **basin-cloud** managed service — same engine, run on Fly Machines + Tigris
 with the dashboard, control plane, and billing wrapped around it.
 
 A project is the unit of isolation: its own bucket prefix, its own credentials,
 its own RLS policies, its own snapshots. The cost story is simple: storage is
 cheap because it lives on Tigris (Fly's S3-compatible store), compute is cheap because the engine is a tokio
+=======
+the **basin-cloud** managed service — same engine, run on Fly Machines + Cloudflare
+R2 with the dashboard, control plane, and billing wrapped around it.
+
+A project is the unit of isolation: its own bucket prefix, its own credentials,
+its own RLS policies, its own snapshots. The cost story is simple: storage is
+cheap because it lives on R2, compute is cheap because the engine is a tokio
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
 server that holds 1,000 connections in 165 MiB of RAM, and project creation is
 free because a project is metadata, not infrastructure.
 
@@ -32,7 +41,11 @@ For evaluation, side projects, and learning. Upgrade in place when ready.
 
 - **1 always-on project** (no scale-to-zero)
 - **5 GB** storage included
+<<<<<<< HEAD
 - **50 GB / month** egress included (this is the API budget; Fly-internal Tigris traffic doesn't count against it)
+=======
+- **50 GB / month** R2 egress included (R2 itself has no egress fees; this is the API budget)
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
 - 50k SQL requests / day
 - Daily backup (24-hour retention)
 - Community support
@@ -102,7 +115,11 @@ Available on Hobby, Pro, Scale (Enterprise terms are custom):
 | BYO-bucket | Enterprise only |
 | BYO-key (KMS) | Enterprise only |
 
+<<<<<<< HEAD
 Tigris traffic within Fly's network is zero-egress. The "egress included" line in each plan refers to
+=======
+R2 itself is zero-egress. The "egress included" line in each plan refers to
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
 the rate at which basin-cloud will serve traffic from your compute pool before
 flagging the project for review — a fair-use guard, not a metered cost.
 
@@ -114,10 +131,16 @@ Three structural reasons Basin can charge less than per-Postgres-project
 vendors:
 
 **Storage.** ZSTD-1 Parquet vs Postgres heap on the same data is 12.5× smaller
+<<<<<<< HEAD
 on audit-log workloads and 3-5× smaller on broader OLTP workloads. Object storage
 (Tigris on basin-cloud) is $0.02/GB/mo with zero Fly-internal egress. A project
 storing 1 GB of "Postgres data" weighs about 80 MB on Basin and costs Basin about
 $0.0016/mo to store.
+=======
+on audit-log workloads and 3-5× smaller on broader OLTP workloads. R2 storage
+itself is $0.015/GB/mo with zero egress. A project storing 1 GB of "Postgres
+data" weighs about 80 MB on Basin and costs Basin about $0.0012/mo to store.
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
 
 **Compute.** A from-scratch Rust + tokio server holds 1,000 connections in
 ~165 MiB of RAM versus ~7.9 GiB for the same Postgres footprint. One Fly Machine
@@ -213,6 +236,7 @@ Not in the OSS bundle and not on the immediate roadmap — see ADR 0006. Basin's
 scope is the database + auth + REST. Edge Functions / Realtime / Storage stay
 out of scope; pair Basin with a serverless functions provider of your choice.
 
+<<<<<<< HEAD
 ### Can I run Basin on AWS S3 instead of Tigris?
 
 Yes. The OSS engine takes `BASIN_STORAGE_BACKEND=s3` with standard
@@ -220,6 +244,14 @@ Yes. The OSS engine takes `BASIN_STORAGE_BACKEND=s3` with standard
 for Cloudflare R2. basin-cloud runs on Tigris because it is Fly's native store
 (zero Fly-internal egress, no credential management overhead) — but Enterprise
 BYO-bucket customers run on whatever object store they bring.
+=======
+### Can I run Basin on AWS S3 instead of R2?
+
+Yes. The OSS engine takes `BASIN_STORAGE_BACKEND=s3` with standard
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars. basin-cloud uses R2
+because R2's zero-egress is structural to the pricing — but Enterprise BYO-bucket
+customers run on whatever object store they bring.
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
 
 ---
 

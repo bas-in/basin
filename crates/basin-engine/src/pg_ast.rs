@@ -92,6 +92,7 @@ pub enum StmtKind {
     Revoke,
     VariableSet,
     VariableShow,
+<<<<<<< HEAD
     // Async notification (not on roadmap per ADR 0012 — LISTEN/NOTIFY are
     // explicit non-goals; remain in is_unsupported() to surface 0A000)
     Listen,
@@ -111,10 +112,28 @@ pub enum StmtKind {
     CreateTrigger,
     DropTrigger,
     // Transaction control (syntactic-accept-only; Basin is auto-commit)
+=======
+    // Async notification (unsupported in v0.1)
+    Listen,
+    Notify,
+    // Prepared / cursor (unsupported in v0.1)
+    Prepare,
+    Execute,
+    Deallocate,
+    DeclareCursor,
+    Fetch,
+    Close,
+    // Extension / trigger (unsupported in v0.1)
+    CreateExtension,
+    CreateTrigger,
+    DropTrigger,
+    // Transaction control (unsupported in v0.1 — Basin is auto-commit)
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
     BeginTransaction,
     Commit,
     Rollback,
     Savepoint,
+<<<<<<< HEAD
     // TRUNCATE — real operation (delete all rows + optionally restart seqs)
     Truncate,
     // Foreign Data Wrappers / Foreign tables (accept-only; Basin has no FDW execution)
@@ -142,6 +161,8 @@ pub enum StmtKind {
     // REINDEX — Basin indexes managed by DataFusion's adaptive planner
     // (syntactic-accept-only; see noop_accept.rs)
     Reindex,
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
     /// Anything we don't yet dispatch on. Routed to the existing
     /// sqlparser pipeline by the executor.
     Other,
@@ -191,7 +212,10 @@ impl StmtKind {
             StmtKind::VariableShow => "SHOW",
             StmtKind::Listen => "LISTEN",
             StmtKind::Notify => "NOTIFY",
+<<<<<<< HEAD
             StmtKind::Unlisten => "UNLISTEN",
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
             StmtKind::Prepare => "PREPARE",
             StmtKind::Execute => "EXECUTE",
             StmtKind::Deallocate => "DEALLOCATE",
@@ -199,13 +223,17 @@ impl StmtKind {
             StmtKind::Fetch => "FETCH",
             StmtKind::Close => "CLOSE",
             StmtKind::CreateExtension => "CREATE EXTENSION",
+<<<<<<< HEAD
             StmtKind::DropExtension => "DROP EXTENSION",
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
             StmtKind::CreateTrigger => "CREATE TRIGGER",
             StmtKind::DropTrigger => "DROP TRIGGER",
             StmtKind::BeginTransaction => "BEGIN",
             StmtKind::Commit => "COMMIT",
             StmtKind::Rollback => "ROLLBACK",
             StmtKind::Savepoint => "SAVEPOINT",
+<<<<<<< HEAD
             StmtKind::Truncate => "TRUNCATE",
             StmtKind::CreateFdw => "CREATE FOREIGN DATA WRAPPER",
             StmtKind::DropFdw => "DROP FOREIGN DATA WRAPPER",
@@ -223,11 +251,14 @@ impl StmtKind {
             StmtKind::SecurityLabel => "SECURITY LABEL",
             StmtKind::Merge => "MERGE",
             StmtKind::Reindex => "REINDEX",
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
             StmtKind::Other => "<other>",
         }
     }
 
     /// `true` if this kind is in the "known-but-not-yet-shipped" set
+<<<<<<< HEAD
     /// rejected by [`reject_unsupported`] with SQLSTATE 0A000.
     ///
     /// Kinds that have been moved to the syntactic-accept (noop) set in
@@ -240,6 +271,28 @@ impl StmtKind {
         matches!(
             self,
             StmtKind::Listen | StmtKind::Notify | StmtKind::Unlisten
+=======
+    /// rejected by [`reject_unsupported`]. Centralised so the executor
+    /// and the test suite stay in sync.
+    pub fn is_unsupported(&self) -> bool {
+        matches!(
+            self,
+            StmtKind::Listen
+                | StmtKind::Notify
+                | StmtKind::Prepare
+                | StmtKind::Execute
+                | StmtKind::Deallocate
+                | StmtKind::DeclareCursor
+                | StmtKind::Fetch
+                | StmtKind::Close
+                | StmtKind::CreateExtension
+                | StmtKind::CreateTrigger
+                | StmtKind::DropTrigger
+                | StmtKind::BeginTransaction
+                | StmtKind::Commit
+                | StmtKind::Rollback
+                | StmtKind::Savepoint
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
         )
     }
 }
@@ -353,7 +406,11 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
 
         NodeEnum::ListenStmt(_) => StmtKind::Listen,
         NodeEnum::NotifyStmt(_) => StmtKind::Notify,
+<<<<<<< HEAD
         NodeEnum::UnlistenStmt(_) => StmtKind::Unlisten,
+=======
+        NodeEnum::UnlistenStmt(_) => StmtKind::Listen,
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
 
         NodeEnum::PrepareStmt(_) => StmtKind::Prepare,
         NodeEnum::ExecuteStmt(_) => StmtKind::Execute,
@@ -365,6 +422,7 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::CreateExtensionStmt(_) => StmtKind::CreateExtension,
         NodeEnum::CreateTrigStmt(_) => StmtKind::CreateTrigger,
 
+<<<<<<< HEAD
         NodeEnum::TruncateStmt(_) => StmtKind::Truncate,
 
         // Foreign Data Wrappers / Foreign tables
@@ -388,6 +446,8 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         // Security labels
         NodeEnum::SecLabelStmt(_) => StmtKind::SecurityLabel,
 
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
         NodeEnum::TransactionStmt(s) => {
             use pg_query::protobuf::TransactionStmtKind as Tk;
             match Tk::try_from(s.kind) {
@@ -416,17 +476,23 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
                 Ok(O::ObjectSequence) => StmtKind::DropSequence,
                 Ok(O::ObjectPolicy) => StmtKind::DropPolicy,
                 Ok(O::ObjectTrigger) => StmtKind::DropTrigger,
+<<<<<<< HEAD
                 Ok(O::ObjectFdw) => StmtKind::DropFdw,
                 Ok(O::ObjectForeignServer) => StmtKind::DropForeignServer,
                 Ok(O::ObjectForeignTable) => StmtKind::DropForeignTable,
                 Ok(O::ObjectExtension) => StmtKind::DropExtension,
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
                 _ => StmtKind::Other,
             }
         }
 
+<<<<<<< HEAD
         NodeEnum::MergeStmt(_) => StmtKind::Merge,
         NodeEnum::ReindexStmt(_) => StmtKind::Reindex,
 
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
         _ => StmtKind::Other,
     }
 }
@@ -543,6 +609,7 @@ mod tests {
 
     #[test]
     fn reject_unsupported_blocks_each_kind() {
+<<<<<<< HEAD
         // Only LISTEN / NOTIFY / UNLISTEN remain in `is_unsupported()`.
         // Everything else that was previously here has been moved to the
         // syntactic-accept (noop) set in `noop_accept::try_accept_as_noop`.
@@ -550,6 +617,29 @@ mod tests {
             ("LISTEN ch", "LISTEN"),
             ("NOTIFY ch", "NOTIFY"),
             ("UNLISTEN ch", "UNLISTEN"),
+=======
+        // Every kind in `is_unsupported()` must produce a
+        // FeatureNotSupported with SQLSTATE 0A000.
+        let cases = [
+            ("LISTEN ch", "LISTEN"),
+            ("NOTIFY ch", "NOTIFY"),
+            ("PREPARE p AS SELECT 1", "PREPARE"),
+            ("EXECUTE p", "EXECUTE"),
+            ("DEALLOCATE p", "DEALLOCATE"),
+            ("DECLARE c CURSOR FOR SELECT 1", "DECLARE CURSOR"),
+            ("FETCH c", "FETCH"),
+            ("CLOSE c", "CLOSE"),
+            ("CREATE EXTENSION pgcrypto", "CREATE EXTENSION"),
+            (
+                "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE TRIGGER",
+            ),
+            ("DROP TRIGGER tr ON t", "DROP TRIGGER"),
+            ("BEGIN", "BEGIN"),
+            ("COMMIT", "COMMIT"),
+            ("ROLLBACK", "ROLLBACK"),
+            ("SAVEPOINT s", "SAVEPOINT"),
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
         ];
 
         for (sql, label) in cases {
@@ -574,10 +664,16 @@ mod tests {
 
     #[test]
     fn reject_unsupported_allows_supported_kinds() {
+<<<<<<< HEAD
         // Every supported / noop-accepted / Other kind must pass through
         // `reject_unsupported` cleanly. Noop-accepted kinds are intercepted
         // before the sqlparser stage in executor.rs; here we only test that
         // reject_unsupported does not block them.
+=======
+        // Every supported / Other kind must pass through cleanly.
+        // LOCK, VACUUM, ANALYZE, CLUSTER are now in the noop_accept set and
+        // also pass reject_unsupported (they are not in is_unsupported()).
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
         let cases = [
             "SELECT 1",
             "INSERT INTO t (a) VALUES (1)",
@@ -601,6 +697,7 @@ mod tests {
             "CREATE ROLE r",
             "DROP ROLE r",
             "ALTER ROLE r WITH LOGIN",
+<<<<<<< HEAD
             // noop-accepted since this commit
             "PREPARE p AS SELECT 1",
             "EXECUTE p",
@@ -613,6 +710,8 @@ mod tests {
             "DROP TRIGGER tr ON t",
             "CREATE EXTENSION pgcrypto",
             "DROP EXTENSION pgcrypto",
+=======
+>>>>>>> worktree-agent-a0f45b8b5d58608d0
         ];
         for sql in cases {
             let tree = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
