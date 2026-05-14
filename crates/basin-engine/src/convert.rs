@@ -23,6 +23,8 @@ use arrow_array::Array as _;
 use arrow_schema as ws_schema;
 use arrow_schema::IntervalUnit as WsIntervalUnit;
 use arrow_schema::TimeUnit as WsTimeUnit;
+// Buffer types used when constructing workspace-side ListArrays.
+use arrow_buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer, ScalarBuffer};
 
 // DataFusion-side (v53) imports.
 use datafusion::arrow::array as df_array;
@@ -117,6 +119,15 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
             )),
             *n,
         ),
+        // Variable-length list (1-D or N-D arrays). Recurse so nested
+        // `List(List(T))` (multi-dim SQL arrays) round-trips cleanly.
+        ws_schema::DataType::List(child) => df_schema::DataType::List(Arc::new(
+            df_schema::Field::new(
+                child.name().clone(),
+                data_type_ws_to_df(child.data_type())?,
+                child.is_nullable(),
+            ),
+        )),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "cannot convert workspace-arrow type to df-arrow: {other:?}"
@@ -154,6 +165,15 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
             )),
             *n,
         ),
+        // Variable-length list (1-D or N-D arrays). Recurse so
+        // `List(List(T))` (multi-dimensional SQL arrays) round-trips.
+        df_schema::DataType::List(child) => ws_schema::DataType::List(Arc::new(
+            ws_schema::Field::new(
+                child.name().clone(),
+                data_type_df_to_ws(child.data_type())?,
+                child.is_nullable(),
+            ),
+        )),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "cannot convert df-arrow type to workspace-arrow: {other:?}"
@@ -825,6 +845,68 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                     _,
                 >(rows, *n);
                 Arc::new(arr)
+            }
+            // Variable-length list (1-D or N-D arrays). We recursively
+            // translate the child values array and rebuild the ListArray on
+            // the workspace side with the same offsets + null bitmap.
+            ws_schema::DataType::List(ws_child_field) => {
+                let df_list = src
+                    .as_any()
+                    .downcast_ref::<df_array::ListArray>()
+                    .ok_or_else(|| {
+                        BasinError::internal(format!(
+                            "expected ListArray for {}",
+                            field.name()
+                        ))
+                    })?;
+
+                // Translate the flat child values array recursively.
+                // Build a 1-column RecordBatch for the child, translate it,
+                // then extract the column back out.
+                let child_df_schema = Arc::new(df_schema::Schema::new(vec![
+                    df_schema::Field::new(
+                        ws_child_field.name(),
+                        df_list
+                            .values()
+                            .data_type()
+                            .clone(),
+                        ws_child_field.is_nullable(),
+                    ),
+                ]));
+                let child_batch = df_array::RecordBatch::try_new(
+                    child_df_schema,
+                    vec![df_list.values().clone()],
+                )
+                .map_err(|e| BasinError::internal(format!("list child batch: {e}")))?;
+                let translated_child_batch = batch_df_to_ws(&child_batch)?;
+                let ws_child_values = translated_child_batch.column(0).clone();
+
+                // Rebuild the ListArray on the workspace side reusing the
+                // same offsets and null bitmap.
+                let offsets: Vec<i32> = (0..=df_list.len())
+                    .map(|k| df_list.value_offsets()[k])
+                    .collect();
+                let ws_child_field_arc: Arc<ws_schema::Field> = Arc::new(ws_schema::Field::new(
+                    ws_child_field.name(),
+                    ws_child_values.data_type().clone(),
+                    ws_child_field.is_nullable(),
+                ));
+                let null_buffer: Option<WsNullBuffer> = if df_list.nulls().is_some() {
+                    let mut b = arrow_buffer::BooleanBufferBuilder::new(df_list.len());
+                    for k in 0..df_list.len() {
+                        b.append(!df_list.is_null(k));
+                    }
+                    Some(WsNullBuffer::new(b.finish()))
+                } else {
+                    None
+                };
+                let ws_list = ws_array::ListArray::new(
+                    ws_child_field_arc,
+                    WsOffsetBuffer::new(ScalarBuffer::from(offsets)),
+                    ws_child_values,
+                    null_buffer,
+                );
+                Arc::new(ws_list)
             }
             other => {
                 return Err(BasinError::InvalidSchema(format!(

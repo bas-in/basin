@@ -245,6 +245,9 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
     let rewritten = crate::udf::rewrite_extract_second(&rewritten);
+    // Rewrite `'infinity'::timestamp` / `'-infinity'::timestamp` to the
+    // `cast_infinity_timestamp(...)` UDF before sqlparser sees the SQL.
+    let rewritten = crate::datetime_extras::rewrite_infinity_timestamp(&rewritten);
     // User-defined `LANGUAGE sql` function inlining. The rewriter is a
     // no-op for tenants with no registered functions and for statements
     // that contain no function calls at all (the cheap pre-gate runs

@@ -959,6 +959,7 @@ version = "0.1.7"
 dependencies = [
  "arrow 54.2.1",
  "arrow-array 54.2.1",
+ "arrow-buffer 54.3.1",
  "arrow-schema 54.3.1",
  "arrow-select 54.2.1",
  "async-trait",

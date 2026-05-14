@@ -580,6 +580,7 @@ mod cost_check;
 mod cron_glue;
 mod cv_ddl;
 pub mod cv_time_bucket;
+mod datetime_extras;
 mod ddl;
 mod dml;
 mod dml_mutate;

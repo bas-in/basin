@@ -167,6 +167,10 @@ pub(crate) async fn open(
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+    // P10: supplemental datetime + array UDFs — overlaps, cast_infinity_timestamp,
+    // array_dims. Registered after pg_compat so name collisions resolve in
+    // favour of the more-specific implementations above.
+    crate::datetime_extras::register_datetime_extras(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
