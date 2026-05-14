@@ -191,6 +191,7 @@ pub(crate) async fn open(
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
 <<<<<<< HEAD
+<<<<<<< HEAD
     // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
     // jsonb_strip_nulls, jsonb_path_query/exists/match, jsonb_object_keys,
     // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
@@ -225,6 +226,14 @@ pub(crate) async fn open(
     // like the other UDFs; cost is O(Arc clones).
     crate::range_udf::register_range_udfs(&ctx);
 >>>>>>> worktree-agent-a59745a1e5916e382
+=======
+    // Phase 5.11.N: pg_catalog scalar stubs — pg_table_is_visible,
+    // pg_get_userbyid, format_type, current_schema(), etc.  These are the
+    // functions psql's \dt / \d-family meta-queries probe; registering them
+    // as constant-returning stubs is enough for psql to plan and execute
+    // without "Invalid function" errors.
+    crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
+>>>>>>> worktree-agent-a64ea2ae9a44cffbc
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
