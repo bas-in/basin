@@ -19,6 +19,33 @@ pub const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 pub const BASIN_TYPE_JSONB: &str = "JSONB";
 pub const BASIN_TYPE_UUID: &str = "UUID";
 
+// ── Network types ─────────────────────────────────────────────────────────────
+/// `INET` — IPv4/IPv6 host address with optional /prefix. Stored as `Utf8`.
+pub const BASIN_TYPE_INET: &str = "INET";
+/// `CIDR` — IPv4/IPv6 network address (mandatory netmask). Stored as `Utf8`.
+pub const BASIN_TYPE_CIDR: &str = "CIDR";
+/// `MACADDR` — 6-byte Ethernet MAC address. Stored as `Utf8`.
+pub const BASIN_TYPE_MACADDR: &str = "MACADDR";
+/// `MACADDR8` — 8-byte EUI-64 MAC address. Stored as `Utf8`.
+pub const BASIN_TYPE_MACADDR8: &str = "MACADDR8";
+
+// ── Bit-string types ──────────────────────────────────────────────────────────
+/// `BIT(n)` — fixed-length bit string (sequence of '0'/'1'). Stored as
+/// `Utf8`; the metadata value is `"BIT(n)"` so the exact declared length
+/// can be recovered at SELECT time.
+pub const BASIN_TYPE_BIT_PREFIX: &str = "BIT(";
+/// `BIT VARYING(n)` / `VARBIT(n)` — variable-length bit string up to `n`
+/// bits. Stored as `Utf8`; metadata value is `"VARBIT(n)"` (or `"VARBIT"`
+/// when no length was specified).
+pub const BASIN_TYPE_VARBIT_PREFIX: &str = "VARBIT";
+
+// ── MONEY ─────────────────────────────────────────────────────────────────────
+/// `MONEY` — currency amount, stored as `Decimal128(20, 2)`. PG uses an
+/// 8-byte signed integer scaled by 100 internally; Decimal128 is the
+/// closest lossless Arrow representation for the range and scale PG
+/// guarantees (`-92233720368547758.08` to `+92233720368547758.07`).
+pub const BASIN_TYPE_MONEY: &str = "MONEY";
+
 /// Per-column markers for declarative lifecycle behaviours. Stored as
 /// Arrow `Field` metadata so they round-trip through the catalog's
 /// schema serde without a `TableMetadata` field per behaviour.
@@ -69,6 +96,78 @@ pub(crate) fn field_is_jsonb(field: &arrow_schema::Field) -> bool {
 /// hyphenated string rather than hex.
 pub(crate) fn field_is_uuid(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+}
+
+/// Returns `true` if `field` carries the `INET` metadata marker.
+pub(crate) fn field_is_inet(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_INET)
+}
+
+/// Returns `true` if `field` carries the `CIDR` metadata marker.
+pub(crate) fn field_is_cidr(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_CIDR)
+}
+
+/// Returns `true` if `field` carries the `MACADDR` metadata marker.
+pub(crate) fn field_is_macaddr(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_MACADDR)
+}
+
+/// Returns `true` if `field` carries the `MACADDR8` metadata marker.
+pub(crate) fn field_is_macaddr8(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_MACADDR8)
+}
+
+/// Returns `true` if `field` carries the `MONEY` metadata marker.
+pub(crate) fn field_is_money(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_MONEY)
+}
+
+/// Returns `true` if `field` is a BIT(n) column (fixed-length bit string).
+/// Checks that the `BASIN_TYPE` value starts with `"BIT("`.
+pub(crate) fn field_is_bit(field: &arrow_schema::Field) -> bool {
+    field
+        .metadata()
+        .get(BASIN_TYPE_KEY)
+        .map(|s| s.starts_with(BASIN_TYPE_BIT_PREFIX))
+        .unwrap_or(false)
+}
+
+/// Returns `true` if `field` is a VARBIT column (variable-length bit string).
+/// Checks that the `BASIN_TYPE` value starts with `"VARBIT"`.
+pub(crate) fn field_is_varbit(field: &arrow_schema::Field) -> bool {
+    field
+        .metadata()
+        .get(BASIN_TYPE_KEY)
+        .map(|s| s.starts_with(BASIN_TYPE_VARBIT_PREFIX))
+        .unwrap_or(false)
+}
+
+/// Extract the declared maximum bit length from a VARBIT field's metadata.
+/// Returns `None` when no length was given (unbounded). Panics if called on
+/// a non-VARBIT field (caller must gate with `field_is_varbit`).
+pub(crate) fn varbit_max_len(field: &arrow_schema::Field) -> Option<u64> {
+    let v = field.metadata().get(BASIN_TYPE_KEY)?;
+    // Formats: "VARBIT" (unbounded) or "VARBIT(n)".
+    let inner = v.strip_prefix("VARBIT(")?;
+    let n_str = inner.strip_suffix(')')?;
+    n_str.parse::<u64>().ok()
+}
+
+/// Extract the declared fixed bit length from a BIT(n) field's metadata.
+/// Returns the `n` from `"BIT(n)"`. Panics if called on a non-BIT field.
+pub(crate) fn bit_fixed_len(field: &arrow_schema::Field) -> u64 {
+    let v = field
+        .metadata()
+        .get(BASIN_TYPE_KEY)
+        .expect("BIT field must have BASIN_TYPE metadata");
+    let inner = v
+        .strip_prefix(BASIN_TYPE_BIT_PREFIX)
+        .and_then(|s| s.strip_suffix(')'))
+        .expect("BIT field BASIN_TYPE must be BIT(n)");
+    inner
+        .parse::<u64>()
+        .expect("BIT(n) metadata must contain a valid integer")
 }
 
 pub(crate) fn field_is_auto_update(field: &arrow_schema::Field) -> bool {
@@ -282,22 +381,70 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form
         // and map it to the Arrow physical layout the rest of the engine
         // already understands: a `FixedSizeList<Float32>` of length N.
+        //
+        // We also handle the full set of PG network / bit-string / money
+        // types here; all ride on `Utf8` (or `Decimal128` for MONEY) with a
+        // `BASIN_TYPE` field metadata marker so INSERT validation and the
+        // pgwire encoder can recover the logical type.
         SqlDataType::Custom(name, modifiers) => {
-            if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("vector") {
-                let dim = parse_vector_dim(modifiers)?;
-                // Child field is nullable=true to match what the Arrow
-                // builder helpers produce (`FixedSizeListArray::
-                // from_iter_primitive` defaults its child to nullable). The
-                // distinction is irrelevant in practice because vector(N) at
-                // the user level never carries per-element NULLs.
-                Ok(DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dim,
-                ))
-            } else {
-                Err(BasinError::InvalidSchema(format!(
+            if name.0.len() != 1 {
+                return Err(BasinError::InvalidSchema(format!(
                     "unsupported custom type: {name}"
-                )))
+                )));
+            }
+            let kw = name.0[0].value.to_ascii_uppercase();
+            match kw.as_str() {
+                "VECTOR" => {
+                    let dim = parse_vector_dim(modifiers)?;
+                    // Child field is nullable=true to match what the Arrow
+                    // builder helpers produce (`FixedSizeListArray::
+                    // from_iter_primitive` defaults its child to nullable). The
+                    // distinction is irrelevant in practice because vector(N) at
+                    // the user level never carries per-element NULLs.
+                    Ok(DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dim,
+                    ))
+                }
+                // ── Network types ────────────────────────────────────────
+                // INET / CIDR / MACADDR / MACADDR8 take no modifiers.
+                // Arrow physical type: Utf8. Logical type recovered via
+                // BASIN_TYPE field metadata set in ddl::schema_from_columns.
+                "INET" if modifiers.is_empty() => Ok(DataType::Utf8),
+                "CIDR" if modifiers.is_empty() => Ok(DataType::Utf8),
+                "MACADDR" if modifiers.is_empty() => Ok(DataType::Utf8),
+                "MACADDR8" if modifiers.is_empty() => Ok(DataType::Utf8),
+                // ── MONEY ────────────────────────────────────────────────
+                // MONEY has no user-visible precision/scale in PG. We pin at
+                // Decimal128(20, 2) — large enough for PG's 8-byte signed
+                // internal representation (max ±92233720368547758.07).
+                "MONEY" if modifiers.is_empty() => Ok(DataType::Decimal128(20, 2)),
+                // ── Bit-string types ─────────────────────────────────────
+                // BIT(n): fixed-length; modifier list has exactly one entry.
+                // BIT without modifier defaults to length 1 (PG semantics).
+                "BIT" => {
+                    // sqlparser surfaces BIT VARYING as two separate tokens;
+                    // bare "BIT" with no modifiers = BIT(1).
+                    if !modifiers.is_empty() {
+                        let n: u64 = modifiers[0].trim().parse().map_err(|_| {
+                            BasinError::InvalidSchema(format!(
+                                "BIT type requires a positive integer length, got {:?}",
+                                modifiers[0]
+                            ))
+                        })?;
+                        if n == 0 {
+                            return Err(BasinError::InvalidSchema(
+                                "BIT(n): n must be >= 1".into(),
+                            ));
+                        }
+                    }
+                    Ok(DataType::Utf8)
+                }
+                // VARBIT(n) / VARBIT: variable-length bit string.
+                "VARBIT" => Ok(DataType::Utf8),
+                _ => Err(BasinError::InvalidSchema(format!(
+                    "unsupported custom type: {name}"
+                ))),
             }
         }
 
@@ -344,6 +491,48 @@ fn clamp_precision(p: u64) -> Result<u8> {
         )));
     }
     Ok(p as u8)
+}
+
+/// Return the `BASIN_TYPE` metadata value for the new stub types handled via
+/// `Custom` AST nodes: network types (`INET`, `CIDR`, `MACADDR`, `MACADDR8`),
+/// bit-string types (`BIT(n)`, `VARBIT(n)`), and `MONEY`. Returns `None` for
+/// all other types (including `vector`, `jsonb`, `uuid`, and all built-ins).
+///
+/// Called from `ddl::schema_from_columns` after `arrow_data_type` so the
+/// metadata marker is attached to the resulting `Field` immediately.
+pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
+    let SqlDataType::Custom(name, modifiers) = sql else {
+        return None;
+    };
+    if name.0.len() != 1 {
+        return None;
+    }
+    let kw = name.0[0].value.to_ascii_uppercase();
+    match kw.as_str() {
+        "INET" if modifiers.is_empty() => Some(BASIN_TYPE_INET.to_string()),
+        "CIDR" if modifiers.is_empty() => Some(BASIN_TYPE_CIDR.to_string()),
+        "MACADDR" if modifiers.is_empty() => Some(BASIN_TYPE_MACADDR.to_string()),
+        "MACADDR8" if modifiers.is_empty() => Some(BASIN_TYPE_MACADDR8.to_string()),
+        "MONEY" if modifiers.is_empty() => Some(BASIN_TYPE_MONEY.to_string()),
+        "BIT" => {
+            // BIT(n) → metadata value "BIT(n)"; bare BIT → "BIT(1)".
+            let n: u64 = if modifiers.is_empty() {
+                1
+            } else {
+                modifiers[0].trim().parse().unwrap_or(1)
+            };
+            Some(format!("BIT({n})"))
+        }
+        "VARBIT" => {
+            // VARBIT(n) → "VARBIT(n)"; bare VARBIT → "VARBIT".
+            if modifiers.is_empty() {
+                Some("VARBIT".to_string())
+            } else {
+                Some(format!("VARBIT({})", modifiers[0].trim()))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Pull the dimensionality out of `vector(N)`'s modifier list. sqlparser
