@@ -604,6 +604,7 @@ mod seq_udf;
 mod session;
 mod sql_functions;
 mod trgm_glue;
+mod pg_operators;
 mod type_ddl;
 mod types;
 mod udf;
