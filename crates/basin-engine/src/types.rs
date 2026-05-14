@@ -18,6 +18,7 @@ use sqlparser::ast::TimezoneInfo;
 pub const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 pub const BASIN_TYPE_JSONB: &str = "JSONB";
 pub const BASIN_TYPE_UUID: &str = "UUID";
+<<<<<<< HEAD
 /// Logical-type marker for PG `TSVECTOR` columns. The Arrow physical type
 /// is `Utf8` — the column stores text (stub; no real lexeme tokenisation).
 /// The metadata flag lets the schema layer distinguish a TSVECTOR column
@@ -25,6 +26,14 @@ pub const BASIN_TYPE_UUID: &str = "UUID";
 pub const BASIN_TYPE_TSVECTOR: &str = "TSVECTOR";
 /// Logical-type marker for PG `TSQUERY` columns. Same physical type (`Utf8`)
 /// and same stub semantics as `TSVECTOR`.
+=======
+/// Logical type marker for `TSVECTOR` columns. The Arrow physical type is
+/// `Utf8`; this marker tells downstream layers (pgwire encoder, info_schema)
+/// to advertise the appropriate PG OID rather than the plain-text OID.
+pub const BASIN_TYPE_TSVECTOR: &str = "TSVECTOR";
+/// Logical type marker for `TSQUERY` columns. Same physical type (`Utf8`);
+/// same purpose as `BASIN_TYPE_TSVECTOR`.
+>>>>>>> worktree-agent-af0b8d7333b8c0693
 pub const BASIN_TYPE_TSQUERY: &str = "TSQUERY";
 
 <<<<<<< HEAD
@@ -540,6 +549,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         },
 
+<<<<<<< HEAD
         // MONEY. PG's `money` type is a fixed-point 8-byte integer; we
         // represent it as Decimal128(19, 2) — enough range for any PG money
         // value, two fractional digits matching PG's default lc_monetary.
@@ -568,6 +578,29 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         sql if is_daterange_sql(sql) => Ok(DataType::Utf8),
         sql if is_tsrange_sql(sql) => Ok(DataType::Utf8),
         sql if is_tstzrange_sql(sql) => Ok(DataType::Utf8),
+=======
+        // TSVECTOR — full-text search document type. Rides on `Utf8`
+        // with `BASIN_TYPE=TSVECTOR` field metadata (set by
+        // `ddl::schema_from_columns`). No real inverted index for now;
+        // the FTS UDF stubs echo the text value.
+        SqlDataType::Custom(name, modifiers)
+            if name.0.len() == 1
+                && name.0[0].value.eq_ignore_ascii_case("tsvector")
+                && modifiers.is_empty() =>
+        {
+            Ok(DataType::Utf8)
+        }
+
+        // TSQUERY — full-text search query type. Same physical type as
+        // TSVECTOR; distinguished only by the `BASIN_TYPE=TSQUERY` marker.
+        SqlDataType::Custom(name, modifiers)
+            if name.0.len() == 1
+                && name.0[0].value.eq_ignore_ascii_case("tsquery")
+                && modifiers.is_empty() =>
+        {
+            Ok(DataType::Utf8)
+        }
+>>>>>>> worktree-agent-af0b8d7333b8c0693
 
         // sqlparser's Postgres dialect parses unknown parameterised types
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form

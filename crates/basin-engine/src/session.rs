@@ -249,6 +249,7 @@ pub(crate) async fn open(
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
     // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
     // jsonb_strip_nulls, jsonb_path_query/exists/match, jsonb_object_keys,
     // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
@@ -297,6 +298,14 @@ pub(crate) async fn open(
     // favour of the more-specific implementations above.
     crate::datetime_extras::register_datetime_extras(&ctx);
 >>>>>>> worktree-agent-a675cd26807f9dc6b
+=======
+    // FTS stub UDFs: to_tsvector, to_tsquery, plainto_tsquery,
+    // phraseto_tsquery, websearch_to_tsquery, ts_rank, ts_rank_cd,
+    // ts_headline, setweight, strip, tsvector_length, numnode, querytree.
+    // These are stubs only — no inverted index; rank functions return 0.0,
+    // text-conversion functions echo their text argument.
+    crate::fts_udf::register_fts_udfs(&ctx);
+>>>>>>> worktree-agent-af0b8d7333b8c0693
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
