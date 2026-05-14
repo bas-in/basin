@@ -587,6 +587,7 @@ mod enum_ordinal;
 mod events;
 mod executor;
 mod fast_select;
+mod fts_udf;
 mod function_ddl;
 mod generated_cols;
 mod geo_glue;

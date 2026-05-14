@@ -167,6 +167,12 @@ pub(crate) async fn open(
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+    // FTS stub UDFs: to_tsvector, to_tsquery, plainto_tsquery,
+    // phraseto_tsquery, websearch_to_tsquery, ts_rank, ts_rank_cd,
+    // ts_headline, setweight, strip, tsvector_length, numnode, querytree.
+    // These are stubs only — no inverted index; rank functions return 0.0,
+    // text-conversion functions echo their text argument.
+    crate::fts_udf::register_fts_udfs(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
