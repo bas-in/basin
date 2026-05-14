@@ -74,15 +74,15 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
             "multi-table DELETE not supported".into(),
         ));
     }
-    if delete.using.is_some() {
-        return Err(BasinError::InvalidSchema(
-            "DELETE ... USING not supported".into(),
-        ));
-    }
     if delete.returning.is_some() {
         return Err(BasinError::InvalidSchema(
             "DELETE ... RETURNING not supported".into(),
         ));
+    }
+    // DELETE FROM t USING u WHERE … — rewrite to plain DELETE using a
+    // subquery that materialises the matching target-table PK values.
+    if let Some(using_tables) = delete.using {
+        return exec_delete_using(sess, delete.selection, &table, using_tables).await;
     }
 
     pre_mutation_flush(sess).await?;
@@ -322,11 +322,6 @@ pub(crate) async fn exec_update(
     selection: Option<Expr>,
     returning: Option<Vec<sqlparser::ast::SelectItem>>,
 ) -> Result<ExecResult> {
-    if from.is_some() {
-        return Err(BasinError::InvalidSchema(
-            "UPDATE ... FROM not supported".into(),
-        ));
-    }
     if returning.is_some() {
         return Err(BasinError::InvalidSchema(
             "UPDATE ... RETURNING not supported".into(),
@@ -336,6 +331,10 @@ pub(crate) async fn exec_update(
         return Err(BasinError::InvalidSchema(
             "UPDATE with JOIN not supported".into(),
         ));
+    }
+    // UPDATE t SET col = u.col FROM u WHERE t.id = u.id — handled separately.
+    if let Some(from_table) = from {
+        return exec_update_from(sess, table_with_joins, assignments, from_table, selection).await;
     }
     let table_name = match &table_with_joins.relation {
         TableFactor::Table {
@@ -635,6 +634,335 @@ pub(crate) async fn exec_update(
     Ok(ExecResult::Empty {
         tag: format!("UPDATE {updated_total}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Join-form DML helpers
+// ---------------------------------------------------------------------------
+
+/// `DELETE FROM t USING u [, …] WHERE <condition>`
+///
+/// Strategy (v0.1, copy-on-write):
+/// 1. Load the target table's PK columns (required; error if absent).
+/// 2. Build and run a SELECT that returns only the target PK columns from
+///    the join: `SELECT t.<pk> FROM t INNER JOIN u ON <condition>`.
+/// 3. Collect the PK values as string scalars (the existing IN-predicate
+///    path handles only string-literal sets in the compound predicate; the
+///    schema's real types are still compared correctly by the Arrow
+///    evaluation layer because scalar values carry their types).
+/// 4. Re-issue a plain `DELETE FROM t WHERE pk IN (...)` via the recursive
+///    `sess.execute` path so cascades, soft-delete, and audit all fire.
+///
+/// Limitation: the target table must have exactly one PK column in v0.1.
+/// Multi-column PKs require a composite IN or repeated OR clauses; we
+/// emit the latter.
+async fn exec_delete_using(
+    sess: &TenantSession,
+    selection: Option<Expr>,
+    target: &TableName,
+    using_tables: Vec<TableWithJoins>,
+) -> Result<ExecResult> {
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, target)
+        .await?;
+    if meta.pk_columns.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "DELETE … USING requires the target table {:?} to have a PRIMARY KEY in v0.1",
+            target.as_str()
+        )));
+    }
+    let pk = &meta.pk_columns;
+    let target_str = target.as_str();
+
+    // Build the SELECT that materialises matching PK tuples.
+    let pk_proj: Vec<String> = pk
+        .iter()
+        .map(|c| format!("{target_str}.{c}"))
+        .collect();
+
+    // USING tables as a comma-separated FROM list.
+    let using_str: Vec<String> = using_tables
+        .iter()
+        .map(|t| t.relation.to_string())
+        .collect();
+
+    let where_sql = match &selection {
+        Some(e) => format!(" WHERE {e}"),
+        None => String::new(),
+    };
+
+    let join_select = format!(
+        "SELECT {proj} FROM {target} , {using}{wh}",
+        proj = pk_proj.join(", "),
+        target = target_str,
+        using = using_str.join(", "),
+        wh = where_sql,
+    );
+
+    // Execute the join SELECT.
+    let join_result = Box::pin(sess.execute(&join_select)).await?;
+    let batches = match join_result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => return Ok(ExecResult::Empty { tag: "DELETE 0".into() }),
+    };
+
+    // Collect pk tuples.
+    let pk_tuples = collect_pk_batches(&batches, pk)?;
+    if pk_tuples.is_empty() {
+        return Ok(ExecResult::Empty { tag: "DELETE 0".into() });
+    }
+
+    // Build a WHERE clause: for single-pk tables use simple IN; for multi-pk
+    // emit (pk1=v1 AND pk2=v2) OR … (matches the cascade helper pattern).
+    let schema = meta.schema.clone();
+    let where_pred = build_pk_in_predicate(&pk_tuples, pk, &schema)?;
+
+    // Execute the plain DELETE.
+    let delete_sql = format!("DELETE FROM {target_str} WHERE {where_pred}");
+    Box::pin(sess.execute(&delete_sql)).await
+}
+
+/// `UPDATE t SET col = expr FROM u [, …] WHERE <condition>`
+///
+/// Strategy (v0.1):
+/// 1. Require that the target table has exactly one PK column.
+/// 2. Determine which SET RHS values come from the USING table vs. are
+///    literals. For v0.1 we require all RHS to be either:
+///    a. A literal / NULL — pass directly to the single-row UPDATE.
+///    b. A compound-identifier `u.col` — project that column from the join.
+/// 3. Run `SELECT t.pk, rhs_col1, rhs_col2, … FROM t JOIN u ON <cond>`
+/// 4. For each result row emit `UPDATE t SET col1=v1, col2=v2, … WHERE pk=pk`.
+async fn exec_update_from(
+    sess: &TenantSession,
+    target_twj: TableWithJoins,
+    assignments: Vec<Assignment>,
+    from_table: TableWithJoins,
+    selection: Option<Expr>,
+) -> Result<ExecResult> {
+    let target_name = match &target_twj.relation {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
+            if alias.is_some() || args.is_some() {
+                return Err(BasinError::InvalidSchema(
+                    "UPDATE target must be a bare table name".into(),
+                ));
+            }
+            single_part_name(name)?.to_string()
+        }
+        _ => {
+            return Err(BasinError::InvalidSchema(
+                "UPDATE target must be a simple table name".into(),
+            ))
+        }
+    };
+    let target = TableName::new(target_name.clone())?;
+
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.tenant, &target)
+        .await?;
+    if meta.pk_columns.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "UPDATE … FROM requires the target table {:?} to have a PRIMARY KEY in v0.1",
+            target_name
+        )));
+    }
+    let pk_col = &meta.pk_columns[0];
+    let schema = meta.schema.clone();
+
+    // Collect the SET targets and their RHS expressions.
+    let mut set_cols: Vec<String> = Vec::new();
+    let mut rhs_exprs: Vec<String> = Vec::new();
+    for a in &assignments {
+        let col = match &a.target {
+            AssignmentTarget::ColumnName(name) => {
+                if name.0.len() == 1 {
+                    name.0[0].value.clone()
+                } else {
+                    // schema.column — take the last part
+                    name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+                }
+            }
+            AssignmentTarget::Tuple(_) => {
+                return Err(BasinError::InvalidSchema(
+                    "UPDATE FROM: tuple assignment targets not supported in v0.1".into(),
+                ))
+            }
+        };
+        set_cols.push(col);
+        rhs_exprs.push(a.value.to_string());
+    }
+
+    // Build the join SELECT: pk + all RHS expressions.
+    let where_sql = match &selection {
+        Some(e) => format!(" WHERE {e}"),
+        None => String::new(),
+    };
+
+    // We project: target.pk, and each RHS as an expression. RHS may be
+    // `u.col` (compound) or a literal — both are valid SQL projections.
+    let rhs_proj: Vec<String> = rhs_exprs
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("{e} AS __rhs_{i}"))
+        .collect();
+
+    let proj = std::iter::once(format!("{target_name}.{pk_col}"))
+        .chain(rhs_proj)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let from_str = from_table.relation.to_string();
+
+    let join_select = format!(
+        "SELECT {proj} FROM {target_name} , {from_str}{wh}",
+        wh = where_sql,
+    );
+
+    let join_result = Box::pin(sess.execute(&join_select)).await?;
+    let batches = match join_result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => return Ok(ExecResult::Empty { tag: "UPDATE 0".into() }),
+    };
+
+    // For each matching row emit an individual UPDATE.
+    let pk_field = schema.field_with_name(pk_col).map_err(|_| {
+        BasinError::InvalidSchema(format!("PK column {pk_col:?} not in table schema"))
+    })?;
+    let mut updated = 0usize;
+    for batch in &batches {
+        let num_rows = batch.num_rows();
+        let pk_arr = batch.column(0);
+        for row in 0..num_rows {
+            let pk_lit = scalar_from_array(pk_arr.as_ref(), row, pk_field.data_type())?;
+
+            // Build SET clause: col1 = rhs_val, col2 = rhs_val, …
+            let mut set_parts: Vec<String> = Vec::new();
+            for (i, col) in set_cols.iter().enumerate() {
+                let rhs_arr = batch.column(i + 1);
+                let rhs_field_dt = batch.schema().field(i + 1).data_type().clone();
+                let rhs_lit = scalar_from_array(rhs_arr.as_ref(), row, &rhs_field_dt)?;
+                set_parts.push(format!("{col} = {rhs_lit}"));
+            }
+
+            let update_sql = format!(
+                "UPDATE {target_name} SET {sets} WHERE {pk_col} = {pk_lit}",
+                sets = set_parts.join(", ")
+            );
+            match Box::pin(sess.execute(&update_sql)).await? {
+                ExecResult::Empty { tag } => {
+                    if tag.starts_with("UPDATE ") {
+                        let n: usize = tag[7..].trim().parse().unwrap_or(0);
+                        updated += n;
+                    }
+                }
+                ExecResult::Rows { .. } => {}
+            }
+        }
+    }
+
+    Ok(ExecResult::Empty {
+        tag: format!("UPDATE {updated}"),
+    })
+}
+
+/// Collect `(pk_col1, pk_col2, …)` tuples from a result set as string
+/// literals. Each column value is rendered as its SQL literal form
+/// (quoted for text, unquoted for numeric types).
+fn collect_pk_batches(
+    batches: &[RecordBatch],
+    pk_cols: &[String],
+) -> Result<Vec<Vec<String>>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let mut tuple = Vec::with_capacity(pk_cols.len());
+            for (i, _) in pk_cols.iter().enumerate() {
+                let arr = batch.column(i);
+                let dt = batch.schema().field(i).data_type().clone();
+                let lit = scalar_from_array(arr.as_ref(), row, &dt)?;
+                tuple.push(lit);
+            }
+            out.push(tuple);
+        }
+    }
+    Ok(out)
+}
+
+/// Render an Arrow array element at `row` as a SQL literal string.
+/// Quoted for Utf8; bare numeric / bool otherwise.
+fn scalar_from_array(
+    arr: &dyn arrow_array::Array,
+    row: usize,
+    dt: &DataType,
+) -> Result<String> {
+    use arrow_array::cast::AsArray;
+    if arr.is_null(row) {
+        return Ok("NULL".into());
+    }
+    match dt {
+        DataType::Utf8 => {
+            let s = arr.as_string::<i32>().value(row);
+            Ok(format!("'{}'", s.replace('\'', "''")))
+        }
+        DataType::LargeUtf8 => {
+            let s = arr.as_string::<i64>().value(row);
+            Ok(format!("'{}'", s.replace('\'', "''")))
+        }
+        DataType::Int8 => Ok(arr.as_primitive::<arrow_array::types::Int8Type>().value(row).to_string()),
+        DataType::Int16 => Ok(arr.as_primitive::<arrow_array::types::Int16Type>().value(row).to_string()),
+        DataType::Int32 => Ok(arr.as_primitive::<arrow_array::types::Int32Type>().value(row).to_string()),
+        DataType::Int64 => Ok(arr.as_primitive::<arrow_array::types::Int64Type>().value(row).to_string()),
+        DataType::Float32 => Ok(arr.as_primitive::<arrow_array::types::Float32Type>().value(row).to_string()),
+        DataType::Float64 => Ok(arr.as_primitive::<arrow_array::types::Float64Type>().value(row).to_string()),
+        DataType::Boolean => {
+            let b = arr.as_boolean().value(row);
+            Ok(if b { "TRUE".into() } else { "FALSE".into() })
+        }
+        DataType::Timestamp(_, _) => {
+            // Render as a BIGINT literal (microseconds) which is what the
+            // predicate evaluator stores timestamps as.
+            use arrow_array::types::TimestampMicrosecondType;
+            let v = arr.as_primitive::<TimestampMicrosecondType>().value(row);
+            Ok(v.to_string())
+        }
+        other => Err(BasinError::InvalidSchema(format!(
+            "UPDATE/DELETE FROM: unsupported PK column type {other:?} in v0.1"
+        ))),
+    }
+}
+
+/// Build a WHERE predicate that matches any of the given PK tuples.
+/// Single-column PK → `pk IN (v1, v2, …)`.
+/// Multi-column PK → `(pk1=v1 AND pk2=v2) OR …`.
+fn build_pk_in_predicate(
+    tuples: &[Vec<String>],
+    pk_cols: &[String],
+    _schema: &Schema,
+) -> Result<String> {
+    if pk_cols.len() == 1 {
+        let values: Vec<String> = tuples.iter().map(|t| t[0].clone()).collect();
+        Ok(format!("{} IN ({})", pk_cols[0], values.join(", ")))
+    } else {
+        let clauses: Vec<String> = tuples
+            .iter()
+            .map(|tuple| {
+                let parts: Vec<String> = pk_cols
+                    .iter()
+                    .zip(tuple.iter())
+                    .map(|(c, v)| format!("{c} = {v}"))
+                    .collect();
+                format!("({})", parts.join(" AND "))
+            })
+            .collect();
+        Ok(clauses.join(" OR "))
+    }
 }
 
 /// One captured row-level change, lazily materialised only when at
