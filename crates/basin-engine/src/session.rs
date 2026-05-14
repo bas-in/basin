@@ -49,6 +49,21 @@ use crate::{Engine, TenantSession};
 /// never exposed to clients.
 pub(crate) const BASIN_URL_BASE: &str = "basin://engine/";
 
+/// `OVERRIDING { SYSTEM | USER } VALUE` clause on INSERT. Tracked
+/// per-pending-statement because sqlparser 0.52 doesn't recognise the
+/// clause; the executor pre-screens it textually and stashes the kind
+/// for the INSERT path to consume. See `session::take_pending_overriding`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverridingKind {
+    /// `OVERRIDING SYSTEM VALUE`: bypasses IDENTITY ALWAYS rejection;
+    /// user-supplied values are accepted. No effect on BY DEFAULT.
+    System,
+    /// `OVERRIDING USER VALUE`: discards user-supplied values on BY
+    /// DEFAULT IDENTITY columns and fills from nextval instead. No
+    /// effect on ALWAYS.
+    User,
+}
+
 /// Per-session mutable state. The `SessionContext` itself is `Send + Sync`
 /// and DataFusion handles concurrency on it; we only need the snapshot cache
 /// behind a mutex.
@@ -73,6 +88,7 @@ pub(crate) struct SessionState {
     /// by the SQL-string sequence rewriter on every `currval` call.
     pub(crate) sequence_cache: Arc<crate::seq_udf::SessionSequenceCache>,
 <<<<<<< HEAD
+<<<<<<< HEAD
     /// Per-session open-cursor registry. `DECLARE … CURSOR FOR …`
     /// materialises the SELECT result and stores it here under the cursor
     /// name; `FETCH` / `MOVE` advance the position; `CLOSE` removes the
@@ -85,6 +101,15 @@ pub(crate) struct SessionState {
     /// `SET search_path`. See `crate::schema_ddl::SchemaState`.
     pub(crate) schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
 >>>>>>> worktree-agent-a47826201518b8712
+=======
+    /// Pending `OVERRIDING { SYSTEM | USER } VALUE` clause stripped from
+    /// the current INSERT statement before sqlparser sees it. Set by
+    /// `execute()`'s pre-screen, consumed (taken) by `exec_insert`.
+    /// `std::sync::Mutex` (not `tokio::sync::Mutex`) so the consumer can
+    /// `.take()` synchronously from inside the INSERT path without
+    /// crossing an `await`.
+    pub(crate) pending_overriding: std::sync::Mutex<Option<OverridingKind>>,
+>>>>>>> worktree-agent-a884fe186837b0737
 }
 
 impl SessionState {
@@ -95,12 +120,35 @@ impl SessionState {
             has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
             sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
 <<<<<<< HEAD
+<<<<<<< HEAD
             cursors: crate::cursor::CursorRegistry::new(),
 =======
             schema_state: Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default())),
 >>>>>>> worktree-agent-a47826201518b8712
+=======
+            pending_overriding: std::sync::Mutex::new(None),
+>>>>>>> worktree-agent-a884fe186837b0737
         }
     }
+}
+
+/// Stash the OVERRIDING kind extracted from the current INSERT
+/// statement's source text. Called by the executor pre-screen.
+pub(crate) fn set_pending_overriding(state: &SessionState, kind: OverridingKind) {
+    *state
+        .pending_overriding
+        .lock()
+        .expect("pending_overriding lock poisoned") = Some(kind);
+}
+
+/// Atomically consume any pending OVERRIDING kind. Returns `None`
+/// when the user didn't write the clause.
+pub(crate) fn take_pending_overriding(state: &SessionState) -> Option<OverridingKind> {
+    state
+        .pending_overriding
+        .lock()
+        .expect("pending_overriding lock poisoned")
+        .take()
 }
 
 #[instrument(skip(engine, current_user, auth_context), fields(tenant = %tenant))]

@@ -1436,6 +1436,158 @@ pub(crate) fn group_rows_by_partition(
     Ok(out)
 }
 
+/// Pre-screen for the SQL standard `INSERT INTO t [...] OVERRIDING {
+/// SYSTEM | USER } VALUE VALUES (...)` clause. sqlparser 0.52 does not
+/// recognise the form; we strip it textually before sqlparser sees the
+/// statement and return the matched kind so the executor can stash it on
+/// the session state. Returns `(original_sql, None)` when the clause is
+/// absent. The match is string-literal- and comment-aware (mirrors the
+/// CLUSTER BY extractor) so the keyword pair can't be spoofed by a
+/// string literal.
+pub(crate) fn extract_insert_overriding(
+    sql: &str,
+) -> Result<(String, Option<crate::session::OverridingKind>)> {
+    // Cheap rejection: only INSERT statements ever carry the clause.
+    let leading = sql.trim_start();
+    if !leading
+        .get(..6)
+        .map(|s| s.eq_ignore_ascii_case("insert"))
+        .unwrap_or(false)
+    {
+        return Ok((sql.to_string(), None));
+    }
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Skip single-quoted string literals (with `''` doubled escapes).
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip double-quoted identifiers (with `""` doubled escapes).
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip `--` line comments.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip `/* ... */` block comments.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+        if (b == b'O' || b == b'o')
+            && bytes_match_kw_ascii(&bytes[i..], b"OVERRIDING")
+            && at_word_boundary_start(bytes, i)
+            && at_word_boundary_end(bytes, i + 10)
+        {
+            // Walk through `OVERRIDING <SYSTEM|USER> VALUE`. Each
+            // sub-token tolerates intervening whitespace; reject any
+            // mismatch so a typo isn't silently dropped.
+            let mut j = i + 10;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let kind = if bytes_match_kw_ascii(&bytes[j..], b"SYSTEM")
+                && at_word_boundary_end(bytes, j + 6)
+            {
+                j += 6;
+                crate::session::OverridingKind::System
+            } else if bytes_match_kw_ascii(&bytes[j..], b"USER")
+                && at_word_boundary_end(bytes, j + 4)
+            {
+                j += 4;
+                crate::session::OverridingKind::User
+            } else {
+                return Err(BasinError::InvalidSchema(
+                    "INSERT ... OVERRIDING: expected SYSTEM or USER".into(),
+                ));
+            };
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if !(bytes_match_kw_ascii(&bytes[j..], b"VALUE") && at_word_boundary_end(bytes, j + 5))
+            {
+                return Err(BasinError::InvalidSchema(
+                    "INSERT ... OVERRIDING ...: expected VALUE".into(),
+                ));
+            }
+            let end = j + 5;
+            // Strip the clause and surrounding whitespace; replace with a
+            // single space so the resulting SQL stays parseable.
+            let mut stripped = String::with_capacity(sql.len() - (end - i));
+            stripped.push_str(&sql[..i].trim_end_matches(|c: char| c.is_whitespace()));
+            stripped.push(' ');
+            stripped.push_str(sql[end..].trim_start_matches(|c: char| c.is_whitespace()));
+            return Ok((stripped, Some(kind)));
+        }
+        i += 1;
+    }
+    Ok((sql.to_string(), None))
+}
+
+fn bytes_match_kw_ascii(bytes: &[u8], kw: &[u8]) -> bool {
+    if bytes.len() < kw.len() {
+        return false;
+    }
+    for (a, b) in bytes.iter().zip(kw.iter()) {
+        if !a.eq_ignore_ascii_case(b) {
+            return false;
+        }
+    }
+    true
+}
+
+fn at_word_boundary_start(bytes: &[u8], i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let prev = bytes[i - 1];
+    !(prev.is_ascii_alphanumeric() || prev == b'_')
+}
+
+fn at_word_boundary_end(bytes: &[u8], i: usize) -> bool {
+    if i >= bytes.len() {
+        return true;
+    }
+    let c = bytes[i];
+    !(c.is_ascii_alphanumeric() || c == b'_')
+}
+
 fn ticks_to_utc_micros(ticks: i64, unit: Option<TimeUnit>) -> Result<DateTime<Utc>> {
     let micros = match unit.unwrap_or(TimeUnit::Microsecond) {
         TimeUnit::Microsecond => ticks,

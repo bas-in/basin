@@ -13,6 +13,7 @@ use sqlparser::ast::{
 use crate::lifecycle::CreateTableLifecycle;
 use crate::types::{
 <<<<<<< HEAD
+<<<<<<< HEAD
     arrow_data_type, basin_type_marker, serial_kind, BASIN_AUDIT_TABLE_KEY,
     BASIN_AUTO_UPDATE_KEY, BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY,
     BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_UUID,
@@ -26,6 +27,12 @@ use crate::types::{
     BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE, BASIN_TYPE_TSRANGE,
     BASIN_TYPE_TSTZRANGE, BASIN_TYPE_UUID, BASIN_TYPE_XML,
 >>>>>>> worktree-agent-a59745a1e5916e382
+=======
+    arrow_data_type, serial_kind, BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY,
+    BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_IDENTITY, BASIN_IDENTITY_ALWAYS,
+    BASIN_IDENTITY_BY_DEFAULT, BASIN_IDENTITY_SEQ, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_JSONB,
+    BASIN_TYPE_KEY, BASIN_TYPE_UUID,
+>>>>>>> worktree-agent-a884fe186837b0737
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -198,6 +205,10 @@ pub(crate) fn schema_and_constraints_from_columns(
         let mut nullable = true;
         let mut generated_expr: Option<String> = None;
         let mut default_text: Option<String> = None;
+        // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` populates this
+        // with the user-written keyword; the post-loop expansion mints a
+        // sequence and tags the field's metadata.
+        let mut identity_mode: Option<&'static str> = None;
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
@@ -278,12 +289,58 @@ pub(crate) fn schema_and_constraints_from_columns(
                     generation_expr_mode,
                     generated_keyword: _,
                 } => {
-                    if sequence_options.is_some() {
-                        return Err(BasinError::InvalidSchema(
-                            "GENERATED ... AS IDENTITY is not supported in v0.1; use a SEQUENCE \
-                             (5.11.K3) or a plain column"
-                                .to_string(),
-                        ));
+                    // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ (
+                    // sequence_options ) ]` lands here with `sequence_options
+                    // = Some(...)` (possibly empty) and `generation_expr =
+                    // None`. PG-shape: NOT NULL is implicit, a backing
+                    // sequence is auto-created, and the INSERT path fills
+                    // omitted slots via nextval. `ALWAYS` mode rejects
+                    // user-supplied values unless `OVERRIDING SYSTEM VALUE`
+                    // is specified at INSERT.
+                    if sequence_options.is_some() && generation_expr.is_none() {
+                        // Inline sequence options after IDENTITY are
+                        // parsed by sqlparser but not yet wired through.
+                        // Reject so a user writing `GENERATED ALWAYS AS
+                        // IDENTITY (START 100)` sees a clean error
+                        // instead of silently getting the default seed.
+                        if let Some(opts) = sequence_options.as_ref() {
+                            if !opts.is_empty() {
+                                return Err(BasinError::InvalidSchema(
+                                    "GENERATED ... AS IDENTITY (<sequence options>) is not \
+                                     supported in v0.1; declare the column without inline \
+                                     sequence options and use `CREATE SEQUENCE` separately"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        // SERIAL + IDENTITY together would mint two
+                        // sequences for the same column and is a user
+                        // error PG also rejects.
+                        if serial.is_some() {
+                            return Err(BasinError::InvalidSchema(format!(
+                                "column {:?} cannot be both SERIAL and GENERATED AS IDENTITY",
+                                col.name.value
+                            )));
+                        }
+                        let mode = match generated_as {
+                            GeneratedAs::Always => BASIN_IDENTITY_ALWAYS,
+                            GeneratedAs::ByDefault => BASIN_IDENTITY_BY_DEFAULT,
+                            GeneratedAs::ExpStored => {
+                                return Err(BasinError::InvalidSchema(format!(
+                                    "GENERATED ... AS IDENTITY on column {:?} cannot also be \
+                                     declared STORED",
+                                    col.name.value
+                                )));
+                            }
+                        };
+                        if identity_mode.is_some() {
+                            return Err(BasinError::InvalidSchema(format!(
+                                "column {:?} declared as IDENTITY twice",
+                                col.name.value
+                            )));
+                        }
+                        identity_mode = Some(mode);
+                        continue;
                     }
                     match generated_as {
                         GeneratedAs::Always | GeneratedAs::ExpStored => {}
@@ -357,6 +414,10 @@ pub(crate) fn schema_and_constraints_from_columns(
         //   * `DEFAULT nextval('<seq>')` is added unless the user wrote
         //     their own DEFAULT (in which case PG keeps the user's).
         //   * `NULL` on the column is rejected (PG does the same).
+        // Per-column backing sequence name for SERIAL / IDENTITY. Set by
+        // either expansion path; the post-loop metadata block tags the
+        // field with `BASIN_IDENTITY_SEQ` so INSERT can route to nextval.
+        let mut identity_seq_name: Option<String> = None;
         if let Some(_kind) = serial {
             if explicit_null.contains(&col.name.value.to_ascii_lowercase()) {
                 return Err(BasinError::InvalidSchema(format!(
@@ -376,13 +437,67 @@ pub(crate) fn schema_and_constraints_from_columns(
                 table_name.to_ascii_lowercase(),
                 col.name.value.to_ascii_lowercase()
             );
-            if default_text.is_none() {
-                default_text = Some(format!("nextval('{seq_name}')"));
-            }
+            // SERIAL is sugar over `GENERATED BY DEFAULT AS IDENTITY`;
+            // the IDENTITY-metadata block below tags the column so the
+            // INSERT path's identity-fill routes through `nextval` for
+            // omitted slots. We deliberately do NOT also set
+            // `BASIN_COLUMN_DEFAULT = nextval('seq')` here — the column-
+            // default path would otherwise fire a second `nextval` for
+            // the same row, doubling the sequence value (and breaking
+            // `SELECT id FROM t` expectations).
             extracted.implicit_sequences.push(ImplicitSequence {
-                name: seq_name,
+                name: seq_name.clone(),
                 column: col.name.value.clone(),
             });
+            identity_seq_name = Some(seq_name);
+        }
+        // IDENTITY columns: same expansion as SERIAL, but no
+        // user-visible DEFAULT (the INSERT path treats omitted IDENTITY
+        // columns specially so the metadata-driven semantics — ALWAYS
+        // vs BY DEFAULT — are honoured rather than overridden by a
+        // generic DEFAULT). We auto-create the backing sequence, force
+        // NOT NULL, and tag the field with mode + sequence-name metadata.
+        if let Some(_mode) = identity_mode {
+            if explicit_null.contains(&col.name.value.to_ascii_lowercase()) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "IDENTITY column {:?} cannot also be declared NULL",
+                    col.name.value
+                )));
+            }
+            if generated_expr.is_some() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "IDENTITY column {:?} cannot also be GENERATED ALWAYS AS",
+                    col.name.value
+                )));
+            }
+            if default_text.is_some() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "IDENTITY column {:?} cannot also have an explicit DEFAULT",
+                    col.name.value
+                )));
+            }
+            // IDENTITY only applies to integer columns. PG accepts INT /
+            // BIGINT / SMALLINT here; the engine widens SmallInt to Int16
+            // in the type bridge but the INSERT row builder only handles
+            // Int64. Restrict to Int64 to match what the rest of the
+            // engine actually serves.
+            if !matches!(dt, DataType::Int64) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "IDENTITY column {:?} must be an integer type (INT / BIGINT)",
+                    col.name.value
+                )));
+            }
+            nullable = false;
+            let seq_name = format!(
+                "{}_{}_seq",
+                table_name.to_ascii_lowercase(),
+                col.name.value.to_ascii_lowercase()
+            );
+            extracted.implicit_sequences.push(ImplicitSequence {
+                name: seq_name.clone(),
+                column: col.name.value.clone(),
+            });
+            identity_seq_name = Some(seq_name);
         }
         let mut md: HashMap<String, String> = HashMap::new();
         if is_jsonb_sql(&col.data_type) {
@@ -406,6 +521,25 @@ pub(crate) fn schema_and_constraints_from_columns(
         }
         if let Some(default_expr) = default_text.as_ref() {
             md.insert(BASIN_COLUMN_DEFAULT.to_string(), default_expr.clone());
+        }
+        // IDENTITY metadata. The INSERT path reads both the mode (ALWAYS
+        // vs BY DEFAULT) and the backing sequence name; the UPDATE path
+        // reads only the mode (to reject writes to GENERATED ALWAYS
+        // IDENTITY columns). SERIAL columns get `BY_DEFAULT` semantics
+        // (PG-shape: SERIAL is exactly sugar over `GENERATED BY DEFAULT
+        // AS IDENTITY`) so subsequent ALTER COLUMN SET GENERATED ALWAYS
+        // is well-defined.
+        if let Some(mode) = identity_mode {
+            md.insert(BASIN_IDENTITY.to_string(), mode.to_string());
+            if let Some(seq) = identity_seq_name.as_ref() {
+                md.insert(BASIN_IDENTITY_SEQ.to_string(), seq.clone());
+            }
+        } else if let Some(seq) = identity_seq_name.as_ref() {
+            md.insert(
+                BASIN_IDENTITY.to_string(),
+                BASIN_IDENTITY_BY_DEFAULT.to_string(),
+            );
+            md.insert(BASIN_IDENTITY_SEQ.to_string(), seq.clone());
         }
         let col_name = &col.name.value;
         if lifecycle
