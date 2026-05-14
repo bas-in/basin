@@ -1871,7 +1871,7 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(boot_vals)),
             Arc::new(StringArray::from(reset_vals)),
             Arc::new(StringArray::from(sourcefiles)),
-            Arc::new(arrow_array::Int32Array::from(sourcelines)),
+            Arc::new(Int32Array::from(sourcelines)),
             Arc::new(BooleanArray::from(pending)),
         ];
         RecordBatch::try_new(schema, columns)
