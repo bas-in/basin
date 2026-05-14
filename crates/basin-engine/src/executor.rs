@@ -368,6 +368,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
     let rewritten = crate::udf::rewrite_vector_operators(sql);
+<<<<<<< HEAD
     // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.
@@ -379,6 +380,15 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
     let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
     let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
+=======
+    // Translate PG range infix operators (`@>`, `<@`, `&&`, `<<`, `>>`,
+    // `-|-`) into UDF calls. Must run before sqlparser sees the SQL because
+    // sqlparser's PostgreSqlDialect does not model these operators.
+    // The rewriter is type-heuristic: `@>` / `<@` are only rewritten when
+    // at least one operand textually starts with a range constructor call
+    // (int4range, numrange, …) so future JSONB `@>` rewrites won't collide.
+    let rewritten = crate::range_udf::rewrite_range_operators(&rewritten);
+>>>>>>> worktree-agent-a59745a1e5916e382
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.

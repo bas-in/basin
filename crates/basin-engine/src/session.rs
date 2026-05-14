@@ -190,6 +190,7 @@ pub(crate) async fn open(
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+<<<<<<< HEAD
     // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
     // jsonb_strip_nulls, jsonb_path_query/exists/match, jsonb_object_keys,
     // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
@@ -219,6 +220,11 @@ pub(crate) async fn open(
 =======
     crate::jsonb_udf::register_jsonb_udfs(&ctx);
 >>>>>>> worktree-agent-a0dfa4d615d91958d
+=======
+    // Range type constructors + accessors + predicates. Registered per-session
+    // like the other UDFs; cost is O(Arc clones).
+    crate::range_udf::register_range_udfs(&ctx);
+>>>>>>> worktree-agent-a59745a1e5916e382
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
