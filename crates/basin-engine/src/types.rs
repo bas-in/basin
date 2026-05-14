@@ -588,29 +588,6 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // semantics — no real tokenisation).  The FTS UDFs in `fts_udf` all
         // accept/return Utf8, so this mapping is consistent end-to-end.
         SqlDataType::Custom(name, modifiers) => {
-            if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case("vector") {
-                let dim = parse_vector_dim(modifiers)?;
-                // Child field is nullable=true to match what the Arrow
-                // builder helpers produce (`FixedSizeListArray::
-                // from_iter_primitive` defaults its child to nullable). The
-                // distinction is irrelevant in practice because vector(N) at
-                // the user level never carries per-element NULLs.
-                Ok(DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dim,
-                ))
-            } else if name.0.len() == 1
-                && (name.0[0].value.eq_ignore_ascii_case("tsvector")
-                    || name.0[0].value.eq_ignore_ascii_case("tsquery"))
-                && modifiers.is_empty()
-            {
-                // Map TSVECTOR / TSQUERY to Utf8 (stub — no real FTS engine).
-                Ok(DataType::Utf8)
-            } else {
-                Err(BasinError::InvalidSchema(format!(
-                    "unsupported custom type: {name}"
-                )));
-            }
             let kw = name.0[0].value.to_ascii_uppercase();
             match kw.as_str() {
                 "VECTOR" => {
@@ -661,6 +638,9 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                 }
                 // VARBIT(n) / VARBIT: variable-length bit string.
                 "VARBIT" => Ok(DataType::Utf8),
+                // ── FTS types ────────────────────────────────────────────
+                // TSVECTOR / TSQUERY stored as Utf8 (stub — no real FTS engine).
+                "TSVECTOR" | "TSQUERY" if modifiers.is_empty() => Ok(DataType::Utf8),
                 _ => Err(BasinError::InvalidSchema(format!(
                     "unsupported custom type: {name}"
                 ))),

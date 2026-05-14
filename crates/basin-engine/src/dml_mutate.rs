@@ -217,6 +217,12 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
     // Resolve any IN (SELECT …) subqueries in the WHERE clause to literal
     // lists before parsing. This must happen before `pre_mutation_flush` so
     // the subquery SELECT sees the most-recently-committed rows.
+    // DELETE FROM t USING u WHERE … — rewrite to plain DELETE using a
+    // subquery that materialises the matching target-table PK values.
+    // Do this BEFORE consuming delete.selection in the subquery resolution.
+    if let Some(using_tables) = delete.using {
+        return exec_delete_using(sess, delete.selection, &table, using_tables).await;
+    }
     let resolved_selection: Option<Expr> = match delete.selection {
         None => None,
         Some(e) => Some(resolve_subqueries_in_expr(sess, e).await?),
@@ -235,11 +241,6 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
         return Err(BasinError::InvalidSchema(
             "DELETE ... RETURNING not supported".into(),
         ));
-    }
-    // DELETE FROM t USING u WHERE … — rewrite to plain DELETE using a
-    // subquery that materialises the matching target-table PK values.
-    if let Some(using_tables) = delete.using {
-        return exec_delete_using(sess, delete.selection, &table, using_tables).await;
     }
     if delete.using.is_some() {
         return Err(BasinError::InvalidSchema(
@@ -660,7 +661,6 @@ pub(crate) async fn exec_update(
                         &sess.engine.config().catalog,
                         &storage,
                         &sess.tenant,
-                        &storage,
                         &f.path,
                         None,
                         &assignments,
@@ -718,14 +718,6 @@ pub(crate) async fn exec_update(
                             news.push(
                                 apply_assignments(catalog, &sess.tenant, b, &mask, &assignments)
                                     .await?,
-                                apply_assignments(
-                                    &sess.engine.config().catalog,
-                                    &sess.tenant,
-                                    b,
-                                    &mask,
-                                    &assignments,
-                                )
-                                .await?,
                             );
                             masks.push(mask);
                         }
@@ -733,10 +725,8 @@ pub(crate) async fn exec_update(
                     } else {
                         let (matched, news) = read_and_apply_assignments_mixed(
                             catalog,
-                            &sess.engine.config().catalog,
                             &storage,
                             &sess.tenant,
-                            &storage,
                             &f.path,
                             p,
                             &assignments,
@@ -2769,14 +2759,6 @@ async fn exec_soft_delete(
                     matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
                     news.push(
                         apply_assignments(catalog, &sess.tenant, b, &mask, &assignments).await?,
-                        apply_assignments(
-                            &sess.engine.config().catalog,
-                            &sess.tenant,
-                            b,
-                            &mask,
-                            &assignments,
-                        )
-                        .await?,
                     );
                     masks.push(mask);
                 }

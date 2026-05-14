@@ -1545,7 +1545,7 @@ pub(crate) fn register_info_schema_providers(
         Arc::new(ColumnDomainUsageProvider::new(catalog.clone(), tenant)?);
     info_schema.register_table("column_domain_usage".to_string(), column_domain_usage_provider)?;
     let column_udt_usage_provider: Arc<dyn TableProvider> =
-        Arc::new(ColumnUdtUsageProvider::new(catalog, tenant)?);
+        Arc::new(ColumnUdtUsageProvider::new(catalog.clone(), tenant)?);
     info_schema.register_table("column_udt_usage".to_string(), column_udt_usage_provider)?;
 
     // information_schema privilege views
@@ -1594,7 +1594,7 @@ pub(crate) fn register_info_schema_providers(
         Arc::new(UserMappingsProvider::new(catalog.clone(), tenant)?);
     info_schema.register_table("user_mappings".to_string(), user_mappings_provider)?;
     let user_mapping_options_provider: Arc<dyn TableProvider> =
-        Arc::new(UserMappingOptionsProvider::new(catalog, tenant)?);
+        Arc::new(UserMappingOptionsProvider::new(catalog.clone(), tenant)?);
     info_schema.register_table("user_mapping_options".to_string(), user_mapping_options_provider)?;
     // pg_catalog.pg_views: plain views + continuous matviews.
     let pg_views_provider: Arc<dyn TableProvider> =

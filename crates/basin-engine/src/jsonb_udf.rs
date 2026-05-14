@@ -2358,20 +2358,22 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
             let mut cur = doc;
             let mut found = true;
             for seg in &segments {
-                match cur {
-                    Value::Object(map) => {
-                        match map.remove(seg.as_str()) {
-                            Some(v) => cur = v,
-                            None => { found = false; break; }
-                        }
+                let tmp = std::mem::replace(&mut cur, Value::Null);
+                let next = match tmp {
+                    Value::Object(mut map) => {
+                        map.remove(seg.as_str())
                     }
-                    Value::Array(arr) => {
+                    Value::Array(mut arr) => {
                         match seg.parse::<usize>().ok() {
-                            Some(idx) if idx < arr.len() => cur = arr.swap_remove(idx),
-                            _ => { found = false; break; }
+                            Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
+                            _ => None,
                         }
                     }
-                    _ => { found = false; break; }
+                    _ => None,
+                };
+                match next {
+                    Some(v) => cur = v,
+                    None => { found = false; break; }
                 }
             }
             if found {
@@ -2422,20 +2424,22 @@ impl ScalarUDFImpl for JsonPathExtractTextUdf {
             let mut cur = doc;
             let mut found = true;
             for seg in &segments {
-                match cur {
-                    Value::Object(map) => {
-                        match map.remove(seg.as_str()) {
-                            Some(v) => cur = v,
-                            None => { found = false; break; }
-                        }
+                let tmp = std::mem::replace(&mut cur, Value::Null);
+                let next = match tmp {
+                    Value::Object(mut map) => {
+                        map.remove(seg.as_str())
                     }
-                    Value::Array(arr) => {
+                    Value::Array(mut arr) => {
                         match seg.parse::<usize>().ok() {
-                            Some(idx) if idx < arr.len() => cur = arr.swap_remove(idx),
-                            _ => { found = false; break; }
+                            Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
+                            _ => None,
                         }
                     }
-                    _ => { found = false; break; }
+                    _ => None,
+                };
+                match next {
+                    Some(v) => cur = v,
+                    None => { found = false; break; }
                 }
             }
             if found {

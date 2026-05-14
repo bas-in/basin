@@ -51,7 +51,7 @@ pub(crate) async fn exec_truncate(
         .ok_or_else(|| BasinError::internal("TRUNCATE: empty parse tree"))?;
 
     let trunc = match node.node.as_ref() {
-        Some(NodeEnum::TruncateStmt(s)) => s.as_ref(),
+        Some(NodeEnum::TruncateStmt(s)) => s,
         _ => {
             return Err(BasinError::internal(
                 "exec_truncate called on non-TRUNCATE statement",
