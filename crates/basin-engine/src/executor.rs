@@ -247,6 +247,45 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let (select_stripped, include_deleted) = extract_select_include_deleted(sql);
     let sql = select_stripped.as_str();
 
+    // ── Advanced SELECT pre-screens ─────────────────────────────────────────
+    //
+    // These rewrites handle SQL constructs that sqlparser 0.52 can't parse at
+    // the statement level (TABLE foo, TABLESAMPLE) or that the sqlparser AST
+    // expresses in a way DataFusion 44 ignores (FETCH FIRST N ROWS ONLY).
+    // Each is a cheap string scan; non-matching SQL is returned as-is (Cow).
+    //
+    // 1. `TABLE foo` → `SELECT * FROM foo`
+    //    sqlparser's top-level dispatch doesn't recognise TABLE as a statement
+    //    start keyword; the query body parser does (SetExpr::Table) but
+    //    DataFusion never encounters that variant. Rewrite before sqlparser.
+    let table_shorthand_rewrite = crate::select_advanced::rewrite_table_shorthand(sql);
+    let sql = table_shorthand_rewrite.as_ref();
+    //
+    // 2. Strip `TABLESAMPLE BERNOULLI(N)` / `SYSTEM(N)`.
+    //    sqlparser 0.52 has the keyword but no grammar production for it, so
+    //    the parse fails.  We strip the clause (best-effort: DataFusion returns
+    //    all rows un-sampled) so the query reaches DataFusion at all.
+    let tablesample_rewrite = crate::select_advanced::strip_tablesample(sql);
+    let sql = tablesample_rewrite.as_ref();
+    //
+    // 3. `FETCH FIRST N ROWS ONLY` / `FETCH NEXT N ROWS ONLY` → `LIMIT N`.
+    //    sqlparser parses these into `Query.fetch`; DataFusion 44's planner
+    //    only reads `Query.limit`, so FETCH is silently ignored without this
+    //    rewrite.  Also handles the combined `OFFSET M ROWS FETCH NEXT N` form.
+    let fetch_rewrite = crate::select_advanced::rewrite_fetch_to_limit(sql);
+    let sql = fetch_rewrite.as_ref();
+    //
+    // 4. `FOR NO KEY UPDATE` → `FOR UPDATE`, `FOR KEY SHARE` → `FOR SHARE`.
+    //    sqlparser 0.52 only recognises `FOR UPDATE` and `FOR SHARE` as lock
+    //    types; the PG-specific variants `FOR NO KEY UPDATE` / `FOR KEY SHARE`
+    //    trigger a parse error. After the rewrite, sqlparser parses the
+    //    `Query.locks` vec normally, and DataFusion ignores it entirely —
+    //    Basin is append-only / optimistic-concurrency so row locking is
+    //    advisory for all four locking-strength keywords.
+    let for_lock_rewrite = crate::select_advanced::rewrite_for_no_key_update_and_key_share(sql);
+    let sql = for_lock_rewrite.as_ref();
+    // ────────────────────────────────────────────────────────────────────────
+
     // Auto-route `ORDER BY <vec_col> <op> <lit> LIMIT k` to the HNSW fast
     // path BEFORE the operator-to-UDF rewrite below. Once `<->` becomes
     // `l2_distance(...)` the structural signal is gone. A `None` here

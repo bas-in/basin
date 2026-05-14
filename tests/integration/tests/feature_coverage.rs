@@ -22,6 +22,13 @@
 //! - SELECT WHERE (single table)          -> covered elsewhere: tests/integration/tests/viability_predicate_pushdown.rs
 //! - SHOW TABLES (per-tenant scoped)      -> covered by feature_coverage::show_tables_per_tenant_scoped
 //! - ORDER BY / LIMIT                     -> covered elsewhere: tests/integration/tests/poc_smoke.rs
+//! - ORDER BY … NULLS FIRST / LAST       -> covered elsewhere: tests/integration/tests/select_advanced.rs
+//! - SELECT DISTINCT ON (cols)            -> covered elsewhere: tests/integration/tests/select_advanced.rs
+//! - FOR UPDATE / SHARE / NO KEY UPDATE / KEY SHARE -> covered elsewhere: tests/integration/tests/select_advanced.rs
+//! - FETCH FIRST/NEXT N ROWS ONLY        -> covered elsewhere: tests/integration/tests/select_advanced.rs
+//! - OFFSET N ROW / ROWS (SQL-std)       -> covered elsewhere: tests/integration/tests/select_advanced.rs
+//! - TABLE <name> shorthand              -> covered elsewhere: tests/integration/tests/select_advanced.rs
+//! - TABLESAMPLE BERNOULLI / SYSTEM      -> covered elsewhere: tests/integration/tests/select_advanced.rs
 //! - UPDATE / DELETE                      -> covered elsewhere: tests/integration/tests/viability_update_delete.rs
 //! - ALTER TABLE                          -> covered elsewhere: tests/integration/tests/viability_alter_table.rs
 //! - CREATE POLICY (RLS)                  -> covered elsewhere: tests/integration/tests/viability_rls_basic.rs
