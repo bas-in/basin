@@ -37,6 +37,29 @@
 //! - JSONB                                -> covered elsewhere: tests/integration/tests/viability_jsonb.rs
 //! - UUID                                 -> covered elsewhere: tests/integration/tests/viability_uuid.rs
 //! - TIMESTAMPTZ                          -> covered elsewhere: tests/integration/tests/viability_partition_pruning.rs, viability_continuous_aggregate.rs
+//! - INT4RANGE                            -> covered elsewhere: tests/integration/tests/type_stubs.rs (ddl_accepts_int4range_column, int4range_constructor_via_sql)
+//! - INT8RANGE                            -> covered elsewhere: tests/integration/tests/type_stubs.rs (ddl_accepts_int8range_column)
+//! - NUMRANGE                             -> covered elsewhere: tests/integration/tests/type_stubs.rs (ddl_accepts_numrange_column)
+//! - DATERANGE                            -> covered elsewhere: tests/integration/tests/type_stubs.rs (ddl_accepts_daterange_column)
+//! - TSRANGE                              -> covered elsewhere: tests/integration/tests/type_stubs.rs (ddl_accepts_tsrange_column)
+//! - TSTZRANGE                            -> covered elsewhere: tests/integration/tests/type_stubs.rs (ddl_accepts_tstzrange_column)
+//! - Range operator @> (contains)        -> covered elsewhere: tests/integration/tests/type_stubs.rs (range_contains_elem_via_sql)
+//! - Range operator <@ (contained by)    -> covered elsewhere: tests/integration/tests/type_stubs.rs (range_contains_elem_via_sql)
+//! - Range operator && (overlaps)        -> covered elsewhere: tests/integration/tests/type_stubs.rs (range_overlaps_via_sql)
+//! - Range operator << (strictly left)   -> covered by feature_coverage::range_strictly_left_operator
+//! - Range operator >> (strictly right)  -> covered by feature_coverage::range_strictly_right_operator
+//! - Range operator -|- (adjacent)       -> covered by feature_coverage::range_adjacent_operator
+//! - Range function lower / upper        -> covered elsewhere: tests/integration/tests/type_stubs.rs (range_lower_upper_via_sql)
+//! - Range function isempty              -> covered by unit tests in crates/basin-engine/src/range_udf.rs
+//! - Range function lower_inc/upper_inc  -> covered elsewhere: tests/integration/tests/type_stubs.rs (range_lower_inc_upper_inc_via_sql)
+//! - Range function lower_inf/upper_inf  -> covered by unit tests in crates/basin-engine/src/range_udf.rs
+//! - Range function range_contains_elem  -> covered elsewhere: tests/integration/tests/type_stubs.rs (range_contains_elem_via_sql)
+//! - Range function range_contains_range -> covered by feature_coverage::range_contains_range_udf
+//! - Range function range_overlaps       -> covered elsewhere: tests/integration/tests/type_stubs.rs (range_overlaps_via_sql)
+//! - Range function range_strictly_left  -> covered by feature_coverage::range_strictly_left_operator
+//! - Range function range_strictly_right -> covered by feature_coverage::range_strictly_right_operator
+//! - Range function range_adjacent       -> covered by feature_coverage::range_adjacent_operator
+//! - Range function range_merge          -> covered by feature_coverage::range_merge_udf
 //!
 //! ## Multi-tenancy
 //! - Per-tenant bucket prefix isolation   -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
@@ -119,6 +142,7 @@ use basin_router::{parse_pins_env, PgRateLimit, ShardMap};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
+use serde_json;
 
 /// Spin a fresh in-process `Engine` against `LocalFileSystem` + `InMemoryCatalog`.
 fn engine_in(dir: &TempDir) -> Engine {
@@ -291,6 +315,136 @@ async fn pgwire_rate_limit_returns_53400() {
         }
     }
     assert!(throttled, "rate limiter never threw, despite drained burst");
+}
+
+// ---------------------------------------------------------------------------
+// Range type feature coverage tests
+// ---------------------------------------------------------------------------
+
+/// Helper: open a fresh in-process engine session.
+async fn range_session() -> (basin_engine::TenantSession, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    (sess, dir)
+}
+
+/// `range_contains_range` UDF: checks that [1,10) @> [3,7) → true
+/// and [1,5) @> [3,7) → false.
+#[tokio::test]
+async fn range_contains_range_udf() {
+    let (sess, _dir) = range_session().await;
+    let r1 = sess
+        .execute("SELECT range_contains_range(int4range(1, 10), int4range(3, 7))")
+        .await
+        .unwrap();
+    let r2 = sess
+        .execute("SELECT range_contains_range(int4range(1, 5), int4range(3, 7))")
+        .await
+        .unwrap();
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
+    {
+        use arrow_array::BooleanArray;
+        let contains = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let no_contain = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(contains.value(0), "[1,10) should contain [3,7)");
+        assert!(!no_contain.value(0), "[1,5) should not contain [3,7)");
+    } else {
+        panic!("expected Rows result");
+    }
+}
+
+/// `range_strictly_left` UDF: [1,5) << [5,10) → true; [1,6) << [5,10) → false.
+#[tokio::test]
+async fn range_strictly_left_operator() {
+    let (sess, _dir) = range_session().await;
+    let r1 = sess
+        .execute("SELECT range_strictly_left(int4range(1, 5), int4range(5, 10))")
+        .await
+        .unwrap();
+    let r2 = sess
+        .execute("SELECT range_strictly_left(int4range(1, 6), int4range(5, 10))")
+        .await
+        .unwrap();
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
+    {
+        use arrow_array::BooleanArray;
+        let left = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let not_left = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(left.value(0), "[1,5) should be strictly left of [5,10)");
+        assert!(!not_left.value(0), "[1,6) is not strictly left of [5,10)");
+    } else {
+        panic!("expected Rows result");
+    }
+}
+
+/// `range_strictly_right` UDF: [5,10) >> [1,5) → true; [4,10) >> [1,5) → false.
+#[tokio::test]
+async fn range_strictly_right_operator() {
+    let (sess, _dir) = range_session().await;
+    let r1 = sess
+        .execute("SELECT range_strictly_right(int4range(5, 10), int4range(1, 5))")
+        .await
+        .unwrap();
+    let r2 = sess
+        .execute("SELECT range_strictly_right(int4range(4, 10), int4range(1, 5))")
+        .await
+        .unwrap();
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
+    {
+        use arrow_array::BooleanArray;
+        let right = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let not_right = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(right.value(0), "[5,10) should be strictly right of [1,5)");
+        assert!(!not_right.value(0), "[4,10) is not strictly right of [1,5)");
+    } else {
+        panic!("expected Rows result");
+    }
+}
+
+/// `range_adjacent` UDF: [1,5) -|- [5,10) → true (share bound, one excl one incl).
+#[tokio::test]
+async fn range_adjacent_operator() {
+    let (sess, _dir) = range_session().await;
+    let r1 = sess
+        .execute("SELECT range_adjacent(int4range(1, 5), int4range(5, 10))")
+        .await
+        .unwrap();
+    let r2 = sess
+        .execute("SELECT range_adjacent(int4range(1, 4), int4range(5, 10))")
+        .await
+        .unwrap();
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
+    {
+        use arrow_array::BooleanArray;
+        let adj = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let not_adj = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(adj.value(0), "[1,5) and [5,10) should be adjacent");
+        assert!(!not_adj.value(0), "[1,4) and [5,10) should not be adjacent");
+    } else {
+        panic!("expected Rows result");
+    }
+}
+
+/// `range_merge` UDF: hull of [1,5) and [3,10) should give [1,10).
+#[tokio::test]
+async fn range_merge_udf() {
+    let (sess, _dir) = range_session().await;
+    let result = sess
+        .execute("SELECT range_merge(int4range(1, 5), int4range(3, 10))")
+        .await
+        .unwrap();
+    if let ExecResult::Rows { batches, .. } = result {
+        let col = batches[0].column(0);
+        let sa = col.as_any().downcast_ref::<StringArray>().unwrap();
+        let v: serde_json::Value = serde_json::from_str(sa.value(0)).unwrap();
+        assert_eq!(v["l"], 1, "merged lower should be 1");
+        assert_eq!(v["u"], 10, "merged upper should be 10");
+        assert_eq!(v["li"], true, "merged lower should be inclusive");
+        assert_eq!(v["ui"], false, "merged upper should be exclusive (from [3,10))");
+    } else {
+        panic!("expected Rows result");
+    }
 }
 
 // --- helpers ----------------------------------------------------------------

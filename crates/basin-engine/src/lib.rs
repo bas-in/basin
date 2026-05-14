@@ -598,6 +598,7 @@ mod prepared;
 mod procedure_ddl;
 pub mod reactor_ddl;
 mod reactor_sink;
+mod range_udf;
 mod rls;
 mod seq_ddl;
 mod seq_udf;

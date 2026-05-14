@@ -78,6 +78,30 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `TIMESTAMPTZ` | ✅ | Arrow `Timestamp(Microsecond, "UTC")` |
 | `TIMESTAMP` (without time zone) | ✅ | Arrow `Timestamp(Microsecond, None)`; pgwire OID 1114; surfaces in `information_schema.columns.data_type` as `"timestamp without time zone"` |
 | `NUMERIC` / `DECIMAL` | ✅ | Arrow `Decimal128(p, s)` (1 ≤ p ≤ 38, 0 ≤ s ≤ p). DDL accepts `NUMERIC`, `NUMERIC(p)`, `NUMERIC(p, s)`, `DECIMAL(...)` synonym. Wire format: text only (binary numeric encoding is varlena-shaped and deferred to v0.2; lenient drivers handle text fine). pgwire OID 1700; `information_schema.columns.data_type` = `"numeric"`. |
+| `INT4RANGE` | ✅ | Arrow `Utf8` + `BASIN_TYPE=INT4RANGE` metadata. Stored as `{"l":<int>,"u":<int>,"li":<bool>,"ui":<bool>}` JSON. Constructor `int4range(lo, hi[, '[]'])`, accessors `lower`/`upper`/`isempty`/`lower_inc`/`upper_inc`/`lower_inf`/`upper_inf`. |
+| `INT8RANGE` | ✅ | Arrow `Utf8` + `BASIN_TYPE=INT8RANGE`. Same JSON layout as INT4RANGE. Constructor `int8range(lo, hi[, bounds])`. |
+| `NUMRANGE` | ✅ | Arrow `Utf8` + `BASIN_TYPE=NUMRANGE`. Constructor `numrange(lo, hi[, bounds])` — bounds default `[)`. |
+| `DATERANGE` | ✅ | Arrow `Utf8` + `BASIN_TYPE=DATERANGE`. Constructor `daterange(lo, hi[, bounds])`. |
+| `TSRANGE` | ✅ | Arrow `Utf8` + `BASIN_TYPE=TSRANGE`. Constructor `tsrange(lo, hi[, bounds])`. |
+| `TSTZRANGE` | ✅ | Arrow `Utf8` + `BASIN_TYPE=TSTZRANGE`. Constructor `tstzrange(lo, hi[, bounds])`. |
+| Range operator `@>` (contains element/range) | ✅ | Rewritten pre-parse to `range_contains_elem(r, v)` or `range_contains_range(r, r2)` when at least one operand is a range constructor. JSONB `@>` is not rewritten (no operand looks like a range constructor). |
+| Range operator `<@` (contained by) | ✅ | Rewritten to `range_contains_elem(r2, v)` / `range_contains_range(r2, r)` (argument order swapped). |
+| Range operator `&&` (overlaps) | ✅ | Rewritten pre-parse to `range_overlaps(a, b)`. |
+| Range operator `<<` (strictly left of) | ✅ | Rewritten pre-parse to `range_strictly_left(a, b)`. |
+| Range operator `>>` (strictly right of) | ✅ | Rewritten pre-parse to `range_strictly_right(a, b)`. |
+| Range operator `-\|-` (adjacent) | ✅ | Rewritten pre-parse to `range_adjacent(a, b)`. |
+| Range function `lower(r)` | ✅ | Returns the lower bound as text; `NULL` for infinite lower bound. |
+| Range function `upper(r)` | ✅ | Returns the upper bound as text; `NULL` for infinite upper bound. |
+| Range function `isempty(r)` | ✅ | Returns `true` when the range has no elements (lower >= upper for exclusive bound). |
+| Range function `lower_inc(r)` / `upper_inc(r)` | ✅ | Return `true` when the respective bound is inclusive. |
+| Range function `lower_inf(r)` / `upper_inf(r)` | ✅ | Return `true` when the respective bound is infinite (NULL in JSON). |
+| Range function `range_contains_elem(r, v)` | ✅ | `r @> v` — element-in-range membership check with bound-inclusivity. |
+| Range function `range_contains_range(r1, r2)` | ✅ | `r1 @> r2` — range containment check. |
+| Range function `range_overlaps(r1, r2)` | ✅ | `r1 && r2` — true when two ranges share at least one element. |
+| Range function `range_strictly_left(r1, r2)` | ✅ | `r1 << r2` — true when r1's upper ≤ r2's lower (exclusive). |
+| Range function `range_strictly_right(r1, r2)` | ✅ | `r1 >> r2` — true when r2's upper ≤ r1's lower (exclusive). |
+| Range function `range_adjacent(r1, r2)` | ✅ | `r1 -\|- r2` — true when ranges share exactly one endpoint (one incl, one excl). |
+| Range function `range_merge(r1, r2)` | ✅ | Returns the smallest range that includes both r1 and r2 (bounding hull). |
 | `INTERVAL`, `MONEY`, `XML`, geometric (LINESTRING/POLYGON) | 🚫 | |
 
 ## Multi-tenancy

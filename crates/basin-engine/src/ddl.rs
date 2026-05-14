@@ -12,9 +12,14 @@ use sqlparser::ast::{
 
 use crate::lifecycle::CreateTableLifecycle;
 use crate::types::{
-    arrow_data_type, serial_kind, BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY,
-    BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_JSONB,
-    BASIN_TYPE_KEY, BASIN_TYPE_UUID,
+    arrow_data_type, is_cidr_sql, is_daterange_sql, is_inet_sql, is_int4range_sql,
+    is_int8range_sql, is_macaddr8_sql, is_macaddr_sql, is_money_sql, is_numrange_sql,
+    is_tsrange_sql, is_tstzrange_sql, is_xml_sql, serial_kind, BASIN_AUDIT_TABLE_KEY,
+    BASIN_AUTO_UPDATE_KEY, BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY,
+    BASIN_TYPE_CIDR, BASIN_TYPE_DATERANGE, BASIN_TYPE_INET, BASIN_TYPE_INT4RANGE,
+    BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_MACADDR,
+    BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE, BASIN_TYPE_TSRANGE,
+    BASIN_TYPE_TSTZRANGE, BASIN_TYPE_UUID, BASIN_TYPE_XML,
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -82,6 +87,39 @@ fn is_uuid_sql(sql: &sqlparser::ast::DataType) -> bool {
                 && modifiers.is_empty()
         }
         _ => false,
+    }
+}
+
+/// Returns the `BASIN_TYPE` marker string to stamp on the Arrow `Field`
+/// metadata for new "text-with-marker" types (network addresses, money, xml,
+/// ranges). Returns `None` for all other types (handled by other branches).
+fn basin_type_marker_for(sql: &sqlparser::ast::DataType) -> Option<&'static str> {
+    if is_inet_sql(sql) {
+        Some(BASIN_TYPE_INET)
+    } else if is_cidr_sql(sql) {
+        Some(BASIN_TYPE_CIDR)
+    } else if is_macaddr_sql(sql) {
+        Some(BASIN_TYPE_MACADDR)
+    } else if is_macaddr8_sql(sql) {
+        Some(BASIN_TYPE_MACADDR8)
+    } else if is_money_sql(sql) {
+        Some(BASIN_TYPE_MONEY)
+    } else if is_xml_sql(sql) {
+        Some(BASIN_TYPE_XML)
+    } else if is_int4range_sql(sql) {
+        Some(BASIN_TYPE_INT4RANGE)
+    } else if is_int8range_sql(sql) {
+        Some(BASIN_TYPE_INT8RANGE)
+    } else if is_numrange_sql(sql) {
+        Some(BASIN_TYPE_NUMRANGE)
+    } else if is_daterange_sql(sql) {
+        Some(BASIN_TYPE_DATERANGE)
+    } else if is_tsrange_sql(sql) {
+        Some(BASIN_TYPE_TSRANGE)
+    } else if is_tstzrange_sql(sql) {
+        Some(BASIN_TYPE_TSTZRANGE)
+    } else {
+        None
     }
 }
 
@@ -345,6 +383,8 @@ pub(crate) fn schema_and_constraints_from_columns(
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_JSONB.to_string());
         } else if is_uuid_sql(&col.data_type) {
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_UUID.to_string());
+        } else if let Some(marker) = basin_type_marker_for(&col.data_type) {
+            md.insert(BASIN_TYPE_KEY.to_string(), marker.to_string());
         }
         if let Some(expr_text) = generated_expr.as_ref() {
             md.insert(BASIN_GENERATED_AS.to_string(), expr_text.clone());

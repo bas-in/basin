@@ -19,6 +19,30 @@ pub const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 pub const BASIN_TYPE_JSONB: &str = "JSONB";
 pub const BASIN_TYPE_UUID: &str = "UUID";
 
+// Network address types — stored as UTF-8 text with a metadata marker so the
+// pgwire encoder can advertise the correct OID and the REST layer can validate
+// format.
+pub const BASIN_TYPE_INET: &str = "INET";
+pub const BASIN_TYPE_CIDR: &str = "CIDR";
+pub const BASIN_TYPE_MACADDR: &str = "MACADDR";
+pub const BASIN_TYPE_MACADDR8: &str = "MACADDR8";
+
+// Money type — Arrow Decimal128(19,2); marker so the encoder emits OID 790.
+pub const BASIN_TYPE_MONEY: &str = "MONEY";
+
+// XML — UTF-8 text with marker for OID 142.
+pub const BASIN_TYPE_XML: &str = "XML";
+
+// Range types — stored as a JSON string `{"l":<lower>,"u":<upper>,"li":<bool>,"ui":<bool>}`.
+// Physical Arrow type is Utf8; the marker carries the PG range sub-type so the
+// pgwire encoder knows which element OID to advertise.
+pub const BASIN_TYPE_INT4RANGE: &str = "INT4RANGE";
+pub const BASIN_TYPE_INT8RANGE: &str = "INT8RANGE";
+pub const BASIN_TYPE_NUMRANGE: &str = "NUMRANGE";
+pub const BASIN_TYPE_DATERANGE: &str = "DATERANGE";
+pub const BASIN_TYPE_TSRANGE: &str = "TSRANGE";
+pub const BASIN_TYPE_TSTZRANGE: &str = "TSTZRANGE";
+
 /// Per-column markers for declarative lifecycle behaviours. Stored as
 /// Arrow `Field` metadata so they round-trip through the catalog's
 /// schema serde without a `TableMetadata` field per behaviour.
@@ -69,6 +93,16 @@ pub(crate) fn field_is_jsonb(field: &arrow_schema::Field) -> bool {
 /// hyphenated string rather than hex.
 pub(crate) fn field_is_uuid(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+}
+
+/// Convenience helper to read the `BASIN_TYPE` marker from a field's metadata.
+/// Used by the pgwire encoder and REST layer to distinguish logical sub-types
+/// that share the same Arrow physical type (e.g. INET vs CIDR vs MACADDR all
+/// on Utf8). Left `#[allow(dead_code)]` because the encoder lives outside
+/// this crate; it will call through the public API.
+#[allow(dead_code)]
+pub(crate) fn field_type_marker(field: &arrow_schema::Field) -> Option<&str> {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str())
 }
 
 pub(crate) fn field_is_auto_update(field: &arrow_schema::Field) -> bool {
@@ -167,6 +201,57 @@ pub(crate) fn serial_kind(sql: &SqlDataType) -> Option<SerialKind> {
         };
     }
     None
+}
+
+/// Returns true when `sql` is one of the recognised network-address type
+/// keywords that ride on `Utf8` with a `BASIN_TYPE` marker.
+pub(crate) fn is_inet_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "inet")
+}
+pub(crate) fn is_cidr_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "cidr")
+}
+pub(crate) fn is_macaddr_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "macaddr")
+}
+pub(crate) fn is_macaddr8_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "macaddr8")
+}
+pub(crate) fn is_money_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "money")
+}
+pub(crate) fn is_xml_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "xml")
+}
+pub(crate) fn is_int4range_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "int4range")
+}
+pub(crate) fn is_int8range_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "int8range")
+}
+pub(crate) fn is_numrange_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "numrange")
+}
+pub(crate) fn is_daterange_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "daterange")
+}
+pub(crate) fn is_tsrange_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "tsrange")
+}
+pub(crate) fn is_tstzrange_sql(sql: &SqlDataType) -> bool {
+    custom_type_name_eq(sql, "tstzrange")
+}
+
+/// True when `sql` is an unparameterised `Custom` whose identifier matches
+/// `keyword` case-insensitively.
+fn custom_type_name_eq(sql: &SqlDataType, keyword: &str) -> bool {
+    if let SqlDataType::Custom(name, modifiers) = sql {
+        name.0.len() == 1
+            && name.0[0].value.eq_ignore_ascii_case(keyword)
+            && modifiers.is_empty()
+    } else {
+        false
+    }
 }
 
 /// Map a sqlparser column type to an Arrow [`DataType`]. Only the small set
@@ -277,6 +362,35 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             )),
             _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         },
+
+        // MONEY. PG's `money` type is a fixed-point 8-byte integer; we
+        // represent it as Decimal128(19, 2) — enough range for any PG money
+        // value, two fractional digits matching PG's default lc_monetary.
+        // sqlparser surfaces `MONEY` through `Custom`; some future dialect
+        // versions may add a dedicated variant. The metadata marker tells the
+        // pgwire encoder to emit OID 790.
+        sql if is_money_sql(sql) => Ok(DataType::Decimal128(19, 2)),
+
+        // XML. sqlparser has a dedicated `XML` variant in some dialects and
+        // also routes it through `Custom`. Physical type is Utf8.
+        sql if is_xml_sql(sql) => Ok(DataType::Utf8),
+
+        // Network address types. All stored as Utf8; metadata carries the
+        // logical sub-type so the pgwire encoder can emit the right OID and
+        // the REST layer can validate format on ingress.
+        sql if is_inet_sql(sql) => Ok(DataType::Utf8),
+        sql if is_cidr_sql(sql) => Ok(DataType::Utf8),
+        sql if is_macaddr_sql(sql) => Ok(DataType::Utf8),
+        sql if is_macaddr8_sql(sql) => Ok(DataType::Utf8),
+
+        // Range types. Stored as Utf8 JSON strings of the shape
+        // `{"l":<lower>,"u":<upper>,"li":<bool>,"ui":<bool>}`.
+        sql if is_int4range_sql(sql) => Ok(DataType::Utf8),
+        sql if is_int8range_sql(sql) => Ok(DataType::Utf8),
+        sql if is_numrange_sql(sql) => Ok(DataType::Utf8),
+        sql if is_daterange_sql(sql) => Ok(DataType::Utf8),
+        sql if is_tsrange_sql(sql) => Ok(DataType::Utf8),
+        sql if is_tstzrange_sql(sql) => Ok(DataType::Utf8),
 
         // sqlparser's Postgres dialect parses unknown parameterised types
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form
