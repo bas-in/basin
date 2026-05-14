@@ -599,6 +599,7 @@ mod procedure_ddl;
 pub mod reactor_ddl;
 mod reactor_sink;
 mod rls;
+mod select_advanced;
 mod seq_ddl;
 mod seq_udf;
 mod session;

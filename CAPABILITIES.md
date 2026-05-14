@@ -38,6 +38,14 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `SELECT` with `WHERE` (single table) | ✅ | DataFusion-planned; predicate pushdown to Parquet |
 | `SHOW TABLES` | ✅ | per-tenant scoped |
 | `ORDER BY` / `LIMIT` | ✅ | full DataFusion support |
+| `ORDER BY … NULLS FIRST` / `NULLS LAST` | ✅ | sqlparser `OrderByExpr.nulls_first`; DataFusion honours it via `SortExpr`. Works for any column type. |
+| `SELECT DISTINCT ON (cols)` | ✅ | sqlparser parses `Select.distinct = Distinct::On(…)`; DataFusion 44 plans via `DistinctOn` logical node — real semantic deduplication, not just an advisory parse. First row in ORDER BY order is returned per distinct-key tuple. |
+| `FOR UPDATE [OF tbl] [SKIP LOCKED\|NOWAIT]` / `FOR SHARE` | ✅ | Parsed by sqlparser 0.52 into `Query.locks`; DataFusion ignores the lock list and executes the SELECT normally. Basin is append-only / optimistic-concurrency — row-level locking is advisory for all locking-strength keywords. |
+| `FOR NO KEY UPDATE` / `FOR KEY SHARE [OF tbl] [SKIP LOCKED\|NOWAIT]` | ✅ | sqlparser 0.52 does not recognise these PG-specific lock strengths. Pre-screen in `select_advanced::rewrite_for_no_key_update_and_key_share` rewrites them to `FOR UPDATE` / `FOR SHARE` before parsing; same advisory semantics apply. |
+| `FETCH FIRST N ROWS ONLY` / `FETCH NEXT N ROWS ONLY` | ✅ | sqlparser parses into `Query.fetch`; DataFusion 44 ignores `fetch` and reads only `Query.limit`. Pre-screen in `select_advanced::rewrite_fetch_to_limit` rewrites to `LIMIT N [OFFSET M]` before parsing. `WITH TIES` accepted and treated as `ONLY`. |
+| `OFFSET N ROW` / `OFFSET N ROWS` (SQL-standard) | ✅ | sqlparser parses `Offset { rows: OffsetRows::Row\|Rows }`; DataFusion reads `Offset.value` and ignores the `ROW`/`ROWS` keyword. Pairs correctly with `LIMIT` or `FETCH FIRST`. |
+| `TABLE <name>` (SQL:2003 shorthand) | ✅ | Pre-screen rewrites to `SELECT * FROM <name>` before sqlparser. sqlparser's top-level dispatch does not recognise `TABLE` as a statement-start keyword. |
+| `TABLESAMPLE BERNOULLI(N)` / `SYSTEM(N)` | ✅ | Pre-screen strips the clause; DataFusion returns all rows (best-effort: correct result, un-sampled). sqlparser 0.52 has the keyword but no grammar production. |
 | Joins (single-shard) | 🛠 | DataFusion handles them; not yet exercised in tests |
 | `UPDATE` / `DELETE` | ✅ | Copy-on-write Iceberg v2. Single-scan partition; `replace_data_files` with optimistic concurrency on both catalog backends; physical deletion of replaced Parquet files. |
 | `ALTER TABLE` | ✅ | `ADD COLUMN`, `SET cold_after`, `SET cold_age_column`, `SET BLOOM FILTERS ON`, `SET row_group_rows`, `RESET row_group_rows`, `CLUSTER BY (...)`, `RESET CLUSTER BY`, `ENABLE/DISABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `DROP POLICY` |
