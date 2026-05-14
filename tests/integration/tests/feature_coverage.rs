@@ -70,6 +70,7 @@
 //! - Analytical path via DuckDB           -> covered elsewhere: tests/integration/tests/viability_analytical.rs
 //! - Engine routes analytical SQL         -> covered elsewhere: tests/integration/tests/viability_analytical_routing.rs
 //! - Cost-based query rejection           -> covered elsewhere: crates/basin-engine/src/cost_check.rs (in-crate; OnceLock-cached env var means a process-wide integration test would race)
+//! - Window functions (ranking + offset + frame + aggregate OVER) -> covered elsewhere: tests/integration/tests/window_fns.rs
 //!
 //! ## Vector search
 //! - vector(N) column type                -> covered elsewhere: tests/integration/tests/vector_smoke.rs
