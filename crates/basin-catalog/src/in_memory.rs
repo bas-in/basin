@@ -303,10 +303,8 @@ impl Catalog for InMemoryCatalog {
                 "rename_table: target {tenant}/{new} already exists"
             )));
         }
-<<<<<<< HEAD
         let entry = tables
             .remove(&old_key)
-=======
         // Look up the old entry and *alias* the new key to its Arc.
         // Two keys end up pointing at the same TableState so the
         // engine's session-level refresh_table call — which the
@@ -318,7 +316,6 @@ impl Catalog for InMemoryCatalog {
         let entry = tables
             .get(&old_key)
             .cloned()
->>>>>>> worktree-agent-aa5bb15d9437f2613
             .ok_or_else(|| BasinError::not_found(format!("{tenant}/{old}")))?;
         tables.insert(new_key, entry);
         Ok(())

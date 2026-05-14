@@ -23,15 +23,12 @@ use arrow_array::Array as _;
 use arrow_schema as ws_schema;
 use arrow_schema::IntervalUnit as WsIntervalUnit;
 use arrow_schema::TimeUnit as WsTimeUnit;
-<<<<<<< HEAD
 // Buffer types used when constructing workspace-side ListArrays.
 use arrow_buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer, ScalarBuffer};
-=======
 // arrow_buffer (v54) provides the cross-version-safe buffer primitives we
 // need to rebuild WS List/LargeList arrays from raw offset and null data.
 use arrow_buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer,
                    ScalarBuffer as WsScalarBuffer};
->>>>>>> worktree-agent-a9872a986c88c7544
 
 // DataFusion-side (v53) imports.
 use datafusion::arrow::array as df_array;
@@ -1073,7 +1070,6 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 >(rows, *n);
                 Arc::new(arr)
             }
-<<<<<<< HEAD
             // Variable-length list (1-D or N-D arrays). We recursively
             // translate the child values array and rebuild the ListArray on
             // the workspace side with the same offsets + null bitmap.
@@ -1135,7 +1131,6 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                     null_buffer,
                 );
                 Arc::new(ws_list)
-=======
             ws_schema::DataType::UInt64 => {
                 let s = src
                     .as_any()
@@ -1296,7 +1291,6 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                     ws_nulls,
                 );
                 Arc::new(arr)
->>>>>>> worktree-agent-a9872a986c88c7544
             }
             other => {
                 return Err(BasinError::InvalidSchema(format!(

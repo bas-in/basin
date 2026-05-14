@@ -12,12 +12,9 @@ use sqlparser::ast::{
 
 use crate::lifecycle::CreateTableLifecycle;
 use crate::types::{
-<<<<<<< HEAD
-<<<<<<< HEAD
     arrow_data_type, basin_type_marker, serial_kind, BASIN_AUDIT_TABLE_KEY,
     BASIN_AUTO_UPDATE_KEY, BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY,
     BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_UUID,
-=======
     arrow_data_type, is_cidr_sql, is_daterange_sql, is_inet_sql, is_int4range_sql,
     is_int8range_sql, is_macaddr8_sql, is_macaddr_sql, is_money_sql, is_numrange_sql,
     is_tsrange_sql, is_tstzrange_sql, is_xml_sql, serial_kind, BASIN_AUDIT_TABLE_KEY,
@@ -26,18 +23,12 @@ use crate::types::{
     BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_MACADDR,
     BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE, BASIN_TYPE_TSRANGE,
     BASIN_TYPE_TSTZRANGE, BASIN_TYPE_UUID, BASIN_TYPE_XML,
->>>>>>> worktree-agent-a59745a1e5916e382
-=======
     arrow_data_type, serial_kind, BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY,
-<<<<<<< HEAD
     BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_IDENTITY, BASIN_IDENTITY_ALWAYS,
     BASIN_IDENTITY_BY_DEFAULT, BASIN_IDENTITY_SEQ, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_JSONB,
     BASIN_TYPE_KEY, BASIN_TYPE_UUID,
->>>>>>> worktree-agent-a884fe186837b0737
-=======
     BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_JSONB,
     BASIN_TYPE_KEY, BASIN_TYPE_TSQUERY, BASIN_TYPE_TSVECTOR, BASIN_TYPE_UUID,
->>>>>>> worktree-agent-af0b8d7333b8c0693
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -108,7 +99,6 @@ fn is_uuid_sql(sql: &sqlparser::ast::DataType) -> bool {
     }
 }
 
-<<<<<<< HEAD
 /// Returns the `BASIN_TYPE` marker string to stamp on the Arrow `Field`
 /// metadata for new "text-with-marker" types (network addresses, money, xml,
 /// ranges). Returns `None` for all other types (handled by other branches).
@@ -139,7 +129,6 @@ fn basin_type_marker_for(sql: &sqlparser::ast::DataType) -> Option<&'static str>
         Some(BASIN_TYPE_TSTZRANGE)
     } else {
         None
-=======
 /// Returns `true` if the SQL column type is `TSVECTOR`. The Arrow physical
 /// type is `Utf8`; the `BASIN_TYPE=TSVECTOR` marker on the field tells
 /// downstream layers to advertise PG OID 3614.
@@ -165,7 +154,6 @@ fn is_tsquery_sql(sql: &sqlparser::ast::DataType) -> bool {
             && modifiers.is_empty()
     } else {
         false
->>>>>>> worktree-agent-af0b8d7333b8c0693
     }
 }
 
@@ -564,24 +552,18 @@ pub(crate) fn schema_and_constraints_from_columns(
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_JSONB.to_string());
         } else if is_uuid_sql(&col.data_type) {
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_UUID.to_string());
-<<<<<<< HEAD
-<<<<<<< HEAD
         } else if let Some(marker) = basin_type_marker(&col.data_type) {
             // Network types (INET, CIDR, MACADDR, MACADDR8), bit-string types
             // (BIT(n), VARBIT(n)), and MONEY all ride on Utf8 / Decimal128 at
             // the Arrow level. The marker is what INSERT validation and the
             // pgwire encoder key off to apply the correct semantics.
             md.insert(BASIN_TYPE_KEY.to_string(), marker);
-=======
         } else if let Some(marker) = basin_type_marker_for(&col.data_type) {
             md.insert(BASIN_TYPE_KEY.to_string(), marker.to_string());
->>>>>>> worktree-agent-a59745a1e5916e382
-=======
         } else if is_tsvector_sql(&col.data_type) {
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSVECTOR.to_string());
         } else if is_tsquery_sql(&col.data_type) {
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSQUERY.to_string());
->>>>>>> worktree-agent-af0b8d7333b8c0693
         }
         if let Some(expr_text) = generated_expr.as_ref() {
             md.insert(BASIN_GENERATED_AS.to_string(), expr_text.clone());

@@ -33,11 +33,8 @@
 
 use std::sync::Arc;
 
-<<<<<<< HEAD
 use arrow_array::Int64Array;
-=======
 use arrow_array::{Array, Int64Array};
->>>>>>> worktree-agent-a884fe186837b0737
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
 use basin_engine::{Engine, EngineConfig, ExecResult};

@@ -188,7 +188,6 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ToTimestampPgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
-<<<<<<< HEAD
     // to_date(text, format) → Date32
     ctx.register_udf(ScalarUDF::from(ToDatePgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
@@ -210,7 +209,6 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
             ],
             Volatility::Immutable,
         ),
-=======
     // PG `to_date(text, format)` — parses a date string with a PG-style
     // format picture and returns `Date32`. Covers `to_date('2024-01-15',
     // 'YYYY-MM-DD')` and other common date-parsing patterns.
@@ -223,7 +221,6 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
     // and similar patterns used by PG-targeted ORMs / reporting tools.
     ctx.register_udf(ScalarUDF::from(ToNumberPgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
->>>>>>> worktree-agent-a9872a986c88c7544
     }));
     // PG-shape `power(x, y)` — always returns Float64. Overrides
     // DataFusion's default `power`, which returns Int64 for two integer
@@ -1935,7 +1932,6 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
     }
 }
 
-<<<<<<< HEAD
 // ---------------------------------------------------------------------------
 // to_date(text, format) → Date32
 // ---------------------------------------------------------------------------
@@ -1943,7 +1939,6 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
 // Parses a date string using a PG-format string (same mapping as to_timestamp)
 // and returns a Date32 (days since Unix epoch 1970-01-01).
 
-=======
 // ─── to_date(text, format) ────────────────────────────────────────────────────
 
 /// PG `to_date(text, format)` — parses a date string using a PG-style format
@@ -1952,20 +1947,17 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
 /// `to_timestamp`.
 ///
 /// Example: `to_date('2024-01-15', 'YYYY-MM-DD')` → the Date32 value for 2024-01-15.
->>>>>>> worktree-agent-a9872a986c88c7544
 #[derive(Debug)]
 struct ToDatePgUdf {
     signature: Signature,
 }
 
 impl ScalarUDFImpl for ToDatePgUdf {
-<<<<<<< HEAD
     fn as_any(&self) -> &dyn Any { self }
     fn name(&self) -> &str { "to_date" }
     fn signature(&self) -> &Signature { &self.signature }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Date32) }
 
-=======
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1978,7 +1970,6 @@ impl ScalarUDFImpl for ToDatePgUdf {
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Date32)
     }
->>>>>>> worktree-agent-a9872a986c88c7544
     #[allow(deprecated)]
     fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
         if args.len() != 2 {
@@ -1986,19 +1977,15 @@ impl ScalarUDFImpl for ToDatePgUdf {
         }
         let n = args
             .iter()
-<<<<<<< HEAD
             .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
-=======
             .filter_map(|a| match a {
                 ColumnarValue::Array(arr) => Some(arr.len()),
                 _ => None,
             })
->>>>>>> worktree-agent-a9872a986c88c7544
             .max()
             .unwrap_or(1);
         let txt = args[0].clone().into_array(n)?;
         let fmt = args[1].clone().into_array(n)?;
-<<<<<<< HEAD
         let txt = txt.as_any().downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Execution("to_date: arg 1 must be Utf8".into()))?;
         let fmt = fmt.as_any().downcast_ref::<StringArray>()
@@ -2301,7 +2288,6 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
     };
 
     Ok(result)
-=======
         let txt = txt
             .as_any()
             .downcast_ref::<StringArray>()
@@ -2538,7 +2524,6 @@ fn parse_pg_number(input: &str, fmt: &str) -> Result<f64, String> {
         return Err(format!("no numeric content found in {input:?}"));
     }
     cleaned.parse::<f64>().map_err(|e| format!("parse error: {e}"))
->>>>>>> worktree-agent-a9872a986c88c7544
 }
 
 #[cfg(test)]

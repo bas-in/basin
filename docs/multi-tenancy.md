@@ -49,11 +49,8 @@ software check that could be wrong; it's an IAM denial.
 
 **Idle projects cost only their bytes.** No backend process, no warm
 connection pool, no provisioned compute. A project that hasn't been touched
-<<<<<<< HEAD
 in a week sits on disk costing $0.015–$0.02/GB/mo on object storage — for a 100 MB project,
-=======
 in a week sits on disk costing $0.015/GB/mo on R2 — for a 100 MB project,
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 that's $0.0015/mo, or about $0.018/year.
 
 **Active projects share a compute pool.** The shard owner holds in-memory
@@ -78,11 +75,8 @@ cannot starve every other customer. See
 **Project deletion is a prefix delete.** `Storage::delete_tenant(project_id)`
 issues a parallel LIST + bulk `DeleteObjects` under the prefix plus a
 `drop_namespace` on the catalog. 100K rows / 100 files deletes in
-<<<<<<< HEAD
 ~4 ms on local FS, ~1.5–2 s on a real S3-compatible store — versus Postgres's
-=======
 ~4 ms on local FS, ~1.5–2 s on Cloudflare R2 — versus Postgres's
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 `DROP SCHEMA CASCADE` which is faster on tiny tables (a few unlinks) but
 linear-in-disk-extents on multi-GB ones.
 
@@ -105,11 +99,8 @@ linear-in-disk-extents on multi-GB ones.
 > projects on S3), not on a small tmpfs table.
 
 Full dashboard: [`benchmark/index_localfs.html`](../benchmark/index_localfs.html).
-<<<<<<< HEAD
 Real-cloud (S3-compatible store) numbers: [`benchmark/index_real.html`](../benchmark/index_real.html).
-=======
 Real-cloud (R2 / AWS S3) numbers: [`benchmark/index_real.html`](../benchmark/index_real.html).
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 
 ---
 
@@ -120,11 +111,8 @@ month workload with modest query traffic, lands around **$0.10–$0.20 per
 project per month**. That's the headline number that makes 10,000-project
 workloads feasible:
 
-<<<<<<< HEAD
 - Storage: 100 MB compressed to ~80 MB Parquet on object storage = $0.0012–$0.0016/mo
-=======
 - Storage: 100 MB compressed to ~80 MB Parquet on R2 = $0.0012/mo
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 - Compute amortised: ~$0.05/project/mo on a shared Fly Machine pool
 - Platform overhead (catalog rows, observability, billing): ~$0.05/project/mo
 

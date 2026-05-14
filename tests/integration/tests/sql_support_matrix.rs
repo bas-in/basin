@@ -2150,7 +2150,6 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
-<<<<<<< HEAD
     // ── PG-specific operators ─────────────────────────────────────────────────
     // Comparison / null-handling
     ("PG/Operators", "SELECT 1 IS DISTINCT FROM 2", &[], &[]),
@@ -2281,8 +2280,6 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
-=======
->>>>>>> worktree-agent-a0f45b8b5d58608d0
     // ── Row-level locking ────────────────────────────────────────────────────
     (
         "SELECT/Locking",

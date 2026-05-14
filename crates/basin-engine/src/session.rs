@@ -87,21 +87,16 @@ pub(crate) struct SessionState {
     /// sequence". Empty until the session's first `nextval`; consulted
     /// by the SQL-string sequence rewriter on every `currval` call.
     pub(crate) sequence_cache: Arc<crate::seq_udf::SessionSequenceCache>,
-<<<<<<< HEAD
-<<<<<<< HEAD
     /// Per-session open-cursor registry. `DECLARE … CURSOR FOR …`
     /// materialises the SELECT result and stores it here under the cursor
     /// name; `FETCH` / `MOVE` advance the position; `CLOSE` removes the
     /// entry.  All cursors are destroyed when the session is dropped
     /// (`CursorRegistry` holds no external state).
     pub(crate) cursors: crate::cursor::CursorRegistry,
-=======
     /// Per-session schema registry and search_path. `"public"` is always
     /// present. Updated by `CREATE SCHEMA` / `DROP SCHEMA` /
     /// `SET search_path`. See `crate::schema_ddl::SchemaState`.
     pub(crate) schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
->>>>>>> worktree-agent-a47826201518b8712
-=======
     /// Pending `OVERRIDING { SYSTEM | USER } VALUE` clause stripped from
     /// the current INSERT statement before sqlparser sees it. Set by
     /// `execute()`'s pre-screen, consumed (taken) by `exec_insert`.
@@ -109,7 +104,6 @@ pub(crate) struct SessionState {
     /// `.take()` synchronously from inside the INSERT path without
     /// crossing an `await`.
     pub(crate) pending_overriding: std::sync::Mutex<Option<OverridingKind>>,
->>>>>>> worktree-agent-a884fe186837b0737
 }
 
 impl SessionState {
@@ -119,15 +113,9 @@ impl SessionState {
             prepared: crate::prepared::PreparedRegistry::new(),
             has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
             sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
-<<<<<<< HEAD
-<<<<<<< HEAD
             cursors: crate::cursor::CursorRegistry::new(),
-=======
             schema_state: Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default())),
->>>>>>> worktree-agent-a47826201518b8712
-=======
             pending_overriding: std::sync::Mutex::new(None),
->>>>>>> worktree-agent-a884fe186837b0737
         }
     }
 }
@@ -227,27 +215,22 @@ pub(crate) async fn open(
     // `to_char`/`to_timestamp` overrides that accept PG-style format strings
     // (`YYYY-MM-DD HH24:MI:SS`) on top of chrono syntax.
     crate::udf::register_pg_compat_udfs(&ctx);
-<<<<<<< HEAD
     // String + datetime gap-fillers: `split_part`, `reverse`, `format`,
     // `quote_ident`, `quote_literal`, `quote_nullable`, `regexp_match`,
     // `regexp_split_to_array`, `chr`, `ascii`, `translate`, `btrim`/`ltrim`/`rtrim`,
     // `convert_from`, `convert_to`, `isfinite`.
     crate::string_dt_udf::register_string_dt_udfs(&ctx);
-=======
     // Full-text search stub UDFs: to_tsvector, to_tsquery, ts_rank, ts_headline,
     // setweight, strip, tsvector_length, numnode, querytree, and
     // tsvector_match_udf (the `@@`-operator substitute). All are stubs that
     // return identity/zero/false values; real FTS is deferred to basin-fts.
     crate::fts_udf::register_fts_udfs(&ctx);
->>>>>>> worktree-agent-aec15a16826dbb25b
     // Auth session functions: `auth_uid()`, `auth_role()`, `auth_jwt()`.
     // These read the per-session AuthContext stamped at open time so RLS
     // policies can reference the authenticated user without re-verifying
     // the JWT on every query. Must be registered after pg_compat to ensure
     // we don't overwrite anything (names are distinct).
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
-<<<<<<< HEAD
-<<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
     // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
@@ -276,14 +259,10 @@ pub(crate) async fn open(
     // Phase 5.11.AGG: PG JSON aggregate UDAFs — json_agg, jsonb_agg,
     // json_object_agg, jsonb_object_agg.
     crate::pg_agg_udf::register_json_agg_udafs(&ctx);
-=======
     crate::jsonb_udf::register_jsonb_udfs(&ctx);
->>>>>>> worktree-agent-a0dfa4d615d91958d
-=======
     // Range type constructors + accessors + predicates. Registered per-session
     // like the other UDFs; cost is O(Arc clones).
     crate::range_udf::register_range_udfs(&ctx);
->>>>>>> worktree-agent-a59745a1e5916e382
 =======
     // Phase 5.11.N: pg_catalog scalar stubs — pg_table_is_visible,
     // pg_get_userbyid, format_type, current_schema(), etc.  These are the

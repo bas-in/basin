@@ -18,7 +18,6 @@ use sqlparser::ast::TimezoneInfo;
 pub const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 pub const BASIN_TYPE_JSONB: &str = "JSONB";
 pub const BASIN_TYPE_UUID: &str = "UUID";
-<<<<<<< HEAD
 /// Logical-type marker for PG `TSVECTOR` columns. The Arrow physical type
 /// is `Utf8` — the column stores text (stub; no real lexeme tokenisation).
 /// The metadata flag lets the schema layer distinguish a TSVECTOR column
@@ -26,17 +25,14 @@ pub const BASIN_TYPE_UUID: &str = "UUID";
 pub const BASIN_TYPE_TSVECTOR: &str = "TSVECTOR";
 /// Logical-type marker for PG `TSQUERY` columns. Same physical type (`Utf8`)
 /// and same stub semantics as `TSVECTOR`.
-=======
 /// Logical type marker for `TSVECTOR` columns. The Arrow physical type is
 /// `Utf8`; this marker tells downstream layers (pgwire encoder, info_schema)
 /// to advertise the appropriate PG OID rather than the plain-text OID.
 pub const BASIN_TYPE_TSVECTOR: &str = "TSVECTOR";
 /// Logical type marker for `TSQUERY` columns. Same physical type (`Utf8`);
 /// same purpose as `BASIN_TYPE_TSVECTOR`.
->>>>>>> worktree-agent-af0b8d7333b8c0693
 pub const BASIN_TYPE_TSQUERY: &str = "TSQUERY";
 
-<<<<<<< HEAD
 // ── Network types ─────────────────────────────────────────────────────────────
 /// `INET` — IPv4/IPv6 host address with optional /prefix. Stored as `Utf8`.
 pub const BASIN_TYPE_INET: &str = "INET";
@@ -64,7 +60,6 @@ pub const BASIN_TYPE_VARBIT_PREFIX: &str = "VARBIT";
 /// guarantees (`-92233720368547758.08` to `+92233720368547758.07`).
 pub const BASIN_TYPE_MONEY: &str = "MONEY";
 
-=======
 // Network address types — stored as UTF-8 text with a metadata marker so the
 // pgwire encoder can advertise the correct OID and the REST layer can validate
 // format.
@@ -89,7 +84,6 @@ pub const BASIN_TYPE_DATERANGE: &str = "DATERANGE";
 pub const BASIN_TYPE_TSRANGE: &str = "TSRANGE";
 pub const BASIN_TYPE_TSTZRANGE: &str = "TSTZRANGE";
 
->>>>>>> worktree-agent-a59745a1e5916e382
 /// Per-column markers for declarative lifecycle behaviours. Stored as
 /// Arrow `Field` metadata so they round-trip through the catalog's
 /// schema serde without a `TableMetadata` field per behaviour.
@@ -163,7 +157,6 @@ pub(crate) fn field_is_uuid(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
 }
 
-<<<<<<< HEAD
 /// Returns `true` if `field` carries the `INET` metadata marker.
 pub(crate) fn field_is_inet(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_INET)
@@ -234,7 +227,6 @@ pub(crate) fn bit_fixed_len(field: &arrow_schema::Field) -> u64 {
     inner
         .parse::<u64>()
         .expect("BIT(n) metadata must contain a valid integer")
-=======
 /// Convenience helper to read the `BASIN_TYPE` marker from a field's metadata.
 /// Used by the pgwire encoder and REST layer to distinguish logical sub-types
 /// that share the same Arrow physical type (e.g. INET vs CIDR vs MACADDR all
@@ -243,7 +235,6 @@ pub(crate) fn bit_fixed_len(field: &arrow_schema::Field) -> u64 {
 #[allow(dead_code)]
 pub(crate) fn field_type_marker(field: &arrow_schema::Field) -> Option<&str> {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str())
->>>>>>> worktree-agent-a59745a1e5916e382
 }
 
 pub(crate) fn field_is_auto_update(field: &arrow_schema::Field) -> bool {
@@ -549,7 +540,6 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         },
 
-<<<<<<< HEAD
         // MONEY. PG's `money` type is a fixed-point 8-byte integer; we
         // represent it as Decimal128(19, 2) — enough range for any PG money
         // value, two fractional digits matching PG's default lc_monetary.
@@ -578,7 +568,6 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         sql if is_daterange_sql(sql) => Ok(DataType::Utf8),
         sql if is_tsrange_sql(sql) => Ok(DataType::Utf8),
         sql if is_tstzrange_sql(sql) => Ok(DataType::Utf8),
-=======
         // TSVECTOR — full-text search document type. Rides on `Utf8`
         // with `BASIN_TYPE=TSVECTOR` field metadata (set by
         // `ddl::schema_from_columns`). No real inverted index for now;
@@ -600,14 +589,12 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         {
             Ok(DataType::Utf8)
         }
->>>>>>> worktree-agent-af0b8d7333b8c0693
 
         // sqlparser's Postgres dialect parses unknown parameterised types
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form
         // and map it to the Arrow physical layout the rest of the engine
         // already understands: a `FixedSizeList<Float32>` of length N.
         //
-<<<<<<< HEAD
         // We also handle the full set of PG network / bit-string / money
         // types here; all ride on `Utf8` (or `Decimal128` for MONEY) with a
         // `BASIN_TYPE` field metadata marker so INSERT validation and the
@@ -615,7 +602,6 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         SqlDataType::Custom(name, modifiers) => {
             if name.0.len() != 1 {
                 return Err(BasinError::InvalidSchema(format!(
-=======
         // FTS types: TSVECTOR and TSQUERY are stored as Utf8 in v0.1 (stub
         // semantics — no real tokenisation).  The FTS UDFs in `fts_udf` all
         // accept/return Utf8, so this mapping is consistent end-to-end.
@@ -640,7 +626,6 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                 Ok(DataType::Utf8)
             } else {
                 Err(BasinError::InvalidSchema(format!(
->>>>>>> worktree-agent-aec15a16826dbb25b
                     "unsupported custom type: {name}"
                 )));
             }

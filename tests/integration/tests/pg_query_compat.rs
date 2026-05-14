@@ -193,13 +193,10 @@ fn assert_rejected(sql: &str) {
     }
 }
 
-<<<<<<< HEAD
 // ──────────────────────────────────────────────────────────────────────────────
 // LISTEN / NOTIFY / UNLISTEN — remain in is_unsupported(); rejected with 0A000
 // ──────────────────────────────────────────────────────────────────────────────
 
-=======
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 #[test]
 fn listen_is_rejected() {
     assert_rejected("LISTEN ch1");
@@ -211,7 +208,6 @@ fn notify_is_rejected() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn unlisten_is_rejected() {
     assert_rejected("UNLISTEN ch1");
 }
@@ -266,7 +262,6 @@ fn create_trigger_is_noop_accepted() {
     // Basin does not execute trigger bodies; syntactic accept keeps tooling
     // scripts from bouncing with 0A000. See ADR 0012.
     assert_allowed(
-=======
 fn prepare_is_rejected() {
     assert_rejected("PREPARE stmt AS SELECT 1");
 }
@@ -319,12 +314,10 @@ fn rollback_is_rejected() {
 #[test]
 fn create_trigger_is_rejected() {
     assert_rejected(
->>>>>>> worktree-agent-a0f45b8b5d58608d0
         "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
     );
 }
 
-<<<<<<< HEAD
 #[test]
 fn drop_trigger_is_noop_accepted() {
     assert_allowed("DROP TRIGGER trg ON t");
@@ -386,8 +379,6 @@ fn declare_cursor_is_noop_accepted() {
     assert_allowed("DECLARE c CURSOR FOR SELECT 1");
 }
 
-=======
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 // ──────────────────────────────────────────────────────────────────────────────
 // Supported-passes-through tests — reject_unsupported returns Ok(())
 // ──────────────────────────────────────────────────────────────────────────────

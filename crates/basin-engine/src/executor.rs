@@ -35,7 +35,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // doesn't know our UDFs.
     let raw_sql = sql;
 
-<<<<<<< HEAD
     // ADR 0014 Phase 1: parse with the real PostgreSQL parser first.
     // This lets us:
     //   1. Intercept noop-accept statements (VACUUM, ANALYZE, CLUSTER, LOCK,
@@ -81,7 +80,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
                 return Ok(result);
             }
         }
-=======
     // ADR 0014 Phase 1: parse with libpg_query; intercept no-op-accept kinds
     // (VACUUM, GRANT, SET, COMMENT, …) before the textual pre-screens run.
     // Dispatch order inside this block:
@@ -97,7 +95,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             }
         }
         crate::pg_ast::reject_unsupported(&tree)?;
->>>>>>> worktree-agent-a0f45b8b5d58608d0
     }
 
     // Phase 5.8: Basin-specific ALTER TABLE extensions (`SET cold_after`,
@@ -113,7 +110,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
 
-<<<<<<< HEAD
     // MOVE <direction> [FROM|IN] <cursor> — sqlparser 0.52 has no
     // Statement::Move AST node.  Pre-screen textually and dispatch before
     // sqlparser even sees the SQL.
@@ -125,9 +121,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // has no AST node for REFRESH, so we recognise the full statement
     // textually and dispatch. `force_full` toggles the v0.1 opt-out from
     // incremental refresh.
-=======
     // REFRESH MATERIALIZED VIEW <name> [ WITH (full = true) ].
->>>>>>> worktree-agent-a884fe186837b0737
     if let Some((name, force_full)) = crate::cv_ddl::match_refresh_materialized_view(sql)? {
         return crate::cv_ddl::exec_refresh_materialized_view(sess, &name, force_full).await;
     }
@@ -282,7 +276,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let (select_stripped, include_deleted) = extract_select_include_deleted(sql);
     let sql = select_stripped.as_str();
 
-<<<<<<< HEAD
     // ── Advanced SELECT pre-screens ─────────────────────────────────────────
     //
     // These rewrites handle SQL constructs that sqlparser 0.52 can't parse at
@@ -321,7 +314,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let for_lock_rewrite = crate::select_advanced::rewrite_for_no_key_update_and_key_share(sql);
     let sql = for_lock_rewrite.as_ref();
     // ────────────────────────────────────────────────────────────────────────
-=======
     // `INSERT INTO t [...] OVERRIDING { SYSTEM | USER } VALUE VALUES (...)`
     // — sqlparser 0.52 doesn't recognise the clause; we lift it out
     // textually and stash the kind on the session state for
@@ -333,7 +325,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     }
     let overriding_owned = overriding_stripped;
     let sql = overriding_owned.as_str();
->>>>>>> worktree-agent-a884fe186837b0737
 
     // Auto-route `ORDER BY <vec_col> <op> <lit> LIMIT k` to the HNSW fast
     // path BEFORE the operator-to-UDF rewrite below. Once `<->` becomes
@@ -376,7 +367,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
     let rewritten = crate::udf::rewrite_vector_operators(sql);
-<<<<<<< HEAD
     // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.
@@ -388,7 +378,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
     let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
     let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
-=======
     // Translate PG range infix operators (`@>`, `<@`, `&&`, `<<`, `>>`,
     // `-|-`) into UDF calls. Must run before sqlparser sees the SQL because
     // sqlparser's PostgreSqlDialect does not model these operators.
@@ -396,12 +385,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // at least one operand textually starts with a range constructor call
     // (int4range, numrange, …) so future JSONB `@>` rewrites won't collide.
     let rewritten = crate::range_udf::rewrite_range_operators(&rewritten);
->>>>>>> worktree-agent-a59745a1e5916e382
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
     let rewritten = crate::udf::rewrite_extract_second(&rewritten);
-<<<<<<< HEAD
     // Rewrite `expr AT TIME ZONE 'tz'` to `at_time_zone(expr, 'tz')` so
     // DataFusion's sqlparser sees a regular function call instead of the
     // AT TIME ZONE infix operator, which it may not handle for all types.
@@ -415,11 +402,9 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // Rewrite PG aggregate name aliases that DataFusion exposes under a
     // different name: `variance(x)` → `var(x)`, `every(x)` → `bool_and(x)`.
     let rewritten = crate::udf::rewrite_pg_agg_aliases(&rewritten);
-=======
     // Rewrite `'infinity'::timestamp` / `'-infinity'::timestamp` to the
     // `cast_infinity_timestamp(...)` UDF before sqlparser sees the SQL.
     let rewritten = crate::datetime_extras::rewrite_infinity_timestamp(&rewritten);
->>>>>>> worktree-agent-a675cd26807f9dc6b
     // User-defined `LANGUAGE sql` function inlining. The rewriter is a
     // no-op for tenants with no registered functions and for statements
     // that contain no function calls at all (the cheap pre-gate runs
@@ -709,7 +694,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             purge: _,
             temporary: _,
         } => crate::seq_ddl::exec_drop_sequence(sess, if_exists, &names).await,
-<<<<<<< HEAD
         Statement::Drop {
             object_type: sqlparser::ast::ObjectType::View,
             if_exists,
@@ -727,7 +711,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             }
             let name = single_part_name(&names[0])?.to_string();
             crate::view_ddl::exec_drop_view(sess, &name, if_exists).await
-=======
         // ── Schema DDL ──────────────────────────────────────────────────
         Statement::CreateSchema {
             schema_name,
@@ -778,7 +761,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
             }
->>>>>>> worktree-agent-a47826201518b8712
         }
         Statement::Insert(ins) => exec_insert(sess, ins).await,
         Statement::Query(_) => {
@@ -869,12 +851,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             crate::dml_mutate::exec_update(sess, table, assignments, from, selection, returning)
                 .await
         }
-<<<<<<< HEAD
         // ----- Cursor lifecycle ----- //
         Statement::Declare { stmts } => exec_declare(sess, stmts).await,
         Statement::Fetch { name, direction, .. } => exec_fetch(sess, &name.value, direction).await,
         Statement::Close { cursor } => exec_close(sess, cursor).await,
-=======
         Statement::Explain {
             analyze,
             verbose,
@@ -885,7 +865,6 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         } => {
             crate::explain::exec_explain(sess, analyze, verbose, format, options, statement).await
         }
->>>>>>> worktree-agent-a70ed6edbc9617ffc
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     }
 }
@@ -2737,7 +2716,6 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
         .await?;
     }
 
-<<<<<<< HEAD
     // View-reference rewriting: replace any reference to a known plain view
     // in the SQL's FROM / JOIN clauses with an inline subquery so DataFusion
     // sees a derived table rather than an unknown table name. This is a
@@ -2752,7 +2730,6 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
     } else {
         sql
     };
-=======
     // Strip schema qualifiers (`schema.table` → `table`) before DataFusion
     // sees the SQL. DataFusion uses its own catalog hierarchy; Basin's tables
     // are all registered in the flat default namespace, so `schema.table`
@@ -2762,7 +2739,6 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
         &sess.state.schema_state,
     );
     let sql_for_df = sql_stripped.as_str();
->>>>>>> worktree-agent-a47826201518b8712
 
     let mut df = sess
         .ctx

@@ -1,13 +1,10 @@
-<<<<<<< HEAD
 //! No-op-accept dispatch for DBA / RBAC primitives and compatibility
 //! statement kinds that Basin accepts syntactically but doesn't enforce or
 //! execute. Real permissions come from `auth.uid()` / `auth.role()` per
 //! ADRs 0005 / 0013.
-=======
 //! No-op-accept dispatch for DBA / RBAC primitives that Basin accepts
 //! syntactically but doesn't enforce. Real permissions come from
 //! `auth.uid()` / `auth.role()` per ADRs 0005 / 0013.
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 //!
 //! # Design
 //!
@@ -20,7 +17,6 @@
 //! For `EXPLAIN`: we return a synthetic single-row result with a human-readable
 //! message rather than an empty tag, so clients that expect a result set
 //! (e.g. `psql \e`, JDBC `executeQuery`) don't crash.
-<<<<<<< HEAD
 //!
 //! # LISTEN / NOTIFY / UNLISTEN
 //!
@@ -32,8 +28,6 @@
 //!
 //! Real cursor lifecycle is implemented by sibling agent a193aadd56ce5cb56.
 //! Those kinds are NOT noop-accepted here.
-=======
->>>>>>> worktree-agent-a0f45b8b5d58608d0
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -101,7 +95,6 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::Revoke => Some(ExecResult::Empty {
             tag: "REVOKE".into(),
         }),
-<<<<<<< HEAD
         // Session-variable control
         StmtKind::VariableSet => Some(ExecResult::Empty { tag: "SET".into() }),
         StmtKind::VariableShow => Some(ExecResult::Empty {
@@ -231,7 +224,6 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
             tag: "REINDEX".into(),
         }),
 
-=======
         // Session-variable control.
         // `SET search_path = …`, `RESET role`, etc. are no-op accepted.
         StmtKind::VariableSet => Some(ExecResult::Empty { tag: "SET".into() }),
@@ -248,7 +240,6 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 Some(ExecResult::Empty { tag: "SHOW".into() })
             }
         }
->>>>>>> worktree-agent-a0f45b8b5d58608d0
         // Everything else is not in our accept set.
         _ => None,
     }
