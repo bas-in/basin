@@ -861,10 +861,23 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             crate::dml_mutate::exec_update(sess, table, assignments, from, selection, returning)
                 .await
         }
+<<<<<<< HEAD
         // ----- Cursor lifecycle ----- //
         Statement::Declare { stmts } => exec_declare(sess, stmts).await,
         Statement::Fetch { name, direction, .. } => exec_fetch(sess, &name.value, direction).await,
         Statement::Close { cursor } => exec_close(sess, cursor).await,
+=======
+        Statement::Explain {
+            analyze,
+            verbose,
+            format,
+            options,
+            statement,
+            ..
+        } => {
+            crate::explain::exec_explain(sess, analyze, verbose, format, options, statement).await
+        }
+>>>>>>> worktree-agent-a70ed6edbc9617ffc
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     }
 }
