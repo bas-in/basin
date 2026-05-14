@@ -220,6 +220,45 @@ impl ScalarUDFImpl for SetvalUdf {
     }
 }
 
+/// Tombstone UDF for `lastval() -> bigint`. Always errors on invocation;
+/// the pre-execution rewriter is the load-bearing path (same pattern as
+/// `NextvalUdf` / `CurrvalUdf` / `SetvalUdf`). `lastval()` takes no
+/// arguments so its signature is a zero-argument volatile scalar.
+#[derive(Debug)]
+pub(crate) struct LastvalUdf {
+    signature: Signature,
+}
+
+impl Default for LastvalUdf {
+    fn default() -> Self {
+        Self {
+            signature: Signature::nullary(Volatility::Volatile),
+        }
+    }
+}
+
+impl ScalarUDFImpl for LastvalUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "lastval"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        exec_err!(
+            "lastval: call was not resolved by the pre-execution rewriter; \
+             this is an internal error — please report it"
+        )
+    }
+}
+
 /// Tag for which kind of sequence call the rewriter saw. The
 /// `setval` advance flag is parsed out of the call's third argument
 /// (defaulting to `true`) by [`parse_seq_args`] rather than being
