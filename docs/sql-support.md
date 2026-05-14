@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778757323 (Unix epoch)
-SQL fragments tested: 460 total / 667 green (across all three configurations).
+Last run: 1778769346 (Unix epoch)
+SQL fragments tested: 460 total / 793 green (across all three configurations).
 
 ## Configurations
 
@@ -36,14 +36,14 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `DECLARE c CURSOR FOR SELECT 1` | 🚫 | 🚫 | 🚫 | feature not supported: DECLARE CURSOR is not supported (SQLSTATE 0A000) |
 | `FETCH 1 FROM c` | 🚫 | 🚫 | 🚫 | feature not supported: FETCH is not supported (SQLSTATE 0A000) |
 | `CLOSE c` | 🚫 | 🚫 | 🚫 | feature not supported: CLOSE is not supported (SQLSTATE 0A000) |
-| `LOCK TABLE t` | 🚫 | 🚫 | 🚫 | feature not supported: LOCK is not supported (SQLSTATE 0A000) |
-| `VACUUM` | 🚫 | 🚫 | 🚫 | feature not supported: VACUUM is not supported (SQLSTATE 0A000) |
-| `ANALYZE` | 🚫 | 🚫 | 🚫 | feature not supported: ANALYZE is not supported (SQLSTATE 0A000) |
-| `CLUSTER t` | 🚫 | 🚫 | 🚫 | feature not supported: CLUSTER is not supported (SQLSTATE 0A000) |
-| `EXPLAIN SELECT 1` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: EXPLAIN SELECT 1 |
-| `EXPLAIN ANALYZE SELECT 1` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: EXPLAIN ANALYZE SELECT 1 |
-| `SET search_path = public` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: SET search_path = public |
-| `SHOW search_path` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: SHOW search_path |
+| `LOCK TABLE t` | ✅ | ✅ | ✅ |  |
+| `VACUUM` | ✅ | ✅ | ✅ |  |
+| `ANALYZE` | ✅ | ✅ | ✅ |  |
+| `CLUSTER t` | ✅ | ✅ | ✅ |  |
+| `EXPLAIN SELECT 1` | ✅ | ✅ | ✅ |  |
+| `EXPLAIN ANALYZE SELECT 1` | ✅ | ✅ | ✅ |  |
+| `SET search_path = public` | ✅ | ✅ | ✅ |  |
+| `SHOW search_path` | ✅ | ✅ | ✅ |  |
 
 ## DDL/Other
 
@@ -76,7 +76,7 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fn()` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TRIGGER is not supported (SQLSTATE 0A000) |
 | `CREATE POLICY p ON t USING (id = 1)` | ✅ | ✅ | ✅ |  |
 | `DROP POLICY p ON t` | ✅ | ✅ | ✅ |  |
-| `COMMENT ON TABLE t IS 'x'` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: COMMENT ON TABLE t IS 'x' |
+| `COMMENT ON TABLE t IS 'x'` | ✅ | ✅ | ✅ |  |
 | `CREATE EXTENSION pgcrypto` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE EXTENSION is not supported (SQLSTATE 0A000) |
 | `CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW WHEN (NEW.id <> OLD.id) EXECUTE FUNCTION fn()` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TRIGGER is not supported (SQLSTATE 0A000) |
 | `CREATE TRIGGER trg INSTEAD OF DELETE ON vv FOR EACH ROW EXECUTE FUNCTION fn()` | 🛠 | 🛠 | 🛠 | setup failed: internal: CREATE VIEW (non-materialised) is not supported in v0… |
@@ -134,10 +134,10 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `ALTER TABLE t VALIDATE CONSTRAINT ck` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ADD, RENAME, PARTITION, SW… |
 | `SELECT * FROM ONLY t` | 🛠 | 🛠 | ✅ | internal: plan: Error during planning: table 'datafusion.public.only' not found |
 | `CREATE TABLE t_2024 PARTITION OF t FOR VALUES FROM (2024) TO (2025)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: P… |
-| `CREATE TABLE t (region TEXT) PARTITION BY LIST (region)` | 📜 | 📜 | 📜 | invalid schema: only PARTITION BY RANGE is supported in v0.1; got LIST |
-| `CREATE TABLE t (id INT) PARTITION BY HASH (id)` | 📜 | 📜 | 📜 | invalid schema: only PARTITION BY RANGE is supported in v0.1; got HASH |
-| `ALTER TABLE t ATTACH PARTITION p FOR VALUES IN ('us')` | 🛠 | 🛠 | 🛠 | setup failed: invalid schema: only PARTITION BY RANGE is supported in v0.1; g… |
-| `ALTER TABLE t DETACH PARTITION p` | 🛠 | 🛠 | 🛠 | setup failed: invalid schema: only PARTITION BY RANGE is supported in v0.1; g… |
+| `CREATE TABLE t (region TEXT) PARTITION BY LIST (region)` | ✅ | ✅ | ✅ |  |
+| `CREATE TABLE t (id INT) PARTITION BY HASH (id)` | ✅ | ✅ | ✅ |  |
+| `ALTER TABLE t ATTACH PARTITION p FOR VALUES IN ('us')` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ADD, RENAME, PARTITION, SW… |
+| `ALTER TABLE t DETACH PARTITION p` | 🛠 | 🛠 | 🛠 | setup failed: internal: parse error: sql parser error: Expected: end of state… |
 
 ## DML
 
@@ -270,8 +270,8 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `SELECT justify_hours(interval '36 hours')` | ✅ | ✅ | ✅ |  |
 | `SELECT justify_days(interval '40 days')` | ✅ | ✅ | ✅ |  |
 | `SELECT justify_interval(interval '1 mon -1 hour')` | ✅ | ✅ | ✅ |  |
-| `SELECT isfinite(NOW())` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'isfinite'. Did you m… |
-| `SELECT isfinite(date '2024-01-01')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'isfinite'. Did you m… |
+| `SELECT isfinite(NOW())` | ✅ | ✅ | ✅ |  |
+| `SELECT isfinite(date '2024-01-01')` | ✅ | ✅ | ✅ |  |
 | `SELECT 'infinity'::timestamp` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Parser error: Error parsing timestamp from 'i… |
 | `SELECT '-infinity'::timestamp` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Parser error: Error parsing timestamp from '-… |
 
@@ -283,30 +283,30 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `SELECT '{"a":1}'::jsonb ->> 'a'` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
 | `SELECT '{"a":1}'::jsonb #> '{a}'` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
 | `SELECT '{"a":1}'::jsonb @> '{"a":1}'` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
-| `SELECT jsonb_set('{"a":1}'::jsonb, '{a}', '2'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_set'. Did you … |
-| `SELECT jsonb_insert('{"a":[1,2]}'::jsonb, '{a,1}', '99'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_insert'. Did y… |
-| `SELECT jsonb_strip_nulls('{"a":1,"b":null}'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_strip_nulls'. … |
-| `SELECT jsonb_path_query('{"a":1}'::jsonb, '$.a')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_path_query'. D… |
-| `SELECT jsonb_path_exists('{"a":1}'::jsonb, '$.a')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_path_exists'. … |
-| `SELECT jsonb_path_match('{"a":1}'::jsonb, '$.a == 1')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_path_match'. D… |
+| `SELECT jsonb_set('{"a":1}'::jsonb, '{a}', '2'::jsonb)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_insert('{"a":[1,2]}'::jsonb, '{a,1}', '99'::jsonb)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_strip_nulls('{"a":1,"b":null}'::jsonb)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_path_query('{"a":1}'::jsonb, '$.a')` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_path_exists('{"a":1}'::jsonb, '$.a')` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_path_match('{"a":1}'::jsonb, '$.a == 1')` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
 | `SELECT '{"a":{"b":1}}'::jsonb @? '$.a.b'` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
 | `SELECT '{"a":1}'::jsonb @@ '$.a == 1'` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
-| `SELECT jsonb_typeof('1'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_typeof'. Did y… |
-| `SELECT jsonb_pretty('{"a":1}'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_pretty'. Did y… |
-| `SELECT jsonb_array_length('[1,2,3]'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_array_length'.… |
-| `SELECT jsonb_object_keys('{"a":1,"b":2}'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_object_keys'. … |
+| `SELECT jsonb_typeof('1'::jsonb)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_pretty('{"a":1}'::jsonb)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_array_length('[1,2,3]'::jsonb)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
+| `SELECT jsonb_object_keys('{"a":1,"b":2}'::jsonb)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
 | `SELECT * FROM jsonb_each('{"a":1}'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_each' not found |
 | `SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_each_text' not f… |
 | `SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_array_elements' … |
 | `SELECT * FROM jsonb_array_elements_text('["a","b"]'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_array_elements_t… |
-| `SELECT jsonb_build_object('a', 1, 'b', 2)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_build_object'.… |
-| `SELECT jsonb_build_array(1, 'a', true)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_build_array'. … |
-| `SELECT to_jsonb(ROW(1, 'a'))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'to_jsonb'. Did you m… |
+| `SELECT jsonb_build_object('a', 1, 'b', 2)` | ✅ | ✅ | ✅ |  |
+| `SELECT jsonb_build_array(1, 'a', true)` | ✅ | ✅ | ✅ |  |
+| `SELECT to_jsonb(ROW(1, 'a'))` | ✅ | ✅ | ✅ |  |
 | `SELECT to_json(ARRAY[1,2,3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'to_json'. Did you me… |
-| `SELECT row_to_json(t) FROM (SELECT 1 AS a) t` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'row_to_json'. Did yo… |
-| `SELECT array_to_json(ARRAY[1,2,3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'array_to_json'. Did … |
-| `SELECT jsonb_agg(id) FROM t` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_agg'. Did you … |
-| `SELECT jsonb_object_agg(name, id) FROM t` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_object_agg'. D… |
+| `SELECT row_to_json(t) FROM (SELECT 1 AS a) t` | 🛠 | 🛠 | 🛠 | internal: plan: Schema error: No field named t. Valid fields are t.a. |
+| `SELECT array_to_json(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
+| `SELECT jsonb_agg(id) FROM t` | 📜 | 📜 | 📜 | internal: execute: Execution error: jsonb_agg requires AggregateUDFImpl; defe… |
+| `SELECT jsonb_object_agg(name, id) FROM t` | 📜 | 📜 | 📜 | internal: execute: Execution error: jsonb_object_agg requires AggregateUDFImp… |
 | `SELECT '{"a":1,"b":2}'::jsonb - 'a'` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
 | `SELECT '{"a":1,"b":2}'::jsonb - ARRAY['a','b']` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
 | `SELECT '[1,2,3]'::jsonb - 1` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type JSONB |
@@ -340,15 +340,15 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `SELECT initcap('hello world')` | ✅ | ✅ | ✅ |  |
 | `SELECT split_part('a,b,c', ',', 2)` | ✅ | ✅ | ✅ |  |
 | `SELECT reverse('abc')` | ✅ | ✅ | ✅ |  |
-| `SELECT format('Hello, %s', 'world')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'format'. Did you mea… |
-| `SELECT format('%I.%s', 'schema', 'tab')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'format'. Did you mea… |
-| `SELECT quote_ident('table name')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'quote_ident'. Did yo… |
-| `SELECT quote_literal('abc')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'quote_literal'. Did … |
-| `SELECT quote_nullable(NULL)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'quote_nullable'. Did… |
+| `SELECT format('Hello, %s', 'world')` | ✅ | ✅ | ✅ |  |
+| `SELECT format('%I.%s', 'schema', 'tab')` | ✅ | ✅ | ✅ |  |
+| `SELECT quote_ident('table name')` | ✅ | ✅ | ✅ |  |
+| `SELECT quote_literal('abc')` | ✅ | ✅ | ✅ |  |
+| `SELECT quote_nullable(NULL)` | ✅ | ✅ | ✅ |  |
 | `SELECT regexp_match('abc123', '([a-z]+)([0-9]+)')` | ✅ | ✅ | ✅ |  |
-| `SELECT regexp_matches('abc123 def456', '[a-z]+\d+', 'g')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'regexp_matches'. Did… |
-| `SELECT regexp_split_to_array('a,b,c', ',')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'regexp_split_to_arra… |
-| `SELECT regexp_split_to_table('a,b,c', ',')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'regexp_split_to_tabl… |
+| `SELECT regexp_matches('abc123 def456', '[a-z]+\d+', 'g')` | ✅ | ✅ | ✅ |  |
+| `SELECT regexp_split_to_array('a,b,c', ',')` | ✅ | ✅ | ✅ |  |
+| `SELECT regexp_split_to_table('a,b,c', ',')` | ✅ | ✅ | ✅ |  |
 | `SELECT chr(65)` | ✅ | ✅ | ✅ |  |
 | `SELECT ascii('A')` | ✅ | ✅ | ✅ |  |
 | `SELECT char_length('hello')` | ✅ | ✅ | ✅ |  |
@@ -372,8 +372,8 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `COPY t FROM '/tmp/x' WITH (FORMAT csv, HEADER, DELIMITER ',')` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: COPY t FROM '/tmp/x' (FORMAT csv, HEADER, DELIM… |
 | `COPY (SELECT * FROM t) TO '/tmp/x' WITH (FORMAT csv)` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: COPY (SELECT * FROM t) TO '/tmp/x' (FORMAT csv) |
 | `DO $$ BEGIN RAISE NOTICE 'hi'; END; $$ LANGUAGE plpgsql` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an SQL statement, found: D… |
-| `COMMENT ON COLUMN t.id IS 'pk'` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: COMMENT ON COLUMN t.id IS 'pk' |
-| `COMMENT ON FUNCTION f(int) IS 'x'` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: comment object_type, found… |
+| `COMMENT ON COLUMN t.id IS 'pk'` | ✅ | ✅ | ✅ |  |
+| `COMMENT ON FUNCTION f(int) IS 'x'` | ✅ | ✅ | ✅ |  |
 | `SELECT pg_advisory_lock(1)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_advisory_lock'. D… |
 | `SELECT pg_advisory_unlock(1)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_advisory_unlock'.… |
 | `SELECT pg_try_advisory_lock(1)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_try_advisory_lock… |
@@ -386,30 +386,30 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 
 | SQL | Default | +PG\_QUERY | +PG\_PLAN | Notes |
 |---|---|---|---|---|
-| `SELECT int4range(1, 10)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'int4range'. Did you … |
+| `SELECT int4range(1, 10)` | ✅ | ✅ | ✅ |  |
 | `SELECT '[1,10)'::int4range` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type Custom(… |
-| `SELECT int4range(1,10) @> 5` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'int4range'. Did you … |
-| `SELECT int4range(1,10) && int4range(5,15)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'int4range'. Did you … |
-| `SELECT lower(int4range(1,10))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'int4range'. Did you … |
-| `SELECT upper(int4range(1,10))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'int4range'. Did you … |
-| `SELECT isempty(int4range(1,1))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'isempty'. Did you me… |
+| `SELECT int4range(1,10) @> 5` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot infer common array type for arr… |
+| `SELECT int4range(1,10) && int4range(5,15)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL binary opera… |
+| `SELECT lower(int4range(1,10))` | ✅ | ✅ | ✅ |  |
+| `SELECT upper(int4range(1,10))` | ✅ | ✅ | ✅ |  |
+| `SELECT isempty(int4range(1,1))` | ✅ | ✅ | ✅ |  |
 | `SELECT '[2020-01-01,2020-12-31]'::daterange` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type Custom(… |
-| `SELECT tsrange(NOW() - interval '1 hour', NOW())` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'tsrange'. Did you me… |
+| `SELECT tsrange(NOW() - interval '1 hour', NOW())` | ✅ | ✅ | ✅ |  |
 | `SELECT int4multirange(int4range(1,5), int4range(10,15))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'int4multirange'. Did… |
 
 ## Roles
 
 | SQL | Default | +PG\_QUERY | +PG\_PLAN | Notes |
 |---|---|---|---|---|
-| `CREATE ROLE alice` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: CREATE ROLE alice |
-| `CREATE ROLE alice WITH LOGIN PASSWORD 'pw'` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: CREATE ROLE alice LOGIN PASSWORD 'pw' |
-| `ALTER ROLE alice WITH SUPERUSER` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE ROLE alice |
-| `DROP ROLE alice` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE ROLE alice |
-| `GRANT SELECT ON t TO alice` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE ROLE alice |
-| `GRANT ALL PRIVILEGES ON t TO alice` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE ROLE alice |
-| `REVOKE INSERT ON t FROM alice` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE ROLE alice |
-| `SET ROLE alice` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: SET ROLE alice |
-| `RESET ROLE` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an SQL statement, found: R… |
+| `CREATE ROLE alice` | ✅ | ✅ | ✅ |  |
+| `CREATE ROLE alice WITH LOGIN PASSWORD 'pw'` | ✅ | ✅ | ✅ |  |
+| `ALTER ROLE alice WITH SUPERUSER` | ✅ | ✅ | ✅ |  |
+| `DROP ROLE alice` | ✅ | ✅ | ✅ |  |
+| `GRANT SELECT ON t TO alice` | ✅ | ✅ | ✅ |  |
+| `GRANT ALL PRIVILEGES ON t TO alice` | ✅ | ✅ | ✅ |  |
+| `REVOKE INSERT ON t FROM alice` | ✅ | ✅ | ✅ |  |
+| `SET ROLE alice` | ✅ | ✅ | ✅ |  |
+| `RESET ROLE` | ✅ | ✅ | ✅ |  |
 | `SELECT current_user` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'current_user'. Did y… |
 | `SELECT session_user` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'session_user'. Did y… |
 
@@ -552,8 +552,8 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | SQL | Default | +PG\_QUERY | +PG\_PLAN | Notes |
 |---|---|---|---|---|
 | `CREATE SCHEMA myschema` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: CREATE SCHEMA myschema |
-| `CREATE SCHEMA AUTHORIZATION alice` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE ROLE alice |
-| `SET search_path = myschema, public` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: SET search_path = myschema, public |
+| `CREATE SCHEMA AUTHORIZATION alice` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: CREATE SCHEMA AUTHORIZATION alice |
+| `SET search_path = myschema, public` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE myschema.t (id INT)` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE SCHEMA myschema |
 | `DROP SCHEMA myschema CASCADE` | 🛠 | 🛠 | 🛠 | setup failed: internal: unsupported in PoC: CREATE SCHEMA myschema |
 
@@ -608,3 +608,10 @@ SQL fragments tested: 460 total / 667 green (across all three configurations).
 | `CREATE TABLE __t (c INT4RANGE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: INT4RANGE |
 | `CREATE TABLE __t (c VECTOR(3)); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 
+---
+
+## Missing something?
+
+If you tried PG syntax that's not in this matrix, [open an issue](https://github.com/bas-in/basin/issues/new?template=sql_compatibility.yml&title=Missing+SQL+syntax%3A+) — we triage compatibility gaps within 48 hours.
+
+This page is regenerated by `cargo test -p basin-integration-tests --test sql_support_matrix`. To suggest an addition to the matrix, edit `tests/integration/tests/sql_support_matrix.rs` and rerun.

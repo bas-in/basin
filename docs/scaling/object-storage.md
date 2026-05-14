@@ -1,8 +1,8 @@
-# Object Storage Scaling — Cloudflare R2 (zero egress) with S3 fallback
+# Object Storage Scaling — S3-compatible backends (Tigris, R2, S3, MinIO)
 
 Status: design + skeleton (2026-05-11)
 Scope: how `basin-storage` and `basin-wal` reach a real object store in
-deployed configurations, and why R2 is the default for the managed cloud.
+deployed configurations, and which backends are supported.
 
 This is the scaling-story companion to `docs/architecture.md` §Layer 4. The
 hot-path durability boundary is still the Raft WAL on local NVMe (ADR 0009);
@@ -30,16 +30,16 @@ Key facts (verified against `crates/basin-storage/src/`):
   without any engine code change.
 - `src/lib.rs::delete_stream_for` already has a special case for the
   `AmazonS3` backend (detected by `Debug` prefix) that rides the bulk
-  `DeleteObjects` API. R2 prints `"AmazonS3(...)"` too (it *is* the AmazonS3
-  backend pointed at a different endpoint), so it inherits this fast path
-  for free.
+  `DeleteObjects` API. Tigris, R2, and other S3-compatible stores also print
+  `"AmazonS3(...)"` (they *are* the AmazonS3 backend pointed at a different
+  endpoint), so they all inherit this fast path for free.
 - `basin-wal` (`crates/basin-wal/src/lib.rs::WalConfig`) takes the same
   `Arc<dyn ObjectStore>` shape. WAL segments live at
   `{root}/wal/{tenant}/{partition}/{ulid}.seg` — orthogonal prefix from
   Parquet data; lifecycle rules are configured separately.
 - The workspace already pulls `object_store = { version = "0.11", features =
   ["aws", "gcp", "http"] }` (root `Cargo.toml` L71). The `aws` feature is
-  what we need for R2; no new dep is required.
+  what we need for S3-compatible backends; no new dep is required.
 
 Today's only real-world wiring (in `services/basin-server/src/main.rs`)
 builds a `LocalFileSystem` rooted at `BASIN_DATA_DIR`. This is honest for
@@ -47,97 +47,88 @@ single-machine deployments and the Fly volume case, but it doesn't scale
 across machines or regions and it doesn't decouple compute from storage.
 Everything below is a small extension to that wiring — no trait changes.
 
-## 2. Why R2
+## 2. Backend cost comparison
 
-Cloudflare R2 is S3-API-compatible, but the pricing curve is materially
-different from AWS S3:
+The three most common cloud backends have materially different pricing curves:
 
-| Item            | AWS S3 (us-east-1)         | Cloudflare R2          |
-|-----------------|----------------------------|------------------------|
-| Storage         | $0.023 / GB-month          | $0.015 / GB-month      |
-| Egress to net   | $0.09 / GB (after 100 GB)  | **$0.00 / GB**         |
-| Egress to peer  | $0.02 / GB (intra-region)  | $0.00 / GB             |
-| Class A (write) | $0.005 / 1k                | $0.0045 / 1k           |
-| Class B (read)  | $0.0004 / 1k               | $0.00036 / 1k          |
-| Data ingress    | $0.00                      | $0.00                  |
+| Item            | AWS S3 (us-east-1)         | Cloudflare R2          | Tigris (Fly-native)    |
+|-----------------|----------------------------|------------------------|------------------------|
+| Storage         | $0.023 / GB-month          | $0.015 / GB-month      | $0.02 / GB-month       |
+| Egress to net   | $0.09 / GB (after 100 GB)  | **$0.00 / GB**         | $0.01 / GB             |
+| Egress Fly-intl | $0.02 / GB (intra-region)  | $0.00 / GB             | **$0.00 / GB** (Fly ↔ Tigris) |
+| Class A (write) | $0.005 / 1k                | $0.0045 / 1k           | $0.05 / 1M             |
+| Class B (read)  | $0.0004 / 1k               | $0.00036 / 1k          | $0.005 / 1M            |
+| Data ingress    | $0.00                      | $0.00                  | $0.00                  |
 
-The line that drives the architecture is **egress = $0.00**. Three concrete
-implications:
+The basin-cloud managed service runs on **Fly.io + Tigris**. Tigris is Fly's
+native S3-compatible store; traffic between Fly Machines and Tigris does not
+egress to the public internet, keeping latency low and egress cost zero for
+intra-Fly traffic.
 
-1. **Globally distributed read replicas pay zero per-byte to hit central
-   storage.** A reader in Sydney pulling a Parquet file written in
-   Johannesburg costs the same as a colocated reader. With S3 the same
-   pattern is roughly $90 per TB read, per replica, per access. This is the
-   reason the managed cloud's read-replica story (ADR 0004) is even
-   financially viable on R2.
-2. **CDN-style fan-out is free.** When the dashboard or a SDK consumer
-   reads a Parquet file through a signed URL, R2 charges the operator
-   nothing for the byte stream that leaves Cloudflare's edge. S3 would
-   charge per consumer.
-3. **Writes are free too.** R2's write side (`PutObject`) costs only the
-   Class A operation; the bytes themselves are uncharged. Compactor
-   write-amplification (writing the cold-tier copy of a hot file) is not
-   penalised on the egress line.
+For self-hosted deployments: `BASIN_STORAGE_BACKEND` selects per deployment.
+All three backends above work, plus MinIO, Wasabi, Backblaze B2, and any
+S3-compatible endpoint. `LocalFileSystem` remains the default for single-machine
+and development setups.
 
-What R2 charges for is small and bounded: storage GB-month and Class A/B
-ops. For a Parquet workload those operations are amortised by row-group
-size (we target ~128 MB Parquet files), so the op-count per GB is in the
-single digits.
+## 3. S3-compatible backend: how to wire it
 
-The OSS engine doesn't *require* R2 — `BASIN_STORAGE_BACKEND` selects per
-deployment. R2 is the cloud's default; self-hosters can keep
-`LocalFileSystem` or `s3` and the same code paths run.
+All S3-compatible endpoints (Tigris, R2, AWS S3, MinIO, etc.) use the same
+`AmazonS3Builder` under the hood. Examples:
 
-## 3. R2 backend: how to wire it
+**Tigris** (basin-cloud default):
 
-Cloudflare's S3-compatible endpoint takes this shape:
+    endpoint: https://fly.storage.tigris.dev
+    region:   auto
 
-    https://<account-id>.r2.cloudflarestorage.com
+**Cloudflare R2**:
 
-Region must be the literal string `auto`. R2 returns 400 on any other
-region for SigV4 reasons. Credentials are an access-key-id / secret-pair
-generated under the bucket's IAM settings.
+    endpoint: https://<account-id>.r2.cloudflarestorage.com
+    region:   auto   # R2 requires "auto"; returns 400 on any other value
+
+Credentials are an access-key-id / secret-pair generated in the provider's
+dashboard or provisioned automatically (e.g. `fly storage create` sets
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_ENDPOINT_URL_S3`
+automatically for Tigris).
 
 Because `object_store::aws::AmazonS3Builder` already accepts a custom
-endpoint, **R2 is "just" an `AmazonS3` constructed with three knobs**:
+endpoint, **every S3-compatible store is "just" an `AmazonS3` constructed with three knobs**:
 
 ```rust
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use object_store::ObjectStore;
 
-fn build_r2(cfg: &R2Config) -> anyhow::Result<Arc<dyn ObjectStore>> {
+fn build_s3_compatible(cfg: &S3LikeConfig) -> anyhow::Result<Arc<dyn ObjectStore>> {
     let store = AmazonS3Builder::new()
-        .with_endpoint(&cfg.endpoint)       // https://<acc>.r2.cloudflarestorage.com
-        .with_region("auto")                // R2 requires "auto"
+        .with_endpoint(&cfg.endpoint)       // e.g. https://fly.storage.tigris.dev
+        .with_region("auto")                // Tigris / R2 use "auto"; AWS uses a real region
         .with_bucket_name(&cfg.bucket)
         .with_access_key_id(&cfg.access_key_id)
         .with_secret_access_key(&cfg.secret_access_key)
         // Required when not running behind a TLS-terminating proxy that
-        // injects v2 path-style — R2 expects virtual-hosted-style today.
+        // injects v2 path-style — Tigris / R2 expect virtual-hosted-style today.
         .with_virtual_hosted_style_request(true)
         .build()?;
     Ok(Arc::new(store))
 }
 ```
 
-There is no new trait, no new transport, no `r2`-feature flag. The
-`AmazonS3` backend's `delete_stream` bulk path works against R2 unchanged
-(R2 implements the SigV4 `DeleteObjects` action).
+There is no new trait, no new transport, no provider-specific feature flag. The
+`AmazonS3` backend's `delete_stream` bulk path works against all S3-compatible
+stores (they all implement the SigV4 `DeleteObjects` action).
 
 Self-hostable example: `crates/basin-storage/src/backends/r2.rs` (see §6).
 
 ## 4. Migration path
 
-There is no breaking migration. The existing S3 backend (if anyone is
-running one) keeps working; R2 is an additional value of
-`BASIN_STORAGE_BACKEND`.
+There is no breaking migration. All existing backends keep working.
 
 | `BASIN_STORAGE_BACKEND` | Backend                                  | Notes                  |
 |-------------------------|------------------------------------------|------------------------|
 | `local` (default)       | `object_store::local::LocalFileSystem`   | today's behaviour      |
 | `s3`                    | `AmazonS3` with `us-east-1` (or env)     | classic AWS S3         |
-| `r2`                    | `AmazonS3` with `auto` + R2 endpoint     | new                    |
+| `r2`                    | `AmazonS3` with `auto` + R2 endpoint     | Cloudflare R2          |
+| `tigris`                | `AmazonS3` with `auto` + Tigris endpoint | Fly-native; basin-cloud default |
 | `memory` (tests)        | `object_store::memory::InMemory`         | unchanged              |
 
 The catalog stores object keys verbatim. If you ever do want to migrate
@@ -147,15 +138,16 @@ S3 API on both sides — Basin doesn't need to know.
 ## 5. Cold-tier story
 
 The cold-tier mechanic is already implemented in `basin-storage` and lives
-under the `cold/` segment of the table prefix. The R2 angle is purely
-operational:
+under the `cold/` segment of the table prefix. The operational setup is
+provider-specific but the engine code is unchanged across backends:
 
 - After N days (configurable, default 30) the compactor rewrites a hot
   Parquet file to its cold-tier sibling key via `paths::rewrite_to_cold`.
   See `src/tier.rs`.
 - A bucket-side lifecycle rule on the `tenants/*/tables/*/cold/` prefix
-  flips the storage class to **R2 Infrequent Access** (or S3-IA). Setup is
-  one-time via `wrangler r2 bucket lifecycle ...` or the dashboard.
+  flips the storage class to the infrequent-access tier for your provider
+  (S3-IA on AWS S3, R2 Infrequent Access on Cloudflare R2, or provider
+  equivalent). Setup is one-time via the provider dashboard or CLI.
 - Old WAL segments follow the same shape: a lifecycle rule on the
   `wal/{tenant}/...` prefix transitions segments older than the
   configured retention window (today: drop entirely; tomorrow: cold-tier
@@ -165,10 +157,6 @@ operational:
   `tier: Hot|Cold` so the planner can prefer hot files when both are
   acceptable answers.
 
-R2-specific note: R2's Infrequent Access class also has zero egress. The
-storage discount is real (~$0.01/GB-month vs $0.015 standard) and there is
-no retrieval fee, unlike S3-IA which charges $0.01/GB on read.
-
 ## 6. Configuration shape
 
 The engine reads four env vars at boot. The credentials never enter the
@@ -176,12 +164,12 @@ fly.toml — they ride `fly secrets set`.
 
 | Env var                       | Required for     | Example                                                  |
 |-------------------------------|------------------|----------------------------------------------------------|
-| `BASIN_STORAGE_BACKEND`       | always (default `local`) | `r2` / `s3` / `local` / `memory`                  |
-| `BASIN_STORAGE_BUCKET`        | `r2`, `s3`       | `basin-engine-dev`                                       |
-| `BASIN_STORAGE_ENDPOINT`      | `r2`             | `https://<account-id>.r2.cloudflarestorage.com`          |
-| `BASIN_STORAGE_REGION`        | `r2`, `s3`       | `auto` (R2) or `us-east-1` (S3)                          |
-| `BASIN_STORAGE_ACCESS_KEY_ID` | `r2`, `s3` (secret) | from `fly secrets set`                                |
-| `BASIN_STORAGE_SECRET_ACCESS_KEY` | `r2`, `s3` (secret) | from `fly secrets set`                            |
+| `BASIN_STORAGE_BACKEND`       | always (default `local`) | `tigris` / `r2` / `s3` / `local` / `memory`       |
+| `BASIN_STORAGE_BUCKET`        | S3-compatible backends   | `basin-engine-dev`                                  |
+| `BASIN_STORAGE_ENDPOINT`      | S3-compatible backends   | `https://fly.storage.tigris.dev` (Tigris) or `https://<account-id>.r2.cloudflarestorage.com` (R2) |
+| `BASIN_STORAGE_REGION`        | S3-compatible backends   | `auto` (Tigris / R2) or `us-east-1` (S3)           |
+| `BASIN_STORAGE_ACCESS_KEY_ID` | S3-compatible (secret)   | from `fly secrets set` or `fly storage create`      |
+| `BASIN_STORAGE_SECRET_ACCESS_KEY` | S3-compatible (secret) | from `fly secrets set` or `fly storage create`  |
 | `BASIN_STORAGE_ROOT_PREFIX`   | optional         | `warehouse` — sub-key all tenant data under one prefix   |
 
 In `services/basin-server/src/main.rs` the existing `LocalFileSystem`
@@ -202,37 +190,37 @@ let store: Arc<dyn ObjectStore> = match std::env::var("BASIN_STORAGE_BACKEND")
 };
 ```
 
-`R2Config::from_env` does the env-var parsing and produces a ready
+`S3LikeConfig::from_env` does the env-var parsing and produces a ready
 `Arc<dyn ObjectStore>` via the `AmazonS3Builder` path in §3. The same
-helper covers S3 (different defaults for `region`; no required endpoint).
+helper covers all S3-compatible backends (different endpoint / region defaults
+per provider; Tigris defaults to `https://fly.storage.tigris.dev`; R2
+requires an explicit endpoint; plain `s3` uses AWS defaults).
 
 The WAL takes the same `Arc<dyn ObjectStore>` and can either share the
 Parquet bucket (different prefix) or use a separate bucket — controlled by
 `BASIN_WAL_BACKEND` mirroring `BASIN_STORAGE_BACKEND`. For Fly's case the
-NVMe-backed local WAL stays — durability is local-fsync — and R2 is only
-the eventual flush target.
+NVMe-backed local WAL stays — durability is local-fsync — and the object
+store is only the eventual flush target.
 
 ## 7. What this design does NOT change
 
 - The hot-path append latency. The WAL still fsyncs locally and acks
-  before R2 sees anything. R2 only enters the picture on the background
-  flush + on Parquet writes (which are already async, batched, and
-  off-thread).
+  before the object store sees anything. The object store only enters the
+  picture on the background flush + on Parquet writes (which are already
+  async, batched, and off-thread).
 - The tenant isolation invariant. Every key still goes through
-  `paths::data_file_key` and begins with `tenants/{tenant}/`. R2 is
-  one bucket, many tenants, prefix-isolated — same as the S3 model.
-- The catalog. R2 stores opaque keys; the catalog is unchanged.
+  `paths::data_file_key` and begins with `tenants/{tenant}/`. The bucket is
+  shared across tenants, prefix-isolated — same model for all backends.
+- The catalog. The object store holds opaque keys; the catalog is unchanged.
 - Tests. `InMemory` and `LocalFileSystem` remain the test backends; no
-  test needs network or real R2 credentials.
+  test needs network or real credentials.
 
 ## 8. Open questions (out of scope for this skeleton)
 
-- Multi-region buckets. R2's "jurisdictional" bucket regions (`auto`
-  picks Cloudflare's choice; `eu`, `fedramp` are pinned) — do we want to
-  pin per-tenant? Likely yes for compliance, deferred.
+- Multi-region buckets. Tigris, R2, and S3 all offer cross-region replication
+  at the bucket level — pin per-tenant? Likely yes for compliance, deferred.
 - Signed URLs for direct-from-edge reads (so the SDK could skip the
-  engine entirely on big Parquet downloads). R2 supports presigned URLs
-  via the S3 API; this is a basin-cloud surface, not basin-engine.
-- Per-tenant credentials. Currently one bucket-wide key; R2 supports
-  bucket-scoped keys, but per-tenant scoping would require Cloudflare API
-  Tokens with object-prefix scoping — out of scope for v0.1.
+  engine entirely on big Parquet downloads). All three backends support
+  presigned URLs via the S3 API; this is a basin-cloud surface, not basin-engine.
+- Per-tenant credentials. Currently one bucket-wide key; per-tenant scoping
+  would require provider-specific IAM/token APIs — out of scope for v0.1.

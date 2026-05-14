@@ -34,7 +34,8 @@ pub(crate) fn data_file_key(
 
 /// Tier-aware variant of [`data_file_key`]. Cold-tier writes land under
 /// `tables/{t}/cold/...` so a single object-store lifecycle rule on the
-/// `cold/` prefix can flip the underlying storage class to S3-IA / R2-IA.
+/// `cold/` prefix can flip the underlying storage class to the infrequent-access
+/// tier (S3-IA on AWS S3, R2-IA on Cloudflare R2, or provider equivalent).
 pub(crate) fn data_file_key_in_tier(
     root: Option<&ObjectPath>,
     tenant: &TenantId,

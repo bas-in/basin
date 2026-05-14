@@ -17,7 +17,7 @@
 //! - Centralised defaults: `region = "auto"` for R2 and Tigris,
 //!   virtual-hosted-style on, anonymous-credentials off. Easy to get wrong
 //!   by hand.
-//! - One place to add provider-specific tweaks (e.g. R2's IA storage class
+//! - One place to add provider-specific tweaks (e.g. provider IA storage class
 //!   when we wire lifecycle policies through the engine instead of the
 //!   bucket dashboard).
 //!

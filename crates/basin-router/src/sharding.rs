@@ -19,7 +19,7 @@
 //! consistent-hash bucketize them is fine *until* it lands two whales on
 //! the same shard. Pinning lets the operator say "this whale always goes
 //! to endpoint #2" — typically a node provisioned with bigger compute,
-//! still sharing the same R2 bucket.
+//! still sharing the same object-store bucket.
 //!
 //! Source for pins in v0.1 is `BASIN_TENANT_PINS`, a comma-separated
 //! list of `tenant_ulid:endpoint_index` pairs. Empty/unset = no pins.

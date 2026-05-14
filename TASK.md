@@ -154,8 +154,8 @@ explicit tests.
       tenant_id → shard_id; 28% max load skew measured; restart survival.
       Cross-shard JOIN deferred.
 - [x] **Tiered storage (hot/cold)**: `ALTER TABLE … SET cold_after = N`;
-      compactor moves files between tiers on a sweep. R2 Infrequent
-      Access wired in.
+      compactor moves files between tiers on a sweep. Provider-level
+      infrequent-access lifecycle rules wired in.
 - [x] **Within-tenant whale handling (sub-shard)**: tenant pinning via
       `BASIN_TENANT_PINS=ulid:idx,...` env var; pinned tenants always
       land on the configured shard endpoint regardless of consistent
@@ -164,7 +164,7 @@ explicit tests.
       below for context:
       **Within-tenant whale handling (sub-shard)**: a 100×-larger
       tenant gets pinned to a dedicated shard owner with bigger
-      compute. Cheap because data stays in shared R2. Folds into the
+      compute. Cheap because data stays in shared object storage. Folds into the
       compute-sharding work — same router, just pinned mapping.
 
 ## Phase 5.7 — Point-query latency: caching + indexes + hot tier (3-6 months)

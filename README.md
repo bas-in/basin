@@ -5,8 +5,10 @@
 <h1 align="center">Basin</h1>
 
 <p align="center">
-  <strong>The multi-tenant Postgres-compatible database that lives on object storage.</strong><br>
-  Per-tenant isolation, 10× cheaper storage than Postgres, single architecture from one tenant to a hundred thousand.
+  <strong>Cheap Postgres on object storage.</strong><br>
+  A Postgres-compatible database that stores every byte as ZSTD-compressed Parquet on S3.
+  Up to 12× smaller on disk, 47× less RAM per connection, and spinning up a new project is
+  a bucket-prefix away — no new VM, no per-DB minimum bill.
 </p>
 
 <p align="center">
@@ -15,12 +17,12 @@
   <a href="./CHANGELOG.md"><img alt="changelog" src="https://img.shields.io/badge/changelog-keep--a--changelog-blue?style=flat-square"></a>
   <a href="./WEDGE.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
   <a href="./benchmark/RESULTS_localfs.md"><img alt="tests passing" src="https://img.shields.io/badge/tests-passing-brightgreen?style=flat-square"></a>
-  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: point query 3.5x faster" src="https://img.shields.io/badge/vs_postgres-point_3.5%C3%97_faster-blue?style=flat-square"></a>
   <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: disk 12.5x smaller" src="https://img.shields.io/badge/vs_postgres-disk_12.5%C3%97_smaller-blue?style=flat-square"></a>
-  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 10x more conns" src="https://img.shields.io/badge/vs_postgres-10%C3%97_more_conns-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: point query 3.5x faster" src="https://img.shields.io/badge/vs_postgres-point_3.5%C3%97_faster-blue?style=flat-square"></a>
   <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 47x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-47%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
   <a href="./CAPABILITIES.md"><img alt="capabilities" src="https://img.shields.io/badge/capabilities-matrix-blue?style=flat-square"></a>
-  <a href="./docs/decisions/"><img alt="decisions" src="https://img.shields.io/badge/decisions-ADR_tracked-blueviolet?style=flat-square"></a>
+  <a href="./docs/sql-support.md"><img alt="SQL support matrix" src="https://img.shields.io/badge/SQL_support-matrix-blue?style=flat-square"></a>
+  <a href="./PRICING.md"><img alt="pricing" src="https://img.shields.io/badge/pricing-1_project_free-green?style=flat-square"></a>
   <a href="./LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square"></a>
 </p>
 
@@ -28,22 +30,17 @@
 
 ## Why Basin
 
-Multi-tenant SaaS built on Postgres hits a wall: per-project pricing destroys the unit economics, RLS isolation is logical-only, audit-log retention costs more than the application revenue. Basin keeps the **Postgres wire protocol and SQL** your apps already speak, but stores every byte as ZSTD-compressed Parquet under a **per-tenant bucket prefix**. Idle tenants cost essentially nothing. Active tenants get low-latency writes through the WAL path. Tenant deletion is a prefix delete, not a `DELETE` cascade.
+**Storage is cheap because it lives on S3-compatible object storage.** Every table is ZSTD-1 Parquet under a project prefix in your bucket of choice (Tigris, AWS S3, Cloudflare R2, local FS). Audit-log-shaped data is 12.5× smaller than Postgres heap on the same workload. Object storage runs $0.015–$0.02/GB/mo — back-of-envelope, what costs $25/mo on Postgres-class block storage is $0.30/mo on Basin.
 
-One architecture from a 10 MB hobbyist tenant to a 100 TB enterprise tenant. No tier wall. No forced migrations. No "you've outgrown us" conversation.
+**Projects are essentially free to create.** A new project is a new bucket prefix. No fork-per-connection. No provisioned VM. No per-DB pricing minimum. Idle projects cost only their bytes. Spin up one project for a side app, or ten thousand for a SaaS — same architecture, same binary.
 
----
+**Compute is light.** Pure-Rust async server. **165 KiB** of RAM per held-open connection vs Postgres's 7.9 MiB — 47× less. 1,000 concurrent connections held without refusal where Postgres caps at 100. The structural advantage comes from being a from-scratch tokio server, not a forking daemon.
 
-## Ecosystem
+**Real Postgres on the wire.** Pgwire v3, simple + extended query, TLS (rustls), `COPY FROM STDIN` / `COPY TO STDOUT`, prepared statements with binary parameters (native JSONB, UUID, BYTEA). Works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM — every Postgres driver. Your ORM doesn't know it isn't talking to Postgres.
 
-Basin (this repo) is the data plane. Three sibling repos sit around it:
+**Object storage unlocks time travel.** Tables are Apache Iceberg snapshots; rollback to any prior snapshot is a metadata write. Forks are zero-copy. Point-in-time restore is a `rollback_to_snapshot` call. No WAL archive to manage, no base-backup-plus-replay dance.
 
-- **[`bas-in/basin-cloud`](https://github.com/bas-in/basin-cloud)** — control plane and dashboard (Go + Vite/JSX SPA, Apache-2.0). Manages orgs, projects, billing, and the auth surface for the hosted dashboard; runs Basin engines on Fly Machines per project. Operators who want a managed UI, multi-project orchestration, and per-project engine URLs use it. Operators running a single self-hosted engine do not need it — basin-server alone is sufficient.
-- **[`bas-in/basin-cli`](https://github.com/bas-in/basin-cli)** — operator daily-driver (Go, Apache-2.0, stdlib-only). `basin login`, `basin projects list`, `basin sql run`, release artefacts are Sigstore-signed. Talks to basin-cloud's `/v1/*` API; not used against a standalone engine.
-- **[`bas-in/basin-js`](https://github.com/bas-in/basin-js)** — TypeScript SDK (MIT). Supabase-shaped `createClient(url, anonKey)` that talks **directly** to a Basin engine (pgwire + REST), not through basin-cloud. Browser, Node, Deno, Bun, Cloudflare Workers. Distributed as [`jsr:@bas-in/basin-js`](https://jsr.io/@bas-in/basin-js) and [`npm:@bas-in/basin-js`](https://www.npmjs.com/package/@bas-in/basin-js).
-- **Planned client SDKs** — basin-py, basin-rs, basin-go, basin-dart, basin-swift, basin-kotlin. All will follow the same engine-direct shape as basin-js.
-
-**Licensing rationale.** Server-side projects (basin engine, basin-cloud, basin-cli) are Apache-2.0 to carry the patent grant operators expect from infrastructure. Client SDKs (basin-js and future siblings) are MIT to match the norm of the SDK ecosystems they sit in (`npm`, `jsr`, `crates.io`, `pypi`, etc.) — friction-free linking from MIT or proprietary apps.
+**One binary, not five.** Native vector search (`vector(N)` + `<->` / `<#>` / `<=>`, HNSW per Parquet segment — no `pg_vector` install). Aggregate / GROUP BY queries auto-route to a DuckDB analytical engine reading the same Iceberg tables — 4.6× faster than DataFusion on million-row aggregates. Signup / JWT / refresh-token auth and a PostgREST-shape HTTP API are part of the same server. `pg_cron`, `pg_net`, `pg_trgm`, `PostGIS` subset, `TimescaleDB`-style continuous aggregates, `pgcrypto`, `uuid-ossp` — all native crates, no extension install.
 
 ---
 
@@ -68,23 +65,12 @@ Basin (this repo) is the data plane. Three sibling repos sit around it:
 | **Refused connections under flood** | **0** | 900 | Basin doesn't refuse a single one |
 | **RAM per held-open connection** | **165 KiB** | 7,895 KiB | **Basin wins 47.7×** |
 | **Connection-accept latency p50** | **1.17 ms** | 1.37 ms | Basin wins 1.17× |
+| **Schema migration** `ADD COLUMN` (100K rows, no default) | **0.04 ms** (metadata-only) | 1.45 ms | Basin wins ~37× |
 
 The connection-scaling and RSS results are the **structural** advantage of being a from-scratch Rust-on-tokio server vs Postgres's fork-per-connection model. They don't shrink as the workload grows; they get more dramatic.
 
-### Multi-tenant lifecycle
-
-| | Basin | Postgres | Result |
-|---|---|---|---|
-| **Idle-tenant RAM cost** (1,000 tenants) | **1.2 KiB / tenant** | ~10 MB / tenant (one DB each) | **Basin wins ~10,000×** |
-| **Schema migration** `ADD COLUMN` (100K rows, no default) | **0.04 ms** (metadata-only) | 1.45 ms | Basin wins ~37× |
-| **Tenant deletion** (100K rows / 100 files, local FS) | 4.77 ms | 3.47 ms | PG wins 0.73× — honest, see below |
-| **Cross-tenant isolation under 2,000 mixed ops** | **0 leaks** | n/a | Structural via bucket prefix |
-| **Noisy-neighbor p99 degradation** | **2.27×** | n/a | Passes the < 5× bar |
-
-> **Honest mixed result on tenant deletion at 100K rows on local FS:** PG's `DROP SCHEMA CASCADE` is a few catalog rows and an `unlink`; Basin's `O(file count)` deletion does 100 separate `delete()` calls. The wedge claim — bucket-prefix delete vs vacuum / extent walks — surfaces at scale (multi-GB tenants on S3), not on a small tmpfs table. Reported as-measured; the dashboard tells the full story.
-
 Full live dashboard: open [`benchmark/index_localfs.html`](./benchmark/index_localfs.html) directly (no server needed).
-Auto-regenerated Markdown report: [`benchmark/RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md). Real-cloud (R2 / AWS S3) results: [`benchmark/index_real.html`](./benchmark/index_real.html). Self-hosted SeaweedFS: [`benchmark/index_seaweedfs.html`](./benchmark/index_seaweedfs.html).
+Auto-regenerated Markdown report: [`benchmark/RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md). Real-cloud (S3-compatible store) results: [`benchmark/index_real.html`](./benchmark/index_real.html). Self-hosted SeaweedFS: [`benchmark/index_seaweedfs.html`](./benchmark/index_seaweedfs.html).
 
 ### Think a benchmark is unfair? Tell us.
 
@@ -103,6 +89,20 @@ explain why we think the test is fair. Decisions get logged in
 
 ---
 
+## Pricing
+
+[`PRICING.md`](./PRICING.md) has the full table. TL;DR:
+
+- **Free** — 1 project, scales-to-zero, forever. No card.
+- **Hobby** — $5/mo. 1 always-on project, 5 GB included.
+- **Pro** — $29/mo. 10 projects, 50 GB included, daily PITR, zero-copy branches.
+- **Scale** — $99/mo. 100 projects, 250 GB, multi-region replicas, 99.95% SLA.
+- **Enterprise** — bring-your-own-bucket, bring-your-own-key, SSO, SOC2, custom SLA.
+
+Self-hosting is Apache-2.0 and free forever. See [`PRICING.md`](./PRICING.md#self-hosted) for the comparison vs Neon, Supabase, Aurora.
+
+---
+
 ## Quickstart
 
 Install basin, point it at a data dir, run. No external object store is needed
@@ -117,10 +117,7 @@ That gives you pgwire on `127.0.0.1:5433`, durable WAL + Parquet under
 Set `BASIN_CATALOG=postgres://...` for restart-safe metadata.
 
 The full production-shaped boot layers WAL, shard owner, connection pool,
-JWT auth, and REST in one process. basin-auth stores identity tables in
-each tenant's own storage (like Supabase's `auth` schema per project) —
-no reserved internal tenant, no loopback. `BASIN_TENANTS` stays your
-application list:
+JWT auth, and REST in one process:
 
 ```sh
 BASIN_BIND=127.0.0.1:5433 \
@@ -140,23 +137,17 @@ BASIN_ANALYTICAL_ENABLED=1 \
 cargo run -p basin-server
 ```
 
-Required vars for production-shaped durability: `BASIN_BIND`,
-`BASIN_CATALOG=postgres://...`, `BASIN_DATA_DIR` or
-`BASIN_STORAGE_BACKEND`, `BASIN_WAL_DIR`, `BASIN_TENANTS`, and
-`BASIN_AUTH_ENABLED` (if you want auth). Everything else is optional.
-Operators who want basin-auth's identity tables on a separate external
-Postgres instance (blast-radius separation) can supply
-`BASIN_AUTH_CATALOG_DSN` as an optional override — this is not the
-default path; by default auth state lives in each tenant's own storage.
-See [`docs/deployment.md`](./docs/deployment.md#optional-external-auth-catalog).
+`BASIN_TENANTS` is the project-list env var — name is historical, projects in the
+public API. Required vars for production-shaped durability: `BASIN_BIND`,
+`BASIN_CATALOG=postgres://...`, `BASIN_DATA_DIR` or `BASIN_STORAGE_BACKEND`,
+`BASIN_WAL_DIR`, `BASIN_TENANTS`, and `BASIN_AUTH_ENABLED` (if you want auth).
+Everything else is optional.
 
 To run the same binary against object storage, set
 `BASIN_STORAGE_BACKEND=r2|s3|tigris` plus the S3-compatible endpoint, bucket,
-region, and credentials documented by `basin-storage`. If `BASIN_WAL_BACKEND`
-is unset, the WAL storage backend mirrors `BASIN_STORAGE_BACKEND`; set
-`BASIN_WAL_BACKEND=local` to keep WAL files on local disk.
+region, and credentials documented by `basin-storage`.
 
-Connect with **any Postgres driver** — `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, your existing ORM:
+Connect with **any Postgres driver**:
 
 ```sh
 psql -h 127.0.0.1 -p 5433 -U alice
@@ -176,15 +167,14 @@ INSERT INTO docs VALUES (1, '[0.01, 0.02, ...]');
 SELECT id FROM docs ORDER BY embedding <-> '[...]' LIMIT 10;
 ```
 
-Confirm the data hit object storage under the tenant prefix:
+Confirm the data hit object storage under the project prefix:
 
 ```sh
 find /tmp/basin/tenants -name '*.parquet'
 # /tmp/basin/tenants/01HABCD…/tables/events/data/2026/05/01/01HEFG….parquet
-# /tmp/basin/tenants/01HABCD…/tables/docs/data/...
 ```
 
-That's a real bucket-native database. Per-tenant prefix isolation is the IAM boundary; one bucket policy revokes all access to a tenant's data even if every other layer is bypassed.
+That's a real bucket-native database. The prefix is the IAM boundary; one bucket policy revokes all access to a project's data even if every other layer is bypassed.
 
 ---
 
@@ -196,10 +186,10 @@ Four layers, each with one job:
    pgwire clients  (any Postgres driver — psql, tokio-postgres, asyncpg, JDBC)
           │
           ▼
-   Routers (stateless)        parses SQL, applies RLS, routes by tenant
+   Routers (stateless)        parses SQL, applies RLS, routes by project
           │
           ▼
-   Shard owners (stateful)    in-memory state for many tenants per process,
+   Shard owners (stateful)    in-memory state for many projects per process,
           │                   eviction on idle, lazy load from WAL + Parquet
           ▼
    WAL                        durable append path; flushes to object storage
@@ -217,18 +207,61 @@ The full architecture document is in [`docs/architecture.md`](./docs/architectur
 
 ## What you can do today
 
-- **Multi-tenant Postgres-compatible SQL** — pgwire v3, simple + extended query protocol, **TLS** (rustls), **`COPY FROM STDIN`/`COPY TO STDOUT`** (CSV). Works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, any Postgres ORM.
+- **Postgres-compatible SQL** — pgwire v3, simple + extended query protocol, **TLS** (rustls), **`COPY FROM STDIN`/`COPY TO STDOUT`** (CSV). Works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, any Postgres ORM.
 - **CRUD + DDL** — `CREATE TABLE`, multi-row `INSERT`, `SELECT`, `UPDATE`, `DELETE` (Iceberg copy-on-write), `ALTER TABLE … CLUSTER BY (…) / SET BLOOM FILTERS ON / SET row_group_rows / SET cold_after / ENABLE ROW LEVEL SECURITY / CREATE POLICY`, `SHOW TABLES`. Prepared statements with parameter bind (text + binary, including native JSONB / UUID).
+- **Time travel** — Iceberg-style snapshots. `Catalog::rollback_to_snapshot(project, table, snapshot_id)` rewinds; `Catalog::fork_table(project, src, dst)` clones a table's metadata + snapshot history into a new sibling that diverges on next commit. Zero data copy until divergence.
 - **Native vector search** — `vector(N)` + `<->` / `<#>` / `<=>` operators, HNSW per Parquet segment. No `pg_vector`.
 - **Postgres-extension equivalents** — `pg_cron` (basin-cron), `pg_net` + `http` (basin-net), `pg_trgm` (basin-trgm), `PostGIS` subset (basin-geo), `TimescaleDB` continuous aggregates (basin-cv), `pgcrypto` + `uuid-ossp` UDFs.
-- **Per-tenant isolation** — bucket prefix is the IAM boundary; 1,000-iter cross-tenant fuzz × 4 attack shapes finds zero leaks. RLS works through UNION + CTE shapes (P0 bypass found and fixed by the security suite this cycle).
-- **Per-tenant connection URLs (managed-Postgres feel)** — `POST /admin/v1/tenants` returns `postgres://<tenant_user>:<password>@host:5433/<db>`. Password is bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/tenants/{user}/rotate`. Cross-tenant isolation under per-tenant URLs is integration-tested; within-tenant RLS still applies.
-- **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation with reuse-detection blanket-revoke, email-link login, per-tenant API keys, per-user session settings) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`). Auth data lives in each tenant's own storage (like Supabase's `auth` schema per project) — no reserved internal tenant, no loopback. **`auth.uid()`**, **`auth.role()`**, and **`auth.jwt()`** SQL session functions let you write Supabase-style RLS policies: `CREATE POLICY "own rows" ON items FOR ALL USING (owner_id = auth.uid())`. Both `auth.uid()` (schema-qualified) and `auth_uid()` (underscore) spellings work.
-- **Durable catalog** — Iceberg-style catalog backed by Postgres when `BASIN_CATALOG=postgres://...`; tables, snapshots, tenant credentials, and `basin-auth`'s identity tables survive process restart. The no-config local quickstart uses an in-memory catalog and is intentionally dev-only. Catalog-level PITR (`rollback_to_snapshot`) and table fork (`fork_table`) shipped.
+- **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation, email-link login, per-project API keys) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`). **`auth.uid()`**, **`auth.role()`**, **`auth.jwt()`** SQL session functions let you write Supabase-style RLS policies.
+- **Per-project connection URLs** — `POST /admin/v1/tenants` returns `postgres://<user>:<password>@host:5433/<db>`. Password bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/tenants/{user}/rotate`.
+- **Durable catalog** — Iceberg-style catalog backed by Postgres when `BASIN_CATALOG=postgres://...`; tables, snapshots, project credentials, and `basin-auth`'s identity tables survive process restart.
 - **Cheap retention** — ZSTD-1 Parquet, 12.5× smaller than Postgres heap on audit-log data; A4 catalog `column_stats` skips footer fetches when the predicate prunes the file.
-- **Operations** — connection pooling, per-tenant pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-tenant counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
+- **Analytical path** — DuckDB on Iceberg, 4.6× faster than DataFusion on million-row aggregates. The planner auto-routes aggregate / GROUP BY queries to it.
+- **Operations** — connection pooling, per-project pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-project counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
 
-The full capability matrix (with what's planned and what's deferred): [`CAPABILITIES.md`](./CAPABILITIES.md).
+The full capability matrix (with what's planned and what's deferred): [`CAPABILITIES.md`](./CAPABILITIES.md). The fine-grained per-syntax matrix derived from automated tests: [`docs/sql-support.md`](./docs/sql-support.md).
+
+---
+
+## PostgreSQL SQL support
+
+Basin parses and runs real PostgreSQL syntax. The exact per-statement matrix below is auto-generated by [`tests/integration/tests/sql_support_matrix.rs`](./tests/integration/tests/sql_support_matrix.rs) and lives in [`docs/sql-support.md`](./docs/sql-support.md) — it re-runs on every `cargo test`, so the numbers stay honest.
+
+**At a glance** (default config, 235 SQL fragments):
+
+| Total | ✅ end-to-end | 🛠 parses+plans, exec fails | 📜 planner rejects | ❌ parser refuses | 🚫 out of scope |
+|---|---|---|---|---|---|
+| 235 | **120** (51%) | 10 | 33 | 14 | 58 |
+
+**By category** (✅ over total, default config):
+
+| Category | Supported (✅) | Total |
+|---|---|---|
+| SELECT — projection / filtering | 18 | 18 |
+| DDL/Other (indexes, types, sequences, functions, policies, …) | 16 | 29 |
+| DDL/Tables | 14 | 29 |
+| DML (INSERT / UPDATE / DELETE / COPY / ON CONFLICT) | 11 | 22 |
+| SELECT — joins / subqueries | 10 | 13 |
+| Expressions (CASE / COALESCE / cast / concat / LIKE) | 9 | 9 |
+| Functions/String | 9 | 9 |
+| SELECT — aggregates / GROUP BY / ROLLUP / CUBE | 8 | 12 |
+| Functions/Math | 7 | 7 |
+| Functions/DateTime | 6 | 8 |
+| SELECT — set operations (UNION / INTERSECT / EXCEPT) | 4 | 4 |
+| SELECT — window functions | 3 | 4 |
+| Functions/Crypto | 3 | 4 |
+| SELECT — CTEs (incl. RECURSIVE) | 2 | 4 |
+| Functions/Array | 0 | 1 |
+| Functions/JSONB | 0 | 4 |
+| Admin / Sessions | 0 | 17 |
+| Transactions | 0 | 8 |
+| Types (column-type catalog) | 0 | 33 |
+
+The Admin / Transactions / Types rows look bleak only because the harness checks them by chaining `DROP TABLE` (intentionally out of scope) — the per-row note in [`docs/sql-support.md`](./docs/sql-support.md) shows the underlying `CREATE TABLE` succeeded.
+
+**Intentionally out of scope.** The 🚫 rows are deliberate: `LISTEN/NOTIFY`, `CREATE EXTENSION`, `VACUUM`, server-side `PREPARE/EXECUTE`, `DROP/TRUNCATE TABLE`, explicit `BEGIN/COMMIT/ROLLBACK`, and the Postgres-extension-only types. The rationale is recorded in [ADR 0002](./docs/decisions/0002-no-postgres-extensions.md) and the surrounding decision log. Most ❌ rows (parser refusals like `UPDATE t SET id = id + 1`, `DELETE … RETURNING`, `COUNT(*) FILTER (…)`) are short-term gaps; most 🚫 are forever-no.
+
+> **See [`docs/sql-support.md`](./docs/sql-support.md) for the full per-statement matrix** — every row links its exact failure mode to the planner / parser / executor layer that owns it.
 
 ---
 
@@ -239,19 +272,79 @@ The full capability matrix (with what's planned and what's deferred): [`CAPABILI
 | **0** | Validate the wedge — customer interviews, design partners | **open** (the gate; engineering is mature enough to need customer signal next) |
 | **1** | Storage substrate — Parquet on object_store, Iceberg-style catalog | **shipped** |
 | **2** | WAL service — sub-5 ms write acks | **v0.1 shipped** (single-node; Raft is v0.2) |
-| **3** | Shard owners — per-tenant state, eviction, compactor | **v0.1 shipped** (in-process; placement service is v0.2) |
+| **3** | Shard owners — per-project state, eviction, compactor | **v0.1 shipped** (in-process; placement service is v0.2) |
 | **4** | Routers + SQL — pgwire v3, extended query, TLS, COPY, native JSONB / UUID binding | **mostly shipped** — single-shard transactions deferred |
 | **5** | Analytical path — DuckDB on Iceberg | **v0.1 shipped** (4.6× faster than DataFusion on 1M-row aggregates) |
-| **5.5** | Sharding axes — partitioning, compute sharding, tiered storage, whale pinning | **shipped** |
+| **5.5** | Sharding axes — partitioning, compute sharding, tiered storage | **shipped** |
 | **5.6** | RLS with `CREATE POLICY` (UNION / CTE coverage) | **shipped** |
 | **5.7** | Caches + bloom + A4 catalog stats + B2 cluster-by + B3 row-group sizing | **shipped**; B1 secondary indexes is the biggest open perf win (~8 weeks) |
 | **5.8** | `pg_cron` + `pg_net` SQL surfaces | **shipped** |
 | **5.9** | Postgres-extension equivalents (basin-geo / -trgm / -cv, JSONB, UUID, pgcrypto) | **shipped** |
-| **5.10** | Identity + REST (basin-auth, basin-rest, OpenAPI, pagination, streaming, API keys, refresh rotation, **per-tenant connection URLs**, **`auth.uid()` / `auth.role()` / `auth.jwt()`** session functions, **per-tenant auth schema**, self-routing credentials) | **shipped** |
+| **5.10** | Identity + REST (basin-auth, basin-rest, OpenAPI, pagination, streaming, API keys, refresh rotation, per-project connection URLs, **`auth.uid()` / `auth.role()` / `auth.jwt()`** session functions) | **shipped** |
 | **6** | Production hardening | **partial** — telemetry / pooling / rate-limit / cost-rejection / catalog-PITR / fork shipped; multi-region (ADR 0009), catalog replication (ADR 0010), cross-shard 2PC (ADR 0011) all locked architecturally and gated on customer demand |
 | **7** | Launch | gated on Phase 0 |
 
 Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.md). Decision log: [`docs/decisions/`](./docs/decisions/).
+
+---
+
+## How Basin compares
+
+### vs Postgres / Aurora / RDS
+
+Postgres is the right answer for high-frequency single-tenant OLTP. **Basin is not trying to be Postgres.** Where Basin wins: workloads where storage cost matters, where you have multiple isolated databases (one per environment, one per customer, one per region), or where you want object-storage economics with relational semantics.
+
+### vs Neon
+
+Neon is serverless Postgres with branching — terrific for **single-DB workloads** that want copy-on-write forks. Basin matches the branching story (Iceberg forks are zero-copy too) but stores data on plain S3 rather than a managed page server, which is cheaper to operate per project and per GB. Where Neon's $19/mo-per-project minimum becomes the bottleneck — 10 projects is $190/mo before storage — Basin's Pro tier covers 10 projects at $29/mo. See [`PRICING.md`](./PRICING.md).
+
+### vs Supabase
+
+Supabase is "BaaS in a box" — Postgres + Auth + Edge Functions + Storage + Realtime. Basin covers the same SQL + Auth + REST surface in one binary, with `auth.uid()` / `auth.role()` / `auth.jwt()` working identically. Where Basin differs is the data-layer economics: Parquet on S3 instead of Postgres heap on block storage. Multi-tenant SaaS that has outgrown Supabase's per-project pricing can migrate the database to Basin via pgwire and keep Supabase Auth, Edge Functions, and Realtime for the parts of the stack they handle well — or run entirely on Basin using basin-auth and basin-rest. Edge Functions / Realtime / Storage are out of scope per ADRs 0005/0006.
+
+### vs Turso / libSQL
+
+Turso is the right answer for **edge-distributed apps** with many tiny SQLite-class databases. Basin is for centralized apps that want **Postgres SQL on cheap object storage** — ZSTD compression, time travel via Iceberg, and a real wire-protocol Postgres surface that ORMs already speak.
+
+### vs ClickHouse / DuckDB / data-warehouse
+
+ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. Basin's Phase 5 analytical path uses DuckDB directly **against the same Iceberg tables**; the OLTP path on the shard owners is what makes the per-row workload work. Same data substrate, two read paths.
+
+### Where Basin is *not* the answer
+
+Per the ADRs:
+
+- **Single-project high-frequency OLTP** → Postgres / Aurora / Neon
+- **Edge / local-first** → Turso / libSQL / Cloudflare D1
+- **Geospatial primary store** → PostGIS
+- **Embedding-only workload** → dedicated vector DB (Qdrant, Pinecone) — but Basin's native `vector(N)` works fine *alongside* tabular data
+- **Embedded SQLite-class library** → SQLite
+- **Globally strongly-consistent writes across regions** → Spanner / CockroachDB
+
+---
+
+## Use cases
+
+- **Multi-environment apps** — dev / staging / prod / per-region as cheap projects on one cluster. See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md) for the multi-tenant SaaS story (per-customer-project isolation, noisy-neighbor scheduler, RLS with `auth.uid()`, cost math at 10k projects).
+- **Audit / event logs** — ZSTD-Parquet compression makes append-mostly workloads dramatically cheaper than Postgres heap.
+- **AI agent / RAG platforms** — native `vector(N)` + HNSW alongside transactional rows in the same database.
+- **Document / activity stores** — write-cheap, analytical-read-occasionally workloads where the analytical path through DuckDB handles aggregates.
+- **Tenanted SaaS** — one Basin cluster replaces hundreds of separate Postgres / Neon / Supabase projects with their per-project minimums. See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md).
+
+If you're a single-app developer building a side project, **use Postgres or the Free tier above**. The cost math doesn't show its full effect until you have multiple projects or multi-GB tables.
+
+---
+
+## Ecosystem
+
+Basin (this repo) is the data plane. Three sibling repos sit around it:
+
+- **[`bas-in/basin-cloud`](https://github.com/bas-in/basin-cloud)** — control plane and dashboard (Go + Vite/JSX SPA, Apache-2.0). Manages orgs, projects, billing; runs Basin engines on Fly Machines per project. Operators who want a managed UI use it. Operators running a single self-hosted engine do not — basin-server alone is sufficient.
+- **[`bas-in/basin-cli`](https://github.com/bas-in/basin-cli)** — operator daily-driver (Go, Apache-2.0, stdlib-only). `basin login`, `basin projects list`, `basin sql run`, release artefacts are Sigstore-signed. Talks to basin-cloud's `/v1/*` API.
+- **[`bas-in/basin-js`](https://github.com/bas-in/basin-js)** — TypeScript SDK (MIT). Supabase-shaped `createClient(url, anonKey)` that talks **directly** to a Basin engine (pgwire + REST), not through basin-cloud. Browser, Node, Deno, Bun, Cloudflare Workers. [`jsr:@bas-in/basin-js`](https://jsr.io/@bas-in/basin-js) and [`npm:@bas-in/basin-js`](https://www.npmjs.com/package/@bas-in/basin-js).
+- **Planned client SDKs** — basin-py, basin-rs, basin-go, basin-dart, basin-swift, basin-kotlin. All will follow the same engine-direct shape as basin-js.
+
+**Licensing rationale.** Server-side projects (basin engine, basin-cloud, basin-cli) are Apache-2.0 to carry the patent grant operators expect from infrastructure. Client SDKs (basin-js and future siblings) are MIT to match the norm of the SDK ecosystems they sit in.
 
 ---
 
@@ -260,22 +353,24 @@ Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.m
 ```
 crates/
   basin-common      shared types, errors, telemetry
-  basin-storage     Parquet + object_store under tenant prefixes
-  basin-catalog     Iceberg-style catalog (in-memory + engine-loopback durable)
+  basin-storage     Parquet + object_store under project prefixes
+  basin-catalog     Iceberg-style catalog (in-memory + Postgres-backed durable)
   basin-wal         file-backed WAL (Raft-backed in v0.2)
   basin-shard       in-process shard owner with WAL → Parquet compactor
-  basin-engine      DataFusion SQL execution, per-tenant sessions
+  basin-engine      DataFusion SQL execution, per-project sessions
   basin-router      pgwire v3 (simple + extended query)
   basin-vector      native HNSW vector search
-  basin-placement   (Phase 3 v0.2) (tenant, partition) → owner mapping
+  basin-placement   (Phase 3 v0.2) (project, partition) → owner mapping
   basin-analytical  (Phase 5) DuckDB / DataFusion against Iceberg directly
 services/
   basin-server      single-process binary
 benchmark/          dashboard + auto-regenerated RESULTS_localfs.md
 docs/
   architecture.md   the four-layer stack, in detail
+  multi-tenancy.md  the multi-tenant SaaS story (per-project isolation, scheduler, cost math)
   decisions/        ADRs — every "no" with the trigger that would change our mind
-  sql-compatibility.md
+  sql-compatibility.md  hand-written compatibility narrative (planner / catalog scope)
+  sql-support.md    auto-generated per-syntax matrix (sql_support_matrix.rs)
 tests/integration/  cross-crate viability + scaling + Postgres comparisons
 ```
 
@@ -298,62 +393,14 @@ open benchmark/index_localfs.html
 
 ---
 
-## How Basin compares
-
-### vs Postgres / Aurora / RDS
-
-Postgres is the right answer for high-frequency single-tenant OLTP. **Basin is not trying to be Postgres.** Where Basin wins: workloads with many tenants where idle ones outnumber active ones by 100× and storage cost dominates. Basin's per-tenant prefix isolation is structural; Postgres's RLS is logical and easy to misconfigure.
-
-### vs Neon
-
-Neon is serverless Postgres with branching — terrific for **single-DB workloads** that want copy-on-write forks. Per-project pricing means N tenants = N projects = N × $19/mo minimum. Basin's per-active-tenant-hour model is two orders of magnitude cheaper at 100+ tenants. Basin doesn't try to match Neon's branching depth or its full Postgres surface — Basin is for the multi-tenant case where Neon's pricing breaks.
-
-### vs Supabase
-
-Supabase is "BaaS in a box" — Postgres + Auth + Edge Functions + Storage + Realtime. Basin now covers the same auth API surface: **`auth.uid()`**, **`auth.role()`**, and **`auth.jwt()`** session functions work identically to Supabase's, so RLS policies written for Supabase transfer directly. Auth data lives in each tenant's own storage namespace (the same per-project `auth` schema model Supabase uses). Where Basin differs is the data-layer economics: one Basin cluster replaces hundreds of separate Supabase projects, each of which carries its own per-project minimum. Multi-tenant SaaS that has outgrown Supabase's per-project pricing can migrate the data layer to Basin via pgwire and keep Supabase Auth, Edge Functions, and Realtime for the parts of the stack they handle well — or run entirely on Basin using basin-auth and basin-rest. Basin is increasingly a viable Supabase alternative for the multi-tenant case, not just something that sits alongside it. (Full BaaS surface — Edge Functions, Storage, Realtime — is out of scope per ADRs 0005/0006; Basin's wedge is the database and auth layer.)
-
-### vs Turso / libSQL
-
-Turso is the right answer for **edge-distributed apps** with many tiny SQLite-class databases. Basin is for centralized multi-tenant SaaS with **shared Postgres SQL across tenants**, ZSTD-compressed object-store retention, and per-tenant compliance isolation that SQLite-per-edge can't naturally provide.
-
-### vs ClickHouse / DuckDB / data-warehouse
-
-ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. Basin's Phase 5 analytical path uses DuckDB directly **against the same Iceberg tables**; the OLTP path on the shard owners is what makes the per-row workload work. Same data substrate, two read paths.
-
-### Where Basin is *not* the answer
-
-Per the ADRs:
-
-- **Single-tenant high-frequency OLTP** → Postgres / Aurora / Neon
-- **Edge / local-first** → Turso / libSQL / Cloudflare D1
-- **Geospatial primary store** → PostGIS
-- **Embedding-only workload** → dedicated vector DB (Qdrant, Pinecone) — but Basin's native `vector(N)` works fine *alongside* tabular data
-- **Embedded SQLite-class library** → SQLite
-- **Globally strongly-consistent writes across regions** → Spanner / CockroachDB
-
----
-
-## Who should use Basin
-
-If your workload is **one of**:
-
-- A multi-tenant SaaS where most tenants are mostly idle and storage cost matters
-- An audit-heavy or compliance-heavy product (fintech, healthcare, security tooling) with strict per-tenant data residency
-- An AI-agent platform with many users storing embeddings + transactional rows alongside each other
-- A document / event log platform where writes are cheap and analytical reads are occasional
-
-…then Basin's wedge probably matches your shape. If you're a single-app developer building a side project, **use Postgres**. The wedge math doesn't apply to you.
-
----
-
-## Keywords for search
-
-Basin is a **multi-tenant Postgres-compatible database** designed for **bucket-native object storage**, with **per-tenant isolation**, **native vector search** (HNSW), **ZSTD-compressed Parquet** storage, an **Apache Iceberg-style catalog**, a file-backed WAL with a Raft WAL simulation toward distributed v0.2, and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Turso**, **PlanetScale**, and **CockroachDB** for the multi-tenant SaaS, audit-log, and AI-agent platform use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.
-
----
-
 ## License
 
 **Apache-2.0** — see [`LICENSE`](./LICENSE).
 
 Contributions welcome. The project is opinionated about scope ([`docs/decisions/`](./docs/decisions/)) — open an issue before writing a PR that adds new surface area. The OSS code is the database; commercial cloud orchestration lives in a separate private repo and never affects what OSS users get.
+
+---
+
+## Keywords for search
+
+Basin is a **Postgres-compatible database on object storage**, with **ZSTD-compressed Apache Parquet** storage, an **Apache Iceberg** catalog, a file-backed WAL with a Raft WAL simulation toward distributed v0.2, **native vector search** (HNSW), and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Turso**, **PlanetScale**, **Aurora**, and **CockroachDB** for cheap-storage SaaS, audit-log, RAG / vector, and multi-project use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.

@@ -46,7 +46,7 @@ or more **followers**:
 
 The follower's view of the world is **read-only** and **lag-bounded**.
 It reads Parquet through the same `basin-storage` API as the leader
-(stateless — both see the same R2/S3 objects via the catalog), and
+(stateless — both see the same S3-compatible bucket objects via the catalog), and
 re-builds the in-memory tail by replaying WAL entries with LSN strictly
 greater than the leader's `last_compacted_lsn` at any given moment.
 
@@ -72,12 +72,12 @@ apply entries in LSN order. The streaming impl can be:
 
 - **v0.2 local FS / single region**: a poll loop on top of `read_from`,
   bounded by `flush_interval` (200 ms today). Sufficient when the
-  leader's WAL backing object store is the same R2 bucket the followers
+  leader's WAL backing object store is the same bucket the followers
   read from.
 - **v0.2.x optimisation**: leader pushes new segments to a fanout
   channel (Redis stream / NATS / Fly machine→machine TCP) so followers
   don't pay the listing cost. Out of scope for the initial PR.
-- **v0.3 multi-region**: regional R2 buckets with cross-region
+- **v0.3 multi-region**: regional buckets with cross-region
   replication, plus optional WAL shipping over Fly's private network.
 
 ### 2.3 Follower lag SLA
@@ -231,7 +231,7 @@ tailing".
 
 Two design points beyond single-region:
 
-- **WAL shipping latency**: cross-region S3/R2 replication is on the
+- **WAL shipping latency**: cross-region object-store replication is on the
   order of seconds. Multi-region followers therefore default to the
   `Eventual` lag tier with `≤ 30 s` rather than `≤ 5 s`. Clients that
   need read-your-writes either route to leader region or run a basin-cli
@@ -300,7 +300,7 @@ verbatim.
 
 ### v0.3 — multi-region followers
 
-- Cross-region WAL shipping (R2 replication or Fly machine→machine).
+- Cross-region WAL shipping (bucket replication or Fly machine→machine).
 - Region-aware router (prefer local region's followers; fall back to
   remote followers; fall back to leader region).
 - Opt-in cross-region promotion.
@@ -319,10 +319,10 @@ verbatim.
 
 ## 7. Open questions
 
-- **WAL fanout substrate**: poll-on-R2 works for v0.2 but adds 200 ms
-  to the lower bound on follower lag. A leader-push channel (Fly
+- **WAL fanout substrate**: polling the object store works for v0.2 but adds
+  200 ms to the lower bound on follower lag. A leader-push channel (Fly
   machine→machine TCP, or NATS) gets us to ≤ 50 ms. Decision deferred
-  until we measure poll-on-R2 in dev.
+  until we measure polling in dev.
 - **Snapshot install for new followers**: a fresh follower replaying
   from `Lsn::ZERO` against a tenant with months of WAL is wasteful.
   v0.2.1 should add a "follower joins from latest Parquet snapshot +

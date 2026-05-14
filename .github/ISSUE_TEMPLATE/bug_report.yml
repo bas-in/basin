@@ -15,8 +15,8 @@ body:
     id: backend
     attributes:
       label: Backend
-      description: LocalFS, AWS S3, Cloudflare R2, MinIO, SeaweedFS, etc.
-      placeholder: "Cloudflare R2"
+      description: LocalFS, AWS S3, Tigris, Cloudflare R2, MinIO, SeaweedFS, etc.
+      placeholder: "Tigris"
     validations:
       required: true
   - type: textarea

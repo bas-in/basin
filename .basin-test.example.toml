@@ -44,10 +44,10 @@ prefix = "basin-test"
 # secret_access_key = "..."
 # session_token     = ""             # only for temporary credentials
 
-# Optional: non-AWS S3-compatible service (R2, MinIO, Tigris, Wasabi, etc.)
-# endpoint   = "https://<account>.r2.cloudflarestorage.com"
+# Optional: non-AWS S3-compatible service (Tigris, R2, MinIO, Wasabi, etc.)
+# endpoint   = "https://fly.storage.tigris.dev"   # Tigris example; R2: https://<account>.r2.cloudflarestorage.com
 # allow_http = false   # set true ONLY for plaintext local MinIO
-# http2_only = true    # AWS S3 / R2 / GCS over HTTPS support h2 multiplexing
+# http2_only = true    # AWS S3 / Tigris / R2 / GCS over HTTPS support h2 multiplexing
                        # — eliminates HTTP/1.1 head-of-line blocking when one
                        # tenant's bulk transfer ties up the connection pool.
                        # MinIO over plain HTTP does NOT speak h2c; leave false

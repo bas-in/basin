@@ -22,8 +22,8 @@ body:
     id: backend
     attributes:
       label: Which backend?
-      description: LocalFS, R2, SeaweedFS, all of them
-      placeholder: "R2 (real cloud)"
+      description: LocalFS, Tigris, R2, S3, SeaweedFS, all of them
+      placeholder: "Tigris (real cloud)"
     validations:
       required: true
   - type: textarea

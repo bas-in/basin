@@ -34,7 +34,9 @@ writes; reads short-circuit at whichever layer holds the answer.
             +------------------------------------------------+
             |  Layer 1: Routers (stateless)                  |
             |  - pgwire v3 termination                       |
-            |  - SQL parse + plan (DataFusion)               |
+            |  - SQL parse via libpg_query (ADR 0014);       |
+            |    typed-AST dispatch -> DDL/DML handler or    |
+            |    PgNode->LogicalPlan; DataFusion executes    |
             |  - RLS predicate injection                     |
             |  - placement lookup, fan-out + merge           |
             |  - OLTP vs analytical decision                 |
@@ -107,6 +109,64 @@ the requesting tenant's prefix; this check is implemented at the
 | Placement    | `basin-placement`              | etcd / FDB     | quorum                   |
 | Analytical   | `basin-analytical`             | none           | horizontal, off OLTP     |
 
+### SQL frontend
+
+The canonical SQL parser is `libpg_query` — the actual PostgreSQL parser
+(`gram.y` + `scan.l`), vendored as a Rust crate ([ADR 0014][adr-0014]).
+Every incoming statement is parsed by libpg_query first, then dispatched
+on the typed protobuf AST.
+
+```
+client SQL  ->  libpg_query (pg_ast.rs)  ->  ParseTree (typed nodes)
+                                                  |
+                                                  v
+                                       pg_ast::stmt_kind +
+                                       reject_unsupported  (SQLSTATE 0A000)
+                                                  |
+                              +-------------------+-------------------+
+                              v                                       v
+                   DDL/DML handler (typed                Phase 2: PgNode ->
+                   AST matchers — Phase 1                DataFusion LogicalPlan
+                   shipped)                              (pg_plan.rs)
+                              \                                   /
+                               \___________________ ____________ /
+                                                   v
+                                       DataFusion executor + optimiser
+                                       (logical-plan executor, not a
+                                       SQL frontend any more)
+```
+
+The migration runs in three phases:
+
+- **Phase 1 — shipped.** libpg_query parses every statement; typed-AST
+  matchers replace the fourteen textual pre-screens that used to sit
+  above sqlparser. `reject_unsupported` returns SQLSTATE 0A000 early for
+  statement kinds Basin doesn't ship (`LISTEN`, `NOTIFY`, `PREPARE`,
+  `DECLARE CURSOR`, `LOCK`, `VACUUM`, `CLUSTER`, `ANALYZE`,
+  `CREATE EXTENSION`, `CREATE TRIGGER`, `BEGIN`/`COMMIT`/`ROLLBACK`).
+- **Phase 2 — in flight.** `pg_plan.rs` translates the pg_query AST for
+  SELECT (subqueries, CTEs, window functions, LATERAL) directly into a
+  DataFusion `LogicalPlan`. DataFusion is demoted from SQL frontend to
+  logical-plan executor.
+- **Phase 3 — queued.** Window frame `EXCLUDE` / `GROUPS`,
+  `GROUPING SETS` / `ROLLUP` / `CUBE`, recursive CTE depth, `MERGE`,
+  lateral specifics, `TABLESAMPLE`. Each lands as a translator pass.
+
+`sqlparser-rs` is retained as a **transitional fallback** for the
+Basin-extension forms libpg_query rejects: `ALTER TABLE … SET cold_after`,
+`REFRESH MATERIALIZED VIEW … WITH (full=true)`,
+`ALTER TABLE … SUBSCRIBE WEBHOOK`, `ALTER TABLE … REACT ON … EXECUTE`,
+and `DROP REACTOR`. That surface shrinks each phase.
+
+Precedent: every serious PG-compat database converges on owning the
+parse → plan path. DuckDB vendored libpg_query and wrote their own
+translator; CockroachDB forked PG's parser into Go; Spanner-PG built a
+translator; YugabyteDB forked PG outright. Basin follows DuckDB's lane.
+
+[adr-0014]: ./decisions/0014-pg-query-as-canonical-parser.md
+
+---
+
 `basin-auth` is a peer crate of `basin-router`, not a separate service.
 Auth tables (`basin_auth_users`, `basin_auth_refresh_tokens`,
 `basin_auth_email_tokens`, etc.) are provisioned in **each tenant's own
@@ -134,9 +194,11 @@ in the background.
 
 1. **Client -> router (~0.1 ms intra-AZ).** pgwire frame arrives. Router
    authenticates the connection and binds it to a `TenantId`.
-2. **Parse + plan + RLS injection (~0.5-1 ms).** DataFusion parses the SQL.
-   The router rewrites the plan to inject `tenant_id = $current_tenant` into
-   every base-table predicate. There is no opt-out for this rewrite.
+2. **Parse + plan + RLS injection (~0.5-1 ms).** `libpg_query` parses the SQL
+   (ADR 0014); the typed AST dispatches to a DDL/DML handler or through the
+   Phase-2 PgNode -> DataFusion LogicalPlan translator. The router rewrites
+   the plan to inject `tenant_id = $current_tenant` into every base-table
+   predicate. There is no opt-out for this rewrite.
 3. **Placement lookup (~0.1 ms, cached).** Router asks `basin-placement` for
    the owner of `(tenant_id, partition)`. Result is cached with a short TTL
    and invalidated on owner-not-found responses.
@@ -457,8 +519,10 @@ explicitly *not*:
   RPO and RTO. If you need global linearizability, this is not the tool.
 - **A from-scratch implementation of Raft, the SQL parser, the table
   format, or the analytical engine.** We integrate `openraft` (or
-  `tikv/raft-rs`), DataFusion, Iceberg + Lakekeeper, and DuckDB. If a
-  PR starts implementing any of those from scratch, it is rejected.
+  `tikv/raft-rs`), `libpg_query` (the real PG parser; ADR 0014),
+  DataFusion as a logical-plan executor, Iceberg + Lakekeeper, and
+  DuckDB. If a PR starts implementing any of those from scratch, it
+  is rejected.
 
 ---
 

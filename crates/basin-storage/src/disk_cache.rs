@@ -29,7 +29,7 @@
 //!   reader/writer
 //!     -> TenantScopedStore (per-tenant semaphore)
 //!     -> DiskCachedStore   (this module)
-//!     -> real ObjectStore  (LocalFS / S3 / R2 / GCS / ...)
+//!     -> real ObjectStore  (LocalFS / S3 / Tigris / R2 / GCS / ...)
 //! ```
 //!
 //! The cache key is the SHA-256 of `(path, range_marker)`. We key on

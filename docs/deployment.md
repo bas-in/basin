@@ -17,7 +17,7 @@ This doc is the practical "where do I put the bytes and which Fly/AWS region" gu
 ## TL;DR
 
 - **One Basin cluster per region. Not per customer.** That's the wedge — Postgres can't multi-tenant cheaply, Basin can.
-- **Recommended cloud:** Fly.io machines + Cloudflare R2 in the same metro. ~5–30 ms RTT, zero egress fees.
+- **Recommended cloud:** Fly.io machines + Tigris (or another S3-compatible store) in the same metro. ~5–30 ms RTT, zero egress fees.
 - **Multi-region is by deployment, not by code:** spin up an independent cluster per region, customers pin to one region at signup.
 - **Cross-region read replicas:** built when first paid customer asks ([ADR 0004](./decisions/0004-multi-region-read-replicas.md)). Cross-region strong-consistency writes: deferred ([ADR 0001](./decisions/0001-single-region-only.md)) — Spanner-class, not until a paying customer demands it.
 
@@ -98,7 +98,7 @@ Basin has none of these:
                              │
                              ▼
                    ┌──────────────────────┐
-                   │  Cloudflare R2       │
+                   │  S3-compatible store  │
                    │  (us-east region)    │
                    │  tenants/<id1>/...   │
                    │  tenants/<id2>/...   │
@@ -108,19 +108,19 @@ Basin has none of these:
 
 ### Key rules
 
-1. **One R2 bucket per region.** Storage stays anchored. EU customer's bytes never leave EU.
+1. **One object-store bucket per region.** Storage stays anchored. EU customer's bytes never leave EU.
 2. **Routers are stateless.** Scale horizontally on connection count.
 3. **Shard owners are stateful.** Each owns a subset of tenants' in-memory state. Consistent-hash routing.
-4. **All shard owners share the same R2 bucket.** Compute scales independently of storage.
+4. **All shard owners share the same bucket.** Compute scales independently of storage.
 5. **basin-auth issues JWTs scoped to a tenant.** Router decodes, hashes tenant_id → shard.
 
-### Concrete: Fly.io + Cloudflare R2 (recommended)
+### Concrete: Fly.io + Tigris (recommended)
 
 Best fit for Basin's design today:
 
-- **Fly.io** has direct interconnect with Cloudflare at major IXPs. ~5–30 ms RTT to R2 from Fly's `nrt` / `iad` / `lhr`.
-- **Cloudflare R2** has zero egress fees at any scale — the killer cost feature.
-- **Tigris**, **Backblaze B2**, **AWS S3** also work; pick by cost/latency/compliance.
+- **Fly.io** Machines are the compute layer. ~5–30 ms RTT to Tigris from Fly's `nrt` / `iad` / `lhr`.
+- **Tigris** (Fly's native S3-compatible store) has zero egress within Fly's network and no per-region bucket management overhead.
+- **Cloudflare R2**, **Backblaze B2**, **AWS S3** also work; pick by cost/latency/compliance.
 
 Per-region resource shape, rough sizing for the first 1k–10k tenants:
 
@@ -128,7 +128,7 @@ Per-region resource shape, rough sizing for the first 1k–10k tenants:
 |---|---|---|
 | Router | Fly Performance 1× × 2 (HA) | ~$30/mo. Stateless; scales linearly with connection count. |
 | Shard owners | Fly Performance 4× × 2 | ~$240/mo. Each handles ~5k tenants' working set. Add more as tenant count grows. |
-| R2 bucket | regional, public-bucket-disabled | Storage: $0.015/GB. Class A (writes): $4.50/M. Class B (reads): $0.36/M. **Egress: $0.** |
+| Object store bucket | regional, public-bucket-disabled | Tigris: ~$0.02/GB + $0.01/GB egress (Fly-internal is free). Cloudflare R2: $0.015/GB zero egress. AWS S3: $0.023/GB + $0.09/GB egress. |
 | Catalog backend | none — embedded | Catalog state (tenant list, table schemas, snapshot manifests, file refs, plus `basin-auth`'s `auth.users` / `auth.refresh_tokens`) lives in the engine's own pgwire loopback, durable on the WAL volume. ~50 MB per 10k tenants. No external Postgres to provision. |
 | Optional: NVMe disk cache | Fly volume, 50 GB | Phase 5.7-A1 cache. ~$5/mo. Cuts cold S3 fetches from ~50 ms → ~100 µs. |
 
@@ -140,7 +140,7 @@ Per-region resource shape, rough sizing for the first 1k–10k tenants:
 
 ### What works without code changes
 
-✅ **Single-region multi-tenant** — that's the default. Deploy one Basin cluster per region, each with its own R2 bucket. Customers connect to the regional endpoint. Their tenant_id pins them to that region's bucket prefix.
+✅ **Single-region multi-tenant** — that's the default. Deploy one Basin cluster per region, each with its own object-store bucket. Customers connect to the regional endpoint. Their tenant_id pins them to that region's bucket prefix.
 
 You can ship this today. It's "multi-region by deployment", not by code.
 
@@ -161,7 +161,7 @@ For cross-region **read replicas** ([ADR 0004](./decisions/0004-multi-region-rea
 
 | Piece | Effort |
 |---|---|
-| R2 cross-region replication (storage layer) | Flip a switch. Cloudflare ships this as a paid add-on. **No Basin code.** |
+| Object-store cross-region replication (storage layer) | Flip a switch in your provider (e.g. Tigris global replication, R2 advanced replication, S3 CRR). **No Basin code.** |
 | Catalog replication | Snapshot-and-pull of the embedded catalog's WAL between regions, replayed at the destination. ~1 week. Operators who run `BASIN_AUTH_CATALOG_DSN` against external Postgres can layer logical replication on that backend instead. |
 | Replica role on basin-router | Read-only session marker. ~3 days. |
 | Snapshot freshness lag visibility | Stats endpoint + optional `READ AT SNAPSHOT <id>` SQL. ~3 days. |
@@ -177,7 +177,7 @@ For cross-region **read replicas** ([ADR 0004](./decisions/0004-multi-region-rea
 ### Phase 1 — ship single-region multi-tenant (this week)
 
 - Pick 2–3 regions to launch (e.g. `us-east-1`, `eu-west-1`, `ap-southeast-1`).
-- Deploy independent Basin clusters in each, one R2 bucket per region.
+- Deploy independent Basin clusters in each, one object-store bucket per region.
 - Customer signup picks region; record `tenant.region` in catalog.
 - DNS: `<region>.basin.example.com` → regional router fleet.
 
@@ -185,7 +185,7 @@ This covers ~95% of B2B SaaS shapes (data residency + low local latency).
 
 ### Phase 2 — cross-region read replicas (when first paid customer asks)
 
-- Enable R2 cross-region replication for that tenant's bucket.
+- Enable cross-region replication for that tenant's bucket (provider-level configuration).
 - Replicate catalog state (snapshot+pull of embedded catalog; PG logical only if operator opted into `BASIN_AUTH_CATALOG_DSN`).
 - Add `replica` role marker to basin-router; read-only sessions land on replicas.
 - Surface replica lag in stats and as a `WARNING` if stale > N seconds.
@@ -202,8 +202,8 @@ Spanner-class engineering. ADR 0001 documents the deferral and the trigger.
 
 Three legitimate reasons (none "by default"):
 
-1. **Whale tenant** — one customer with 100× the load of others. **Pin them to their own shard owner with bigger compute.** Same R2 bucket, different in-memory shard. Cheap because storage is shared.
-2. **Compliance customer** — needs BYO-bucket or BYO-key (Phase 6, [TASK.md](../TASK.md)). They get their own R2 bucket; data never touches Basin's bucket. Same Basin process, different storage backend per session.
+1. **Whale tenant** — one customer with 100× the load of others. **Pin them to their own shard owner with bigger compute.** Same bucket, different in-memory shard. Cheap because storage is shared.
+2. **Compliance customer** — needs BYO-bucket or BYO-key (Phase 6, [TASK.md](../TASK.md)). They get their own bucket; data never touches Basin's bucket. Same Basin process, different storage backend per session.
 3. **Region-restricted** — solved by per-region cluster, not per-customer instance. Customer picks region at signup.
 
 If a sales lead asks for "dedicated Postgres instance" → educate them on Basin's structural isolation, then offer (1) or (2) at premium pricing.
@@ -228,14 +228,14 @@ This mirrors what Snowflake and BigQuery do. Supabase / Neon's per-project prici
 ## Operational checklist (per region)
 
 - [ ] Fly.io app created in the region
-- [ ] R2 bucket created in the region
+- [ ] Object-store bucket created in the region (Tigris, R2, S3, or compatible)
 - [ ] `BASIN_DATA_DIR` + `BASIN_WAL_DIR` volumes attached (the embedded catalog lives here — no external Postgres to provision)
 - [ ] DNS: `<region>.basin.example.com` → router fleet
 - [ ] Auth signing key (one global key OR per-region keys)
 - [ ] Monitoring: per-tenant ops/s, p50/p99, RAM, IO via OTLP
-- [ ] Backup: R2 versioning enabled (Iceberg snapshots are the data; no `pg_dump` needed)
+- [ ] Backup: bucket versioning enabled (Iceberg snapshots are the data; no `pg_dump` needed)
 - [ ] Rate limit: per-tenant guard for compute and `basin-net` outbound HTTP
-- [ ] Disaster recovery: R2 bucket replication target (manual cross-region copy if Phase 2 not yet built)
+- [ ] Disaster recovery: bucket replication target (manual cross-region copy if Phase 2 not yet built)
 
 ---
 
@@ -317,7 +317,7 @@ is left intact — pass `--include-tenant-creds` to drop it as well.
 
 - Application / customer data tables — only identifiers in the
   `basin_auth_*` namespace are affected.
-- WAL segments, Iceberg snapshots, R2 buckets — there is no object-store
+- WAL segments, Iceberg snapshots, object-store buckets — there is no object-store
   cleanup involved.
 - The reserved `basin_auth` tenant entry on the router — that is
   auto-injected on every start.

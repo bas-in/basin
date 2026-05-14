@@ -14,6 +14,8 @@ Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on 
 
 Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_coverage.rs`](./tests/integration/tests/feature_coverage.rs) (or its named cross-reference in that file's audit comment). Security invariants verified by [`tests/integration/tests/security.rs`](./tests/integration/tests/security.rs).
 
+> **For the fine-grained per-syntax matrix derived from automated tests, see [`docs/sql-support.md`](./docs/sql-support.md).**
+
 ---
 
 ## Wire protocol
@@ -33,6 +35,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 
 | Capability | Status | Notes |
 |---|---|---|
+| Parser: libpg_query (ADR 0014, Phase 1) | 🛠 | `pg_query` (libpg_query vendored via Rust crate) is now the canonical SQL parse + statement-classification frontend. Every incoming statement is parsed by the real PostgreSQL 16 parser; unsupported kinds (LISTEN, NOTIFY, VACUUM, CREATE TRIGGER, BEGIN/COMMIT/ROLLBACK, etc.) are rejected with SQLSTATE 0A000 before sqlparser sees them. sqlparser-rs remains a transitional fallback for SELECT/DML/DDL node bodies during Phase 1. Textual pre-screens in `executor.rs` are being replaced by typed AST matches in Agents 2–4; Agent 5 makes the pg_query path unconditional. See [ADR 0014](./docs/decisions/0014-pg-query-as-canonical-parser.md). |
 | `CREATE TABLE` | ✅ | int{2,4,8}, text/varchar, boolean, double, vector(N), JSONB, UUID, BYTEA |
 | `INSERT … VALUES` (single + multi-row) | ✅ | string-quoted vector / JSONB / UUID literals supported |
 | `SELECT` with `WHERE` (single table) | ✅ | DataFusion-planned; predicate pushdown to Parquet |
@@ -54,7 +57,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | `UPDATE … SET col = <expression>` | 🛠 | RHS must be a literal or a single bind parameter (`SET name = $1`). Expressions like `SET name = name \|\| ' (updated)'` or `SET count = count + 1` get rejected with `expected literal of type Utf8 …`. Compute the new value client-side. |
 | `UPDATE … WHERE col IN (SELECT …)` / `WHERE EXISTS (SELECT …)` | 🛠 | subquery in WHERE rejected with `WHERE clause not representable in v0.1`. Materialise the inner SELECT client-side and pass IDs as a bind-parameter list. |
 | `SELECT *` Arrow projection on specific column-shapes | 🛠 | occasionally fails with `expected '32' at position N; got 'M'` on tables that mix `BIGSERIAL PK + TEXT UNIQUE + TIMESTAMPTZ DEFAULT` (root-caused to Arrow type-projection mismatch on the wire). Workaround: list columns explicitly. Tracked for v0.2. |
-| psql `\dt` / `\d`-family meta-commands | 🛠 | psql probes `pg_catalog.pg_table_is_visible`, `pg_get_userbyid`, `pg_get_function_arguments`, etc. — the views in Phase 5.11.M ship but the underlying UDFs don't, so `\dt` errors with `Invalid function 'pg_catalog.pg_table_is_visible'`. List tables via `SELECT table_name FROM information_schema.tables` until the UDF surface ships. |
+| psql `\dt` / `\d`-family meta-commands | ✅ | Phase 5.11.N: 20 pg_catalog scalar stubs registered — `pg_table_is_visible`, `pg_get_userbyid`, `pg_get_function_arguments/result/identity_arguments`, `pg_get_expr`, `pg_get_indexdef`, `format_type`, `pg_get_constraintdef`, `pg_total_relation_size`, `pg_table_size`, `pg_relation_size`, `obj_description`, `col_description`, `pg_get_partkeydef`, `pg_encoding_to_char`, `current_schema`, `current_schemas`, `has_table_privilege`, `has_schema_privilege`. Each registered under both bare and `pg_catalog.`-qualified names. Note: `current_schemas(bool)` returns the PG array-literal string `{pg_catalog,public}` rather than a true `text[]` because Basin's df↔ws arrow bridge does not yet support List types. |
 | Prepared statements with parameter bind | ✅ | shipped with extended-query protocol |
 | Foreign keys | ✅ | single-tenant single-shard. `REFERENCES users(id)` (column-level) and table-level `FOREIGN KEY (col) REFERENCES users(id)` both supported. `ON DELETE NO ACTION` (default; rejects parent DELETE if children exist) and `ON DELETE CASCADE` (recursive child DELETE via existing engine path). `SET NULL` / `SET DEFAULT` / `RESTRICT` rejected at CREATE. Cross-tenant FKs structurally blocked by tenant-scoped `Catalog::load_table`. Referenced columns must be PK (multi-column UNIQUE not yet shipped). |
 | Triggers (declarative lifecycle + SQL-bodied reactors) | ✅ | **Reframed away from PL/pgSQL per [ADR 0012](./docs/decisions/0012-change-event-primitive.md).** Declarative lifecycle (Phase 5.11.B): `AUTO_UPDATE` columns, `AUDIT TO <table>` table option, `SOFT DELETE` columns with `INCLUDE DELETED` opt-out — covers ~75% of `audit_*` and `updated_at` trigger use cases. SQL-bodied reactors `ALTER TABLE … REACT ON {INSERT\|UPDATE\|DELETE} [WHEN (…)] EXECUTE <sql>` (Phase 5.11.C) — Tier 0 sink trait + capture point in `crates/basin-common::events`; pre-commit dispatch with `NEW`/`OLD`/`TG_OP`/`TG_TABLE_NAME` substitution; reactor failure rolls back the source mutation. Constraint reactors `REACT ON INSERT CONSTRAINT (predicate)` (Phase 5.11.C2) via the `__basin_assert(predicate, error_text)` UDF (works around DataFusion's eager CASE-eval); SQLSTATE 23514 on violation. `DROP REACTOR <name> ON <table>`. PL/pgSQL parser / interpreter explicitly out of scope. |
@@ -91,7 +94,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Row-Level Security | ✅ | `ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` with `current_user`-aware predicates injected at logical-plan layer; cross-tenant leak invariant tested |
 | BYO-bucket | ◻️ | customer's S3 + IAM role |
 | BYO-key (KMS) | ✅ | Engine seam fully wired. `EncryptionProvider` trait in `basin-storage::encryption` + `Storage::attach_encryption_provider` (opt-in, default `None` = plaintext) + per-tenant `TenantStorageConfig` registry persisted via catalog (`Storage::set_tenant_storage_config`) + cache-invalidation on update. `wrap_key_with_config` / `unwrap_key_with_config` extension methods route per-tenant CMK refs (default-impl forwards to `wrap_key`/`unwrap_key` for backward compat). Writer envelope-encrypts the Parquet body with a fresh per-file AES-256-GCM data key + persists the wrapped key as a `<path>.wrapped` sidecar; reader transparently unwraps. **External callers plug in their own KMS adapter** — the OSS engine ships only the trait + per-tenant config + envelope-encryption hooks. |
-| Tenant deletion (`O(file_count)`) | ✅ | `Storage::delete_tenant` is catalog-first paths + parallel orphan LIST + bulk DeleteObjects + drop_namespace; LocalFS 4ms, R2 ~1.4-2.2s |
+| Tenant deletion (`O(file_count)`) | ✅ | `Storage::delete_tenant` is catalog-first paths + parallel orphan LIST + bulk DeleteObjects + drop_namespace; LocalFS ~4ms, high-latency S3-compatible store ~1.4-2.2s |
 | Table fork (catalog COW) | ✅ | `Catalog::fork_table(tenant, src, dst)` clones a table's metadata + snapshot history into a new sibling within the same tenant, sharing data files by reference. Diverges on next commit. v0.2 adds cross-tenant fork with refcount-aware GC. |
 | Within-tenant time partitioning | ✅ | `CREATE TABLE … PARTITION BY RANGE (ts)`; partition pruning |
 | Tiered storage (hot/cold) | ✅ | `ALTER TABLE … SET cold_after = N`; compactor moves files between tiers |
@@ -111,7 +114,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Pluggable `object_store` in `basin-server` | ✅ | `BASIN_STORAGE_BACKEND=local|r2|s3|tigris` wires the runnable binary to local FS or S3-compatible object stores. The storage crate still accepts any `dyn ObjectStore` for embedding/tests. |
 | **NVMe disk cache** | ✅ | LRU on local SSD; ~50ms cold S3 fetches → ~100µs warm SSD reads. Default-on. 101× speedup measured. |
 | **Parquet page cache (RAM)** | ✅ | LRU of decoded RecordBatches; <1ms warm hits. Default-on. 7.24× speedup measured. |
-| HTTP/2 toggle for S3 client | ✅ | `S3Config::http2_only`; useful on AWS S3 / R2 over HTTPS |
+| HTTP/2 toggle for S3 client | ✅ | `S3Config::http2_only`; useful on AWS S3 / Tigris / R2 over HTTPS |
 | Iceberg-style catalog (in-memory) | ✅ | atomic appends, optimistic concurrency |
 | Iceberg-style catalog (durable) | ✅ | Postgres-backed; survives restart. Multi-region replication direction: single-writer global PG with regional read replicas via PG logical replication — see [ADR 0010](./docs/decisions/0010-catalog-replication.md). |
 | Point-in-time restore (catalog level) | 🛠 | `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` truncates history to ≤ target and rewinds the head pointer. InMemory + Postgres impls. v0.2 adds physical file GC for orphaned post-rollback files; cross-DML rollback waits on soft-delete (also v0.2). Project-wide variants (`list_snapshots_project_wide`, `diff_snapshots`, `rollback_to_snapshot_project_wide`) shipped for Migration Manager v0.2. |
@@ -181,7 +184,7 @@ the corresponding `ScalarUDF`s and parse the relevant `WITH (…)` options.
 | Single-region | ✅ | the wedge customer's posture |
 | Multi-region by deployment (one cluster per region) | ✅ | works today; document at [`docs/deployment.md`](./docs/deployment.md) |
 | `region` field on `TenantMetadata` | ◻️ | 1-day Phase 1 add to make region-pinning explicit |
-| S3 cross-region replication of data | ◻️ | "free" via bucket-level configuration on AWS S3 / R2 |
+| S3 cross-region replication of data | ◻️ | "free" via bucket-level configuration on AWS S3, Tigris, R2, etc. |
 | Eventual-consistent cross-region read replicas | ◻️ | scoped in [ADR 0004](./docs/decisions/0004-multi-region-read-replicas.md), build planned |
 | Cross-region 2PC / strong consistency | 🚫 | see [ADR 0001](./docs/decisions/0001-single-region-only.md) — Spanner-class, deferred until paid |
 
@@ -222,7 +225,7 @@ architecture rationale. TL;DR:
   that Postgres-as-a-Service vendors charge per project because Postgres
   can't multi-tenant cheaply. Basin can. ~$0.10–$0.20 per tenant per
   month all-in for a 100 MB / 10k-tenant workload.
-- **Cloudflare R2 + Fly.io is the recommended cloud.** Zero egress, ~5–30 ms
+- **Fly.io + Tigris is the managed cloud.** Zero egress, ~5–30 ms
   RTT in-metro, no surprise bills.
 - **Multi-region today** = deploy one Basin cluster per region. No DB
   changes required. Read-replica / cross-region writes are Phase 6 work.

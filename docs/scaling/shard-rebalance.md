@@ -274,17 +274,18 @@ and another is cold, **move whole shards** between machines.
 
 ### Six-step move
 
-Each step assumes Fly Machines + Cloudflare R2. The shard is currently on
-machine `M_src`, moving to `M_tgt`. The R2 bucket is shared.
+Each step assumes Fly Machines + an S3-compatible object store (Tigris in
+basin-cloud; any backend for self-hosted). The shard is currently on
+machine `M_src`, moving to `M_tgt`. The bucket is shared.
 
-1. **Snapshot to R2** — already done by the running compactor; the
-   Parquet base IS in R2. The WAL tail (last few seconds of writes) is
-   the only thing not yet in R2.
+1. **Snapshot to object store** — already done by the running compactor; the
+   Parquet base IS in the bucket. The WAL tail (last few seconds of writes) is
+   the only thing not yet flushed.
 2. **Force a WAL flush + Parquet drain on `M_src`** —
-   `Shard::flush_to_parquet()` (already exists). After this, R2 has
+   `Shard::flush_to_parquet()` (already exists). After this, the bucket has
    every row that's been ACK'd up to time `t`.
 3. **Bring up `M_tgt`** — spawn a new Fly machine running the same
-   `basin-engine` binary, configured with the same R2 bucket and the
+   `basin-engine` binary, configured with the same bucket and the
    shared placement-service endpoint. The embedded catalog is local to
    the engine — `M_tgt` does not need a separate Postgres connection.
    It comes up cold (no resident tenants).
@@ -296,21 +297,21 @@ machine `M_src`, moving to `M_tgt`. The R2 bucket is shared.
    reconnects the client transparently).
 5. **Replay WAL tail on `M_tgt`** — `M_tgt` lazy-loads each
    `(tenant, partition)` on first access (today's cold-start path via
-   `replay_wal_into`). The WAL is in R2; replay is a few-megabyte read
-   + IPC decode.
+   `replay_wal_into`). The WAL is in the bucket; replay is a few-megabyte
+   read + IPC decode.
 6. **Drop `M_src`** — once `M_src` reports zero resident partitions for
    the moved set, the placement service hard-terminates it (Fly
-   machine destroy). The R2 bucket is unchanged.
+   machine destroy). The bucket is unchanged.
 
 The whole move is **2–10 seconds** worth of unavailability for the
 moved partitions (steps 4–5). Other partitions on `M_src` are
 unaffected.
 
-### Why this works on Fly + R2
+### Why this works on Fly + shared object storage
 
-- **R2 is the shared substrate.** Both machines see the same Parquet
-  files and the same WAL segments. The move is purely a "who owns the
-  in-memory state" decision — no data copies.
+- **The object store is the shared substrate.** Both machines see the same
+  Parquet files and the same WAL segments. The move is purely a "who owns
+  the in-memory state" decision — no data copies.
 - **Catalog is the linearisation point.** Same as the split: the
   placement-service flip is an atomic transaction against the
   placement store (`UPDATE shard_placement SET machine = $tgt WHERE
@@ -319,8 +320,8 @@ unaffected.
   external durability can point placement at any pgwire backend.
   Writers see either old or new owner, never both.
 - **WAL replay is the catchup mechanism.** `M_tgt` doesn't need state
-  transfer from `M_src`; it reconstructs state from R2. The cost is
-  the replay-time RAM and a small read burst on R2 — both bounded by
+  transfer from `M_src`; it reconstructs state from the bucket. The cost is
+  the replay-time RAM and a small read burst — both bounded by
   the size of the tail (≤ a minute's worth of writes, by design of the
   compaction interval).
 

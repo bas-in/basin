@@ -834,7 +834,7 @@ impl Storage {
     /// Prefer [`Storage::delete_tenant`] when a catalog is available — it
     /// fires `DeleteObjects` against the catalog-known files in parallel
     /// with the LIST RPC, hiding one round-trip on high-RTT object stores
-    /// (R2 from APAC: ~300-500ms saved on a tenant of 100 small files).
+    /// (~300-500ms saved on a tenant of 100 small files at high-latency endpoints).
     #[tracing::instrument(skip(self), fields(tenant=%tenant))]
     pub async fn delete_tenant_prefix(&self, tenant: &TenantId) -> Result<usize> {
         let started = std::time::Instant::now();
@@ -916,9 +916,10 @@ impl Storage {
     ///    in-memory and Postgres backends each implement this in a
     ///    single statement / single locked pass.
     ///
-    /// On R2 from APAC for a tenant of 100 small files, this drops the
-    /// wall clock from ~3.2 s (LIST → bulk DELETE serial) to ~1.2 s
-    /// (parallel LIST + DELETE; one RTT hidden).
+    /// On a high-latency S3-compatible store (e.g. cross-region) for a
+    /// tenant of 100 small files, this drops the wall clock from ~3.2 s
+    /// (LIST → bulk DELETE serial) to ~1.2 s (parallel LIST + DELETE; one
+    /// RTT hidden).
     ///
     /// Falls back to the LIST-only path when [`Catalog::list_tenant_data_files`]
     /// returns an error (e.g. a transient catalog outage) — the storage

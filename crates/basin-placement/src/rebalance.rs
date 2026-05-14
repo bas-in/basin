@@ -6,12 +6,12 @@
 //! ## Overview
 //!
 //! When one shard *machine* is hot and another is cold, we move whole
-//! shards between them. The R2 bucket is shared substrate (no data
-//! copy); the move is purely a "who owns the in-memory state" decision
+//! shards between them. The object-store bucket is shared substrate (no
+//! data copy); the move is purely a "who owns the in-memory state" decision
 //! plus a WAL tail replay on the target. Steps:
 //!
 //! 1. Flush + Parquet-drain on `M_src` (no in-flight tail in RAM only).
-//! 2. Bring up `M_tgt` (cold engine, same R2 bucket + Neon catalog).
+//! 2. Bring up `M_tgt` (cold engine, same bucket + catalog).
 //! 3. Atomic placement flip in the catalog (the linearisation point).
 //! 4. `M_tgt` lazy-loads each `(tenant, partition)` on first access via
 //!    the existing WAL replay path.
