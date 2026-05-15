@@ -22,6 +22,7 @@ use basin_catalog::PartitionSpec;
 use basin_common::{BasinError, PartitionKey, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlparser::ast::{DataType as SqlDataType, Expr, FunctionArguments, UnaryOperator, Value};
+use sqlparser::ast::ValueWithSpan;
 
 use crate::types::{
     bit_fixed_len, field_is_bit, field_is_cidr, field_is_inet, field_is_jsonb, field_is_macaddr,
@@ -525,15 +526,15 @@ fn coerce_bytea(expr: &Expr) -> Result<Option<Vec<u8>>> {
             data_type: SqlDataType::Bytea,
             ..
         } => inner.as_ref(),
-        Expr::Value(Value::Null) => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
         _ => expr,
     };
     let s = match inner {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => s,
-        Expr::Value(Value::Null) => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => s,
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
         _ => {
             return Err(BasinError::InvalidSchema(format!(
                 "expected bytea literal, got {expr:?}"
@@ -579,11 +580,11 @@ fn coerce_bytea(expr: &Expr) -> Result<Option<Vec<u8>>> {
 /// literal itself as a problem; that's a valid JSON token.
 fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
     let s: &str = match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => s.as_str(),
-        Expr::Value(Value::Null) => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => s.as_str(),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
         // A bare `Cast` like `'{...}'::jsonb` is friendly to allow even
         // though our DDL doesn't produce it; peel and recurse.
         Expr::Cast { expr: inner, .. } => return coerce_jsonb(inner.as_ref(), col),
@@ -623,10 +624,10 @@ fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
 /// would surprise readers later.
 fn coerce_uuid(expr: &Expr, col: &str) -> Result<Option<[u8; 16]>> {
     match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
             let parsed = uuid::Uuid::parse_str(s).map_err(|e| {
                 BasinError::InvalidSchema(format!(
                     "invalid UUID literal for column {col}: {e} (got {s:?})"
@@ -634,7 +635,7 @@ fn coerce_uuid(expr: &Expr, col: &str) -> Result<Option<[u8; 16]>> {
             })?;
             Ok(Some(*parsed.as_bytes()))
         }
-        Expr::Value(Value::Null) => Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Ok(None),
         Expr::Cast { expr: inner, .. } => coerce_uuid(inner.as_ref(), col),
         Expr::Function(f) => {
             // Match `gen_random_uuid()` (pgcrypto) and
@@ -676,11 +677,11 @@ fn coerce_uuid(expr: &Expr, col: &str) -> Result<Option<[u8; 16]>> {
 /// single-quoted string. Cast wrappers (`'...'::inet`) are accepted by peeling.
 fn coerce_string_for_typed(expr: &Expr, col: &str, type_name: &str) -> Result<Option<String>> {
     match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => Ok(Some(s.clone())),
-        Expr::Value(Value::Null) => Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => Ok(Some(s.clone())),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Ok(None),
         Expr::Cast { expr: inner, .. } => coerce_string_for_typed(inner.as_ref(), col, type_name),
         other => Err(BasinError::InvalidSchema(format!(
             "expected {type_name} string literal for column {col}, got {other}"
@@ -823,14 +824,14 @@ fn coerce_bit_string(
     col: &str,
 ) -> Result<Option<String>> {
     let s = match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => s.clone(),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => s.clone(),
         // sqlparser parses `B'0110'` as Value::SingleQuotedString with the
         // `B` prefix consumed — it becomes the raw string without the `B`.
         // We handle the case where the user wrote a number literal of 0/1s.
-        Expr::Value(Value::Null) => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
         Expr::Cast { expr: inner, .. } => {
             return coerce_bit_string(inner.as_ref(), max_len, exact, col);
         }
@@ -882,10 +883,10 @@ fn coerce_bit_string(
 /// through `coerce_decimal128`.
 fn coerce_money(expr: &Expr, precision: u8, scale: i8, col: &str) -> Result<Option<i128>> {
     match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
             // Strip leading currency symbol(s) and any commas used as
             // thousands separators. Keep digits, '.', '+', '-'.
             let stripped: String = s
@@ -955,13 +956,13 @@ fn check_null_allowed(field: &arrow_schema::Field) -> Result<()> {
 /// type mismatch.
 fn coerce_i64(expr: &Expr) -> Result<Option<i64>> {
     match peel_unary(expr) {
-        (negated, Expr::Value(Value::Number(s, _))) => {
+        (negated, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
             let parsed: i64 = s.parse().map_err(|e| {
                 BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
             })?;
             Ok(Some(if negated { -parsed } else { parsed }))
         }
-        (false, Expr::Value(Value::Null)) => Ok(None),
+        (false, Expr::Value(ValueWithSpan { value: Value::Null, .. })) => Ok(None),
         (_, other) => Err(BasinError::InvalidSchema(format!(
             "expected integer literal, got {other}"
         ))),
@@ -970,13 +971,13 @@ fn coerce_i64(expr: &Expr) -> Result<Option<i64>> {
 
 fn coerce_f64(expr: &Expr) -> Result<Option<f64>> {
     match peel_unary(expr) {
-        (negated, Expr::Value(Value::Number(s, _))) => {
+        (negated, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
             let parsed: f64 = s
                 .parse()
                 .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")))?;
             Ok(Some(if negated { -parsed } else { parsed }))
         }
-        (false, Expr::Value(Value::Null)) => Ok(None),
+        (false, Expr::Value(ValueWithSpan { value: Value::Null, .. })) => Ok(None),
         (_, other) => Err(BasinError::InvalidSchema(format!(
             "expected float literal, got {other}"
         ))),
@@ -999,17 +1000,17 @@ fn coerce_f64(expr: &Expr) -> Result<Option<f64>> {
 fn coerce_decimal128(expr: &Expr, precision: u8, scale: i8, col: &str) -> Result<Option<i128>> {
     let (negated, inner) = peel_unary(expr);
     let s = match inner {
-        Expr::Value(Value::Number(s, _)) => s.as_str(),
-        Expr::Value(Value::Null) if !negated => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.as_str(),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) if !negated => return Ok(None),
         Expr::Cast { expr: ce, .. } => {
             // Allow `'1.50'::numeric(10,2)` style casts by recursing into
             // the inner expression.
             return coerce_decimal128(ce.as_ref(), precision, scale, col);
         }
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => s.as_str(),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => s.as_str(),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "expected NUMERIC literal for column {col}, got {other}"
@@ -1143,11 +1144,11 @@ fn coerce_string(expr: &Expr) -> Result<Option<String>> {
 /// pure waste.
 fn coerce_string_ref(expr: &Expr) -> Result<Option<&str>> {
     match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::NationalStringLiteral(s))
-        | Expr::Value(Value::EscapedStringLiteral(s)) => Ok(Some(s.as_str())),
-        Expr::Value(Value::Null) => Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. }) => Ok(Some(s.as_str())),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Ok(None),
         other => Err(BasinError::InvalidSchema(format!(
             "expected string literal, got {other}"
         ))),
@@ -1165,10 +1166,10 @@ fn coerce_string_ref(expr: &Expr) -> Result<Option<&str>> {
 /// rather than getting a silently-truncated vector.
 fn coerce_vector(expr: &Expr, dim: usize, col: &str) -> Result<Option<Vec<f32>>> {
     let parsed: Vec<f32> = match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => parse_vector_literal(s)?,
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => parse_vector_literal(s)?,
         Expr::Array(a) => {
             let mut v = Vec::with_capacity(a.elem.len());
             for e in &a.elem {
@@ -1183,7 +1184,7 @@ fn coerce_vector(expr: &Expr, dim: usize, col: &str) -> Result<Option<Vec<f32>>>
             }
             v
         }
-        Expr::Value(Value::Null) => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "expected vector literal (string `'[...]'` or `ARRAY[...]`) for column {col}, got {other}"
@@ -1216,18 +1217,18 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
     // surfaces it as `Expr::Cast`. The inner expression is what we coerce.
     let inner = match expr {
         Expr::Cast { expr: inner, .. } => inner.as_ref(),
-        Expr::Value(Value::Null) => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
         _ => expr,
     };
     match inner {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
             let micros = parse_timestamp_string(s)?;
             Ok(Some(micros))
         }
-        Expr::Value(Value::Number(n, _)) => {
+        Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => {
             // Accept integer epoch microseconds. Negative values handled below.
             let parsed: i64 = n.parse().map_err(|e| {
                 BasinError::InvalidSchema(format!("bad timestamp integer literal {n:?}: {e}"))
@@ -1238,7 +1239,7 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
             op: UnaryOperator::Minus,
             expr: inner,
         } => {
-            if let Expr::Value(Value::Number(n, _)) = inner.as_ref() {
+            if let Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) = inner.as_ref() {
                 let parsed: i64 = n.parse().map_err(|e| {
                     BasinError::InvalidSchema(format!("bad timestamp integer literal -{n:?}: {e}"))
                 })?;
@@ -1249,7 +1250,7 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
                 )))
             }
         }
-        Expr::Value(Value::Null) => Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Ok(None),
         Expr::Function(f) => {
             // `now()` / `current_timestamp` / `transaction_timestamp()` —
             // zero-arg time-source functions. Used most commonly as
@@ -1340,8 +1341,8 @@ fn micros_from_dt(dt: DateTime<Utc>) -> Result<i64> {
 
 fn coerce_bool(expr: &Expr) -> Result<Option<bool>> {
     match expr {
-        Expr::Value(Value::Boolean(b)) => Ok(Some(*b)),
-        Expr::Value(Value::Null) => Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) => Ok(Some(*b)),
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Ok(None),
         other => Err(BasinError::InvalidSchema(format!(
             "expected boolean literal, got {other}"
         ))),

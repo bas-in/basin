@@ -51,6 +51,7 @@ use crate::pg_ast::ObjectNamePartExt;
 use basin_catalog::{Catalog, SequenceDef};
 use basin_common::{BasinError, Result, ProjectId};
 use sqlparser::ast::{Expr, ObjectName, SequenceOptions, UnaryOperator, Value};
+use sqlparser::ast::ValueWithSpan;
 
 use crate::{ExecResult, ProjectSession};
 
@@ -244,7 +245,7 @@ fn apply_options(def: &mut SequenceDef, options: &[SequenceOptions]) -> Result<(
 /// with a clear error.
 fn parse_signed_int(expr: &Expr, opt_name: &str) -> Result<i64> {
     match expr {
-        Expr::Value(Value::Number(s, _)) => s.parse::<i64>().map_err(|e| {
+        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().map_err(|e| {
             BasinError::InvalidSchema(format!(
                 "CREATE SEQUENCE {opt_name}: invalid integer {s:?} ({e})"
             ))
@@ -253,7 +254,7 @@ fn parse_signed_int(expr: &Expr, opt_name: &str) -> Result<i64> {
             op: UnaryOperator::Minus,
             expr: inner,
         } => match inner.as_ref() {
-            Expr::Value(Value::Number(s, _)) => {
+            Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => {
                 let n: i64 = s.parse().map_err(|e| {
                     BasinError::InvalidSchema(format!(
                         "CREATE SEQUENCE {opt_name}: invalid integer {s:?} ({e})"
@@ -513,7 +514,7 @@ fn int_to_expr(n: i64) -> Expr {
     if n < 0 {
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
-            expr: Box::new(Expr::Value(Value::Number(
+            expr: Box::new(Expr::Value(ValueWithSpan { value: Value::Number(, .. }
                 (-(n as i128)).to_string(),
                 false,
             ))),

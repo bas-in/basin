@@ -38,6 +38,7 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_common::{BasinError, Result};
 use sqlparser::ast::{ObjectName, SchemaName};
+use sqlparser::ast::ValueWithSpan;
 
 use crate::{ExecResult, ProjectSession};
 
@@ -355,8 +356,8 @@ pub(crate) fn exec_set_search_path(
     for v in values {
         let name = match v {
             Expr::Identifier(id) => id.value.to_ascii_lowercase(),
-            Expr::Value(Value::SingleQuotedString(s)) => s.to_ascii_lowercase(),
-            Expr::Value(Value::DoubleQuotedString(s)) => s.to_ascii_lowercase(),
+            Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => s.to_ascii_lowercase(),
+            Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. }) => s.to_ascii_lowercase(),
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "SET search_path: unsupported value {other}"

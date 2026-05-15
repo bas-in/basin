@@ -36,6 +36,7 @@ use crate::pg_ast::ObjectNamePartExt;
 use arrow_schema::{DataType, Field};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::{
+use sqlparser::ast::ValueWithSpan;
     Assignment, AssignmentTarget, BinaryOperator, Expr, FromTable, ObjectName, Query, SetExpr,
     Statement, TableFactor, Value,
 };
@@ -420,7 +421,7 @@ fn name_to_table(name: &ObjectName) -> Result<TableName> {
 
 fn placeholder_index(e: &Expr) -> Option<usize> {
     match e {
-        Expr::Value(Value::Placeholder(s)) => {
+        Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. }) => {
             s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok())
         }
         _ => None,
@@ -482,7 +483,7 @@ async fn walk_select_for_predicates(
     // LIMIT $N and OFFSET $N — Postgres types these as int8 (BIGINT). Drivers
     // that don't get this hint refuse to bind i64 values for them. Without
     // this, every ORM with `.limit(?)` / `.offset(?)` breaks at the client.
-    if let Some(Expr::Value(Value::Placeholder(s))) = q.limit.as_ref() {
+    if let Some(Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. })) = q.limit.as_ref() {
         if let Some(idx) = s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
             if let Some(slot) = out.get_mut(idx.saturating_sub(1)) {
                 *slot = DataType::Int64;
@@ -490,7 +491,7 @@ async fn walk_select_for_predicates(
         }
     }
     if let Some(off) = q.offset.as_ref() {
-        if let Expr::Value(Value::Placeholder(s)) = &off.value {
+        if let Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. }) = &off.value {
             if let Some(idx) = s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
                 if let Some(slot) = out.get_mut(idx.saturating_sub(1)) {
                     *slot = DataType::Int64;

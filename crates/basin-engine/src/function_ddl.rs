@@ -29,6 +29,7 @@ use basin_catalog::{
 };
 use basin_common::{BasinError, Result};
 use sqlparser::ast::{
+use sqlparser::ast::ValueWithSpan;
     CreateFunctionBody, DataType as SqlDataType, Expr, Ident, ObjectName, OperateFunctionArg,
     TimezoneInfo, Value,
 };
@@ -388,8 +389,8 @@ fn extract_body_text(body: &Option<CreateFunctionBody>, fn_name: &str) -> Result
     match body {
         CreateFunctionBody::AsBeforeOptions(expr) | CreateFunctionBody::AsAfterOptions(expr) => {
             match expr {
-                Expr::Value(Value::DollarQuotedString(s)) => Ok(s.value.clone()),
-                Expr::Value(Value::SingleQuotedString(s)) => Ok(s.clone()),
+                Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(s), .. }) => Ok(s.value.clone()),
+                Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Ok(s.clone()),
                 other => Err(BasinError::InvalidSchema(format!(
                     "CREATE FUNCTION {fn_name}: function body must be a dollar-quoted \
                      or single-quoted string literal containing a single SELECT; got {other}"

@@ -27,6 +27,7 @@ use basin_catalog::TableMetadata;
 use basin_common::{BasinError, PartitionKey, Result, TableName};
 use basin_storage::{Predicate, ReadOptions, ScalarValue};
 use sqlparser::ast::{
+use sqlparser::ast::ValueWithSpan;
     BinaryOperator, Expr, GroupByExpr, ObjectName, Query, SelectItem, SetExpr, Statement,
     TableFactor, UnaryOperator, Value,
 };
@@ -147,7 +148,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // placeholders fall through to DataFusion.
     let limit = match &q.limit {
         None => None,
-        Some(Expr::Value(Value::Number(s, _))) => match s.parse::<i64>() {
+        Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => match s.parse::<i64>() {
             Ok(n) if n >= 0 => Some(n as usize),
             _ => return None,
         },
@@ -238,21 +239,21 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
         other => (false, other),
     };
     match inner {
-        Expr::Value(Value::Number(s, _)) => {
+        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => {
             let parsed: i64 = s.parse().ok()?;
             Some(ScalarValue::Int64(if negate { -parsed } else { parsed }))
         }
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
             if negate {
                 None
             } else {
                 Some(ScalarValue::Utf8(s.clone()))
             }
         }
-        Expr::Value(Value::Boolean(b)) => {
+        Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) => {
             if negate {
                 None
             } else {

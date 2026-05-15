@@ -36,6 +36,7 @@ use datafusion::datasource::listing::{
 use datafusion::prelude::SessionContext;
 use object_store::path::Path as ObjectPath;
 use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
+use sqlparser::ast::ValueWithSpan;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::sync::Mutex;
@@ -704,11 +705,11 @@ fn literal_to_micros(expr: &Expr) -> Option<i64> {
         other => other,
     };
     match inner {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => parse_timestamp_string_for_pruning(s),
-        Expr::Value(Value::Number(n, _)) => n.parse().ok(),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => parse_timestamp_string_for_pruning(s),
+        Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => n.parse().ok(),
         _ => None,
     }
 }

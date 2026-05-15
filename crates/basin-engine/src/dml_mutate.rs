@@ -64,6 +64,7 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use sqlparser::ast::{
+use sqlparser::ast::ValueWithSpan;
     Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, ObjectName, SelectItem,
     TableFactor, TableWithJoins, UnaryOperator, Value,
 };
@@ -156,7 +157,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(Value::Number(
+                    expr: Box::new(Expr::Value(ValueWithSpan { value: Value::Number(, .. }
                         (-v).to_string(),
                         false,
                     ))),
@@ -182,7 +183,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0.0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(Value::Number(
+                    expr: Box::new(Expr::Value(ValueWithSpan { value: Value::Number(, .. }
                         (-v).to_string(),
                         false,
                     ))),
@@ -2270,7 +2271,7 @@ fn literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<ScalarValu
 fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option<ScalarValue>> {
     let (negated, inner) = peel_unary(expr);
     match (dt, inner) {
-        (DataType::Int64, Expr::Value(Value::Number(s, _))) => {
+        (DataType::Int64, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
             let parsed: i64 = s.parse().map_err(|e| {
                 BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
             })?;
@@ -2280,7 +2281,7 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
                 parsed
             })))
         }
-        (DataType::Float64, Expr::Value(Value::Number(s, _))) => {
+        (DataType::Float64, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
             let parsed: f64 = s
                 .parse()
                 .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")))?;
@@ -2290,10 +2291,10 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
                 parsed
             })))
         }
-        (DataType::Utf8, Expr::Value(Value::SingleQuotedString(s)))
-        | (DataType::Utf8, Expr::Value(Value::DoubleQuotedString(s)))
-        | (DataType::Utf8, Expr::Value(Value::EscapedStringLiteral(s)))
-        | (DataType::Utf8, Expr::Value(Value::NationalStringLiteral(s))) => {
+        (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }))
+        | (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. }))
+        | (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. }))
+        | (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. })) => {
             if negated {
                 Err(BasinError::InvalidSchema(format!(
                     "cannot negate string literal in SET {col} = {expr}"
@@ -2302,7 +2303,7 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
                 Ok(Some(ScalarValue::Utf8(s.clone())))
             }
         }
-        (DataType::Boolean, Expr::Value(Value::Boolean(b))) => {
+        (DataType::Boolean, Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. })) => {
             if negated {
                 Err(BasinError::InvalidSchema(format!(
                     "cannot negate boolean literal in SET {col} = {expr}"
@@ -2319,13 +2320,13 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
             // refresh-token-rotate, and password-reset flows all rely on
             // this round trip.
             let micros: i64 = match inner {
-                Expr::Value(Value::Number(s, _)) => s.parse::<i64>().map_err(|e| {
+                Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().map_err(|e| {
                     BasinError::InvalidSchema(format!("bad timestamp literal {s:?}: {e}"))
                 })?,
-                Expr::Value(Value::SingleQuotedString(s))
-                | Expr::Value(Value::DoubleQuotedString(s))
-                | Expr::Value(Value::EscapedStringLiteral(s))
-                | Expr::Value(Value::NationalStringLiteral(s)) => {
+                Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+                | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+                | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+                | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
                     chrono::DateTime::parse_from_rfc3339(s)
                         .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_micros())
                         .map_err(|e| {
@@ -2513,7 +2514,7 @@ fn identifier_or_err(e: &Expr) -> Result<String> {
 fn as_literal(e: &Expr) -> Result<Option<ScalarValue>> {
     let (negated, inner) = peel_unary(e);
     Ok(match inner {
-        Expr::Value(Value::Number(s, _)) => {
+        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => {
             // Try integer first; fall back to float if the literal has a `.`.
             if s.contains('.') || s.contains('e') || s.contains('E') {
                 let v: f64 = s.parse().map_err(|e| {
@@ -2527,10 +2528,10 @@ fn as_literal(e: &Expr) -> Result<Option<ScalarValue>> {
                 Some(ScalarValue::Int64(if negated { -v } else { v }))
             }
         }
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s)) => {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
             if negated {
                 return Err(BasinError::InvalidSchema(
                     "cannot negate string literal in WHERE".into(),
@@ -2538,7 +2539,7 @@ fn as_literal(e: &Expr) -> Result<Option<ScalarValue>> {
             }
             Some(ScalarValue::Utf8(s.clone()))
         }
-        Expr::Value(Value::Boolean(b)) => {
+        Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) => {
             if negated {
                 return Err(BasinError::InvalidSchema(
                     "cannot negate boolean literal in WHERE".into(),
