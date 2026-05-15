@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778839498 (Unix epoch)
-SQL fragments tested: 490 total / 1269 green (across all three configurations).
+Last run: 1778886905 (Unix epoch)
+SQL fragments tested: 697 total / 1650 green (across all three configurations).
 
 ## Configurations
 
@@ -31,11 +31,20 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `NOTIFY ch, 'msg'` | 🚫 | 🚫 | 🚫 | feature not supported: NOTIFY is not supported (SQLSTATE 0A000) |
 | `UNLISTEN ch` | 🚫 | 🚫 | 🚫 | feature not supported: UNLISTEN is not supported (SQLSTATE 0A000) |
 | `PREPARE stmt AS SELECT 1` | ✅ | ✅ | ✅ |  |
+| `PREPARE stmt(INT) AS SELECT $1` | ✅ | ✅ | ✅ |  |
 | `EXECUTE stmt` | ✅ | ✅ | ✅ |  |
+| `EXECUTE stmt(42)` | ✅ | ✅ | ✅ |  |
 | `DEALLOCATE stmt` | ✅ | ✅ | ✅ |  |
+| `DEALLOCATE ALL` | ✅ | ✅ | ✅ |  |
 | `DECLARE c CURSOR FOR SELECT 1` | ✅ | ✅ | ✅ |  |
+| `DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id` | ✅ | ✅ | ✅ |  |
+| `DECLARE c NO SCROLL CURSOR FOR SELECT 1` | ✅ | ✅ | ✅ |  |
 | `FETCH 1 FROM c` | ✅ | ✅ | ✅ |  |
+| `FETCH ALL FROM c` | ✅ | ✅ | ✅ |  |
+| `FETCH FORWARD 5 FROM c` | ✅ | ✅ | ✅ |  |
+| `MOVE FORWARD 2 IN c` | ✅ | ✅ | ✅ |  |
 | `CLOSE c` | ✅ | ✅ | ✅ |  |
+| `CLOSE ALL` | 🚫 | 🚫 | 🚫 | internal: CLOSE ALL is not supported in v0.1; close cursors individually |
 | `LOCK TABLE t` | ✅ | ✅ | ✅ |  |
 | `VACUUM` | ✅ | ✅ | ✅ |  |
 | `ANALYZE` | ✅ | ✅ | ✅ |  |
@@ -78,10 +87,26 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `DROP POLICY p ON t` | ✅ | ✅ | ✅ |  |
 | `COMMENT ON TABLE t IS 'x'` | ✅ | ✅ | ✅ |  |
 | `CREATE EXTENSION pgcrypto` | ✅ | ✅ | ✅ |  |
+| `CREATE EXTENSION IF NOT EXISTS pgcrypto` | ✅ | ✅ | ✅ |  |
+| `DROP EXTENSION IF EXISTS pgcrypto` | ✅ | ✅ | ✅ |  |
+| `CREATE AGGREGATE myagg(INT) (SFUNC = int4pl, STYPE = INT)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an object type after CREAT… |
+| `CREATE OPERATOR + (LEFTARG = INT, RIGHTARG = INT, FUNCTION = int4pl)` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: CREATE OPERATOR + (FUNCTION = int4pl, LEFTARG =… |
+| `CREATE TYPE mycomposite AS (x INT, y INT)` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TYPE … AS (composite) is out of scope for v0.… |
+| `CREATE TYPE myenum AS ENUM ('a', 'b', 'c')` | ✅ | ✅ | ✅ |  |
+| `CREATE RULE myrule AS ON INSERT TO t DO ALSO NOTHING` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an object type after CREAT… |
+| `CREATE EVENT TRIGGER myevt ON ddl_command_start EXECUTE FUNCTION fn()` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an object type after CREAT… |
+| `CREATE PUBLICATION mypub FOR ALL TABLES` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an object type after CREAT… |
+| `CREATE SUBSCRIPTION mysub CONNECTION 'host=localhost' PUBLICATION mypub` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an object type after CREAT… |
+| `CREATE SERVER myserver FOREIGN DATA WRAPPER postgres_fdw` | ✅ | ✅ | ✅ |  |
+| `CREATE FOREIGN TABLE ft (id INT) SERVER myserver` | ✅ | ✅ | ✅ |  |
+| `ALTER VIEW v AS SELECT id FROM t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: ALTER VIEW v AS SELECT id FROM t |
+| `CREATE OR REPLACE VIEW v AS SELECT id FROM t` | ✅ | ✅ | ✅ |  |
+| `DROP TRIGGER trg ON t` | ✅ | ✅ | ✅ |  |
 | `CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW WHEN (NEW.id <> OLD.id) EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
 | `CREATE TRIGGER trg INSTEAD OF DELETE ON vv FOR EACH ROW EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
 | `CREATE TRIGGER trg AFTER INSERT ON t REFERENCING NEW TABLE AS new_t FOR EACH STATEMENT EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
 | `CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
+| `CREATE COLLATION my_collation (LOCALE = 'en-US')` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an object type after CREAT… |
 
 ## DDL/Tables
 
@@ -138,6 +163,10 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `CREATE TABLE t (id INT) PARTITION BY HASH (id)` | ✅ | ✅ | ✅ |  |
 | `ALTER TABLE t ATTACH PARTITION p FOR VALUES IN ('us')` | ✅ | ✅ | ✅ |  |
 | `ALTER TABLE t DETACH PARTITION p` | 🚫 | 🚫 | 🚫 | setup failed: feature not supported: CREATE TABLE … PARTITION OF is not sup… |
+| `CREATE TABLE t (name TEXT COLLATE "C")` | 📜 | 📜 | 📜 | invalid schema: unsupported column option in PoC: COLLATE "C" |
+| `CREATE TABLE t2 AS SELECT * FROM t` | ✅ | ✅ | ✅ |  |
+| `CREATE TABLE t2 AS SELECT * FROM t WITH NO DATA` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: W… |
+| `CREATE TABLE t_default PARTITION OF t DEFAULT` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TABLE … PARTITION OF is not supported (SQLSTA… |
 
 ## DML
 
@@ -161,10 +190,15 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `DELETE FROM t` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t WHERE id = 1` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t USING u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
-| `DELETE FROM t RETURNING id` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: i… |
+| `DELETE FROM t RETURNING id` | ✅ | ✅ | ✅ |  |
 | `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET id = u.id WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | ✅ | ✅ | ✅ |  |
 | `COPY t FROM STDIN` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ;, found: EOF |
 | `COPY t TO STDOUT` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: COPY t TO STDOUT |
+| `INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING` | ✅ | ✅ | ✅ |  |
+| `INSERT INTO t (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE t.id > 0` | ✅ | ✅ | ✅ |  |
+| `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.id > 0 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | ✅ | ✅ | ✅ |  |
+| `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | 📜 | 📜 | 📜 | invalid schema: WHERE clause not representable in v0.1: NOT EXISTS (SELECT 1 … |
+| `UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING USER VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
 
@@ -177,10 +211,22 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT NULLIF(1, 1)` | ✅ | ✅ | ✅ |  |
 | `SELECT GREATEST(1,2,3)` | ✅ | ✅ | ✅ |  |
 | `SELECT LEAST(1,2,3)` | ✅ | ✅ | ✅ |  |
-| `SELECT 1::TEXT` | ✅ | ✅ | ✅ |  |
-| `SELECT CAST(1 AS TEXT)` | ✅ | ✅ | ✅ |  |
+| `SELECT 1::TEXT` | 📜 | 📜 | 📜 | invalid schema: cannot convert df-arrow type to workspace-arrow: Utf8View |
+| `SELECT CAST(1 AS TEXT)` | 📜 | 📜 | 📜 | invalid schema: cannot convert df-arrow type to workspace-arrow: Utf8View |
 | `SELECT 'a' \|\| 'b'` | ✅ | ✅ | ✅ |  |
 | `SELECT 'abc' LIKE 'a%'` | ✅ | ✅ | ✅ |  |
+| `SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT id, CASE WHEN id < 0 THEN 'neg' WHEN id = 0 THEN 'zero' ELSE 'pos' END FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT 1::BIGINT + 2::BIGINT` | ✅ | ✅ | ✅ |  |
+| `SELECT '2024-01-01'::DATE` | ✅ | ✅ | ✅ |  |
+| `SELECT '12:00:00'::TIME` | 📜 | 📜 | 📜 | invalid schema: cannot translate column Utf8("12:00:00") of type Time64(Nanos… |
+| `SELECT '2024-01-01 12:00:00'::TIMESTAMP` | ✅ | ✅ | ✅ |  |
+| `SELECT '00:01:00'::INTERVAL` | 🛠 | 🛠 | 🛠 | internal: execute: Optimizer rule 'simplify_expressions' failed caused by Arr… |
+| `SELECT 'a6c5e8f0-1234-5678-abcd-000000000000'::UUID` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type UUID |
+| `SELECT 'true'::BOOLEAN` | ✅ | ✅ | ✅ |  |
+| `SELECT B'1010'` | 📜 | 📜 | 📜 | internal: plan: Error during planning: Unsupported Value 'SingleQuotedByteStr… |
+| `SELECT X'FF'` | ✅ | ✅ | ✅ |  |
+| `SELECT $1` | 🛠 | 🛠 | 🛠 | internal: execute: Execution error: Placeholder '$1' was not provided a value… |
 | `SELECT true IS TRUE` | ✅ | ✅ | ✅ |  |
 | `SELECT true IS NOT TRUE` | ✅ | ✅ | ✅ |  |
 | `SELECT false IS FALSE` | ✅ | ✅ | ✅ |  |
@@ -203,8 +249,16 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT websearch_to_tsquery('english', 'quick OR fox')` | ✅ | ✅ | ✅ |  |
 | `SELECT ts_rank(to_tsvector('a quick'), to_tsquery('quick'))` | ✅ | ✅ | ✅ |  |
 | `SELECT ts_headline('a quick fox', to_tsquery('quick'))` | ✅ | ✅ | ✅ |  |
-| `CREATE TABLE doc (body TEXT, ts TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', body)) STORED)` | ✅ | ✅ | ✅ |  |
-| `CREATE INDEX ON doc USING gin (ts)` | ✅ | ✅ | ✅ |  |
+| `CREATE TABLE doc (body TEXT, ts TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', body)) STORED)` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: TSVECTOR |
+| `CREATE INDEX ON doc USING gin (ts)` | 📜 | 📜 | 📜 | setup failed: invalid schema: unsupported column type in PoC: TSVECTOR |
+| `SELECT tsvector_to_array(to_tsvector('a quick fox'))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'tsvector_to_array'. … |
+| `SELECT tsquery_phrase(to_tsquery('quick'), to_tsquery('fox'))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'tsquery_phrase'. Did… |
+| `SELECT to_tsvector('a') @@ to_tsquery('b')` | ✅ | ✅ | ✅ |  |
+| `SELECT ts_rank_cd(to_tsvector('a quick fox'), to_tsquery('quick'))` | ✅ | ✅ | ✅ |  |
+| `SELECT numnode(to_tsquery('quick & fox'))` | ✅ | ✅ | ✅ |  |
+| `SELECT querytree(to_tsquery('quick & fox'))` | ✅ | ✅ | ✅ |  |
+| `SELECT strip(to_tsvector('a quick fox'))` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t WHERE ts @@ to_tsquery('english', 'quick')` | 📜 | 📜 | 📜 | setup failed: invalid schema: unsupported column type in PoC: TSVECTOR |
 
 ## Functions/Array
 
@@ -234,6 +288,14 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT ARRAY[1,2] @> ARRAY[1]` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2] \|\| ARRAY[3,4]` | ✅ | ✅ | ✅ |  |
+| `SELECT cardinality(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
+| `SELECT array_fill(0, ARRAY[3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'array_fill'. Did you… |
+| `SELECT array_fill(0, ARRAY[2,3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'array_fill'. Did you… |
+| `SELECT 2 = ANY(ARRAY[1,2,3])` | 🛠 | 🛠 | 🛠 | internal: execute: type_coercion caused by Error during planning: Can not fin… |
+| `SELECT 5 > ALL(ARRAY[1,2,3])` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: ALL only supports subquery c… |
+| `SELECT array_positions(ARRAY[1,2,1,3], 1)` | ✅ | ✅ | ✅ |  |
+| `SELECT array_dims(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM unnest(ARRAY['a','b'], ARRAY[1,2]) AS t(letter, num)` | ✅ | ✅ | ✅ |  |
 
 ## Functions/Crypto
 
@@ -260,7 +322,7 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT make_time(12, 30, 45.5)` | ✅ | ✅ | ✅ |  |
 | `SELECT make_timestamp(2024, 1, 15, 12, 30, 45.5)` | ✅ | ✅ | ✅ |  |
 | `SELECT make_timestamptz(2024, 1, 15, 12, 30, 45.5, 'UTC')` | ✅ | ✅ | ✅ |  |
-| `SELECT make_interval(years => 1, days => 30)` | ✅ | ✅ | ✅ |  |
+| `SELECT make_interval(years => 1, days => 30)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Function 'make_interval' does not supp… |
 | `SELECT date_part('year', NOW())` | ✅ | ✅ | ✅ |  |
 | `SELECT EXTRACT(EPOCH FROM NOW())` | ✅ | ✅ | ✅ |  |
 | `SELECT date '2024-01-01' + interval '1 day'` | ✅ | ✅ | ✅ |  |
@@ -274,6 +336,19 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT isfinite(date '2024-01-01')` | ✅ | ✅ | ✅ |  |
 | `SELECT 'infinity'::timestamp` | ✅ | ✅ | ✅ |  |
 | `SELECT '-infinity'::timestamp` | ✅ | ✅ | ✅ |  |
+| `SELECT clock_timestamp()` | ✅ | ✅ | ✅ |  |
+| `SELECT statement_timestamp()` | ✅ | ✅ | ✅ |  |
+| `SELECT transaction_timestamp()` | ✅ | ✅ | ✅ |  |
+| `SELECT localtime` | ✅ | ✅ | ✅ |  |
+| `SELECT localtimestamp` | ✅ | ✅ | ✅ |  |
+| `SELECT timeofday()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'timeofday'. Did you … |
+| `SELECT TO_DATE('2024-01-15', 'YYYY-MM-DD')` | ✅ | ✅ | ✅ |  |
+| `SELECT TO_NUMBER('12345.67', '99999.99')` | ✅ | ✅ | ✅ |  |
+| `SELECT date_bin('1 hour'::interval, NOW(), '2000-01-01'::timestamptz)` | ✅ | ✅ | ✅ |  |
+| `SELECT interval '1 year 2 months 3 days'` | ✅ | ✅ | ✅ |  |
+| `SELECT EXTRACT(DOW FROM NOW())` | ✅ | ✅ | ✅ |  |
+| `SELECT EXTRACT(QUARTER FROM NOW())` | ✅ | ✅ | ✅ |  |
+| `SELECT EXTRACT(WEEK FROM NOW())` | ✅ | ✅ | ✅ |  |
 
 ## Functions/JSONB
 
@@ -311,6 +386,15 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT '{"a":1,"b":2}'::jsonb - ARRAY['a','b']` | ✅ | ✅ | ✅ |  |
 | `SELECT '[1,2,3]'::jsonb - 1` | ✅ | ✅ | ✅ |  |
 | `SELECT '{"a":1}'::jsonb \|\| '{"b":2}'::jsonb` | ✅ | ✅ | ✅ |  |
+| `SELECT json_to_record('{"a":1,"b":"foo"}'::json) AS t(a int, b text)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: (… |
+| `SELECT jsonb_to_record('{"a":1,"b":"foo"}'::jsonb) AS t(a int, b text)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: (… |
+| `SELECT * FROM json_to_recordset('[{"a":1},{"a":2}]'::json) AS t(a int)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'json_to_recordset' not… |
+| `SELECT * FROM jsonb_to_recordset('[{"a":1},{"a":2}]'::jsonb) AS t(a int)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_to_recordset' no… |
+| `SELECT jsonb_path_query_array('{"a":[1,2,3]}'::jsonb, '$.a[*]')` | ✅ | ✅ | ✅ |  |
+| `SELECT '{"a":1}'::jsonb #- '{a}'` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot infer common type for bitwise o… |
+| `SELECT jsonb_extract_path('{"a":{"b":1}}'::jsonb, 'a', 'b')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_extract_path'.… |
+| `SELECT jsonb_extract_path_text('{"a":{"b":"x"}}'::jsonb, 'a', 'b')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_extract_path_t… |
+| `SELECT jsonb_populate_record(NULL::t, '{"id":1}'::jsonb) FROM t LIMIT 1` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_populate_recor… |
 
 ## Functions/Math
 
@@ -320,9 +404,28 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT CEIL(1.5)` | ✅ | ✅ | ✅ |  |
 | `SELECT FLOOR(1.5)` | ✅ | ✅ | ✅ |  |
 | `SELECT ROUND(1.5)` | ✅ | ✅ | ✅ |  |
+| `SELECT ROUND(3.14159, 2)` | ✅ | ✅ | ✅ |  |
+| `SELECT TRUNC(3.7)` | ✅ | ✅ | ✅ |  |
+| `SELECT TRUNC(3.7, 1)` | ✅ | ✅ | ✅ |  |
 | `SELECT POWER(2,10)` | ✅ | ✅ | ✅ |  |
 | `SELECT SQRT(4)` | ✅ | ✅ | ✅ |  |
 | `SELECT MOD(10,3)` | ✅ | ✅ | ✅ |  |
+| `SELECT LOG(100)` | ✅ | ✅ | ✅ |  |
+| `SELECT LOG(10, 100)` | ✅ | ✅ | ✅ |  |
+| `SELECT LN(2.718281828::float8)` | ✅ | ✅ | ✅ |  |
+| `SELECT EXP(1.0::float8)` | ✅ | ✅ | ✅ |  |
+| `SELECT PI()` | ✅ | ✅ | ✅ |  |
+| `SELECT SIGN(-5)` | ✅ | ✅ | ✅ |  |
+| `SELECT RANDOM()` | ✅ | ✅ | ✅ |  |
+| `SELECT DIV(10, 3)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'div'. Did you mean '… |
+| `SELECT FACTORIAL(5)` | ✅ | ✅ | ✅ |  |
+| `SELECT GCD(12, 8)` | ✅ | ✅ | ✅ |  |
+| `SELECT LCM(4, 6)` | ✅ | ✅ | ✅ |  |
+| `SELECT DEGREES(3.14159)` | ✅ | ✅ | ✅ |  |
+| `SELECT RADIANS(180.0)` | ✅ | ✅ | ✅ |  |
+| `SELECT SIN(0.0)` | ✅ | ✅ | ✅ |  |
+| `SELECT COS(0.0)` | ✅ | ✅ | ✅ |  |
+| `SELECT TAN(0.0)` | ✅ | ✅ | ✅ |  |
 
 ## Functions/String
 
@@ -330,7 +433,7 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 |---|---|---|---|---|
 | `SELECT LOWER('A')` | ✅ | ✅ | ✅ |  |
 | `SELECT UPPER('a')` | ✅ | ✅ | ✅ |  |
-| `SELECT SUBSTRING('abc' FROM 1 FOR 2)` | ✅ | ✅ | ✅ |  |
+| `SELECT SUBSTRING('abc' FROM 1 FOR 2)` | 📜 | 📜 | 📜 | invalid schema: cannot convert df-arrow type to workspace-arrow: Utf8View |
 | `SELECT LENGTH('abc')` | ✅ | ✅ | ✅ |  |
 | `SELECT REPLACE('abc','a','z')` | ✅ | ✅ | ✅ |  |
 | `SELECT TRIM(' a ')` | ✅ | ✅ | ✅ |  |
@@ -340,6 +443,22 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT initcap('hello world')` | ✅ | ✅ | ✅ |  |
 | `SELECT split_part('a,b,c', ',', 2)` | ✅ | ✅ | ✅ |  |
 | `SELECT reverse('abc')` | ✅ | ✅ | ✅ |  |
+| `SELECT left('abcdef', 3)` | ✅ | ✅ | ✅ |  |
+| `SELECT right('abcdef', 3)` | ✅ | ✅ | ✅ |  |
+| `SELECT repeat('ab', 3)` | ✅ | ✅ | ✅ |  |
+| `SELECT position('c' IN 'abcdef')` | ✅ | ✅ | ✅ |  |
+| `SELECT strpos('abcdef', 'cd')` | ✅ | ✅ | ✅ |  |
+| `SELECT overlay('abcdef' PLACING 'xyz' FROM 2 FOR 3)` | ✅ | ✅ | ✅ |  |
+| `SELECT md5('abc')` | 📜 | 📜 | 📜 | invalid schema: cannot convert df-arrow type to workspace-arrow: Utf8View |
+| `SELECT sha256('abc'::bytea)` | ✅ | ✅ | ✅ |  |
+| `SELECT starts_with('abcdef', 'abc')` | ✅ | ✅ | ✅ |  |
+| `SELECT ends_with('abcdef', 'def')` | ✅ | ✅ | ✅ |  |
+| `SELECT SUBSTRING('abcdef' FROM '[a-c]+')` | 📜 | 📜 | 📜 | internal: plan: Error during planning: Internal error: Function 'substr' fail… |
+| `SELECT SUBSTRING('abc' FROM 2)` | 📜 | 📜 | 📜 | invalid schema: cannot convert df-arrow type to workspace-arrow: Utf8View |
+| `SELECT concat('a', 'b', 'c')` | ✅ | ✅ | ✅ |  |
+| `SELECT concat_ws(',', 'a', 'b', 'c')` | ✅ | ✅ | ✅ |  |
+| `SELECT to_hex(255)` | ✅ | ✅ | ✅ |  |
+| `SELECT lpad('x', 5)` | ✅ | ✅ | ✅ |  |
 | `SELECT format('Hello, %s', 'world')` | ✅ | ✅ | ✅ |  |
 | `SELECT format('%I.%s', 'schema', 'tab')` | ✅ | ✅ | ✅ |  |
 | `SELECT quote_ident('table name')` | ✅ | ✅ | ✅ |  |
@@ -381,6 +500,15 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT pg_typeof(1)` | ✅ | ✅ | ✅ |  |
 | `SELECT pg_size_pretty(1024::bigint)` | ✅ | ✅ | ✅ |  |
 | `SELECT pg_column_size('hello')` | ✅ | ✅ | ✅ |  |
+| `SELECT version()` | ✅ | ✅ | ✅ |  |
+| `SELECT current_schema()` | ✅ | ✅ | ✅ |  |
+| `SELECT current_database()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'current_database'. D… |
+| `SELECT current_schemas(false)` | ✅ | ✅ | ✅ |  |
+| `SELECT current_setting('search_path')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'current_setting'. Di… |
+| `SELECT set_config('search_path', 'public', false)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'set_config'. Did you… |
+| `SELECT pg_postmaster_start_time()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_postmaster_start_… |
+| `SELECT pg_backend_pid()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_backend_pid'. Did… |
+| `SELECT pg_is_in_recovery()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_is_in_recovery'. … |
 
 ## PG/Operators
 
@@ -431,6 +559,21 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT '[2020-01-01,2020-12-31]'::daterange` | ✅ | ✅ | ✅ |  |
 | `SELECT tsrange(NOW() - interval '1 hour', NOW())` | ✅ | ✅ | ✅ |  |
 | `SELECT int4multirange(int4range(1,5), int4range(10,15))` | ✅ | ✅ | ✅ |  |
+| `SELECT numrange(1.5, 2.5)` | ✅ | ✅ | ✅ |  |
+| `SELECT numrange(1.0, 10.0) @> 5.5` | ✅ | ✅ | ✅ |  |
+| `SELECT int8range(1, 100)` | ✅ | ✅ | ✅ |  |
+| `SELECT int8range(1, 100) && int8range(50, 200)` | ✅ | ✅ | ✅ |  |
+| `SELECT tstzrange(NOW() - interval '1 hour', NOW())` | ✅ | ✅ | ✅ |  |
+| `SELECT lower_inc(int4range(1, 10))` | ✅ | ✅ | ✅ |  |
+| `SELECT upper_inc(int4range(1, 10))` | ✅ | ✅ | ✅ |  |
+| `SELECT lower_inf(int4range(NULL, 10))` | ✅ | ✅ | ✅ |  |
+| `SELECT upper_inf(int4range(1, NULL))` | ✅ | ✅ | ✅ |  |
+| `SELECT int4range(1,5) + int4range(3,8)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot coerce arithmetic expression Ut… |
+| `SELECT int4range(1,10) * int4range(5,15)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot coerce arithmetic expression Ut… |
+| `SELECT int4range(1,10) - int4range(5,15)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot coerce arithmetic expression Ut… |
+| `SELECT int4range(1,5) << int4range(7,10)` | ✅ | ✅ | ✅ |  |
+| `SELECT int4range(1,5) -\|- int4range(5,10)` | ✅ | ✅ | ✅ |  |
+| `SELECT int4multirange(int4range(1,5)) @> 3` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot infer common argument type for … |
 
 ## Roles
 
@@ -447,6 +590,12 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `RESET ROLE` | ✅ | ✅ | ✅ |  |
 | `SELECT current_user` | ✅ | ✅ | ✅ |  |
 | `SELECT session_user` | ✅ | ✅ | ✅ |  |
+| `GRANT SELECT ON ALL TABLES IN SCHEMA public TO alice` | ✅ | ✅ | ✅ |  |
+| `GRANT USAGE ON SCHEMA public TO alice` | ✅ | ✅ | ✅ |  |
+| `REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM alice` | ✅ | ✅ | ✅ |  |
+| `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO alice` | ✅ | ✅ | ✅ |  |
+| `CREATE ROLE mygrp NOLOGIN` | ✅ | ✅ | ✅ |  |
+| `GRANT mygrp TO alice` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: a privilege keyword, found… |
 
 ## SELECT/Aggregate
 
@@ -464,9 +613,9 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT id, GROUPING(id) FROM t GROUP BY ROLLUP (id)` | ✅ | ✅ | ✅ |  |
 | `SELECT id, name FROM t GROUP BY CUBE (id, name)` | ✅ | ✅ | ✅ |  |
 | `SELECT id, name FROM t GROUP BY GROUPING SETS ((id), (name))` | ✅ | ✅ | ✅ |  |
-| `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM t` | 🚫 | 🚫 | 🚫 | internal: plan: This feature is not implemented: WITHIN GROUP is not supporte… |
-| `SELECT percentile_disc(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY id) FROM t` | 🚫 | 🚫 | 🚫 | internal: plan: This feature is not implemented: WITHIN GROUP is not supporte… |
-| `SELECT mode() WITHIN GROUP (ORDER BY id) FROM t` | 🚫 | 🚫 | 🚫 | internal: plan: This feature is not implemented: WITHIN GROUP is not supporte… |
+| `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT percentile_disc(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY id) FROM t` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'percentile_disc'. Di… |
+| `SELECT mode() WITHIN GROUP (ORDER BY id) FROM t` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'mode'. Did you mean … |
 | `SELECT stddev(id), stddev_pop(id), stddev_samp(id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT variance(id), var_pop(id), var_samp(id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT corr(id, id), covar_pop(id, id), covar_samp(id, id) FROM t` | ✅ | ✅ | ✅ |  |
@@ -478,6 +627,9 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT array_agg(id ORDER BY id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT array_agg(DISTINCT id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT string_agg(name, ',' ORDER BY id) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT SUM(id) FILTER (WHERE id > 0), COUNT(*) FILTER (WHERE id < 0) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT json_object_agg(name, id) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT XMLAGG(XMLELEMENT(NAME foo, id)) FROM t` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ), found: foo at Line: 1, … |
 
 ## SELECT/CTE
 
@@ -487,10 +639,13 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `WITH cte AS (SELECT * FROM t) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r` | 🛠 | 🛠 | 🛠 | internal: plan: Schema error: No field named n. Valid fields are r."Int64(1)". |
 | `WITH ins AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM ins` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query INSERT INTO t VALUES (… |
+| `WITH upd AS (UPDATE t SET id = 99 WHERE id = 1 RETURNING id) SELECT * FROM upd` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query UPDATE t SET id = 99 W… |
+| `WITH del AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT * FROM del` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query DELETE FROM t WHERE id… |
+| `WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Projections require unique expression … |
 | `WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a, b` | ✅ | ✅ | ✅ |  |
-| `WITH RECURSIVE r AS (SELECT 1 AS n UNION SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r` | 🚫 | 🚫 | 🚫 | internal: plan: This feature is not implemented: Recursive queries with a dis… |
+| `WITH RECURSIVE r AS (SELECT 1 AS n UNION SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r` | ✅ | ✅ | ✅ |  |
 
 ## SELECT/Joins
 
@@ -509,9 +664,14 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id = ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id > ALL (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported ast node Functio… |
+| `SELECT * FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
+| `SELECT t.id, (SELECT COUNT(*) FROM u WHERE u.id = t.id) AS cnt FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Argument #2 must be an INTEGER or NULL… |
 | `SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
-| `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported ast node Functio… |
+| `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'unnest' not found |
+| `SELECT t.id, sub.* FROM t, LATERAL jsonb_each('{"a":1}'::jsonb) sub` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
 
 ## SELECT/Locking
 
@@ -547,6 +707,12 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT * FROM t WHERE name SIMILAR TO 'a%'` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE name ~ '^a'` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE name ~* '^A'` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t ORDER BY id ASC NULLS FIRST` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t ORDER BY id DESC NULLS LAST` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t FETCH FIRST 3 ROWS ONLY` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t FETCH FIRST 3 ROWS WITH TIES` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t ORDER BY 1` | ✅ | ✅ | ✅ |  |
 
 ## SELECT/SetOps
 
@@ -555,7 +721,12 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT 1 UNION SELECT 2` | ✅ | ✅ | ✅ |  |
 | `SELECT 1 UNION ALL SELECT 2` | ✅ | ✅ | ✅ |  |
 | `SELECT 1 INTERSECT SELECT 1` | ✅ | ✅ | ✅ |  |
+| `SELECT 1 INTERSECT ALL SELECT 1` | ✅ | ✅ | ✅ |  |
 | `SELECT 1 EXCEPT SELECT 2` | ✅ | ✅ | ✅ |  |
+| `SELECT 1 EXCEPT ALL SELECT 2` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t UNION SELECT id FROM u ORDER BY id` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t INTERSECT SELECT id FROM u` | ✅ | ✅ | ✅ |  |
+| `SELECT id FROM t EXCEPT SELECT id FROM u` | ✅ | ✅ | ✅ |  |
 
 ## SELECT/Window
 
@@ -581,6 +752,15 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SELECT SUM(id) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t` | 📜 | 📜 | 📜 | internal: plan: Error during planning: GROUPS requires an ORDER BY clause |
 | `SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ), found: EXCLUDE at Line:… |
 | `SELECT id, SUM(id) OVER w FROM t WINDOW w AS (PARTITION BY id)` | ✅ | ✅ | ✅ |  |
+| `SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT SUM(id) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT SUM(id) OVER (ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM t` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ), found: EXCLUDE at Line:… |
+| `SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ), found: EXCLUDE at Line:… |
+| `SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS) FROM t` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ), found: EXCLUDE at Line:… |
+| `SELECT id, SUM(id) OVER w1, AVG(id) OVER w2 FROM t WINDOW w1 AS (ORDER BY id), w2 AS (PARTITION BY id ORDER BY id)` | ✅ | ✅ | ✅ |  |
+| `SELECT COUNT(*) OVER (PARTITION BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT SUM(id) FILTER (WHERE id > 0) OVER (ORDER BY id) FROM t` | ✅ | ✅ | ✅ |  |
 
 ## Schemas
 
@@ -591,6 +771,9 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `SET search_path = myschema, public` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE myschema.t (id INT)` | ✅ | ✅ | ✅ |  |
 | `DROP SCHEMA myschema CASCADE` | ✅ | ✅ | ✅ |  |
+| `DROP SCHEMA IF EXISTS myschema` | ✅ | ✅ | ✅ |  |
+| `SELECT myschema.t.id FROM myschema.t` | ✅ | ✅ | ✅ |  |
+| `ALTER TABLE myschema.t ADD COLUMN name TEXT` | 🚫 | 🚫 | 🚫 | invalid identifier: schema-qualified table not supported in PoC: myschema.t |
 
 ## Transactions
 
@@ -604,6 +787,12 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `ROLLBACK TO s` | ✅ | ✅ | ✅ |  |
 | `BEGIN ISOLATION LEVEL SERIALIZABLE` | ✅ | ✅ | ✅ |  |
 | `BEGIN READ ONLY` | ✅ | ✅ | ✅ |  |
+| `BEGIN READ WRITE` | ✅ | ✅ | ✅ |  |
+| `START TRANSACTION` | ✅ | ✅ | ✅ |  |
+| `START TRANSACTION ISOLATION LEVEL READ COMMITTED` | ✅ | ✅ | ✅ |  |
+| `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` | ✅ | ✅ | ✅ |  |
+| `ROLLBACK TO SAVEPOINT s` | ✅ | ✅ | ✅ |  |
+| `RELEASE SAVEPOINT s` | ✅ | ✅ | ✅ |  |
 
 ## Types
 
@@ -638,10 +827,28 @@ SQL fragments tested: 490 total / 1269 green (across all three configurations).
 | `CREATE TABLE __t (c MACADDR); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 | `CREATE TABLE __t (c MONEY); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 | `CREATE TABLE __t (c XML); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
-| `CREATE TABLE __t (c TSVECTOR); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c TSVECTOR); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: TSVECTOR |
 | `CREATE TABLE __t (c POINT); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 | `CREATE TABLE __t (c INT4RANGE); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 | `CREATE TABLE __t (c VECTOR(3)); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c BIT(8)); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: BIT(8) |
+| `CREATE TABLE __t (c BIT VARYING(8)); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: BIT VARYING(8) |
+| `CREATE TABLE __t (c OID); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: OID |
+| `CREATE TABLE __t (c REGCLASS); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: REGCLASS |
+| `CREATE TABLE __t (c REGTYPE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: REGTYPE |
+| `CREATE TABLE __t (c TSQUERY); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: TSQUERY |
+| `CREATE TABLE __t (c PG_LSN); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: PG_LSN |
+| `CREATE TABLE __t (c INT8RANGE); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c NUMRANGE); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c TSRANGE); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c TSTZRANGE); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c DATERANGE); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c INT4MULTIRANGE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: INT4MULTIRANGE |
+| `CREATE TABLE __t (c INT8MULTIRANGE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: INT8MULTIRANGE |
+| `CREATE TABLE __t (c NUMMULTIRANGE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: NUMMULTIRANGE |
+| `CREATE TABLE __t (c TSMULTIRANGE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: TSMULTIRANGE |
+| `CREATE TABLE __t (c TSTZMULTIRANGE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: TSTZMULTIRANGE |
+| `CREATE TABLE __t (c DATEMULTIRANGE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: DATEMULTIRANGE |
 
 ---
 

@@ -472,6 +472,102 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
+    (
+        "DDL/Other",
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "DROP EXTENSION IF EXISTS pgcrypto",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "CREATE AGGREGATE myagg(INT) (SFUNC = int4pl, STYPE = INT)",
+        &[],
+        &["DROP AGGREGATE IF EXISTS myagg(INT)"],
+    ),
+    (
+        "DDL/Other",
+        "CREATE OPERATOR + (LEFTARG = INT, RIGHTARG = INT, FUNCTION = int4pl)",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "CREATE TYPE mycomposite AS (x INT, y INT)",
+        &[],
+        &["DROP TYPE IF EXISTS mycomposite"],
+    ),
+    (
+        "DDL/Other",
+        "CREATE TYPE myenum AS ENUM ('a', 'b', 'c')",
+        &[],
+        &["DROP TYPE IF EXISTS myenum"],
+    ),
+    (
+        "DDL/Other",
+        "CREATE RULE myrule AS ON INSERT TO t DO ALSO NOTHING",
+        &["CREATE TABLE t (id INT NOT NULL)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "DDL/Other",
+        "CREATE EVENT TRIGGER myevt ON ddl_command_start EXECUTE FUNCTION fn()",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "CREATE PUBLICATION mypub FOR ALL TABLES",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "CREATE SUBSCRIPTION mysub CONNECTION 'host=localhost' PUBLICATION mypub",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "CREATE SERVER myserver FOREIGN DATA WRAPPER postgres_fdw",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "CREATE FOREIGN TABLE ft (id INT) SERVER myserver",
+        &[],
+        &[],
+    ),
+    (
+        "DDL/Other",
+        "ALTER VIEW v AS SELECT id FROM t",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE VIEW v AS SELECT * FROM t",
+        ],
+        &["DROP TABLE t"],
+    ),
+    (
+        "DDL/Other",
+        "CREATE OR REPLACE VIEW v AS SELECT id FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "DDL/Other",
+        "DROP TRIGGER trg ON t",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fn()",
+        ],
+        &["DROP TABLE t"],
+    ),
     // ── DML ──────────────────────────────────────────────────────────────────
     (
         "DML",
@@ -632,6 +728,54 @@ static MATRIX: &[Entry] = &[
         "COPY t TO STDOUT",
         &["CREATE TABLE t (id INT NOT NULL)"],
         &["DROP TABLE t"],
+    ),
+    // ON CONFLICT extra variants
+    (
+        "DML",
+        "INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING",
+        &["CREATE TABLE t (id INT PRIMARY KEY)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "DML",
+        "INSERT INTO t (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE t.id > 0",
+        &["CREATE TABLE t (id INT PRIMARY KEY, name TEXT)"],
+        &["DROP TABLE t"],
+    ),
+    // MERGE extra variants
+    (
+        "DML",
+        "MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.id > 0 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (u.id)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    // Correlated / NOT-style subqueries in DML
+    (
+        "DML",
+        "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "DML",
+        "UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
     ),
     // ── SELECT — projection / filtering ──────────────────────────────────────
     ("SELECT/Projection", "SELECT 1", &[], &[]),
@@ -876,6 +1020,40 @@ static MATRIX: &[Entry] = &[
         ],
         &["DROP TABLE t", "DROP TABLE u"],
     ),
+    // Correlated subqueries
+    (
+        "SELECT/Joins",
+        "SELECT * FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "SELECT/Joins",
+        "SELECT * FROM t WHERE id NOT IN (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "SELECT/Joins",
+        "SELECT t.id, (SELECT COUNT(*) FROM u WHERE u.id = t.id) AS cnt FROM t",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO u VALUES (1), (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
     // ── SELECT — aggregate / window ───────────────────────────────────────────
     (
         "SELECT/Aggregate",
@@ -973,11 +1151,83 @@ static MATRIX: &[Entry] = &[
         &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
         &["DROP TABLE t"],
     ),
+    // ── SELECT — ORDER BY / LIMIT / OFFSET / FETCH ───────────────────────────
+    (
+        "SELECT/Projection",
+        "SELECT id FROM t ORDER BY id ASC NULLS FIRST",
+        &["CREATE TABLE t (id INT)", "INSERT INTO t VALUES (1), (NULL)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Projection",
+        "SELECT id FROM t ORDER BY id DESC NULLS LAST",
+        &["CREATE TABLE t (id INT)", "INSERT INTO t VALUES (1), (NULL)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Projection",
+        "SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Projection",
+        "SELECT id FROM t FETCH FIRST 3 ROWS ONLY",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Projection",
+        "SELECT id FROM t FETCH FIRST 3 ROWS WITH TIES",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Projection",
+        "SELECT id FROM t ORDER BY 1",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
     // ── SELECT — set ops ──────────────────────────────────────────────────────
     ("SELECT/SetOps", "SELECT 1 UNION SELECT 2", &[], &[]),
     ("SELECT/SetOps", "SELECT 1 UNION ALL SELECT 2", &[], &[]),
     ("SELECT/SetOps", "SELECT 1 INTERSECT SELECT 1", &[], &[]),
+    ("SELECT/SetOps", "SELECT 1 INTERSECT ALL SELECT 1", &[], &[]),
     ("SELECT/SetOps", "SELECT 1 EXCEPT SELECT 2", &[], &[]),
+    ("SELECT/SetOps", "SELECT 1 EXCEPT ALL SELECT 2", &[], &[]),
+    (
+        "SELECT/SetOps",
+        "SELECT id FROM t UNION SELECT id FROM u ORDER BY id",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (2), (3)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "SELECT/SetOps",
+        "SELECT id FROM t INTERSECT SELECT id FROM u",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (2), (3)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "SELECT/SetOps",
+        "SELECT id FROM t EXCEPT SELECT id FROM u",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1), (2)",
+            "INSERT INTO u VALUES (2), (3)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
     // ── SELECT — CTE ──────────────────────────────────────────────────────────
     (
         "SELECT/CTE",
@@ -1002,6 +1252,24 @@ static MATRIX: &[Entry] = &[
         "WITH ins AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM ins",
         &["CREATE TABLE t (id INT NOT NULL)"],
         &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/CTE",
+        "WITH upd AS (UPDATE t SET id = 99 WHERE id = 1 RETURNING id) SELECT * FROM upd",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/CTE",
+        "WITH del AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT * FROM del",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/CTE",
+        "WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib",
+        &[],
+        &[],
     ),
     // ── Expressions / casts ───────────────────────────────────────────────────
     (
@@ -1217,6 +1485,75 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
+    (
+        "Types",
+        "CREATE TABLE __t (c BIT(8)); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c BIT VARYING(8)); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c OID); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c REGCLASS); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c REGTYPE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c TSQUERY); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c PG_LSN); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Expressions",
+        "SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "Expressions",
+        "SELECT id, CASE WHEN id < 0 THEN 'neg' WHEN id = 0 THEN 'zero' ELSE 'pos' END FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (5)"],
+        &["DROP TABLE t"],
+    ),
+    ("Expressions", "SELECT 1::BIGINT + 2::BIGINT", &[], &[]),
+    ("Expressions", "SELECT '2024-01-01'::DATE", &[], &[]),
+    ("Expressions", "SELECT '12:00:00'::TIME", &[], &[]),
+    ("Expressions", "SELECT '2024-01-01 12:00:00'::TIMESTAMP", &[], &[]),
+    ("Expressions", "SELECT '00:01:00'::INTERVAL", &[], &[]),
+    ("Expressions", "SELECT 'a6c5e8f0-1234-5678-abcd-000000000000'::UUID", &[], &[]),
+    ("Expressions", "SELECT 'true'::BOOLEAN", &[], &[]),
+    ("Expressions", "SELECT B'1010'", &[], &[]),
+    ("Expressions", "SELECT X'FF'", &[], &[]),
+    (
+        "Expressions",
+        "SELECT $1",
+        &[],
+        &[],
+    ),
     // ── Functions / operators ─────────────────────────────────────────────────
     ("Functions/String", "SELECT LOWER('A')", &[], &[]),
     ("Functions/String", "SELECT UPPER('a')", &[], &[]),
@@ -1279,9 +1616,28 @@ static MATRIX: &[Entry] = &[
     ("Functions/Math", "SELECT CEIL(1.5)", &[], &[]),
     ("Functions/Math", "SELECT FLOOR(1.5)", &[], &[]),
     ("Functions/Math", "SELECT ROUND(1.5)", &[], &[]),
+    ("Functions/Math", "SELECT ROUND(3.14159, 2)", &[], &[]),
+    ("Functions/Math", "SELECT TRUNC(3.7)", &[], &[]),
+    ("Functions/Math", "SELECT TRUNC(3.7, 1)", &[], &[]),
     ("Functions/Math", "SELECT POWER(2,10)", &[], &[]),
     ("Functions/Math", "SELECT SQRT(4)", &[], &[]),
     ("Functions/Math", "SELECT MOD(10,3)", &[], &[]),
+    ("Functions/Math", "SELECT LOG(100)", &[], &[]),
+    ("Functions/Math", "SELECT LOG(10, 100)", &[], &[]),
+    ("Functions/Math", "SELECT LN(2.718281828::float8)", &[], &[]),
+    ("Functions/Math", "SELECT EXP(1.0::float8)", &[], &[]),
+    ("Functions/Math", "SELECT PI()", &[], &[]),
+    ("Functions/Math", "SELECT SIGN(-5)", &[], &[]),
+    ("Functions/Math", "SELECT RANDOM()", &[], &[]),
+    ("Functions/Math", "SELECT DIV(10, 3)", &[], &[]),
+    ("Functions/Math", "SELECT FACTORIAL(5)", &[], &[]),
+    ("Functions/Math", "SELECT GCD(12, 8)", &[], &[]),
+    ("Functions/Math", "SELECT LCM(4, 6)", &[], &[]),
+    ("Functions/Math", "SELECT DEGREES(3.14159)", &[], &[]),
+    ("Functions/Math", "SELECT RADIANS(180.0)", &[], &[]),
+    ("Functions/Math", "SELECT SIN(0.0)", &[], &[]),
+    ("Functions/Math", "SELECT COS(0.0)", &[], &[]),
+    ("Functions/Math", "SELECT TAN(0.0)", &[], &[]),
     ("Functions/Crypto", "SELECT GEN_RANDOM_UUID()", &[], &[]),
     (
         "Functions/Crypto",
@@ -1382,6 +1738,57 @@ static MATRIX: &[Entry] = &[
         &["CREATE TABLE doc (body TEXT, ts TSVECTOR)"],
         &["DROP TABLE doc"],
     ),
+    (
+        "FullTextSearch",
+        "SELECT tsvector_to_array(to_tsvector('a quick fox'))",
+        &[],
+        &[],
+    ),
+    (
+        "FullTextSearch",
+        "SELECT tsquery_phrase(to_tsquery('quick'), to_tsquery('fox'))",
+        &[],
+        &[],
+    ),
+    (
+        "FullTextSearch",
+        "SELECT to_tsvector('a') @@ to_tsquery('b')",
+        &[],
+        &[],
+    ),
+    (
+        "FullTextSearch",
+        "SELECT ts_rank_cd(to_tsvector('a quick fox'), to_tsquery('quick'))",
+        &[],
+        &[],
+    ),
+    (
+        "FullTextSearch",
+        "SELECT numnode(to_tsquery('quick & fox'))",
+        &[],
+        &[],
+    ),
+    (
+        "FullTextSearch",
+        "SELECT querytree(to_tsquery('quick & fox'))",
+        &[],
+        &[],
+    ),
+    (
+        "FullTextSearch",
+        "SELECT strip(to_tsvector('a quick fox'))",
+        &[],
+        &[],
+    ),
+    (
+        "FullTextSearch",
+        "SELECT * FROM t WHERE ts @@ to_tsquery('english', 'quick')",
+        &[
+            "CREATE TABLE t (id INT NOT NULL, ts TSVECTOR)",
+            "INSERT INTO t VALUES (1, to_tsvector('a quick fox'))",
+        ],
+        &["DROP TABLE t"],
+    ),
     // ── Range types ──────────────────────────────────────────────────────────
     ("Ranges", "SELECT int4range(1, 10)", &[], &[]),
     ("Ranges", "SELECT '[1,10)'::int4range", &[], &[]),
@@ -1410,6 +1817,122 @@ static MATRIX: &[Entry] = &[
     (
         "Ranges",
         "SELECT int4multirange(int4range(1,5), int4range(10,15))",
+        &[],
+        &[],
+    ),
+    ("Ranges", "SELECT numrange(1.5, 2.5)", &[], &[]),
+    ("Ranges", "SELECT numrange(1.0, 10.0) @> 5.5", &[], &[]),
+    ("Ranges", "SELECT int8range(1, 100)", &[], &[]),
+    ("Ranges", "SELECT int8range(1, 100) && int8range(50, 200)", &[], &[]),
+    (
+        "Ranges",
+        "SELECT tstzrange(NOW() - interval '1 hour', NOW())",
+        &[],
+        &[],
+    ),
+    ("Ranges", "SELECT lower_inc(int4range(1, 10))", &[], &[]),
+    ("Ranges", "SELECT upper_inc(int4range(1, 10))", &[], &[]),
+    ("Ranges", "SELECT lower_inf(int4range(NULL, 10))", &[], &[]),
+    ("Ranges", "SELECT upper_inf(int4range(1, NULL))", &[], &[]),
+    (
+        "Ranges",
+        "SELECT int4range(1,5) + int4range(3,8)",
+        &[],
+        &[],
+    ),
+    (
+        "Ranges",
+        "SELECT int4range(1,10) * int4range(5,15)",
+        &[],
+        &[],
+    ),
+    (
+        "Ranges",
+        "SELECT int4range(1,10) - int4range(5,15)",
+        &[],
+        &[],
+    ),
+    (
+        "Ranges",
+        "SELECT int4range(1,5) << int4range(7,10)",
+        &[],
+        &[],
+    ),
+    (
+        "Ranges",
+        "SELECT int4range(1,5) -|- int4range(5,10)",
+        &[],
+        &[],
+    ),
+    (
+        "Ranges",
+        "SELECT int4multirange(int4range(1,5)) @> 3",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c INT8RANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c NUMRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c TSRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c TSTZRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c DATERANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c INT4MULTIRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c INT8MULTIRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c NUMMULTIRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c TSMULTIRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c TSTZMULTIRANGE); DROP TABLE __t",
+        &[],
+        &[],
+    ),
+    (
+        "Types",
+        "CREATE TABLE __t (c DATEMULTIRANGE); DROP TABLE __t",
         &[],
         &[],
     ),
@@ -1534,6 +2057,54 @@ static MATRIX: &[Entry] = &[
     (
         "Functions/Array",
         "SELECT ARRAY[1,2] || ARRAY[3,4]",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT cardinality(ARRAY[1,2,3])",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT array_fill(0, ARRAY[3])",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT array_fill(0, ARRAY[2,3])",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT 2 = ANY(ARRAY[1,2,3])",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT 5 > ALL(ARRAY[1,2,3])",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT array_positions(ARRAY[1,2,1,3], 1)",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT array_dims(ARRAY[1,2,3])",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/Array",
+        "SELECT * FROM unnest(ARRAY['a','b'], ARRAY[1,2]) AS t(letter, num)",
         &[],
         &[],
     ),
@@ -1709,6 +2280,60 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
+    (
+        "Functions/JSONB",
+        "SELECT json_to_record('{\"a\":1,\"b\":\"foo\"}'::json) AS t(a int, b text)",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT jsonb_to_record('{\"a\":1,\"b\":\"foo\"}'::jsonb) AS t(a int, b text)",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT * FROM json_to_recordset('[{\"a\":1},{\"a\":2}]'::json) AS t(a int)",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT * FROM jsonb_to_recordset('[{\"a\":1},{\"a\":2}]'::jsonb) AS t(a int)",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT jsonb_path_query_array('{\"a\":[1,2,3]}'::jsonb, '$.a[*]')",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT '{\"a\":1}'::jsonb #- '{a}'",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT jsonb_extract_path('{\"a\":{\"b\":1}}'::jsonb, 'a', 'b')",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT jsonb_extract_path_text('{\"a\":{\"b\":\"x\"}}'::jsonb, 'a', 'b')",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/JSONB",
+        "SELECT jsonb_populate_record(NULL::t, '{\"id\":1}'::jsonb) FROM t LIMIT 1",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
     // ── String advanced ──────────────────────────────────────────────────────
     ("Functions/String", "SELECT initcap('hello world')", &[], &[]),
     (
@@ -1718,6 +2343,22 @@ static MATRIX: &[Entry] = &[
         &[],
     ),
     ("Functions/String", "SELECT reverse('abc')", &[], &[]),
+    ("Functions/String", "SELECT left('abcdef', 3)", &[], &[]),
+    ("Functions/String", "SELECT right('abcdef', 3)", &[], &[]),
+    ("Functions/String", "SELECT repeat('ab', 3)", &[], &[]),
+    ("Functions/String", "SELECT position('c' IN 'abcdef')", &[], &[]),
+    ("Functions/String", "SELECT strpos('abcdef', 'cd')", &[], &[]),
+    ("Functions/String", "SELECT overlay('abcdef' PLACING 'xyz' FROM 2 FOR 3)", &[], &[]),
+    ("Functions/String", "SELECT md5('abc')", &[], &[]),
+    ("Functions/String", "SELECT sha256('abc'::bytea)", &[], &[]),
+    ("Functions/String", "SELECT starts_with('abcdef', 'abc')", &[], &[]),
+    ("Functions/String", "SELECT ends_with('abcdef', 'def')", &[], &[]),
+    ("Functions/String", "SELECT SUBSTRING('abcdef' FROM '[a-c]+')", &[], &[]),
+    ("Functions/String", "SELECT SUBSTRING('abc' FROM 2)", &[], &[]),
+    ("Functions/String", "SELECT concat('a', 'b', 'c')", &[], &[]),
+    ("Functions/String", "SELECT concat_ws(',', 'a', 'b', 'c')", &[], &[]),
+    ("Functions/String", "SELECT to_hex(255)", &[], &[]),
+    ("Functions/String", "SELECT lpad('x', 5)", &[], &[]),
     (
         "Functions/String",
         "SELECT format('Hello, %s', 'world')",
@@ -1937,6 +2578,54 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
+    ("Functions/DateTime", "SELECT clock_timestamp()", &[], &[]),
+    ("Functions/DateTime", "SELECT statement_timestamp()", &[], &[]),
+    ("Functions/DateTime", "SELECT transaction_timestamp()", &[], &[]),
+    ("Functions/DateTime", "SELECT localtime", &[], &[]),
+    ("Functions/DateTime", "SELECT localtimestamp", &[], &[]),
+    ("Functions/DateTime", "SELECT timeofday()", &[], &[]),
+    (
+        "Functions/DateTime",
+        "SELECT TO_DATE('2024-01-15', 'YYYY-MM-DD')",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/DateTime",
+        "SELECT TO_NUMBER('12345.67', '99999.99')",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/DateTime",
+        "SELECT date_bin('1 hour'::interval, NOW(), '2000-01-01'::timestamptz)",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/DateTime",
+        "SELECT interval '1 year 2 months 3 days'",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/DateTime",
+        "SELECT EXTRACT(DOW FROM NOW())",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/DateTime",
+        "SELECT EXTRACT(QUARTER FROM NOW())",
+        &[],
+        &[],
+    ),
+    (
+        "Functions/DateTime",
+        "SELECT EXTRACT(WEEK FROM NOW())",
+        &[],
+        &[],
+    ),
     // ── Window advanced ──────────────────────────────────────────────────────
     (
         "SELECT/Window",
@@ -2034,6 +2723,60 @@ static MATRIX: &[Entry] = &[
         &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
         &["DROP TABLE t"],
     ),
+    (
+        "SELECT/Window",
+        "SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT SUM(id) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT SUM(id) OVER (ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT SUM(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT id, SUM(id) OVER w1, AVG(id) OVER w2 FROM t WINDOW w1 AS (ORDER BY id), w2 AS (PARTITION BY id ORDER BY id)",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT COUNT(*) OVER (PARTITION BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Window",
+        "SELECT SUM(id) FILTER (WHERE id > 0) OVER (ORDER BY id) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
     // ── Aggregates advanced ──────────────────────────────────────────────────
     (
         "SELECT/Aggregate",
@@ -2120,6 +2863,27 @@ static MATRIX: &[Entry] = &[
             "CREATE TABLE t (id INT NOT NULL, name TEXT)",
             "INSERT INTO t VALUES (1, 'a')",
         ],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Aggregate",
+        "SELECT SUM(id) FILTER (WHERE id > 0), COUNT(*) FILTER (WHERE id < 0) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1), (-1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Aggregate",
+        "SELECT json_object_agg(name, id) FROM t",
+        &[
+            "CREATE TABLE t (id INT NOT NULL, name TEXT)",
+            "INSERT INTO t VALUES (1, 'a')",
+        ],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Aggregate",
+        "SELECT XMLAGG(XMLELEMENT(NAME foo, id)) FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
         &["DROP TABLE t"],
     ),
     // ── IS predicates ────────────────────────────────────────────────────────
@@ -2419,6 +3183,23 @@ static MATRIX: &[Entry] = &[
         &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
         &["DROP TABLE t"],
     ),
+    (
+        "SELECT/Joins",
+        "SELECT t.id, sub.* FROM t, LATERAL jsonb_each('{\"a\":1}'::jsonb) sub",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "SELECT/Joins",
+        "SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO u VALUES (1)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
     // ── Generated columns + IDENTITY ─────────────────────────────────────────
     (
         "DDL/Tables",
@@ -2614,6 +3395,42 @@ static MATRIX: &[Entry] = &[
     ("Roles", "RESET ROLE", &[], &[]),
     ("Roles", "SELECT current_user", &[], &[]),
     ("Roles", "SELECT session_user", &[], &[]),
+    (
+        "Roles",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO alice",
+        &["CREATE ROLE alice"],
+        &["DROP ROLE alice"],
+    ),
+    (
+        "Roles",
+        "GRANT USAGE ON SCHEMA public TO alice",
+        &["CREATE ROLE alice"],
+        &["DROP ROLE alice"],
+    ),
+    (
+        "Roles",
+        "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM alice",
+        &["CREATE ROLE alice"],
+        &["DROP ROLE alice"],
+    ),
+    (
+        "Roles",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO alice",
+        &["CREATE ROLE alice"],
+        &["DROP ROLE alice"],
+    ),
+    (
+        "Roles",
+        "CREATE ROLE mygrp NOLOGIN",
+        &[],
+        &["DROP ROLE mygrp"],
+    ),
+    (
+        "Roles",
+        "GRANT mygrp TO alice",
+        &["CREATE ROLE mygrp NOLOGIN", "CREATE ROLE alice"],
+        &["DROP ROLE alice", "DROP ROLE mygrp"],
+    ),
     // ── Schemas ──────────────────────────────────────────────────────────────
     (
         "Schemas",
@@ -2644,6 +3461,31 @@ static MATRIX: &[Entry] = &[
         "DROP SCHEMA myschema CASCADE",
         &["CREATE SCHEMA myschema"],
         &[],
+    ),
+    (
+        "Schemas",
+        "DROP SCHEMA IF EXISTS myschema",
+        &[],
+        &[],
+    ),
+    (
+        "Schemas",
+        "SELECT myschema.t.id FROM myschema.t",
+        &[
+            "CREATE SCHEMA myschema",
+            "CREATE TABLE myschema.t (id INT NOT NULL)",
+            "INSERT INTO myschema.t VALUES (1)",
+        ],
+        &["DROP SCHEMA myschema CASCADE"],
+    ),
+    (
+        "Schemas",
+        "ALTER TABLE myschema.t ADD COLUMN name TEXT",
+        &[
+            "CREATE SCHEMA myschema",
+            "CREATE TABLE myschema.t (id INT NOT NULL)",
+        ],
+        &["DROP SCHEMA myschema CASCADE"],
     ),
     // ── Triggers ─────────────────────────────────────────────────────────────
     (
@@ -2770,6 +3612,59 @@ static MATRIX: &[Entry] = &[
         &[],
         &[],
     ),
+    // System information functions
+    ("Misc", "SELECT version()", &[], &[]),
+    ("Misc", "SELECT current_schema()", &[], &[]),
+    ("Misc", "SELECT current_database()", &[], &[]),
+    ("Misc", "SELECT current_schemas(false)", &[], &[]),
+    ("Misc", "SELECT current_setting('search_path')", &[], &[]),
+    (
+        "Misc",
+        "SELECT set_config('search_path', 'public', false)",
+        &[],
+        &[],
+    ),
+    ("Misc", "SELECT pg_postmaster_start_time()", &[], &[]),
+    ("Misc", "SELECT pg_backend_pid()", &[], &[]),
+    (
+        "Misc",
+        "SELECT pg_is_in_recovery()",
+        &[],
+        &[],
+    ),
+    // Collation
+    (
+        "DDL/Other",
+        "CREATE COLLATION my_collation (LOCALE = 'en-US')",
+        &[],
+        &["DROP COLLATION IF EXISTS my_collation"],
+    ),
+    (
+        "DDL/Tables",
+        "CREATE TABLE t (name TEXT COLLATE \"C\")",
+        &[],
+        &["DROP TABLE t"],
+    ),
+    // CREATE TABLE AS (CTAS)
+    (
+        "DDL/Tables",
+        "CREATE TABLE t2 AS SELECT * FROM t",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
+        &["DROP TABLE t", "DROP TABLE t2"],
+    ),
+    (
+        "DDL/Tables",
+        "CREATE TABLE t2 AS SELECT * FROM t WITH NO DATA",
+        &["CREATE TABLE t (id INT NOT NULL)"],
+        &["DROP TABLE t", "DROP TABLE t2"],
+    ),
+    // Default partition
+    (
+        "DDL/Tables",
+        "CREATE TABLE t_default PARTITION OF t DEFAULT",
+        &["CREATE TABLE t (id INT) PARTITION BY RANGE (id)"],
+        &["DROP TABLE t"],
+    ),
     // ── Transactions ──────────────────────────────────────────────────────────
     ("Transactions", "BEGIN", &[], &[]),
     ("Transactions", "COMMIT", &[], &[]),
@@ -2799,6 +3694,22 @@ static MATRIX: &[Entry] = &[
         &[],
     ),
     ("Transactions", "BEGIN READ ONLY", &[], &[]),
+    ("Transactions", "BEGIN READ WRITE", &[], &[]),
+    ("Transactions", "START TRANSACTION", &[], &[]),
+    (
+        "Transactions",
+        "START TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        &[],
+        &[],
+    ),
+    (
+        "Transactions",
+        "START TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        &[],
+        &[],
+    ),
+    ("Transactions", "ROLLBACK TO SAVEPOINT s", &[], &[]),
+    ("Transactions", "RELEASE SAVEPOINT s", &[], &[]),
     // ── Sessions / admin ──────────────────────────────────────────────────────
     (
         "Admin/Sessions",
@@ -2826,13 +3737,31 @@ static MATRIX: &[Entry] = &[
     ),
     (
         "Admin/Sessions",
+        "PREPARE stmt(INT) AS SELECT $1",
+        &[],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
         "EXECUTE stmt",
         &[],
         &[],
     ),
     (
         "Admin/Sessions",
+        "EXECUTE stmt(42)",
+        &["PREPARE stmt(INT) AS SELECT $1"],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
         "DEALLOCATE stmt",
+        &[],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
+        "DEALLOCATE ALL",
         &[],
         &[],
     ),
@@ -2844,7 +3773,37 @@ static MATRIX: &[Entry] = &[
     ),
     (
         "Admin/Sessions",
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id",
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1), (2), (3)"],
+        &["DROP TABLE t"],
+    ),
+    (
+        "Admin/Sessions",
+        "DECLARE c NO SCROLL CURSOR FOR SELECT 1",
+        &[],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
         "FETCH 1 FROM c",
+        &["DECLARE c CURSOR FOR SELECT 1"],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
+        "FETCH ALL FROM c",
+        &["DECLARE c CURSOR FOR SELECT 1"],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
+        "FETCH FORWARD 5 FROM c",
+        &["DECLARE c CURSOR FOR SELECT 1"],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
+        "MOVE FORWARD 2 IN c",
         &["DECLARE c CURSOR FOR SELECT 1"],
         &[],
     ),
@@ -2852,6 +3811,12 @@ static MATRIX: &[Entry] = &[
         "Admin/Sessions",
         "CLOSE c",
         &["DECLARE c CURSOR FOR SELECT 1"],
+        &[],
+    ),
+    (
+        "Admin/Sessions",
+        "CLOSE ALL",
+        &[],
         &[],
     ),
     (
@@ -3223,10 +4188,10 @@ async fn sql_support_matrix() {
     println!("Wrote {}", out_path.display());
 
     // ── Sanity assertions ─────────────────────────────────────────────────────
-    // The matrix must have at least 120 rows.
+    // The matrix must have at least 550 rows.
     assert!(
-        total >= 120,
-        "expected at least 120 SQL fragments, got {total}"
+        total >= 550,
+        "expected at least 550 SQL fragments, got {total}"
     );
     // At least some rows must succeed in the default config.
     let default_ok = matrix_rows.iter().filter(|r| r.outcomes[0] == Outcome::Ok).count();
