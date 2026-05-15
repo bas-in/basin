@@ -42,7 +42,7 @@ impl IndexColumn {
 pub(crate) fn parse_index_columns(ci: &CreateIndex) -> Vec<IndexColumn> {
     ci.columns
         .iter()
-        .map(|ob: &OrderByExpr| match &ob.expr {
+        .map(|ob: &sqlparser::ast::IndexColumn| match &ob.column.expr {
             Expr::Identifier(ident) => IndexColumn::Bare(ident.value.clone()),
             Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
                 IndexColumn::Bare(parts[0].value.clone())

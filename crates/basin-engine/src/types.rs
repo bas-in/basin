@@ -544,7 +544,9 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // INTERVAL — PG's interval type. Stored as Arrow
         // `Interval(MonthDayNano)` which matches DataFusion's native interval
         // representation and allows arithmetic with timestamps.
-        SqlDataType::Interval => Ok(DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)),
+        SqlDataType::Interval { .. } => {
+            Ok(DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano))
+        }
 
         // Array types: INT[], TEXT[], etc. Stored as Arrow List<element_type>.
         // Supports the `INT[]` / `TEXT[]` PG syntax (sqlparser SquareBracket
@@ -709,9 +711,9 @@ fn decimal128_from_exact_number_info(info: &ExactNumberInfo) -> Result<DataType>
         ExactNumberInfo::Precision(p) => (clamp_precision(*p)?, 0),
         ExactNumberInfo::PrecisionAndScale(p, s) => {
             let prec = clamp_precision(*p)?;
-            if *s > i8::MAX as u64 {
+            if *s > i8::MAX as i64 || *s < i8::MIN as i64 {
                 return Err(BasinError::InvalidSchema(format!(
-                    "NUMERIC scale {s} exceeds i8::MAX"
+                    "NUMERIC scale {s} exceeds i8 range"
                 )));
             }
             let scale = *s as i8;

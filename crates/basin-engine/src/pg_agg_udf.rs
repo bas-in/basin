@@ -65,12 +65,12 @@ impl AggregateUDFImpl for JsonAggUdaf {
         Ok(Box::new(JsonAggAccumulator { values: vec![] }))
     }
 
-    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<Field>> {
-        Ok(vec![Field::new(
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<datafusion::arrow::datatypes::FieldRef>> {
+        Ok(vec![std::sync::Arc::new(Field::new(
             format!("{}_state", args.name),
             DataType::Utf8,
             true,
-        )])
+        ))])
     }
 }
 
@@ -170,12 +170,12 @@ impl AggregateUDFImpl for JsonObjectAggUdaf {
         }))
     }
 
-    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<Field>> {
-        Ok(vec![Field::new(
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<datafusion::arrow::datatypes::FieldRef>> {
+        Ok(vec![std::sync::Arc::new(Field::new(
             format!("{}_state", args.name),
             DataType::Utf8,
             true,
-        )])
+        ))])
     }
 }
 

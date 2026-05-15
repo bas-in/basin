@@ -387,7 +387,8 @@ fn extract_body_text(body: &Option<CreateFunctionBody>, fn_name: &str) -> Result
         ))
     })?;
     match body {
-        CreateFunctionBody::AsBeforeOptions(expr) | CreateFunctionBody::AsAfterOptions(expr) => {
+        CreateFunctionBody::AsBeforeOptions { body: expr, .. }
+        | CreateFunctionBody::AsAfterOptions { body: expr, .. } => {
             match expr {
                 Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(s), .. }) => Ok(s.value.clone()),
                 Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Ok(s.clone()),

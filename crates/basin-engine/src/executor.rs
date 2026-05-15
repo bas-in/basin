@@ -1276,9 +1276,9 @@ async fn exec_create_index(
         log_partial_index_notice(&index_name, &pred.to_string());
     }
     if let Some(method) = &ci.using {
-        let m = method.value.as_str();
+        let m = method.to_string();
         if !matches!(m.to_lowercase().as_str(), "btree") {
-            log_using_notice(&index_name, m);
+            log_using_notice(&index_name, &m);
         }
     }
     if !ci.include.is_empty() {

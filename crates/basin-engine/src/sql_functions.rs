@@ -511,6 +511,7 @@ fn rewrite_table_factor(
             let needs_lateral = call_args.iter().any(arg_references_outer);
             let body = inline_table_call(def, &call_args, by_name, depth + 1)?;
             let alias_for_derived = alias.take().unwrap_or_else(|| sqlparser::ast::TableAlias {
+                explicit: false,
                 name: sqlparser::ast::Ident::new(def.name.clone()),
                 columns: Vec::new(),
             });
@@ -518,6 +519,7 @@ fn rewrite_table_factor(
                 lateral: needs_lateral,
                 subquery: Box::new(body),
                 alias: Some(alias_for_derived),
+                sample: None,
             };
             Ok(())
         }

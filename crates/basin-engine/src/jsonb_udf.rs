@@ -1201,13 +1201,12 @@ impl ScalarUDFImpl for JsonbPathMatchUdf {
     fn signature(&self) -> &Signature { &self.signature }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
-    #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
         // Delegate to the same logic as jsonb_path_exists
         JsonbPathExistsUdf {
             signature: self.signature.clone(),
-        }.invoke(args)
+        }
+        .invoke_with_args(args)
     }
 }
 
@@ -3165,8 +3164,8 @@ use datafusion::catalog::Session;
 /// Extract JSON text from a literal Expr (Utf8 or LargeBinary).
 fn json_from_expr(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s))) => Some(s.clone()),
-        Expr::Literal(ScalarValue::LargeBinary(Some(b))) => String::from_utf8(b.clone()).ok(),
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s.clone()),
+        Expr::Literal(ScalarValue::LargeBinary(Some(b)), _) => String::from_utf8(b.clone()).ok(),
         _ => None,
     }
 }
