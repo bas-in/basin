@@ -46,8 +46,8 @@ use basin_catalog::Catalog;
 use basin_common::{BasinError, Result, TableName, ProjectId};
 use basin_storage::{evaluate_predicate, Predicate, ScalarValue};
 use basin_vector::Distance;
-use sqlparser::ast::{
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, ObjectName, OrderByExpr, SelectItem, SetExpr, Statement,
     TableFactor, UnaryOperator, Value,
 };

@@ -34,8 +34,8 @@
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use crate::pg_ast::ObjectNamePartExt;
-use sqlparser::ast::{
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, SelectItem, SetExpr,
     Statement, TableFactor, Value,
 };

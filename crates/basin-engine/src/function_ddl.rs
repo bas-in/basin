@@ -28,8 +28,8 @@ use basin_catalog::{
     Catalog, SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
 use basin_common::{BasinError, Result};
-use sqlparser::ast::{
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{
     CreateFunctionBody, DataType as SqlDataType, Expr, Ident, ObjectName, OperateFunctionArg,
     TimezoneInfo, Value,
 };

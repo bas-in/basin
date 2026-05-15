@@ -26,8 +26,8 @@ use arrow_schema::Schema;
 use basin_catalog::TableMetadata;
 use basin_common::{BasinError, PartitionKey, Result, TableName};
 use basin_storage::{Predicate, ReadOptions, ScalarValue};
-use sqlparser::ast::{
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, ObjectName, Query, SelectItem, SetExpr, Statement,
     TableFactor, UnaryOperator, Value,
 };

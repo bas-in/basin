@@ -63,8 +63,8 @@ use basin_storage::{
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
-use sqlparser::ast::{
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, ObjectName, SelectItem,
     TableFactor, TableWithJoins, UnaryOperator, Value,
 };
@@ -157,10 +157,9 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(ValueWithSpan { value: Value::Number(, .. }
-                        (-v).to_string(),
-                        false,
-                    ))),
+                    expr: Box::new(Expr::Value(
+                        Value::Number((-v).to_string(), false).into(),
+                    )),
                 })
             } else {
                 Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
@@ -183,10 +182,9 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0.0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(ValueWithSpan { value: Value::Number(, .. }
-                        (-v).to_string(),
-                        false,
-                    ))),
+                    expr: Box::new(Expr::Value(
+                        Value::Number((-v).to_string(), false).into(),
+                    )),
                 })
             } else {
                 Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))

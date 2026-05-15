@@ -514,10 +514,9 @@ fn int_to_expr(n: i64) -> Expr {
     if n < 0 {
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
-            expr: Box::new(Expr::Value(ValueWithSpan { value: Value::Number(, .. }
-                (-(n as i128)).to_string(),
-                false,
-            ))),
+            expr: Box::new(Expr::Value(
+                Value::Number((-(n as i128)).to_string(), false).into(),
+            )),
         }
     } else {
         Expr::Value((Value::Number(n.to_string(), false)).into())

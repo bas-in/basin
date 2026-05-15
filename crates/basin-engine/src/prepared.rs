@@ -35,8 +35,8 @@ use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_schema::{DataType, Field};
 use basin_common::{BasinError, Result, TableName};
-use sqlparser::ast::{
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Expr, FromTable, ObjectName, Query, SetExpr,
     Statement, TableFactor, Value,
 };
