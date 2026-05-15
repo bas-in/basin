@@ -98,6 +98,7 @@ async fn start_server_with_shard() -> TestServer {
         pool: None,
         shard_endpoints: None,
         tls: None,
+        connection_limiter: None,
     })
     .await
     .expect("server failed to bind");

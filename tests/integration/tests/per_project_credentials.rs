@@ -224,6 +224,7 @@ async fn boot() -> Option<Servers> {
         pool: None,
         shard_endpoints: None,
         tls: None,
+        connection_limiter: None,
     })
     .await
     .expect("router bind");

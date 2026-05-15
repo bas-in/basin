@@ -1552,6 +1552,16 @@ pub(crate) struct BasinStartupHandler<F: SessionFactory + 'static> {
     resolver: Arc<dyn ProjectResolver>,
     /// Per-connection session slot. Filled in once the user authenticates.
     slot: Arc<Mutex<Option<Arc<F::Session>>>>,
+    /// Optional per-project connection ceiling. When `Some`, the startup
+    /// handler checks the live count against the project's `max_connections`
+    /// limit (resolved fresh each connect) and rejects with SQLSTATE 53300
+    /// if the limit is reached. `None` means unlimited.
+    connection_limiter: Option<Arc<crate::ConnectionLimiter>>,
+    /// Holds the `ConnectionGuard` for the duration of this connection.
+    /// Filled after successful authentication (when the limiter admits the
+    /// connection). Dropped automatically when the handler is dropped at
+    /// connection close, which decrements the per-project live count.
+    conn_guard: Arc<Mutex<Option<crate::ConnectionGuard>>>,
 }
 
 impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
@@ -1559,11 +1569,14 @@ impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
         factory: Arc<F>,
         resolver: Arc<dyn ProjectResolver>,
         slot: Arc<Mutex<Option<Arc<F::Session>>>>,
+        connection_limiter: Option<Arc<crate::ConnectionLimiter>>,
     ) -> Self {
         Self {
             factory,
             resolver,
             slot,
+            connection_limiter,
+            conn_guard: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1621,6 +1634,33 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
                             "invalid pgwire credentials".to_owned(),
                         )))
                     })?;
+
+                // Per-project connection ceiling check. The limit is resolved
+                // dynamically (fresh call per connect — not a lifetime cache)
+                // so a plan upgrade propagates to new connections immediately.
+                // None limiter ⇒ unlimited (correct for self-hosted OSS with
+                // no control plane wired).
+                if let Some(limiter) = &self.connection_limiter {
+                    match limiter.try_admit(project).await {
+                        Ok(guard) => {
+                            *self.conn_guard.lock().await = Some(guard);
+                        }
+                        Err(live) => {
+                            tracing::warn!(
+                                %project,
+                                live_connections = live,
+                                "pgwire connection rejected: max_connections reached",
+                            );
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    crate::error::connection_limit_reached_response(),
+                                ))
+                                .await?;
+                            client.flush().await?;
+                            return Ok(());
+                        }
+                    }
+                }
 
                 let session = self.factory.open(project, &user).await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(

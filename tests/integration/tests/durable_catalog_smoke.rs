@@ -129,6 +129,7 @@ async fn boot_server(
         pool: None,
         shard_endpoints: None,
         tls: None,
+        connection_limiter: None,
     })
     .await
     .expect("server failed to bind")

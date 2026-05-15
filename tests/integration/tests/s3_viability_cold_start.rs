@@ -84,6 +84,7 @@ async fn s3_viability_cold_start() {
         pool: None,
         shard_endpoints: None,
         tls: None,
+        connection_limiter: None,
     })
     .await
     .expect("basin router failed to bind");

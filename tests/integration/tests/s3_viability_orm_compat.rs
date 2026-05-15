@@ -67,6 +67,7 @@ async fn start_server(s3_cfg: &basin_integration_tests::test_config::S3Config) -
         pool: None,
         shard_endpoints: None,
         tls: None,
+        connection_limiter: None,
     })
     .await
     .expect("server failed to bind");

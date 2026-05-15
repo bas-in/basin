@@ -48,6 +48,7 @@ use basin_common::{BasinError, Result};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 
+mod connection_limit;
 mod copy;
 mod error;
 mod protocol;
@@ -59,6 +60,9 @@ pub mod test_cluster;
 mod tls;
 mod types;
 
+pub use connection_limit::{
+    ConnectionGuard, ConnectionLimiter, ConnectionLimitProvider, NoConnectionLimit,
+};
 pub use rate_limit::{from_env_qps, PgRateLimit, BURST_FACTOR, DEFAULT_SUSTAINED_QPS};
 pub use resolver::{
     ApiKeyProjectResolver, JwtProjectResolver, StackedProjectResolver, StaticProjectResolver,
@@ -99,6 +103,15 @@ pub struct ServerConfig {
     pub pool: Option<Arc<basin_pool::SessionPool>>,
     pub shard_endpoints: Option<Vec<String>>,
     pub tls: Option<Arc<TlsConfig>>,
+    /// Per-project connection ceiling enforcement.
+    ///
+    /// `None` → unlimited (equivalent to `Some(Arc::new(ConnectionLimiter::unlimited()))`).
+    /// Pass a `ConnectionLimiter` wired to a [`ConnectionLimitProvider`] that
+    /// reads the project's `max_connections` from the control plane to enable
+    /// enforcement. The limit is resolved dynamically on each new connection
+    /// (not cached lifetime-wide), so a plan upgrade propagates to new
+    /// connections without a restart.
+    pub connection_limiter: Option<Arc<ConnectionLimiter>>,
 }
 
 /// Bind, listen, accept until the process is killed.
@@ -123,6 +136,7 @@ pub async fn run_with_shutdown(cfg: ServerConfig, shutdown: oneshot::Receiver<()
         cfg.pool,
         cfg.shard_endpoints,
         cfg.tls,
+        cfg.connection_limiter,
         shutdown,
     )
     .await
@@ -144,8 +158,9 @@ pub async fn run_until_bound(cfg: ServerConfig) -> Result<RunningServer> {
     let pool = cfg.pool;
     let shard_endpoints = cfg.shard_endpoints;
     let tls = cfg.tls;
+    let connection_limiter = cfg.connection_limiter;
     let join = tokio::spawn(async move {
-        accept_loop(listener, engine, resolver, pool, shard_endpoints, tls, rx).await
+        accept_loop(listener, engine, resolver, pool, shard_endpoints, tls, connection_limiter, rx).await
     });
     Ok(RunningServer {
         local_addr,
@@ -169,6 +184,7 @@ async fn accept_loop(
     pool: Option<Arc<basin_pool::SessionPool>>,
     shard_endpoints: Option<Vec<String>>,
     tls: Option<Arc<TlsConfig>>,
+    connection_limiter: Option<Arc<ConnectionLimiter>>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     // Build the TlsAcceptor once at startup so every connection shares one
@@ -235,6 +251,7 @@ async fn accept_loop(
             resolver,
             rate_limit,
             tls_acceptor,
+            connection_limiter,
             &mut shutdown,
         )
         .await;
@@ -248,6 +265,7 @@ async fn accept_loop(
             resolver,
             rate_limit,
             tls_acceptor,
+            connection_limiter,
             &mut shutdown,
         )
         .await;
@@ -260,6 +278,7 @@ async fn accept_loop(
         resolver,
         rate_limit,
         tls_acceptor,
+        connection_limiter,
         &mut shutdown,
     )
     .await
@@ -275,6 +294,7 @@ async fn run_accept_loop<F>(
     resolver: Arc<dyn ProjectResolver>,
     rate_limit: Option<Arc<PgRateLimit>>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    connection_limiter: Option<Arc<ConnectionLimiter>>,
     shutdown: &mut oneshot::Receiver<()>,
 ) -> Result<()>
 where
@@ -298,8 +318,9 @@ where
                 let resolver = resolver.clone();
                 let rate_limit = rate_limit.clone();
                 let tls_acceptor = tls_acceptor.clone();
+                let connection_limiter = connection_limiter.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(sock, peer, factory, resolver, rate_limit, tls_acceptor).await {
+                    if let Err(e) = handle_connection(sock, peer, factory, resolver, rate_limit, tls_acceptor, connection_limiter).await {
                         tracing::warn!(error = %e, %peer, "connection ended with error");
                     }
                 });
@@ -316,6 +337,7 @@ async fn handle_connection<F>(
     resolver: Arc<dyn ProjectResolver>,
     rate_limit: Option<Arc<PgRateLimit>>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    connection_limiter: Option<Arc<ConnectionLimiter>>,
 ) -> Result<()>
 where
     F: SessionFactory + 'static,
@@ -327,7 +349,7 @@ where
     ));
     let copy_state = simple.copy_state.clone();
     let handlers = BasinHandlers {
-        startup: Arc::new(BasinStartupHandler::new(factory, resolver, slot.clone())),
+        startup: Arc::new(BasinStartupHandler::new(factory, resolver, slot.clone(), connection_limiter)),
         simple,
         extended: Arc::new(BasinExtendedQueryHandler::new(slot, rate_limit, copy_state)),
     };

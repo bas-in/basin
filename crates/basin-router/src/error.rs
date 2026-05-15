@@ -31,6 +31,19 @@ pub(crate) fn rate_limit_exceeded_response() -> ErrorResponse {
     info.into()
 }
 
+/// Pgwire `ErrorResponse` for the per-project connection ceiling (SQLSTATE
+/// `53300` — `too_many_connections`). Sent during startup handshake when the
+/// project has reached its `max_connections` limit; the connection is closed
+/// immediately after this response.
+pub(crate) fn connection_limit_reached_response() -> ErrorResponse {
+    let info = ErrorInfo::new(
+        "FATAL".to_owned(),
+        "53300".to_owned(),
+        "connection limit reached".to_owned(),
+    );
+    info.into()
+}
+
 fn classify(err: &BasinError) -> (&'static str, &'static str) {
     match err {
         BasinError::InvalidIdent(_) | BasinError::InvalidSchema(_) => ("ERROR", "42601"), // syntax_error

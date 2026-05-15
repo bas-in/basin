@@ -57,6 +57,7 @@ async fn spawn_router(
         pool: None,
         shard_endpoints: None,
         tls,
+        connection_limiter: None,
     })
     .await
     .expect("server failed to bind");
