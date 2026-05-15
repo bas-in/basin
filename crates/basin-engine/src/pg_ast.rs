@@ -1610,3 +1610,65 @@ impl ObjectNamePartExt for sqlparser::ast::ObjectNamePart {
         }
     }
 }
+
+/// sqlparser 0.61 collapsed `Query.limit` / `Query.offset` / `Query.limit_by`
+/// into a single optional `Query.limit_clause: Option<LimitClause>`. These
+/// helpers restore the old per-field accessors so pre-0.61 call sites keep
+/// their existing logic with a minimal `q.limit` -> `query_limit(q)` swap.
+pub trait QueryClauseExt {
+    fn ext_limit(&self) -> Option<&sqlparser::ast::Expr>;
+    fn ext_limit_mut(&mut self) -> Option<&mut sqlparser::ast::Expr>;
+    fn ext_offset(&self) -> Option<&sqlparser::ast::Offset>;
+    fn ext_limit_by(&self) -> &[sqlparser::ast::Expr];
+}
+
+impl QueryClauseExt for sqlparser::ast::Query {
+    fn ext_limit(&self) -> Option<&sqlparser::ast::Expr> {
+        match self.limit_clause.as_ref()? {
+            sqlparser::ast::LimitClause::LimitOffset { limit, .. } => limit.as_ref(),
+            sqlparser::ast::LimitClause::OffsetCommaLimit { limit, .. } => Some(limit),
+        }
+    }
+    fn ext_limit_mut(&mut self) -> Option<&mut sqlparser::ast::Expr> {
+        match self.limit_clause.as_mut()? {
+            sqlparser::ast::LimitClause::LimitOffset { limit, .. } => limit.as_mut(),
+            sqlparser::ast::LimitClause::OffsetCommaLimit { limit, .. } => Some(limit),
+        }
+    }
+    fn ext_offset(&self) -> Option<&sqlparser::ast::Offset> {
+        match self.limit_clause.as_ref()? {
+            sqlparser::ast::LimitClause::LimitOffset { offset, .. } => offset.as_ref(),
+            sqlparser::ast::LimitClause::OffsetCommaLimit { .. } => None,
+        }
+    }
+    fn ext_limit_by(&self) -> &[sqlparser::ast::Expr] {
+        match self.limit_clause.as_ref() {
+            Some(sqlparser::ast::LimitClause::LimitOffset { limit_by, .. }) => limit_by,
+            _ => &[],
+        }
+    }
+}
+
+/// sqlparser 0.61 replaced `OrderBy.exprs: Vec<OrderByExpr>` with
+/// `OrderBy.kind: OrderByKind`. These helpers expose the expression list
+/// for the common `ORDER BY <expr>, ...` form (the `ALL` form yields an
+/// empty slice / no-op iteration, matching prior behavior closely).
+pub trait OrderByExt {
+    fn ext_exprs(&self) -> &[sqlparser::ast::OrderByExpr];
+    fn ext_exprs_mut(&mut self) -> &mut [sqlparser::ast::OrderByExpr];
+}
+
+impl OrderByExt for sqlparser::ast::OrderBy {
+    fn ext_exprs(&self) -> &[sqlparser::ast::OrderByExpr] {
+        match &self.kind {
+            sqlparser::ast::OrderByKind::Expressions(v) => v,
+            sqlparser::ast::OrderByKind::All(_) => &[],
+        }
+    }
+    fn ext_exprs_mut(&mut self) -> &mut [sqlparser::ast::OrderByExpr] {
+        match &mut self.kind {
+            sqlparser::ast::OrderByKind::Expressions(v) => v,
+            sqlparser::ast::OrderByKind::All(_) => &mut [],
+        }
+    }
+}

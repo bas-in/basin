@@ -31,7 +31,7 @@
 //! pays a getenv on the hot path.
 
 use std::sync::OnceLock;
-use crate::pg_ast::ObjectNamePartExt;
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 
 use basin_catalog::Catalog;
 use basin_common::{BasinError, Result, TableName, ProjectId};
@@ -77,7 +77,7 @@ pub async fn estimate_query_rows(
         Statement::Query(q) => q,
         _ => return Ok(None),
     };
-    if q.limit.is_some() {
+    if q.ext_limit().is_some() {
         return Ok(None);
     }
     let body = match q.body.as_ref() {

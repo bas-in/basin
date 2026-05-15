@@ -38,7 +38,7 @@
 //! tier for keeping the storage API stable.
 
 use std::sync::Arc;
-use crate::pg_ast::ObjectNamePartExt;
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
@@ -144,7 +144,7 @@ pub async fn rewrite_vector_order_by(
 
     // Criterion 5 (LIMIT must be a constant integer) is checked first
     // because failures are common and cheap to spot.
-    let k = match &query.limit {
+    let k = match query.ext_limit() {
         Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => match s.parse::<i64>() {
             Ok(n) if n > 0 => n as usize,
             _ => return Ok(None),
@@ -155,8 +155,8 @@ pub async fn rewrite_vector_order_by(
     // Reject any query that carries auxiliary clauses we'd silently lose
     // when routing.
     if query.with.is_some()
-        || !query.limit_by.is_empty()
-        || query.offset.is_some()
+        || !query.ext_limit_by().is_empty()
+        || query.ext_offset().is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
@@ -170,10 +170,10 @@ pub async fn rewrite_vector_order_by(
     let Some(order) = query.order_by.as_ref() else {
         return Ok(None);
     };
-    if order.exprs.len() != 1 {
+    if order.ext_exprs().len() != 1 {
         return Ok(None);
     }
-    let order_expr: &OrderByExpr = &order.exprs[0];
+    let order_expr: &OrderByExpr = &order.ext_exprs()[0];
     // Criterion 6: ASC. `asc = None` means default which is ASC.
     if let Some(false) = order_expr.asc {
         return Ok(None);

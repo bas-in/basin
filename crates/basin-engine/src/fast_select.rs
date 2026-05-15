@@ -19,7 +19,7 @@
 //! [`ProjectHandle`]: basin_shard::ProjectHandle
 
 use std::sync::Arc;
-use crate::pg_ast::ObjectNamePartExt;
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -60,8 +60,8 @@ pub(crate) fn match_simple_select(stmt: &Statement) -> Option<SimpleSelectPlan> 
 fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     if q.with.is_some()
         || q.order_by.is_some()
-        || !q.limit_by.is_empty()
-        || q.offset.is_some()
+        || !q.ext_limit_by().is_empty()
+        || q.ext_offset().is_some()
         || q.fetch.is_some()
         || !q.locks.is_empty()
         || q.for_clause.is_some()
@@ -146,7 +146,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
 
     // LIMIT: literal non-negative integer. `LIMIT ALL`, expressions, and
     // placeholders fall through to DataFusion.
-    let limit = match &q.limit {
+    let limit = match q.ext_limit() {
         None => None,
         Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => match s.parse::<i64>() {
             Ok(n) if n >= 0 => Some(n as usize),

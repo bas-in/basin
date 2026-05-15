@@ -31,7 +31,7 @@
 //! - NULL: literal `NULL`.
 
 use std::collections::HashMap;
-use crate::pg_ast::ObjectNamePartExt;
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 
 use arrow_schema::{DataType, Field};
 use basin_common::{BasinError, Result, TableName};
@@ -483,14 +483,14 @@ async fn walk_select_for_predicates(
     // LIMIT $N and OFFSET $N — Postgres types these as int8 (BIGINT). Drivers
     // that don't get this hint refuse to bind i64 values for them. Without
     // this, every ORM with `.limit(?)` / `.offset(?)` breaks at the client.
-    if let Some(Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. })) = q.limit.as_ref() {
+    if let Some(Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. })) = q.ext_limit() {
         if let Some(idx) = s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
             if let Some(slot) = out.get_mut(idx.saturating_sub(1)) {
                 *slot = DataType::Int64;
             }
         }
     }
-    if let Some(off) = q.offset.as_ref() {
+    if let Some(off) = q.ext_offset() {
         if let Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. }) = &off.value {
             if let Some(idx) = s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
                 if let Some(slot) = out.get_mut(idx.saturating_sub(1)) {

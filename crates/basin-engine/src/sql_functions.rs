@@ -30,7 +30,7 @@
 //!   defensive backstop.
 
 use std::collections::HashMap;
-use crate::pg_ast::ObjectNamePartExt;
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType};
@@ -405,7 +405,7 @@ fn rewrite_query(
     depth: usize,
 ) -> Result<()> {
     rewrite_set_expr(&mut query.body, by_name, depth)?;
-    if let Some(limit) = query.limit.as_mut() {
+    if let Some(limit) = query.ext_limit_mut() {
         rewrite_expr(limit, by_name, depth)?;
     }
     Ok(())
@@ -844,7 +844,7 @@ fn function_arg_to_expr(arg: &FunctionArg, fn_name: &str) -> Result<Expr> {
 
 fn substitute_args_in_query(query: &mut Query, subs: &HashMap<String, Expr>) -> Result<()> {
     substitute_args_in_set_expr(&mut query.body, subs)?;
-    if let Some(limit) = query.limit.as_mut() {
+    if let Some(limit) = query.ext_limit_mut() {
         substitute_args_in_expr(limit, subs)?;
     }
     Ok(())
@@ -1006,7 +1006,7 @@ fn parse_body(body: &str, fn_name: &str) -> Result<Query> {
 fn collect_function_calls_in_query(q: &Query) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     collect_set_expr(&q.body, &mut out);
-    if let Some(limit) = q.limit.as_ref() {
+    if let Some(limit) = q.ext_limit() {
         collect_expr(limit, &mut out);
     }
     out

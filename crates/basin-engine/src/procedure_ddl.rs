@@ -37,7 +37,7 @@
 //!   interpreter Basin explicitly skips.
 
 use std::collections::HashMap;
-use crate::pg_ast::ObjectNamePartExt;
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SqlArgType, SqlFunctionArg, SqlProcedureDef};
@@ -484,7 +484,7 @@ fn substitute_args_in_query(
     subs: &HashMap<String, Expr>,
 ) -> Result<()> {
     substitute_args_in_set_expr(&mut query.body, subs)?;
-    if let Some(limit) = query.limit.as_mut() {
+    if let Some(limit) = query.ext_limit_mut() {
         substitute_args_in_expr(limit, subs)?;
     }
     Ok(())

@@ -29,7 +29,7 @@
 //! improvement.
 
 use std::collections::HashMap;
-use crate::pg_ast::ObjectNamePartExt;
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -266,7 +266,7 @@ async fn rewrite_query(ctx: &mut RewriteCtx<'_>, q: &mut Query) -> Result<()> {
         // with one bare table is supported — see [`extract_from_binding`]).
         if let SetExpr::Select(sel) = q.body.as_mut() {
             if let Some(binding) = extract_from_binding(sel) {
-                for obe in order_by.exprs.iter_mut() {
+                for obe in order_by.ext_exprs_mut().iter_mut() {
                     rewrite_expr_for_ordering(ctx, &binding, &mut obe.expr).await?;
                 }
             }
