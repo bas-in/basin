@@ -11,6 +11,11 @@
 #   ./benchmark/run_pg_compare.sh              # auto-detect docker vs native pg
 #   SKIP_DOCKER=1 ./benchmark/run_pg_compare.sh   # skip docker, expect a pg on :5432
 #
+# This single-suite script is still supported and unchanged. For a full
+# parallelised LocalFS+SeaweedFS run (≤10 min wall-clock), use the split
+# harness instead:  ./benchmark/run/run_all.sh
+# (its localfs_compare group runs this same compare_postgres workload).
+#
 # Idempotency:
 #   - Named container "basin_pg_bench" is stopped+removed on EXIT (trap).
 #   - --rm on docker run means the container cleans up even if the trap fires late.
