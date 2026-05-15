@@ -5,14 +5,14 @@
     "compression": "ZSTD (Parquet default level) vs Vortex sampling/BtrBlocks cascade",
     "dataset": "audit-log: id(i64), ts(utf8), actor(utf8/8-cardinality), event(utf8/4-cardinality), body(utf8/json-ish~120B)",
     "parquet_bytes": 3174879,
-    "parquet_scan_ms": 60.013584,
+    "parquet_scan_ms": 61.747125,
     "rows": 1000000,
-    "scan_ratio_parquet_over_vortex": 18.071166211677475,
+    "scan_ratio_parquet_over_vortex": 18.98986585918305,
     "size_ratio_parquet_over_vortex": 1.9496875468249895,
     "vortex_bytes": 1628404,
-    "vortex_scan_ms": 3.320958
+    "vortex_scan_ms": 3.251583
   },
-  "generated_at": "@1778843191",
+  "generated_at": "@1778851649",
   "id": "vortex_parquet",
   "kind": "compare",
   "metrics": [
@@ -25,11 +25,11 @@
       "unit": "bytes"
     },
     {
-      "basin": 60.013584,
+      "basin": 61.747125,
       "better": "postgres",
       "label": "Full-scan wall time",
-      "postgres": 3.320958,
-      "ratio_text": "parquet / vortex = 18.07x",
+      "postgres": 3.251583,
+      "ratio_text": "parquet / vortex = 18.99x",
       "unit": "ms"
     }
   ],
