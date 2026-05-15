@@ -293,6 +293,13 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let tablesample_rewrite = crate::select_advanced::strip_tablesample(sql);
     let sql = tablesample_rewrite.as_ref();
     //
+    // 2b. Strip `ONLY ` table inheritance modifier from `FROM ONLY <tbl>` /
+    //     `JOIN ONLY <tbl>`. Basin has no table inheritance (flat-storage design);
+    //     `ONLY` is a semantic no-op here. Rewriting to plain `FROM <tbl>` makes
+    //     the query run normally against the base table.
+    let only_rewrite = crate::pg_ast::strip_only_modifier(sql);
+    let sql = only_rewrite.as_ref();
+    //
     // 3. `FETCH FIRST N ROWS ONLY` / `FETCH NEXT N ROWS ONLY` → `LIMIT N`.
     //    sqlparser parses these into `Query.fetch`; DataFusion 44's planner
     //    only reads `Query.limit`, so FETCH is silently ignored without this

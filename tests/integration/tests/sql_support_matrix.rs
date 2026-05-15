@@ -2984,14 +2984,16 @@ async fn run_pass() -> Vec<(Outcome, String)> {
             }
         };
 
-        // Run setup statements — failures abort this row (mark ExecFailed).
+        // Run setup statements — failures abort this row.
+        // If the setup statement itself is rejected as out-of-scope (0A000 /
+        // FeatureNotSupported), the whole row is a design exclusion (🚫),
+        // not a runtime failure (🛠).
         let mut setup_ok = true;
         for setup_sql in setup.iter() {
             if let Err(e) = sess.execute(setup_sql).await {
-                results.push((
-                    Outcome::ExecFailed,
-                    short_note(&format!("setup failed: {e}")),
-                ));
+                let note = short_note(&format!("setup failed: {e}"));
+                let (outcome, _) = classify_error(&e);
+                results.push((outcome, note));
                 setup_ok = false;
                 break;
             }

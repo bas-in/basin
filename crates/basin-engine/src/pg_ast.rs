@@ -142,6 +142,11 @@ pub enum StmtKind {
     // REINDEX — Basin indexes managed by DataFusion's adaptive planner
     // (syntactic-accept-only; see noop_accept.rs)
     Reindex,
+    // PL/pgSQL anonymous block — ADR 0012 design exclusion; no PL/pgSQL runtime.
+    DoBlock,
+    // CREATE TABLE … PARTITION OF — declarative partitioning is a design
+    // exclusion (flat-storage model); surface 0A000 per ADR 0012.
+    CreateTablePartitionOf,
     /// Anything we don't yet dispatch on. Routed to the existing
     /// sqlparser pipeline by the executor.
     Other,
@@ -223,6 +228,8 @@ impl StmtKind {
             StmtKind::SecurityLabel => "SECURITY LABEL",
             StmtKind::Merge => "MERGE",
             StmtKind::Reindex => "REINDEX",
+            StmtKind::DoBlock => "DO",
+            StmtKind::CreateTablePartitionOf => "CREATE TABLE … PARTITION OF",
             StmtKind::Other => "<other>",
         }
     }
@@ -243,7 +250,16 @@ impl StmtKind {
         // Everything else (BEGIN/COMMIT/PREPARE/cursor lifecycle/extensions/
         // triggers) is either noop-accepted via noop_accept.rs or has a real
         // implementation; reject_unsupported must let them through.
-        matches!(self, StmtKind::Listen | StmtKind::Notify | StmtKind::Unlisten)
+        matches!(
+            self,
+            StmtKind::Listen
+                | StmtKind::Notify
+                | StmtKind::Unlisten
+                // ADR 0012 design exclusions — no PL/pgSQL runtime
+                | StmtKind::DoBlock
+                // Declarative partitioning — flat-storage design exclusion
+                | StmtKind::CreateTablePartitionOf
+        )
     }
 }
 
@@ -287,7 +303,15 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::UpdateStmt(_) => StmtKind::Update,
         NodeEnum::DeleteStmt(_) => StmtKind::Delete,
 
-        NodeEnum::CreateStmt(_) => StmtKind::CreateTable,
+        NodeEnum::CreateStmt(s) => {
+            // A `CREATE TABLE … PARTITION OF parent FOR VALUES …` carries a
+            // non-None `partbound`; treat it as a distinct design-exclusion kind.
+            if s.partbound.is_some() {
+                StmtKind::CreateTablePartitionOf
+            } else {
+                StmtKind::CreateTable
+            }
+        }
         NodeEnum::AlterTableStmt(_) => StmtKind::AlterTable,
         NodeEnum::IndexStmt(_) => StmtKind::CreateIndex,
 
@@ -429,6 +453,9 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
 
         NodeEnum::MergeStmt(_) => StmtKind::Merge,
         NodeEnum::ReindexStmt(_) => StmtKind::Reindex,
+
+        // PL/pgSQL anonymous block — ADR 0012 design exclusion
+        NodeEnum::DoStmt(_) => StmtKind::DoBlock,
 
         _ => StmtKind::Other,
     }
@@ -959,8 +986,180 @@ pub fn reject_unsupported(tree: &ParseTree) -> Result<()> {
                 kind.as_label()
             )));
         }
+
+        // Fine-grained sub-statement checks that cannot be expressed as a single
+        // StmtKind because the top-level node is shared with supported variants.
+
+        let Some(inner) = node.node.as_ref() else {
+            continue;
+        };
+
+        // CREATE TABLE with EXCLUDE constraint — Basin has no GiST / exclusion
+        // index support. This is a design exclusion (flat-storage model).
+        if let NodeEnum::CreateStmt(cs) = inner {
+            use pg_query::protobuf::ConstrType;
+            let has_exclusion = cs.table_elts.iter().any(|elt| {
+                if let Some(NodeEnum::Constraint(c)) = elt.node.as_ref() {
+                    c.contype == ConstrType::ConstrExclusion as i32
+                } else {
+                    false
+                }
+            });
+            if has_exclusion {
+                return Err(BasinError::FeatureNotSupported(
+                    "EXCLUDE constraint is not supported (SQLSTATE 0A000): \
+                     Basin has no GiST index backend"
+                        .into(),
+                ));
+            }
+        }
+
+        // ALTER TABLE … DETACH PARTITION — declarative partitioning design exclusion.
+        if let NodeEnum::AlterTableStmt(at) = inner {
+            use pg_query::protobuf::AlterTableType;
+            let has_detach = at.cmds.iter().any(|cmd| {
+                if let Some(NodeEnum::AlterTableCmd(c)) = cmd.node.as_ref() {
+                    c.subtype == AlterTableType::AtDetachPartition as i32
+                        || c.subtype == AlterTableType::AtDetachPartitionFinalize as i32
+                } else {
+                    false
+                }
+            });
+            if has_detach {
+                return Err(BasinError::FeatureNotSupported(
+                    "ALTER TABLE … DETACH PARTITION is not supported (SQLSTATE 0A000): \
+                     Basin uses flat storage without declarative partitioning"
+                        .into(),
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// Strip the `ONLY` table-inheritance modifier from `FROM ONLY <table>` and
+/// `JOIN ONLY <table>` expressions.
+///
+/// Basin has no table inheritance (flat-storage design); `ONLY` is syntactically
+/// accepted by the real PostgreSQL parser but has no effect in Basin — every
+/// query already implicitly targets the named table only. Removing the keyword
+/// makes the SQL parseable by sqlparser and executable by DataFusion.
+///
+/// # Strategy
+///
+/// Text-level scan: find every occurrence of `FROM ONLY ` or `JOIN ONLY ` (case-
+/// insensitive) that is followed by an identifier character, and remove the
+/// `ONLY ` (5 chars). Single-quoted literals are skipped to avoid mangling
+/// string values that happen to contain the phrase.
+///
+/// Returns the original `sql` as `Cow::Borrowed` when no rewrite is needed.
+pub fn strip_only_modifier(sql: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: the word ONLY doesn't appear at all.
+    if !sql.to_ascii_uppercase().contains("ONLY") {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut modified = false;
+
+    while i < len {
+        // Skip single-quoted string literals.
+        if bytes[i] == b'\'' {
+            if modified {
+                out.push('\'');
+            }
+            i += 1;
+            while i < len {
+                let ch = bytes[i];
+                if modified {
+                    out.push(ch as char);
+                }
+                i += 1;
+                if ch == b'\'' {
+                    // Handle escaped quotes ('').
+                    if i < len && bytes[i] == b'\'' {
+                        if modified {
+                            out.push('\'');
+                        }
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Check for `FROM ONLY ` or `JOIN ONLY ` (case-insensitive).
+        // We match the pattern: (FROM|JOIN) followed by whitespace and ONLY and whitespace.
+        // More precisely: the keyword FROM/JOIN, at least one space, then ONLY, then at
+        // least one space or the end.
+        let remaining = &sql[i..];
+        let upper_rem = remaining.to_ascii_uppercase();
+
+        let keyword_len = if upper_rem.starts_with("FROM") && i + 4 <= len {
+            Some(4usize)
+        } else if upper_rem.starts_with("JOIN") && i + 4 <= len {
+            Some(4usize)
+        } else {
+            None
+        };
+
+        if let Some(kw_len) = keyword_len {
+            // Ensure character before is a word boundary (start or non-ident).
+            let prev_is_boundary = i == 0 || {
+                let prev = bytes[i - 1];
+                !prev.is_ascii_alphanumeric() && prev != b'_'
+            };
+            if prev_is_boundary {
+                // Scan past the keyword and any whitespace.
+                let mut j = i + kw_len;
+                while j < len && bytes[j] == b' ' {
+                    j += 1;
+                }
+                // Check for ONLY keyword.
+                let rem2 = sql[j..].to_ascii_uppercase();
+                if rem2.starts_with("ONLY") {
+                    let after_only = j + 4;
+                    // ONLY must be followed by whitespace (not part of a longer word).
+                    if after_only < len
+                        && (bytes[after_only] == b' '
+                            || bytes[after_only] == b'\t'
+                            || bytes[after_only] == b'\n'
+                            || bytes[after_only] == b'\r')
+                    {
+                        // We have FROM/JOIN <spaces> ONLY <space>.
+                        // Copy up through FROM/JOIN and the single space, then skip ONLY + one space.
+                        if !modified {
+                            out = sql[..i].to_string();
+                            modified = true;
+                        }
+                        // Emit the FROM/JOIN keyword.
+                        out.push_str(&sql[i..i + kw_len]);
+                        // Emit ONE space (collapse any run of spaces before ONLY).
+                        out.push(' ');
+                        // Skip past `ONLY ` (the keyword plus its one following space).
+                        i = after_only + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if modified {
+            out.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+
+    if modified {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(sql)
+    }
 }
 
 #[cfg(test)]
@@ -1285,6 +1484,106 @@ mod tests {
         ];
         for sql in cases {
             assert_eq!(rewrite_tsvector_at_at(sql), sql, "case: {sql}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // strip_only_modifier — FROM ONLY / JOIN ONLY table-inheritance strip
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn strip_only_no_op_when_absent() {
+        let sql = "SELECT * FROM t";
+        assert_eq!(strip_only_modifier(sql), sql);
+    }
+
+    #[test]
+    fn strip_only_from_only() {
+        let got = strip_only_modifier("SELECT * FROM ONLY t");
+        assert_eq!(got, "SELECT * FROM t");
+    }
+
+    #[test]
+    fn strip_only_join_only() {
+        let got = strip_only_modifier("SELECT * FROM a JOIN ONLY b ON a.id = b.id");
+        assert_eq!(got, "SELECT * FROM a JOIN b ON a.id = b.id");
+    }
+
+    #[test]
+    fn strip_only_case_insensitive() {
+        let got = strip_only_modifier("select * from only t");
+        assert_eq!(got, "select * from t");
+    }
+
+    #[test]
+    fn strip_only_does_not_touch_string_literals() {
+        // 'FROM ONLY foo' inside a string literal must not be rewritten.
+        let sql = "SELECT 'FROM ONLY foo' FROM t";
+        assert_eq!(strip_only_modifier(sql), sql);
+    }
+
+    #[test]
+    fn strip_only_does_not_mangle_only_as_identifier() {
+        // A column named `only` should not be affected.
+        let sql = "SELECT only FROM t";
+        assert_eq!(strip_only_modifier(sql), sql);
+    }
+
+    #[test]
+    fn strip_only_detects_do_block_as_design_exclusion() {
+        let tree =
+            parse("DO $$ BEGIN RAISE NOTICE 'hi'; END; $$ LANGUAGE plpgsql").expect("pg_query parses DO");
+        let node = tree.stmts().next().expect("one stmt");
+        assert_eq!(stmt_kind(node), StmtKind::DoBlock);
+        let err = reject_unsupported(&tree).expect_err("DoBlock should be rejected");
+        match err {
+            BasinError::FeatureNotSupported(msg) => {
+                assert!(msg.contains("0A000"), "expected SQLSTATE 0A000 in: {msg}");
+            }
+            other => panic!("expected FeatureNotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_only_detects_partition_of_as_design_exclusion() {
+        let tree = parse(
+            "CREATE TABLE t_2024 PARTITION OF t FOR VALUES FROM (2024) TO (2025)",
+        )
+        .expect("pg_query parses PARTITION OF");
+        let node = tree.stmts().next().expect("one stmt");
+        assert_eq!(stmt_kind(node), StmtKind::CreateTablePartitionOf);
+        let err = reject_unsupported(&tree).expect_err("CreateTablePartitionOf should be rejected");
+        match err {
+            BasinError::FeatureNotSupported(msg) => {
+                assert!(msg.contains("0A000"), "expected SQLSTATE 0A000 in: {msg}");
+            }
+            other => panic!("expected FeatureNotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_only_detects_exclude_constraint_as_design_exclusion() {
+        let tree = parse("CREATE TABLE t (id INT, EXCLUDE USING gist (id WITH =))")
+            .expect("pg_query parses EXCLUDE");
+        let err = reject_unsupported(&tree).expect_err("EXCLUDE should be rejected");
+        match err {
+            BasinError::FeatureNotSupported(msg) => {
+                assert!(msg.contains("0A000"), "expected SQLSTATE 0A000 in: {msg}");
+            }
+            other => panic!("expected FeatureNotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_only_detects_detach_partition_as_design_exclusion() {
+        let tree = parse("ALTER TABLE t DETACH PARTITION p")
+            .expect("pg_query parses DETACH PARTITION");
+        let err = reject_unsupported(&tree).expect_err("DETACH PARTITION should be rejected");
+        match err {
+            BasinError::FeatureNotSupported(msg) => {
+                assert!(msg.contains("0A000"), "expected SQLSTATE 0A000 in: {msg}");
+            }
+            other => panic!("expected FeatureNotSupported, got {other:?}"),
         }
     }
 }
