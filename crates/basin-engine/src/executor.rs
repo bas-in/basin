@@ -853,21 +853,35 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // RLS off see the fast path exactly as before — same one-`bool`
             // catalog read the existing path already pays.
             if let Some(plan) = match_simple_select(&stmt) {
-                // Skip the fast path when the "table" is actually a plain view:
-                // the fast path reads Parquet directly and would fail with NotFound.
-                // The full DataFusion path (exec_select below) rewrites view refs.
-                let is_view = sess
+                // Fast-path gate: load the table metadata exactly once and
+                // derive all three guard conditions from that single result.
+                // Previously this performed 3 separate catalog round-trips
+                // (lookup_view, table_has_rls → load_table, table_has_soft_delete
+                // → load_table); now it is one load_table + one lookup_view.
+                //
+                // We still need lookup_view because views and tables live in
+                // separate catalog maps and can share a name in principle.
+                let table_meta = sess
                     .engine
                     .config()
                     .catalog
-                    .lookup_view(&sess.project, plan.table.as_str())
+                    .load_table(&sess.project, &plan.table)
                     .await
-                    .is_some();
-                if !is_view
-                    && !table_has_rls(sess, &plan.table).await?
-                    && !table_has_soft_delete(sess, &plan.table).await?
-                {
-                    return execute_simple_select(sess, plan).await;
+                    .ok();
+                if let Some(ref meta) = table_meta {
+                    let is_view = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .lookup_view(&sess.project, plan.table.as_str())
+                        .await
+                        .is_some();
+                    let has_rls = meta.rls_enabled;
+                    let has_soft_delete =
+                        crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
+                    if !is_view && !has_rls && !has_soft_delete {
+                        return execute_simple_select(sess, plan, table_meta).await;
+                    }
                 }
             }
             exec_select(sess, sql, include_deleted).await
@@ -2889,35 +2903,6 @@ async fn apply_rls_to_select(
         return Ok(df);
     }
     crate::rls::inject_select_predicates(&sess.ctx, df, &policies, &sess.current_user).await
-}
-
-/// One catalog `load_table` call. Returns `true` only when the table has
-/// `rls_enabled = true`. We don't cache this on the session because policy
-/// state can change mid-session (every `CREATE/ALTER/DROP POLICY` /
-/// `ALTER TABLE … ENABLE/DISABLE ROW LEVEL SECURITY` writes through to the
-/// catalog), and a per-query catalog hop is an O(microsecond) cost on the
-/// SELECT path that's already doing one anyway.
-async fn table_has_rls(sess: &ProjectSession, table: &TableName) -> Result<bool> {
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, table)
-        .await?;
-    Ok(meta.rls_enabled)
-}
-
-/// Companion of [`table_has_rls`] for the soft-delete predicate-injection
-/// gate. Tables without a SOFT DELETE column take the simple-select fast
-/// path unchanged.
-async fn table_has_soft_delete(sess: &ProjectSession, table: &TableName) -> Result<bool> {
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, table)
-        .await?;
-    Ok(crate::types::soft_delete_column(meta.schema.as_ref()).is_some())
 }
 
 /// AND-merge an `<soft_delete_col> IS NULL` predicate into `df`'s logical

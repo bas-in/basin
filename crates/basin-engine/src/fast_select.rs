@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use basin_catalog::TableMetadata;
 use basin_common::{BasinError, PartitionKey, Result, TableName};
 use basin_storage::{Predicate, ReadOptions, ScalarValue};
 use sqlparser::ast::{
@@ -276,10 +277,17 @@ const HEAVY_BYTE_THRESHOLD: u64 = 50 * 1024 * 1024;
 /// up, the shard's [`ProjectHandle`]). Returns the merged result set ready to
 /// hand back to the caller.
 ///
+/// `prefetched_meta` may carry `TableMetadata` already loaded by the caller's
+/// fast-path gate check (which loaded it to inspect `rls_enabled` and the
+/// soft-delete column). When supplied we skip the redundant `load_table` call;
+/// when `None` we fall back to loading it ourselves (e.g. callers that don't
+/// pre-check).
+///
 /// [`ProjectHandle`]: basin_shard::ProjectHandle
 pub(crate) async fn execute_simple_select(
     sess: &ProjectSession,
     plan: SimpleSelectPlan,
+    prefetched_meta: Option<TableMetadata>,
 ) -> Result<ExecResult> {
     // Flush the in-RAM tail before we look up the table's metadata so the
     // post-flush snapshot drives the heavy-read gating below. Without this
@@ -288,12 +296,18 @@ pub(crate) async fn execute_simple_select(
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
     }
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, &plan.table)
-        .await?;
+    // Use the pre-fetched metadata when available (saves one catalog round-trip
+    // that the fast-path gate already paid). Fall back to loading when not.
+    let meta = match prefetched_meta {
+        Some(m) => m,
+        None => {
+            sess.engine
+                .config()
+                .catalog
+                .load_table(&sess.project, &plan.table)
+                .await?
+        }
+    };
 
     // Validate the projection against the cached schema. Doing it here means
     // unknown columns surface as a clean `NotFound` instead of an opaque
@@ -535,5 +549,76 @@ mod tests {
     fn rejects_expression_in_projection() {
         let stmt = parse_one("SELECT id + 1 FROM t");
         assert!(match_simple_select(&stmt).is_none());
+    }
+
+    /// Timing micro-bench: measures median latency of the fast-path SELECT
+    /// (catalog lookup + Parquet read) over 200 iterations on a 10k-row table.
+    /// Run with:
+    ///   `CARGO_BUILD_JOBS=1 cargo test -p basin-engine --lib \
+    ///    fast_select::tests::bench_fast_select_latency -- --nocapture --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_fast_select_latency() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use basin_catalog::{Catalog, InMemoryCatalog};
+        use basin_common::ProjectId;
+        use crate::{Engine, EngineConfig};
+        use object_store::local::LocalFileSystem;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+
+        let project = ProjectId::new();
+        let sess = engine.open_session(project).await.unwrap();
+
+        // Create a table and insert 10k rows.
+        sess.execute("CREATE TABLE audit_log (id BIGINT, user_id BIGINT, action TEXT, ts BIGINT)")
+            .await
+            .unwrap();
+        let mut tuples = Vec::with_capacity(10_000);
+        for i in 0i64..10_000 {
+            tuples.push(format!("({i}, {}, 'login', {})", i % 100, i * 1000));
+        }
+        sess.execute(&format!("INSERT INTO audit_log VALUES {}", tuples.join(",")))
+            .await
+            .unwrap();
+
+        const ITERS: usize = 200;
+        let mut samples: Vec<f64> = Vec::with_capacity(ITERS);
+
+        // Warm up.
+        for _ in 0..10 {
+            let _ = sess.execute("SELECT id, user_id FROM audit_log WHERE id = 42").await.unwrap();
+        }
+
+        for i in 0..ITERS {
+            let t0 = Instant::now();
+            let _ = sess.execute(&format!(
+                "SELECT id, user_id FROM audit_log WHERE id = {}", i as i64 % 10_000
+            ))
+            .await
+            .unwrap();
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = samples[ITERS / 2];
+        let p95 = samples[(ITERS * 95) / 100];
+        let p99 = samples[(ITERS * 99) / 100];
+        let mean = samples.iter().sum::<f64>() / ITERS as f64;
+        println!(
+            "\nbench_fast_select_latency: mean={mean:.3}ms  p50={p50:.3}ms  p95={p95:.3}ms  p99={p99:.3}ms"
+        );
     }
 }
