@@ -14,7 +14,8 @@ path = "src/main.rs"
 [dependencies]
 # Vortex columnar format (requires arrow 58)
 vortex-array = "0.70"
-vortex-file = "0.70"
+vortex-file = { version = "0.70", features = ["zstd"] }
+vortex-btrblocks = { version = "0.70", features = ["zstd", "pco"] }
 vortex-session = "0.70"
 vortex-io = { version = "0.70", features = ["tokio"] }
 vortex-layout = "0.70"

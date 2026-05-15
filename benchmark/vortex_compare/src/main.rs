@@ -28,8 +28,12 @@ use vortex_array::arrays::{ChunkedArray, StructArray, VarBinArray};
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_io::session::RuntimeSessionExt;
+use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::{Buffer, ByteBufferMut};
-use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, register_default_encodings};
+use vortex_file::{
+    OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder,
+    register_default_encodings,
+};
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
@@ -208,10 +212,17 @@ async fn write_vortex(path: &Path, session: &VortexSession) -> u64 {
     ])
     .unwrap();
 
+    // Build the aggressive write strategy: BtrBlocks with Zstd (strings) + Pco (numerics).
+    let compressor = BtrBlocksCompressorBuilder::default().with_compact();
+    let strategy = WriteStrategyBuilder::default()
+        .with_btrblocks_builder(compressor)
+        .build();
+
     // Write to in-memory buffer.
     let mut buf = ByteBufferMut::empty();
     session
         .write_options()
+        .with_strategy(strategy)
         .write(&mut buf, struct_array.into_array().to_array_stream())
         .await
         .unwrap();
@@ -354,7 +365,7 @@ async fn main() {
             "vortex_scan_ms": vortex_ms,
             "size_ratio_parquet_over_vortex": size_ratio,
             "scan_ratio_parquet_over_vortex": scan_ratio,
-            "compression": "ZSTD (Parquet default level) vs Vortex default encodings",
+            "compression": "ZSTD (Parquet default level) vs Vortex sampling/BtrBlocks cascade",
             "dataset": "audit-log: id(i64), ts(utf8), actor(utf8/8-cardinality), event(utf8/4-cardinality), body(utf8/json-ish~120B)"
         },
         "note": "JSON key 'basin'=Parquet, 'postgres'=Vortex (schema reuse from Postgres compare card). Standalone binary: cargo run --manifest-path benchmark/vortex_compare/Cargo.toml --release",

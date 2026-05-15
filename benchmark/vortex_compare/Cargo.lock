@@ -2286,6 +2286,7 @@ checksum = "86548e6548a15ebb243d280c0a7a5cd67bef8631033b48b999f6a5900cc11ae8"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
+ "pco",
  "rand",
  "rustc-hash",
  "tracing",
@@ -2299,11 +2300,13 @@ dependencies = [
  "vortex-fastlanes",
  "vortex-fsst",
  "vortex-mask",
+ "vortex-pco",
  "vortex-runend",
  "vortex-sequence",
  "vortex-sparse",
  "vortex-utils",
  "vortex-zigzag",
+ "vortex-zstd",
 ]
 
 [[package]]
@@ -2345,6 +2348,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "vortex-array",
+ "vortex-btrblocks",
  "vortex-buffer",
  "vortex-file",
  "vortex-io",
@@ -2471,6 +2475,7 @@ dependencies = [
  "vortex-sparse",
  "vortex-utils",
  "vortex-zigzag",
+ "vortex-zstd",
 ]
 
 [[package]]
@@ -2717,6 +2722,22 @@ dependencies = [
  "vortex-mask",
  "vortex-session",
  "zigzag",
+]
+
+[[package]]
+name = "vortex-zstd"
+version = "0.70.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd578a30132badc04709af4bd581e372f010a1c59a5e959a2f20fdbea099338f"
+dependencies = [
+ "itertools 0.14.0",
+ "prost",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-mask",
+ "vortex-session",
+ "zstd",
 ]
 
 [[package]]

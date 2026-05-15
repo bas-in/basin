@@ -2,34 +2,34 @@
   "available": true,
   "claim": "Vortex achieves competitive compression and fast full-scan vs ZSTD Parquet on audit-log data.",
   "details": {
-    "compression": "ZSTD (Parquet default level) vs Vortex default encodings",
+    "compression": "ZSTD (Parquet default level) vs Vortex sampling/BtrBlocks cascade",
     "dataset": "audit-log: id(i64), ts(utf8), actor(utf8/8-cardinality), event(utf8/4-cardinality), body(utf8/json-ish~120B)",
     "parquet_bytes": 3174879,
-    "parquet_scan_ms": 63.255958,
+    "parquet_scan_ms": 60.013584,
     "rows": 1000000,
-    "scan_ratio_parquet_over_vortex": 16.943557152936222,
-    "size_ratio_parquet_over_vortex": 0.13251882005921375,
-    "vortex_bytes": 23957948,
-    "vortex_scan_ms": 3.733334
+    "scan_ratio_parquet_over_vortex": 18.071166211677475,
+    "size_ratio_parquet_over_vortex": 1.9496875468249895,
+    "vortex_bytes": 1628404,
+    "vortex_scan_ms": 3.320958
   },
-  "generated_at": "@1778842004",
+  "generated_at": "@1778843191",
   "id": "vortex_parquet",
   "kind": "compare",
   "metrics": [
     {
       "basin": 3174879.0,
-      "better": "basin",
+      "better": "postgres",
       "label": "On-disk size",
-      "postgres": 23957948.0,
-      "ratio_text": "parquet / vortex = 0.13x",
+      "postgres": 1628404.0,
+      "ratio_text": "parquet / vortex = 1.95x",
       "unit": "bytes"
     },
     {
-      "basin": 63.255958,
+      "basin": 60.013584,
       "better": "postgres",
       "label": "Full-scan wall time",
-      "postgres": 3.733334,
-      "ratio_text": "parquet / vortex = 16.94x",
+      "postgres": 3.320958,
+      "ratio_text": "parquet / vortex = 18.07x",
       "unit": "ms"
     }
   ],
