@@ -43,7 +43,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
+use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, StringArray, UInt64Array};
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -99,7 +99,9 @@ async fn one_i32(sess: &basin_engine::TenantSession, sql: &str) -> i64 {
     one_int(sess, sql).await
 }
 
-/// Extract i64 or i32 (flexibly) from single-cell result.
+/// Extract i64 / i32 / u64 (flexibly) from single-cell result. DataFusion
+/// returns `cardinality`, `array_length`, `array_ndims`, `array_position(s)`,
+/// etc. as UInt64; Postgres returns those as int4/int8. Accept all three.
 async fn one_int(sess: &basin_engine::TenantSession, sql: &str) -> i64 {
     let col = single_col(sess, sql).await;
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
@@ -108,7 +110,10 @@ async fn one_int(sess: &basin_engine::TenantSession, sql: &str) -> i64 {
     if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
         return a.value(0) as i64;
     }
-    panic!("not Int64 or Int32 for: {sql} (type={:?})", col.data_type())
+    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+        return a.value(0) as i64;
+    }
+    panic!("not Int64 / Int32 / UInt64 for: {sql} (type={:?})", col.data_type())
 }
 
 /// Extract string from single-cell result.

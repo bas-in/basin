@@ -2042,15 +2042,7 @@ impl InfoSchemaQuery {
             n_live.push(row_count);
             n_dead.push(0);
         }
-        for name in &names {
-            let oid = fnv1a_64_to_positive_i64(
-                format!("basin.pg_class:{tenant}:{}", name.as_str()).as_bytes(),
-            );
-            relids.push(oid);
-            schemas.push(DEFAULT_SCHEMA);
-            relnames.push(name.as_str().to_string());
-        }
-        let _n = relids.len();
+        let n = relids.len();
         let schema = Self::pg_stat_user_tables_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(relids)),
@@ -2065,6 +2057,17 @@ impl InfoSchemaQuery {
             Arc::new(Int64Array::from(n_del)),
             Arc::new(Int64Array::from(n_live)),
             Arc::new(Int64Array::from(n_dead)),
+            // last_vacuum / last_autovacuum / last_analyze / last_autoanalyze —
+            // all nullable Utf8; Basin doesn't run vacuum/analyze so always NULL.
+            Arc::new(StringArray::from(vec![None::<&str>; n])),
+            Arc::new(StringArray::from(vec![None::<&str>; n])),
+            Arc::new(StringArray::from(vec![None::<&str>; n])),
+            Arc::new(StringArray::from(vec![None::<&str>; n])),
+            // vacuum_count / autovacuum_count / analyze_count / autoanalyze_count
+            Arc::new(Int64Array::from(vec![0i64; n])),
+            Arc::new(Int64Array::from(vec![0i64; n])),
+            Arc::new(Int64Array::from(vec![0i64; n])),
+            Arc::new(Int64Array::from(vec![0i64; n])),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_stat_user_tables build: {e}")))
@@ -2185,6 +2188,9 @@ impl InfoSchemaQuery {
     // -----------------------------------------------------------------------
 
     pub fn pg_stat_activity_schema() -> Arc<Schema> {
+        // Canonical PG `pg_stat_activity` column order. Timestamps reported
+        // as text in v0.1; once we wire real session start times to backend
+        // metadata switch to Timestamp(Microsecond, Some("UTC")).
         Arc::new(Schema::new(vec![
             Field::new("datid", DataType::Int64, true),
             Field::new("datname", DataType::Utf8, true),
@@ -2193,10 +2199,6 @@ impl InfoSchemaQuery {
             Field::new("usename", DataType::Utf8, true),
             Field::new("application_name", DataType::Utf8, true),
             Field::new("client_addr", DataType::Utf8, true),
-            Field::new("state", DataType::Utf8, true),
-            Field::new("query", DataType::Utf8, true),
-            Field::new("wait_event_type", DataType::Utf8, true),
-            Field::new("wait_event", DataType::Utf8, true),
             Field::new("client_hostname", DataType::Utf8, true),
             Field::new("client_port", DataType::Int32, true),
             Field::new("backend_start", DataType::Utf8, true),
@@ -2219,8 +2221,6 @@ impl InfoSchemaQuery {
     ) -> Result<RecordBatch> {
         let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{tenant}").as_bytes());
         let role_oid = role_oid_for(tenant);
-        let uid = role_oid_for(tenant);
-        let uname = tenant.to_string();
         let schema = Self::pg_stat_activity_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![Some(db_oid)])),
@@ -2229,26 +2229,20 @@ impl InfoSchemaQuery {
             Arc::new(Int64Array::from(vec![Some(role_oid)])),
             Arc::new(StringArray::from(vec![Some(tenant.to_string())])),
             Arc::new(StringArray::from(vec![Some("basin")])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![Some("active")])),
-            Arc::new(Int32Array::from(vec![1i32])),
-            Arc::new(Int64Array::from(vec![Some(uid)])),
-            Arc::new(StringArray::from(vec![Some(uname)])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(Int32Array::from(vec![None::<i32>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![Some("active")])),
-            Arc::new(Int64Array::from(vec![None::<i64>])),
-            Arc::new(Int64Array::from(vec![None::<i64>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![Some("client backend")])),
+            Arc::new(StringArray::from(vec![None::<String>])), // client_addr
+            Arc::new(StringArray::from(vec![None::<String>])), // client_hostname
+            Arc::new(Int32Array::from(vec![None::<i32>])),     // client_port
+            Arc::new(StringArray::from(vec![None::<String>])), // backend_start
+            Arc::new(StringArray::from(vec![None::<String>])), // xact_start
+            Arc::new(StringArray::from(vec![None::<String>])), // query_start
+            Arc::new(StringArray::from(vec![None::<String>])), // state_change
+            Arc::new(StringArray::from(vec![None::<String>])), // wait_event_type
+            Arc::new(StringArray::from(vec![None::<String>])), // wait_event
+            Arc::new(StringArray::from(vec![Some("active")])),  // state
+            Arc::new(Int64Array::from(vec![None::<i64>])),     // backend_xid
+            Arc::new(Int64Array::from(vec![None::<i64>])),     // backend_xmin
+            Arc::new(StringArray::from(vec![None::<String>])), // query
+            Arc::new(StringArray::from(vec![Some("client backend")])), // backend_type
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_activity build: {e}")))

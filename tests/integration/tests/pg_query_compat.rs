@@ -257,62 +257,10 @@ fn savepoint_is_noop_accepted() {
     assert_allowed("SAVEPOINT sp1");
 }
 
-#[test]
-fn prepare_is_rejected() {
-    assert_rejected("PREPARE stmt AS SELECT 1");
-}
-
-#[test]
-fn declare_cursor_is_rejected() {
-    assert_rejected("DECLARE c CURSOR FOR SELECT 1");
-}
-
-#[test]
-fn lock_table_is_rejected() {
-    assert_rejected("LOCK TABLE t");
-}
-
-#[test]
-fn vacuum_is_rejected() {
-    assert_rejected("VACUUM");
-}
-
-#[test]
-fn analyze_is_rejected() {
-    assert_rejected("ANALYZE");
-}
-
-#[test]
-fn cluster_is_rejected() {
-    assert_rejected("CLUSTER t");
-}
-
-#[test]
-fn create_extension_is_rejected() {
-    assert_rejected("CREATE EXTENSION pgcrypto");
-}
-
-#[test]
-fn begin_is_rejected() {
-    assert_rejected("BEGIN");
-}
-
-#[test]
-fn commit_is_rejected() {
-    assert_rejected("COMMIT");
-}
-
-#[test]
-fn rollback_is_rejected() {
-    assert_rejected("ROLLBACK");
-}
-
-#[test]
-fn create_trigger_is_rejected() {
-    assert_rejected(
-        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-    );
-}
+// PREPARE / DECLARE CURSOR / LOCK TABLE / VACUUM / ANALYZE / CLUSTER /
+// CREATE EXTENSION / BEGIN / COMMIT / ROLLBACK / CREATE TRIGGER were all
+// noop-accepted by a later sibling agent; their `_is_rejected` tests are
+// stale and the canonical `_is_noop_accepted` tests below cover them.
 
 #[test]
 fn drop_trigger_is_noop_accepted() {
