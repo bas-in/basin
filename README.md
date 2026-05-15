@@ -30,7 +30,7 @@
 
 ## Why Basin
 
-**Storage is cheap because it lives on S3-compatible object storage.** Every table is ZSTD-1 Parquet under a project prefix in your bucket of choice (Tigris, AWS S3, Cloudflare R2, local FS). Audit-log-shaped data is 12.5× smaller than Postgres heap on the same workload. Object storage runs $0.015–$0.02/GB/mo — back-of-envelope, what costs $25/mo on Postgres-class block storage is $0.30/mo on Basin.
+**Storage is cheap because it lives on S3-compatible object storage.** Every table is ZSTD-1 Parquet under a project prefix in your bucket of choice (Tigris, AWS S3, MinIO, local FS). Audit-log-shaped data is 12.5× smaller than Postgres heap on the same workload. Object storage runs $0.015–$0.02/GB/mo — back-of-envelope, what costs $25/mo on Postgres-class block storage is $0.30/mo on Basin.
 
 **Projects are essentially free to create.** A new project is a new bucket prefix. No fork-per-connection. No provisioned VM. No per-DB pricing minimum. Idle projects cost only their bytes. Spin up one project for a side app, or ten thousand for a SaaS — same architecture, same binary.
 
@@ -123,7 +123,7 @@ public API. Required vars for production-shaped durability: `BASIN_BIND`,
 Everything else is optional.
 
 To run the same binary against object storage, set
-`BASIN_STORAGE_BACKEND=r2|s3|tigris` plus the S3-compatible endpoint, bucket,
+`BASIN_STORAGE_BACKEND=s3|tigris` plus the S3-compatible endpoint, bucket,
 region, and credentials documented by `basin-storage`.
 
 Connect with **any Postgres driver**:
@@ -175,12 +175,14 @@ Four layers, each with one job:
           │
           ▼
    Object storage + catalog   /projects/{id}/... Parquet + Iceberg-style metadata
-                              local FS, S3, R2, Tigris — same binary, different bucket
+                              local FS, S3, Tigris (S3-compatible) — same binary, different bucket
 ```
 
 The full architecture document is in [`docs/architecture.md`](./docs/architecture.md). Every "no" we've recorded is in [`docs/decisions/`](./docs/decisions/).
 
 **Built on:** Apache Arrow · Apache Iceberg (table format) · Apache Parquet · Apache DataFusion (SQL planner) · Tokio · pgwire-rs · openraft (single-process Raft WAL simulation today; cross-process distributed WAL is v0.2). Pure Rust, `#![forbid(unsafe_code)]` across every crate.
+
+Basin's query engine is built on [Apache DataFusion](https://datafusion.apache.org/), the open-source SQL query engine from the Apache Software Foundation. Basin does not fork DataFusion — every query plan runs through upstream operators with Basin-shaped rules layered on top (RLS injection, project isolation, partition pruning).
 
 ---
 

@@ -112,10 +112,10 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Coalesced metadata in catalog (Phase 5.7 A4) | ✅ | file-level `column_stats` (min / max / null per column) on every committed `DataFileRef`; `Storage::read_paths` skips LIST + per-file footer fetch when the catalog stats prove the predicate prunes the file. Row-group-level coalesced stats deferred to v0.2 (B1). |
 | Per-table row-group sizing | ✅ | `ALTER TABLE … SET row_group_rows = N`; small row groups for point-heavy tables |
 | Cluster-by physical sort (Phase 5.7 B2) | ✅ | `Catalog::set_cluster_columns` configures per-table cluster columns; the writer `lexsort`s every batch by those columns before Parquet flush so related rows live in the same row group / file. Combined with A3 bloom + A4 catalog stats, point queries on the cluster columns prune to one file in the common case. SQL: `CREATE TABLE … CLUSTER BY (...)` / `ALTER TABLE … CLUSTER BY (...)` / `ALTER TABLE … RESET CLUSTER BY`. |
-| Pluggable `object_store` in `basin-server` | ✅ | `BASIN_STORAGE_BACKEND=local|r2|s3|tigris` wires the runnable binary to local FS or S3-compatible object stores. The storage crate still accepts any `dyn ObjectStore` for embedding/tests. |
+| Pluggable `object_store` in `basin-server` | ✅ | `BASIN_STORAGE_BACKEND=local|s3|tigris` wires the runnable binary to local FS or S3-compatible object stores. The storage crate still accepts any `dyn ObjectStore` for embedding/tests. |
 | **NVMe disk cache** | ✅ | LRU on local SSD; ~50ms cold S3 fetches → ~100µs warm SSD reads. Default-on. 101× speedup measured. |
 | **Parquet page cache (RAM)** | ✅ | LRU of decoded RecordBatches; <1ms warm hits. Default-on. 7.24× speedup measured. |
-| HTTP/2 toggle for S3 client | ✅ | `S3Config::http2_only`; useful on AWS S3 / Tigris / R2 over HTTPS |
+| HTTP/2 toggle for S3 client | ✅ | `S3Config::http2_only`; useful on AWS S3 / Tigris over HTTPS |
 | Iceberg-style catalog (in-memory) | ✅ | atomic appends, optimistic concurrency |
 | Iceberg-style catalog (durable) | ✅ | Postgres-backed; survives restart. Multi-region replication direction: single-writer global PG with regional read replicas via PG logical replication — see [ADR 0010](./docs/decisions/0010-catalog-replication.md). |
 | Point-in-time restore (catalog level) | 🛠 | `Catalog::rollback_to_snapshot(project, table, snapshot_id)` truncates history to ≤ target and rewinds the head pointer. InMemory + Postgres impls. v0.2 adds physical file GC for orphaned post-rollback files; cross-DML rollback waits on soft-delete (also v0.2). Project-wide variants (`list_snapshots_project_wide`, `diff_snapshots`, `rollback_to_snapshot_project_wide`) shipped for Migration Manager v0.2. |
@@ -185,7 +185,7 @@ the corresponding `ScalarUDF`s and parse the relevant `WITH (…)` options.
 | Single-region | ✅ | the wedge customer's posture |
 | Multi-region by deployment (one cluster per region) | ✅ | works today; document at [`docs/deployment.md`](./docs/deployment.md) |
 | `region` field on `ProjectMetadata` | ◻️ | 1-day Phase 1 add to make region-pinning explicit |
-| S3 cross-region replication of data | ◻️ | "free" via bucket-level configuration on AWS S3, Tigris, R2, etc. |
+| S3 cross-region replication of data | ◻️ | "free" via bucket-level configuration on AWS S3, Tigris, etc. |
 | Eventual-consistent cross-region read replicas | ◻️ | scoped in [ADR 0004](./docs/decisions/0004-multi-region-read-replicas.md), build planned |
 | Cross-region 2PC / strong consistency | 🚫 | see [ADR 0001](./docs/decisions/0001-single-region-only.md) — Spanner-class, deferred until paid |
 

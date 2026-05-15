@@ -120,7 +120,7 @@ Best fit for Basin's design today:
 
 - **Fly.io** Machines are the compute layer. ~5–30 ms RTT to Tigris from Fly's `nrt` / `iad` / `lhr`.
 - **Tigris** (Fly's native S3-compatible store) has zero egress within Fly's network and no per-region bucket management overhead.
-- **Cloudflare R2**, **Backblaze B2**, **AWS S3** also work; pick by cost/latency/compliance.
+- **AWS S3**, **Backblaze B2**, **MinIO**, and other S3-compatible stores also work; pick by cost/latency/compliance.
 
 Per-region resource shape, rough sizing for the first 1k–10k projects:
 
@@ -128,7 +128,7 @@ Per-region resource shape, rough sizing for the first 1k–10k projects:
 |---|---|---|
 | Router | Fly Performance 1× × 2 (HA) | ~$30/mo. Stateless; scales linearly with connection count. |
 | Shard owners | Fly Performance 4× × 2 | ~$240/mo. Each handles ~5k projects' working set. Add more as project count grows. |
-| Object store bucket | regional, public-bucket-disabled | Tigris: ~$0.02/GB + $0.01/GB egress (Fly-internal is free). Cloudflare R2: $0.015/GB zero egress. AWS S3: $0.023/GB + $0.09/GB egress. |
+| Object store bucket | regional, public-bucket-disabled | Tigris: ~$0.02/GB + $0.01/GB egress (Fly-internal is free). AWS S3: $0.023/GB + $0.09/GB egress. |
 | Catalog backend | none — embedded | Catalog state (project list, table schemas, snapshot manifests, file refs, plus `basin-auth`'s `auth.users` / `auth.refresh_tokens`) lives in the engine's own pgwire loopback, durable on the WAL volume. ~50 MB per 10k projects. No external Postgres to provision. |
 | Optional: NVMe disk cache | Fly volume, 50 GB | Phase 5.7-A1 cache. ~$5/mo. Cuts cold S3 fetches from ~50 ms → ~100 µs. |
 
@@ -161,7 +161,7 @@ For cross-region **read replicas** ([ADR 0004](./decisions/0004-multi-region-rea
 
 | Piece | Effort |
 |---|---|
-| Object-store cross-region replication (storage layer) | Flip a switch in your provider (e.g. Tigris global replication, R2 advanced replication, S3 CRR). **No Basin code.** |
+| Object-store cross-region replication (storage layer) | Flip a switch in your provider (e.g. Tigris global replication, S3 CRR). **No Basin code.** |
 | Catalog replication | Snapshot-and-pull of the embedded catalog's WAL between regions, replayed at the destination. ~1 week. Operators who run `BASIN_AUTH_CATALOG_DSN` against external Postgres can layer logical replication on that backend instead. |
 | Replica role on basin-router | Read-only session marker. ~3 days. |
 | Snapshot freshness lag visibility | Stats endpoint + optional `READ AT SNAPSHOT <id>` SQL. ~3 days. |
@@ -228,7 +228,7 @@ This mirrors what Snowflake and BigQuery do. Supabase / Neon's per-project prici
 ## Operational checklist (per region)
 
 - [ ] Fly.io app created in the region
-- [ ] Object-store bucket created in the region (Tigris, R2, S3, or compatible)
+- [ ] Object-store bucket created in the region (Tigris, S3, or other S3-compatible)
 - [ ] `BASIN_DATA_DIR` + `BASIN_WAL_DIR` volumes attached (the embedded catalog lives here — no external Postgres to provision)
 - [ ] DNS: `<region>.basin.example.com` → router fleet
 - [ ] Auth signing key (one global key OR per-region keys)

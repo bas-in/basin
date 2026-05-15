@@ -62,25 +62,22 @@ and quiet's tail-latency improves substantially.
 |---|---|---|---|---|
 | LocalFS | 3.69× | (n/a) | **1.52×** | <5× ✅ |
 | Local MinIO | 44× | 36.86× | **32.02×** (p50: 1.39×) | <5× ❌ |
-| Cloudflare R2 (APAC, HTTP/1.1) | (n/a) | (n/a) | **1.26×** (p50: 0.98×) | <5× ✅ |
+| Tigris (Fly-native, APAC, HTTP/1.1) | (n/a) | (n/a) | **1.26×** (p50: 0.98×) | <5× ✅ |
 
-**The Cloudflare R2 number (tested from APAC) is the cloud-backend measurement.**
+**The Tigris number (tested from APAC) is the cloud-backend measurement.**
 It validates the diagnosis directly: the 32× on local MinIO is single-process
 MinIO server saturation (~8–12 concurrent reads). On a backend with effectively
 unbounded server-side concurrency, the per-project Semaphore floor +
 `target_partitions=1` is sufficient — quiet's p99 stays within 1.3× of
 baseline even while a noisy project runs 4 concurrent 1M-row scans.
-Tigris (the basin-cloud production backend) should land in the same range
-given similar server-side parallelism.
+Tigris is the basin-cloud production backend.
 
-R2 was tested over HTTP/1.1 — Cloudflare's R2 S3-API endpoint
-ALPN-negotiates HTTP/1.1 from this region (no h2 multiplex). HTTP/1.1
-worked anyway because the bottleneck was never client-side
-multiplexing; it was server-side concurrency. AWS S3 and Tigris over h2
-should land in the same range.
+The test was run over HTTP/1.1 (no h2 multiplex). HTTP/1.1 worked anyway
+because the bottleneck was never client-side multiplexing; it was server-side
+concurrency. AWS S3 and Tigris over h2 should land in the same range.
 
 v0.4 also wires an HTTP/2 toggle into `S3Config::http2_only`. AWS S3,
-Tigris, R2, and GCS support h2 over TLS and benefit from it; MinIO 2025-10-15+
+Tigris, and GCS support h2 over TLS and benefit from it; MinIO 2025-10-15+
 *advertises* h2 in ALPN but downgrades to HTTP/1.1 — empirically
 verified, so the toggle is for production backends only.
 
