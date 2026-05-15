@@ -117,8 +117,8 @@ Engine catch-up + CI / release pipeline hot-fix.
   macOS from test matrix, added `concurrency` cancellation, relaxed
   `cargo audit` (no `--deny warnings`).
 - **Release**: native `ubuntu-24.04-arm` runner for aarch64-linux
-  (replaces `cross` + Docker, which was timing out on
-  duckdb-bundled). Persisted per-target build cache. Stripped debug
+  (replaces `cross` + Docker, which was timing out on heavy bundled
+  dependencies). Persisted per-target build cache. Stripped debug
   info from release artefacts.
 
 > **Pipeline note**: v0.1.2 also tried sccache via the GHA cache

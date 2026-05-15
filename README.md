@@ -40,7 +40,7 @@
 
 **Object storage unlocks time travel.** Tables are Apache Iceberg snapshots; rollback to any prior snapshot is a metadata write. Forks are zero-copy. Point-in-time restore is a `rollback_to_snapshot` call. No WAL archive to manage, no base-backup-plus-replay dance.
 
-**One binary, not five.** Native vector search (`vector(N)` + `<->` / `<#>` / `<=>`, HNSW per Parquet segment — no `pg_vector` install). Aggregate / GROUP BY queries auto-route to a DuckDB analytical engine reading the same Iceberg tables — 4.6× faster than DataFusion on million-row aggregates. Signup / JWT / refresh-token auth and a PostgREST-shape HTTP API are part of the same server. `pg_cron`, `pg_net`, `pg_trgm`, `PostGIS` subset, `TimescaleDB`-style continuous aggregates, `pgcrypto`, `uuid-ossp` — all native crates, no extension install.
+**One binary, not five.** Native vector search (`vector(N)` + `<->` / `<#>` / `<=>`, HNSW per Parquet segment — no `pg_vector` install). Analytical flexibility via Vortex scan pushdown with projection/predicate zone-map pruning, catalog-statistics file pruning, and incremental pre-aggregation (`CREATE MATERIALIZED VIEW … WITH (basin.continuous)`) — all on the same DataFusion engine, no second engine required. Signup / JWT / refresh-token auth and a PostgREST-shape HTTP API are part of the same server. `pg_cron`, `pg_net`, `pg_trgm`, `PostGIS` subset, `TimescaleDB`-style continuous aggregates, `pgcrypto`, `uuid-ossp` — all native crates, no extension install.
 
 ---
 
@@ -133,7 +133,6 @@ BASIN_AUTH_ENABLED=1 \
   BASIN_AUTH_SMTP_USERNAME=u BASIN_AUTH_SMTP_PASSWORD=p \
   BASIN_AUTH_SMTP_FROM=noreply@example.com BASIN_AUTH_SMTP_TLS=starttls \
 BASIN_REST_ENABLED=1 BASIN_REST_BIND=127.0.0.1:5434 \
-BASIN_ANALYTICAL_ENABLED=1 \
 cargo run -p basin-server
 ```
 
@@ -216,7 +215,7 @@ The full architecture document is in [`docs/architecture.md`](./docs/architectur
 - **Per-project connection URLs** — `POST /admin/v1/tenants` returns `postgres://<user>:<password>@host:5433/<db>`. Password bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/tenants/{user}/rotate`.
 - **Durable catalog** — Iceberg-style catalog backed by Postgres when `BASIN_CATALOG=postgres://...`; tables, snapshots, project credentials, and `basin-auth`'s identity tables survive process restart.
 - **Cheap retention** — ZSTD-1 Parquet, 12.5× smaller than Postgres heap on audit-log data; A4 catalog `column_stats` skips footer fetches when the predicate prunes the file.
-- **Analytical path** — DuckDB on Iceberg, 4.6× faster than DataFusion on million-row aggregates. The planner auto-routes aggregate / GROUP BY queries to it.
+- **Analytical path** — DataFusion with Vortex scan pushdown (projection/predicate zone-map pruning skips chunks before the object-store GET), catalog-statistics file pruning, and incremental continuous materialized views. Heavy scans use stateless pooled compute over shared object storage — elastic scale-out without a second engine.
 - **Operations** — connection pooling, per-project pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-project counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
 
 The full capability matrix (with what's planned and what's deferred): [`CAPABILITIES.md`](./CAPABILITIES.md). The fine-grained per-syntax matrix derived from automated tests: [`docs/sql-support.md`](./docs/sql-support.md).
@@ -274,7 +273,7 @@ The Admin / Transactions / Types rows look bleak only because the harness checks
 | **2** | WAL service — sub-5 ms write acks | **v0.1 shipped** (single-node; Raft is v0.2) |
 | **3** | Shard owners — per-project state, eviction, compactor | **v0.1 shipped** (in-process; placement service is v0.2) |
 | **4** | Routers + SQL — pgwire v3, extended query, TLS, COPY, native JSONB / UUID binding | **mostly shipped** — single-shard transactions deferred |
-| **5** | Analytical path — DuckDB on Iceberg | **v0.1 shipped** (4.6× faster than DataFusion on 1M-row aggregates) |
+| **5** | Analytical path — DataFusion with Vortex scan layer, catalog pruning, continuous pre-aggregation | **v0.1 shipped** |
 | **5.5** | Sharding axes — partitioning, compute sharding, tiered storage | **shipped** |
 | **5.6** | RLS with `CREATE POLICY` (UNION / CTE coverage) | **shipped** |
 | **5.7** | Caches + bloom + A4 catalog stats + B2 cluster-by + B3 row-group sizing | **shipped**; B1 secondary indexes is the biggest open perf win (~8 weeks) |
@@ -308,7 +307,7 @@ Turso is the right answer for **edge-distributed apps** with many tiny SQLite-cl
 
 ### vs ClickHouse / DuckDB / data-warehouse
 
-ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. Basin's Phase 5 analytical path uses DuckDB directly **against the same Iceberg tables**; the OLTP path on the shard owners is what makes the per-row workload work. Same data substrate, two read paths.
+ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. Basin handles analytics on a single DataFusion engine: Vortex scan pushdown prunes chunks before the object-store GET, catalog-statistics file pruning skips irrelevant files, and incremental continuous materialized views make expensive aggregations nearly free at query time. Stateless pooled compute over shared object storage adds elastic scale-out for the residual heavy scans — enabled precisely because there is no embedded second engine to coordinate with.
 
 ### Where Basin is *not* the answer
 
@@ -328,7 +327,7 @@ Per the ADRs:
 - **Multi-environment apps** — dev / staging / prod / per-region as cheap projects on one cluster. See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md) for the multi-tenant SaaS story (per-customer-project isolation, noisy-neighbor scheduler, RLS with `auth.uid()`, cost math at 10k projects).
 - **Audit / event logs** — ZSTD-Parquet compression makes append-mostly workloads dramatically cheaper than Postgres heap.
 - **AI agent / RAG platforms** — native `vector(N)` + HNSW alongside transactional rows in the same database.
-- **Document / activity stores** — write-cheap, analytical-read-occasionally workloads where the analytical path through DuckDB handles aggregates.
+- **Document / activity stores** — write-cheap, analytical-read-occasionally workloads where Vortex scan pushdown and continuous pre-aggregation keep analytical queries fast without a second engine.
 - **Tenanted SaaS** — one Basin cluster replaces hundreds of separate Postgres / Neon / Supabase projects with their per-project minimums. See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md).
 
 If you're a single-app developer building a side project, **use Postgres or the Free tier above**. The cost math doesn't show its full effect until you have multiple projects or multi-GB tables.
@@ -361,7 +360,7 @@ crates/
   basin-router      pgwire v3 (simple + extended query)
   basin-vector      native HNSW vector search
   basin-placement   (Phase 3 v0.2) (project, partition) → owner mapping
-  basin-analytical  (Phase 5) DuckDB / DataFusion against Iceberg directly
+  basin-analytical  (Phase 5) DataFusion analytical pool against Iceberg directly
 services/
   basin-server      single-process binary
 benchmark/          dashboard + auto-regenerated RESULTS_localfs.md
