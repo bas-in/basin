@@ -398,9 +398,6 @@ Notes on each transition:
 
 ## 7. Two query paths: transactional vs analytical
 
-Basin has two query engines because OLTP and OLAP have incompatible
-optimization targets.
-
 ### Transactional path
 
 - **Engine:** DataFusion, executing inside the shard owner against the
@@ -413,9 +410,22 @@ optimization targets.
 
 ### Analytical path
 
-- **Engine:** DuckDB or DataFusion (depending on workload) running in
-  `basin-analytical`, reading Iceberg directly from object storage.
-- **Latency:** seconds to minutes; designed for throughput, not interactivity.
+- **Engine:** DataFusion running in `basin-analytical`, reading Iceberg
+  directly from object storage. Single engine — analytical flexibility
+  comes from:
+  1. Vortex scan layer with projection/predicate pushdown against zone-maps
+     (skip chunks before the object-store GET).
+  2. Catalog-statistics file pruning (skip irrelevant files entirely).
+  3. Incremental/continuous pre-aggregation (`CREATE MATERIALIZED VIEW …
+     WITH (basin.continuous)`) — make heavy aggregates nearly free at
+     query time.
+  4. Surgical custom DataFusion physical operators where benchmarks prove
+     a gap.
+  5. Stateless pooled compute over shared object storage — elastic scale-out
+     enabled precisely because there is no embedded second engine to
+     coordinate with.
+- **Latency:** seconds to minutes for residual heavy scans; sub-second for
+  pre-aggregated queries.
 - **Consistency:** snapshot-isolated against the catalog snapshot picked at
   query start.
 - **Use it for:** large aggregates, full-table scans, joins across many
@@ -517,12 +527,11 @@ explicitly *not*:
   time. There is no global serializable transaction. There is no
   multi-master. Cross-region failover is asynchronous with documented
   RPO and RTO. If you need global linearizability, this is not the tool.
-- **A from-scratch implementation of Raft, the SQL parser, the table
-  format, or the analytical engine.** We integrate `openraft` (or
-  `tikv/raft-rs`), `libpg_query` (the real PG parser; ADR 0014),
-  DataFusion as a logical-plan executor, Iceberg + Lakekeeper, and
-  DuckDB. If a PR starts implementing any of those from scratch, it
-  is rejected.
+- **A from-scratch implementation of Raft, the SQL parser, or the table
+  format.** We integrate `openraft` (or `tikv/raft-rs`), `libpg_query`
+  (the real PG parser; ADR 0014), DataFusion as a logical-plan executor,
+  and Iceberg + Lakekeeper. If a PR starts implementing any of those from
+  scratch, it is rejected.
 
 ---
 

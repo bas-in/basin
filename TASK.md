@@ -135,9 +135,13 @@ See `README.md` "Try the PoC" for usage.
 
 ## Phase 5 — Analytical path (1–2 months) — **v0.1 shipped**
 
-- [x] `basin-analytical`: pool reading Iceberg directly via DuckDB
-      (4.6× faster than DataFusion on 1M-row aggregates; LocalFS-only,
-      S3 via DuckDB httpfs deferred to v0.2)
+- [x] `basin-analytical`: stateless DataFusion pool reading Iceberg directly
+      from object storage; Vortex scan layer with projection/predicate
+      zone-map pushdown (skip chunks before the object-store GET);
+      catalog-statistics file pruning; incremental continuous pre-aggregation
+      via `CREATE MATERIALIZED VIEW … WITH (basin.continuous)`;
+      surgical custom DataFusion physical operators where benchmarks prove a gap;
+      stateless pooled compute enables elastic scale-out over shared object storage
 - [x] Planner heuristic to route analytical queries off the OLTP path
       (aggregate / GROUP BY / `/*+ analytical */` hint)
 - [-] Bench: 10 TB Iceberg scan — deferred (1M-row covers the wedge)
@@ -867,7 +871,7 @@ Bench artefacts: the patched harness lives at `basin-cloud/backend/cmd/neonbench
 
 ## Critical rules (from the brief — re-read before scope-creep)
 
-- Don't build Raft, the SQL parser, the table format, or the analytical engine.
+- Don't build Raft, the SQL parser, or the table format from scratch.
 - The WAL is the durability boundary, **not** S3.
 - Cold start under 200 ms or hobbyists pick Turso.
 - One leaked row across projects and the project dies.
