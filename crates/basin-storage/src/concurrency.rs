@@ -39,16 +39,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use basin_common::ProjectId;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
 use tokio::sync::Semaphore;
 
-use crate::scheduler::{Priority, Scheduler, PRIORITY_RANGE_BYTES_THRESHOLD};
+use crate::scheduler::{Priority, Scheduler};
 
 /// Wraps an [`ObjectStore`] so every RPC it forwards is gated on
 /// (a) the per-project liveness-floor semaphore, then (b) the cross-project
@@ -134,39 +133,16 @@ impl ObjectStore for ProjectScopedStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn get_range(
+    fn delete_stream(
         &self,
-        location: &ObjectPath,
-        range: std::ops::Range<usize>,
-    ) -> object_store::Result<Bytes> {
-        let _floor = self.sem.acquire().await.expect("semaphore not closed");
-        // Range size determines priority: small range = point-shaped
-        // (footer / dictionary page / single page), large range =
-        // bulk-shaped (full row group). The threshold is the same one
-        // `concurrency.rs` heuristics flip on (PRIORITY_RANGE_BYTES_THRESHOLD).
-        let priority = if range.end.saturating_sub(range.start) >= PRIORITY_RANGE_BYTES_THRESHOLD {
-            Priority::Low
-        } else {
-            Priority::High
-        };
-        let _slot = self.scheduler.acquire(self.project, priority).await;
-        self.inner.get_range(location, range).await
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        // Pass through to inner — the per-item delete RPCs inherit the
+        // semaphore/scheduler gating via the inner store's own delete path.
+        self.inner.delete_stream(locations)
     }
 
-    async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
-        let _floor = self.sem.acquire().await.expect("semaphore not closed");
-        // HEAD is canonical point-shape: 0 bytes, single round-trip.
-        let _slot = self.scheduler.acquire(self.project, Priority::High).await;
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        let _floor = self.sem.acquire().await.expect("semaphore not closed");
-        let _slot = self.scheduler.acquire(self.project, Priority::High).await;
-        self.inner.delete(location).await
-    }
-
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         // We collect the inner stream into a Vec under a single
         // permit + scheduler slot, then return a stream over that Vec.
         // Every caller in `basin-storage` and the engine listings
@@ -177,11 +153,12 @@ impl ObjectStore for ProjectScopedStore {
         let sem = self.sem.clone();
         let scheduler = self.scheduler.clone();
         let project = self.project;
-        let inner_stream = self.inner.list(prefix);
+        let inner = self.inner.clone();
+        let prefix = prefix.cloned();
         futures::stream::once(async move {
             let _floor = sem.acquire_owned().await.expect("semaphore not closed");
             let _slot = scheduler.acquire(project, Priority::High).await;
-            inner_stream.collect::<Vec<_>>().await
+            inner.list(prefix.as_ref()).collect::<Vec<_>>().await
         })
         .flat_map(futures::stream::iter)
         .boxed()
@@ -196,21 +173,17 @@ impl ObjectStore for ProjectScopedStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        let _floor = self.sem.acquire().await.expect("semaphore not closed");
-        // COPY is server-side; from the client's perspective it's a
-        // single small request, so High.
-        let _slot = self.scheduler.acquire(self.project, Priority::High).await;
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
+        // COPY is server-side; from the client's perspective it's a
+        // single small request, so High. CopyMode::Overwrite = old `copy`,
+        // CopyMode::Create = old `copy_if_not_exists`.
         let _slot = self.scheduler.acquire(self.project, Priority::High).await;
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }

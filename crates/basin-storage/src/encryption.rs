@@ -98,26 +98,29 @@ pub(crate) struct BytesFileReader {
 impl parquet::arrow::async_reader::AsyncFileReader for BytesFileReader {
     fn get_bytes(
         &mut self,
-        range: std::ops::Range<usize>,
+        range: std::ops::Range<u64>,
     ) -> futures::future::BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let bytes = self.bytes.clone();
         async move {
-            if range.end > bytes.len() {
+            let start = range.start as usize;
+            let end = range.end as usize;
+            if end > bytes.len() {
                 return Err(parquet::errors::ParquetError::General(format!(
                     "BytesFileReader: range {:?} out of bounds (len={})",
                     range,
                     bytes.len()
                 )));
             }
-            Ok(bytes.slice(range))
+            Ok(bytes.slice(start..end))
         }
         .boxed()
     }
 
-    fn get_metadata(
-        &mut self,
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a parquet::arrow::arrow_reader::ArrowReaderOptions>,
     ) -> futures::future::BoxFuture<
-        '_,
+        'a,
         parquet::errors::Result<std::sync::Arc<parquet::file::metadata::ParquetMetaData>>,
     > {
         let bytes = self.bytes.clone();

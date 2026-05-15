@@ -9,7 +9,7 @@ use arrow_schema::SchemaRef;
 use basin_common::{BasinError, Result, TableName, ProjectId};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
 };
@@ -93,8 +93,9 @@ pub(crate) async fn list_data_files_with_stats(
                         .head(&path)
                         .await
                         .map_err(|e| BasinError::storage(format!("head {path}: {e}")))?;
-                    let size = head.size as u64;
-                    let mut reader = ParquetObjectReader::new(store.clone(), head);
+                    let size = head.size;
+                    let mut reader = ParquetObjectReader::new(store.clone(), path.clone())
+                        .with_file_size(size);
                     let arrow_meta =
                         ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
                             .await
@@ -508,14 +509,7 @@ async fn read_one(
     // cache for next time.
     let (builder, file_size) = if let Some(cached) = meta_cache.get(&path) {
         let size = cached.size;
-        let synthetic = object_store::ObjectMeta {
-            location: path.clone(),
-            last_modified: chrono::Utc::now(),
-            size: size as usize,
-            e_tag: None,
-            version: None,
-        };
-        let reader = ParquetObjectReader::new(store, synthetic);
+        let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
         let arrow_meta =
             ArrowReaderMetadata::try_new(cached.meta, ArrowReaderOptions::default())
                 .map_err(|e| BasinError::storage(format!("rehydrate parquet meta {path}: {e}")))?;
@@ -528,8 +522,8 @@ async fn read_one(
             .head(&path)
             .await
             .map_err(|e| BasinError::storage(format!("head {path}: {e}")))?;
-        let size = head.size as u64;
-        let mut reader = ParquetObjectReader::new(store, head);
+        let size = head.size;
+        let mut reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
         let arrow_meta =
             ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
                 .await

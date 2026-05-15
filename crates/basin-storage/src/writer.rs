@@ -13,7 +13,7 @@ use arrow_array::RecordBatch;
 use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
 use bytes::Bytes;
 use chrono::Utc;
-use object_store::PutPayload;
+use object_store::{ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;

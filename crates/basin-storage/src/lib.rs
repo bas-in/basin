@@ -35,7 +35,7 @@ use basin_catalog::Catalog;
 use basin_common::{Result, TableName, ProjectCounterRegistry, ProjectId};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::Semaphore;
 
 pub use basin_catalog::ProjectStorageConfig;
@@ -1168,10 +1168,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use basin_common::{PartitionKey, TableName, ProjectId};
     use futures::StreamExt;
+    use futures::stream::BoxStream;
     use object_store::local::LocalFileSystem;
     use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts,
-        PutOptions, PutPayload, PutResult,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStoreExt, PutMultipartOpts, PutOptions, PutPayload, PutResult,
     };
     use tempfile::TempDir;
 
@@ -1375,21 +1376,26 @@ mod tests {
                 self.range_gets.fetch_add(1, Ordering::Relaxed);
                 if let object_store::GetRange::Bounded(rng) = r {
                     self.range_bytes
-                        .fetch_add(rng.end.saturating_sub(rng.start), Ordering::Relaxed);
+                        .fetch_add(rng.end.saturating_sub(rng.start) as usize, Ordering::Relaxed);
                 }
             }
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
             &self,
             prefix: Option<&ObjectPath>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let inner = self.inner.clone();
+            let prefix = prefix.cloned();
+            inner.list(prefix.as_ref())
         }
 
         async fn list_with_delimiter(
@@ -1399,16 +1405,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(
+        async fn copy_opts(
             &self,
             from: &ObjectPath,
             to: &ObjectPath,
+            options: CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

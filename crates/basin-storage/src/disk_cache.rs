@@ -84,8 +84,8 @@ use futures::stream::{BoxStream, StreamExt};
 use lru::LruCache;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -698,7 +698,7 @@ impl ObjectStore for DiskCachedStore {
         // Downstream consumers of the read path (parquet) only inspect
         // `payload`, so this is safe in practice. The `meta` field is
         // populated best-effort.
-        let len = bytes.len();
+        let len = bytes.len() as u64;
         let range_resolved = match &range {
             None => 0..len,
             Some(GetRange::Bounded(r)) => r.clone(),
@@ -722,31 +722,20 @@ impl ObjectStore for DiskCachedStore {
         })
     }
 
-    async fn get_range(
+    fn delete_stream(
         &self,
-        location: &ObjectPath,
-        range: std::ops::Range<usize>,
-    ) -> object_store::Result<Bytes> {
-        self.get_cached(location, Some(GetRange::Bounded(range)))
-            .await
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        // Pass through to inner; cache invalidation happens per-item in
+        // `delete` (ObjectStoreExt), not here. delete_stream is a bulk path
+        // the base impls provide; we let the inner store handle it directly.
+        self.inner.delete_stream(locations)
     }
 
-    async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
-        // HEAD is metadata, not bytes — pass through.
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        let res = self.inner.delete(location).await;
-        // Invalidate even on inner-DELETE failure: the caller is
-        // signalling intent to remove the file, and a stale cache entry
-        // after a partial delete is the harder bug to debug.
-        self.invalidate(location).await;
-        res
-    }
-
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let inner = self.inner.clone();
+        let prefix = prefix.cloned();
+        inner.list(prefix.as_ref())
     }
 
     async fn list_with_delimiter(
@@ -756,18 +745,18 @@ impl ObjectStore for DiskCachedStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        let res = self.inner.copy(from, to).await;
-        self.invalidate(to).await;
-        res
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
-        let res = self.inner.copy_if_not_exists(from, to).await;
+        // Invalidate destination after copy regardless of mode:
+        // CopyMode::Overwrite = old `copy` (overwrite target),
+        // CopyMode::Create = old `copy_if_not_exists` (only if absent).
+        // In both cases the destination's cached bytes are stale after
+        // a successful copy, and a failed copy leaves the cache consistent.
+        let res = self.inner.copy_opts(from, to, options).await;
         self.invalidate(to).await;
         res
     }
@@ -778,6 +767,7 @@ mod tests {
     use super::*;
 
     use object_store::local::LocalFileSystem;
+    use object_store::ObjectStoreExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -820,14 +810,19 @@ mod tests {
             self.gets.fetch_add(1, Ordering::Relaxed);
             self.inner.get_opts(location, options).await
         }
-        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
         }
         fn list(
             &self,
             prefix: Option<&ObjectPath>,
-        ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let inner = self.inner.clone();
+            let prefix = prefix.cloned();
+            inner.list(prefix.as_ref())
         }
         async fn list_with_delimiter(
             &self,
@@ -835,15 +830,13 @@ mod tests {
         ) -> object_store::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn copy_if_not_exists(
+        async fn copy_opts(
             &self,
             from: &ObjectPath,
             to: &ObjectPath,
+            options: CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

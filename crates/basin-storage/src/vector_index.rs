@@ -17,7 +17,7 @@ use basin_vector::{Distance, HnswIndex, HnswIndexBuilder};
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::PutPayload;
+use object_store::{ObjectStoreExt, PutPayload};
 use ulid::Ulid;
 
 use crate::Storage;
