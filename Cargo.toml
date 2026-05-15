@@ -157,5 +157,13 @@ lto = false
 codegen-units = 16
 debug = 1
 
+# Per-package, NOT global: deps keep debug=1 so their sccache entries stay
+# warm (a global debug change cold-rebuilds the whole DataFusion tree).
+# Only the ~30 integration test binaries drop debuginfo → fast link.
+# opt-level inherits 3, so measured benchmark numbers are unaffected.
+[profile.release.package.basin-integration-tests]
+debug = 0
+strip = true
+
 [profile.bench]
 lto = "thin"

@@ -1,0 +1,4 @@
+# Runtime artifacts produced by run_all.sh / _setup.sh — never committed.
+.ready/
+.logs/
+__pycache__/
