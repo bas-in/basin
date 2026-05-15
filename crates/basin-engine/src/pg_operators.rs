@@ -270,16 +270,27 @@ pub(crate) fn rewrite_array_operators(sql: &str) -> String {
 
 fn rewrite_regex_op_once(sql: String, op: &str, negate: bool, case_insensitive: bool) -> String {
     let mut s = sql;
+    let mut search_from = 0usize;
     loop {
-        let Some(op_start) = find_regex_op_outside_strings(&s, op) else {
+        let Some(rel) = find_regex_op_outside_strings(&s[search_from..], op) else {
             break;
         };
+        let op_start = search_from + rel;
         let op_end = op_start + op.len();
 
         let (lhs_start, lhs_end) = regex_extract_left(&s, op_start);
         let (rhs_start, rhs_end) = regex_extract_right(&s, op_end);
         let lhs = s[lhs_start..lhs_end].trim().to_string();
         let rhs = s[rhs_start..rhs_end].trim().to_string();
+
+        // Skip when the operator is unary (no LHS token, or the LHS is a
+        // SQL keyword like SELECT/WHERE) — PG `~` / `~*` / `!~` / `!~*` are
+        // strictly binary; `~int` is the bitwise-NOT unary operator and must
+        // not be rewritten as a POSIX regex match.
+        if lhs.is_empty() || lhs_looks_like_sql_keyword(&lhs) {
+            search_from = op_end;
+            continue;
+        }
 
         let call = if case_insensitive {
             format!("regexp_like({lhs}, {rhs}, 'i')")
@@ -292,6 +303,7 @@ fn rewrite_regex_op_once(sql: String, op: &str, negate: bool, case_insensitive: 
             call
         };
         s.replace_range(lhs_start..rhs_end, &replacement);
+        search_from = lhs_start + replacement.len();
     }
     s
 }
@@ -370,6 +382,45 @@ fn find_regex_op_outside_strings(s: &str, op: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// SQL keywords that can sit just before a regex operator candidate but
+/// never actually serve as an LHS operand — `SELECT ~0` is unary `~`, not
+/// `SELECT REGEXP_LIKE(…)`. Conservative list: anything that appears at
+/// the start of a SELECT / DML clause boundary.
+fn lhs_looks_like_sql_keyword(lhs: &str) -> bool {
+    matches!(
+        lhs.to_ascii_uppercase().as_str(),
+        "SELECT"
+            | "WHERE"
+            | "FROM"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "SET"
+            | "VALUES"
+            | "ON"
+            | "AS"
+            | "IS"
+            | "IN"
+            | "BY"
+            | "ORDER"
+            | "GROUP"
+            | "HAVING"
+            | "LIMIT"
+            | "OFFSET"
+            | "JOIN"
+            | "USING"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+            | "CASE"
+            | "RETURNING"
+    )
 }
 
 /// Walk left from `op_start` to find the LHS operand of a regex operator.

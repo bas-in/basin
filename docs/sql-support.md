@@ -2,7 +2,7 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778807244 (Unix epoch)
+Last run: 1778808588 (Unix epoch)
 SQL fragments tested: 486 total / 996 green (across all three configurations).
 
 ## Configurations
@@ -618,8 +618,8 @@ SQL fragments tested: 486 total / 996 green (across all three configurations).
 | `CREATE TABLE __t (c CHAR(10)); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 | `CREATE TABLE __t (c CITEXT); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: CITEXT |
 | `CREATE TABLE __t (c BOOLEAN); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
-| `CREATE TABLE __t (c DATE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: DATE |
-| `CREATE TABLE __t (c TIME); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: TIME |
+| `CREATE TABLE __t (c DATE); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
+| `CREATE TABLE __t (c TIME); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: cannot convert workspace-arrow type to df-arrow: Time64(Micro… |
 | `CREATE TABLE __t (c TIMESTAMP); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 | `CREATE TABLE __t (c TIMESTAMPTZ); DROP TABLE __t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: DROP TABLE __t |
 | `CREATE TABLE __t (c INTERVAL); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: INTERVAL |

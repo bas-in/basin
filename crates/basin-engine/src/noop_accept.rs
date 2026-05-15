@@ -29,10 +29,6 @@
 //! Real cursor lifecycle is implemented by sibling agent a193aadd56ce5cb56.
 //! Those kinds are NOT noop-accepted here.
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
-use std::sync::Arc;
-
 use crate::pg_ast::StmtKind;
 use crate::ExecResult;
 

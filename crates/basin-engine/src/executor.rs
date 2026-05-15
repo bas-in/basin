@@ -352,7 +352,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
     // matching UDF calls before handing the SQL to sqlparser. See
     // `udf::rewrite_vector_operators` for the strategy and its limits.
-    let rewritten = crate::udf::rewrite_vector_operators(sql);
+    // Lower `tsvector @@ tsquery` to the `ts_match(...)` UDF before sqlparser
+    // sees the SQL — sqlparser doesn't have AtAt in its operator table.
+    let rewritten = crate::pg_ast::rewrite_tsvector_at_at(sql);
+    let rewritten = crate::udf::rewrite_vector_operators(&rewritten);
     // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.
@@ -774,6 +777,18 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
                                 "analytical path failed, falling back to OLTP engine"
                             );
                         }
+                    }
+                }
+            }
+
+            // pg_plan routing instrumentation (ADR 0014 Phase 2). When the
+            // parsed SELECT matches the shape the new translator handles,
+            // bump the counter — independent of whether the fast path or
+            // DataFusion path actually serves the query.
+            if let Ok(tree) = crate::pg_ast::parse(sql) {
+                if let Some(node) = tree.stmts().next() {
+                    if crate::pg_plan::supports_shape(node) {
+                        sess.engine.note_pg_plan_routed();
                     }
                 }
             }
@@ -2655,20 +2670,6 @@ async fn commit_with_retry(
 }
 
 async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> Result<ExecResult> {
-    // pg_plan routing instrumentation (ADR 0014 Phase 2). When the parsed
-    // SELECT matches the subset the new translator handles, bump the
-    // counter. Unsupported shapes (GROUP BY, joins, CTE, set ops, …) leave
-    // the counter alone and the existing sqlparser/DataFusion path serves
-    // the query. Actual plan use comes in a later phase; this is the
-    // observable hook tests assert against.
-    if let Ok(tree) = crate::pg_ast::parse(sql) {
-        if let Some(node) = tree.stmts().next() {
-            if crate::pg_plan::supports_shape(node) {
-                sess.engine.note_pg_plan_routed();
-            }
-        }
-    }
-
     // Option A for tail-visibility: when the shard is wired in, the in-RAM
     // tail produced by INSERTs hasn't yet landed in Parquet. Force a synchronous
     // flush + catalog commit before planning so DataFusion's ListingTable scan
