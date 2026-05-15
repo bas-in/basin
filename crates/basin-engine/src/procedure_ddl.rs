@@ -352,7 +352,9 @@ fn parse_arg_list(inside: &str, proc_name: &str) -> Result<Vec<SqlFunctionArg>> 
         ))
     })?;
     let parsed_args = match stmt {
-        Statement::CreateFunction { args, .. } => args.unwrap_or_default(),
+        Statement::CreateFunction(sqlparser::ast::CreateFunction { args, .. }) => {
+            args.unwrap_or_default()
+        }
         _ => {
             return Err(BasinError::internal(format!(
                 "CREATE PROCEDURE {proc_name}: synth parse returned wrong shape"
@@ -433,13 +435,13 @@ fn substitute_args_in_statement(stmt: &mut Statement, subs: &HashMap<String, Exp
             // existing tests).
             Ok(())
         }
-        Statement::Update {
+        Statement::Update(sqlparser::ast::Update {
             assignments,
             from,
             selection,
             returning,
             ..
-        } => {
+        }) => {
             for assn in assignments.iter_mut() {
                 substitute_args_in_expr(&mut assn.value, subs)?;
             }

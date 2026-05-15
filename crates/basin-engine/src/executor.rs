@@ -1400,7 +1400,7 @@ async fn exec_drop_index(
 }
 
 async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Result<ExecResult> {
-    let name = single_part_name(&ins.table_name)?;
+    let name = single_part_name(crate::pg_ast::insert_object_name(&ins)?)?;
     let table = TableName::new(name)?;
 
     // --- DEFAULT VALUES: source is None and columns list is empty -----------
@@ -1973,7 +1973,7 @@ async fn exec_insert_default_values(
 ) -> Result<ExecResult> {
     use sqlparser::ast::{Expr, Value};
 
-    let name = single_part_name(&ins.table_name)?;
+    let name = single_part_name(crate::pg_ast::insert_object_name(&ins)?)?;
     let table = TableName::new(name)?;
 
     let meta = sess

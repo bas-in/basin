@@ -193,11 +193,11 @@ fn rewrite_statement(stmt: &mut Statement, event: &ChangeEvent) {
                 rewrite_query(source, event);
             }
         }
-        Statement::Update {
+        Statement::Update(sqlparser::ast::Update {
             assignments,
             selection,
             ..
-        } => {
+        }) => {
             for a in assignments.iter_mut() {
                 rewrite_expr(&mut a.value, event);
             }

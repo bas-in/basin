@@ -255,7 +255,7 @@ async fn infer_param_types(
     };
     match stmt {
         Statement::Insert(ins) => {
-            let table_name = name_to_table(&ins.table_name)?;
+            let table_name = name_to_table(crate::pg_ast::insert_object_name(&ins)?)?;
             let meta = sess
                 .engine
                 .config()
@@ -307,12 +307,12 @@ async fn infer_param_types(
         Statement::Query(q) => {
             walk_select_for_predicates(sess, &q, out, is_jsonb_out, is_uuid_out).await?;
         }
-        Statement::Update {
+        Statement::Update(sqlparser::ast::Update {
             table,
             assignments,
             selection,
             ..
-        } => {
+        }) => {
             // Resolve the target table once; placeholder slots in SET and
             // WHERE are typed against its column list.
             if let TableFactor::Table { name, .. } = &table.relation {

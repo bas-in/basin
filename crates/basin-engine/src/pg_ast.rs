@@ -1672,3 +1672,32 @@ impl OrderByExt for sqlparser::ast::OrderBy {
         }
     }
 }
+
+/// sqlparser 0.61 replaced `Insert.table_name: ObjectName` with
+/// `Insert.table: TableObject` (an enum of `TableName(ObjectName)` |
+/// `TableFunction(Function)`). This helper restores the old accessor for
+/// the only form Basin supports (a plain table name), erroring cleanly on
+/// the table-function form rather than silently mis-handling it.
+pub fn insert_object_name(
+    ins: &sqlparser::ast::Insert,
+) -> Result<&sqlparser::ast::ObjectName> {
+    match &ins.table {
+        sqlparser::ast::TableObject::TableName(name) => Ok(name),
+        sqlparser::ast::TableObject::TableFunction(_) => Err(BasinError::FeatureNotSupported(
+            "INSERT INTO TABLE FUNCTION(...) is not supported".into(),
+        )),
+    }
+}
+
+/// sqlparser 0.61 changed PK/UNIQUE constraint column lists from
+/// `Vec<Ident>` to `Vec<IndexColumn>`, where each `IndexColumn` wraps an
+/// `OrderByExpr` whose `.expr` is normally an `Expr::Identifier`. This
+/// extracts the bare column name for the common (only supported) case;
+/// non-identifier index expressions stringify (best-effort, matches the
+/// prior "whatever the ident text was" behavior for simple columns).
+pub fn index_column_name(col: &sqlparser::ast::IndexColumn) -> String {
+    match &col.column.expr {
+        sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
+        other => other.to_string(),
+    }
+}

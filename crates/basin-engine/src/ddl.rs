@@ -249,16 +249,15 @@ pub(crate) fn schema_and_constraints_from_columns(
                 // collapse the two; we route `is_primary == true` to the
                 // PK column list and `is_primary == false` to the unique
                 // constraint set (synthesising a PG-shaped name).
-                ColumnOption::Unique { is_primary, .. } => {
-                    if *is_primary {
-                        col_pk_columns.push(col.name.value.clone());
-                    } else {
-                        let uname = format!("{table_name}_{}_key", col.name.value);
-                        extracted.uniques.push(UniqueConstraint {
-                            name: uname,
-                            columns: vec![col.name.value.clone()],
-                        });
-                    }
+                ColumnOption::PrimaryKey(_) => {
+                    col_pk_columns.push(col.name.value.clone());
+                }
+                ColumnOption::Unique(_) => {
+                    let uname = format!("{table_name}_{}_key", col.name.value);
+                    extracted.uniques.push(UniqueConstraint {
+                        name: uname,
+                        columns: vec![col.name.value.clone()],
+                    });
                 }
                 ColumnOption::Check(expr) => {
                     let name = format!("{table_name}_{}_check", col.name.value);
@@ -267,19 +266,19 @@ pub(crate) fn schema_and_constraints_from_columns(
                         predicate: expr.to_string(),
                     });
                 }
-                ColumnOption::ForeignKey {
+                ColumnOption::ForeignKey(sqlparser::ast::ForeignKeyConstraint {
                     foreign_table,
                     referred_columns,
                     on_delete,
                     on_update,
                     ..
-                } => {
+                }) => {
                     if foreign_table.0.len() != 1 {
                         return Err(BasinError::InvalidSchema(format!(
                             "FOREIGN KEY references must be a bare table name; got {foreign_table}"
                         )));
                     }
-                    let ref_table = foreign_table.0[0].value.clone();
+                    let ref_table = foreign_table.0[0].id_val().clone();
                     // PG-shape: `REFERENCES <t>` without a column list
                     // means "the PK of <t>". The PK lookup must hit the
                     // catalog and so happens in the async executor
@@ -625,22 +624,34 @@ pub(crate) fn schema_and_constraints_from_columns(
     let mut table_pk: Vec<String> = Vec::new();
     for tc in table_constraints {
         match tc {
-            TableConstraint::PrimaryKey { columns, name, .. } => {
+            TableConstraint::PrimaryKey(sqlparser::ast::PrimaryKeyConstraint {
+                columns,
+                name,
+                ..
+            }) => {
                 if !table_pk.is_empty() {
                     return Err(BasinError::InvalidSchema(
                         "multiple table-level PRIMARY KEY clauses".into(),
                     ));
                 }
                 let _ = name;
-                table_pk = columns.iter().map(|i| i.value.clone()).collect();
+                table_pk = columns
+                    .iter()
+                    .map(crate::pg_ast::index_column_name)
+                    .collect();
             }
-            TableConstraint::Unique { name, columns, .. } => {
+            TableConstraint::Unique(sqlparser::ast::UniqueConstraint {
+                name, columns, ..
+            }) => {
                 if columns.is_empty() {
                     return Err(BasinError::InvalidSchema(
                         "UNIQUE: column list cannot be empty".into(),
                     ));
                 }
-                let cols: Vec<String> = columns.iter().map(|i| i.value.clone()).collect();
+                let cols: Vec<String> = columns
+                    .iter()
+                    .map(crate::pg_ast::index_column_name)
+                    .collect();
                 // Reject duplicates inside the constraint's own column
                 // list — PG accepts this but it's almost always a typo
                 // and the dedup check on enforcement makes the dup a
@@ -662,7 +673,7 @@ pub(crate) fn schema_and_constraints_from_columns(
                     columns: cols,
                 });
             }
-            TableConstraint::ForeignKey {
+            TableConstraint::ForeignKey(sqlparser::ast::ForeignKeyConstraint {
                 name,
                 columns,
                 foreign_table,
@@ -670,13 +681,13 @@ pub(crate) fn schema_and_constraints_from_columns(
                 on_delete,
                 on_update,
                 ..
-            } => {
+            }) => {
                 if foreign_table.0.len() != 1 {
                     return Err(BasinError::InvalidSchema(format!(
                         "FOREIGN KEY references must be a bare table name; got {foreign_table}"
                     )));
                 }
-                let ref_table = foreign_table.0[0].value.clone();
+                let ref_table = foreign_table.0[0].id_val().clone();
                 if columns.is_empty() {
                     return Err(BasinError::InvalidSchema(
                         "FOREIGN KEY: empty column list".into(),
@@ -709,7 +720,7 @@ pub(crate) fn schema_and_constraints_from_columns(
                     });
                 }
             }
-            TableConstraint::Check { name, expr } => {
+            TableConstraint::Check(sqlparser::ast::CheckConstraint { name, expr, .. }) => {
                 check_counter += 1;
                 let cname = match name {
                     Some(n) => n.value.clone(),
