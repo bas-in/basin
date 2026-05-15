@@ -1,17 +1,17 @@
 {
   "kind": "scaling",
-  "id": "tenant_count",
-  "name": "Per-tenant cost vs tenant count",
-  "claim": "RAM and quiet point-query latency per tenant stay near-constant as tenant count grows.",
+  "id": "project_count",
+  "name": "Per-project cost vs project count",
+  "claim": "RAM and quiet point-query latency per project stay near-constant as project count grows.",
   "passed": true,
   "x_axis": {
-    "key": "tenant_count",
-    "label": "tenants"
+    "key": "project_count",
+    "label": "projects"
   },
   "series": [
     {
-      "key": "per_tenant_ram_kib",
-      "label": "Per-tenant RAM",
+      "key": "per_project_ram_kib",
+      "label": "Per-project RAM",
       "unit": "KiB"
     },
     {
@@ -22,38 +22,38 @@
   ],
   "rows": [
     {
-      "per_tenant_ram_kib": 400.0,
-      "quiet_p50_ms": 0.459208,
-      "rss_delta_kib": 400,
-      "tenant_count": 1
+      "per_project_ram_kib": 96.0,
+      "project_count": 1,
+      "quiet_p50_ms": 0.30075,
+      "rss_delta_kib": 96
     },
     {
-      "per_tenant_ram_kib": 69.33333333333333,
-      "quiet_p50_ms": 0.411833,
-      "rss_delta_kib": 624,
-      "tenant_count": 10
+      "per_project_ram_kib": 76.44444444444444,
+      "project_count": 10,
+      "quiet_p50_ms": 0.27345800000000003,
+      "rss_delta_kib": 688
     },
     {
-      "per_tenant_ram_kib": 3.7333333333333334,
-      "quiet_p50_ms": 0.420167,
-      "rss_delta_kib": 336,
-      "tenant_count": 100
+      "per_project_ram_kib": 7.644444444444445,
+      "project_count": 100,
+      "quiet_p50_ms": 0.252375,
+      "rss_delta_kib": 688
     },
     {
-      "per_tenant_ram_kib": 4.871111111111111,
-      "quiet_p50_ms": 0.435583,
-      "rss_delta_kib": 4384,
-      "tenant_count": 1000
+      "per_project_ram_kib": 5.44,
+      "project_count": 1000,
+      "quiet_p50_ms": 0.227458,
+      "rss_delta_kib": 4896
     }
   ],
   "primary": {
     "label": "quiet_p50_at_max / quiet_p50_at_1",
-    "value": 0.9485527255622724,
+    "value": 0.7563025768911055,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1778393198"
+  "generated_at": "@1778866814"
 }

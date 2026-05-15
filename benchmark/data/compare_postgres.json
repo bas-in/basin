@@ -7,51 +7,51 @@
   "metrics": [
     {
       "label": "On-disk bytes",
-      "basin": 8121894.0,
-      "postgres": 101195776.0,
+      "basin": 8095517.0,
+      "postgres": 101203968.0,
       "unit": "bytes",
       "better": "basin",
-      "ratio_text": "pg / basin = 12.46x"
+      "ratio_text": "pg / basin = 12.50x"
     },
     {
       "label": "Point query p50",
-      "basin": 0.789042,
-      "postgres": 17.877,
+      "basin": 0.438166,
+      "postgres": 13.407,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 22.66x"
+      "ratio_text": "pg / basin = 30.60x"
     },
     {
       "label": "Range scan p50 (~10k rows)",
-      "basin": 49.653125,
-      "postgres": 20.582,
+      "basin": 6.938833,
+      "postgres": 15.919,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.41x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.29x"
     },
     {
       "label": "Aggregate COUNT/SUM GROUP BY p50",
-      "basin": 521.294875,
-      "postgres": 65.022,
+      "basin": 36.03125,
+      "postgres": 107.751,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.12x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.99x"
     },
     {
       "label": "Bulk INSERT 1M rows",
-      "basin": 85233.030291,
-      "postgres": 2528.337416,
+      "basin": 18830.521459,
+      "postgres": 5904.378291999999,
       "unit": "ms",
       "better": "postgres"
     },
     {
       "label": "Cold-start first query",
-      "basin": 4.647875,
-      "postgres": 37.912792,
+      "basin": 4.590000000000001,
+      "postgres": 49.792708999999995,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 8.16x"
+      "ratio_text": "pg / basin = 10.85x"
     }
   ],
-  "generated_at": "@1778841445"
+  "generated_at": "@1778866580"
 }

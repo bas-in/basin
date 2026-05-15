@@ -1,11 +1,11 @@
 {
   "kind": "viability",
   "id": "rls_isolation",
-  "name": "RLS preserves tenant prefix isolation (real S3)",
-  "claim": "Cross-tenant row leakage is zero across every RLS configuration combination, with data hosted on real S3.",
+  "name": "RLS preserves project prefix isolation (real S3)",
+  "claim": "Cross-project row leakage is zero across every RLS configuration combination, with data hosted on real S3.",
   "passed": true,
   "primary": {
-    "label": "cross_tenant_leak",
+    "label": "cross_project_leak",
     "value": 0.0,
     "unit": "rows",
     "bar": {
@@ -15,10 +15,10 @@
   },
   "details": {
     "bucket": "basin-test",
-    "cross_tenant_leak": 0,
+    "cross_project_leak": 0,
     "endpoint": "http://127.0.0.1:8333",
-    "tenant_a": "01KQZYTS3R8N0NK91HXM32DQR8",
-    "tenant_b": "01KQZYTS3RJHHRH4Q0FDH50VCZ"
+    "project_a": "01KRPBQXBTZKM9RQPHCJEMWVFS",
+    "project_b": "01KRPBQXBTKHDX595S71A3912P"
   },
-  "generated_at": "@1778115241"
+  "generated_at": "@1778866976"
 }

@@ -1,17 +1,17 @@
 {
   "kind": "scaling",
-  "id": "tenant_count",
-  "name": "Per-tenant cost vs tenant count (real S3)",
-  "claim": "RAM and quiet point-query latency per tenant stay near-constant as tenant count grows on a real S3-compatible backend.",
+  "id": "project_count",
+  "name": "Per-project cost vs project count (real S3)",
+  "claim": "RAM and quiet point-query latency per project stay near-constant as project count grows on a real S3-compatible backend.",
   "passed": true,
   "x_axis": {
-    "key": "tenant_count",
-    "label": "tenants"
+    "key": "project_count",
+    "label": "projects"
   },
   "series": [
     {
-      "key": "per_tenant_ram_kib",
-      "label": "Per-tenant RAM",
+      "key": "per_project_ram_kib",
+      "label": "Per-project RAM",
       "unit": "KiB"
     },
     {
@@ -22,32 +22,32 @@
   ],
   "rows": [
     {
-      "per_tenant_ram_kib": 160.0,
-      "quiet_p50_ms": 1540.4844170000001,
-      "rss_delta_kib": 160,
-      "tenant_count": 1
+      "per_project_ram_kib": 96.0,
+      "project_count": 1,
+      "quiet_p50_ms": 1.780166,
+      "rss_delta_kib": 96
     },
     {
-      "per_tenant_ram_kib": 174.22222222222223,
-      "quiet_p50_ms": 1564.459083,
-      "rss_delta_kib": 1568,
-      "tenant_count": 10
+      "per_project_ram_kib": 49.77777777777778,
+      "project_count": 10,
+      "quiet_p50_ms": 1.74825,
+      "rss_delta_kib": 448
     },
     {
-      "per_tenant_ram_kib": 0.0,
-      "quiet_p50_ms": 1490.774834,
-      "rss_delta_kib": -4576,
-      "tenant_count": 100
+      "per_project_ram_kib": 4.622222222222222,
+      "project_count": 100,
+      "quiet_p50_ms": 1.7243339999999998,
+      "rss_delta_kib": 416
     }
   ],
   "primary": {
     "label": "quiet_p50_at_max / quiet_p50_at_1",
-    "value": 0.9677312003604642,
+    "value": 0.9686366327634613,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1778210232"
+  "generated_at": "@1778867212"
 }

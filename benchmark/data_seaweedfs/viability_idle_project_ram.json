@@ -1,12 +1,12 @@
 {
   "kind": "viability",
-  "id": "idle_tenant_ram",
-  "name": "Idle-tenant RAM cost (real S3)",
-  "claim": "Basin holds many idle tenants in one process for under 500 KiB each, with a real-S3 Storage attached to each tenant's control-plane state.",
+  "id": "idle_project_ram",
+  "name": "Idle-project RAM cost (real S3)",
+  "claim": "Basin holds many idle projects in one process for under 500 KiB each, with a real-S3 Storage attached to each project's control-plane state.",
   "passed": true,
   "primary": {
-    "label": "per_tenant_kib",
-    "value": 0.64,
+    "label": "per_project_kib",
+    "value": 0.432,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
@@ -16,9 +16,9 @@
   "details": {
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
-    "rss_after_kib": 14176,
-    "rss_before_kib": 13536,
-    "tenants": 1000
+    "projects": 1000,
+    "rss_after_kib": 14784,
+    "rss_before_kib": 14352
   },
-  "generated_at": "@1778115245"
+  "generated_at": "@1778866966"
 }

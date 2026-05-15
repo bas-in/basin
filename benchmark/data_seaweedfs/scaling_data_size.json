@@ -1,7 +1,7 @@
 {
   "kind": "scaling",
   "id": "data_size",
-  "name": "Single-tenant data size scale-up (real S3)",
+  "name": "Single-project data size scale-up (real S3)",
   "claim": "On real S3, storage is linear in row count and point-query latency stays bounded.",
   "passed": true,
   "x_axis": {
@@ -32,35 +32,35 @@
   ],
   "rows": [
     {
-      "bytes_per_row": 9.0222,
-      "disk_mib": 0.08604240417480469,
-      "point_ms_p50": 2135.286708,
+      "bytes_per_row": 9.1374,
+      "disk_mib": 0.08714103698730469,
+      "point_ms_p50": 2.087125,
       "rows": 10000,
-      "scan_ms_p50": 1537.96875
+      "scan_ms_p50": 1.6917499999999999
     },
     {
-      "bytes_per_row": 8.96126,
-      "disk_mib": 0.8546123504638672,
-      "point_ms_p50": 2264.8920000000003,
+      "bytes_per_row": 9.05831,
+      "disk_mib": 0.8638677597045898,
+      "point_ms_p50": 2.104458,
       "rows": 100000,
-      "scan_ms_p50": 6669.136917000001
+      "scan_ms_p50": 10.034834
     },
     {
-      "bytes_per_row": 8.952667,
-      "disk_mib": 8.537928581237793,
-      "point_ms_p50": 2686.853541,
+      "bytes_per_row": 9.048944,
+      "disk_mib": 8.629745483398438,
+      "point_ms_p50": 3.403625,
       "rows": 1000000,
-      "scan_ms_p50": 56325.256625
+      "scan_ms_p50": 103.018667
     }
   ],
   "primary": {
     "label": "point query p50 growth (1M / 10K)",
-    "value": 1.2583104324742511,
+    "value": 1.6307719949691561,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1778208246"
+  "generated_at": "@1778866960"
 }

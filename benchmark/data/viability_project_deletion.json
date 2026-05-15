@@ -1,12 +1,12 @@
 {
   "kind": "viability",
-  "id": "tenant_deletion",
-  "name": "Tenant deletion latency",
-  "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel) completes in under 3 seconds (caches reset; cold path).",
+  "id": "project_deletion",
+  "name": "Project deletion latency",
+  "claim": "Deleting a project of 100 small files via Storage::delete_project (catalog-first; LIST mop-up in parallel) completes in under 3 seconds (caches reset; cold path).",
   "passed": true,
   "primary": {
     "label": "deletion_ms",
-    "value": 4.8655,
+    "value": 4.0747919999999995,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -15,7 +15,7 @@
   },
   "details": {
     "files": 100,
-    "setup_ms": 267.270625
+    "setup_ms": 42.873416999999996
   },
-  "generated_at": "@1778393636"
+  "generated_at": "@1778866756"
 }

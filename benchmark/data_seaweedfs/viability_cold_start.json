@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "cold_start_ms",
-    "value": 69.99158399999999,
+    "value": 17.571042,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -14,10 +14,10 @@
     }
   },
   "details": {
-    "bind_addr": "127.0.0.1:51563",
+    "bind_addr": "127.0.0.1:57834",
     "bucket": "basin-test",
-    "cold_start_ms": 69.99158399999999,
+    "cold_start_ms": 17.571042,
     "endpoint": "http://127.0.0.1:8333"
   },
-  "generated_at": "@1778157142"
+  "generated_at": "@1778866954"
 }

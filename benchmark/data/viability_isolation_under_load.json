@@ -1,8 +1,8 @@
 {
   "kind": "viability",
   "id": "isolation_under_load",
-  "name": "Tenant isolation under concurrent load",
-  "claim": "Concurrent multi-tenant traffic produces zero cross-tenant row leakage.",
+  "name": "Project isolation under concurrent load",
+  "claim": "Concurrent multi-project traffic produces zero cross-project row leakage.",
   "passed": true,
   "primary": {
     "label": "leaks",
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "elapsed_s": 1.4955809580000001,
+    "elapsed_s": 0.378126667,
     "ops": 2000,
-    "tenants": 50
+    "projects": 50
   },
-  "generated_at": "@1778393382"
+  "generated_at": "@1778866580"
 }

@@ -1,26 +1,26 @@
 {
   "kind": "compare",
   "id": "lifecycle_ops",
-  "name": "Lifecycle ops: tenant deletion + ADD COLUMN",
-  "claim": "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+  "name": "Lifecycle ops: project deletion + ADD COLUMN",
+  "claim": "Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
   "available": true,
   "metrics": [
     {
-      "label": "Tenant deletion (1 tenant, 100K rows)",
-      "basin": 4.060333,
-      "postgres": 8.216917,
+      "label": "Project deletion (1 project, 100K rows)",
+      "basin": 8.057042000000001,
+      "postgres": 47.250125,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 2.02x"
+      "ratio_text": "pg / basin = 5.86x"
     },
     {
       "label": "ADD COLUMN on 100K rows",
-      "basin": 0.7352920000000001,
-      "postgres": 2.168958,
+      "basin": 0.423792,
+      "postgres": 51.022833,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 2.95x"
+      "ratio_text": "pg / basin = 120.40x"
     }
   ],
-  "generated_at": "@1778802140"
+  "generated_at": "@1778866550"
 }

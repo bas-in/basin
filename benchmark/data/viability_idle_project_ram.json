@@ -1,12 +1,12 @@
 {
   "kind": "viability",
-  "id": "idle_tenant_ram",
-  "name": "Idle-tenant RAM cost",
-  "claim": "Basin holds many idle tenants in one process for under 500 KiB each.",
+  "id": "idle_project_ram",
+  "name": "Idle-project RAM cost",
+  "claim": "Basin holds many idle projects in one process for under 500 KiB each.",
   "passed": true,
   "primary": {
-    "label": "per_tenant_kib",
-    "value": 1.12,
+    "label": "per_project_kib",
+    "value": 1.184,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "rss_after_kib": 10016,
-    "rss_before_kib": 8896,
-    "tenants": 1000
+    "projects": 1000,
+    "rss_after_kib": 7984,
+    "rss_before_kib": 6800
   },
-  "generated_at": "@1778393376"
+  "generated_at": "@1778866577"
 }

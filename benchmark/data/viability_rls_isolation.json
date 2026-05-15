@@ -1,11 +1,11 @@
 {
   "kind": "viability",
   "id": "rls_isolation",
-  "name": "RLS preserves tenant prefix isolation",
-  "claim": "Cross-tenant row leakage is zero across every RLS configuration combination.",
+  "name": "RLS preserves project prefix isolation",
+  "claim": "Cross-project row leakage is zero across every RLS configuration combination.",
   "passed": true,
   "primary": {
-    "label": "cross_tenant_leak",
+    "label": "cross_project_leak",
     "value": 0.0,
     "unit": "rows",
     "bar": {
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "cross_tenant_leak": 0,
-    "tenant_a": "01KR88AGH7QZVBGP7JB95D1D8V",
-    "tenant_b": "01KR88AGH7R2GNED882Z3RJDTR"
+    "cross_project_leak": 0,
+    "project_a": "01KRPBHB9D9R2DF4DC0DFDBYX8",
+    "project_b": "01KRPBHB9D8J2SVEQXV24BSVBK"
   },
-  "generated_at": "@1778393629"
+  "generated_at": "@1778866761"
 }

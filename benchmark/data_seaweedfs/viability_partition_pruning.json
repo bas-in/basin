@@ -1,12 +1,12 @@
 {
   "kind": "viability",
   "id": "partition_pruning",
-  "name": "Within-tenant time-based partition pruning (real S3)",
+  "name": "Within-project time-based partition pruning (real S3)",
   "claim": "A 1-month range query against 12 months of partitioned data, hosted on real S3, reads at most one partition's worth of bytes (range/full bytes ratio < 0.2).",
   "passed": true,
   "primary": {
     "label": "partition_bytes_ratio (range / full)",
-    "value": 0.071456,
+    "value": 0.12079072087802445,
     "unit": "ratio",
     "bar": {
       "op": "less_than",
@@ -16,15 +16,15 @@
   "details": {
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
-    "full_scan_bytes": 31250,
+    "full_scan_bytes": 32072,
     "full_scan_gets": 12,
     "full_scan_range_gets": 36,
     "months": 12,
-    "range_scan_bytes": 2233,
+    "range_scan_bytes": 3874,
     "range_scan_gets": 1,
     "range_scan_range_gets": 2,
-    "ratio": 0.071456,
+    "ratio": 0.12079072087802445,
     "rows_per_month": 100
   },
-  "generated_at": "@1778115239"
+  "generated_at": "@1778866972"
 }

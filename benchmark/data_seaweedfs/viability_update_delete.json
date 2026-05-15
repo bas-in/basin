@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "UPDATE+DELETE elapsed (ms)",
-    "value": 24.319208,
+    "value": 15.214833,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -15,12 +15,12 @@
   },
   "details": {
     "bucket": "basin-test",
-    "delete_ms": 7.402333,
+    "delete_ms": 6.336083,
     "endpoint": "http://127.0.0.1:8333",
     "remaining_rows": 9997,
     "rows": 10000,
-    "total_ms": 24.319208,
-    "update_ms": 16.916875
+    "total_ms": 15.214833,
+    "update_ms": 8.87875
   },
-  "generated_at": "@1778115246"
+  "generated_at": "@1778866982"
 }

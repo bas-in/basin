@@ -1,12 +1,12 @@
 {
   "kind": "scaling",
-  "id": "tenant_deletion_at_scale",
-  "name": "Tenant deletion at scale (Basin vs Postgres)",
-  "claim": "Basin's tenant teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows.",
+  "id": "project_deletion_at_scale",
+  "name": "Project deletion at scale (Basin vs Postgres)",
+  "claim": "Basin's project teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows.",
   "passed": true,
   "x_axis": {
     "key": "file_count",
-    "label": "files per tenant"
+    "label": "files per project"
   },
   "series": [
     {
@@ -22,32 +22,32 @@
   ],
   "rows": [
     {
-      "basin_ms": 5.351542,
+      "basin_ms": 5.5672500000000005,
       "file_count": 100,
       "pg_skipped": false,
-      "postgres_ms": 4.131208
+      "postgres_ms": 4.185208
     },
     {
-      "basin_ms": 46.196041,
+      "basin_ms": 34.881958,
       "file_count": 1000,
       "pg_skipped": false,
-      "postgres_ms": 8.378416
+      "postgres_ms": 9.449375
     },
     {
-      "basin_ms": 179.34112499999998,
+      "basin_ms": 173.74629099999999,
       "file_count": 5000,
       "pg_skipped": false,
-      "postgres_ms": 5.087000000000001
+      "postgres_ms": 1.922542
     }
   ],
   "primary": {
     "label": "basin delete_ms at largest scale",
-    "value": 179.34112499999998,
+    "value": 173.74629099999999,
     "unit": "ms",
     "bar": {
       "op": "less_than",
       "value": null
     }
   },
-  "generated_at": "@1778393206"
+  "generated_at": "@1778866819"
 }

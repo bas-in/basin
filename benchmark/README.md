@@ -32,6 +32,28 @@ open benchmark/index_localfs.html
 Re-run steps 1–2 whenever you want fresh numbers. To bundle a single
 dashboard, pass `--dir <data_dir>` (e.g. `--dir data_real`).
 
+### Fast path: parallel LocalFS + SeaweedFS run
+
+The serial flow above is slow. For a full LocalFS+SeaweedFS run with a
+≤10 min wall-clock target, use the split harness:
+
+```sh
+./benchmark/run/run_all.sh                  # both configs, parallel
+ONLY=localfs   ./benchmark/run/run_all.sh   # LocalFS groups only
+ONLY=seaweedfs ./benchmark/run/run_all.sh   # SeaweedFS groups only
+```
+
+It builds the test binaries once, starts one shared SeaweedFS gateway
+(trap-torn-down on exit), runs each config×category group with bounded
+concurrency, rebuilds each `manifest.json` from the JSONs the run
+actually produced (failed/absent cards are omitted, not carried forward
+with stale numbers), re-bundles the dashboards, prints the total
+wall-clock, and fails loudly if it exceeds 12 min. Individual groups are
+independently runnable: `./benchmark/run/_group.sh localfs_viability`.
+The legacy `./benchmark/run_pg_compare.sh` still works unchanged for the
+single Postgres-compare suite. Does NOT run the real-cloud (`data_real`)
+config — that needs live credentials and is operator-gated.
+
 ## Dashboards are config-driven
 
 The set of dashboards lives in [`dashboards.toml`](./dashboards.toml).

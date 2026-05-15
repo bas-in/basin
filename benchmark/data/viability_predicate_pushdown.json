@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "reduction_x (full_scan_bytes / point_query_bytes)",
-    "value": 101.18441770647652,
+    "value": 101.24365067577602,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "file_bytes": 5453088,
-    "full_scan_bytes": 5449388,
-    "point_query_bytes": 53856
+    "file_bytes": 5457088,
+    "full_scan_bytes": 5453388,
+    "point_query_bytes": 53864
   },
-  "generated_at": "@1778393621"
+  "generated_at": "@1778866754"
 }

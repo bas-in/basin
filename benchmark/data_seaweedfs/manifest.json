@@ -1,32 +1,45 @@
 {
   "viability": [
-    "s3_credentials_smoke",
-    "compression_ratio",
-    "predicate_pushdown",
-    "tenant_deletion",
-    "large_dataset_pointquery",
-    "isolation_under_load",
-    "vector_search",
-    "shard_insert_path",
-    "partition_pruning",
-    "rls_basic",
-    "rls_isolation",
-    "tiered_storage",
     "alter_add_column",
+    "alter_table",
     "basin_cron",
     "bloom_filter_pruning",
-    "cold_start"
+    "cold_start",
+    "compression_ratio",
+    "disk_cache",
+    "durable_catalog",
+    "extended_protocol",
+    "idle_project_ram",
+    "isolation_under_load",
+    "large_dataset_pointquery",
+    "orm_compat",
+    "page_cache",
+    "partition_pruning",
+    "predicate_pushdown",
+    "project_deletion",
+    "rls_basic",
+    "rls_isolation",
+    "row_group_sizing",
+    "s3_credentials_smoke",
+    "shard_insert_path",
+    "tiered_storage",
+    "update_delete",
+    "vector_search"
   ],
   "scaling": [
-    "data_size",
-    "concurrency",
-    "noisy_neighbor",
     "compute_shards",
-    "tenant_count"
+    "concurrency",
+    "data_size",
+    "idle_projects",
+    "perf_stack",
+    "project_count",
+    "project_deletion_at_scale",
+    "project_deletion_realistic"
   ],
   "compare": [
-    "postgres",
+    "backup_cost",
     "lifecycle_ops",
-    "backup_cost"
+    "postgres",
+    "server_lifecycle"
   ]
 }

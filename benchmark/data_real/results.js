@@ -346,7 +346,7 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778114894"
     },
-    "scaling_idle_tenants": {
+    "scaling_idle_projects": {
       "kind": "scaling",
       "id": "idle_tenants",
       "name": "Idle-tenant cost curve (real S3)",
@@ -535,7 +535,7 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778183808"
     },
-    "scaling_tenant_count": {
+    "scaling_project_count": {
       "kind": "scaling",
       "id": "tenant_count",
       "name": "Per-tenant cost vs tenant count (real S3)",
@@ -588,7 +588,7 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778156736"
     },
-    "scaling_tenant_deletion_at_scale": {
+    "scaling_project_deletion_at_scale": {
       "kind": "scaling",
       "id": "tenant_deletion_at_scale",
       "name": "Tenant deletion at scale, real S3 (Basin vs Postgres)",
@@ -965,7 +965,7 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778110682"
     },
-    "viability_idle_tenant_ram": {
+    "viability_idle_project_ram": {
       "kind": "viability",
       "id": "idle_tenant_ram",
       "name": "Idle-tenant RAM cost (real S3)",
@@ -1242,6 +1242,29 @@ window.__BASIN_RESULTS = {
       },
       "generated_at": "@1778111236"
     },
+    "viability_project_deletion": {
+      "kind": "viability",
+      "id": "tenant_deletion",
+      "name": "Tenant deletion latency (real S3)",
+      "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path).",
+      "passed": true,
+      "primary": {
+        "label": "deletion_ms",
+        "value": 1421.755,
+        "unit": "ms",
+        "bar": {
+          "op": "less_than",
+          "value": 3000.0
+        }
+      },
+      "details": {
+        "bucket": "baisn-test",
+        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "files": 100,
+        "setup_ms": 13610.615667
+      },
+      "generated_at": "@1778120542"
+    },
     "viability_rls_basic": {
       "kind": "viability",
       "id": "rls_basic",
@@ -1376,29 +1399,6 @@ window.__BASIN_RESULTS = {
         "n_inserts": 1000
       },
       "generated_at": "@1778111302"
-    },
-    "viability_tenant_deletion": {
-      "kind": "viability",
-      "id": "tenant_deletion",
-      "name": "Tenant deletion latency (real S3)",
-      "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path).",
-      "passed": true,
-      "primary": {
-        "label": "deletion_ms",
-        "value": 1421.755,
-        "unit": "ms",
-        "bar": {
-          "op": "less_than",
-          "value": 3000.0
-        }
-      },
-      "details": {
-        "bucket": "baisn-test",
-        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
-        "files": 100,
-        "setup_ms": 13610.615667
-      },
-      "generated_at": "@1778120542"
     },
     "viability_tiered_storage": {
       "kind": "viability",

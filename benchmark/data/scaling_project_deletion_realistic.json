@@ -1,12 +1,12 @@
 {
   "kind": "scaling",
-  "id": "tenant_deletion_realistic",
-  "name": "Tenant deletion at scale, realistic SaaS schema (Basin vs Postgres)",
-  "claim": "Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row × every index + validates every FK on the cascade; Basin's tenant teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile.",
+  "id": "project_deletion_realistic",
+  "name": "Project deletion at scale, realistic SaaS schema (Basin vs Postgres)",
+  "claim": "Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row × every index + validates every FK on the cascade; Basin's project teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile.",
   "passed": false,
   "x_axis": {
     "key": "file_count",
-    "label": "files per tenant"
+    "label": "files per project"
   },
   "series": [
     {
@@ -22,32 +22,32 @@
   ],
   "rows": [
     {
-      "basin_ms": 5.1405,
+      "basin_ms": 5.930834,
       "file_count": 100,
       "pg_skipped": false,
-      "postgres_ms": 35.213750000000005
+      "postgres_ms": 6.262125
     },
     {
-      "basin_ms": 40.258,
+      "basin_ms": 34.584042000000004,
       "file_count": 1000,
       "pg_skipped": false,
-      "postgres_ms": 16.485834
+      "postgres_ms": 26.773374999999998
     },
     {
-      "basin_ms": 157.060666,
+      "basin_ms": 176.620875,
       "file_count": 5000,
       "pg_skipped": false,
-      "postgres_ms": 10.442
+      "postgres_ms": 12.400708999999999
     }
   ],
   "primary": {
     "label": "Basin/Postgres ratio at 5000 files (realistic schema)",
-    "value": 15.04124363148822,
+    "value": 14.242804584802371,
     "unit": "ratio",
     "bar": {
       "op": "less_than",
       "value": 1.0000000000000002
     }
   },
-  "generated_at": "@1778393219"
+  "generated_at": "@1778866829"
 }

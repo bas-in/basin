@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "row_groups_pruned_by_bloom / row_groups_considered",
-    "value": 1.0,
+    "value": 0.9,
     "unit": "fraction",
     "bar": {
       "op": "greater_than_or_equal",
@@ -17,8 +17,8 @@
     "absent_in_range_target": "550 (outside [500, 600) gap)",
     "bloom_only_phase": {
       "groups_considered": 10,
-      "groups_scanned": 0,
-      "pruned_by_bloom": 10,
+      "groups_scanned": 1,
+      "pruned_by_bloom": 9,
       "pruned_by_stats": 0
     },
     "bucket": "basin-test",
@@ -38,5 +38,5 @@
     "row_group_size": 100,
     "rows": 1000
   },
-  "generated_at": "@1778157142"
+  "generated_at": "@1778866950"
 }

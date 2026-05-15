@@ -1,27 +1,27 @@
 {
   "kind": "compare",
   "id": "lifecycle_ops",
-  "name": "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-  "claim": "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+  "name": "Lifecycle ops on real S3: project deletion + ADD COLUMN",
+  "claim": "Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
   "available": true,
   "metrics": [
     {
-      "label": "Tenant deletion (1 tenant, 100K rows in 100 files; basin on S3)",
-      "basin": 1682.821208,
-      "postgres": 13.694125,
+      "label": "Project deletion (1 project, 100K rows in 100 files; basin on S3)",
+      "basin": 9.983749999999999,
+      "postgres": 9.852,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.01x"
+      "ratio_text": "pg / basin = 0.99x"
     },
     {
       "label": "ADD COLUMN on 100K rows",
-      "basin": 0.542458,
-      "postgres": 21.816458,
+      "basin": 0.42054199999999997,
+      "postgres": 1.438667,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 40.22x"
+      "ratio_text": "pg / basin = 3.42x"
     }
   ],
-  "generated_at": "@1778331906",
-  "note": "Basin storage on real S3 — tenant deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."
+  "generated_at": "@1778866947",
+  "note": "Basin storage on real S3 — project deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."
 }

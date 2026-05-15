@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "data_file_path": "tenants/01KR8836QCQ8J587QYFX4TSGXV/tables/events/data/_default/2026/05/10/01KR8836QR4JGP1H7G8SN129SZ.parquet",
-    "encrypted_body_bytes": 1153,
-    "plaintext_body_bytes": 1125,
+    "data_file_path": "projects/01KRPBBZRN4WCHZ9ZY0FG3TSNP/tables/events/data/_default/2026/05/15/01KRPBBZRRZMRYHSJG89YY9B5G.parquet",
+    "encrypted_body_bytes": 1187,
+    "plaintext_body_bytes": 1159,
     "rows_round_tripped": 100,
     "sidecar_bytes": 33
   },
-  "generated_at": "@1778393389"
+  "generated_at": "@1778866585"
 }

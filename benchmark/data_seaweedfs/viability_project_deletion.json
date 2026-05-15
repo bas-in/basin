@@ -1,12 +1,12 @@
 {
   "kind": "viability",
-  "id": "tenant_deletion",
-  "name": "Tenant deletion latency (real S3)",
-  "claim": "Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path).",
+  "id": "project_deletion",
+  "name": "Project deletion latency (real S3)",
+  "claim": "Deleting a project of 100 small files via Storage::delete_project (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path).",
   "passed": true,
   "primary": {
     "label": "deletion_ms",
-    "value": 19.488625,
+    "value": 29.150833000000002,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -17,7 +17,7 @@
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
     "files": 100,
-    "setup_ms": 20.036291000000002
+    "setup_ms": 39.379083
   },
-  "generated_at": "@1778120518"
+  "generated_at": "@1778866997"
 }

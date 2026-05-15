@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "ratio (csv / parquet)",
-    "value": 20.220711243237197,
+    "value": 20.21422372016493,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
@@ -17,8 +17,8 @@
     "bucket": "basin-test",
     "csv_bytes": 126513913,
     "endpoint": "http://127.0.0.1:8333",
-    "parquet_bytes": 6256650,
+    "parquet_bytes": 6258658,
     "rows": 1000000
   },
-  "generated_at": "@1778115273"
+  "generated_at": "@1778866984"
 }

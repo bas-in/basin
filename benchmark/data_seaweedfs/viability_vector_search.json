@@ -14,16 +14,16 @@
     }
   },
   "details": {
-    "brute_ms": 64.73887500000001,
+    "brute_ms": 62.20225,
     "bucket": "basin-test",
     "dim": 64,
     "endpoint": "http://127.0.0.1:8333",
-    "hnsw_ms": 17.7555,
-    "hnsw_speedup_x": 3.64613077637915,
+    "hnsw_ms": 18.837084,
+    "hnsw_speedup_x": 3.302116718277627,
     "overlap": 10,
     "rows": 5000,
     "sql_rows": 100,
     "top_k": 10
   },
-  "generated_at": "@1778115270"
+  "generated_at": "@1778867008"
 }
