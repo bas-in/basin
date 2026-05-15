@@ -1,0 +1,38 @@
+{
+  "available": true,
+  "claim": "Vortex achieves competitive compression and fast full-scan vs ZSTD Parquet on audit-log data.",
+  "details": {
+    "compression": "ZSTD (Parquet default level) vs Vortex default encodings",
+    "dataset": "audit-log: id(i64), ts(utf8), actor(utf8/8-cardinality), event(utf8/4-cardinality), body(utf8/json-ish~120B)",
+    "parquet_bytes": 3174879,
+    "parquet_scan_ms": 64.378375,
+    "rows": 1000000,
+    "scan_ratio_parquet_over_vortex": 15.858207346737695,
+    "size_ratio_parquet_over_vortex": 0.13251882005921375,
+    "vortex_bytes": 23957948,
+    "vortex_scan_ms": 4.059625
+  },
+  "generated_at": "@1778841985",
+  "id": "vortex_parquet",
+  "kind": "compare",
+  "metrics": [
+    {
+      "basin": 3174879.0,
+      "better": "basin",
+      "label": "On-disk size",
+      "postgres": 23957948.0,
+      "ratio_text": "parquet / vortex = 0.13x",
+      "unit": "bytes"
+    },
+    {
+      "basin": 64.378375,
+      "better": "postgres",
+      "label": "Full-scan wall time",
+      "postgres": 4.059625,
+      "ratio_text": "parquet / vortex = 15.86x",
+      "unit": "ms"
+    }
+  ],
+  "name": "Parquet (ZSTD) vs Vortex — audit-log 1M rows",
+  "note": "JSON key 'basin'=Parquet, 'postgres'=Vortex (schema reuse from Postgres compare card). Standalone binary: cargo run --manifest-path benchmark/vortex_compare/Cargo.toml --release"
+}

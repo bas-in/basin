@@ -97,6 +97,14 @@ code), run `./serve.sh` and open `http://localhost:8000/` —
 `dashboard.js` falls back to `fetch()` automatically when the bundle is
 absent.
 
+## Parquet vs Vortex comparison
+
+`benchmark/vortex_compare/` is a standalone Rust binary (not a workspace member — it lives outside the main workspace so it can depend on Vortex, which requires Arrow 58, without conflicting with the workspace's Arrow 54 pin). It generates the same 1 M-row synthetic audit-log dataset used in `viability_compression_ratio.rs`, writes it once as ZSTD Parquet and once as a Vortex file using Vortex's default encodings, then prints sizes and cold full-scan times to stdout and writes `benchmark/data/compare_vortex_parquet.json`. On the numbers measured so far: Parquet is ~7.5× smaller (ZSTD compression wins decisively on text-heavy data), while Vortex scans ~17× faster because it avoids decompression entirely. Run it from the repo root with:
+
+```sh
+cargo run --manifest-path benchmark/vortex_compare/Cargo.toml --release
+```
+
 ## Stack
 
 No build step, no framework. Just `template.html`, `dashboards.toml`,

@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "vortex-compare"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "vortex_compare"
+path = "src/main.rs"
+
+[dependencies]
+# Vortex columnar format (requires arrow 58)
+vortex-array = "0.70"
+vortex-file = "0.70"
+vortex-session = "0.70"
+vortex-io = { version = "0.70", features = ["tokio"] }
+vortex-layout = "0.70"
+vortex-buffer = "0.70"
+
+# Parquet + arrow 58 (matching vortex's arrow requirement)
+arrow-array = "58"
+arrow-schema = "58"
+parquet = { version = "58", features = ["async"] }
+
+# Async runtime (vortex-file uses async IO)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "fs"] }
+futures = "0.3"
+
+# JSON output
+serde_json = "1"
