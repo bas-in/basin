@@ -61,7 +61,7 @@ Basin has none of these:
 | Per-project Semaphore + scheduler ([ADR 0008](./decisions/0008-noisy-neighbor-fairness.md)) | Fairness without spawning processes |
 | Catalog scales linearly with project count | No 10k limit |
 
-**Cost per project:** essentially `bytes × $0.015/GB + microseconds of CPU per query`. At 10,000 projects × 100 MB each, total cost is ~$1k/month all-in. Same workload on Supabase costs $25k/month minimum.
+**Cost per project:** essentially `bytes × $0.023/GB + ops × $0.40/1M + $0.02 per project`. At 10,000 projects × 100 MB each, total cost is ~$1k/month all-in. Same workload on Supabase costs $25k/month minimum (at $25/project).
 
 ---
 
@@ -216,10 +216,10 @@ Mapping the architecture to billing:
 
 | Tier | Architecture | Cost driver |
 |---|---|---|
-| Free | Shared cluster, default storage cap (e.g. 1 GB) | Bytes only |
-| Pro | Shared cluster, higher caps + caches enabled | Bytes + active hours |
-| Enterprise | Dedicated shard owner pinned, BYO-bucket optional | Compute + bytes |
-| Compliance | Dedicated cluster + BYO-bucket + BYO-KMS | Premium flat |
+| Free | Shared cluster, 100 MB cap, 25 max connections | Bytes only |
+| Hobby / Pro / Team | Shared cluster, higher caps + caches enabled | Bytes + active hours |
+| Scale | Shared cluster, dedicated compute pool isolation | Bytes + active hours |
+| Enterprise | Dedicated shard owner pinned, BYO-bucket + BYO-KMS optional | Compute + bytes |
 
 This mirrors what Snowflake and BigQuery do. Supabase / Neon's per-project pricing is forced on them by Postgres; Basin doesn't have that constraint.
 

@@ -6,17 +6,23 @@ with the dashboard, control plane, and billing wrapped around it.
 
 A project is the unit of isolation: its own bucket prefix, its own credentials,
 its own RLS policies, its own snapshots. The cost story is simple: storage is
-cheap because it lives on Tigris (Fly's S3-compatible store), compute is cheap because the engine is a tokio
-the **basin-cloud** managed service — same engine, run on Fly Machines + Cloudflare
-R2 with the dashboard, control plane, and billing wrapped around it.
+cheap because it lives on Tigris (Fly's S3-compatible store), compute is cheap
+because the engine is a tokio server that holds 1,000 connections in 165 MiB of
+RAM, and project creation is free because a project is metadata, not
+infrastructure.
 
-A project is the unit of isolation: its own bucket prefix, its own credentials,
-its own RLS policies, its own snapshots. The cost story is simple: storage is
-cheap because it lives on R2, compute is cheap because the engine is a tokio
-server that holds 1,000 connections in 165 MiB of RAM, and project creation is
-free because a project is metadata, not infrastructure.
+**basin-cloud is serverless and usage-billed.** You pay for bytes stored
+($0.023/GB/mo), operations ($0.40/1M ops), and a small per-project base
+($0.02/project/mo). There is no reserved capacity, no charge for idle projects,
+and no per-connection fee. The monthly plan price is the plan — the scarcity
+levers are per-tier *ceilings* (a hard cap on max concurrent connections, set far
+above Neon/Supabase because tokio tasks are cheap), not reservations.
 
-Last updated: 2026-05-14.
+**Self-hosted OSS has no limits.** Connection caps, project counts, and storage
+limits are cloud control-plane concepts, not engine restrictions. If you run
+basin-server yourself, the engine imposes none of them.
+
+Last updated: 2026-05-15.
 
 ---
 
@@ -25,55 +31,59 @@ Last updated: 2026-05-14.
 ### Free — $0 / month forever
 
 - **1 project**
-- **100 MB** storage
+- **100 MB** storage cap
+- **25 max concurrent connections**
 - **Scales to zero** — project pauses after 5 min idle, resumes in under a second on first connect
-- **1k SQL requests / day**
 - pgwire + REST + auth all enabled
 - Native vector search, JSONB, UUID, all built-in extensions
 - No credit card. No expiry.
 
 For evaluation, side projects, and learning. Upgrade in place when ready.
 
-### Hobby — $5 / month
+### Hobby — $9 / month
 
-- **1 always-on project** (no scale-to-zero)
-- **5 GB** storage included
-- **50 GB / month** egress included (this is the API budget; Fly-internal Tigris traffic doesn't count against it)
-- **50 GB / month** R2 egress included (R2 itself has no egress fees; this is the API budget)
-- 50k SQL requests / day
-- Daily backup (24-hour retention)
+- **1 project**
+- **2 GB** storage cap
+- **75 max concurrent connections**
+- Always-on (no scale-to-zero pause)
+- Daily snapshot retention, 7-day PITR
 - Community support
 
-Adding a second project: $1/mo (storage and compute pooled).
+### Pro — $39 / month
 
-### Pro — $29 / month
-
-- **10 always-on projects**
-- **50 GB** storage included across all projects
+- **10 projects**
+- **25 GB** storage cap across all projects
+- **250 max concurrent connections**
 - **Daily backups + point-in-time restore** to any minute in the last 7 days
 - **Zero-copy branches** — fork a project via Iceberg metadata, diverge on next write, no data copy
-- 500k SQL requests / day
 - Email support, 24-hour response SLA
 - Custom domains for REST endpoints
 
-Adding projects beyond 10: $1/mo each.
+### Team — $199 / month
 
-### Scale — $99 / month
+- **25 projects**
+- **75 GB** storage cap across all projects
+- **750 max concurrent connections**
+- **30-day PITR**
+- Audit-log retention (unlimited duration)
+- Shared Slack support channel
+- All Pro features
 
-- **100 always-on projects**
-- **250 GB** storage included
-- **Point-in-time restore** to any minute in the last 30 days
+### Scale — $249 / month
+
+- **100 projects**
+- **150 GB** storage cap across all projects
+- **3,000 max concurrent connections**
+- **30-day PITR**
 - **Multi-region read replicas** (read-after-write within region, eventually-consistent cross-region)
 - **99.95% uptime SLA**
 - Priority routing — projects on Scale sit on dedicated compute pools, isolated from Free/Hobby noise
-- 5M SQL requests / day
 - Email + Slack support, 4-hour response SLA, named contact
-
-Adding projects beyond 100: $0.50/mo each.
 
 ### Enterprise — talk to us
 
 - **Unlimited projects**
+- **10,000 max concurrent connections**
 - **Bring your own bucket** — your S3, your AWS account, your IAM role; basin-cloud runs the compute but never touches your data plane
 - **Bring your own key** — your KMS, your CMK, your rotation policy. Every Parquet write envelope-encrypted with a per-file data key wrapped by your CMK
 - **SSO** — SAML, OIDC, SCIM provisioning
@@ -90,29 +100,47 @@ Typical Enterprise customers are $2k–$15k/mo.
 
 ---
 
+## Plan summary
+
+| Plan | $/mo | Projects | Storage cap | Max concurrent connections |
+|---|---|---|---|---|
+| Free | $0 | 1 | 100 MB | 25 |
+| Hobby | $9 | 1 | 2 GB | 75 |
+| Pro | $39 | 10 | 25 GB | 250 |
+| Team | $199 | 25 | 75 GB | 750 |
+| Scale | $249 | 100 | 150 GB | 3,000 |
+| Enterprise | contact sales | unlimited | unlimited | 10,000 |
+
+Max concurrent connections are hard ceilings enforced by the control plane,
+not reserved capacity. Connections over the ceiling wait (not error) while a
+slot becomes free. Because the engine is tokio-based, these ceilings are
+deliberately set far above typical Neon/Supabase connection limits — they exist
+to prevent one account from exhausting the pool, not to sell capacity.
+
+Usage over the included storage cap is billed at the standard storage rate.
+Operations beyond the plan's included ops are billed at the standard ops rate.
+There is no charge for idle projects.
+
+---
+
 ## Add-ons
 
-Available on Hobby, Pro, Scale (Enterprise terms are custom):
+Available on Hobby, Pro, Team, Scale (Enterprise terms are custom):
 
 | Add-on | Cost |
 |---|---|
 | Extra storage (Hobby) | $0.02 / GB / month |
 | Extra storage (Pro) | $0.015 / GB / month |
-| Extra storage (Scale) | $0.01 / GB / month |
-| Extra projects (Hobby / Pro) | $1 / project / month |
-| Extra projects (Scale) | $0.50 / project / month |
-| Always-on compute over the daily request budget | $0.05 / 100k requests |
+| Extra storage (Team / Scale) | $0.01 / GB / month |
 | Cross-region replicas (Pro) | $10 / replica / month |
-| Custom domain TLS (Hobby) | included on Pro+ |
 | Extended PITR (Pro) — 30-day window | $20 / month |
-| Audit-log export (Pro) | $50 / month |
+| Audit-log export (Pro / Team) | $50 / month |
 | BYO-bucket | Enterprise only |
 | BYO-key (KMS) | Enterprise only |
 
-Tigris traffic within Fly's network is zero-egress. The "egress included" line in each plan refers to
-R2 itself is zero-egress. The "egress included" line in each plan refers to
-the rate at which basin-cloud will serve traffic from your compute pool before
-flagging the project for review — a fair-use guard, not a metered cost.
+Tigris traffic within Fly's network is zero-egress. There is no separate egress
+line item for basin-cloud; the standard storage and ops rates cover the full
+data path.
 
 ---
 
@@ -121,14 +149,12 @@ flagging the project for review — a fair-use guard, not a metered cost.
 Three structural reasons Basin can charge less than per-Postgres-project
 vendors:
 
-**Storage.** ZSTD-1 Parquet vs Postgres heap on the same data is 12.5× smaller
-on audit-log workloads and 3-5× smaller on broader OLTP workloads. Object storage
-(Tigris on basin-cloud) is $0.02/GB/mo with zero Fly-internal egress. A project
-storing 1 GB of "Postgres data" weighs about 80 MB on Basin and costs Basin about
-$0.0016/mo to store.
-on audit-log workloads and 3-5× smaller on broader OLTP workloads. R2 storage
-itself is $0.015/GB/mo with zero egress. A project storing 1 GB of "Postgres
-data" weighs about 80 MB on Basin and costs Basin about $0.0012/mo to store.
+**Storage.** The storage format is compact Parquet (Vortex-encoded on recent
+engine versions), not Postgres heap. On audit-log workloads the same data is
+12.5× smaller; on broader OLTP workloads, 3–5× smaller. Object storage
+(Tigris on basin-cloud) runs $0.02/GB/mo with zero Fly-internal egress. A
+project storing 1 GB of "Postgres data" weighs about 80 MB on Basin and costs
+Basin about $0.0016/mo to store.
 
 **Compute.** A from-scratch Rust + tokio server holds 1,000 connections in
 ~165 MiB of RAM versus ~7.9 GiB for the same Postgres footprint. One Fly Machine
@@ -137,25 +163,25 @@ Postgres. The compute pool amortises across projects.
 
 **Project creation is free.** A new project is a new bucket prefix. There's no
 new VM to provision, no new Postgres process to fork, no per-DB minimum.
-That's why we can give 10 projects on Pro for $29/mo — the marginal cost of
+That's why we can offer 10 projects on Pro for $39/mo — the marginal cost of
 the 10th project, given the 1st, is nearly zero.
 
 ---
 
 ## Compared to other managed Postgres-like services
 
-For 10 projects, 50 GB total storage, modest workload:
+For 10 projects, 25 GB total storage, modest workload:
 
 | Service | Approximate monthly cost |
 |---|---|
-| **Basin Pro** | **$29** — covers all 10 projects, 50 GB storage included |
+| **Basin Pro** | **$39** — covers all 10 projects, 25 GB storage cap included |
 | Neon (Launch) | ~$190 — $19/mo minimum × 10 projects |
 | Supabase Pro | ~$250 — $25/mo per project × 10 |
 | AWS RDS db.t4g.micro × 10 | ~$170 (compute) + ~$5 (storage) |
 | Aurora Serverless v2 × 10 | ~$430 (idle 0.5 ACU × 730 hr × 10) + storage |
 
 Numbers are list prices from those vendors' public pages, current as of
-2026-05-14. Storage costs grow with volume; compute costs grow with always-on
+2026-05-15. Storage costs grow with volume; compute costs grow with always-on
 hours; per-project minimums are the line item that snaps once you cross
 ~5 projects.
 
@@ -171,14 +197,19 @@ volume drives the bill.
 The OSS engine ([`README.md`](./README.md)) is Apache-2.0 and free to run
 anywhere. Single binary, configure with env vars, point at any S3-compatible
 bucket. The cloud product adds the dashboard, the control plane, the billing
-glue, the per-project Fly Machine orchestration, and the operational team that
-keeps it up — none of which the OSS users have to think about.
+glue, and the operational team that keeps it up — none of which OSS users have
+to think about.
+
+The connection caps, project limits, and storage ceilings listed above are
+cloud control-plane concepts. The OSS engine enforces none of them — you can
+run as many projects as you want, with as many connections as your hardware
+supports.
 
 If you're operating Basin yourself:
 
-- Buy R2 / S3 / Tigris storage directly — usually $0.01–$0.02/GB/month
+- Buy Tigris / S3 / MinIO storage directly — usually $0.01–$0.02/GB/month
 - Pay your own compute (Fly Machines, Hetzner, AWS, bare metal — your call)
-- Run as many projects as you want for free; the OSS bundle includes the project resolver, auth, REST, and dashboard-server APIs
+- Run as many projects as you want; the OSS bundle includes the project resolver, auth, REST, and dashboard-server APIs
 
 The cloud product never restricts the OSS engine. Anything basin-cloud does is
 something an OSS user can do too — operating it is the work you're paying us
@@ -188,12 +219,12 @@ not to do.
 
 ## FAQ
 
-### What counts as an "always-on project"?
+### What counts as a concurrent connection?
 
-The compute pool keeps the project's session warm 24/7. Connections don't pay
-a cold-start. The Free tier suspends after 5 minutes of no requests and
-resumes in <1s on first connect — perceptible only on the very first request
-after idle.
+An open TCP connection to the pgwire endpoint counts against the ceiling while
+it is open. Idle connections count. The ceiling is enforced by the control
+plane, not the engine — connections over the cap wait for a slot, they do not
+receive an error.
 
 ### Can I move from one plan to another?
 
@@ -209,8 +240,8 @@ them natively.
 
 ### What happens to my data if I cancel?
 
-90-day retention on Hobby/Pro/Scale (you can restore by resubscribing within
-the window), then permanent deletion. Enterprise gets a custom retention
+90-day retention on Hobby/Pro/Team/Scale (you can restore by resubscribing
+within the window), then permanent deletion. Enterprise gets a custom retention
 schedule. Free tier: data deleted at suspension after 30 days of full idle.
 
 ### Do you offer a non-profit or open-source discount?
@@ -227,16 +258,11 @@ out of scope; pair Basin with a serverless functions provider of your choice.
 ### Can I run Basin on AWS S3 instead of Tigris?
 
 Yes. The OSS engine takes `BASIN_STORAGE_BACKEND=s3` with standard
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars, or `BASIN_STORAGE_BACKEND=r2`
-for Cloudflare R2. basin-cloud runs on Tigris because it is Fly's native store
-(zero Fly-internal egress, no credential management overhead) — but Enterprise
-BYO-bucket customers run on whatever object store they bring.
-### Can I run Basin on AWS S3 instead of R2?
-
-Yes. The OSS engine takes `BASIN_STORAGE_BACKEND=s3` with standard
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars. basin-cloud uses R2
-because R2's zero-egress is structural to the pricing — but Enterprise BYO-bucket
-customers run on whatever object store they bring.
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars, or
+`BASIN_STORAGE_BACKEND=r2` for Cloudflare R2. basin-cloud runs on Tigris
+because it is Fly's native store (zero Fly-internal egress, no credential
+management overhead) — but Enterprise BYO-bucket customers run on whatever
+object store they bring.
 
 ---
 

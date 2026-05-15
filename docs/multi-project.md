@@ -29,7 +29,7 @@ multi-project cheaply:
 The wedge cases hit hardest at:
 
 - **100+ customers with most idle** — paying $25/mo × 100 customers = $2,500/mo
-  on Supabase Pro before storage. Most of that compute is unused.
+  on Supabase Pro before storage (Supabase charges per project). Most of that compute is unused.
 - **Compliance / data-residency products** — "give each customer their own
   bucket prefix so I can prove isolation in an audit" is hard to do cleanly
   in a shared Postgres.
@@ -114,7 +114,8 @@ workloads feasible:
 
 At 10,000 active projects with this profile: **~$1,500/mo total**. The same
 workload on Supabase Pro is 10,000 × $25/mo = $250,000/mo (assuming you could
-even get 10,000 projects provisioned). On Neon Launch: 10,000 × $19/mo = $190,000/mo.
+even provision 10,000 projects). On Neon Launch: 10,000 × $19/mo = $190,000/mo.
+Basin Pro covers 10 projects at $39/mo; Scale covers 100 projects at $249/mo.
 The cost story is two orders of magnitude. That's the wedge.
 
 For pricing on basin-cloud specifically, see [`PRICING.md`](../PRICING.md).
