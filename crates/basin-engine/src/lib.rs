@@ -51,6 +51,23 @@ use basin_common::{
 };
 use uuid::Uuid;
 
+/// Pre-built stateless UDF registry shared across all sessions on one `Engine`.
+///
+/// Building a `SessionContext` for a new project session requires registering
+/// ~200 stateless UDFs (vector distance, JSONB, string, datetime, FTS stubs,
+/// pg_catalog, range, pg_scalar, interval-tz, etc.). The stateless UDFs are
+/// identical for every session, so we build them once at `Engine::new` time
+/// and clone the `Arc<ScalarUDF>` / `Arc<AggregateUDF>` handles at
+/// session-open time (arc ref-count bump, no allocation).
+///
+/// The cache also includes DataFusion's own default built-ins so the
+/// `SessionStateBuilder` at session-open time can skip `with_default_features`
+/// for scalars/aggregates and use this combined vec directly.
+pub(crate) struct StatelessUdfCache {
+    pub(crate) scalar: Vec<Arc<datafusion::logical_expr::ScalarUDF>>,
+    pub(crate) aggregate: Vec<Arc<datafusion::logical_expr::AggregateUDF>>,
+}
+
 /// Engine configuration.
 ///
 /// `storage` and `catalog` are shared across all project sessions; per-project
@@ -109,6 +126,10 @@ pub(crate) struct EngineInner {
     /// `basin-webhooks`) reads this same registry; the engine's
     /// `ALTER TABLE … SUBSCRIBE WEBHOOK …` SQL surface mutates it.
     pub(crate) webhook_registry: crate::webhook_registry::WebhookRegistry,
+    /// Pre-built stateless UDF registry. Shared across all sessions; each
+    /// session-open clones only the `Arc` handles (ref-count bumps, no heap
+    /// allocation for the UDF structs themselves). See `StatelessUdfCache`.
+    pub(crate) udf_cache: Arc<StatelessUdfCache>,
     // additional state (DataFusion runtime, per-project context cache) lives
     // in the implementation module; intentionally not exposed here.
 }
@@ -139,6 +160,12 @@ impl Engine {
             registry.register_post_commit(Arc::new(crate::events::TracingSink));
         }
         let catalog = cfg.catalog.clone();
+        // Build the stateless UDF cache once. We register all stateless UDFs
+        // into a throwaway `SessionContext` (which also seeds DataFusion's own
+        // default built-ins) and then extract the populated function maps.
+        // Session-open time then just clones these Arc handles instead of
+        // constructing ~200 UDF structs and acquiring 200+ write-locks.
+        let udf_cache = Arc::new(crate::session::build_stateless_udf_cache());
         let inner = Arc::new(EngineInner {
             cfg,
             vector_routing_count: AtomicU64::new(0),
@@ -148,6 +175,7 @@ impl Engine {
             event_sinks: RwLock::new(registry),
             event_seq: Mutex::new(HashMap::new()),
             webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
+            udf_cache,
         });
         attach_reactor_sink(&inner, catalog);
         Self { inner }

@@ -33,6 +33,7 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use object_store::path::Path as ObjectPath;
 use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
@@ -44,12 +45,41 @@ use tracing::instrument;
 use url::Url;
 
 use crate::convert::schema_ws_to_df;
-use crate::{Engine, ProjectSession};
+use crate::{Engine, ProjectSession, StatelessUdfCache};
 
 /// Synthetic URL we register the storage `ObjectStore` under. The scheme is
 /// purely an internal protocol between `basin-engine` and DataFusion; it is
 /// never exposed to clients.
 pub(crate) const BASIN_URL_BASE: &str = "basin://engine/";
+
+/// Build the shared stateless UDF registry once at `Engine::new` time.
+///
+/// Strategy: register all stateless UDFs into a throwaway `SessionContext`
+/// (which has DataFusion's own built-in functions pre-seeded). Then extract
+/// the populated `scalar_functions` and `aggregate_functions` maps. Each
+/// subsequent session-open just clones the `Arc` handles (ref-count bumps
+/// only, no struct allocation) and passes them to `SessionStateBuilder`
+/// for batch insertion without holding a write-lock per UDF.
+pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
+    let ctx = SessionContext::new();
+    crate::udf::register_distance_udfs(&ctx);
+    crate::udf::register_pg_udfs(&ctx);
+    crate::udf::register_pg_compat_udfs(&ctx);
+    crate::string_dt_udf::register_string_dt_udfs(&ctx);
+    crate::fts_udf::register_fts_udfs(&ctx);
+    crate::jsonb_udf::register_jsonb_udfs(&ctx);
+    crate::interval_tz_udf::register_interval_tz_udfs(&ctx);
+    crate::pg_scalar_aliases::register_pg_scalar_aliases(&ctx);
+    crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
+    crate::pg_agg_udf::register_json_agg_udafs(&ctx);
+    crate::range_udf::register_range_udfs(&ctx);
+    crate::datetime_extras::register_datetime_extras(&ctx);
+    let state = ctx.state();
+    StatelessUdfCache {
+        scalar: state.scalar_functions().values().cloned().collect(),
+        aggregate: state.aggregate_functions().values().cloned().collect(),
+    }
+}
 
 /// `OVERRIDING { SYSTEM | USER } VALUE` clause on INSERT. Tracked
 /// per-pending-statement because sqlparser 0.52 doesn't recognise the
@@ -179,7 +209,7 @@ pub(crate) async fn open(
     // a v0.3 catalog field. The noisy detector still applies — it
     // would catch a hypothetical per-deployment override that bumps
     // partitions back up for a project that abuses it.
-    let cfg = datafusion::execution::config::SessionConfig::new()
+    let session_cfg = datafusion::execution::config::SessionConfig::new()
         .set_str(
             "datafusion.execution.listing_table_ignore_subdirectory",
             "false",
@@ -193,7 +223,27 @@ pub(crate) async fn open(
             "noisy project detected (target_partitions already pinned to 1)"
         );
     }
-    let ctx = SessionContext::new_with_config(cfg);
+
+    // Build the SessionContext via SessionStateBuilder so all stateless UDFs
+    // are batch-inserted during state construction (no write-lock per UDF).
+    // The pre-built cache on Engine holds DataFusion's built-in functions
+    // plus every Basin stateless UDF as `Arc<ScalarUDF>` handles; cloning
+    // the Vec here is O(n) Arc ref-count bumps — no struct allocation.
+    let udf_cache = engine.inner.udf_cache.as_ref();
+    let state = SessionStateBuilder::new()
+        .with_config(session_cfg)
+        // Non-UDF defaults: table factories, file formats, expr planners,
+        // optimizer rules, window functions. We override scalar_functions and
+        // aggregate_functions below with the combined (DF defaults + Basin)
+        // cache, so `with_default_features` is not called for those.
+        .with_default_features()
+        // Replace the default scalar/aggregate sets with the combined cache.
+        // `with_scalar_functions` overwrites whatever `with_default_features`
+        // set; since the cache includes DF's own defaults, nothing is lost.
+        .with_scalar_functions(udf_cache.scalar.clone())
+        .with_aggregate_functions(udf_cache.aggregate.clone())
+        .build();
+    let ctx = SessionContext::new_with_state(state);
     let url = Url::parse(BASIN_URL_BASE)
         .map_err(|e| BasinError::internal(format!("bad basin url: {e}")))?;
     // Register the *project-scoped* store so every range read DataFusion
@@ -205,60 +255,10 @@ pub(crate) async fn open(
     let store = engine.config().storage.project_object_store(&project);
     ctx.register_object_store(&url, store);
 
-    // Register the vector distance UDFs once per session. They're stateless
-    // and don't depend on per-project data; registering on every session is
-    // cheap and keeps the UDFs visible to any SQL the session executes.
-    crate::udf::register_distance_udfs(&ctx);
-    // pgcrypto + uuid-ossp shaped UDFs (gen_random_uuid, digest, encode,
-    // decode, crypt, gen_salt). Same per-session shape as the distance
-    // UDFs; registration is `Arc<ScalarUDF>::clone` under the hood.
-    crate::udf::register_pg_udfs(&ctx);
-    // Phase 5.11.A: PG-compat scalar functions — `mod`, `age`, plus
-    // `to_char`/`to_timestamp` overrides that accept PG-style format strings
-    // (`YYYY-MM-DD HH24:MI:SS`) on top of chrono syntax.
-    crate::udf::register_pg_compat_udfs(&ctx);
-    // String + datetime gap-fillers: `split_part`, `reverse`, `format`,
-    // `quote_ident`, `quote_literal`, `quote_nullable`, `regexp_match`,
-    // `regexp_split_to_array`, `chr`, `ascii`, `translate`, `btrim`/`ltrim`/`rtrim`,
-    // `convert_from`, `convert_to`, `isfinite`.
-    crate::string_dt_udf::register_string_dt_udfs(&ctx);
-    // Full-text search stub UDFs: to_tsvector, to_tsquery, ts_rank, ts_headline,
-    // setweight, strip, tsvector_length, numnode, querytree, and
-    // tsvector_match_udf (the `@@`-operator substitute). All are stubs that
-    // return identity/zero/false values; real FTS is deferred to basin-fts.
-    crate::fts_udf::register_fts_udfs(&ctx);
     // Auth session functions: `auth_uid()`, `auth_role()`, `auth_jwt()`.
-    // These read the per-session AuthContext stamped at open time so RLS
-    // policies can reference the authenticated user without re-verifying
-    // the JWT on every query. Must be registered after pg_compat to ensure
-    // we don't overwrite anything (names are distinct).
+    // These capture a per-session Arc<AuthContext> so they cannot be cached.
+    // Only these 3 UDFs require individual write-lock acquisitions per session.
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
-    // JSONB scalar UDFs: jsonb_typeof, jsonb_pretty, jsonb_set, jsonb_insert,
-    // jsonb_strip_nulls, jsonb_path_query/exists/match, jsonb_object_keys,
-    // jsonb_each, jsonb_each_text, jsonb_array_elements[_text],
-    // jsonb_build_object, jsonb_build_array, to_jsonb, row_to_json,
-    // array_to_json, and aggregate stubs (jsonb_agg, jsonb_object_agg).
-    // Extended JSON path, JSON conversion, and JSON operator UDFs.
-    crate::jsonb_udf::register_jsonb_udfs(&ctx);
-    // Interval arithmetic + time-zone shim UDFs (Phase bulk-interval-tz).
-    crate::interval_tz_udf::register_interval_tz_udfs(&ctx);
-    // Phase 5.11.B: extended PG scalar inventory — `ceiling`/`sign` aliases,
-    // `clock_timestamp`/`transaction_timestamp`/`statement_timestamp`/
-    // `localtime`/`localtimestamp` stubs, `make_time`/`make_timestamp`/
-    // `make_interval`, `width_bucket`, `to_number`.
-    crate::pg_scalar_aliases::register_pg_scalar_aliases(&ctx);
-    // pg_catalog stub UDFs for psql `\dt` / `\d`-family meta-commands.
-    crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
-    // Phase 5.11.AGG: PG JSON aggregate UDAFs — json_agg, jsonb_agg,
-    // json_object_agg, jsonb_object_agg.
-    crate::pg_agg_udf::register_json_agg_udafs(&ctx);
-    // Range type constructors + accessors + predicates. Registered per-session
-    // like the other UDFs; cost is O(Arc clones).
-    crate::range_udf::register_range_udfs(&ctx);
-    // P10: supplemental datetime + array UDFs — overlaps, cast_infinity_timestamp,
-    // array_dims. Registered after pg_compat so name collisions resolve in
-    // favour of the more-specific implementations above.
-    crate::datetime_extras::register_datetime_extras(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the project-scoped catalog
@@ -741,4 +741,148 @@ fn parse_timestamp_string_for_pruning(s: &str) -> Option<i64> {
         return Some(DateTime::<Utc>::from_naive_utc_and_offset(n, Utc).timestamp_micros());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Timing micro-bench: measures the SessionContext construction + UDF
+    /// registration phase in isolation (the primary target of the stateless-UDF-cache
+    /// optimisation). Compares the BEFORE (200+ individual write-lock register_udf
+    /// calls) vs the AFTER (SessionStateBuilder batch-insert + 3 auth UDFs) paths
+    /// side-by-side in the same binary on the same machine.
+    ///
+    /// Run with:
+    ///   `CARGO_BUILD_JOBS=4 cargo test -p basin-engine --release --lib \
+    ///    session::tests::bench_session_open_latency -- --nocapture --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_session_open_latency() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use basin_catalog::{Catalog, InMemoryCatalog};
+        use basin_common::ProjectId;
+        use crate::{Engine, EngineConfig};
+        use crate::AuthContext;
+        use datafusion::prelude::SessionContext;
+        use datafusion::execution::config::SessionConfig;
+        use datafusion::execution::SessionStateBuilder;
+        use object_store::local::LocalFileSystem;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+        let auth = Arc::new(AuthContext::anonymous());
+
+        const ITERS: usize = 200;
+
+        // --- BEFORE baseline: old path (SessionContext::new_with_config + per-UDF write-lock) ---
+        let mut before_samples: Vec<f64> = Vec::with_capacity(ITERS);
+        // Warm up.
+        for _ in 0..10 {
+            let cfg = SessionConfig::new()
+                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .with_target_partitions(1);
+            let ctx = SessionContext::new_with_config(cfg);
+            crate::udf::register_distance_udfs(&ctx);
+            crate::udf::register_pg_udfs(&ctx);
+            crate::udf::register_pg_compat_udfs(&ctx);
+            crate::string_dt_udf::register_string_dt_udfs(&ctx);
+            crate::fts_udf::register_fts_udfs(&ctx);
+            crate::udf::register_auth_udfs(&ctx, auth.clone());
+            crate::jsonb_udf::register_jsonb_udfs(&ctx);
+            crate::interval_tz_udf::register_interval_tz_udfs(&ctx);
+            crate::pg_scalar_aliases::register_pg_scalar_aliases(&ctx);
+            crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
+            crate::pg_agg_udf::register_json_agg_udafs(&ctx);
+            crate::range_udf::register_range_udfs(&ctx);
+            crate::datetime_extras::register_datetime_extras(&ctx);
+            let _ = ctx;
+        }
+        for _ in 0..ITERS {
+            let t0 = Instant::now();
+            let cfg = SessionConfig::new()
+                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .with_target_partitions(1);
+            let ctx = SessionContext::new_with_config(cfg);
+            crate::udf::register_distance_udfs(&ctx);
+            crate::udf::register_pg_udfs(&ctx);
+            crate::udf::register_pg_compat_udfs(&ctx);
+            crate::string_dt_udf::register_string_dt_udfs(&ctx);
+            crate::fts_udf::register_fts_udfs(&ctx);
+            crate::udf::register_auth_udfs(&ctx, auth.clone());
+            crate::jsonb_udf::register_jsonb_udfs(&ctx);
+            crate::interval_tz_udf::register_interval_tz_udfs(&ctx);
+            crate::pg_scalar_aliases::register_pg_scalar_aliases(&ctx);
+            crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
+            crate::pg_agg_udf::register_json_agg_udafs(&ctx);
+            crate::range_udf::register_range_udfs(&ctx);
+            crate::datetime_extras::register_datetime_extras(&ctx);
+            let _ = ctx;
+            before_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        before_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let before_p50 = before_samples[ITERS / 2];
+        let before_p95 = before_samples[(ITERS * 95) / 100];
+        let before_mean = before_samples.iter().sum::<f64>() / ITERS as f64;
+        println!(
+            "\nBEFORE (unbatched, 200+ individual register_udf write-lock): mean={before_mean:.3}ms  p50={before_p50:.3}ms  p95={before_p95:.3}ms"
+        );
+
+        // --- AFTER: batched via UDF cache (current implementation) -----------
+        let udf_cache = engine.inner.udf_cache.as_ref();
+        let mut after_samples: Vec<f64> = Vec::with_capacity(ITERS);
+        // Warm up.
+        for _ in 0..10 {
+            let cfg = SessionConfig::new()
+                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .with_target_partitions(1);
+            let state = SessionStateBuilder::new()
+                .with_config(cfg)
+                .with_default_features()
+                .with_scalar_functions(udf_cache.scalar.clone())
+                .with_aggregate_functions(udf_cache.aggregate.clone())
+                .build();
+            let ctx = SessionContext::new_with_state(state);
+            crate::udf::register_auth_udfs(&ctx, auth.clone());
+            let _ = ctx;
+        }
+        for _ in 0..ITERS {
+            let t0 = Instant::now();
+            let cfg = SessionConfig::new()
+                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .with_target_partitions(1);
+            let state = SessionStateBuilder::new()
+                .with_config(cfg)
+                .with_default_features()
+                .with_scalar_functions(udf_cache.scalar.clone())
+                .with_aggregate_functions(udf_cache.aggregate.clone())
+                .build();
+            let ctx = SessionContext::new_with_state(state);
+            crate::udf::register_auth_udfs(&ctx, auth.clone());
+            let _ = ctx;
+            after_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        after_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let after_p50 = after_samples[ITERS / 2];
+        let after_p95 = after_samples[(ITERS * 95) / 100];
+        let after_mean = after_samples.iter().sum::<f64>() / ITERS as f64;
+        println!(
+            "AFTER  (batched UDF cache, 3 individual register_udf for auth):  mean={after_mean:.3}ms  p50={after_p50:.3}ms  p95={after_p95:.3}ms"
+        );
+        let speedup = before_p50 / after_p50;
+        println!(
+            "Improvement: p50 {speedup:.1}x faster ({before_p50:.3}ms -> {after_p50:.3}ms)",
+        );
+    }
 }
