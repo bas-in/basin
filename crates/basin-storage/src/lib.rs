@@ -963,10 +963,10 @@ impl Storage {
         // ---- 2. Concurrently: (a) DELETE catalog set, (b) LIST -------
         //
         // (a) catalog DELETE: feed an in-memory iterator of paths into
-        // the inner store's `delete_stream`. On AWS / R2 the AmazonS3
-        // override batches into 1000-key DeleteObjects requests, 20 in
-        // flight; on LocalFS / GCS the default `.buffered(10)` per-key
-        // path runs.
+        // the inner store's `delete_stream`. On AWS S3 / Tigris the
+        // AmazonS3 backend batches into 1000-key DeleteObjects requests,
+        // 20 in flight; on LocalFS / GCS the default `.buffered(10)`
+        // per-key path runs.
         let cat_paths: Vec<ObjectPath> = cat_files
             .into_iter()
             .map(|f| ObjectPath::from(f.path))

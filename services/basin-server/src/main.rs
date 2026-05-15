@@ -27,12 +27,12 @@
 //!
 //! ```text
 //! BASIN_STORAGE_BACKEND=local                           # default; uses BASIN_DATA_DIR
-//! BASIN_STORAGE_BACKEND=r2|s3|tigris                    # S3-compatible object store
+//! BASIN_STORAGE_BACKEND=s3|tigris                       # S3-compatible object store
 //! BASIN_STORAGE_ROOT_PREFIX=warehouse                   # optional bucket sub-prefix
 //! ```
 //!
 //! S3-compatible backends use `BASIN_STORAGE_*` / AWS-compatible env vars parsed
-//! by `basin_storage::backends::r2::S3LikeConfig`.
+//! by `basin_storage::backends::s3_compatible::S3LikeConfig`.
 //!
 //! ## WAL + shard owner
 //!
@@ -404,6 +404,10 @@ async fn main() -> Result<()> {
         pool,
         shard_endpoints: None,
         tls,
+        // Pass None for now — unlimited connections. Wire a
+        // ConnectionLimiter here to enforce per-project max_connections
+        // limits sourced from the control plane.
+        connection_limiter: None,
     };
     let router = basin_router::run_until_bound(server_cfg)
         .await
@@ -649,8 +653,8 @@ fn build_storage_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
             );
             Ok(Arc::new(fs))
         }
-        "r2" | "s3" | "tigris" => {
-            let s3_cfg = basin_storage::backends::r2::S3LikeConfig::from_env()
+        "s3" | "tigris" => {
+            let s3_cfg = basin_storage::backends::s3_compatible::S3LikeConfig::from_env()
                 .map_err(|e| anyhow!(e))
                 .context("load S3-compatible storage backend config")?;
             let provider = format!("{:?}", s3_cfg.provider);
@@ -673,7 +677,7 @@ fn build_storage_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
             Ok(store)
         }
         other => Err(anyhow!(
-            "BASIN_STORAGE_BACKEND must be 'local', 'r2', 's3', or 'tigris', got {other:?}"
+            "BASIN_STORAGE_BACKEND must be 'local', 's3', or 'tigris', got {other:?}"
         )),
     }
 }
@@ -705,8 +709,8 @@ fn build_wal_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
             );
             Ok(Arc::new(fs))
         }
-        "r2" | "s3" | "tigris" => {
-            let s3_cfg = basin_storage::backends::r2::S3LikeConfig::from_env()
+        "s3" | "tigris" => {
+            let s3_cfg = basin_storage::backends::s3_compatible::S3LikeConfig::from_env()
                 .map_err(|e| anyhow!(e))
                 .context(
                     "load S3-compatible WAL backend config; BASIN_WAL_BACKEND uses BASIN_STORAGE_* credentials",
@@ -731,7 +735,7 @@ fn build_wal_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
             Ok(store)
         }
         other => Err(anyhow!(
-            "BASIN_WAL_BACKEND must be 'local', 'r2', 's3', or 'tigris', got {other:?}"
+            "BASIN_WAL_BACKEND must be 'local', 's3', or 'tigris', got {other:?}"
         )),
     }
 }

@@ -7,12 +7,11 @@
 //!
 //! Today's contents:
 //!
-//! - [`r2`] — S3-compatible backend module covering Tigris, Cloudflare R2,
-//!   AWS S3, MinIO, etc. (same builder, different endpoint / region defaults).
-//!   Picked by `BASIN_STORAGE_BACKEND=r2|s3|tigris`, or inferred from Fly's
+//! - [`s3_compatible`] — S3-compatible backend module covering Tigris, AWS S3,
+//!   MinIO, Wasabi, etc. (same builder, different endpoint / region defaults).
+//!   Picked by `BASIN_STORAGE_BACKEND=s3|tigris`, or inferred from Fly's
 //!   `AWS_ENDPOINT_URL_S3` when no explicit backend is set. The config
-//!   type is `S3LikeConfig` (with `R2Config` retained as a
-//!   backward-compat alias).
+//!   type is `S3LikeConfig`.
 //!
 //! `local` and `memory` backends don't live here because they don't need
 //! configuration plumbing — `LocalFileSystem::new_with_prefix(path)` and
@@ -20,4 +19,4 @@
 //!
 //! See `docs/scaling/object-storage.md` for the full design.
 
-pub mod r2;
+pub mod s3_compatible;

@@ -244,7 +244,7 @@ pub async fn start_n_shards(n: usize) -> Cluster {
 
 /// Variant of [`start_n_shards`] that lets the caller supply a pre-built
 /// [`basin_storage::Storage`] and the [`TempDir`] backing it. Tests that
-/// need to point shards at an alternative object store (e.g. real S3 / R2)
+/// need to point shards at an alternative object store (e.g. real S3 / Tigris)
 /// build the `Storage` themselves and feed it in here. The returned
 /// `Cluster` keeps the tempdir alive for the duration of the test.
 ///
@@ -283,6 +283,7 @@ pub async fn start_n_shards_with_storage(
             pool: None,
             shard_endpoints: None,
             tls: None,
+        connection_limiter: None,
         })
         .await
         .expect("spawn shard listener");
@@ -311,6 +312,7 @@ pub async fn start_n_shards_with_storage(
         pool: None,
         shard_endpoints: Some(shard_endpoints.clone()),
         tls: None,
+        connection_limiter: None,
     })
     .await
     .expect("spawn front router");

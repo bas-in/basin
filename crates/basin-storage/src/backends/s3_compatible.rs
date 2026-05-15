@@ -1,10 +1,10 @@
-//! S3-compatible object-store backend (R2 / Tigris / S3 / MinIO / Wasabi).
+//! S3-compatible object-store backend (Tigris / S3 / MinIO / Wasabi / etc.).
 //!
-//! Cloudflare R2, Tigris (Fly's S3 surface), AWS S3, MinIO and Wasabi all
-//! speak the same S3 API: SigV4, same `PutObject` / `GetObject` /
-//! `DeleteObjects` actions. The only differences are the endpoint URL and
-//! the region literal — both belong in config, not in code. As a result
-//! this module is a thin wrapper around `object_store::aws::AmazonS3`.
+//! Tigris (Fly's S3 surface), AWS S3, MinIO and Wasabi all speak the same S3
+//! API: SigV4, same `PutObject` / `GetObject` / `DeleteObjects` actions. The
+//! only differences are the endpoint URL and the region literal — both belong
+//! in config, not in code. As a result this module is a thin wrapper around
+//! `object_store::aws::AmazonS3`.
 //!
 //! Why a wrapper at all?
 //!
@@ -14,9 +14,9 @@
 //!   app automatically — when both are present the canonical
 //!   `BASIN_STORAGE_*` wins. The binary's startup code calls one function
 //!   and doesn't care about the difference.
-//! - Centralised defaults: `region = "auto"` for R2 and Tigris,
-//!   virtual-hosted-style on, anonymous-credentials off. Easy to get wrong
-//!   by hand.
+//! - Centralised defaults: `region = "auto"` for Tigris (and other
+//!   providers that use `auto`), virtual-hosted-style on, anonymous-credentials
+//!   off. Easy to get wrong by hand.
 //! - One place to add provider-specific tweaks (e.g. provider IA storage class
 //!   when we wire lifecycle policies through the engine instead of the
 //!   bucket dashboard).
@@ -35,34 +35,28 @@ use object_store::ObjectStore;
 /// env-var surface; only the *default* region and endpoint differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
-    /// Cloudflare R2. Region must be `auto`; endpoint is required and
-    /// follows the shape `https://<account-id>.r2.cloudflarestorage.com`.
-    R2,
     /// AWS S3 proper. Region is required (e.g. `us-east-1`); endpoint is
     /// optional (defaults to the AWS regional endpoint).
     S3,
     /// Tigris (Fly's globally distributed S3-compatible store, provisioned
     /// via `fly storage create`). Region is `auto`; endpoint defaults to
-    /// `https://fly.storage.tigris.dev`.
+    /// `https://fly.storage.tigris.dev`. This is the basin-cloud default.
     Tigris,
 }
 
 impl Provider {
     fn default_region(self) -> &'static str {
         match self {
-            Provider::R2 => "auto",
             Provider::S3 => "us-east-1",
             Provider::Tigris => "auto",
         }
     }
 
     /// Provider's well-known endpoint, if one exists. `S3` has no fixed
-    /// endpoint (the AWS SDK derives it from the region); R2 needs an
-    /// account-scoped endpoint and so returns `None` (it must come from
-    /// config); Tigris has a single global endpoint.
+    /// endpoint (the AWS SDK derives it from the region); Tigris has a
+    /// single global endpoint.
     fn default_endpoint(&self) -> Option<&'static str> {
         match self {
-            Provider::R2 => None,
             Provider::S3 => None,
             Provider::Tigris => Some("https://fly.storage.tigris.dev"),
         }
@@ -76,10 +70,9 @@ impl Provider {
 pub struct S3LikeConfig {
     pub provider: Provider,
     pub bucket: String,
-    /// Optional. Required for `Provider::R2`. Shape:
-    /// `https://<account-id>.r2.cloudflarestorage.com`. For `Provider::S3`
-    /// leave `None` to use AWS's regional endpoint; set for S3-compatible
-    /// stores like MinIO or Wasabi. For `Provider::Tigris`, defaults to
+    /// Optional. For `Provider::S3`, leave `None` to use AWS's regional
+    /// endpoint; set for S3-compatible stores like MinIO, Wasabi, or any
+    /// custom endpoint. For `Provider::Tigris`, defaults to
     /// `https://fly.storage.tigris.dev` if unset.
     pub endpoint: Option<String>,
     pub region: String,
@@ -89,18 +82,15 @@ pub struct S3LikeConfig {
     pub session_token: Option<String>,
 }
 
-/// Backward-compatibility alias for the pre-rename type name.
-pub type R2Config = S3LikeConfig;
-
 impl S3LikeConfig {
     /// Construct from environment variables. The contract:
     ///
     /// | Env var                            | Fly fallback              | Required | Notes                                              |
     /// |------------------------------------|---------------------------|----------|----------------------------------------------------|
-    /// | `BASIN_STORAGE_BACKEND`            | —                         | see note | `r2`, `s3` or `tigris`; can be inferred (see note) |
+    /// | `BASIN_STORAGE_BACKEND`            | —                         | see note | `s3` or `tigris`; can be inferred (see note)       |
     /// | `BASIN_STORAGE_BUCKET`             | `BUCKET_NAME`             | yes      |                                                    |
-    /// | `BASIN_STORAGE_ENDPOINT`           | `AWS_ENDPOINT_URL_S3`     | r2 only  | tigris defaults to `https://fly.storage.tigris.dev`|
-    /// | `BASIN_STORAGE_REGION`             | `AWS_REGION`              | no       | defaults: r2/tigris=`auto`, s3=`us-east-1`         |
+    /// | `BASIN_STORAGE_ENDPOINT`           | `AWS_ENDPOINT_URL_S3`     | no       | tigris defaults to `https://fly.storage.tigris.dev`|
+    /// | `BASIN_STORAGE_REGION`             | `AWS_REGION`              | no       | defaults: tigris=`auto`, s3=`us-east-1`            |
     /// | `BASIN_STORAGE_ACCESS_KEY_ID`      | `AWS_ACCESS_KEY_ID`       | yes      |                                                    |
     /// | `BASIN_STORAGE_SECRET_ACCESS_KEY`  | `AWS_SECRET_ACCESS_KEY`   | yes      |                                                    |
     /// | `BASIN_STORAGE_SESSION_TOKEN`      | —                         | no       | STS deployments only                               |
@@ -108,7 +98,7 @@ impl S3LikeConfig {
     /// Backend inference: if `BASIN_STORAGE_BACKEND` is unset but
     /// `AWS_ENDPOINT_URL_S3` is set (Fly-Tigris case), the provider is
     /// inferred from the endpoint host — `tigris.dev` → `Tigris`,
-    /// `cloudflarestorage.com` → `R2`, otherwise `S3`.
+    /// otherwise `S3`.
     ///
     /// The function is library-agnostic about the error type so it can be
     /// called from `anyhow`-using binaries; we return a `String` and let
@@ -119,12 +109,11 @@ impl S3LikeConfig {
             .filter(|s| !s.is_empty())
         {
             Some(b) => match b.as_str() {
-                "r2" => Provider::R2,
                 "s3" => Provider::S3,
                 "tigris" => Provider::Tigris,
                 other => {
                     return Err(format!(
-                        "S3LikeConfig::from_env: unsupported backend {other:?} (expected r2, s3, or tigris)"
+                        "S3LikeConfig::from_env: unsupported backend {other:?} (expected s3 or tigris)"
                     ))
                 }
             },
@@ -136,7 +125,6 @@ impl S3LikeConfig {
                     .filter(|s| !s.is_empty());
                 match ep.as_deref() {
                     Some(e) if e.contains("tigris.dev") => Provider::Tigris,
-                    Some(e) if e.contains("cloudflarestorage.com") => Provider::R2,
                     Some(_) => Provider::S3,
                     None => {
                         return Err(
@@ -161,12 +149,6 @@ impl S3LikeConfig {
                     .filter(|s| !s.is_empty())
             })
             .or_else(|| provider.default_endpoint().map(|s| s.to_string()));
-        if provider == Provider::R2 && endpoint.is_none() {
-            return Err(
-                "BASIN_STORAGE_BACKEND=r2 requires BASIN_STORAGE_ENDPOINT (or AWS_ENDPOINT_URL_S3)"
-                    .into(),
-            );
-        }
 
         let region = std::env::var("BASIN_STORAGE_REGION")
             .ok()
@@ -200,10 +182,8 @@ impl S3LikeConfig {
             .with_region(&self.region)
             .with_access_key_id(&self.access_key_id)
             .with_secret_access_key(&self.secret_access_key)
-            // R2 needs virtual-hosted-style (`<bucket>.<acc>.r2...`) so the
-            // pre-signed URLs the engine hands out match Cloudflare's
-            // routing. Tigris and AWS S3 also accept this form, so this
-            // default is safe across providers.
+            // Virtual-hosted-style is required by Tigris and accepted by
+            // AWS S3, so this default is safe across S3-compatible providers.
             .with_virtual_hosted_style_request(true);
 
         if let Some(ep) = &self.endpoint {
@@ -212,7 +192,7 @@ impl S3LikeConfig {
         if let Some(tok) = &self.session_token {
             b = b.with_token(tok);
         }
-        // R2 / Tigris endpoints are always HTTPS; reject any plaintext
+        // S3-compatible endpoints are always HTTPS; reject any plaintext
         // config to avoid silently leaking credentials over the wire.
         if let Some(ep) = &self.endpoint {
             if !ep.starts_with("https://") {
@@ -312,9 +292,9 @@ mod tests {
     }
 
     #[test]
-    fn default_region_for_r2_is_auto() {
-        assert_eq!(Provider::R2.default_region(), "auto");
+    fn default_region_for_s3_is_us_east_1() {
         assert_eq!(Provider::S3.default_region(), "us-east-1");
+        assert_eq!(Provider::S3.default_endpoint(), None);
     }
 
     #[test]
@@ -324,14 +304,12 @@ mod tests {
             Provider::Tigris.default_endpoint(),
             Some("https://fly.storage.tigris.dev")
         );
-        assert_eq!(Provider::R2.default_endpoint(), None);
-        assert_eq!(Provider::S3.default_endpoint(), None);
     }
 
     #[test]
     fn build_rejects_plaintext_endpoint() {
         let cfg = S3LikeConfig {
-            provider: Provider::R2,
+            provider: Provider::Tigris,
             bucket: "b".into(),
             endpoint: Some("http://example.com".into()),
             region: "auto".into(),
@@ -341,22 +319,6 @@ mod tests {
         };
         let err = cfg.build_object_store().unwrap_err();
         assert!(err.contains("HTTPS"), "got {err}");
-    }
-
-    #[test]
-    fn build_accepts_well_formed_r2_config() {
-        let cfg = S3LikeConfig {
-            provider: Provider::R2,
-            bucket: "basin-engine-dev".into(),
-            endpoint: Some("https://abc.r2.cloudflarestorage.com".into()),
-            region: "auto".into(),
-            access_key_id: "AKIA...".into(),
-            secret_access_key: "secret".into(),
-            session_token: None,
-        };
-        // We don't actually issue any HTTP — just prove the builder is
-        // happy with the shape.
-        let _store = cfg.build_object_store().expect("build");
     }
 
     #[test]

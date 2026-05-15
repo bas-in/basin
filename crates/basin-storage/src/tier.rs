@@ -7,7 +7,7 @@
 //! catalog records; the compactor enforces the policy.
 //!
 //! On real deployments, the cold prefix maps to a cheaper storage class
-//! (S3 Infrequent Access, R2-IA, or provider equivalent) via a bucket
+//! (S3 Infrequent Access, Tigris infrequent-access, or provider equivalent) via a bucket
 //! lifecycle rule. Wiring that up is out of scope for the in-process viability test —
 //! we only need the path layout + atomic catalog swap to be honest.
 
