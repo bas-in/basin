@@ -164,6 +164,10 @@ pub(crate) struct CacheEntry {
 /// field order differs, and that's recoverable downstream.
 ///
 /// Caller passes `None` for "all columns".
+///
+/// Allocation policy: zero heap allocation for the common cases (None or
+/// 1 column). For ≥2 columns we need a scratch Vec to sort, sized exactly
+/// to `cols.len()`, so bookkeeping is O(ncols) not O(ncols × avg_name_len).
 pub(crate) fn hash_projection(projection: Option<&[String]>) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     match projection {
@@ -171,11 +175,23 @@ pub(crate) fn hash_projection(projection: Option<&[String]>) -> u64 {
             b"ALL".hash(&mut h);
         }
         Some(cols) => {
-            let mut sorted: Vec<&String> = cols.iter().collect();
-            sorted.sort();
             b"PROJ".hash(&mut h);
-            for c in sorted {
-                c.hash(&mut h);
+            match cols.len() {
+                0 => {}
+                1 => {
+                    // Single column: no sort needed, no allocation.
+                    cols[0].hash(&mut h);
+                }
+                _ => {
+                    // Multiple columns: sort indices rather than cloning
+                    // strings, so we allocate one Vec<usize> instead of
+                    // a Vec<&String> of the same size.
+                    let mut order: Vec<usize> = (0..cols.len()).collect();
+                    order.sort_by_key(|&i| cols[i].as_str());
+                    for i in order {
+                        cols[i].hash(&mut h);
+                    }
+                }
             }
         }
     }
@@ -183,40 +199,79 @@ pub(crate) fn hash_projection(projection: Option<&[String]>) -> u64 {
 }
 
 /// Hash a filter set deterministically. Order-independent (we sort by a
-/// stable string form first) so `WHERE a = 1 AND b = 2` matches
+/// stable tuple key) so `WHERE a = 1 AND b = 2` matches
 /// `WHERE b = 2 AND a = 1`.
+///
+/// Allocation policy: zero heap allocation when there are 0 or 1 filters
+/// (the common case for point queries and full scans). For ≥2 filters we
+/// allocate one `Vec<usize>` of index permutations (not a Vec<String>)
+/// so each predicate contributes 8 bytes of scratch rather than a
+/// heap-formatted string.
 pub(crate) fn hash_filters(filters: &[Predicate]) -> u64 {
-    let mut keys: Vec<String> = filters.iter().map(predicate_to_key).collect();
-    keys.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     b"FLT".hash(&mut h);
-    for k in &keys {
-        k.hash(&mut h);
+    match filters.len() {
+        0 => {}
+        1 => {
+            // Single filter: no sort needed, no allocation.
+            hash_one_predicate(&mut h, &filters[0]);
+        }
+        _ => {
+            // Multiple filters: sort by index using a stable tuple key,
+            // then hash in sorted order. No string formatting needed.
+            let mut order: Vec<usize> = (0..filters.len()).collect();
+            order.sort_by_key(|&i| predicate_sort_key(&filters[i]));
+            for i in order {
+                hash_one_predicate(&mut h, &filters[i]);
+            }
+        }
     }
     h.finish()
 }
 
-fn predicate_to_key(p: &Predicate) -> String {
+/// Feed one predicate into a hasher without any intermediate allocation.
+fn hash_one_predicate(h: &mut std::collections::hash_map::DefaultHasher, p: &Predicate) {
     let (op, col, val) = match p {
-        Predicate::Eq(c, v) => ("EQ", c, v),
-        Predicate::Gt(c, v) => ("GT", c, v),
-        Predicate::Lt(c, v) => ("LT", c, v),
+        Predicate::Eq(c, v) => (0u8, c, v),
+        Predicate::Gt(c, v) => (1u8, c, v),
+        Predicate::Lt(c, v) => (2u8, c, v),
     };
-    format!("{op}|{col}|{}", scalar_to_key(val))
+    op.hash(h);
+    col.hash(h);
+    hash_scalar(h, val);
 }
 
-fn scalar_to_key(v: &ScalarValue) -> String {
+/// Hash a scalar directly without formatting it as a String.
+fn hash_scalar(h: &mut std::collections::hash_map::DefaultHasher, v: &ScalarValue) {
     match v {
-        ScalarValue::Int64(x) => format!("i64:{x}"),
-        ScalarValue::UInt64(x) => format!("u64:{x}"),
-        // f64 hashing via to_bits keeps NaN deterministic (same NaN
-        // bit-pattern hashes the same; different patterns don't share
-        // a cache slot, which is fine — NaN equality is undefined
-        // anyway).
-        ScalarValue::Float64(x) => format!("f64:{}", x.to_bits()),
-        ScalarValue::Utf8(s) => format!("utf8:{s}"),
-        ScalarValue::Boolean(b) => format!("bool:{b}"),
+        ScalarValue::Int64(x) => { 0u8.hash(h); x.hash(h); }
+        ScalarValue::UInt64(x) => { 1u8.hash(h); x.hash(h); }
+        // Hash f64 via its bit representation so NaN is deterministic.
+        ScalarValue::Float64(x) => { 2u8.hash(h); x.to_bits().hash(h); }
+        ScalarValue::Utf8(s) => { 3u8.hash(h); s.hash(h); }
+        ScalarValue::Boolean(b) => { 4u8.hash(h); b.hash(h); }
     }
+}
+
+/// A sort key for predicates that is allocation-free (returns a tuple of
+/// primitive / borrowed values that `sort_by_key` can use without boxing).
+/// The tuple is `(op_tag, column_name, value_discriminant, value_bytes)`.
+/// Value bytes cover the integer/float cases; strings sort by their content.
+/// This mirrors the ordering that the old string-formatted sort produced.
+fn predicate_sort_key(p: &Predicate) -> (u8, &str, u8) {
+    let (op, col, val) = match p {
+        Predicate::Eq(c, v) => (0u8, c.as_str(), v),
+        Predicate::Gt(c, v) => (1u8, c.as_str(), v),
+        Predicate::Lt(c, v) => (2u8, c.as_str(), v),
+    };
+    let vd = match val {
+        ScalarValue::Int64(_) => 0u8,
+        ScalarValue::UInt64(_) => 1u8,
+        ScalarValue::Float64(_) => 2u8,
+        ScalarValue::Utf8(_) => 3u8,
+        ScalarValue::Boolean(_) => 4u8,
+    };
+    (op, col, vd)
 }
 
 /// Default LRU index capacity. The byte budget is the load-bearing

@@ -78,6 +78,11 @@ pub(crate) async fn list_data_files_with_stats(
 
     // Fan out per-file footer reads with bounded concurrency. Each cache
     // hit is a no-op; cache misses do one short range GET each.
+    //
+    // We use `size_bytes` from the listing result (populated by
+    // `list_data_files`) instead of issuing a HEAD per file: object-store
+    // LIST responses already include the object size, so the HEAD would be
+    // a redundant round-trip that duplicates work the LIST already did.
     let work: Vec<_> = files
         .iter()
         .enumerate()
@@ -85,17 +90,17 @@ pub(crate) async fn list_data_files_with_stats(
             let store = store.clone();
             let cache = cache.clone();
             let path = f.path.clone();
+            let listed_size = f.size_bytes; // captured from LIST, no HEAD needed
             async move {
                 let meta = if let Some(cached) = cache.get(&path) {
                     cached.meta
                 } else {
-                    let head = store
-                        .head(&path)
-                        .await
-                        .map_err(|e| BasinError::storage(format!("head {path}: {e}")))?;
-                    let size = head.size;
+                    // Use the file size from the listing to skip the HEAD
+                    // round-trip. The size is stable for our immutable data
+                    // files and is accurate: object_store LIST returns the
+                    // real content-length for every backend we support.
                     let mut reader = ParquetObjectReader::new(store.clone(), path.clone())
-                        .with_file_size(size);
+                        .with_file_size(listed_size);
                     let arrow_meta =
                         ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
                             .await
@@ -107,7 +112,7 @@ pub(crate) async fn list_data_files_with_stats(
                         path.clone(),
                         CachedParquetMeta {
                             meta: m.clone(),
-                            size,
+                            size: listed_size,
                         },
                     );
                     m
@@ -561,9 +566,9 @@ fn build_row_filter(
         Vec::with_capacity(filters.len());
 
     for filter in filters {
-        let col = filter.column().to_string();
+        let col = filter.column();
         let col_idx = arrow_schema
-            .index_of(&col)
+            .index_of(col)
             .map_err(|_| BasinError::storage(format!("unknown column {col}")))?;
         let mask = ProjectionMask::roots(parquet_schema, [col_idx]);
         let f = filter.clone();
@@ -680,44 +685,34 @@ fn bloom_check(sbbf: &parquet::bloom_filter::Sbbf, value: &ScalarValue) -> bool 
 }
 
 /// Decide if an entire row group can be pruned given the conjunction of
-/// filters.
-fn row_group_pruned(
-    rg: &RowGroupMetaData,
-    arrow_schema: &SchemaRef,
-    filters: &[Predicate],
-) -> bool {
-    if filters.is_empty() {
-        return false;
-    }
-    for f in filters {
-        if predicate_excludes_group(rg, arrow_schema, f) {
+/// filters, using pre-resolved (column_index, predicate) pairs. This
+/// avoids calling `arrow_schema.index_of` inside the per-row-group loop.
+fn row_group_pruned_resolved(rg: &RowGroupMetaData, resolved: &[(usize, &Predicate)]) -> bool {
+    for &(idx, f) in resolved {
+        if predicate_excludes_group_by_idx(rg, idx, f) {
             return true;
         }
     }
     false
 }
 
-fn predicate_excludes_group(
-    rg: &RowGroupMetaData,
-    arrow_schema: &SchemaRef,
-    filter: &Predicate,
-) -> bool {
-    let col = filter.column();
-    let Ok(idx) = arrow_schema.index_of(col) else {
-        return false;
-    };
-    let Some(col_meta) = rg.columns().get(idx) else {
+/// Check if a predicate can rule out a row group using the pre-resolved
+/// column index. Avoids the `index_of` schema scan and avoids cloning the
+/// scalar value (borrows it directly from the predicate).
+fn predicate_excludes_group_by_idx(rg: &RowGroupMetaData, col_idx: usize, filter: &Predicate) -> bool {
+    let Some(col_meta) = rg.columns().get(col_idx) else {
         return false;
     };
     let Some(stats) = col_meta.statistics() else {
         return false;
     };
 
-    let Some(value) = filter_value(filter) else {
-        return false;
+    // Borrow the scalar value directly — no clone needed.
+    let value = match filter {
+        Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v,
     };
 
-    match (filter, &value, stats) {
+    match (filter, value, stats) {
         (Predicate::Eq(_, _), ScalarValue::Int64(v), Statistics::Int64(s)) => {
             let min = s.min_opt().copied();
             let max = s.max_opt().copied();
@@ -743,12 +738,6 @@ fn predicate_excludes_group(
             }
         }
         _ => false,
-    }
-}
-
-fn filter_value(filter: &Predicate) -> Option<ScalarValue> {
-    match filter {
-        Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => Some(v.clone()),
     }
 }
 
@@ -874,8 +863,22 @@ where
             .fetch_add(total, Ordering::Relaxed);
         let mut kept = Vec::with_capacity(row_groups.len());
         let mut pruned = 0u64;
+        // Pre-resolve (col_index, predicate_ref) once per file rather than
+        // re-running `arrow_schema.index_of(col)` (an O(ncols) linear scan)
+        // inside the per-row-group loop. For a file with N row groups and M
+        // filters this cuts schema lookups from N×M to M — a real win when
+        // N is 10+ (e.g. the 10k-row-per-file shape in the predicate-pushdown
+        // benchmark).
+        let resolved: Vec<(usize, &Predicate)> = if opts.filters.is_empty() {
+            Vec::new()
+        } else {
+            opts.filters
+                .iter()
+                .filter_map(|f| arrow_schema.index_of(f.column()).ok().map(|idx| (idx, f)))
+                .collect()
+        };
         for (i, rg) in row_groups.iter().enumerate() {
-            if row_group_pruned(rg, &arrow_schema, &opts.filters) {
+            if row_group_pruned_resolved(rg, &resolved) {
                 pruned += 1;
             } else {
                 kept.push(i);
