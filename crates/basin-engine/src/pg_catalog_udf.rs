@@ -22,7 +22,7 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, String
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
@@ -526,7 +526,8 @@ impl ScalarUDFImpl for SimpleOidBoolUdf {
         Ok(DataType::Boolean)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(BooleanArray::from(vec![self.value; n]));
         Ok(ColumnarValue::Array(arr))
@@ -558,7 +559,8 @@ impl ScalarUDFImpl for SimpleOidTextUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(StringArray::from(vec![self.value.as_str(); n]));
         Ok(ColumnarValue::Array(arr))
@@ -590,7 +592,8 @@ impl ScalarUDFImpl for EmptyTextMultiArgUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(StringArray::from(vec![""; n]));
         Ok(ColumnarValue::Array(arr))
@@ -622,7 +625,8 @@ impl ScalarUDFImpl for NullTextMultiArgUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; n]));
         Ok(ColumnarValue::Array(arr))
@@ -688,7 +692,8 @@ impl ScalarUDFImpl for FormatTypeUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         // First arg is the OID; ignore the second (typemod).
         let oid_col = args[0].clone().into_array(n)?;
@@ -749,7 +754,8 @@ impl ScalarUDFImpl for RelationSizeUdf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![0i64; n]));
         Ok(ColumnarValue::Array(arr))
@@ -780,7 +786,8 @@ impl ScalarUDFImpl for PgEncodingToCharUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(StringArray::from(vec!["UTF8"; n]));
         Ok(ColumnarValue::Array(arr))
@@ -811,7 +818,7 @@ impl ScalarUDFImpl for CurrentSchemaUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
             "public".to_string(),
         ))))
@@ -850,7 +857,8 @@ impl ScalarUDFImpl for CurrentSchemasUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         // Return the PG text-array literal form: {pg_catalog,public}
         let arr: ArrayRef = Arc::new(StringArray::from(vec!["{pg_catalog,public}"; n]));
@@ -882,7 +890,8 @@ impl ScalarUDFImpl for HasPrivilegeUdf {
         Ok(DataType::Boolean)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));
         Ok(ColumnarValue::Array(arr))
@@ -913,7 +922,8 @@ impl ScalarUDFImpl for VoidNullArgUdf {
         Ok(DataType::Null)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let _ = args;
         Ok(ColumnarValue::Scalar(ScalarValue::Null))
     }
@@ -945,7 +955,8 @@ impl ScalarUDFImpl for SimpleConstBoolUdf {
         Ok(DataType::Boolean)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(BooleanArray::from(vec![self.value; n]));
         Ok(ColumnarValue::Array(arr))
@@ -977,17 +988,11 @@ impl ScalarUDFImpl for SimpleConstTextUdf {
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
-    #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = if args.is_empty() { 1 } else { num_rows(args) };
         let arr: ArrayRef = Arc::new(StringArray::from(vec![self.value.as_str(); n]));
         Ok(ColumnarValue::Array(arr))
-    }
-    #[allow(deprecated)]
-    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            self.value.clone(),
-        ))))
     }
 }
 
@@ -1017,7 +1022,8 @@ impl ScalarUDFImpl for SimpleConstInt64Udf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![self.value; n]));
         Ok(ColumnarValue::Array(arr))

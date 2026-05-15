@@ -51,7 +51,7 @@ use datafusion::catalog::{SchemaProvider, Session};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_plan::memory::MemoryExec;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::convert::{batch_ws_to_df, schema_ws_to_df};
@@ -127,8 +127,8 @@ impl TableProvider for InfoSchemaTablesProvider {
         // partition. We always emit a single partition (the catalog scan
         // is cheap enough that splitting wouldn't help).
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -190,8 +190,8 @@ impl TableProvider for InfoSchemaColumnsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -253,8 +253,8 @@ impl TableProvider for PgAttributeProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -315,8 +315,8 @@ impl TableProvider for PgNamespaceProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -376,8 +376,8 @@ impl TableProvider for PgClassProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -440,8 +440,8 @@ impl TableProvider for PgProcProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -503,8 +503,8 @@ impl TableProvider for RoutinesProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -567,8 +567,8 @@ impl TableProvider for PgIndexProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -629,8 +629,8 @@ impl TableProvider for PgConstraintProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -692,8 +692,8 @@ impl TableProvider for InfoSchemaViewsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -753,8 +753,8 @@ impl TableProvider for PgViewsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -814,8 +814,8 @@ impl TableProvider for InfoSchemaSchemataProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -878,8 +878,8 @@ impl TableProvider for TableConstraintsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -940,8 +940,8 @@ impl TableProvider for KeyColumnUsageProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -1003,8 +1003,8 @@ impl TableProvider for ReferentialConstraintsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -1066,8 +1066,8 @@ impl TableProvider for PgTypeProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -1128,8 +1128,8 @@ impl TableProvider for PgDependProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -1191,8 +1191,8 @@ impl TableProvider for PgAuthidProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemoryExec::try_new(&partitions, Arc::clone(&self.schema), projection.cloned())?;
-        Ok(Arc::new(exec))
+        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        Ok(exec)
     }
 }
 
@@ -1264,12 +1264,12 @@ macro_rules! simple_provider {
                 let df_batch = batch_ws_to_df(&ws_batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let partitions = vec![vec![df_batch]];
-                let exec = MemoryExec::try_new(
+                let exec = MemorySourceConfig::try_new_exec(
                     &partitions,
                     Arc::clone(&self.schema),
                     projection.cloned(),
                 )?;
-                Ok(Arc::new(exec))
+                Ok(exec)
             }
         }
     };
@@ -1347,7 +1347,7 @@ pub(crate) fn register_info_schema_providers(
     catalog: Arc<dyn Catalog>,
     project: ProjectId,
 ) -> DfResult<()> {
-    use datafusion::catalog_common::memory::MemorySchemaProvider;
+    use datafusion::catalog::MemorySchemaProvider;
 
     // The default catalog name is `datafusion` (see DataFusion's
     // `ConfigOptions::default_catalog`). It's created automatically by

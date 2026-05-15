@@ -35,7 +35,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::prelude::SessionContext;
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -99,7 +99,8 @@ impl ScalarUDFImpl for OverlapsUdf {
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 4 {
             return exec_err!("overlaps: expected 4 args, got {}", args.len());
         }
@@ -181,7 +182,8 @@ impl ScalarUDFImpl for InfinityTimestampUdf {
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!(
                 "cast_infinity_timestamp: expected 1 arg, got {}",
@@ -251,7 +253,8 @@ impl ScalarUDFImpl for ArrayDimsUdf {
             other => exec_err!("array_dims: unsupported type {other:?}"),
         }
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("array_dims: expected 1 arg, got {}", args.len());
         }
@@ -325,7 +328,8 @@ impl ScalarUDFImpl for ArrayBoundUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Int64)
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("{} expects 2 arguments, got {}", self.name, args.len());
         }
@@ -382,7 +386,8 @@ impl ScalarUDFImpl for GenerateSubscriptsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Int64)
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() < 2 {
             return exec_err!("generate_subscripts expects at least 2 arguments");
         }
@@ -431,7 +436,8 @@ impl ScalarUDFImpl for ArrayContainsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("array_contains expects 2 arguments, got {}", args.len());
         }
@@ -488,7 +494,8 @@ impl ScalarUDFImpl for ArraysOverlapUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("arrays_overlap expects 2 arguments, got {}", args.len());
         }
@@ -545,7 +552,8 @@ impl ScalarUDFImpl for Int4MultirangeUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = args.iter().filter_map(|a| match a {
             ColumnarValue::Array(arr) => Some(arr.len()),
             _ => None,

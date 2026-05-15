@@ -23,7 +23,7 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -214,7 +214,10 @@ impl ScalarUDFImpl for RangeConstructorUdf {
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         if args.len() < 2 {
             return exec_err!("{}: expected at least 2 arguments", self.name);
         }
@@ -337,7 +340,10 @@ impl ScalarUDFImpl for RangeAccessorUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let field_key = match self.field {
             RangeField::Lower => "l",
             RangeField::Upper => "u",
@@ -398,7 +404,10 @@ impl ScalarUDFImpl for IsEmptyUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let range_strs = columnar_to_strings(&args[0], batch_size)?;
         let mut out = Vec::with_capacity(batch_size);
         for rs in &range_strs {
@@ -460,7 +469,10 @@ impl ScalarUDFImpl for BoundFlagUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let range_strs = columnar_to_strings(&args[0], batch_size)?;
         let flag = self.flag;
         let mut out = Vec::with_capacity(batch_size);
@@ -512,7 +524,10 @@ impl ScalarUDFImpl for RangeContainsElemUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let range_strs = columnar_to_strings(&args[0], batch_size)?;
         let elem_strs = columnar_to_strings(&args[1], batch_size)?;
         let mut out = Vec::with_capacity(batch_size);
@@ -572,7 +587,10 @@ impl ScalarUDFImpl for RangeOverlapsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let a_strs = columnar_to_strings(&args[0], batch_size)?;
         let b_strs = columnar_to_strings(&args[1], batch_size)?;
         let mut out = Vec::with_capacity(batch_size);
@@ -649,7 +667,10 @@ impl ScalarUDFImpl for RangeContainsRangeUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let outer_strs = columnar_to_strings(&args[0], batch_size)?;
         let inner_strs = columnar_to_strings(&args[1], batch_size)?;
         let mut out = Vec::with_capacity(batch_size);
@@ -738,7 +759,10 @@ impl ScalarUDFImpl for RangeRelationalUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let a_strs = columnar_to_strings(&args[0], batch_size)?;
         let b_strs = columnar_to_strings(&args[1], batch_size)?;
         let kind = self.kind;
@@ -831,7 +855,10 @@ impl ScalarUDFImpl for RangeMergeUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
-    fn invoke_batch(&self, args: &[ColumnarValue], batch_size: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let batch_size = args.number_rows;
+        let _ = batch_size;
+        let args = &args.args;
         let a_strs = columnar_to_strings(&args[0], batch_size)?;
         let b_strs = columnar_to_strings(&args[1], batch_size)?;
         let mut out: Vec<Option<String>> = Vec::with_capacity(batch_size);

@@ -43,7 +43,7 @@ use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -322,7 +322,8 @@ impl ScalarUDFImpl for SplitPartUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let delims = to_str_vec(args, 1, n)?;
@@ -397,7 +398,8 @@ impl ScalarUDFImpl for SimpleStrUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let out: Vec<Option<String>> = strings
@@ -440,7 +442,8 @@ impl ScalarUDFImpl for FormatUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.is_empty() {
             return exec_err!("format() requires at least 1 argument");
         }
@@ -532,7 +535,8 @@ impl ScalarUDFImpl for QuoteNullableUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr = args[0].clone().into_array(n)?;
         let out: Vec<Option<String>> = match arr.data_type() {
@@ -590,7 +594,8 @@ impl ScalarUDFImpl for RegexpMatchUdf {
     }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let patterns = to_str_vec(args, 1, n)?;
@@ -667,7 +672,8 @@ impl ScalarUDFImpl for RegexpSplitToArrayUdf {
     }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let patterns = to_str_vec(args, 1, n)?;
@@ -727,7 +733,8 @@ impl ScalarUDFImpl for RegexpSplitToTableStubUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         Ok(ColumnarValue::Array(str_vec_to_array(strings)))
@@ -750,7 +757,8 @@ impl ScalarUDFImpl for ChrUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr = args[0].clone().into_array(n)?;
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
@@ -805,7 +813,8 @@ impl ScalarUDFImpl for AsciiUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int32) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let out: Vec<Option<i32>> = strings
@@ -836,7 +845,8 @@ impl ScalarUDFImpl for TranslateUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let froms = to_str_vec(args, 1, n)?;
@@ -893,7 +903,8 @@ impl ScalarUDFImpl for TrimCharsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let chars_vec: Option<Vec<Option<String>>> = if args.len() > 1 {
@@ -946,7 +957,8 @@ impl ScalarUDFImpl for ConvertFromUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let bytes_arr = args[0].clone().into_array(n)?;
         let bytes = bytes_arr
@@ -985,7 +997,8 @@ impl ScalarUDFImpl for ConvertToUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Binary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let strings = to_str_vec(args, 0, n)?;
         let out: Vec<Option<Vec<u8>>> = strings
@@ -1014,7 +1027,8 @@ impl ScalarUDFImpl for IsFiniteUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));
         Ok(ColumnarValue::Array(arr))

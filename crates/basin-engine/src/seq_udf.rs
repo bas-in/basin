@@ -36,7 +36,7 @@ use basin_common::{BasinError, Result, ProjectId};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use tokio::sync::Mutex;
 
@@ -136,7 +136,7 @@ impl ScalarUDFImpl for NextvalUdf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         exec_err!(
             "nextval: dynamic sequence-name arguments are not supported in v0.1; \
              use a string literal"
@@ -171,7 +171,7 @@ impl ScalarUDFImpl for CurrvalUdf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         exec_err!(
             "currval: dynamic sequence-name arguments are not supported in v0.1; \
              use a string literal"
@@ -212,7 +212,7 @@ impl ScalarUDFImpl for SetvalUdf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         exec_err!(
             "setval: dynamic sequence-name arguments are not supported in v0.1; \
              use a string literal"
@@ -251,7 +251,7 @@ impl ScalarUDFImpl for LastvalUdf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         exec_err!(
             "lastval: call was not resolved by the pre-execution rewriter; \
              this is an internal error — please report it"

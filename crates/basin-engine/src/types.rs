@@ -430,7 +430,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
 
         SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Boolean),
 
-        SqlDataType::Double
+        SqlDataType::Double(_)
         | SqlDataType::DoublePrecision
         | SqlDataType::Float8
         | SqlDataType::Float(_) => Ok(DataType::Float64),

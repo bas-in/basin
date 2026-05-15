@@ -71,7 +71,7 @@ fn sql_data_type_to_arg(dt: &SqlDataType) -> Result<SqlArgType> {
         | SqlDataType::Character(_)
         | SqlDataType::String(_) => Ok(SqlArgType::Text),
         SqlDataType::Boolean | SqlDataType::Bool => Ok(SqlArgType::Boolean),
-        SqlDataType::Double
+        SqlDataType::Double(_)
         | SqlDataType::DoublePrecision
         | SqlDataType::Float8
         | SqlDataType::Float(_) => Ok(SqlArgType::Double),

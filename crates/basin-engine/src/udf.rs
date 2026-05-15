@@ -36,7 +36,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 use sha2::Digest;
@@ -340,7 +340,8 @@ impl ScalarUDFImpl for VectorDistanceUdf {
         Ok(DataType::Float64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         invoke_distance(self.kind, args)
     }
 }
@@ -740,7 +741,8 @@ impl ScalarUDFImpl for GenRandomUuid {
         Ok(DataType::FixedSizeBinary(16))
     }
     #[allow(deprecated)]
-    fn invoke_no_args(&self, number_rows: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let number_rows = args.number_rows;
         // Generate one fresh v4 UUID per row. The `Volatile` signature
         // disables DataFusion's "evaluate once and broadcast" path so
         // every row really does get a distinct id.
@@ -776,7 +778,8 @@ impl ScalarUDFImpl for DigestUdf {
         Ok(DataType::Binary)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         invoke_digest(args)
     }
 }
@@ -876,7 +879,8 @@ impl ScalarUDFImpl for EncodeUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         invoke_encode(args)
     }
 }
@@ -1003,7 +1007,8 @@ impl ScalarUDFImpl for DecodeUdf {
         Ok(DataType::Binary)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         invoke_decode(args)
     }
 }
@@ -1105,7 +1110,8 @@ impl ScalarUDFImpl for CryptUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         invoke_crypt(args)
     }
 }
@@ -1237,7 +1243,8 @@ impl ScalarUDFImpl for GenSaltUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         invoke_gen_salt(args)
     }
 }
@@ -1505,7 +1512,8 @@ impl ScalarUDFImpl for ModUdf {
         Ok(arg_types[0].clone())
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("mod expects 2 arguments, got {}", args.len());
         }
@@ -1597,7 +1605,8 @@ impl ScalarUDFImpl for AgeUdf {
         Ok(DataType::Interval(IntervalUnit::MonthDayNano))
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("age expects 2 arguments, got {}", args.len());
         }
@@ -1817,7 +1826,8 @@ impl ScalarUDFImpl for ToCharPgUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("to_char expects 2 arguments, got {}", args.len());
         }
@@ -1901,7 +1911,8 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
         Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("to_timestamp expects 2 arguments, got {}", args.len());
         }
@@ -1985,7 +1996,8 @@ impl ScalarUDFImpl for ToDatePgUdf {
         Ok(DataType::Date32)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("to_date expects 2 arguments, got {}", args.len());
         }
@@ -2050,7 +2062,8 @@ impl ScalarUDFImpl for ConvertBytesUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Binary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 3 {
             return exec_err!("convert expects 3 arguments, got {}", args.len());
         }
@@ -2121,7 +2134,8 @@ impl ScalarUDFImpl for LengthPgUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int32) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("length expects 1 argument, got {}", args.len());
         }
@@ -2340,7 +2354,8 @@ impl ScalarUDFImpl for ToNumberPgUdf {
         Ok(DataType::Float64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("to_number expects 2 arguments, got {}", args.len());
         }
@@ -2620,7 +2635,8 @@ impl ScalarUDFImpl for PowerFloat64Udf {
         Ok(DataType::Float64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("power expects 2 arguments, got {}", args.len());
         }
@@ -2687,7 +2703,8 @@ impl ScalarUDFImpl for ExtractSecondPgUdf {
         Ok(DataType::Float64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!(
                 "__basin_extract_second expects 1 argument, got {}",
@@ -2740,7 +2757,8 @@ impl ScalarUDFImpl for BasinAssertUdf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("__basin_assert expects 2 arguments, got {}", args.len());
         }
@@ -3083,7 +3101,7 @@ impl ScalarUDFImpl for AuthUidUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         match &self.auth_context.auth_uid {
             Some(uid) => {
                 let s = uid.to_string();
@@ -3123,7 +3141,7 @@ impl ScalarUDFImpl for AuthRoleUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         Ok(ColumnarValue::Scalar(
             datafusion::scalar::ScalarValue::Utf8(Some(self.auth_context.auth_role.clone())),
         ))
@@ -3160,7 +3178,7 @@ impl ScalarUDFImpl for AuthJwtUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         match &self.auth_context.auth_claims {
             Some(claims) => {
                 let json_str = serde_json::to_string(claims).map_err(|e| {

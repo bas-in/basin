@@ -3096,8 +3096,8 @@ fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
         | Expr::CompoundIdentifier(_)
         | Expr::Value(_)
         | Expr::TypedString { .. }
-        | Expr::Wildcard
-        | Expr::QualifiedWildcard(_) => {}
+        | Expr::Wildcard(_)
+        | Expr::QualifiedWildcard(_, _) => {}
         // Anything else (windows, lambdas, MATCH, dialect-specific) —
         // walking it is best-effort and we're conservative on misses
         // here: the `_` arm is reachable only on shapes that don't carry

@@ -40,7 +40,7 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Float32Array, Int3
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -285,7 +285,8 @@ impl ScalarUDFImpl for PassthroughLastTextUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let last = args.last().expect("at least one argument required");
         let arr = last.clone().into_array(n)?;
@@ -324,7 +325,8 @@ impl ScalarUDFImpl for PassthroughFirstTextUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let first = args.first().expect("at least one argument required");
         let arr = first.clone().into_array(n)?;
@@ -362,7 +364,8 @@ impl ScalarUDFImpl for ZeroFloat32Udf {
         Ok(DataType::Float32)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(Float32Array::from(vec![0.0f32; n]));
         Ok(ColumnarValue::Array(arr))
@@ -395,7 +398,8 @@ impl ScalarUDFImpl for ConstInt32Udf {
         Ok(DataType::Int32)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(Int32Array::from(vec![self.value; n]));
         Ok(ColumnarValue::Array(arr))
@@ -428,7 +432,8 @@ impl ScalarUDFImpl for TsvectorLengthUdf {
         Ok(DataType::Int32)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr = args[0].clone().into_array(n)?;
         let strings = arr
@@ -479,7 +484,8 @@ impl ScalarUDFImpl for TsHeadlineUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         // 2-arg: (body, tsquery) → body is args[0]
         // 3-arg: (config, body, tsquery) → body is args[1]
@@ -534,7 +540,8 @@ impl ScalarUDFImpl for TsvectorMatchUdf {
         Ok(DataType::Boolean)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(BooleanArray::from(vec![self.returns_true; n]));
         Ok(ColumnarValue::Array(arr))

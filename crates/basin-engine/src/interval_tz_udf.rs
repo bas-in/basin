@@ -67,7 +67,7 @@ use datafusion::arrow::array::types::IntervalMonthDayNano;
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -323,7 +323,8 @@ impl ScalarUDFImpl for JustifyUdf {
     }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let intervals = to_interval_vec(args, 0, n)?;
         let out: Vec<Option<IntervalMonthDayNano>> = intervals
@@ -390,7 +391,8 @@ impl ScalarUDFImpl for ToCharIntervalUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("to_char_interval expects 2 arguments, got {}", args.len());
         }
@@ -514,7 +516,8 @@ impl ScalarUDFImpl for TimezoneUdf {
     }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("timezone expects 2 arguments, got {}", args.len());
         }
@@ -575,7 +578,8 @@ impl ScalarUDFImpl for AtTimeZoneUdf {
     }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("at_time_zone expects 2 arguments, got {}", args.len());
         }
@@ -630,7 +634,8 @@ impl ScalarUDFImpl for DateIntUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Date32) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("{} expects 2 arguments, got {}", self.name, args.len());
         }
@@ -691,7 +696,8 @@ impl ScalarUDFImpl for DateDiffDaysUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int32) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("date_diff_days expects 2 arguments, got {}", args.len());
         }
@@ -732,7 +738,8 @@ impl ScalarUDFImpl for EpochFromIntervalUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Float64) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = num_rows(args);
         let intervals = to_interval_vec(args, 0, n)?;
         use datafusion::arrow::array::Float64Array;

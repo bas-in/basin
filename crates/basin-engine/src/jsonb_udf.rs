@@ -32,7 +32,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::catalog::TableFunctionImpl;
@@ -698,7 +698,8 @@ impl ScalarUDFImpl for JsonbTypeofUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_typeof expects 1 argument, got {}", args.len());
         }
@@ -742,7 +743,8 @@ impl ScalarUDFImpl for JsonbPrettyUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_pretty expects 1 argument, got {}", args.len());
         }
@@ -781,7 +783,8 @@ impl ScalarUDFImpl for JsonbArrayLengthUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int64) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_array_length expects 1 argument, got {}", args.len());
         }
@@ -816,7 +819,8 @@ impl ScalarUDFImpl for JsonbStripNullsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_strip_nulls expects 1 argument, got {}", args.len());
         }
@@ -853,7 +857,8 @@ impl ScalarUDFImpl for JsonbSetUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() < 3 || args.len() > 4 {
             return exec_err!("jsonb_set expects 3 or 4 arguments, got {}", args.len());
         }
@@ -946,7 +951,8 @@ impl ScalarUDFImpl for JsonbInsertUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() < 3 || args.len() > 4 {
             return exec_err!("jsonb_insert expects 3 or 4 arguments, got {}", args.len());
         }
@@ -1038,7 +1044,8 @@ impl ScalarUDFImpl for JsonbPathQueryUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_path_query expects 2 arguments, got {}", args.len());
         }
@@ -1126,7 +1133,8 @@ impl ScalarUDFImpl for JsonbPathExistsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_path_exists expects 2 arguments, got {}", args.len());
         }
@@ -1194,7 +1202,8 @@ impl ScalarUDFImpl for JsonbPathMatchUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         // Delegate to the same logic as jsonb_path_exists
         JsonbPathExistsUdf {
             signature: self.signature.clone(),
@@ -1218,7 +1227,8 @@ impl ScalarUDFImpl for JsonbObjectKeysUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_object_keys expects 1 argument, got {}", args.len());
         }
@@ -1259,7 +1269,8 @@ impl ScalarUDFImpl for JsonbEachUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         // SRF stub: returns the full JSON string (callers that need real SRF
         // behaviour will hit a "not a table function" error upstream anyway).
         if args.len() != 1 {
@@ -1297,7 +1308,8 @@ impl ScalarUDFImpl for JsonbEachTextUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_each_text expects 1 argument, got {}", args.len());
         }
@@ -1348,7 +1360,8 @@ impl ScalarUDFImpl for JsonbArrayElementsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_array_elements expects 1 argument, got {}", args.len());
         }
@@ -1390,7 +1403,8 @@ impl ScalarUDFImpl for JsonbArrayElementsTextUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("jsonb_array_elements_text expects 1 argument, got {}", args.len());
         }
@@ -1436,7 +1450,8 @@ impl ScalarUDFImpl for JsonbBuildObjectUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() % 2 != 0 {
             return exec_err!(
                 "jsonb_build_object requires an even number of arguments (key/value pairs), got {}",
@@ -1491,7 +1506,8 @@ impl ScalarUDFImpl for JsonBuildObjectUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() % 2 != 0 {
             return exec_err!(
                 "json_build_object requires an even number of arguments (key/value pairs), got {}",
@@ -1547,7 +1563,8 @@ impl ScalarUDFImpl for JsonbBuildArrayUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = row_count(args);
         let arrays: Vec<ArrayRef> = args
             .iter()
@@ -1581,7 +1598,8 @@ impl ScalarUDFImpl for ToJsonbUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("to_jsonb expects 1 argument, got {}", args.len());
         }
@@ -1617,7 +1635,8 @@ impl ScalarUDFImpl for RowToJsonUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("row_to_json expects 1 argument, got {}", args.len());
         }
@@ -1650,7 +1669,8 @@ impl ScalarUDFImpl for ArrayToJsonUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.is_empty() || args.len() > 2 {
             return exec_err!("array_to_json expects 1 or 2 arguments, got {}", args.len());
         }
@@ -1695,7 +1715,7 @@ impl ScalarUDFImpl for JsonbAggStubUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         exec_err!(
             "jsonb_agg requires AggregateUDFImpl; \
              deferred to v0.2 — use jsonb_build_array() for scalar aggregation"
@@ -1719,7 +1739,7 @@ impl ScalarUDFImpl for JsonbObjectAggStubUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         exec_err!(
             "jsonb_object_agg requires AggregateUDFImpl; \
              deferred to v0.2 — use jsonb_build_object() for scalar object construction"
@@ -1884,7 +1904,8 @@ impl ScalarUDFImpl for JsonbPathQueryFirstUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_path_query_first expects 2 arguments, got {}", args.len());
         }
@@ -1927,7 +1948,8 @@ impl ScalarUDFImpl for JsonbPathQueryArrayUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_path_query_array expects 2 arguments, got {}", args.len());
         }
@@ -1967,7 +1989,8 @@ impl ScalarUDFImpl for JsonTypeofUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("json_typeof expects 1 argument, got {}", args.len());
         }
@@ -2011,7 +2034,8 @@ impl ScalarUDFImpl for JsonStripNullsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("json_strip_nulls expects 1 argument, got {}", args.len());
         }
@@ -2051,7 +2075,8 @@ impl ScalarUDFImpl for ToJsonUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("to_json expects 1 argument, got {}", args.len());
         }
@@ -2090,7 +2115,8 @@ impl ScalarUDFImpl for JsonEachUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("json_each expects 1 argument, got {}", args.len());
         }
@@ -2131,7 +2157,8 @@ impl ScalarUDFImpl for JsonEachTextUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("json_each_text expects 1 argument, got {}", args.len());
         }
@@ -2178,7 +2205,8 @@ impl ScalarUDFImpl for JsonObjectKeysUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("json_object_keys expects 1 argument, got {}", args.len());
         }
@@ -2216,7 +2244,8 @@ impl ScalarUDFImpl for JsonArrayElementsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("json_array_elements expects 1 argument, got {}", args.len());
         }
@@ -2257,7 +2286,8 @@ impl ScalarUDFImpl for JsonArrayElementsTextUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("json_array_elements_text expects 1 argument, got {}", args.len());
         }
@@ -2303,7 +2333,8 @@ impl ScalarUDFImpl for JsonGetUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("json_get expects 2 arguments, got {}", args.len());
         }
@@ -2359,7 +2390,8 @@ impl ScalarUDFImpl for JsonGetTextUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("json_get_text expects 2 arguments, got {}", args.len());
         }
@@ -2418,7 +2450,8 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("json_path_extract expects 2 arguments, got {}", args.len());
         }
@@ -2485,7 +2518,8 @@ impl ScalarUDFImpl for JsonPathExtractTextUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("json_path_extract_text expects 2 arguments, got {}", args.len());
         }
@@ -2556,7 +2590,8 @@ impl ScalarUDFImpl for JsonbContainsUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_contains expects 2 arguments, got {}", args.len());
         }
@@ -2611,7 +2646,8 @@ impl ScalarUDFImpl for JsonbContainedByUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_contained_by expects 2 arguments, got {}", args.len());
         }
@@ -2652,7 +2688,8 @@ impl ScalarUDFImpl for JsonbHasKeyUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_has_key expects 2 arguments, got {}", args.len());
         }
@@ -2699,7 +2736,8 @@ impl ScalarUDFImpl for JsonbHasAllKeysUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_has_all_keys expects 2 arguments, got {}", args.len());
         }
@@ -2745,7 +2783,8 @@ impl ScalarUDFImpl for JsonbHasAnyKeyUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_has_any_key expects 2 arguments, got {}", args.len());
         }
@@ -2790,7 +2829,8 @@ impl ScalarUDFImpl for JsonbConcatUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_concat expects 2 arguments, got {}", args.len());
         }
@@ -2855,7 +2895,8 @@ impl ScalarUDFImpl for JsonbDeleteKeyUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("jsonb_delete_key expects 2 arguments, got {}", args.len());
         }
@@ -2898,7 +2939,8 @@ impl ScalarUDFImpl for JsonbDeleteKeysUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         use datafusion::arrow::array::ListArray;
         use datafusion::arrow::array::LargeListArray;
         if args.len() != 2 {
@@ -2980,7 +3022,8 @@ impl ScalarUDFImpl for JsonbDeleteIndexUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
 
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         use datafusion::arrow::array::Int32Array;
         if args.len() != 2 {
             return exec_err!("jsonb_delete_index expects 2 arguments, got {}", args.len());
@@ -3048,7 +3091,7 @@ impl ScalarUDFImpl for JsonToRecordStubUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
 
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         exec_err!(
             "{} requires DataFusion TableProvider (SRF); \
              deferred to v0.2 — use jsonb_each() or parse keys manually",

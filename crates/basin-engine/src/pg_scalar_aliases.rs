@@ -47,7 +47,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -294,7 +294,8 @@ impl ScalarUDFImpl for AliasF64Udf {
         Ok(DataType::Float64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 1 {
             return exec_err!("{} expects 1 argument, got {}", self.name, args.len());
         }
@@ -365,7 +366,8 @@ impl ScalarUDFImpl for NowStubUdf {
         Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         let n = args
             .iter()
             .filter_map(|a| match a {
@@ -409,7 +411,7 @@ impl ScalarUDFImpl for LocaltimeUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let t = Utc::now();
         let s = format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second());
         Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(
@@ -487,7 +489,8 @@ impl ScalarUDFImpl for MakeTimeUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 3 {
             return exec_err!("make_time expects 3 arguments, got {}", args.len());
         }
@@ -550,7 +553,8 @@ impl ScalarUDFImpl for MakeTimestampUdf {
         Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 6 {
             return exec_err!("make_timestamp expects 6 arguments, got {}", args.len());
         }
@@ -622,7 +626,8 @@ impl ScalarUDFImpl for MakeTimestamptzUdf {
         Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() < 6 || args.len() > 7 {
             return exec_err!("make_timestamptz expects 6 or 7 arguments, got {}", args.len());
         }
@@ -696,7 +701,7 @@ impl ScalarUDFImpl for MakeIntervalUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke(&self, _args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // v0.1 stub: returns "0 seconds" — sufficient for ORM startup probes.
         Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(
             Some("0 seconds".into()),
@@ -729,7 +734,8 @@ impl ScalarUDFImpl for WidthBucketUdf {
         Ok(DataType::Int64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 4 {
             return exec_err!("width_bucket expects 4 arguments, got {}", args.len());
         }
@@ -810,7 +816,8 @@ impl ScalarUDFImpl for ToNumberUdf {
         Ok(DataType::Float64)
     }
     #[allow(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
         if args.len() != 2 {
             return exec_err!("to_number expects 2 arguments, got {}", args.len());
         }
