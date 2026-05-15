@@ -1212,7 +1212,33 @@ fn range_extract_right(s: &str, start: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::Field;
+    use datafusion::config::ConfigOptions;
     use datafusion::scalar::ScalarValue;
+
+    /// df53 removed `invoke_batch`; tests reach the UDF through this shim,
+    /// which builds the `ScalarFunctionArgs` the new `invoke_with_args` takes.
+    trait InvokeBatchCompat {
+        fn invoke_batch(&self, args: &[ColumnarValue], n: usize) -> DFResult<ColumnarValue>;
+    }
+    impl<T: ScalarUDFImpl> InvokeBatchCompat for T {
+        fn invoke_batch(&self, args: &[ColumnarValue], n: usize) -> DFResult<ColumnarValue> {
+            let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type()).collect();
+            let return_type = self.return_type(&arg_types)?;
+            let arg_fields = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| Arc::new(Field::new(format!("a{i}"), a.data_type(), true)))
+                .collect();
+            self.invoke_with_args(ScalarFunctionArgs {
+                args: args.to_vec(),
+                arg_fields,
+                number_rows: n,
+                return_field: Arc::new(Field::new("out", return_type, true)),
+                config_options: Arc::new(ConfigOptions::default()),
+            })
+        }
+    }
 
     fn make_range(lo: i64, hi: i64) -> ColumnarValue {
         let json = format!(r#"{{"l":{},"u":{},"li":true,"ui":false}}"#, lo, hi);

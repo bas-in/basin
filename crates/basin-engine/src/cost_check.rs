@@ -219,7 +219,7 @@ mod tests {
 
         let stmt = parse_one("SELECT * FROM t LIMIT 10");
         if let Statement::Query(q) = &stmt {
-            assert!(q.limit.is_some(), "LIMIT must be parsed");
+            assert!(q.ext_limit().is_some(), "LIMIT must be parsed");
         } else {
             panic!("expected Query");
         }

@@ -1011,10 +1011,10 @@ mod tests {
         if n < 0 {
             Expr::UnaryOp {
                 op: UnaryOperator::Minus,
-                expr: Box::new(Expr::Value(Value::Number((-n).to_string(), false))),
+                expr: Box::new(Expr::Value(Value::Number((-n).to_string(), false).into())),
             }
         } else {
-            Expr::Value(Value::Number(n.to_string(), false))
+            Expr::Value(Value::Number(n.to_string(), false).into())
         }
     }
 
