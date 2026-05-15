@@ -396,7 +396,10 @@ mod tests {
             name: &str,
         ) -> Result<Arc<dyn datafusion::catalog::TableProvider>, TranslateError> {
             if name == self.name {
-                let mem = MemTable::try_new(self.schema.clone(), vec![])
+                // df53 rejects zero partitions at scan time ("No partitions
+                // provided"); one empty partition scans to zero rows, which
+                // is all these plan-translation tests need.
+                let mem = MemTable::try_new(self.schema.clone(), vec![vec![]])
                     .map_err(|e| TranslateError::Internal(e.to_string()))?;
                 Ok(Arc::new(mem))
             } else {
