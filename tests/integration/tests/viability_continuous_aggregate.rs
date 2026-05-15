@@ -106,7 +106,7 @@ async fn viability_continuous_aggregate() {
             sql.push(',');
         }
         let day = 26 + (i / 20); // 26..=30
-        let hour = (i % 24);
+        let hour = i % 24;
         sql.push_str(&format!(
             "({i}, '2026-04-{day:02}T{hour:02}:00:00Z', 'p-{i}')"
         ));

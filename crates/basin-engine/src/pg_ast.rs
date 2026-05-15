@@ -239,24 +239,11 @@ impl StmtKind {
     /// rejected by [`reject_unsupported`]. Centralised so the executor
     /// and the test suite stay in sync.
     pub fn is_unsupported(&self) -> bool {
-        matches!(
-            self,
-            StmtKind::Listen
-                | StmtKind::Notify
-                | StmtKind::Prepare
-                | StmtKind::Execute
-                | StmtKind::Deallocate
-                | StmtKind::DeclareCursor
-                | StmtKind::Fetch
-                | StmtKind::Close
-                | StmtKind::CreateExtension
-                | StmtKind::CreateTrigger
-                | StmtKind::DropTrigger
-                | StmtKind::BeginTransaction
-                | StmtKind::Commit
-                | StmtKind::Rollback
-                | StmtKind::Savepoint
-        )
+        // Only ADR 0012 design exclusions are unconditionally rejected.
+        // Everything else (BEGIN/COMMIT/PREPARE/cursor lifecycle/extensions/
+        // triggers) is either noop-accepted via noop_accept.rs or has a real
+        // implementation; reject_unsupported must let them through.
+        matches!(self, StmtKind::Listen | StmtKind::Notify | StmtKind::Unlisten)
     }
 }
 
@@ -370,7 +357,6 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::ListenStmt(_) => StmtKind::Listen,
         NodeEnum::NotifyStmt(_) => StmtKind::Notify,
         NodeEnum::UnlistenStmt(_) => StmtKind::Unlisten,
-        NodeEnum::UnlistenStmt(_) => StmtKind::Listen,
 
         NodeEnum::PrepareStmt(_) => StmtKind::Prepare,
         NodeEnum::ExecuteStmt(_) => StmtKind::Execute,
@@ -1069,26 +1055,13 @@ mod tests {
     #[test]
     fn reject_unsupported_blocks_each_kind() {
         // Every kind in `is_unsupported()` must produce a
-        // FeatureNotSupported with SQLSTATE 0A000.
+        // FeatureNotSupported with SQLSTATE 0A000. Per ADR 0012 only
+        // pub/sub statements are unconditionally rejected; everything else
+        // is either noop-accepted or has a real implementation.
         let cases = [
             ("LISTEN ch", "LISTEN"),
             ("NOTIFY ch", "NOTIFY"),
-            ("PREPARE p AS SELECT 1", "PREPARE"),
-            ("EXECUTE p", "EXECUTE"),
-            ("DEALLOCATE p", "DEALLOCATE"),
-            ("DECLARE c CURSOR FOR SELECT 1", "DECLARE CURSOR"),
-            ("FETCH c", "FETCH"),
-            ("CLOSE c", "CLOSE"),
-            ("CREATE EXTENSION pgcrypto", "CREATE EXTENSION"),
-            (
-                "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-                "CREATE TRIGGER",
-            ),
-            ("DROP TRIGGER tr ON t", "DROP TRIGGER"),
-            ("BEGIN", "BEGIN"),
-            ("COMMIT", "COMMIT"),
-            ("ROLLBACK", "ROLLBACK"),
-            ("SAVEPOINT s", "SAVEPOINT"),
+            ("UNLISTEN ch", "UNLISTEN"),
         ];
 
         for (sql, label) in cases {

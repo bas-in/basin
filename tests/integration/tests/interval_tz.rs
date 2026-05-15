@@ -96,6 +96,7 @@ async fn assert_ok(sess: &basin_engine::TenantSession, sql: &str) {
 }
 
 /// Assert `sql` returns a single Boolean true.
+#[allow(dead_code)]
 async fn assert_true(sess: &basin_engine::TenantSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {

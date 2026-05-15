@@ -1,3 +1,6 @@
+// Resolver helpers staged for ADR 0014 Phase 2; suppress dead-code until wired.
+#![allow(dead_code)]
+
 //! `CREATE SCHEMA`, `DROP SCHEMA`, and `SET search_path` SQL surface.
 //!
 //! ## Basin's flat model

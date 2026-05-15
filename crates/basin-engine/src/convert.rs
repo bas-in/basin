@@ -151,15 +151,6 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
             )),
             *n,
         ),
-        // Variable-length list (1-D or N-D arrays). Recurse so nested
-        // `List(List(T))` (multi-dim SQL arrays) round-trips cleanly.
-        ws_schema::DataType::List(child) => df_schema::DataType::List(Arc::new(
-            df_schema::Field::new(
-                child.name().clone(),
-                data_type_ws_to_df(child.data_type())?,
-                child.is_nullable(),
-            ),
-        )),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "cannot convert workspace-arrow type to df-arrow: {other:?}"
@@ -213,15 +204,6 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
             )),
             *n,
         ),
-        // Variable-length list (1-D or N-D arrays). Recurse so
-        // `List(List(T))` (multi-dimensional SQL arrays) round-trips.
-        df_schema::DataType::List(child) => ws_schema::DataType::List(Arc::new(
-            ws_schema::Field::new(
-                child.name().clone(),
-                data_type_df_to_ws(child.data_type())?,
-                child.is_nullable(),
-            ),
-        )),
         other => {
             return Err(BasinError::InvalidSchema(format!(
                 "cannot convert df-arrow type to workspace-arrow: {other:?}"
@@ -1215,44 +1197,6 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 };
                 arr
             }
-            ws_schema::DataType::List(ws_child_field) => {
-                // src is a DF ListArray; child values are DF-typed.
-                // Cross-version boundary: rebuild offsets and nulls on the WS side.
-                let s = src
-                    .as_any()
-                    .downcast_ref::<df_array::ListArray>()
-                    .ok_or_else(|| {
-                        BasinError::internal(format!("expected ListArray for {}", field.name()))
-                    })?;
-                let df_child_type = data_type_ws_to_df(ws_child_field.data_type())?;
-                let df_child_schema = Arc::new(df_schema::Schema::new(vec![df_schema::Field::new(
-                    ws_child_field.name().clone(),
-                    df_child_type,
-                    ws_child_field.is_nullable(),
-                )]));
-                let child_df_batch =
-                    df_array::RecordBatch::try_new(df_child_schema, vec![s.values().clone()])
-                        .map_err(|e| {
-                            BasinError::internal(format!("ListArray child batch: {e}"))
-                        })?;
-                let child_ws_batch = batch_df_to_ws(&child_df_batch)?;
-                let ws_child_arr = child_ws_batch.column(0).clone();
-                // Rebuild WS offsets from raw i32 values (cross-version safe).
-                let raw_offsets: Vec<i32> = s.offsets().iter().copied().collect();
-                let ws_offsets =
-                    WsOffsetBuffer::new(WsScalarBuffer::from(raw_offsets));
-                let ws_nulls = s.nulls().map(|nb| {
-                    let bools: Vec<bool> = (0..nb.len()).map(|i| nb.is_valid(i)).collect();
-                    WsNullBuffer::from(bools)
-                });
-                let arr = ws_array::ListArray::new(
-                    Arc::new((**ws_child_field).clone()),
-                    ws_offsets,
-                    ws_child_arr,
-                    ws_nulls,
-                );
-                Arc::new(arr)
-            }
             ws_schema::DataType::LargeList(ws_child_field) => {
                 let s = src
                     .as_any()
@@ -1308,10 +1252,8 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{
-        Array, BooleanArray, Int32Array, Int64Array, ListArray, StringArray, UInt64Array,
-    };
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_array::{Array, Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
     // Helper: build a WS schema + batch with one column of the given type.

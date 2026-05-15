@@ -351,10 +351,16 @@ fn find_regex_op_outside_strings(s: &str, op: &str) -> Option<usize> {
                     continue;
                 }
             }
-            // Make sure `~` is not just part of `~~` (LIKE operator in PG).
+            // Make sure `~` is not part of `~~` (LIKE operator in PG) — or
+            // the SECOND `~` of `~~`. Skip both bytes when we see either.
             if op == "~" {
                 let followed_by_tilde = i + 1 < bytes.len() && bytes[i + 1] == b'~';
+                let preceded_by_tilde = i > 0 && bytes[i - 1] == b'~';
                 if followed_by_tilde {
+                    i += 2;
+                    continue;
+                }
+                if preceded_by_tilde {
                     i += 1;
                     continue;
                 }

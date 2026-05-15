@@ -1,3 +1,6 @@
+// pg_query AST matchers staged for ADR 0014 Phase 2; suppress dead-code.
+#![allow(dead_code)]
+
 //! `CREATE SEQUENCE` / `DROP SEQUENCE` SQL surface (5.11.K3).
 //!
 //! sqlparser 0.52 has native AST nodes for both forms

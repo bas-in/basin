@@ -1,3 +1,6 @@
+// pg_query AST matchers + check-predicate helpers staged for ADR 0014 Phase 2.
+#![allow(dead_code)]
+
 //! `CREATE/ALTER/DROP TYPE` and `CREATE/DROP DOMAIN` SQL surface.
 //!
 //! Five statement shapes route through this module:

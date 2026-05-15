@@ -1,6 +1,8 @@
 //! Shared test fixtures: a tiny axum HTTP server that lets each test
 //! script its own response sequence and capture the requests it received.
 
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use arrow_array::Int64Array;
 use basin_catalog::InMemoryCatalog;
 use basin_common::TenantId;
 use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};

@@ -27,19 +27,19 @@
       "tenants": 23
     },
     {
-      "load_pct": 27.0,
+      "load_pct": 24.0,
       "shard": 1,
-      "tenants": 27
+      "tenants": 24
+    },
+    {
+      "load_pct": 26.0,
+      "shard": 2,
+      "tenants": 26
     },
     {
       "load_pct": 27.0,
-      "shard": 2,
-      "tenants": 27
-    },
-    {
-      "load_pct": 23.0,
       "shard": 3,
-      "tenants": 23
+      "tenants": 27
     }
   ],
   "primary": {
@@ -51,5 +51,5 @@
       "value": 50.0
     }
   },
-  "generated_at": "@1778393089"
+  "generated_at": "@1778802449"
 }

@@ -36,7 +36,7 @@ use std::borrow::Cow;
 /// semicolon) is rewritten; anything that doesn't match is returned unchanged.
 /// Schemas (`TABLE schema.tbl`) are preserved: the rewritten form becomes
 /// `SELECT * FROM schema.tbl`.
-pub(crate) fn rewrite_table_shorthand(sql: &str) -> Cow<str> {
+pub(crate) fn rewrite_table_shorthand(sql: &str) -> Cow<'_, str> {
     let trimmed = sql.trim();
     let upper = trimmed.to_ascii_uppercase();
     // Must start with TABLE (case-insensitive) followed by whitespace.
@@ -68,7 +68,7 @@ pub(crate) fn rewrite_table_shorthand(sql: &str) -> Cow<str> {
 /// The rewrite is conservative: it only fires when the clause appears between
 /// a closing `>` identifier and `WHERE`/`ORDER`/`LIMIT`/`FETCH`/end-of-input.
 /// Complex cases (subqueries, CTEs) are left unchanged.
-pub(crate) fn strip_tablesample(sql: &str) -> Cow<str> {
+pub(crate) fn strip_tablesample(sql: &str) -> Cow<'_, str> {
     // Fast path: no TABLESAMPLE keyword.
     let upper = sql.to_ascii_uppercase();
     if !upper.contains("TABLESAMPLE") {
@@ -105,7 +105,7 @@ pub(crate) fn strip_tablesample(sql: &str) -> Cow<str> {
         // The original string after the method word.
         let after_method_orig = &after_ws[after_ws.len() - method_end..];
         let after_method = after_method_orig.trim_start();
-        let after_method_upper = &after_ws_upper[after_ws_upper.len() - method_end..].trim_start().to_ascii_uppercase();
+        let _after_method_upper = &after_ws_upper[after_ws_upper.len() - method_end..].trim_start().to_ascii_uppercase();
         // Expect `(...)`.
         if !after_method.starts_with('(') {
             // No paren; leave unchanged.
@@ -120,7 +120,7 @@ pub(crate) fn strip_tablesample(sql: &str) -> Cow<str> {
             let skip_to = after_method[close + 1..].trim_start();
             // Emit a space so we don't run adjacent tokens together.
             result.push(' ');
-            let consumed = sql.len() - remaining.len()   // already emitted
+            let _consumed = sql.len() - remaining.len()   // already emitted
                 + pos                                      // up to TABLESAMPLE
                 + "TABLESAMPLE".len()                      // keyword
                 + delta                                    // ws before method
@@ -167,7 +167,7 @@ pub(crate) fn strip_tablesample(sql: &str) -> Cow<str> {
 ///
 /// `WITH TIES` is treated as `ONLY` (DataFusion doesn't support TIES).
 /// `PERCENT` variants are not rewritten (very rare; fall through to error).
-pub(crate) fn rewrite_fetch_to_limit(sql: &str) -> Cow<str> {
+pub(crate) fn rewrite_fetch_to_limit(sql: &str) -> Cow<'_, str> {
     let upper = sql.to_ascii_uppercase();
     if !upper.contains("FETCH") {
         return Cow::Borrowed(sql);
@@ -257,7 +257,7 @@ pub(crate) fn rewrite_fetch_to_limit(sql: &str) -> Cow<str> {
 /// keywords are advisory — the SELECT executes without acquiring any locks.
 /// This matches the documented behaviour of `FOR UPDATE` / `FOR SHARE` in
 /// Basin.
-pub(crate) fn rewrite_for_no_key_update_and_key_share(sql: &str) -> Cow<str> {
+pub(crate) fn rewrite_for_no_key_update_and_key_share(sql: &str) -> Cow<'_, str> {
     let upper = sql.to_ascii_uppercase();
     // Fast path: neither target phrase is present.
     if !upper.contains("FOR NO KEY UPDATE") && !upper.contains("FOR KEY SHARE") {
@@ -405,7 +405,10 @@ fn rfind_whole_word(haystack: &str, word: &str) -> Option<usize> {
     let mut result = None;
     let mut start = 0;
     loop {
-        let pos = haystack[start..].find(word)?;
+        let pos = match haystack[start..].find(word) {
+            Some(p) => p,
+            None => return result,
+        };
         let abs = start + pos;
         let before_ok = abs == 0
             || !haystack.as_bytes()[abs - 1].is_ascii_alphanumeric()

@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use basin_common::{BasinError, TenantId};
 use chrono::Utc;
@@ -232,7 +231,7 @@ async fn email_token_expiry(store: &Arc<dyn AuthStore>) {
 async fn api_key_lifecycle(store: &Arc<dyn AuthStore>) {
     let tenant = TenantId::new();
     let user_id = Uuid::new_v4();
-    let email = format!("apikey-{}@conformance.test", Uuid::new_v4());
+    let _email = format!("apikey-{}@conformance.test", Uuid::new_v4());
     let hash = bcrypt_hash("testpassword");
     store
         .create_user(&tenant, &user_id.to_string(), &hash, user_id)
@@ -472,7 +471,6 @@ mod pg_conformance_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use basin_common::TenantId;
     use tokio_postgres::NoTls;
     use ulid::Ulid;
 

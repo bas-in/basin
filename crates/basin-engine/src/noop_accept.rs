@@ -95,11 +95,6 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::Revoke => Some(ExecResult::Empty {
             tag: "REVOKE".into(),
         }),
-        // Session-variable control
-        StmtKind::VariableSet => Some(ExecResult::Empty { tag: "SET".into() }),
-        StmtKind::VariableShow => Some(ExecResult::Empty {
-            tag: "SHOW".into(),
-        }),
         // Foreign Data Wrappers / Foreign tables — accept-only; Basin has no FDW execution
         StmtKind::CreateFdw => Some(ExecResult::Empty {
             tag: "CREATE FOREIGN DATA WRAPPER".into(),

@@ -53,7 +53,7 @@ use arrow_array::{
     TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use basin_catalog::{Catalog, DataFileRef};
+use basin_catalog::DataFileRef;
 use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName, TenantId};
 use basin_storage::{
     evaluate_compound, evaluate_compound_for_pruning, vector_index_segment_key_for_data_file,
@@ -1252,6 +1252,7 @@ fn build_pk_in_predicate(
 /// the raw expression string handed to DataFusion as a `SELECT <sql_text>
 /// FROM <src>` projection.
 #[derive(Clone)]
+#[allow(dead_code)]
 enum AssignmentValue {
     Scalar(ScalarValue),
     DFExpr { sql_text: String, col_type: DataType },
@@ -1863,6 +1864,7 @@ async fn apply_assignments(
 
 /// Blend two arrays: take `new_col` at rows where `mask` is true, `orig`
 /// at rows where mask is false or null. Both arrays must be the same length.
+#[allow(dead_code)]
 fn blend_by_mask(orig: &ArrayRef, new_col: &ArrayRef, mask: &BooleanArray) -> Result<ArrayRef> {
     if orig.len() != new_col.len() || orig.len() != mask.len() {
         return Err(BasinError::internal(format!(
@@ -2727,13 +2729,6 @@ async fn exec_soft_delete(
                 let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
                 let news =
                     apply_assignments_all(catalog, &sess.tenant, &befores, &assignments).await?;
-                let news = apply_assignments_all(
-                    &sess.engine.config().catalog,
-                    &sess.tenant,
-                    &befores,
-                    &assignments,
-                )
-                .await?;
                 updated_total += f.row_count as usize;
                 replaced_paths.push(f.path.as_ref().to_string());
                 if capture_events {
@@ -2851,6 +2846,7 @@ async fn exec_soft_delete(
 // ---------------------------------------------------------------------------
 
 /// Build the projected schema for an empty RETURNING result.
+#[allow(dead_code)]
 fn schema_for_returning(table_schema: &Schema, items: &[SelectItem]) -> Result<Schema> {
     let col_indices = returning_column_indices(items, table_schema)?;
     let fields: Vec<Field> = col_indices
@@ -2861,6 +2857,7 @@ fn schema_for_returning(table_schema: &Schema, items: &[SelectItem]) -> Result<S
 }
 
 /// Resolve `RETURNING` items to column indices into `table_schema`.
+#[allow(dead_code)]
 fn returning_column_indices(items: &[SelectItem], schema: &Schema) -> Result<Vec<usize>> {
     let mut indices = Vec::new();
     for item in items {

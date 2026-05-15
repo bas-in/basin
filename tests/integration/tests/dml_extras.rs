@@ -43,6 +43,7 @@ async fn session(engine: &Engine) -> TenantSession {
     engine.open_session(TenantId::new()).await.unwrap()
 }
 
+#[allow(dead_code)]
 fn ok(r: ExecResult) -> ExecResult { r }
 
 fn rows(batches: &[RecordBatch]) -> usize {

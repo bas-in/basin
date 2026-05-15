@@ -2050,7 +2050,7 @@ impl InfoSchemaQuery {
             schemas.push(DEFAULT_SCHEMA);
             relnames.push(name.as_str().to_string());
         }
-        let n = relids.len();
+        let _n = relids.len();
         let schema = Self::pg_stat_user_tables_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(relids)),

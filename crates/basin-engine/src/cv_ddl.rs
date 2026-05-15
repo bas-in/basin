@@ -1,3 +1,8 @@
+// Several pg_query-based AST matchers + helpers here are staged for ADR 0014
+// Phase 2 when the routing flips off the textual pre-screen. Suppress the
+// dead-code warnings until that wires up.
+#![allow(dead_code)]
+
 //! `CREATE/REFRESH/DROP MATERIALIZED VIEW` SQL surface.
 //!
 //! Three statement shapes route through this module:
