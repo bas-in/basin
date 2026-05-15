@@ -3246,7 +3246,461 @@ pub(crate) fn rewrite_json_operators(sql: &str) -> String {
             s = rewrite_binary_op_to_fn(&s, op, func);
         }
     }
+
+    // Rewrite `row_to_json(<alias>)` / `to_json(<alias>)` where `<alias>` is
+    // a subquery alias from `FROM (SELECT ...) <alias>`.  DataFusion rejects the
+    // original because it tries to find a column named `<alias>` and fails.
+    // We extract the column aliases from the inner SELECT projection and rewrite
+    // to `jsonb_build_object('col1', col1, ...)`.
+    s = rewrite_row_to_json_subquery(&s);
+
+    // Rewrite multi-dimensional PG array literal casts, e.g.
+    // `'{{1,2},{3,4}}'::int[][]` → `make_array(make_array(1,2), make_array(3,4))`.
+    // The 1-D case is handled by `pg_operators::rewrite_pg_array_literal_casts`;
+    // this pass handles the 2-D shape only.
+    s = rewrite_pg_multidim_array_literal(&s);
+
     s
+}
+
+/// Rewrite `row_to_json(<alias>)` / `to_json(<alias>)` in a query of the form
+///   `SELECT row_to_json(<alias>) FROM (SELECT <cols>) <alias>`
+/// to
+///   `SELECT jsonb_build_object('col1', col1, ...) FROM (SELECT <cols>) <alias>`
+///
+/// Only handles the single-table `FROM (SELECT ...) <alias>` shape.
+/// Best-effort textual rewrite; leaves anything else unchanged.
+pub(crate) fn rewrite_row_to_json_subquery(sql: &str) -> String {
+    // Quick check: must contain row_to_json or to_json and a subquery alias.
+    let lower = sql.to_ascii_lowercase();
+    let has_row_to_json = lower.contains("row_to_json(") || lower.contains("to_json(");
+    if !has_row_to_json {
+        return sql.to_string();
+    }
+    if !lower.contains("from") || !lower.contains("select") {
+        return sql.to_string();
+    }
+
+    // Find `FROM (SELECT ...) <alias>` pattern.
+    // We look for: FROM \s* ( \s* SELECT ... ) \s* <alias>
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let lower_b = lower.as_bytes();
+
+    // Find position of `from` keyword followed by `(`
+    let mut i = 0usize;
+    let mut from_paren_pos: Option<usize> = None; // position of `(` after FROM
+    while i + 5 <= len {
+        // look for 'from' keyword (word boundary)
+        if lower_b[i..].starts_with(b"from") {
+            let before_ok = i == 0 || !lower_b[i-1].is_ascii_alphanumeric() && lower_b[i-1] != b'_';
+            let after_ok = i + 4 < len && !lower_b[i+4].is_ascii_alphanumeric() && lower_b[i+4] != b'_';
+            if before_ok && after_ok {
+                // skip whitespace
+                let mut j = i + 4;
+                while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
+                if j < len && bytes[j] == b'(' {
+                    from_paren_pos = Some(j);
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let paren_start = match from_paren_pos {
+        Some(p) => p,
+        None => return sql.to_string(),
+    };
+
+    // Find the matching closing paren for the subquery.
+    let mut depth = 0i32;
+    let mut paren_end: Option<usize> = None;
+    let mut k = paren_start;
+    while k < len {
+        match bytes[k] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    paren_end = Some(k);
+                    break;
+                }
+            }
+            b'\'' => {
+                k += 1;
+                while k < len {
+                    if bytes[k] == b'\'' {
+                        if k + 1 < len && bytes[k+1] == b'\'' { k += 2; continue; }
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    let paren_end = match paren_end {
+        Some(p) => p,
+        None => return sql.to_string(),
+    };
+
+    // Extract the content between the outer parens: the subquery.
+    let inner_sql = &sql[paren_start + 1..paren_end];
+    let inner_lower = inner_sql.to_ascii_lowercase();
+    // Must start with SELECT (possibly with whitespace).
+    let trimmed_inner = inner_lower.trim_start();
+    if !trimmed_inner.starts_with("select") {
+        return sql.to_string();
+    }
+
+    // Parse the alias: skip whitespace after `)`
+    let mut alias_start = paren_end + 1;
+    while alias_start < len && bytes[alias_start].is_ascii_whitespace() { alias_start += 1; }
+    // Read the alias identifier
+    if alias_start >= len {
+        return sql.to_string();
+    }
+    let mut alias_end = alias_start;
+    while alias_end < len && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_') {
+        alias_end += 1;
+    }
+    if alias_end == alias_start {
+        return sql.to_string();
+    }
+    let alias = &sql[alias_start..alias_end];
+    let alias_lower = alias.to_ascii_lowercase();
+
+    // Check that `row_to_json(<alias>)` or `to_json(<alias>)` appears in SQL
+    // (case-insensitive, whole-word alias match).
+    let row_to_json_pat = format!("row_to_json({})", alias_lower);
+    let to_json_pat = format!("to_json({})", alias_lower);
+    let sql_lower2 = sql.to_ascii_lowercase();
+    if !sql_lower2.contains(&row_to_json_pat) && !sql_lower2.contains(&to_json_pat) {
+        return sql.to_string();
+    }
+
+    // Extract column aliases from the inner SELECT projection.
+    // Strategy: find the SELECT list (everything between SELECT and FROM/end of inner),
+    // split on commas (top-level only), and extract the AS-alias or last token.
+    let col_aliases = extract_select_aliases(inner_sql);
+    if col_aliases.is_empty() {
+        return sql.to_string();
+    }
+
+    // Build `jsonb_build_object('col1', col1, 'col2', col2, ...)`.
+    let mut args = String::new();
+    for (idx, col) in col_aliases.iter().enumerate() {
+        if idx > 0 { args.push_str(", "); }
+        args.push('\'');
+        args.push_str(col);
+        args.push_str("', ");
+        args.push_str(col);
+    }
+    let replacement = format!("jsonb_build_object({args})");
+
+    // Replace `row_to_json(<alias>)` and `to_json(<alias>)` with the replacement.
+    // We do a case-insensitive search and replace.
+    let mut result = sql.to_string();
+    for pat_lower in &[row_to_json_pat, to_json_pat] {
+        loop {
+            let result_lower = result.to_ascii_lowercase();
+            if let Some(pos) = result_lower.find(pat_lower.as_str()) {
+                result.replace_range(pos..pos + pat_lower.len(), &replacement);
+            } else {
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Extract column aliases from a SELECT projection list.
+/// E.g., `SELECT 1 AS a, 'x' AS b` → `["a", "b"]`
+/// Falls back to positional names if AS is missing: `SELECT 1, 2` → `["col1", "col2"]` (skipped).
+/// Only handles the shape: `SELECT <expr> AS <alias> [, ...]`.
+fn extract_select_aliases(inner_sql: &str) -> Vec<String> {
+    let lower = inner_sql.to_ascii_lowercase();
+    // Find the SELECT keyword.
+    let sel_pos = match lower.find("select") {
+        Some(p) => p,
+        None => return vec![],
+    };
+    let after_select = &inner_sql[sel_pos + 6..];
+    // Find where the projection ends: either at `FROM` or end of string.
+    let from_pos = {
+        let al = after_select.to_ascii_lowercase();
+        find_from_boundary(&al)
+    };
+    let projection_str = match from_pos {
+        Some(p) => &after_select[..p],
+        None => after_select,
+    };
+
+    // Split on top-level commas.
+    let items = split_top_level_commas(projection_str);
+    let mut aliases = Vec::new();
+    for item in items {
+        let item = item.trim();
+        let item_lower = item.to_ascii_lowercase();
+        // Look for `AS <alias>` at the end.
+        // Find last `AS ` token.
+        if let Some(as_pos) = find_last_as(&item_lower) {
+            let after_as = item[as_pos + 2..].trim();
+            // Take the alias — it's either a plain ident or a quoted one.
+            let alias = after_as
+                .trim_matches('"')
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if !alias.is_empty() {
+                aliases.push(alias);
+            }
+        }
+    }
+    aliases
+}
+
+/// Find the position of a top-level `FROM` keyword in the string.
+fn find_from_boundary(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i + 4 <= len {
+        if &bytes[i..i+4] == b"from" {
+            let before_ok = i == 0 || !bytes[i-1].is_ascii_alphanumeric() && bytes[i-1] != b'_';
+            let after_ok = i + 4 >= len || !bytes[i+4].is_ascii_alphanumeric() && bytes[i+4] != b'_';
+            if before_ok && after_ok {
+                return Some(i);
+            }
+        }
+        // Skip string literals
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' { if i+1 < len && bytes[i+1] == b'\'' { i += 2; continue; } break; }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a comma-separated SQL projection list at top-level commas only
+/// (not commas inside function calls / parens).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => { if depth > 0 { depth -= 1; } }
+            b'\'' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' { if i+1 < len && bytes[i+1] == b'\'' { i += 2; continue; } break; }
+                    i += 1;
+                }
+            }
+            b',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Find the last occurrence of ` AS ` or ` as ` token in a lowercased string,
+/// ensuring word boundaries.
+fn find_last_as(lower: &str) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let len = bytes.len();
+    let mut last = None;
+    let mut i = 0usize;
+    while i + 4 <= len {
+        if &bytes[i..i+2] == b"as" {
+            let before_ok = i == 0 || bytes[i-1].is_ascii_whitespace();
+            let after_ok = i + 2 < len && bytes[i+2].is_ascii_whitespace();
+            if before_ok && after_ok {
+                last = Some(i);
+            }
+        }
+        i += 1;
+    }
+    last
+}
+
+/// Rewrite 2-D PostgreSQL array literal casts to nested `make_array` calls.
+///
+/// `'{{1,2},{3,4}}'::int[][]` → `make_array(make_array(1,2), make_array(3,4))`
+///
+/// Only handles 2-D numeric/boolean arrays.  Text (VARCHAR etc.) 2-D arrays and
+/// higher dimensionality are left unchanged.
+pub(crate) fn rewrite_pg_multidim_array_literal(sql: &str) -> String {
+    if !sql.contains("::") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let len = bytes.len();
+
+    while i < len {
+        // Look for a single-quoted literal starting with `{{`
+        if bytes[i] != b'\'' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        // Scan the quoted string
+        let str_start = i;
+        i += 1;
+        let content_start = i;
+        // Skip whitespace then check for `{{`
+        let mut scan = i;
+        while scan < len && bytes[scan] == b' ' { scan += 1; }
+        let is_multidim = scan + 1 < len && bytes[scan] == b'{' && bytes[scan + 1] == b'{';
+
+        // Find closing quote
+        let mut str_end = content_start;
+        while str_end < len {
+            if bytes[str_end] == b'\'' {
+                if str_end + 1 < len && bytes[str_end + 1] == b'\'' { str_end += 2; continue; }
+                break;
+            }
+            str_end += 1;
+        }
+
+        if !is_multidim {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        let str_inner = &sql[content_start..str_end];
+
+        // Check for `::type[][]` after the closing quote
+        let after_q = str_end + 1;
+        if after_q + 2 > len || &sql[after_q..after_q + 2] != "::" {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        let type_start = after_q + 2;
+        let mut type_end = type_start;
+        while type_end < len
+            && (sql.as_bytes()[type_end].is_ascii_alphanumeric()
+                || sql.as_bytes()[type_end] == b'_')
+        {
+            type_end += 1;
+        }
+        let type_name = &sql[type_start..type_end];
+
+        // Must be followed by `[][]`
+        if type_end + 4 > len
+            || &sql[type_end..type_end + 4] != "[][]"
+        {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        // Only handle numeric/boolean types
+        let type_lower = type_name.to_ascii_lowercase();
+        let is_numeric = matches!(
+            type_lower.as_str(),
+            "int" | "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint"
+            | "float4" | "float8" | "real" | "numeric" | "bool" | "boolean"
+        );
+        if !is_numeric {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        // Parse `{{row1_elem1,row1_elem2,...},{row2_elem1,...},...}`
+        // Strip outer `{` and `}`
+        let inner = str_inner.trim();
+        let inner = match inner.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            Some(s) => s,
+            None => {
+                out.push_str(&sql[str_start..str_end + 1]);
+                i = str_end + 1;
+                continue;
+            }
+        };
+
+        // Split inner on `},{` to get sub-arrays
+        // We need to split at top-level `},{` boundaries.
+        let sub_arrays = split_multidim_rows(inner);
+        let mut outer_args = String::new();
+        for (idx, sub) in sub_arrays.iter().enumerate() {
+            if idx > 0 { outer_args.push_str(", "); }
+            // sub is like `{1,2}` or `1,2`
+            let sub_trimmed = sub.trim();
+            let sub_content = sub_trimmed.strip_prefix('{')
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(sub_trimmed);
+            let elems: Vec<&str> = sub_content.split(',').map(|e| e.trim()).collect();
+            let inner_args = elems.join(", ");
+            outer_args.push_str(&format!("make_array({inner_args})"));
+        }
+        let replacement = format!("make_array({outer_args})");
+        out.push_str(&replacement);
+        i = type_end + 4; // skip past `'...'::type[][]`
+    }
+    out
+}
+
+/// Split multi-dim array inner string `{1,2},{3,4}` into sub-array strings.
+fn split_multidim_rows(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    // End of a sub-array (or element), include the closing `}`
+                    parts.push(&s[start..i + 1]);
+                    // Skip the `,` separator
+                    let mut j = i + 1;
+                    while j < len && bytes[j] == b',' { j += 1; }
+                    i = j;
+                    start = i;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Remaining flat elements (no braces)
+    let rem = s[start..].trim();
+    if !rem.is_empty() {
+        parts.push(&s[start..]);
+    }
+    parts
 }
 
 /// Strip `::jsonb` and `::json` casts so DataFusion's planner does not reject
@@ -3610,5 +4064,45 @@ mod json_op_rewrite_tests {
     fn test_has_key_op() {
         let r = rewrite_json_operators("SELECT data ? 'foo' FROM t");
         assert!(r.contains("jsonb_has_key(data, 'foo')"), "got: {r}");
+    }
+
+    #[test]
+    fn test_row_to_json_subquery_alias() {
+        let sql = "SELECT row_to_json(t) FROM (SELECT 1 AS a) t";
+        let r = rewrite_json_operators(sql);
+        assert!(
+            r.contains("jsonb_build_object('a', a)"),
+            "expected jsonb_build_object rewrite, got: {r}"
+        );
+        assert!(!r.contains("row_to_json(t)"), "row_to_json(t) should be gone: {r}");
+    }
+
+    #[test]
+    fn test_row_to_json_subquery_multi_col() {
+        let sql = "SELECT row_to_json(s) FROM (SELECT 1 AS id, 'x' AS name) s";
+        let r = rewrite_json_operators(sql);
+        assert!(r.contains("jsonb_build_object("), "got: {r}");
+        assert!(r.contains("'id', id"), "got: {r}");
+        assert!(r.contains("'name', name"), "got: {r}");
+    }
+
+    #[test]
+    fn test_row_to_json_no_match_plain_table() {
+        // row_to_json(t) without subquery alias should not be rewritten by this function
+        let sql = "SELECT row_to_json(t) FROM t";
+        let r = rewrite_json_operators(sql);
+        // No subquery alias, so remains as row_to_json(t)
+        assert!(r.contains("row_to_json(t)"), "got: {r}");
+    }
+
+    #[test]
+    fn test_multidim_array_literal_int() {
+        let sql = "SELECT '{{1,2},{3,4}}'::int[][]";
+        let r = rewrite_json_operators(sql);
+        assert!(
+            r.contains("make_array(make_array(1,2), make_array(3,4))")
+                || r.contains("make_array(make_array(1, 2), make_array(3, 4))"),
+            "got: {r}"
+        );
     }
 }

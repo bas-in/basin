@@ -207,6 +207,11 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
         signature: Signature::variadic_any(Volatility::Immutable),
     }));
 
+    // json_build_object(variadic any) -> text  (Utf8 variant of jsonb_build_object)
+    ctx.register_udf(ScalarUDF::from(JsonBuildObjectUdf {
+        signature: Signature::variadic_any(Volatility::Immutable),
+    }));
+
     // jsonb_build_array(variadic any) -> jsonb
     ctx.register_udf(ScalarUDF::from(JsonbBuildArrayUdf {
         signature: Signature::variadic_any(Volatility::Immutable),
@@ -1466,6 +1471,62 @@ impl ScalarUDFImpl for JsonbBuildObjectUdf {
             }
         }
         let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// json_build_object(variadic any) -> text  (Utf8 variant)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct JsonBuildObjectUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for JsonBuildObjectUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "json_build_object" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() % 2 != 0 {
+            return exec_err!(
+                "json_build_object requires an even number of arguments (key/value pairs), got {}",
+                args.len()
+            );
+        }
+        let n = row_count(args);
+        let arrays: Vec<ArrayRef> = args
+            .iter()
+            .map(|a| a.clone().into_array(n))
+            .collect::<DFResult<_>>()?;
+
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut map = serde_json::Map::new();
+            let mut null_row = false;
+            for pair in arrays.chunks(2) {
+                let key_val = array_element_to_json(&pair[0], i);
+                let val_val = array_element_to_json(&pair[1], i);
+                let key_str = match &key_val {
+                    Value::String(s) => s.clone(),
+                    Value::Null => { null_row = true; break; }
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                map.insert(key_str, val_val);
+            }
+            if null_row {
+                out.push(None);
+            } else {
+                let v = Value::Object(map);
+                out.push(Some(v.to_string()));
+            }
+        }
+        use datafusion::arrow::array::StringArray;
+        let result = StringArray::from(out);
         Ok(ColumnarValue::Array(Arc::new(result)))
     }
 }

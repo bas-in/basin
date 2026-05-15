@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778839184 (Unix epoch)
-SQL fragments tested: 490 total / 1263 green (across all three configurations).
+Last run: 1778839498 (Unix epoch)
+SQL fragments tested: 490 total / 1269 green (across all three configurations).
 
 ## Configurations
 
@@ -213,7 +213,7 @@ SQL fragments tested: 490 total / 1263 green (across all three configurations).
 | `SELECT '{1,2}'::int[] && '{2,3}'::int[]` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT '{1,2,3}'::int[]` | ✅ | ✅ | ✅ |  |
-| `SELECT '{{1,2},{3,4}}'::int[][]` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Cast error: Cannot cast string '{{1,2},{3,4}}… |
+| `SELECT '{{1,2},{3,4}}'::int[][]` | ✅ | ✅ | ✅ |  |
 | `SELECT (ARRAY[1,2,3])[2]` | ✅ | ✅ | ✅ |  |
 | `SELECT (ARRAY[1,2,3,4,5])[2:4]` | ✅ | ✅ | ✅ |  |
 | `SELECT array_length(ARRAY[1,2,3], 1)` | ✅ | ✅ | ✅ |  |
@@ -303,7 +303,7 @@ SQL fragments tested: 490 total / 1263 green (across all three configurations).
 | `SELECT jsonb_build_array(1, 'a', true)` | ✅ | ✅ | ✅ |  |
 | `SELECT to_jsonb(ROW(1, 'a'))` | ✅ | ✅ | ✅ |  |
 | `SELECT to_json(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
-| `SELECT row_to_json(t) FROM (SELECT 1 AS a) t` | 🛠 | 🛠 | 🛠 | internal: plan: Schema error: No field named t. Valid fields are t.a. |
+| `SELECT row_to_json(t) FROM (SELECT 1 AS a) t` | ✅ | ✅ | ✅ |  |
 | `SELECT array_to_json(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_agg(id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_object_agg(name, id) FROM t` | ✅ | ✅ | ✅ |  |
