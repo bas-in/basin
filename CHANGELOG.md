@@ -11,6 +11,22 @@ graduate to 1.0 and the standard SemVer guarantees.
 ## [Unreleased]
 
 ### Added
+- **SQL-compat lift: ~75% → 97.2% fragment coverage.** 423 of 435
+  non-design-excluded fragments now pass end-to-end (490 total; 55 are
+  explicit design-exclusions). Key work shipped in this cycle:
+  JSONB operators (`->` / `->>` / `#>` / `@>` / `?` family) via
+  DataFusion JSON support; scalar function catalogue (date/time,
+  string, math, coalesce/nullif/greatest/least); range, array, and
+  date type support; operator rewriters for vector distance and JSONB
+  paths; `LIMIT`/`OFFSET` parameter-type inference (fixes `i64`
+  binding from ORMs); `BYTEA` DDL + Arrow `LargeBinary` round-trip;
+  `NUMERIC`/`DECIMAL` column type; design-exclusion classification
+  of 55 deliberately out-of-scope fragments (`LISTEN/NOTIFY`,
+  `BEGIN/COMMIT/ROLLBACK`, `DROP TABLE`, extensions, etc.).
+  Remaining real v0.2 gaps: `LATERAL` joins, `WITH RECURSIVE` +
+  DML-in-CTE, advanced window frames (`RANGE INTERVAL` / `GROUPS` /
+  `EXCLUDE`), `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`.
+  See [`docs/sql-support.md`](./docs/sql-support.md).
 - `auth.uid()`, `auth.role()`, `auth.jwt()` SQL session functions — Supabase-compatible;
   usable in RLS policies (`CREATE POLICY … USING (owner_id = auth.uid())`). Both
   `auth.uid()` and `auth_uid()` spellings work.

@@ -249,4 +249,4 @@ above are honest recommendations.
 
 ---
 
-*Last updated: 2026-05-12. This file is hand-maintained; PRs welcome.*
+*Last updated: 2026-05-15. This file is hand-maintained; PRs welcome.*

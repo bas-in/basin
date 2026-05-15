@@ -861,6 +861,8 @@ correctly), per-tenant pgwire credential auth, persistence across sessions.
 - [ ] `SELECT *` Arrow-projection error — fails on specific column-shape combinations (`BIGSERIAL PK + TEXT + TEXT UNIQUE + TIMESTAMPTZ DEFAULT now()`) with `expected '32' at position N; got 'M'`. Workaround is explicit-column SELECT. Root cause: type-OID encoding mismatch on the wire (Arrow → pgwire row description). Reproducer in the bench's `bench_users` shape.
 - [ ] `pg_catalog` UDFs psql uses for meta-commands — `pg_table_is_visible`, `pg_get_userbyid`, `pg_get_function_arguments`, `pg_get_indexdef`, etc. The 17 views in Phase 5.11.M ship but the helper UDFs don't, so `\dt` / `\d` / `\df` all error out. Pair with the next basin-trgm / basin-net SQL-surface ship since it's also a UDF-registry batch.
 
+**SQL-compat milestone (2026-05-15):** fragment-level coverage lifted from ~75% to **97.2%** (423 / 435 non-design-excluded fragments). Remaining real v0.2 gaps: `LATERAL` joins, `WITH RECURSIVE` + DML-in-CTE, advanced window frames (`RANGE INTERVAL` / `GROUPS` / `EXCLUDE`), `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`. See [`docs/sql-support.md`](./docs/sql-support.md) for the full matrix.
+
 Bench artefacts: the patched harness lives at `basin-cloud/backend/cmd/neonbench/main.go` (multi-row VALUES + literal-RHS UPDATE + best-effort DROP + per-table CREATE with "already exists" tolerated). The Postgres compat matrix in basin-cloud/src/pages/docs/PostgresCompat.jsx mirrors these gaps for end-users.
 
 ## Critical rules (from the brief — re-read before scope-creep)

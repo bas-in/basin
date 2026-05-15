@@ -13,13 +13,16 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred
 
 ---
 
-## Roadmap status — checkpoint 2026-05-01
+## Roadmap status — checkpoint 2026-05-15
 
 **The full WEDGE 1–5 + 5c slice is shipped.** All five items below are at
-v0.1 with passing benchmark coverage. Workspace tests: **216 / 216 passing,
-0 failures**. The dashboard stories are honest — every red card has a
-documented architectural reason (single-process limit, etc.) and a future
-trigger to revisit.
+v0.1 with passing benchmark coverage. Workspace tests passing; dashboard
+stories honest — every red card has a documented architectural reason and a
+future trigger to revisit. SQL-compat fragment coverage: **97.2%** (423 / 435
+non-design-excluded fragments — up from ~75% at last checkpoint). Remaining
+real v0.2 gaps: `LATERAL` joins, `WITH RECURSIVE` + DML-in-CTE, advanced
+window frames, `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`. See
+[`docs/sql-support.md`](./docs/sql-support.md).
 
 Three additional crates landed alongside the wedge by founder direction
 and now ship as part of the open-source bundle (Phase 5.10 in
@@ -38,7 +41,7 @@ hosted-cloud product lives in a separate repo):**
 5. **Phase 5.11.A — expanded built-in function catalogue** — date/time, string, math, coalesce, aggregate. Gates triggers + PL/pgSQL. ~3 weeks. The smaller "drop in your existing PG schema" win and a hard prerequisite for everything else in 5.11.
 6. **Phase 5.11.D — `CREATE MATERIALIZED VIEW` SQL surface** — drop the `cv_glue` stub. ~1 week, lands once 5.11.A is in.
 7. **B1 per-tenant secondary indexes** — biggest remaining point-query win. ~8 weeks.
-8. **Phase 5.12 — SmithDB-inspired storage optimizations (lands after SQL compat clears 400 ✅).** LangChain's [SmithDB](https://www.langchain.com/blog/introducing-smithdb) is a Rust + DataFusion + Vortex + object-store database that ships LangSmith's agent-trace workload in production. The architecture is a cousin of Basin's; the four patterns below are battle-tested under the same constraints we operate within. Land them in this order:
+8. **Phase 5.12 — SmithDB-inspired storage optimizations (SQL compat at 97.2% / 423 ✅ — gate cleared).** LangChain's [SmithDB](https://www.langchain.com/blog/introducing-smithdb) is a Rust + DataFusion + Vortex + object-store database that ships LangSmith's agent-trace workload in production. The architecture is a cousin of Basin's; the four patterns below are battle-tested under the same constraints we operate within. Land them in this order:
    - **5.12.A — time-tiered compaction.** Replace the compactor's uniform schedule with SmithDB-style time-tiered policy: recent partitions compact often, older partitions settle into larger files. Matches Basin's audit-log target workload exactly. ~1 week. Single file: `crates/basin-shard/src/compactor.rs`.
    - **5.12.B — late materialization for big payloads.** Split JSONB and large-text columns from "core" columns at row-group write time so point queries that don't project the payload skip the body entirely. SmithDB does this for trace bodies; Basin's audit-log workload has the same shape (small core + big JSON). ~2 weeks. Touches the Parquet writer in `basin-storage` and the planner's projection pushdown. Compounds with A4 catalog stats + cluster-by for ~10× point-query latency improvement on payload-heavy tables.
    - **5.12.C — Vortex as opt-in storage format ([proposed ADR 0015](./docs/decisions/0015-vortex-storage-format.md)).** `CREATE TABLE … WITH (basin.file_format = 'vortex')` writes Vortex instead of Parquet for that table. Parquet stays default — preserves Iceberg / DuckDB / Athena / Spark read-compat for default tables. Per-table opt-in keeps the migration surface bounded. SmithDB validates Vortex at production scale (100× faster random access vs Parquet, 10-20× faster scans). ~3 weeks. New module: `crates/basin-storage/src/vortex_format.rs` implementing the same `FileFormat` trait Parquet does.
