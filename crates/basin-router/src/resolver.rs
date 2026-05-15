@@ -1,64 +1,64 @@
-//! Map a pgwire `user` parameter to a `TenantId`.
+//! Map a pgwire `user` parameter to a `ProjectId`.
 //!
-//! The PoC ships a `StaticTenantResolver` driven by a `HashMap`; production
+//! The PoC ships a `StaticProjectResolver` driven by a `HashMap`; production
 //! deployments will swap in a network-backed resolver (etcd/FDB lookup,
-//! tenant-control-plane RPC, etc.). The trait is async because any real
+//! project-control-plane RPC, etc.). The trait is async because any real
 //! implementation will hit the network.
 //!
-//! [`JwtTenantResolver`] is the auth-aware variant: the pgwire `user`
+//! [`JwtProjectResolver`] is the auth-aware variant: the pgwire `user`
 //! parameter carries the bearer JWT verbatim (optionally prefixed with
 //! `"Bearer "`); the resolver verifies the token via
-//! `basin_auth::AuthService` and returns the embedded `tenant_id` claim.
+//! `basin_auth::AuthService` and returns the embedded `project_id` claim.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 
-/// Resolves a pgwire `user` to a `TenantId`. Implementations must be safe to
+/// Resolves a pgwire `user` to a `ProjectId`. Implementations must be safe to
 /// share across connections; `&self` is the only handle the router holds.
 #[async_trait]
-pub trait TenantResolver: Send + Sync {
-    async fn resolve(&self, username: &str) -> Result<TenantId>;
+pub trait ProjectResolver: Send + Sync {
+    async fn resolve(&self, username: &str) -> Result<ProjectId>;
 
     /// Variant that also receives the cleartext-password from the pgwire
     /// startup handshake. Default impl drops the password and falls
     /// through to `resolve(username)` — so existing JWT / API-key /
     /// static resolvers don't need to change. The
-    /// [`TenantCredentialsResolver`] overrides this to bcrypt-validate
-    /// the `(user, password)` pair against the per-tenant credential row
-    /// and resolve the tenant from there.
-    async fn resolve_credentials(&self, username: &str, _password: &str) -> Result<TenantId> {
+    /// [`ProjectCredentialsResolver`] overrides this to bcrypt-validate
+    /// the `(user, password)` pair against the per-project credential row
+    /// and resolve the project from there.
+    async fn resolve_credentials(&self, username: &str, _password: &str) -> Result<ProjectId> {
         self.resolve(username).await
     }
 }
 
-/// In-memory resolver keyed on username -> tenant id. Useful for the PoC and
+/// In-memory resolver keyed on username -> project id. Useful for the PoC and
 /// for tests; not a production tool.
 #[derive(Debug, Clone, Default)]
-pub struct StaticTenantResolver {
-    map: HashMap<String, TenantId>,
+pub struct StaticProjectResolver {
+    map: HashMap<String, ProjectId>,
 }
 
-impl StaticTenantResolver {
-    pub fn new(map: HashMap<String, TenantId>) -> Self {
+impl StaticProjectResolver {
+    pub fn new(map: HashMap<String, ProjectId>) -> Self {
         Self { map }
     }
 
-    pub fn with_entry(mut self, user: impl Into<String>, tenant: TenantId) -> Self {
-        self.map.insert(user.into(), tenant);
+    pub fn with_entry(mut self, user: impl Into<String>, project: ProjectId) -> Self {
+        self.map.insert(user.into(), project);
         self
     }
 }
 
 #[async_trait]
-impl TenantResolver for StaticTenantResolver {
-    async fn resolve(&self, username: &str) -> Result<TenantId> {
+impl ProjectResolver for StaticProjectResolver {
+    async fn resolve(&self, username: &str) -> Result<ProjectId> {
         self.map
             .get(username)
             .copied()
-            .ok_or_else(|| BasinError::not_found(format!("no tenant mapped for user {username:?}")))
+            .ok_or_else(|| BasinError::not_found(format!("no project mapped for user {username:?}")))
     }
 }
 
@@ -67,24 +67,24 @@ impl TenantResolver for StaticTenantResolver {
 /// pgwire has no native bearer-token slot, so we overload `user`: clients
 /// connect with `user=<jwt>` (optionally `user=Bearer <jwt>`) and the
 /// resolver verifies the token through [`basin_auth::AuthService`] before
-/// returning the embedded `tenant_id` claim. This keeps the wire format
+/// returning the embedded `project_id` claim. This keeps the wire format
 /// untouched — every existing pgwire driver works as long as it can put
 /// arbitrary text in `user`. See `basin-router/src/lib.rs` for the
 /// integration story.
 #[derive(Clone)]
-pub struct JwtTenantResolver {
+pub struct JwtProjectResolver {
     auth: Arc<basin_auth::AuthService>,
 }
 
-impl JwtTenantResolver {
+impl JwtProjectResolver {
     pub fn new(auth: Arc<basin_auth::AuthService>) -> Self {
         Self { auth }
     }
 }
 
 #[async_trait]
-impl TenantResolver for JwtTenantResolver {
-    async fn resolve(&self, username: &str) -> Result<TenantId> {
+impl ProjectResolver for JwtProjectResolver {
+    async fn resolve(&self, username: &str) -> Result<ProjectId> {
         // Optional `Bearer ` prefix mirrors the HTTP Authorization header so
         // operators can paste tokens copied from the REST flow.
         let token = username.strip_prefix("Bearer ").unwrap_or(username);
@@ -92,63 +92,63 @@ impl TenantResolver for JwtTenantResolver {
             .auth
             .verify_jwt(token)
             .map_err(|e| BasinError::not_found(format!("invalid jwt: {e}")))?;
-        Ok(claims.tenant_id)
+        Ok(claims.project_id)
     }
 }
 
 /// API-key-backed resolver. The pgwire `user` parameter carries an opaque
 /// long-lived API key (optionally `Bearer ...`-prefixed); the resolver
-/// looks it up in the auth DB and returns the owning tenant. Pair with
-/// [`StackedTenantResolver`] in front of [`JwtTenantResolver`] when a
+/// looks it up in the auth DB and returns the owning project. Pair with
+/// [`StackedProjectResolver`] in front of [`JwtProjectResolver`] when a
 /// deployment serves both credential types on the same listener.
 #[derive(Clone)]
-pub struct ApiKeyTenantResolver {
+pub struct ApiKeyProjectResolver {
     auth: Arc<basin_auth::AuthService>,
 }
 
-impl ApiKeyTenantResolver {
+impl ApiKeyProjectResolver {
     pub fn new(auth: Arc<basin_auth::AuthService>) -> Self {
         Self { auth }
     }
 }
 
 #[async_trait]
-impl TenantResolver for ApiKeyTenantResolver {
-    async fn resolve(&self, username: &str) -> Result<TenantId> {
+impl ProjectResolver for ApiKeyProjectResolver {
+    async fn resolve(&self, username: &str) -> Result<ProjectId> {
         let token = username.strip_prefix("Bearer ").unwrap_or(username);
-        let (tenant, _user) = self
+        let (project, _user) = self
             .auth
             .validate_api_key(token)
             .await
             .map_err(|e| BasinError::not_found(format!("invalid api key: {e}")))?;
-        Ok(tenant)
+        Ok(project)
     }
 }
 
-/// Resolves tenants by `(pgwire_user, password)` pair against the
-/// `auth_tenant_credentials` table. Built atop `basin_auth::AuthService`
+/// Resolves projects by `(pgwire_user, password)` pair against the
+/// `auth_project_credentials` table. Built atop `basin_auth::AuthService`
 /// so revocation, rotation, and bcrypt validation all live in one place.
 ///
-/// The customer-facing surface is the connection URL `provision_tenant_db`
+/// The customer-facing surface is the connection URL `provision_project_db`
 /// hands back: `postgres://<pgwire_user>:<password>@<host>/<dbname>`.
 /// When pgwire startup arrives with that URL's `(user, password)`, this
-/// resolver bcrypt-verifies and returns the tenant id; failure surfaces
+/// resolver bcrypt-verifies and returns the project id; failure surfaces
 /// as a uniform `BasinError::InvalidIdent("invalid pgwire credentials")`
 /// — never leaks user existence vs. wrong password.
 #[derive(Clone)]
-pub struct TenantCredentialsResolver {
+pub struct ProjectCredentialsResolver {
     auth: Arc<basin_auth::AuthService>,
 }
 
-impl TenantCredentialsResolver {
+impl ProjectCredentialsResolver {
     pub fn new(auth: Arc<basin_auth::AuthService>) -> Self {
         Self { auth }
     }
 }
 
 #[async_trait]
-impl TenantResolver for TenantCredentialsResolver {
-    async fn resolve(&self, _username: &str) -> Result<TenantId> {
+impl ProjectResolver for ProjectCredentialsResolver {
+    async fn resolve(&self, _username: &str) -> Result<ProjectId> {
         // The credentials path requires the password slot. Without it we
         // can't bcrypt-verify; refuse loudly so a misconfigured stack
         // doesn't silently accept any password.
@@ -157,30 +157,30 @@ impl TenantResolver for TenantCredentialsResolver {
         ))
     }
 
-    async fn resolve_credentials(&self, username: &str, password: &str) -> Result<TenantId> {
+    async fn resolve_credentials(&self, username: &str, password: &str) -> Result<ProjectId> {
         self.auth
             .validate_pgwire_credentials(username, password)
             .await
     }
 }
 
-/// Resolves tenants by trying each backing resolver in order until one
-/// succeeds. Used by basin-server when JWT, API-key, per-tenant credentials,
+/// Resolves projects by trying each backing resolver in order until one
+/// succeeds. Used by basin-server when JWT, API-key, per-project credentials,
 /// and static fallback are in play on the same listener.
 #[derive(Clone)]
-pub struct StackedTenantResolver {
-    resolvers: Vec<Arc<dyn TenantResolver>>,
+pub struct StackedProjectResolver {
+    resolvers: Vec<Arc<dyn ProjectResolver>>,
 }
 
-impl StackedTenantResolver {
-    pub fn new(resolvers: Vec<Arc<dyn TenantResolver>>) -> Self {
+impl StackedProjectResolver {
+    pub fn new(resolvers: Vec<Arc<dyn ProjectResolver>>) -> Self {
         Self { resolvers }
     }
 }
 
 #[async_trait]
-impl TenantResolver for StackedTenantResolver {
-    async fn resolve(&self, username: &str) -> Result<TenantId> {
+impl ProjectResolver for StackedProjectResolver {
+    async fn resolve(&self, username: &str) -> Result<ProjectId> {
         let mut last_err = None;
         for r in &self.resolvers {
             match r.resolve(username).await {
@@ -192,7 +192,7 @@ impl TenantResolver for StackedTenantResolver {
             .unwrap_or_else(|| BasinError::not_found(format!("no resolver matched {username:?}"))))
     }
 
-    async fn resolve_credentials(&self, username: &str, password: &str) -> Result<TenantId> {
+    async fn resolve_credentials(&self, username: &str, password: &str) -> Result<ProjectId> {
         let mut last_err = None;
         for r in &self.resolvers {
             match r.resolve_credentials(username, password).await {
@@ -211,17 +211,17 @@ mod tests {
 
     #[tokio::test]
     async fn static_resolver_lookup() {
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let mut map = HashMap::new();
         map.insert("alice".to_owned(), t);
-        let r = StaticTenantResolver::new(map);
+        let r = StaticProjectResolver::new(map);
 
         assert_eq!(r.resolve("alice").await.unwrap(), t);
         let err = r.resolve("bob").await.unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
 
-    // --- StackedTenantResolver tests ----------------------------------------
+    // --- StackedProjectResolver tests ----------------------------------------
     //
     // Use a counting resolver so we can assert that the second backing
     // resolver is *not* polled when the first one already succeeds. This
@@ -231,32 +231,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingResolver {
-        inner: Arc<dyn TenantResolver>,
+        inner: Arc<dyn ProjectResolver>,
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl TenantResolver for CountingResolver {
-        async fn resolve(&self, username: &str) -> Result<TenantId> {
+    impl ProjectResolver for CountingResolver {
+        async fn resolve(&self, username: &str) -> Result<ProjectId> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.inner.resolve(username).await
         }
     }
 
-    fn static_with(user: &str, t: TenantId) -> Arc<dyn TenantResolver> {
-        Arc::new(StaticTenantResolver::default().with_entry(user, t))
+    fn static_with(user: &str, t: ProjectId) -> Arc<dyn ProjectResolver> {
+        Arc::new(StaticProjectResolver::default().with_entry(user, t))
     }
 
     #[tokio::test]
     async fn stacked_resolver_uses_first_match() {
-        let t1 = TenantId::new();
-        let t2 = TenantId::new();
+        let t1 = ProjectId::new();
+        let t2 = ProjectId::new();
         let second_calls = Arc::new(AtomicUsize::new(0));
         let second = Arc::new(CountingResolver {
             inner: static_with("alice", t2),
             calls: second_calls.clone(),
         });
-        let stacked = StackedTenantResolver::new(vec![static_with("alice", t1), second]);
+        let stacked = StackedProjectResolver::new(vec![static_with("alice", t1), second]);
 
         assert_eq!(stacked.resolve("alice").await.unwrap(), t1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 0);
@@ -264,10 +264,10 @@ mod tests {
 
     #[tokio::test]
     async fn stacked_resolver_falls_through_on_first_err() {
-        let t = TenantId::new();
-        let stacked = StackedTenantResolver::new(vec![
+        let t = ProjectId::new();
+        let stacked = StackedProjectResolver::new(vec![
             // First resolver has no entry for "alice" -> NotFound.
-            Arc::new(StaticTenantResolver::default()),
+            Arc::new(StaticProjectResolver::default()),
             static_with("alice", t),
         ]);
         assert_eq!(stacked.resolve("alice").await.unwrap(), t);
@@ -275,9 +275,9 @@ mod tests {
 
     #[tokio::test]
     async fn stacked_resolver_returns_last_err_when_all_fail() {
-        let stacked = StackedTenantResolver::new(vec![
-            Arc::new(StaticTenantResolver::default().with_entry("bob", TenantId::new())),
-            Arc::new(StaticTenantResolver::default().with_entry("carol", TenantId::new())),
+        let stacked = StackedProjectResolver::new(vec![
+            Arc::new(StaticProjectResolver::default().with_entry("bob", ProjectId::new())),
+            Arc::new(StaticProjectResolver::default().with_entry("carol", ProjectId::new())),
         ]);
         let err = stacked.resolve("alice").await.unwrap_err();
         // Last resolver is the carol-only map; its NotFound message mentions
@@ -289,7 +289,7 @@ mod tests {
         );
     }
 
-    // --- JwtTenantResolver tests --------------------------------------------
+    // --- JwtProjectResolver tests --------------------------------------------
     //
     // These tests stand up a live `AuthService` against PG. They mirror the
     // skip-cleanly pattern used by `basin-auth`'s own tests so the suite is
@@ -403,7 +403,7 @@ mod tests {
     /// signup/email flow — these tests are about the resolver, not the auth
     /// flows. We use the `JwtVerifier` trait's underlying `verify_jwt` to
     /// confirm the token round-trips, then drive the resolver against it.
-    fn issue_via_auth(svc: &AuthService, tenant: &TenantId) -> String {
+    fn issue_via_auth(svc: &AuthService, project: &ProjectId) -> String {
         // Reach into the same `verify_jwt`-compatible signing key by going
         // through a fresh `JwtKeys` configured with the same secret as the
         // service. The service's secret is `[9u8; 32]` per `base_cfg`.
@@ -411,7 +411,7 @@ mod tests {
         let now = chrono::Utc::now();
         let (jwt, _) = keys
             .issue(
-                tenant,
+                project,
                 Uuid::new_v4(),
                 "x@example.com",
                 &[],
@@ -425,15 +425,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn jwt_resolver_returns_tenant_for_valid_token() {
+    async fn jwt_resolver_returns_project_for_valid_token() {
         let Some((svc, _g)) = try_connect().await else {
             return;
         };
-        let tenant = TenantId::new();
-        let jwt = issue_via_auth(&svc, &tenant);
-        let resolver = JwtTenantResolver::new(Arc::new(svc));
+        let project = ProjectId::new();
+        let jwt = issue_via_auth(&svc, &project);
+        let resolver = JwtProjectResolver::new(Arc::new(svc));
         let got = resolver.resolve(&jwt).await.expect("resolve");
-        assert_eq!(got, tenant);
+        assert_eq!(got, project);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,8 +441,8 @@ mod tests {
         let Some((svc, _g)) = try_connect().await else {
             return;
         };
-        let tenant = TenantId::new();
-        let jwt = issue_via_auth(&svc, &tenant);
+        let project = ProjectId::new();
+        let jwt = issue_via_auth(&svc, &project);
         let mut bytes = jwt.into_bytes();
         // Flip the last char of the signature; same trick as basin-auth's
         // tampered-signature test.
@@ -450,7 +450,7 @@ mod tests {
         *last = if *last == b'A' { b'B' } else { b'A' };
         let tampered = String::from_utf8(bytes).unwrap();
 
-        let resolver = JwtTenantResolver::new(Arc::new(svc));
+        let resolver = JwtProjectResolver::new(Arc::new(svc));
         let err = resolver.resolve(&tampered).await.unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
@@ -460,11 +460,11 @@ mod tests {
         let Some((svc, _g)) = try_connect().await else {
             return;
         };
-        let tenant = TenantId::new();
-        let jwt = issue_via_auth(&svc, &tenant);
+        let project = ProjectId::new();
+        let jwt = issue_via_auth(&svc, &project);
         let with_prefix = format!("Bearer {jwt}");
-        let resolver = JwtTenantResolver::new(Arc::new(svc));
+        let resolver = JwtProjectResolver::new(Arc::new(svc));
         let got = resolver.resolve(&with_prefix).await.expect("resolve");
-        assert_eq!(got, tenant);
+        assert_eq!(got, project);
     }
 }

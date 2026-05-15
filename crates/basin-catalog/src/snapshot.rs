@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::metadata::DataFileRef;
 
-/// Monotonic snapshot identifier, scoped to one `(tenant, table)`.
+/// Monotonic snapshot identifier, scoped to one `(project, table)`.
 ///
 /// We use a `u64` rather than the random 64-bit ints Iceberg uses on the wire
 /// because in-memory we want strict ordering for `list_snapshots` and the

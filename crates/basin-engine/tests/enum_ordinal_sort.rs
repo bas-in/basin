@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -64,7 +64,7 @@ fn collect_status_column(res: ExecResult) -> Vec<Option<String>> {
 async fn order_by_enum_uses_declaration_order() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
         .await
@@ -100,7 +100,7 @@ async fn order_by_enum_uses_declaration_order() {
 async fn order_by_enum_desc() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
         .await
@@ -133,7 +133,7 @@ async fn order_by_enum_desc() {
 async fn range_filter_uses_ordinal() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
         .await
@@ -168,7 +168,7 @@ async fn range_filter_uses_ordinal() {
 async fn equality_filter_unaffected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
         .await

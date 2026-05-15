@@ -18,7 +18,7 @@ use std::time::Duration;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{ReadOptions, Storage, StorageConfig};
@@ -118,25 +118,25 @@ async fn s3_viability_tiered_storage() {
         wal.clone(),
     ));
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
-    let _handle = shard.get(&tenant, &part).await.unwrap();
+    let _handle = shard.get(&project, &part).await.unwrap();
 
     let old_batch = build_batch(0, 10, 100);
     let new_batch = build_batch(1000, 10, 10);
     catalog
-        .create_table(&tenant, &table, old_batch.schema().as_ref())
+        .create_table(&project, &table, old_batch.schema().as_ref())
         .await
         .unwrap();
 
     let old_file = storage
-        .write_batch(&tenant, &table, &part, &old_batch)
+        .write_batch(&project, &table, &part, &old_batch)
         .await
         .unwrap();
     let new_file = storage
-        .write_batch(&tenant, &table, &part, &new_batch)
+        .write_batch(&project, &table, &part, &new_batch)
         .await
         .unwrap();
 
@@ -146,7 +146,7 @@ async fn s3_viability_tiered_storage() {
     let mut current_snap = basin_catalog::SnapshotId::GENESIS;
     let after_old = catalog
         .append_data_files(
-            &tenant,
+            &project,
             &table,
             current_snap,
             vec![basin_catalog::DataFileRef {
@@ -161,7 +161,7 @@ async fn s3_viability_tiered_storage() {
     current_snap = after_old.current_snapshot;
     let _after_new = catalog
         .append_data_files(
-            &tenant,
+            &project,
             &table,
             current_snap,
             vec![basin_catalog::DataFileRef {
@@ -176,7 +176,7 @@ async fn s3_viability_tiered_storage() {
 
     catalog
         .set_tier_policy(
-            &tenant,
+            &project,
             &table,
             Some(30 * SECS_PER_DAY as u64),
             Some("ts".to_string()),
@@ -184,7 +184,7 @@ async fn s3_viability_tiered_storage() {
         .await
         .unwrap();
 
-    let pre = storage.list_data_files(&tenant, &table).await.unwrap();
+    let pre = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(pre.len(), 2);
     for f in &pre {
         assert_eq!(f.tier, basin_storage::Tier::Hot);
@@ -192,7 +192,7 @@ async fn s3_viability_tiered_storage() {
 
     shard.run_tiering_sweep().await.unwrap();
 
-    let post = storage.list_data_files(&tenant, &table).await.unwrap();
+    let post = storage.list_data_files(&project, &table).await.unwrap();
     let cold_files: Vec<_> = post
         .iter()
         .filter(|f| matches!(f.tier, basin_storage::Tier::Cold))
@@ -225,7 +225,7 @@ async fn s3_viability_tiered_storage() {
     assert!(still_alive.is_empty(), "migrated hot file should be gone");
 
     let stream = storage
-        .read(&tenant, &table, ReadOptions::default())
+        .read(&project, &table, ReadOptions::default())
         .await
         .unwrap();
     let batches: Vec<RecordBatch> = stream
@@ -239,7 +239,7 @@ async fn s3_viability_tiered_storage() {
 
     // Idempotency
     shard.run_tiering_sweep().await.unwrap();
-    let post2 = storage.list_data_files(&tenant, &table).await.unwrap();
+    let post2 = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(post2.len(), 2);
     let cold2: usize = post2
         .iter()

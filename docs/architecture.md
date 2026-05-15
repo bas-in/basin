@@ -9,11 +9,11 @@ that the code is built against. For the phased build plan see
 > [`basin-cli`](https://github.com/bas-in/basin-cli) and
 > [`basin-cloud`](https://github.com/bas-in/basin-cloud).
 
-Basin is a bucket-native, multi-tenant, Postgres-compatible database. The whole
+Basin is a bucket-native, multi-project, Postgres-compatible database. The whole
 system is organized around four ideas:
 
-1. **Tenants are first-class.** Every byte on disk and every row in memory
-   belongs to exactly one tenant, addressed by a stable `TenantId`.
+1. **Projects are first-class.** Every byte on disk and every row in memory
+   belongs to exactly one project, addressed by a stable `ProjectId`.
 2. **The bucket is the source of truth for long-term state.** Parquet files
    under an Iceberg catalog are the canonical record. Compute is disposable.
 3. **Durability is decided by Raft, not by S3.** The hot path never blocks on
@@ -42,12 +42,12 @@ writes; reads short-circuit at whichever layer holds the answer.
             |  - OLTP vs analytical decision                 |
             +------------------------------------------------+
                                      |
-                          (gRPC, mTLS, per-tenant token)
+                          (gRPC, mTLS, per-project token)
                                      |
                                      v
             +------------------------------------------------+
             |  Layer 2: Shard owners (stateful)              |
-            |  - own (tenant_id, partition) -> Arrow state   |
+            |  - own (project_id, partition) -> Arrow state   |
             |  - lazy load from WAL + Parquet                |
             |  - point lookups, range scans, single-shard tx |
             |  - background compactor -> Parquet + catalog   |
@@ -57,7 +57,7 @@ writes; reads short-circuit at whichever layer holds the answer.
             +------------------------------------------------+
             |  Layer 3: Regional WAL (Raft, 3-5 nodes)       |
             |  - durability boundary                         |
-            |  - append keyed by (tenant_id, partition)      |
+            |  - append keyed by (project_id, partition)      |
             |  - quorum commit to local NVMe                 |
             |  - async batched flush to S3 every ~200 ms     |
             +------------------------------------------------+
@@ -65,20 +65,20 @@ writes; reads short-circuit at whichever layer holds the answer.
                                      v
             +------------------------------------------------+
             |  Layer 4: Object storage + Iceberg catalog     |
-            |  - Parquet under /tenants/{tenant_id}/...      |
+            |  - Parquet under /projects/{project_id}/...      |
             |  - Iceberg REST catalog (Lakekeeper-compatible)|
             |  - WAL segment archive                         |
             |  - analytical queries read here directly       |
             +------------------------------------------------+
 ```
 
-### Per-tenant prefix layout
+### Per-project prefix layout
 
-Every tenant gets a single prefix in object storage. Nothing belonging to
-tenant A is ever stored under tenant B's prefix. The layout is:
+Every project gets a single prefix in object storage. Nothing belonging to
+project A is ever stored under project B's prefix. The layout is:
 
 ```
-/tenants/{tenant_id}/
+/projects/{project_id}/
     tables/
         {table_name}/
             metadata/                 Iceberg metadata (vN.metadata.json, manifests)
@@ -93,7 +93,7 @@ tenant A is ever stored under tenant B's prefix. The layout is:
 
 The prefix is the unit of IAM, the unit of billing, and the unit of branching.
 Storage code refuses to issue any read or write whose key does not begin with
-the requesting tenant's prefix; this check is implemented at the
+the requesting project's prefix; this check is implemented at the
 `basin-storage` API boundary, not at call sites.
 
 ### What runs where
@@ -101,9 +101,9 @@ the requesting tenant's prefix; this check is implemented at the
 | Layer        | Crate / service                | State          | Scaling axis             |
 | ------------ | ------------------------------ | -------------- | ------------------------ |
 | Router       | `basin-router`                 | none           | horizontal, behind LB    |
-| Auth         | `basin-auth`                   | state in per-tenant `basin_auth.*` schema, accessed via `Engine::open_session_as` (in-process) | horizontal, peer of router |
+| Auth         | `basin-auth`                   | state in per-project `basin_auth.*` schema, accessed via `Engine::open_session_as` (in-process) | horizontal, peer of router |
 | REST         | `basin-rest`                   | none           | horizontal, peer of router |
-| Shard owner  | `basin-shard`                  | RAM, NVMe cache| (tenant, partition) hash |
+| Shard owner  | `basin-shard`                  | RAM, NVMe cache| (project, partition) hash |
 | WAL          | `basin-wal`                    | Raft log + S3  | one Raft group per region (or shard group) |
 | Storage      | `basin-storage`, `basin-catalog` | bucket + catalog | object storage         |
 | Placement    | `basin-placement`              | etcd / FDB     | quorum                   |
@@ -169,14 +169,14 @@ translator; YugabyteDB forked PG outright. Basin follows DuckDB's lane.
 
 `basin-auth` is a peer crate of `basin-router`, not a separate service.
 Auth tables (`basin_auth_users`, `basin_auth_refresh_tokens`,
-`basin_auth_email_tokens`, etc.) are provisioned in **each tenant's own
-storage namespace** under a `basin_auth` schema prefix when the tenant is
+`basin_auth_email_tokens`, etc.) are provisioned in **each project's own
+storage namespace** under a `basin_auth` schema prefix when the project is
 created — the same pattern Supabase uses with an `auth` schema inside
 every project's own Postgres database. There is no reserved internal
-tenant. The auth service accesses tenant auth state via
-`Engine::open_session_as(tenant_id, "basin_auth_service")` — in-process,
+project. The auth service accesses project auth state via
+`Engine::open_session_as(project_id, "basin_auth_service")` — in-process,
 no TCP connection, no loopback. Startup order is: engine → auth (with
-`EngineAuthStore`) → `StackedTenantResolver` → pgwire; there is no
+`EngineAuthStore`) → `StackedProjectResolver` → pgwire; there is no
 circular startup dependency. Operators who want auth state on a separate
 external Postgres instance (blast-radius isolation) can supply
 `BASIN_AUTH_CATALOG_DSN` as an optional override — see
@@ -193,19 +193,19 @@ durability is guaranteed by Raft, and not a millisecond later. S3 work happens
 in the background.
 
 1. **Client -> router (~0.1 ms intra-AZ).** pgwire frame arrives. Router
-   authenticates the connection and binds it to a `TenantId`.
+   authenticates the connection and binds it to a `ProjectId`.
 2. **Parse + plan + RLS injection (~0.5-1 ms).** `libpg_query` parses the SQL
    (ADR 0014); the typed AST dispatches to a DDL/DML handler or through the
    Phase-2 PgNode -> DataFusion LogicalPlan translator. The router rewrites
-   the plan to inject `tenant_id = $current_tenant` into every base-table
+   the plan to inject `project_id = $current_project` into every base-table
    predicate. There is no opt-out for this rewrite.
 3. **Placement lookup (~0.1 ms, cached).** Router asks `basin-placement` for
-   the owner of `(tenant_id, partition)`. Result is cached with a short TTL
+   the owner of `(project_id, partition)`. Result is cached with a short TTL
    and invalidated on owner-not-found responses.
 4. **Router -> shard owner (gRPC, ~0.3-0.5 ms).** The plan (or its mutating
    fragment) is shipped to the owner over mTLS.
 5. **Shard owner -> WAL append (~2-4 ms).** The owner serializes the mutation
-   into a WAL record keyed by `(tenant_id, partition)` and calls Raft append.
+   into a WAL record keyed by `(project_id, partition)` and calls Raft append.
    The WAL leader replicates to followers and waits for quorum acknowledgment
    on local NVMe.
 6. **Quorum ack -> in-memory apply (~0.1 ms).** Once the WAL returns
@@ -218,9 +218,9 @@ in the background.
 In parallel, decoupled from the hot path:
 
 - **WAL batch flush (~every 200 ms or 1 MB).** The WAL leader uploads a
-  segment to S3 under `/tenants/{tenant_id}/wal/...`. Failure here triggers
+  segment to S3 under `/projects/{project_id}/wal/...`. Failure here triggers
   retry and alerting; it does **not** retract the durability ack.
-- **Compactor (minutes).** Per-tenant background task drains WAL segments
+- **Compactor (minutes).** Per-project background task drains WAL segments
   into Parquet files, then issues an atomic `append_data_files` commit to
   the Iceberg catalog. Only after the catalog commit succeeds may the WAL
   segments be garbage collected.
@@ -253,14 +253,14 @@ analytical path see section 7.
 4. **Result merge.** Router merges results from multiple shards if the query
    fanned out, then streams to the client.
 
-### Cold-start handling for idle tenants
+### Cold-start handling for idle projects
 
-Idle tenants are evicted from RAM after a configurable timeout (default 5
-minutes). When a request arrives for an evicted or never-loaded tenant the
+Idle projects are evicted from RAM after a configurable timeout (default 5
+minutes). When a request arrives for an evicted or never-loaded project the
 shard owner reconstructs state lazily.
 
 1. **Router routes to owner.** Placement still knows the owner; the owner
-   simply has nothing in memory for `(tenant_id, partition)`.
+   simply has nothing in memory for `(project_id, partition)`.
 2. **Owner reads catalog.** It pulls the current Iceberg snapshot for each
    table the query touches.
 3. **Owner streams the latest Parquet files** that satisfy the query
@@ -271,14 +271,14 @@ shard owner reconstructs state lazily.
 5. **Owner serves the query** and keeps the warm state for subsequent
    requests.
 
-**Cold-start target: < 200 ms for a typical small tenant.** Beyond that
+**Cold-start target: < 200 ms for a typical small project.** Beyond that
 hobbyists pick a different system, and rightly so. Achieving it depends on:
 
 - Iceberg snapshots small enough to fetch in tens of milliseconds.
 - Parquet files sized so the working set is a handful of objects, not
   thousands.
 - WAL tails kept short by the compactor.
-- Owner pre-fetching adjacent partitions for the same tenant.
+- Owner pre-fetching adjacent partitions for the same project.
 
 ---
 
@@ -306,64 +306,64 @@ analytical scans, branching) and never where its weaknesses bite
 
 ---
 
-## 5. Tenant isolation: defense in depth
+## 5. Project isolation: defense in depth
 
-> **Top security invariant: one leaked row across tenants and the project
+> **Top security invariant: one leaked row across projects and the project
 > is dead.**
 
-Multi-tenant SaaS customers are buying isolation. A single confirmed
-cross-tenant leak — a row, a query result, an object key, an error message
-that contains another tenant's data — is not a bug to patch and move on
+Multi-project SaaS customers are buying isolation. A single confirmed
+cross-project leak — a row, a query result, an object key, an error message
+that contains another project's data — is not a bug to patch and move on
 from. It is a credibility-ending event for a database vendor. Every layer
 enforces isolation independently so that no single failure can cause one.
 
 ### Layer 1: Router predicate injection
 
-- Every connection is bound to exactly one `TenantId` at authentication
+- Every connection is bound to exactly one `ProjectId` at authentication
   time. The binding is immutable for the life of the connection.
-- The DataFusion plan rewriter injects `tenant_id = $current_tenant` into
+- The DataFusion plan rewriter injects `project_id = $current_project` into
   every base-table scan. There is no flag, hint, session variable, or
   superuser bypass. Plans that cannot be rewritten are rejected.
 - User-defined `CREATE POLICY` (Postgres-syntax row-level security) layers
-  on top of the mandatory tenant predicate; it can narrow access further,
+  on top of the mandatory project predicate; it can narrow access further,
   never widen it.
-- Cross-tenant fuzz tests run continuously. Any escape is a P0.
+- Cross-project fuzz tests run continuously. Any escape is a P0.
 
 ### Layer 2: Shard owner physical segregation
 
-- A shard owner process holds many tenants, but their Arrow state lives in
-  separate per-tenant arenas with separate metadata.
-- RPCs into the owner carry the `TenantId` in a signed metadata field. The
-  owner refuses requests whose claimed tenant does not match a server-side
+- A shard owner process holds many projects, but their Arrow state lives in
+  separate per-project arenas with separate metadata.
+- RPCs into the owner carry the `ProjectId` in a signed metadata field. The
+  owner refuses requests whose claimed project does not match a server-side
   authorization check against the placement service.
-- The owner's query executor takes `(tenant_id, partition)` as required
-  parameters of every storage handle. There is no "ambient" tenant.
+- The owner's query executor takes `(project_id, partition)` as required
+  parameters of every storage handle. There is no "ambient" project.
 
 ### Layer 3: Bucket IAM scoped per request
 
 - Storage credentials are minted per request and scoped to
-  `arn:.../tenants/{tenant_id}/*`. They do not grant access to any other
-  tenant prefix.
+  `arn:.../projects/{project_id}/*`. They do not grant access to any other
+  project prefix.
 - For BYO-bucket customers (Phase 6), the platform assumes a customer-
-  provided IAM role and operates entirely under that role for that tenant.
+  provided IAM role and operates entirely under that role for that project.
 - For BYO-key customers, the platform never sees plaintext; KMS decrypts
   occur in an enclave.
 - Storage code reasserts the prefix invariant on every operation: the
-  resolved object key must begin with the per-request tenant prefix or
+  resolved object key must begin with the per-request project prefix or
   the call panics in tests and returns a hard error in production.
 
 ### Layer 4: Operational
 
-- Logs and traces redact bodies by default; tenant data never appears in
+- Logs and traces redact bodies by default; project data never appears in
   shared dashboards.
 - A bug bounty runs from public beta onward.
 - A security review gates each phase boundary.
 
 ---
 
-## 6. Tenant lifecycle
+## 6. Project lifecycle
 
-Tenants move through well-defined states. The control plane (`services/
+Projects move through well-defined states. The control plane (`services/
 control-plane`) owns transitions; data-plane components observe state via
 the placement service.
 
@@ -372,24 +372,24 @@ the placement service.
 | `create`           | Provisioning prefix, IAM, catalog namespace                          | API call                               |
 | `active`           | At least one shard owner holds state in RAM; sub-ms reads            | First write or read after `create`     |
 | `idle`             | No shard owner holds state; data lives only in WAL + Parquet         | No traffic for the eviction window     |
-| `cold reactivation`| Lazy load on next request; target < 200 ms                           | Request arrives for an idle tenant     |
+| `cold reactivation`| Lazy load on next request; target < 200 ms                           | Request arrives for an idle project     |
 | `delete`           | Soft delete, then prefix purge after the retention window            | API call                               |
 | `branch`           | Copy-on-write fork via catalog metadata; no data is copied at fork   | API call                               |
 
 Notes on each transition:
 
-- **create.** Allocates `TenantId`, creates the bucket prefix, registers an
+- **create.** Allocates `ProjectId`, creates the bucket prefix, registers an
   Iceberg namespace, mints initial credentials. No shard owner is assigned
   until the first request.
-- **active <-> idle.** Eviction is per `(tenant_id, partition)`, not per
-  tenant. A large tenant may have some partitions hot and others cold.
+- **active <-> idle.** Eviction is per `(project_id, partition)`, not per
+  project. A large project may have some partitions hot and others cold.
 - **cold reactivation.** Described in section 3. The owner reads the
   catalog, streams the relevant Parquet, replays the WAL tail.
-- **delete.** Marks the tenant `deleted` in placement so routers reject
+- **delete.** Marks the project `deleted` in placement so routers reject
   new requests immediately. WAL segments and Parquet under the prefix are
   retained for the configured window (for restore + compliance), then
   purged with the prefix itself.
-- **branch.** Creates a new tenant whose catalog metadata points at the
+- **branch.** Creates a new project whose catalog metadata points at the
   parent's existing data files. Subsequent writes to the branch land under
   the branch's own prefix; subsequent writes to the parent do not affect
   the branch. Branching is metadata-only and runs in milliseconds.
@@ -445,7 +445,7 @@ dispatch:
    OLTP query as analytical hurts one query *and* takes seconds to
    discover.
 
-The two paths share the same RLS injection and per-tenant prefix scoping.
+The two paths share the same RLS injection and per-project prefix scoping.
 The analytical pool's bucket credentials are scoped per request just like
 the shard owner's.
 
@@ -465,30 +465,30 @@ records the target shape so we don't paint ourselves into a corner.
 - Catalog (Lakekeeper-compatible, basin-native) runs in-process on the
   shard owners, backed by the regional WAL + Parquet. No external
   database is provisioned. `basin-auth` stores identity tables in each
-  tenant's own storage namespace; auth state and table metadata share
+  project's own storage namespace; auth state and table metadata share
   the same durability domain by default.
 
 ### Multi-region (target)
 
-- **Regional WALs.** Each region runs its own Raft group. A tenant is
+- **Regional WALs.** Each region runs its own Raft group. A project is
   homed in one region at a time; cross-region active-active is explicitly
   not on the roadmap (see non-goals).
-- **S3 cross-region replication** for the tenant prefix, enabling
+- **S3 cross-region replication** for the project prefix, enabling
   disaster recovery and failover. Replication is asynchronous; failover
-  semantics are documented per tenant SLA tier.
+  semantics are documented per project SLA tier.
 - **Catalog replication.** Snapshot-and-pull of the embedded catalog
   between regions, replayed at the destination — same shape as WAL
   segment shipping, no external service required. Auth state replicates
-  naturally with each tenant's storage because it lives in the same
-  per-tenant namespace; no separate auth replication path is needed.
+  naturally with each project's storage because it lives in the same
+  per-project namespace; no separate auth replication path is needed.
   Operators who supply `BASIN_AUTH_CATALOG_DSN` (external Postgres
   override) can layer that vendor's logical replication on the auth
   backend instead. Decision recorded in Phase 6.
-- **Tenant migration** between regions runs as: drain to WAL, snapshot
+- **Project migration** between regions runs as: drain to WAL, snapshot
   to S3, replicate, attach in the destination region, repoint placement.
   Downtime budget is seconds, not minutes.
 - **Routers** can live in any region; they look up placement and route
-  to the home region of the tenant.
+  to the home region of the project.
 
 Cross-region writes pay the cross-region RTT for WAL quorum; this is a
 deliberate choice, because cross-region active-active without a global
@@ -502,9 +502,9 @@ not ship that.
 To keep the project from drifting into things it is not, Basin is
 explicitly *not*:
 
-- **A Postgres replacement for high-frequency single-tenant OLTP.** If
-  you have one giant tenant doing 100k writes/sec on a single primary key
-  range, run Postgres or CockroachDB. Basin's wedge is many tenants,
+- **A Postgres replacement for high-frequency single-project OLTP.** If
+  you have one giant project doing 100k writes/sec on a single primary key
+  range, run Postgres or CockroachDB. Basin's wedge is many projects,
   each modest in size, sharing infrastructure cleanly.
 - **A data lake.** Iceberg is the storage layer, but Basin is not a
   general-purpose lakehouse. It is a transactional database that happens
@@ -513,7 +513,7 @@ explicitly *not*:
 - **Embedded.** Basin is a network database. There is no in-process
   mode, no SQLite-like single-binary embedding, no WASM build target on
   the roadmap.
-- **Globally consistent.** A tenant lives in exactly one region at a
+- **Globally consistent.** A project lives in exactly one region at a
   time. There is no global serializable transaction. There is no
   multi-master. Cross-region failover is asynchronous with documented
   RPO and RTO. If you need global linearizability, this is not the tool.

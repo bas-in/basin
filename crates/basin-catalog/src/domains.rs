@@ -1,4 +1,4 @@
-//! Per-tenant `CREATE DOMAIN` catalog.
+//! Per-project `CREATE DOMAIN` catalog.
 //!
 //! Customers will write
 //!
@@ -19,13 +19,13 @@
 //! `BASIN_DOMAIN=<name>` field metadata marker so the INSERT path can
 //! enforce the `CHECK` predicate against the row's value before commit.
 //!
-//! The catalog is a single shared `HashMap<(TenantId, String),
-//! DomainDef>` — same shape as [`crate::functions`] — so per-tenant
-//! cost stays `O(bytes)` with no per-tenant heavy resource.
+//! The catalog is a single shared `HashMap<(ProjectId, String),
+//! DomainDef>` — same shape as [`crate::functions`] — so per-project
+//! cost stays `O(bytes)` with no per-project heavy resource.
 
 use serde::{Deserialize, Serialize};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 use crate::functions::SqlArgType;
 
@@ -36,12 +36,12 @@ use crate::functions::SqlArgType;
 /// is still referenced.
 pub const BASIN_DOMAIN_KEY: &str = "BASIN_DOMAIN";
 
-/// Catalog row for a `CREATE DOMAIN` declaration. Stored per-tenant;
-/// two tenants registering the same domain name are independent rows.
+/// Catalog row for a `CREATE DOMAIN` declaration. Stored per-project;
+/// two projects registering the same domain name are independent rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainDef {
-    pub tenant: TenantId,
-    /// Unqualified domain name within the tenant.
+    pub project: ProjectId,
+    /// Unqualified domain name within the project.
     pub name: String,
     /// Underlying PG-shape base type (`INT`, `TEXT`, `BOOLEAN`, …). The
     /// engine maps this to an Arrow `DataType` at column-resolution
@@ -61,7 +61,7 @@ pub struct DomainDef {
 /// [`basin_common::BasinError`] at the catalog API boundary.
 #[derive(Debug)]
 pub enum DomainError {
-    /// Domain with that name already exists for this tenant.
+    /// Domain with that name already exists for this project.
     Duplicate,
     /// `drop_domain` was called on a name that isn't registered.
     NotFound,
@@ -90,7 +90,7 @@ mod tests {
 
     fn def(check: Option<&str>) -> DomainDef {
         DomainDef {
-            tenant: TenantId::new(),
+            project: ProjectId::new(),
             name: "d".into(),
             base_type: SqlArgType::Int,
             check_predicate: check.map(|s| s.to_string()),

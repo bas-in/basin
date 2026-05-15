@@ -1,19 +1,19 @@
-//! Tenant-agnostic email-link login.
+//! Project-agnostic email-link login.
 //!
-//! Distinct from the per-tenant `flows::magic` flow: the request body has
+//! Distinct from the per-project `flows::magic` flow: the request body has
 //! only `email`, and we resolve the user at consume time. The bcrypt-hashed
 //! token row sits in `auth_magic_links` with no `user_id` — the spec keeps
-//! the table tenant- and user-blind.
+//! the table project- and user-blind.
 //!
 //! Flow:
 //!   1. POST `/auth/v1/magic-link` body `{"email"}` → 204 always (no user-
 //!      enumeration leak). If a user exists, we insert a row + send mail.
 //!   2. POST `/auth/v1/magic-link/consume` body `{"token"}` → tokens.
 //!
-//! Multi-tenant note: `users` is unique on `(tenant_id, email)`, so the same
-//! address can exist in many tenants. v0.1 picks the most-recently-created
+//! Multi-project note: `users` is unique on `(project_id, email)`, so the same
+//! address can exist in many projects. v0.1 picks the most-recently-created
 //! user matching the email at consume time. This is good enough for the
-//! single-tenant-per-user wedge; multi-tenant disambiguation is a follow-up.
+//! single-project-per-user wedge; multi-project disambiguation is a follow-up.
 
 use std::time::Duration;
 
@@ -101,9 +101,9 @@ pub(crate) async fn consume(inner: &Inner, raw_token: &str) -> Result<Tokens> {
     }
 
     // v0.1: pick the most-recently-created user with this email. See the
-    // module comment on the multi-tenant follow-up.
+    // module comment on the multi-project follow-up.
     let user_row = inner.store.latest_user_by_email(&email).await?;
-    let Some((user_id, tenant)) = user_row else {
+    let Some((user_id, project)) = user_row else {
         return Err(BasinError::not_found("user for magic link"));
     };
 
@@ -111,7 +111,7 @@ pub(crate) async fn consume(inner: &Inner, raw_token: &str) -> Result<Tokens> {
     // verification timestamp in.
     inner.store.mark_email_verified_by_user_id(user_id).await?;
 
-    issue_tokens_for(inner, &tenant, user_id, &email).await
+    issue_tokens_for(inner, &project, user_id, &email).await
 }
 
 /// Helper used by tests to drain the most recently-issued raw token from the

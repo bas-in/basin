@@ -46,7 +46,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{
     evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ReadOptions,
@@ -220,32 +220,32 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
         page_cache: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
     let catalog = InMemoryCatalog::new();
     catalog
-        .create_table(&tenant, &table, &schema())
+        .create_table(&project, &table, &schema())
         .await
         .unwrap();
 
     // Two files with disjoint id ranges. file-A: 0..500; file-B: 500..1000.
     let batch_a = build_batch(0, 500);
     let df_a = storage
-        .write_batch(&tenant, &table, &part, &batch_a)
+        .write_batch(&project, &table, &part, &batch_a)
         .await
         .unwrap();
     let batch_b = build_batch(500, 500);
     let df_b = storage
-        .write_batch(&tenant, &table, &part, &batch_b)
+        .write_batch(&project, &table, &part, &batch_b)
         .await
         .unwrap();
 
     // Commit both via the catalog. After A4 the committed `DataFileRef`s
     // carry `column_stats`, so the catalog-loaded snapshot is enough to
     // prune at file granularity.
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     let refs = vec![
         DataFileRef {
             path: df_a.path.as_ref().to_string(),
@@ -261,12 +261,12 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
         },
     ];
     catalog
-        .append_data_files(&tenant, &table, meta.current_snapshot, refs)
+        .append_data_files(&project, &table, meta.current_snapshot, refs)
         .await
         .unwrap();
 
     // ----- Sanity: catalog stats round-tripped non-empty per file -----
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     let head_snapshot = meta.current().expect("snapshot exists").clone();
     assert_eq!(head_snapshot.data_files.len(), 2);
     for f in &head_snapshot.data_files {
@@ -329,7 +329,7 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
         ..Default::default()
     };
     let stream = storage
-        .read_paths(&tenant, survivors, opts_all_out)
+        .read_paths(&project, survivors, opts_all_out)
         .await
         .unwrap();
     let pruned_rows: usize = stream
@@ -366,7 +366,7 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
         filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(1500))],
         ..Default::default()
     };
-    let stream = storage.read(&tenant, &table, opts_all_out).await.unwrap();
+    let stream = storage.read(&project, &table, opts_all_out).await.unwrap();
     let unpruned_rows: usize = stream
         .map(|b| b.unwrap().num_rows())
         .collect::<Vec<_>>()
@@ -418,7 +418,7 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
         ..Default::default()
     };
     let stream = storage
-        .read_paths(&tenant, vec![surviving_path.clone()], opts_selective)
+        .read_paths(&project, vec![surviving_path.clone()], opts_selective)
         .await
         .unwrap();
     let hit_rows: usize = stream

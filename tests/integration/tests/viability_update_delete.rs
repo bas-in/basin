@@ -1,6 +1,6 @@
 //! Viability test: copy-on-write UPDATE / DELETE on a 10K-row table.
 //!
-//! Claim: a tenant can issue an UPDATE and a DELETE that each touch a
+//! Claim: a project can issue an UPDATE and a DELETE that each touch a
 //! handful of rows in a 10K-row table, and both commit through the
 //! engine + catalog + storage round trip in well under 2 seconds.
 //! End-to-end this exercises:
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
@@ -53,7 +53,7 @@ fn engine_in(dir: &TempDir) -> Engine {
 async fn viability_update_delete() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await

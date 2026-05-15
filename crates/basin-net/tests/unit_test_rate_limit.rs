@@ -1,18 +1,18 @@
-//! Unit test: per-tenant rate limiter caps outbound requests.
+//! Unit test: per-project rate limiter caps outbound requests.
 //!
 //! Default budget is 10 req/s sustained, burst 30. We submit 50 immediate
-//! attempts against the same tenant and assert at most `BURST + small slack`
+//! attempts against the same project and assert at most `BURST + small slack`
 //! pass the gate — the rest must surface `RateLimited`.
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_net::{AllowList, GuardConfig, HttpClient, RateLimit};
 
 #[tokio::test]
 async fn burst_is_capped_to_governor_budget() {
     let client =
         HttpClient::with_config(GuardConfig::default(), AllowList::new(), RateLimit::new());
-    let tenant = TenantId::new();
-    client.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    client.allow_host(&project, "127.0.0.1").await;
 
     // The rate-limit gate is hit *before* the actual reqwest dispatch. By
     // pointing at a port nothing is listening on we still drive the gate
@@ -22,7 +22,7 @@ async fn burst_is_capped_to_governor_budget() {
     let mut allowed = 0usize;
     let mut rate_limited = 0usize;
     for _ in 0..50 {
-        let r = client.http_get(&tenant, "http://127.0.0.1:1/").await;
+        let r = client.http_get(&project, "http://127.0.0.1:1/").await;
         match r {
             Err(e) => {
                 let msg = format!("{e}");
@@ -48,11 +48,11 @@ async fn burst_is_capped_to_governor_budget() {
 }
 
 #[tokio::test]
-async fn rate_limit_is_per_tenant() {
+async fn rate_limit_is_per_project() {
     let client =
         HttpClient::with_config(GuardConfig::default(), AllowList::new(), RateLimit::new());
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     client.allow_host(&alice, "127.0.0.1").await;
     client.allow_host(&bob, "127.0.0.1").await;
 

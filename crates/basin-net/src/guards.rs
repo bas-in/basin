@@ -1,13 +1,13 @@
-//! Per-tenant safety controls. Three independent gates wrap every outbound
+//! Per-project safety controls. Three independent gates wrap every outbound
 //! request:
 //!
 //! 1. [`AllowList`] — host-based opt-in. Default DENY-ALL. Required to
 //!    prevent SSRF (AWS metadata service, internal RFC1918 endpoints, the
 //!    customer's own ENGINE process talking to itself).
-//! 2. [`RateLimit`] — per-tenant token bucket via the `governor` crate. The
+//! 2. [`RateLimit`] — per-project token bucket via the `governor` crate. The
 //!    burst size is intentionally larger than the sustained rate so a noisy
-//!    tenant who issues a flurry to one allowlisted target doesn't starve a
-//!    polite tenant on the same shard.
+//!    project who issues a flurry to one allowlisted target doesn't starve a
+//!    polite project on the same shard.
 //! 3. [`GuardConfig`] — body-cap and timeout knobs read once at
 //!    [`HttpClient::new`] time.
 //!
@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use tokio::sync::RwLock;
 
@@ -70,14 +70,14 @@ impl Default for GuardConfig {
     }
 }
 
-/// Per-tenant URL allowlist. Lookup is by host (the `Host` part of the URL —
+/// Per-project URL allowlist. Lookup is by host (the `Host` part of the URL —
 /// no path matching). Stored in-memory; persistence to a `_net_allowed_hosts`
 /// table is the natural follow-up once the engine's UDF arg-types catch up.
 ///
 /// Cheap to clone (`Arc` inside).
 #[derive(Clone, Default, Debug)]
 pub struct AllowList {
-    inner: Arc<RwLock<HashMap<TenantId, HashSet<String>>>>,
+    inner: Arc<RwLock<HashMap<ProjectId, HashSet<String>>>>,
 }
 
 impl AllowList {
@@ -85,27 +85,27 @@ impl AllowList {
         Self::default()
     }
 
-    /// Add a host to `tenant`'s allowlist. Idempotent.
-    pub async fn allow(&self, tenant: &TenantId, host: impl Into<String>) {
+    /// Add a host to `project`'s allowlist. Idempotent.
+    pub async fn allow(&self, project: &ProjectId, host: impl Into<String>) {
         let mut g = self.inner.write().await;
-        g.entry(*tenant)
+        g.entry(*project)
             .or_default()
             .insert(host.into().to_lowercase());
     }
 
     /// Remove a host. Returns `true` if it was present.
-    pub async fn deny(&self, tenant: &TenantId, host: &str) -> bool {
+    pub async fn deny(&self, project: &ProjectId, host: &str) -> bool {
         let mut g = self.inner.write().await;
-        match g.get_mut(tenant) {
+        match g.get_mut(project) {
             Some(set) => set.remove(&host.to_lowercase()),
             None => false,
         }
     }
 
-    /// Snapshot the allowlist for `tenant`. Empty when never seeded.
-    pub async fn list(&self, tenant: &TenantId) -> Vec<String> {
+    /// Snapshot the allowlist for `project`. Empty when never seeded.
+    pub async fn list(&self, project: &ProjectId) -> Vec<String> {
         let g = self.inner.read().await;
-        g.get(tenant)
+        g.get(project)
             .map(|s| {
                 let mut v: Vec<String> = s.iter().cloned().collect();
                 v.sort();
@@ -115,10 +115,10 @@ impl AllowList {
     }
 
     /// The load-bearing check. Splits `url` for its host part, lowercases
-    /// it, and confirms `tenant` has explicitly opted in. The default
-    /// behaviour is **deny** so a freshly-provisioned tenant cannot
+    /// it, and confirms `project` has explicitly opted in. The default
+    /// behaviour is **deny** so a freshly-provisioned project cannot
     /// accidentally exfiltrate to anywhere.
-    pub async fn check(&self, tenant: &TenantId, url: &str) -> Result<(), HttpError> {
+    pub async fn check(&self, project: &ProjectId, url: &str) -> Result<(), HttpError> {
         let parsed =
             url::Url::parse(url).map_err(|e| HttpError::InvalidUrl(format!("{url}: {e}")))?;
         let host = parsed
@@ -127,7 +127,7 @@ impl AllowList {
             .to_lowercase();
         let g = self.inner.read().await;
         let ok = g
-            .get(tenant)
+            .get(project)
             .map(|set| set.contains(&host))
             .unwrap_or(false);
         if ok {
@@ -138,7 +138,7 @@ impl AllowList {
     }
 }
 
-/// Per-tenant token-bucket rate limiter. Leans on `governor::RateLimiter`'s
+/// Per-project token-bucket rate limiter. Leans on `governor::RateLimiter`'s
 /// keyed variant; the same crate `basin-auth` already pulls in.
 ///
 /// 10 req/s sustained, burst 30. Sustained is rendered as 600/min by
@@ -148,7 +148,7 @@ impl AllowList {
 /// Cheap to clone.
 #[derive(Clone)]
 pub struct RateLimit {
-    inner: Arc<RateLimiter<TenantId, DefaultKeyedStateStore<TenantId>, DefaultClock>>,
+    inner: Arc<RateLimiter<ProjectId, DefaultKeyedStateStore<ProjectId>, DefaultClock>>,
 }
 
 impl std::fmt::Debug for RateLimit {
@@ -158,7 +158,7 @@ impl std::fmt::Debug for RateLimit {
 }
 
 impl RateLimit {
-    /// Sustained rate, requests per second. Hard-coded; a per-tenant override
+    /// Sustained rate, requests per second. Hard-coded; a per-project override
     /// is on the v0.2 list.
     pub const SUSTAINED_PER_SEC: u32 = 10;
     /// Burst allowance (tokens that can accumulate while idle). 3× sustained
@@ -178,9 +178,9 @@ impl RateLimit {
     }
 
     /// One token check. Errors with [`HttpError::RateLimited`] when the
-    /// tenant's bucket is empty.
-    pub fn check(&self, tenant: &TenantId) -> Result<(), HttpError> {
-        match self.inner.check_key(tenant) {
+    /// project's bucket is empty.
+    pub fn check(&self, project: &ProjectId) -> Result<(), HttpError> {
+        match self.inner.check_key(project) {
             Ok(_) => Ok(()),
             Err(_) => Err(HttpError::RateLimited),
         }

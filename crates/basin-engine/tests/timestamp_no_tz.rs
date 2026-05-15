@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -39,7 +39,7 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -98,7 +98,7 @@ fn col_ts_micros(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
 async fn create_table_timestamp_without_tz_succeeds() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, ts TIMESTAMP)")
         .await
@@ -109,7 +109,7 @@ async fn create_table_timestamp_without_tz_succeeds() {
 async fn insert_timestamp_without_tz_round_trips() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL)")
         .await
@@ -131,7 +131,7 @@ async fn insert_timestamp_without_tz_round_trips() {
 async fn timestamp_without_tz_in_pg_type_view() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let batches = rows(
         &sess,
@@ -150,7 +150,7 @@ async fn timestamp_without_tz_in_pg_type_view() {
 async fn timestamp_without_tz_in_information_schema_columns() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL)")
         .await
@@ -177,7 +177,7 @@ async fn timestamp_and_timestamptz_distinct_types() {
     // depends on this distinction (e.g. `WHERE atttypid = 1114` filters).
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE both (\

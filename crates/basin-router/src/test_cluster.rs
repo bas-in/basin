@@ -7,8 +7,8 @@
 //!    ephemeral port, fronted by its own `basin-engine::Engine` whose
 //!    `EngineConfig` shares the same `Storage` + catalog with all other
 //!    shards in the cluster. Multiple shards over one `Storage`/`Catalog`
-//!    instance is fine for v0.1: tenants are partitioned by hash, so two
-//!    different shards never read or write the same tenant prefix.
+//!    instance is fine for v0.1: projects are partitioned by hash, so two
+//!    different shards never read or write the same project prefix.
 //! 2. [`SpawnedRouter`] — a separate basin-router bound to its own
 //!    ephemeral port, configured in shard mode against the spawned shards'
 //!    endpoints. Pgwire clients connect here.
@@ -31,26 +31,26 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use basin_common::{Result, TenantId};
+use basin_common::{Result, ProjectId};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use crate::resolver::{StaticTenantResolver, TenantResolver};
+use crate::resolver::{StaticProjectResolver, ProjectResolver};
 use crate::{run_until_bound, RunningServer, ServerConfig};
 
 /// A single in-process Basin shard owner. Listens on an ephemeral port and
 /// uses the supplied storage/catalog (shared with the other shards in the
 /// cluster).
 ///
-/// Each shard wraps the cluster-wide [`DynamicTenantResolver`] in a
+/// Each shard wraps the cluster-wide [`DynamicProjectResolver`] in a
 /// [`CountingResolver`] so the test can read back, per-shard:
 ///
 /// - total connection count
-/// - per-tenant connection count
+/// - per-project connection count
 ///
 /// That gives the routing-stability test enough signal to verify (a) that
-/// the same tenant always lands on the same shard, and (b) the load
+/// the same project always lands on the same shard, and (b) the load
 /// distribution across shards.
 pub struct SpawnedShard {
     pub addr: SocketAddr,
@@ -120,10 +120,10 @@ pub struct Cluster {
     /// Endpoints in the same order as `shards`. Convenience for tests that
     /// want to map a shard index back to a string and vice versa.
     pub shard_endpoints: Vec<String>,
-    /// Tenant resolver shared across the cluster. Tests insert
-    /// `(username, TenantId)` pairs here so each shard (and the router)
-    /// resolves the same name to the same tenant.
-    pub resolver: Arc<DynamicTenantResolver>,
+    /// Project resolver shared across the cluster. Tests insert
+    /// `(username, ProjectId)` pairs here so each shard (and the router)
+    /// resolves the same name to the same project.
+    pub resolver: Arc<DynamicProjectResolver>,
     _data_dir: TempDir,
 }
 
@@ -141,28 +141,28 @@ impl Cluster {
     }
 }
 
-/// Tenant resolver whose backing map can be mutated after construction.
+/// Project resolver whose backing map can be mutated after construction.
 /// Tests register usernames lazily as they connect new clients, so the
-/// router and every shard need to agree on the username -> tenant mapping
+/// router and every shard need to agree on the username -> project mapping
 /// without rebuilding their resolvers.
 #[derive(Default)]
-pub struct DynamicTenantResolver {
-    inner: tokio::sync::RwLock<HashMap<String, TenantId>>,
+pub struct DynamicProjectResolver {
+    inner: tokio::sync::RwLock<HashMap<String, ProjectId>>,
 }
 
-impl DynamicTenantResolver {
+impl DynamicProjectResolver {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub async fn insert(&self, user: impl Into<String>, tenant: TenantId) {
-        self.inner.write().await.insert(user.into(), tenant);
+    pub async fn insert(&self, user: impl Into<String>, project: ProjectId) {
+        self.inner.write().await.insert(user.into(), project);
     }
 }
 
 #[async_trait::async_trait]
-impl TenantResolver for DynamicTenantResolver {
-    async fn resolve(&self, username: &str) -> Result<TenantId> {
+impl ProjectResolver for DynamicProjectResolver {
+    async fn resolve(&self, username: &str) -> Result<ProjectId> {
         self.inner
             .read()
             .await
@@ -170,7 +170,7 @@ impl TenantResolver for DynamicTenantResolver {
             .copied()
             .ok_or_else(|| {
                 basin_common::BasinError::not_found(format!(
-                    "no tenant mapped for user {username:?}"
+                    "no project mapped for user {username:?}"
                 ))
             })
     }
@@ -182,9 +182,9 @@ impl TenantResolver for DynamicTenantResolver {
 pub struct ShardStats {
     /// Total connections this shard has authenticated.
     pub total: AtomicU64,
-    /// Connections per tenant. Bounded by the number of distinct tenants
+    /// Connections per project. Bounded by the number of distinct projects
     /// the test connects under, so it doesn't grow without limit.
-    pub per_tenant: tokio::sync::Mutex<HashMap<TenantId, u64>>,
+    pub per_project: tokio::sync::Mutex<HashMap<ProjectId, u64>>,
 }
 
 impl ShardStats {
@@ -192,27 +192,27 @@ impl ShardStats {
         self.total.load(Ordering::Relaxed)
     }
 
-    pub async fn snapshot_per_tenant(&self) -> HashMap<TenantId, u64> {
-        self.per_tenant.lock().await.clone()
+    pub async fn snapshot_per_project(&self) -> HashMap<ProjectId, u64> {
+        self.per_project.lock().await.clone()
     }
 }
 
-/// Wraps an inner [`TenantResolver`] and bumps a [`ShardStats`] counter
+/// Wraps an inner [`ProjectResolver`] and bumps a [`ShardStats`] counter
 /// every time the inner resolver succeeds. Used by [`start_n_shards`] to
 /// give each shard its own counter; the cluster-wide
-/// [`DynamicTenantResolver`] holds the actual `username -> TenantId`
+/// [`DynamicProjectResolver`] holds the actual `username -> ProjectId`
 /// mappings.
 struct CountingResolver {
-    inner: Arc<dyn TenantResolver>,
+    inner: Arc<dyn ProjectResolver>,
     stats: Arc<ShardStats>,
 }
 
 #[async_trait::async_trait]
-impl TenantResolver for CountingResolver {
-    async fn resolve(&self, username: &str) -> Result<TenantId> {
+impl ProjectResolver for CountingResolver {
+    async fn resolve(&self, username: &str) -> Result<ProjectId> {
         let t = self.inner.resolve(username).await?;
         self.stats.total.fetch_add(1, Ordering::Relaxed);
-        let mut g = self.stats.per_tenant.lock().await;
+        let mut g = self.stats.per_project.lock().await;
         *g.entry(t).or_insert(0) += 1;
         Ok(t)
     }
@@ -225,7 +225,7 @@ impl TenantResolver for CountingResolver {
 /// own `Engine` and pgwire listener; the front router runs in shard mode
 /// against the resulting endpoint list.
 ///
-/// Tenant -> shard mapping is performed by the `ShardMap` baked into the
+/// Project -> shard mapping is performed by the `ShardMap` baked into the
 /// router's accept loop. Tests register usernames into `cluster.resolver`
 /// before connecting; both the router and every shard consult the same
 /// resolver, so resolution is consistent across processes.
@@ -261,7 +261,7 @@ pub async fn start_n_shards_with_storage(
 
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
 
-    let resolver = Arc::new(DynamicTenantResolver::new());
+    let resolver = Arc::new(DynamicProjectResolver::new());
 
     let mut shards: Vec<SpawnedShard> = Vec::with_capacity(n);
     let mut shard_endpoints: Vec<String> = Vec::with_capacity(n);
@@ -272,14 +272,14 @@ pub async fn start_n_shards_with_storage(
             shard: None,
         });
         let stats = Arc::new(ShardStats::default());
-        let counting: Arc<dyn TenantResolver> = Arc::new(CountingResolver {
-            inner: resolver.clone() as Arc<dyn TenantResolver>,
+        let counting: Arc<dyn ProjectResolver> = Arc::new(CountingResolver {
+            inner: resolver.clone() as Arc<dyn ProjectResolver>,
             stats: stats.clone(),
         });
         let running: RunningServer = run_until_bound(ServerConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             engine,
-            tenant_resolver: counting,
+            project_resolver: counting,
             pool: None,
             shard_endpoints: None,
             tls: None,
@@ -303,11 +303,11 @@ pub async fn start_n_shards_with_storage(
         catalog: catalog.clone(),
         shard: None,
     });
-    let resolver_dyn: Arc<dyn TenantResolver> = resolver.clone();
+    let resolver_dyn: Arc<dyn ProjectResolver> = resolver.clone();
     let router_running = run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine: router_engine,
-        tenant_resolver: resolver_dyn,
+        project_resolver: resolver_dyn,
         pool: None,
         shard_endpoints: Some(shard_endpoints.clone()),
         tls: None,
@@ -330,18 +330,18 @@ pub async fn start_n_shards_with_storage(
     }
 }
 
-/// Convenience helper used by [`StaticTenantResolver`]-only callers that
-/// just need a one-shot map of usernames -> tenants. The integration test
-/// uses [`DynamicTenantResolver`] directly because tenants are added one
+/// Convenience helper used by [`StaticProjectResolver`]-only callers that
+/// just need a one-shot map of usernames -> projects. The integration test
+/// uses [`DynamicProjectResolver`] directly because projects are added one
 /// at a time, but having both forms documented saves a step for static
 /// callers.
 #[allow(dead_code)]
 pub fn static_resolver_with(
-    entries: impl IntoIterator<Item = (String, TenantId)>,
-) -> Arc<StaticTenantResolver> {
+    entries: impl IntoIterator<Item = (String, ProjectId)>,
+) -> Arc<StaticProjectResolver> {
     let mut map = HashMap::new();
     for (k, v) in entries {
         map.insert(k, v);
     }
-    Arc::new(StaticTenantResolver::new(map))
+    Arc::new(StaticProjectResolver::new(map))
 }

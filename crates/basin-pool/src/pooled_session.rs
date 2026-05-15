@@ -4,14 +4,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use basin_common::TenantId;
-use basin_engine::TenantSession;
+use basin_common::ProjectId;
+use basin_engine::ProjectSession;
 
 use crate::state::{PoolKey, PooledEntry};
 use crate::Inner;
 
 /// A leased session. Dropping the handle returns the underlying
-/// [`TenantSession`] to the pool's idle queue.
+/// [`ProjectSession`] to the pool's idle queue.
 ///
 /// The session reference is exposed via [`PooledSession::session`] rather
 /// than by `Deref`. We deliberately do not hand out ownership: the pool
@@ -25,7 +25,7 @@ pub struct PooledSession {
 impl PooledSession {
     /// The underlying engine session. Use this exactly the way the router
     /// would use the value returned by `Engine::open_session`.
-    pub fn session(&self) -> &TenantSession {
+    pub fn session(&self) -> &ProjectSession {
         &self
             .entry
             .as_ref()
@@ -33,10 +33,10 @@ impl PooledSession {
             .session
     }
 
-    /// The tenant this session is bound to. Convenience accessor that
-    /// matches `TenantSession::tenant` so callers don't need to deref.
-    pub fn tenant(&self) -> TenantId {
-        self.key.tenant
+    /// The project this session is bound to. Convenience accessor that
+    /// matches `ProjectSession::project` so callers don't need to deref.
+    pub fn project(&self) -> ProjectId {
+        self.key.project
     }
 }
 
@@ -69,7 +69,7 @@ impl Drop for PooledSession {
 
 /// Wrap a freshly-acquired entry plus its key in a `PooledSession`. Kept in
 /// this module so the field-visibility surface stays small.
-pub(crate) fn build(pool: Arc<Inner>, key: PoolKey, session: Arc<TenantSession>) -> PooledSession {
+pub(crate) fn build(pool: Arc<Inner>, key: PoolKey, session: Arc<ProjectSession>) -> PooledSession {
     PooledSession {
         entry: Some(PooledEntry {
             session,

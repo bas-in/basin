@@ -33,8 +33,8 @@ use std::time::Instant;
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
@@ -73,7 +73,7 @@ fn build_batch(start: i64, len: usize) -> RecordBatch {
 }
 
 /// One point query through the engine. Asserts exactly one row matches.
-async fn engine_point_query(sess: &TenantSession, id: i64) -> Result<(), String> {
+async fn engine_point_query(sess: &ProjectSession, id: i64) -> Result<(), String> {
     let sql = format!("SELECT id, payload FROM t WHERE id = {}", id);
     let res = sess
         .execute(&sql)
@@ -134,13 +134,13 @@ async fn s3_large_dataset_pointquery() {
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
 
-    catalog.create_namespace(&tenant).await.unwrap();
+    catalog.create_namespace(&project).await.unwrap();
     catalog
-        .create_table(&tenant, &table, &schema())
+        .create_table(&project, &table, &schema())
         .await
         .unwrap();
 
@@ -159,7 +159,7 @@ async fn s3_large_dataset_pointquery() {
             let start = (f * ROWS_PER_FILE) as i64;
             let batch = build_batch(start, ROWS_PER_FILE);
             storage
-                .write_batch(&tenant, &table, &part, &batch)
+                .write_batch(&project, &table, &part, &batch)
                 .await
                 .unwrap()
         });
@@ -176,9 +176,9 @@ async fn s3_large_dataset_pointquery() {
     }
     let seed_elapsed = seed_started.elapsed();
 
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     catalog
-        .append_data_files(&tenant, &table, meta.current_snapshot, data_files)
+        .append_data_files(&project, &table, meta.current_snapshot, data_files)
         .await
         .unwrap();
 
@@ -187,7 +187,7 @@ async fn s3_large_dataset_pointquery() {
         catalog: catalog.clone(),
         shard: None,
     });
-    let sess = engine.open_session(tenant).await.unwrap();
+    let sess = engine.open_session(project).await.unwrap();
 
     // One throwaway SELECT to flush DataFusion's per-session lazy
     // initialisation — same rationale as the LocalFS card.

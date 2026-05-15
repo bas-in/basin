@@ -1,35 +1,35 @@
-//! Object-key construction. Centralized so tenant prefix enforcement is
+//! Object-key construction. Centralized so project prefix enforcement is
 //! impossible to bypass — all writers and listers must go through these
 //! helpers.
 
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use chrono::{DateTime, Datelike, Utc};
 use object_store::path::Path as ObjectPath;
 use ulid::Ulid;
 
 use crate::tier::Tier;
 
-/// Path under which all tenant data lives.
-pub(crate) const TENANTS_SEGMENT: &str = "tenants";
+/// Path under which all project data lives.
+pub(crate) const PROJECTS_SEGMENT: &str = "projects";
 const TABLES_SEGMENT: &str = "tables";
 
 /// Build the absolute object key for one new data file in the hot tier.
 ///
 /// Layout:
-/// `{root?}/tenants/{tenant}/tables/{table}/data/{partition}/yyyy/mm/dd/{ulid}.parquet`
+/// `{root?}/projects/{project}/tables/{table}/data/{partition}/yyyy/mm/dd/{ulid}.parquet`
 ///
 /// The partition segment is included so files for different partition keys
 /// don't collide, even though pruning by partition is currently a list-time
 /// concern.
 pub(crate) fn data_file_key(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     partition: &PartitionKey,
     now: DateTime<Utc>,
     file_id: Ulid,
 ) -> ObjectPath {
-    data_file_key_in_tier(root, tenant, table, partition, now, file_id, Tier::Hot)
+    data_file_key_in_tier(root, project, table, partition, now, file_id, Tier::Hot)
 }
 
 /// Tier-aware variant of [`data_file_key`]. Cold-tier writes land under
@@ -38,7 +38,7 @@ pub(crate) fn data_file_key(
 /// tier (S3-IA on AWS S3, R2-IA on Cloudflare R2, or provider equivalent).
 pub(crate) fn data_file_key_in_tier(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     partition: &PartitionKey,
     now: DateTime<Utc>,
@@ -46,8 +46,8 @@ pub(crate) fn data_file_key_in_tier(
     tier: Tier,
 ) -> ObjectPath {
     let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
-    p = p.child(TENANTS_SEGMENT);
-    p = p.child(tenant.as_prefix());
+    p = p.child(PROJECTS_SEGMENT);
+    p = p.child(project.as_prefix());
     p = p.child(TABLES_SEGMENT);
     p = p.child(table.as_str());
     p = p.child(tier.segment());
@@ -69,27 +69,27 @@ pub(crate) fn data_file_key_in_tier(
     p.child(format!("{file_id}.parquet"))
 }
 
-/// Prefix that all of one tenant+table's hot-tier data files live under.
+/// Prefix that all of one project+table's hot-tier data files live under.
 /// Used by listing.
 #[cfg(test)]
 pub(crate) fn table_data_prefix(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
 ) -> ObjectPath {
-    table_tier_prefix(root, tenant, table, Tier::Hot)
+    table_tier_prefix(root, project, table, Tier::Hot)
 }
 
-/// Prefix that all of one tenant+table's files in a storage tier live under.
+/// Prefix that all of one project+table's files in a storage tier live under.
 pub(crate) fn table_tier_prefix(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     tier: Tier,
 ) -> ObjectPath {
     let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
-    p = p.child(TENANTS_SEGMENT);
-    p = p.child(tenant.as_prefix());
+    p = p.child(PROJECTS_SEGMENT);
+    p = p.child(project.as_prefix());
     p = p.child(TABLES_SEGMENT);
     p = p.child(table.as_str());
     p.child(tier.segment())
@@ -140,13 +140,13 @@ pub(crate) fn rewrite_to_cold(path: &ObjectPath) -> Option<ObjectPath> {
     None
 }
 
-/// Prefix that all of one tenant's data lives under. Used for the safety-net
+/// Prefix that all of one project's data lives under. Used for the safety-net
 /// invariant test.
 #[cfg(test)]
-pub(crate) fn tenant_prefix(root: Option<&ObjectPath>, tenant: &TenantId) -> ObjectPath {
+pub(crate) fn project_prefix(root: Option<&ObjectPath>, project: &ProjectId) -> ObjectPath {
     let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
-    p = p.child(TENANTS_SEGMENT);
-    p.child(tenant.as_prefix())
+    p = p.child(PROJECTS_SEGMENT);
+    p.child(project.as_prefix())
 }
 
 #[cfg(test)]
@@ -155,36 +155,36 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn key_layout_includes_tenant_and_date() {
-        let tenant = TenantId::new();
+    fn key_layout_includes_project_and_date() {
+        let project = ProjectId::new();
         let table = TableName::new("orders").unwrap();
         let part = PartitionKey::new("region:us").unwrap();
         let now = Utc.with_ymd_and_hms(2026, 4, 30, 12, 0, 0).unwrap();
         let id = Ulid::new();
-        let key = data_file_key(None, &tenant, &table, &part, now, id);
+        let key = data_file_key(None, &project, &table, &part, now, id);
         let s = key.as_ref();
         let expected_prefix =
-            format!("tenants/{tenant}/tables/orders/data/region:us/2026/04/30/{id}.parquet");
+            format!("projects/{project}/tables/orders/data/region:us/2026/04/30/{id}.parquet");
         assert_eq!(s, expected_prefix);
     }
 
     #[test]
     fn key_with_root_prefix() {
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("t").unwrap();
         let part = PartitionKey::default_key();
         let root = ObjectPath::from("warehouse");
-        let key = data_file_key(Some(&root), &tenant, &table, &part, Utc::now(), Ulid::new());
-        assert!(key.as_ref().starts_with("warehouse/tenants/"));
+        let key = data_file_key(Some(&root), &project, &table, &part, Utc::now(), Ulid::new());
+        assert!(key.as_ref().starts_with("warehouse/projects/"));
     }
 
     /// "Fuzz-ish": across many random combinations the produced path always
-    /// begins with `tenants/{tenant}/`. This is the load-bearing isolation
+    /// begins with `projects/{project}/`. This is the load-bearing isolation
     /// invariant for this crate.
     #[test]
-    fn path_helper_always_includes_tenant_prefix() {
+    fn path_helper_always_includes_project_prefix() {
         for _ in 0..256 {
-            let tenant = TenantId::new();
+            let project = ProjectId::new();
             let table_name = format!("t{}", Ulid::new().to_string().to_lowercase());
             let table = TableName::new(&table_name[..table_name.len().min(63)]).unwrap();
             let part = if Ulid::new().0 % 2 == 0 {
@@ -192,20 +192,20 @@ mod tests {
             } else {
                 PartitionKey::new(format!("p{}", Ulid::new())).unwrap()
             };
-            let key = data_file_key(None, &tenant, &table, &part, Utc::now(), Ulid::new());
-            let prefix = format!("tenants/{tenant}/");
+            let key = data_file_key(None, &project, &table, &part, Utc::now(), Ulid::new());
+            let prefix = format!("projects/{project}/");
             assert!(
                 key.as_ref().starts_with(&prefix),
-                "key {} missing tenant prefix {}",
+                "key {} missing project prefix {}",
                 key,
                 prefix
             );
 
-            let listed = table_data_prefix(None, &tenant, &table);
+            let listed = table_data_prefix(None, &project, &table);
             assert!(listed.as_ref().starts_with(&prefix));
 
-            let tprefix = tenant_prefix(None, &tenant);
-            assert_eq!(tprefix.as_ref(), format!("tenants/{tenant}"));
+            let tprefix = project_prefix(None, &project);
+            assert_eq!(tprefix.as_ref(), format!("projects/{project}"));
         }
     }
 }

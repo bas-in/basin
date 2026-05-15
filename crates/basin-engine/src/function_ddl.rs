@@ -10,7 +10,7 @@
 //!
 //! 2. `DROP FUNCTION [IF EXISTS] <name>(<args>)` — remove a previously-
 //!    registered function. Argument list is parsed by sqlparser but ignored
-//!    here: v0.1 disallows function-name overloading per tenant, so the
+//!    here: v0.1 disallows function-name overloading per project, so the
 //!    name is the unique key.
 //!
 //! 3. `ALTER FUNCTION <name>(<args>) RENAME TO <new>` — sqlparser 0.52 has
@@ -33,7 +33,7 @@ use sqlparser::ast::{
 };
 
 use crate::sql_functions::{validate_for_registration, validate_no_mutual_recursion};
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Translate a sqlparser-parsed `CREATE FUNCTION` into a `SqlFunctionDef`
 /// and persist it via `Catalog::register_sql_function`. Validation —
@@ -44,7 +44,7 @@ use crate::{ExecResult, TenantSession};
 /// future direct Rust API.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn exec_create_function(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     or_replace: bool,
     temporary: bool,
     name: ObjectName,
@@ -55,7 +55,7 @@ pub(crate) async fn exec_create_function(
 ) -> Result<ExecResult> {
     if temporary {
         return Err(BasinError::InvalidSchema(
-            "CREATE TEMPORARY FUNCTION is not supported; functions are tenant-scoped".into(),
+            "CREATE TEMPORARY FUNCTION is not supported; functions are project-scoped".into(),
         ));
     }
     let lang = language.as_ref().map(|l| l.value.as_str()).unwrap_or("");
@@ -98,7 +98,7 @@ pub(crate) async fn exec_create_function(
     let body_text = extract_body_text(&function_body, &fn_name)?;
 
     let def = SqlFunctionDef {
-        tenant: sess.tenant,
+        project: sess.project,
         name: fn_name.clone(),
         args: def_args,
         return_type: parsed_return,
@@ -110,14 +110,14 @@ pub(crate) async fn exec_create_function(
 
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     if !or_replace {
-        if let Some(_existing) = catalog.lookup_sql_function(&sess.tenant, &fn_name).await {
+        if let Some(_existing) = catalog.lookup_sql_function(&sess.project, &fn_name).await {
             return Err(BasinError::InvalidSchema(format!(
                 "CREATE FUNCTION: function {fn_name:?} already exists; \
                  use CREATE OR REPLACE FUNCTION to replace it"
             )));
         }
     }
-    let existing_map = collect_tenant_function_map(&catalog, &sess.tenant, &fn_name).await;
+    let existing_map = collect_project_function_map(&catalog, &sess.project, &fn_name).await;
     validate_no_mutual_recursion(&validated, &existing_map)?;
     catalog.register_sql_function(validated).await?;
 
@@ -128,10 +128,10 @@ pub(crate) async fn exec_create_function(
 
 /// Execute `DROP FUNCTION [IF EXISTS] <name>(<args>)`. The argument list
 /// from the AST is accepted (and parsed) but not used to disambiguate;
-/// v0.1 forbids overloading per tenant so `(tenant, name)` is the unique
+/// v0.1 forbids overloading per project so `(project, name)` is the unique
 /// key.
 pub(crate) async fn exec_drop_function(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     if_exists: bool,
     names: Vec<ObjectName>,
 ) -> Result<ExecResult> {
@@ -143,7 +143,7 @@ pub(crate) async fn exec_drop_function(
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     for name in names {
         let fn_name = single_part_object_name(&name)?;
-        match catalog.drop_sql_function(&sess.tenant, &fn_name).await {
+        match catalog.drop_sql_function(&sess.project, &fn_name).await {
             Ok(()) => {}
             Err(BasinError::NotFound(_)) if if_exists => {}
             Err(BasinError::NotFound(_)) => {
@@ -163,7 +163,7 @@ pub(crate) async fn exec_drop_function(
 /// has no `AlterFunction` AST node; the caller pre-screens the SQL via
 /// [`match_alter_function_rename`] and routes here on a match.
 pub(crate) async fn exec_alter_function_rename(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     old_name: &str,
     new_name: &str,
 ) -> Result<ExecResult> {
@@ -174,11 +174,11 @@ pub(crate) async fn exec_alter_function_rename(
     }
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     let existing = catalog
-        .lookup_sql_function(&sess.tenant, old_name)
+        .lookup_sql_function(&sess.project, old_name)
         .await
         .ok_or_else(|| BasinError::not_found(format!("function {old_name:?} does not exist")))?;
     if catalog
-        .lookup_sql_function(&sess.tenant, new_name)
+        .lookup_sql_function(&sess.project, new_name)
         .await
         .is_some()
     {
@@ -194,27 +194,27 @@ pub(crate) async fn exec_alter_function_rename(
     // Treat the rename as if registering `new_name` against the post-
     // rename catalog: skip both the old name (about to be dropped) and
     // the new name (replaced by `validated`).
-    let mut existing_map = collect_tenant_function_map(&catalog, &sess.tenant, new_name).await;
+    let mut existing_map = collect_project_function_map(&catalog, &sess.project, new_name).await;
     existing_map.remove(&old_name.to_ascii_lowercase());
     validate_no_mutual_recursion(&validated, &existing_map)?;
     catalog.register_sql_function(validated).await?;
-    catalog.drop_sql_function(&sess.tenant, old_name).await?;
+    catalog.drop_sql_function(&sess.project, old_name).await?;
     Ok(ExecResult::Empty {
         tag: "ALTER FUNCTION".into(),
     })
 }
 
-/// Snapshot the tenant's currently-registered SQL functions into a map
+/// Snapshot the project's currently-registered SQL functions into a map
 /// keyed by lowercased name, omitting `excluded_name`. The exclusion is
 /// for `CREATE OR REPLACE` semantics (the new def is authoritative for
 /// its own name) and for `ALTER ... RENAME TO <new>` (where the new
 /// name will displace any prior entry).
-async fn collect_tenant_function_map(
+async fn collect_project_function_map(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     excluded_name: &str,
 ) -> std::collections::HashMap<String, SqlFunctionDef> {
-    let funcs = catalog.list_sql_functions(tenant).await;
+    let funcs = catalog.list_sql_functions(project).await;
     let excl = excluded_name.to_ascii_lowercase();
     let mut map = std::collections::HashMap::with_capacity(funcs.len());
     for f in funcs {

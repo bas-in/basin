@@ -6,8 +6,8 @@
 //! handler. The body limit lives inside the CORS layer so a preflight
 //! `OPTIONS` doesn't trip the limit unnecessarily.
 //!
-//! Per-tenant rate limiting is enforced *inside* the handler (via
-//! [`authorize`]) because the rate-limit key is `claims.tenant_id`, which
+//! Per-project rate limiting is enforced *inside* the handler (via
+//! [`authorize`]) because the rate-limit key is `claims.project_id`, which
 //! we don't have until after JWT verification — and JWT verification is the
 //! cheapest reliable way to identify the request's owner.
 
@@ -43,7 +43,7 @@ impl Inner {
         // minute matches the requested rate.
         let rate = cfg.rate_limit_per_sec.saturating_mul(60).max(1);
         Self {
-            rate_limiter: basin_auth::rate_limit::PerKey::per_minute(rate, "rest_per_tenant"),
+            rate_limiter: basin_auth::rate_limit::PerKey::per_minute(rate, "rest_per_project"),
             cfg,
         }
     }
@@ -85,9 +85,9 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/auth/v1/request-password-reset",
             post(auth_routes::request_password_reset),
         )
-        // Tenant-agnostic email-link login. POST /auth/v1/magic-link body
+        // Project-agnostic email-link login. POST /auth/v1/magic-link body
         // `{email}` → 204; POST /auth/v1/magic-link/consume body `{token}` →
-        // tokens. The legacy per-tenant flow lives in `AuthService` for now.
+        // tokens. The legacy per-project flow lives in `AuthService` for now.
         .route("/auth/v1/magic-link", post(auth_routes::request_email_link))
         .route(
             "/auth/v1/magic-link/consume",
@@ -101,17 +101,17 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/auth/v1/api-keys/:id",
             axum::routing::delete(auth_routes::delete_api_key),
         )
-        // Operator-grade endpoints: provision per-tenant pgwire credentials
+        // Operator-grade endpoints: provision per-project pgwire credentials
         // and rotate them. All gated on `claims.is_admin == true` (see
         // `admin_routes::*`).
-        .route("/admin/v1/tenants", post(admin_routes::provision_tenant))
+        .route("/admin/v1/projects", post(admin_routes::provision_project))
         .route(
-            "/admin/v1/tenants/:pgwire_user/rotate",
-            post(admin_routes::rotate_tenant),
+            "/admin/v1/projects/:pgwire_user/rotate",
+            post(admin_routes::rotate_project),
         )
         .route(
-            "/admin/v1/tenants/:tenant_id/credentials",
-            get(admin_routes::list_tenant_credentials),
+            "/admin/v1/projects/:project_id/credentials",
+            get(admin_routes::list_project_credentials),
         )
         .route("/health", get(health))
         .layer(body_limit)
@@ -160,7 +160,7 @@ fn build_cors(origins: &[String]) -> CorsLayer {
         .allow_headers(headers)
 }
 
-/// Verify the bearer token, run the per-tenant rate-limit check, and return
+/// Verify the bearer token, run the per-project rate-limit check, and return
 /// the parsed claims. All `/rest/v1/*` handlers call this as the first step;
 /// it owns the auth + limiter stack.
 ///
@@ -191,8 +191,8 @@ pub(crate) async fn authorize(
         // don't surface the JWT error here so a caller using an API key
         // doesn't get a misleading "invalid jwt" message.
         Err(_) => match state.cfg.auth.validate_api_key(token).await {
-            Ok((tenant, user)) => Claims {
-                tenant_id: tenant,
+            Ok((project, user)) => Claims {
+                project_id: project,
                 user_id: user,
                 email: "<api-key>".to_string(),
                 roles: Vec::new(),
@@ -208,11 +208,11 @@ pub(crate) async fn authorize(
         },
     };
 
-    // Per-tenant rate limit.
+    // Per-project rate limit.
     state
         .rate_limiter
-        .check(&claims.tenant_id.to_string())
-        .map_err(|_| ApiError::rate_limited("per-tenant rate limit exceeded"))?;
+        .check(&claims.project_id.to_string())
+        .map_err(|_| ApiError::rate_limited("per-project rate limit exceeded"))?;
 
     Ok(claims)
 }

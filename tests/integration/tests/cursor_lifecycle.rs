@@ -1,7 +1,7 @@
 //! Cursor lifecycle integration test.
 //!
 //! Exercises DECLARE / FETCH (all directions) / MOVE / CLOSE through the
-//! engine's public `TenantSession::execute` API so the full executor dispatch
+//! engine's public `ProjectSession::execute` API so the full executor dispatch
 //! path is covered.
 //!
 //! All cursors in Basin v0.1 are fully materialised at DECLARE time
@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -73,7 +73,7 @@ fn assert_empty(result: &ExecResult, expected_tag: &str) {
 async fn cursor_declare_fetch_close() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // Create a table and insert 20 rows.
     sess.execute("CREATE TABLE nums (id BIGINT NOT NULL)")
@@ -122,7 +122,7 @@ async fn cursor_declare_fetch_close() {
 async fn cursor_fetch_directions() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE items (id BIGINT NOT NULL)")
         .await
@@ -159,7 +159,7 @@ async fn cursor_fetch_directions() {
 async fn cursor_move_advances_position() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE seq (n BIGINT NOT NULL)")
         .await
@@ -204,7 +204,7 @@ async fn cursor_move_advances_position() {
 async fn cursor_scroll_keyword_accepted() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t2 (x BIGINT NOT NULL)")
         .await

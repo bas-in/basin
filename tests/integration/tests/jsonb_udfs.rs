@@ -4,7 +4,7 @@
 //! verifying correct output shapes, null handling, and semantic correctness
 //! against expected values derived from PostgreSQL 16.
 //!
-//! Uses `TenantSession::execute` directly (no pgwire); JSONB columns are
+//! Uses `ProjectSession::execute` directly (no pgwire); JSONB columns are
 //! returned as Arrow `LargeBinary` so tests decode them with `serde_json`.
 
 #![allow(clippy::print_stdout)]
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Int64Array, LargeBinaryArray, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -44,7 +44,7 @@ async fn open_engine() -> (TempDir, Engine) {
 
 /// Run a SELECT that returns one row × one LargeBinary (JSONB) column.
 /// Decodes the bytes to a serde_json::Value.
-async fn one_jsonb(sess: &basin_engine::TenantSession, sql: &str) -> Option<Value> {
+async fn one_jsonb(sess: &basin_engine::ProjectSession, sql: &str) -> Option<Value> {
     let batches = match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
@@ -67,7 +67,7 @@ async fn one_jsonb(sess: &basin_engine::TenantSession, sql: &str) -> Option<Valu
 }
 
 /// Run a SELECT that returns one row × one Utf8 column.
-async fn one_text(sess: &basin_engine::TenantSession, sql: &str) -> Option<String> {
+async fn one_text(sess: &basin_engine::ProjectSession, sql: &str) -> Option<String> {
     let batches = match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
@@ -87,7 +87,7 @@ async fn one_text(sess: &basin_engine::TenantSession, sql: &str) -> Option<Strin
 }
 
 /// Run a SELECT that returns one row × one Int64 column.
-async fn one_int(sess: &basin_engine::TenantSession, sql: &str) -> Option<i64> {
+async fn one_int(sess: &basin_engine::ProjectSession, sql: &str) -> Option<i64> {
     let batches = match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
@@ -107,7 +107,7 @@ async fn one_int(sess: &basin_engine::TenantSession, sql: &str) -> Option<i64> {
 }
 
 /// Run a SELECT that returns one row × one Boolean column.
-async fn one_bool(sess: &basin_engine::TenantSession, sql: &str) -> Option<bool> {
+async fn one_bool(sess: &basin_engine::ProjectSession, sql: &str) -> Option<bool> {
     let batches = match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
@@ -134,7 +134,7 @@ async fn one_bool(sess: &basin_engine::TenantSession, sql: &str) -> Option<bool>
 #[tokio::test]
 async fn test_jsonb_typeof() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Object
     assert_eq!(
@@ -178,7 +178,7 @@ async fn test_jsonb_typeof() {
 #[tokio::test]
 async fn test_jsonb_pretty() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_text(&sess, r#"SELECT jsonb_pretty('{"a":1,"b":2}')"#).await;
     let text = result.expect("jsonb_pretty should return text");
@@ -192,7 +192,7 @@ async fn test_jsonb_pretty() {
 #[tokio::test]
 async fn test_jsonb_array_length() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(
         one_int(&sess, r#"SELECT jsonb_array_length('[1,2,3]')"#).await,
@@ -216,7 +216,7 @@ async fn test_jsonb_array_length() {
 #[tokio::test]
 async fn test_jsonb_strip_nulls() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_jsonb(
         &sess,
@@ -236,7 +236,7 @@ async fn test_jsonb_strip_nulls() {
 #[tokio::test]
 async fn test_jsonb_set() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Replace existing key
     let result = one_jsonb(
@@ -254,7 +254,7 @@ async fn test_jsonb_set() {
 #[tokio::test]
 async fn test_jsonb_insert() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Insert into array
     let result = one_jsonb(
@@ -277,7 +277,7 @@ async fn test_jsonb_insert() {
 #[tokio::test]
 async fn test_jsonb_path_query() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Simple key navigation
     let result = one_jsonb(
@@ -302,7 +302,7 @@ async fn test_jsonb_path_query() {
 #[tokio::test]
 async fn test_jsonb_path_exists() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(
         one_bool(&sess, r#"SELECT jsonb_path_exists('{"a":{"b":1}}', '$.a.b')"#).await,
@@ -320,7 +320,7 @@ async fn test_jsonb_path_exists() {
 #[tokio::test]
 async fn test_jsonb_path_match() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(
         one_bool(&sess, r#"SELECT jsonb_path_match('{"x":42}', '$.x')"#).await,
@@ -338,7 +338,7 @@ async fn test_jsonb_path_match() {
 #[tokio::test]
 async fn test_jsonb_object_keys() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_text(
         &sess,
@@ -358,7 +358,7 @@ async fn test_jsonb_object_keys() {
 #[tokio::test]
 async fn test_jsonb_each() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_text(
         &sess,
@@ -377,7 +377,7 @@ async fn test_jsonb_each() {
 #[tokio::test]
 async fn test_jsonb_each_text() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_text(
         &sess,
@@ -395,7 +395,7 @@ async fn test_jsonb_each_text() {
 #[tokio::test]
 async fn test_jsonb_array_elements() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_jsonb(
         &sess,
@@ -411,7 +411,7 @@ async fn test_jsonb_array_elements() {
 #[tokio::test]
 async fn test_jsonb_array_elements_text() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_text(
         &sess,
@@ -427,7 +427,7 @@ async fn test_jsonb_array_elements_text() {
 #[tokio::test]
 async fn test_jsonb_build_object() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_jsonb(
         &sess,
@@ -444,7 +444,7 @@ async fn test_jsonb_build_object() {
 #[tokio::test]
 async fn test_jsonb_build_array() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = one_jsonb(
         &sess,
@@ -466,7 +466,7 @@ async fn test_jsonb_build_array() {
 #[tokio::test]
 async fn test_to_jsonb() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Integer → JSONB number
     let result = one_jsonb(&sess, r#"SELECT to_jsonb(42)"#).await
@@ -492,7 +492,7 @@ async fn test_to_jsonb() {
 #[tokio::test]
 async fn test_row_to_json() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Stub accepts any scalar; should return JSONB
     let result = one_jsonb(&sess, r#"SELECT row_to_json(42)"#).await
@@ -504,7 +504,7 @@ async fn test_row_to_json() {
 #[tokio::test]
 async fn test_array_to_json() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Pass a JSON array literal — should come back as jsonb
     let result = one_jsonb(
@@ -524,7 +524,7 @@ async fn test_array_to_json() {
 #[tokio::test]
 async fn test_jsonb_agg_stub_errors_cleanly() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // The stub should error with a clear message
     let result = sess.execute(r#"SELECT jsonb_agg(1)"#).await;
@@ -540,7 +540,7 @@ async fn test_jsonb_agg_stub_errors_cleanly() {
 #[tokio::test]
 async fn test_jsonb_object_agg_stub_errors_cleanly() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let result = sess.execute(r#"SELECT jsonb_object_agg('k', 'v')"#).await;
     assert!(result.is_err(), "jsonb_object_agg stub should return an error");
@@ -555,7 +555,7 @@ async fn test_jsonb_object_agg_stub_errors_cleanly() {
 #[tokio::test]
 async fn test_jsonb_udf_round_trip_with_table() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE docs (id BIGINT, data JSONB)")
         .await

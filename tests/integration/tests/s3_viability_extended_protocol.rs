@@ -14,10 +14,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
-use basin_router::{ServerConfig, StaticTenantResolver};
+use basin_router::{ServerConfig, StaticProjectResolver};
 use basin_storage::{Storage, StorageConfig};
 use object_store::path::Path as ObjectPath;
 use serde_json::json;
@@ -57,17 +57,17 @@ async fn start_server(s3_cfg: &basin_integration_tests::test_config::S3Config) -
         shard: None,
     });
 
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     let mut map = HashMap::new();
     map.insert("alice".to_owned(), alice);
     map.insert("bob".to_owned(), bob);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -51,7 +51,7 @@ fn col_i64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
 async fn create_refresh_select_drop_round_trip() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // 1. Source table.
     sess.execute("CREATE TABLE events (bucket BIGINT NOT NULL, n BIGINT NOT NULL)")
@@ -144,7 +144,7 @@ async fn create_materialized_view_without_basin_continuous_is_rejected() {
     // Non-continuous regular materialised views are not supported in v0.1.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL)")
         .await
@@ -168,7 +168,7 @@ async fn create_materialized_view_without_basin_continuous_is_rejected() {
 async fn refresh_on_non_existent_view_errors() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute("REFRESH MATERIALIZED VIEW does_not_exist")
@@ -185,7 +185,7 @@ async fn refresh_on_non_existent_view_errors() {
 async fn drop_if_exists_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // DROP IF EXISTS on a non-existent view returns Ok.
     sess.execute("DROP MATERIALIZED VIEW IF EXISTS not_there")

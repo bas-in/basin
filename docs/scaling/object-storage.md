@@ -24,8 +24,8 @@ Key facts (verified against `crates/basin-storage/src/`):
   backend type internally — `LocalFileSystem`, `InMemory`, `AmazonS3` are all
   legal substitutions at the call site.
 - `src/paths.rs::data_file_key` and `src/tier.rs::Tier` already encode the
-  tier layout: `tenants/{tenant}/tables/{table}/data/...` for hot,
-  `tenants/{tenant}/tables/{table}/cold/...` for cold. A single bucket-side
+  tier layout: `projects/{project}/tables/{table}/data/...` for hot,
+  `projects/{project}/tables/{table}/cold/...` for cold. A single bucket-side
   lifecycle rule on the `cold/` prefix can transition class to S3-IA / R2-IA
   without any engine code change.
 - `src/lib.rs::delete_stream_for` already has a special case for the
@@ -35,7 +35,7 @@ Key facts (verified against `crates/basin-storage/src/`):
   endpoint), so they all inherit this fast path for free.
 - `basin-wal` (`crates/basin-wal/src/lib.rs::WalConfig`) takes the same
   `Arc<dyn ObjectStore>` shape. WAL segments live at
-  `{root}/wal/{tenant}/{partition}/{ulid}.seg` — orthogonal prefix from
+  `{root}/wal/{project}/{partition}/{ulid}.seg` — orthogonal prefix from
   Parquet data; lifecycle rules are configured separately.
 - The workspace already pulls `object_store = { version = "0.11", features =
   ["aws", "gcp", "http"] }` (root `Cargo.toml` L71). The `aws` feature is
@@ -144,12 +144,12 @@ provider-specific but the engine code is unchanged across backends:
 - After N days (configurable, default 30) the compactor rewrites a hot
   Parquet file to its cold-tier sibling key via `paths::rewrite_to_cold`.
   See `src/tier.rs`.
-- A bucket-side lifecycle rule on the `tenants/*/tables/*/cold/` prefix
+- A bucket-side lifecycle rule on the `projects/*/tables/*/cold/` prefix
   flips the storage class to the infrequent-access tier for your provider
   (S3-IA on AWS S3, R2 Infrequent Access on Cloudflare R2, or provider
   equivalent). Setup is one-time via the provider dashboard or CLI.
 - Old WAL segments follow the same shape: a lifecycle rule on the
-  `wal/{tenant}/...` prefix transitions segments older than the
+  `wal/{project}/...` prefix transitions segments older than the
   configured retention window (today: drop entirely; tomorrow: cold-tier
   for replay-from-archive scenarios).
 - The engine doesn't need to know which class a key is in — it just GETs
@@ -170,7 +170,7 @@ fly.toml — they ride `fly secrets set`.
 | `BASIN_STORAGE_REGION`        | S3-compatible backends   | `auto` (Tigris / R2) or `us-east-1` (S3)           |
 | `BASIN_STORAGE_ACCESS_KEY_ID` | S3-compatible (secret)   | from `fly secrets set` or `fly storage create`      |
 | `BASIN_STORAGE_SECRET_ACCESS_KEY` | S3-compatible (secret) | from `fly secrets set` or `fly storage create`  |
-| `BASIN_STORAGE_ROOT_PREFIX`   | optional         | `warehouse` — sub-key all tenant data under one prefix   |
+| `BASIN_STORAGE_ROOT_PREFIX`   | optional         | `warehouse` — sub-key all project data under one prefix   |
 
 In `services/basin-server/src/main.rs` the existing `LocalFileSystem`
 construction grows a small dispatch:
@@ -208,9 +208,9 @@ store is only the eventual flush target.
   before the object store sees anything. The object store only enters the
   picture on the background flush + on Parquet writes (which are already
   async, batched, and off-thread).
-- The tenant isolation invariant. Every key still goes through
-  `paths::data_file_key` and begins with `tenants/{tenant}/`. The bucket is
-  shared across tenants, prefix-isolated — same model for all backends.
+- The project isolation invariant. Every key still goes through
+  `paths::data_file_key` and begins with `projects/{project}/`. The bucket is
+  shared across projects, prefix-isolated — same model for all backends.
 - The catalog. The object store holds opaque keys; the catalog is unchanged.
 - Tests. `InMemory` and `LocalFileSystem` remain the test backends; no
   test needs network or real credentials.
@@ -218,9 +218,9 @@ store is only the eventual flush target.
 ## 8. Open questions (out of scope for this skeleton)
 
 - Multi-region buckets. Tigris, R2, and S3 all offer cross-region replication
-  at the bucket level — pin per-tenant? Likely yes for compliance, deferred.
+  at the bucket level — pin per-project? Likely yes for compliance, deferred.
 - Signed URLs for direct-from-edge reads (so the SDK could skip the
   engine entirely on big Parquet downloads). All three backends support
   presigned URLs via the S3 API; this is a basin-cloud surface, not basin-engine.
-- Per-tenant credentials. Currently one bucket-wide key; per-tenant scoping
+- Per-project credentials. Currently one bucket-wide key; per-project scoping
   would require provider-specific IAM/token APIs — out of scope for v0.1.

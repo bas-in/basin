@@ -1,4 +1,4 @@
-//! Per-tenant SQL-bodied reactor catalog.
+//! Per-project SQL-bodied reactor catalog.
 //!
 //! Customers will eventually write
 //!
@@ -13,18 +13,18 @@
 //! (`crates/basin-engine/src/reactor_sink.rs`) consumes [`ReactorDef`]
 //! lookups inside its `ChangeEventSink::publish` impl.
 //!
-//! The catalog is a single shared `HashMap<(TenantId, String),
+//! The catalog is a single shared `HashMap<(ProjectId, String),
 //! ReactorDef>` keyed on a composite identifier — same shape as
-//! [`crate::functions`] — so per-tenant cost stays `O(bytes)` with no
-//! per-tenant heavy resource. The composite key is
-//! `<table>:<reactor_name>` so two tables in the same tenant can register
+//! [`crate::functions`] — so per-project cost stays `O(bytes)` with no
+//! per-project heavy resource. The composite key is
+//! `<table>:<reactor_name>` so two tables in the same project can register
 //! reactors with the same name (matching PG's per-table trigger
 //! namespace).
 
 use bitflags::bitflags;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use basin_common::{ChangeOp, TableName, TenantId};
+use basin_common::{ChangeOp, TableName, ProjectId};
 
 bitflags! {
     /// Mutation ops a reactor matches. Bitset so the SQL surface's
@@ -70,13 +70,13 @@ impl ReactorOps {
     }
 }
 
-/// Catalog row for a registered reactor. Stored per-tenant, scoped to
+/// Catalog row for a registered reactor. Stored per-project, scoped to
 /// one table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactorDef {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: TableName,
-    /// Unqualified reactor name, unique per `(tenant, table)`. Validated
+    /// Unqualified reactor name, unique per `(project, table)`. Validated
     /// to be a SQL identifier.
     pub name: String,
     /// Bitset of `INSERT` / `UPDATE` / `DELETE` ops the reactor fires
@@ -97,7 +97,7 @@ pub struct ReactorDef {
 #[derive(Debug)]
 pub enum ReactorError {
     /// Reactor name collides with an existing reactor on the same
-    /// `(tenant, table)`.
+    /// `(project, table)`.
     Duplicate,
     /// Body failed to parse as a single SQL statement.
     InvalidBody(String),

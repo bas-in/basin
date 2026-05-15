@@ -14,7 +14,7 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
@@ -99,8 +99,8 @@ async fn s3_vector_search() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let session = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let session = engine.open_session(project).await.unwrap();
     let table = TableName::new("docs").unwrap();
 
     session
@@ -134,14 +134,14 @@ async fn s3_vector_search() {
     .unwrap();
     let part = PartitionKey::default_key();
     let df = storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .unwrap();
 
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     catalog
         .append_data_files(
-            &tenant,
+            &project,
             &table,
             meta.current_snapshot,
             vec![DataFileRef {
@@ -155,7 +155,7 @@ async fn s3_vector_search() {
         .unwrap();
 
     drop(session);
-    let session = engine.open_session(tenant).await.unwrap();
+    let session = engine.open_session(project).await.unwrap();
 
     let query = det_vec(424_242, DIM);
     let query_lit = vector_lit(&query);

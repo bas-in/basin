@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
 use object_store::local::LocalFileSystem;
 use serde_json::Value;
@@ -202,24 +202,24 @@ fn last_token(mailer: &StubMailer) -> String {
     tail[..end].to_owned()
 }
 
-/// Verified email, signed-in tokens for `tenant`, ready to use in
+/// Verified email, signed-in tokens for `project`, ready to use in
 /// `Authorization: Bearer <jwt>` headers.
 async fn make_user(
     auth: &AuthService,
     mailer: &StubMailer,
-    tenant: &TenantId,
+    project: &ProjectId,
     email: &str,
 ) -> basin_auth::Tokens {
     let user = auth
-        .signup(tenant, email, "longenoughpassword")
+        .signup(project, email, "longenoughpassword")
         .await
         .expect("signup");
-    auth.request_email_verification(tenant, user)
+    auth.request_email_verification(project, user)
         .await
         .expect("request verify");
     let tok = last_token(mailer);
-    auth.verify_email(tenant, &tok).await.expect("verify");
-    auth.signin(tenant, email, "longenoughpassword")
+    auth.verify_email(project, &tok).await.expect("verify");
+    auth.signin(project, email, "longenoughpassword")
         .await
         .expect("signin")
 }
@@ -353,12 +353,12 @@ async fn signup_signin_returns_jwt() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new().to_string();
-    let tenant_parsed: TenantId = tenant.parse().unwrap();
+    let project = ProjectId::new().to_string();
+    let project_parsed: ProjectId = project.parse().unwrap();
 
     // signup via REST
     let body = serde_json::json!({
-        "tenant_id": tenant,
+        "project_id": project,
         "email": "ss@example.com",
         "password": "longenoughpassword",
     })
@@ -381,13 +381,13 @@ async fn signup_signin_returns_jwt() {
 
     // Verify email out of band (the email gets sent through the stub mailer).
     auth.request_email_verification(
-        &tenant_parsed,
+        &project_parsed,
         r.json()["user_id"].as_str().unwrap().parse().unwrap(),
     )
     .await
     .unwrap();
     let tok = last_token(&mailer);
-    let body = serde_json::json!({"tenant_id": tenant, "token": tok}).to_string();
+    let body = serde_json::json!({"project_id": project, "token": tok}).to_string();
     let r = http_request(
         addr,
         "POST",
@@ -405,7 +405,7 @@ async fn signup_signin_returns_jwt() {
 
     // Now signin and assert tokens come back.
     let body = serde_json::json!({
-        "tenant_id": tenant,
+        "project_id": project,
         "email": "ss@example.com",
         "password": "longenoughpassword",
     })
@@ -469,16 +469,16 @@ async fn crud_round_trip() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // CREATE TABLE out-of-band via the engine session.
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE items (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
         .unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant, "ct@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "ct@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     // POST a single object.
@@ -540,9 +540,9 @@ async fn select_cap_enforced() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE big (id BIGINT NOT NULL)")
         .await
@@ -552,7 +552,7 @@ async fn select_cap_enforced() {
     let sql = format!("INSERT INTO big VALUES {}", values.join(", "));
     session.execute(&sql).await.unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant, "cap@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "cap@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     let r = http_request(
@@ -607,9 +607,9 @@ async fn eq_filter() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE rows (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
@@ -619,7 +619,7 @@ async fn eq_filter() {
         .await
         .unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant, "eq@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "eq@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     let r = http_request(
@@ -646,9 +646,9 @@ async fn order_and_pagination() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE seq (id BIGINT NOT NULL)")
         .await
@@ -658,7 +658,7 @@ async fn order_and_pagination() {
         .await
         .unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant, "ord@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "ord@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     // order=id.desc, limit=2, offset=1 → expect [4, 3].
@@ -687,10 +687,10 @@ async fn patch_round_trip() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // CREATE TABLE out-of-band via the engine session.
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE patches (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
@@ -700,7 +700,7 @@ async fn patch_round_trip() {
         .await
         .unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant, "patch@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "patch@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     // PATCH the row with id=1.
@@ -764,8 +764,8 @@ async fn patch_requires_filter() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
-    let toks = make_user(&auth, &mailer, &tenant, "patchnf@example.com").await;
+    let project = ProjectId::new();
+    let toks = make_user(&auth, &mailer, &project, "patchnf@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     let r = http_request(
@@ -811,16 +811,16 @@ async fn cors_preflight() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn openapi_lists_tenant_tables() {
+async fn openapi_lists_project_tables() {
     let Some((running, svc, auth, mailer, _g)) = try_serve().await else {
         return;
     };
     let addr = running.local_addr;
-    let tenant_a = TenantId::new();
-    let tenant_b = TenantId::new();
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
 
-    // Tenant A owns 3 tables.
-    let sa = svc.inner.cfg.engine.open_session(tenant_a).await.unwrap();
+    // Project A owns 3 tables.
+    let sa = svc.inner.cfg.engine.open_session(project_a).await.unwrap();
     sa.execute("CREATE TABLE alpha (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -830,13 +830,13 @@ async fn openapi_lists_tenant_tables() {
     sa.execute("CREATE TABLE gamma (id BIGINT NOT NULL)")
         .await
         .unwrap();
-    // Tenant B owns 1.
-    let sb = svc.inner.cfg.engine.open_session(tenant_b).await.unwrap();
+    // Project B owns 1.
+    let sb = svc.inner.cfg.engine.open_session(project_b).await.unwrap();
     sb.execute("CREATE TABLE only_b (id BIGINT NOT NULL)")
         .await
         .unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant_a, "oa@example.com").await;
+    let toks = make_user(&auth, &mailer, &project_a, "oa@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     let r = http_request(
@@ -856,7 +856,7 @@ async fn openapi_lists_tenant_tables() {
     let v = r.json();
     assert_eq!(v["openapi"], "3.0.3");
     let paths = v["paths"].as_object().expect("paths object");
-    assert_eq!(paths.len(), 3, "tenant A has exactly 3 tables: {paths:?}");
+    assert_eq!(paths.len(), 3, "project A has exactly 3 tables: {paths:?}");
     assert!(paths.contains_key("/rest/v1/alpha"));
     assert!(paths.contains_key("/rest/v1/beta"));
     assert!(paths.contains_key("/rest/v1/gamma"));
@@ -870,7 +870,7 @@ async fn openapi_lists_tenant_tables() {
         }
     }
 
-    // Components must include matching schemas for tenant A only.
+    // Components must include matching schemas for project A only.
     let schemas = v["components"]["schemas"].as_object().expect("schemas");
     assert!(schemas.contains_key("alpha"));
     assert!(schemas.contains_key("beta"));
@@ -886,11 +886,11 @@ async fn openapi_includes_column_types() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // One table that exercises the type mapping: BIGINT, TEXT, BOOLEAN,
     // DOUBLE, BYTEA, JSONB, UUID, TIMESTAMPTZ, VECTOR(N).
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute(
             "CREATE TABLE shapes ( \
@@ -908,7 +908,7 @@ async fn openapi_includes_column_types() {
         .await
         .unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant, "ot@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "ot@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
     let r = http_request(
         addr,
@@ -983,10 +983,10 @@ async fn api_key_bearer_authenticates_rest() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // Set up a verified user + JWT so we can mint an API key via REST.
-    let toks = make_user(&auth, &mailer, &tenant, "apikey@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "apikey@example.com").await;
     let bearer_jwt = format!("Bearer {}", toks.access_token);
 
     // POST /auth/v1/api-keys returns the plaintext secret exactly once.
@@ -1028,7 +1028,7 @@ async fn api_key_bearer_authenticates_rest() {
     assert!(arr[0].get("secret").is_none() || arr[0]["secret"].is_null());
 
     // CREATE TABLE so the api-key bearer has something to GET.
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE k (id BIGINT NOT NULL)")
         .await
@@ -1115,9 +1115,9 @@ async fn pagination_cursor_advances() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE pages (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
@@ -1128,7 +1128,7 @@ async fn pagination_cursor_advances() {
         .await
         .unwrap();
 
-    let toks = make_user(&auth, &mailer, &tenant, "cur@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "cur@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     let mut seen: Vec<i64> = Vec::new();
@@ -1169,9 +1169,9 @@ async fn streaming_response_for_large_payload() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
-    let session = svc.inner.cfg.engine.open_session(tenant).await.unwrap();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
     session
         .execute("CREATE TABLE bulk (id BIGINT NOT NULL)")
         .await
@@ -1185,7 +1185,7 @@ async fn streaming_response_for_large_payload() {
             .unwrap();
     }
 
-    let toks = make_user(&auth, &mailer, &tenant, "stm@example.com").await;
+    let toks = make_user(&auth, &mailer, &project, "stm@example.com").await;
     let bearer = format!("Bearer {}", toks.access_token);
 
     let r = http_request(
@@ -1234,10 +1234,10 @@ async fn magic_link_round_trip() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // Bootstrap: signup + verify so a user exists for the email.
-    let _ = make_user(&auth, &mailer, &tenant, "ml-rt@example.com").await;
+    let _ = make_user(&auth, &mailer, &project, "ml-rt@example.com").await;
 
     // Drain the verification email so `last_token` doesn't pick it up later.
     let _ = mailer.sent();
@@ -1312,8 +1312,8 @@ async fn refresh_token_reuse_detected_revokes_all() {
         return;
     };
     let addr = running.local_addr;
-    let tenant = TenantId::new();
-    let toks_a = make_user(&auth, &mailer, &tenant, "rt-r@example.com").await;
+    let project = ProjectId::new();
+    let toks_a = make_user(&auth, &mailer, &project, "rt-r@example.com").await;
 
     // First rotation A → B.
     let body = serde_json::json!({"refresh_token": toks_a.refresh_token}).to_string();

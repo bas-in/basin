@@ -38,7 +38,7 @@ serde_json.workspace = true
 uuid.workspace = true
 
 # Stable per-(subscription, event) idempotency key. SHA-256 over the
-# canonical (subscription_id, tenant, table, seq) tuple — same crate the
+# canonical (subscription_id, project, table, seq) tuple — same crate the
 # engine already pulls in for `digest()` UDFs, no new build cost.
 sha2.workspace = true
 hex.workspace = true
@@ -49,7 +49,7 @@ hex.workspace = true
 bitflags = "2"
 
 # Cheap structural URL validation in `WebhookRegistry::add` — the
-# per-tenant allowlist gate at delivery time is in `basin-net`. Same
+# per-project allowlist gate at delivery time is in `basin-net`. Same
 # version basin-net pins.
 url = "2"
 

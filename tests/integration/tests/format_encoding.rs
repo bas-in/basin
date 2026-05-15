@@ -32,7 +32,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -61,7 +61,7 @@ async fn open_engine() -> (TempDir, Engine) {
 }
 
 /// Execute a single-row, single-column query; return first-column value as String.
-async fn one_string(sess: &basin_engine::TenantSession, sql: &str) -> String {
+async fn one_string(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches
@@ -120,7 +120,7 @@ fn render_scalar(arr: &dyn Array, i: usize) -> String {
 #[tokio::test]
 async fn to_char_datetime_extended() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // MS (milliseconds) — 3-digit sub-second.
     assert_eq!(
@@ -219,7 +219,7 @@ async fn to_char_datetime_extended() {
 #[tokio::test]
 async fn to_char_numeric() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Basic integer formatting.  PG pads to template width with spaces.
     // We just assert the digits are present and no error is raised.
@@ -255,7 +255,7 @@ async fn to_char_numeric() {
 #[tokio::test]
 async fn to_date_basic() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Parse a DD-Mon-YYYY date string.
     // We verify by formatting back with to_char to an ISO date.
@@ -296,7 +296,7 @@ async fn to_date_basic() {
 #[tokio::test]
 async fn to_timestamp_extended() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Round-trip with MS (milliseconds).
     assert_eq!(
@@ -328,7 +328,7 @@ async fn to_timestamp_extended() {
 #[tokio::test]
 async fn encode_decode_formats() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // hex round-trip.
     assert_eq!(
@@ -372,7 +372,7 @@ async fn encode_decode_formats() {
 #[tokio::test]
 async fn text_encoding_roundtrip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // convert_to produces bytea; convert_from decodes it back.
     assert_eq!(
@@ -406,7 +406,7 @@ async fn text_encoding_roundtrip() {
 #[tokio::test]
 async fn length_bytea() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // ASCII text: byte length == character length.
     assert_eq!(
@@ -438,7 +438,7 @@ async fn length_bytea() {
 #[tokio::test]
 async fn bit_and_octet_length() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // bit_length('hello') = 5 * 8 = 40.
     assert_eq!(
@@ -466,7 +466,7 @@ async fn bit_and_octet_length() {
 #[tokio::test]
 async fn overlay_function() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // PG: overlay('Txxxxas' PLACING 'hom' FROM 2 FOR 4) = 'Thomas'
     assert_eq!(
@@ -496,7 +496,7 @@ async fn overlay_function() {
 #[tokio::test]
 async fn translate_function() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Basic substitution: e→i, l→p, so Hello → Hippo.
     assert_eq!(
@@ -524,7 +524,7 @@ async fn translate_function() {
 #[tokio::test]
 async fn position_in() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(
         one_string(&sess, "SELECT position('cd' IN 'abcdef')").await,
@@ -543,7 +543,7 @@ async fn position_in() {
 #[tokio::test]
 async fn quote_functions() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // quote_literal wraps in single quotes, doubles internal quotes.
     assert_eq!(
@@ -577,7 +577,7 @@ async fn quote_functions() {
 #[tokio::test]
 async fn format_function() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // %s — plain substitution.
     assert_eq!(

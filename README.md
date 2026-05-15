@@ -124,7 +124,7 @@ BASIN_BIND=127.0.0.1:5433 \
 BASIN_CATALOG=postgres://postgres@127.0.0.1:5432/postgres \
 BASIN_DATA_DIR=/tmp/basin \
 BASIN_WAL_DIR=/tmp/basin/wal \
-BASIN_TENANTS='alice=*,bob=*' \
+BASIN_PROJECTS='alice=*,bob=*' \
 BASIN_SHARD_ENABLED=1 \
 BASIN_POOL_ENABLED=1 \
 BASIN_AUTH_ENABLED=1 \
@@ -137,10 +137,10 @@ BASIN_ANALYTICAL_ENABLED=1 \
 cargo run -p basin-server
 ```
 
-`BASIN_TENANTS` is the project-list env var — name is historical, projects in the
+`BASIN_PROJECTS` is the project-list env var — name is historical, projects in the
 public API. Required vars for production-shaped durability: `BASIN_BIND`,
 `BASIN_CATALOG=postgres://...`, `BASIN_DATA_DIR` or `BASIN_STORAGE_BACKEND`,
-`BASIN_WAL_DIR`, `BASIN_TENANTS`, and `BASIN_AUTH_ENABLED` (if you want auth).
+`BASIN_WAL_DIR`, `BASIN_PROJECTS`, and `BASIN_AUTH_ENABLED` (if you want auth).
 Everything else is optional.
 
 To run the same binary against object storage, set
@@ -170,8 +170,8 @@ SELECT id FROM docs ORDER BY embedding <-> '[...]' LIMIT 10;
 Confirm the data hit object storage under the project prefix:
 
 ```sh
-find /tmp/basin/tenants -name '*.parquet'
-# /tmp/basin/tenants/01HABCD…/tables/events/data/2026/05/01/01HEFG….parquet
+find /tmp/basin/projects -name '*.parquet'
+# /tmp/basin/projects/01HABCD…/tables/events/data/2026/05/01/01HEFG….parquet
 ```
 
 That's a real bucket-native database. The prefix is the IAM boundary; one bucket policy revokes all access to a project's data even if every other layer is bypassed.
@@ -195,7 +195,7 @@ Four layers, each with one job:
    WAL                        durable append path; flushes to object storage
           │
           ▼
-   Object storage + catalog   /tenants/{id}/... Parquet + Iceberg-style metadata
+   Object storage + catalog   /projects/{id}/... Parquet + Iceberg-style metadata
                               local FS, S3, R2, Tigris — same binary, different bucket
 ```
 
@@ -213,7 +213,7 @@ The full architecture document is in [`docs/architecture.md`](./docs/architectur
 - **Native vector search** — `vector(N)` + `<->` / `<#>` / `<=>` operators, HNSW per Parquet segment. No `pg_vector`.
 - **Postgres-extension equivalents** — `pg_cron` (basin-cron), `pg_net` + `http` (basin-net), `pg_trgm` (basin-trgm), `PostGIS` subset (basin-geo), `TimescaleDB` continuous aggregates (basin-cv), `pgcrypto` + `uuid-ossp` UDFs.
 - **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation, email-link login, per-project API keys) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`). **`auth.uid()`**, **`auth.role()`**, **`auth.jwt()`** SQL session functions let you write Supabase-style RLS policies.
-- **Per-project connection URLs** — `POST /admin/v1/tenants` returns `postgres://<user>:<password>@host:5433/<db>`. Password bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/tenants/{user}/rotate`.
+- **Per-project connection URLs** — `POST /admin/v1/projects` returns `postgres://<user>:<password>@host:5433/<db>`. Password bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/projects/{user}/rotate`.
 - **Durable catalog** — Iceberg-style catalog backed by Postgres when `BASIN_CATALOG=postgres://...`; tables, snapshots, project credentials, and `basin-auth`'s identity tables survive process restart.
 - **Cheap retention** — ZSTD-1 Parquet, 12.5× smaller than Postgres heap on audit-log data; A4 catalog `column_stats` skips footer fetches when the predicate prunes the file.
 - **Analytical path** — DuckDB on Iceberg, 4.6× faster than DataFusion on million-row aggregates. The planner auto-routes aggregate / GROUP BY queries to it.
@@ -270,7 +270,7 @@ Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.m
 
 ### vs Postgres / Aurora / RDS
 
-Postgres is the right answer for high-frequency single-tenant OLTP. **Basin is not trying to be Postgres.** Where Basin wins: workloads where storage cost matters, where you have multiple isolated databases (one per environment, one per customer, one per region), or where you want object-storage economics with relational semantics.
+Postgres is the right answer for high-frequency single-project OLTP. **Basin is not trying to be Postgres.** Where Basin wins: workloads where storage cost matters, where you have multiple isolated databases (one per environment, one per customer, one per region), or where you want object-storage economics with relational semantics.
 
 ### vs Neon
 
@@ -278,7 +278,7 @@ Neon is serverless Postgres with branching — terrific for **single-DB workload
 
 ### vs Supabase
 
-Supabase is "BaaS in a box" — Postgres + Auth + Edge Functions + Storage + Realtime. Basin covers the same SQL + Auth + REST surface in one binary, with `auth.uid()` / `auth.role()` / `auth.jwt()` working identically. Where Basin differs is the data-layer economics: Parquet on S3 instead of Postgres heap on block storage. Multi-tenant SaaS that has outgrown Supabase's per-project pricing can migrate the database to Basin via pgwire and keep Supabase Auth, Edge Functions, and Realtime for the parts of the stack they handle well — or run entirely on Basin using basin-auth and basin-rest. Edge Functions / Realtime / Storage are out of scope per ADRs 0005/0006.
+Supabase is "BaaS in a box" — Postgres + Auth + Edge Functions + Storage + Realtime. Basin covers the same SQL + Auth + REST surface in one binary, with `auth.uid()` / `auth.role()` / `auth.jwt()` working identically. Where Basin differs is the data-layer economics: Parquet on S3 instead of Postgres heap on block storage. Multi-project SaaS that has outgrown Supabase's per-project pricing can migrate the database to Basin via pgwire and keep Supabase Auth, Edge Functions, and Realtime for the parts of the stack they handle well — or run entirely on Basin using basin-auth and basin-rest. Edge Functions / Realtime / Storage are out of scope per ADRs 0005/0006.
 
 ### vs Turso / libSQL
 
@@ -303,11 +303,11 @@ Per the ADRs:
 
 ## Use cases
 
-- **Multi-environment apps** — dev / staging / prod / per-region as cheap projects on one cluster. See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md) for the multi-tenant SaaS story (per-customer-project isolation, noisy-neighbor scheduler, RLS with `auth.uid()`, cost math at 10k projects).
+- **Multi-environment apps** — dev / staging / prod / per-region as cheap projects on one cluster. See [`docs/multi-project.md`](./docs/multi-project.md) for the multi-project SaaS story (per-customer-project isolation, noisy-neighbor scheduler, RLS with `auth.uid()`, cost math at 10k projects).
 - **Audit / event logs** — ZSTD-Parquet compression makes append-mostly workloads dramatically cheaper than Postgres heap.
 - **AI agent / RAG platforms** — native `vector(N)` + HNSW alongside transactional rows in the same database.
 - **Document / activity stores** — write-cheap, analytical-read-occasionally workloads where the analytical path through DuckDB handles aggregates.
-- **Tenanted SaaS** — one Basin cluster replaces hundreds of separate Postgres / Neon / Supabase projects with their per-project minimums. See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md).
+- **Projected SaaS** — one Basin cluster replaces hundreds of separate Postgres / Neon / Supabase projects with their per-project minimums. See [`docs/multi-project.md`](./docs/multi-project.md).
 
 If you're a single-app developer building a side project, **use Postgres or the Free tier above**. The cost math doesn't show its full effect until you have multiple projects or multi-GB tables.
 
@@ -345,7 +345,7 @@ services/
 benchmark/          dashboard + auto-regenerated RESULTS_localfs.md
 docs/
   architecture.md   the four-layer stack, in detail
-  multi-tenancy.md  the multi-tenant SaaS story (per-project isolation, scheduler, cost math)
+  multi-project.md  the multi-project SaaS story (per-project isolation, scheduler, cost math)
   decisions/        ADRs — every "no" with the trigger that would change our mind
   sql-compatibility.md  hand-written compatibility narrative (planner / catalog scope)
   sql-support.md    auto-generated per-syntax matrix (sql_support_matrix.rs)

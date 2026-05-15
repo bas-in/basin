@@ -1,10 +1,10 @@
 //! S3 port of `viability_rls_isolation.rs`.
 //!
-//! Two tenants, RLS toggled in every combination, asserting zero cross-tenant
+//! Two projects, RLS toggled in every combination, asserting zero cross-project
 //! row leakage. Same shape as the LocalFS variant; the storage backend is
 //! real S3.
 //!
-//! Card id: `rls_isolation`. Bar: `cross_tenant_leak == 0`.
+//! Card id: `rls_isolation`. Bar: `cross_project_leak == 0`.
 //!
 //! Skips cleanly when `[s3]` is missing.
 
@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{Storage, StorageConfig};
@@ -24,7 +24,7 @@ use serde_json::json;
 
 const TEST_NAME: &str = "s3_viability_rls_isolation";
 
-async fn count_forbidden_marker(sess: &TenantSession, sql: &str, forbidden_marker: &str) -> usize {
+async fn count_forbidden_marker(sess: &ProjectSession, sql: &str, forbidden_marker: &str) -> usize {
     let res = sess.execute(sql).await.expect("query failed");
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
@@ -81,13 +81,13 @@ async fn s3_viability_rls_isolation() {
         shard: None,
     });
 
-    let tenant_a = TenantId::new();
-    let tenant_b = TenantId::new();
-    let marker_a = format!("A-{}", tenant_a);
-    let marker_b = format!("B-{}", tenant_b);
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
+    let marker_a = format!("A-{}", project_a);
+    let marker_b = format!("B-{}", project_b);
 
-    let admin_a = engine.open_session(tenant_a).await.unwrap();
-    let admin_b = engine.open_session(tenant_b).await.unwrap();
+    let admin_a = engine.open_session(project_a).await.unwrap();
+    let admin_b = engine.open_session(project_b).await.unwrap();
 
     for s in [&admin_a, &admin_b] {
         s.execute(
@@ -97,8 +97,8 @@ async fn s3_viability_rls_isolation() {
         .unwrap();
     }
 
-    let shared_a = engine.open_session_as(tenant_a, "shared").await.unwrap();
-    let shared_b = engine.open_session_as(tenant_b, "shared").await.unwrap();
+    let shared_a = engine.open_session_as(project_a, "shared").await.unwrap();
+    let shared_b = engine.open_session_as(project_b, "shared").await.unwrap();
 
     for i in 0..5_i64 {
         admin_a
@@ -160,7 +160,7 @@ async fn s3_viability_rls_isolation() {
     };
     assert_eq!(
         a_post_drop, 0,
-        "tenant A under RLS-on + no policy should see 0 rows; got {a_post_drop}"
+        "project A under RLS-on + no policy should see 0 rows; got {a_post_drop}"
     );
     let b_unaffected = match shared_b.execute("SELECT marker FROM events").await.unwrap() {
         ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
@@ -170,25 +170,25 @@ async fn s3_viability_rls_isolation() {
 
     let pass = leak_count == 0;
     println!(
-        "[S3 viability_rls_isolation] cross_tenant_leak={leak_count} (bar=0) {}",
+        "[S3 viability_rls_isolation] cross_project_leak={leak_count} (bar=0) {}",
         if pass { "PASS" } else { "FAIL" }
     );
 
     report_real_viability(
         "rls_isolation",
-        "RLS preserves tenant prefix isolation (real S3)",
-        "Cross-tenant row leakage is zero across every RLS configuration combination, with data hosted on real S3.",
+        "RLS preserves project prefix isolation (real S3)",
+        "Cross-project row leakage is zero across every RLS configuration combination, with data hosted on real S3.",
         pass,
         PrimaryMetric {
-            label: "cross_tenant_leak".into(),
+            label: "cross_project_leak".into(),
             value: leak_count as f64,
             unit: "rows".into(),
             bar: BarOp::eq(0.0),
         },
         json!({
-            "cross_tenant_leak": leak_count,
-            "tenant_a": tenant_a.to_string(),
-            "tenant_b": tenant_b.to_string(),
+            "cross_project_leak": leak_count,
+            "project_a": project_a.to_string(),
+            "project_b": project_b.to_string(),
             "endpoint": s3_cfg.endpoint.clone(),
             "bucket": s3_cfg.bucket,
         }),
@@ -196,6 +196,6 @@ async fn s3_viability_rls_isolation() {
 
     assert_eq!(
         leak_count, 0,
-        "{leak_count} cross-tenant rows leaked under RLS"
+        "{leak_count} cross-project rows leaked under RLS"
     );
 }

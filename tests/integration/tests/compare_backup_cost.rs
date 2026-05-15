@@ -6,7 +6,7 @@
 //! immutable Parquet files) while Postgres `pg_dump` is O(data) — it
 //! has to serialise every row.
 //!
-//! Setup: 1 tenant, 100k rows in 100 files (~1k rows / file).
+//! Setup: 1 project, 100k rows in 100 files (~1k rows / file).
 //!
 //! Basin path:
 //!   - Insert 100k rows split into 100 INSERT batches so the writer flushes
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_postgres_compare, CompareMetric, WhichWins};
 use object_store::local::LocalFileSystem;
@@ -117,9 +117,9 @@ async fn compare_backup_cost() {
         catalog: catalog.clone(),
         shard: None,
     });
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let sess = engine.open_session(project).await.unwrap();
     sess.execute(
         "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
     )
@@ -146,7 +146,7 @@ async fn compare_backup_cost() {
     let files_listed = engine
         .config()
         .storage
-        .list_data_files(&tenant, &table)
+        .list_data_files(&project, &table)
         .await
         .unwrap();
     println!(
@@ -164,7 +164,7 @@ async fn compare_backup_cost() {
     // current TableMetadata and serialise the active snapshot to JSON;
     // the byte size is the backup-on-the-wire size.
     let basin_backup_start = Instant::now();
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     let current = meta
         .current()
         .expect("table must have at least the genesis snapshot")
@@ -202,7 +202,7 @@ async fn compare_backup_cost() {
         }
     };
 
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema = format!("basin_backup_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema.clone(),

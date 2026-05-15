@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 
 fn name(s: &str) -> TableName {
     TableName::new(s).unwrap()
@@ -38,7 +38,7 @@ fn schema_with(cols: &[(&str, DataType, bool)]) -> Arc<Schema> {
 #[tokio::test]
 async fn not_null_columns_appear_in_table_constraints() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let s = schema_with(&[
@@ -76,7 +76,7 @@ async fn not_null_columns_appear_in_table_constraints() {
 #[tokio::test]
 async fn nullable_columns_absent_from_table_constraints() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     // Every column is nullable: zero NOT NULL rows should land.
@@ -99,7 +99,7 @@ async fn nullable_columns_absent_from_table_constraints() {
 #[tokio::test]
 async fn key_column_usage_empty_v01() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = schema_with(&[("id", DataType::Int64, false)]);
     cat.create_table(&t, &name("widgets"), &s).await.unwrap();
@@ -124,7 +124,7 @@ async fn key_column_usage_empty_v01() {
 #[tokio::test]
 async fn referential_constraints_empty_v01() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = schema_with(&[("id", DataType::Int64, false)]);
     cat.create_table(&t, &name("widgets"), &s).await.unwrap();
@@ -146,10 +146,10 @@ async fn referential_constraints_empty_v01() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_constraints() {
+async fn cross_project_isolation_constraints() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
 
@@ -180,7 +180,7 @@ async fn cross_tenant_isolation_constraints() {
     assert_eq!(table_names_b, vec!["tbl_b"]);
 
     // key_column_usage / referential_constraints stay empty for both,
-    // but the cross-tenant invariant still holds (no rows == no leak).
+    // but the cross-project invariant still holds (no rows == no leak).
     assert_eq!(
         InfoSchemaQuery::key_column_usage(&cat, &a)
             .await

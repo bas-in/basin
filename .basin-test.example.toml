@@ -49,7 +49,7 @@ prefix = "basin-test"
 # allow_http = false   # set true ONLY for plaintext local MinIO
 # http2_only = true    # AWS S3 / Tigris / R2 / GCS over HTTPS support h2 multiplexing
                        # — eliminates HTTP/1.1 head-of-line blocking when one
-                       # tenant's bulk transfer ties up the connection pool.
+                       # project's bulk transfer ties up the connection pool.
                        # MinIO over plain HTTP does NOT speak h2c; leave false
                        # there. Confirmed empirically on MinIO 2024-12 — the
                        # server upgrades the connection but then returns

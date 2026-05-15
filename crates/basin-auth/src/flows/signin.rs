@@ -6,7 +6,7 @@
 //! hash if the user doesn't exist) so the response time doesn't tell an
 //! attacker whether the email exists.
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -20,16 +20,16 @@ const DUMMY_HASH: &str = "$2b$04$dummyhashthatshouldneververifyXXXXXXXXXXXXXXXXX
 
 pub(crate) async fn signin(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     email: &str,
     password_raw: &str,
 ) -> Result<Tokens> {
-    inner.ip_limiter.check(&format!("signin:{tenant}"))?;
+    inner.ip_limiter.check(&format!("signin:{project}"))?;
     inner.email_limiter.check(&format!("signin:{email}"))?;
 
     let email = crate::normalise_email(email)?;
 
-    let row = inner.store.find_user_by_email(tenant, &email).await?;
+    let row = inner.store.find_user_by_email(project, &email).await?;
 
     let (user_id, hash, verified) = match row {
         Some(r) => (Some(r.user_id), r.password_hash, r.email_verified_at),
@@ -48,20 +48,20 @@ pub(crate) async fn signin(
         ));
     }
 
-    issue_tokens_for(inner, tenant, user_id, &email).await
+    issue_tokens_for(inner, project, user_id, &email).await
 }
 
 /// Issue a JWT + refresh pair for a user. Reused by signin, magic-link,
 /// and refresh.
 pub(crate) async fn issue_tokens_for(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     user_id: Uuid,
     email: &str,
 ) -> Result<Tokens> {
     let now = Utc::now();
     let (access_token, access_expires_at) = inner.jwt.issue(
-        tenant,
+        project,
         user_id,
         email,
         // No role hierarchy in v1.
@@ -70,7 +70,7 @@ pub(crate) async fn issue_tokens_for(
         inner.cfg.token_ttl,
     )?;
     let (refresh_token, refresh_expires_at) =
-        issue_refresh(inner, tenant, user_id, email, now).await?;
+        issue_refresh(inner, project, user_id, email, now).await?;
     Ok(Tokens {
         access_token,
         refresh_token,

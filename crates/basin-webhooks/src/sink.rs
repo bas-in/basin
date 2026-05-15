@@ -2,7 +2,7 @@
 //! [`ChangeEventSink`](basin_common::ChangeEventSink) implementation.
 //!
 //! Wired into the engine via `Engine::attach_post_commit_sink`. On every
-//! committed mutation, looks up matching subscriptions for `(tenant,
+//! committed mutation, looks up matching subscriptions for `(project,
 //! table, op)`, builds an envelope per match, and enqueues each delivery.
 //! The actual HTTP POST happens out-of-band on [`WebhookWorker`] —
 //! `publish` returns `Ok(())` as soon as the entries are durable in the
@@ -55,7 +55,7 @@ impl WebhookSink {
     /// Build with both an explicit clock and an explicit counters
     /// registry. Production wiring constructs one [`WebhookCountersRegistry`]
     /// at process start and shares it between the sink and the worker so
-    /// enqueue/dequeue both bump the same per-tenant counters.
+    /// enqueue/dequeue both bump the same per-project counters.
     pub fn with_clock_and_counters(
         registry: WebhookRegistry,
         queue: Arc<RetryQueue>,
@@ -78,9 +78,9 @@ impl WebhookSink {
         &self.queue
     }
 
-    /// Per-tenant counters registry. Cloneable handle suitable for
+    /// Per-project counters registry. Cloneable handle suitable for
     /// admin handlers that want to expose webhook delivery metrics
-    /// per tenant.
+    /// per project.
     pub fn counters(&self) -> Arc<WebhookCountersRegistry> {
         self.counters.clone()
     }
@@ -99,7 +99,7 @@ impl WebhookSink {
 impl ChangeEventSink for WebhookSink {
     async fn publish(&self, event: &ChangeEvent) -> Result<()> {
         let bit = Self::op_bit(event.op);
-        let subs = self.registry.list(&event.tenant).await;
+        let subs = self.registry.list(&event.project).await;
         for sub in subs {
             // Match: same table, op-bit set, not paused, no predicate.
             if sub.table != event.table {
@@ -144,13 +144,13 @@ impl ChangeEventSink for WebhookSink {
             // `next_attempt_at` is on the test timeline, not the wall
             // clock.
             self.queue
-                .enqueue_at(sub.id, event.tenant, envelope, self.clock.now())
+                .enqueue_at(sub.id, event.project, envelope, self.clock.now())
                 .await?;
-            // Bump the per-tenant pending depth; the worker decrements it
+            // Bump the per-project pending depth; the worker decrements it
             // on dequeue. Enqueue-then-fail-to-decrement produces a stale
             // positive count, which is the right signal for "events are
             // accumulating".
-            self.counters.for_tenant(&event.tenant).record_enqueue();
+            self.counters.for_project(&event.project).record_enqueue();
         }
         Ok(())
     }

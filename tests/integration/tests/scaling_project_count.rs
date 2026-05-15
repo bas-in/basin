@@ -1,28 +1,28 @@
-//! Scaling test: per-tenant cost as a function of total tenant count.
+//! Scaling test: per-project cost as a function of total project count.
 //!
-//! Card: `scaling_tenant_count`
-//! Claim: Basin's per-tenant overhead — both RAM and quiet-tenant point-query
-//! latency — stays roughly constant as tenant count grows. The wedge depends
-//! on this: pricing assumes 90% of tenants are idle 90% of the time, so the
-//! marginal cost per idle tenant must not balloon.
+//! Card: `scaling_project_count`
+//! Claim: Basin's per-project overhead — both RAM and quiet-project point-query
+//! latency — stays roughly constant as project count grows. The wedge depends
+//! on this: pricing assumes 90% of projects are idle 90% of the time, so the
+//! marginal cost per idle project must not balloon.
 //!
-//! Method: provision N tenants, each with `events(id BIGINT, payload TEXT)`
+//! Method: provision N projects, each with `events(id BIGINT, payload TEXT)`
 //! seeded with one row. Measure two things at each scale:
-//!   - per-tenant RAM (RSS delta / N).
-//!   - p50 of 5 point-query samples on a single quiet tenant while the other
+//!   - per-project RAM (RSS delta / N).
+//!   - p50 of 5 point-query samples on a single quiet project while the other
 //!     N-1 sit idle.
 //!
 //! Bar: `quiet_p50_at_max <= 5 * quiet_p50_at_1`.
 //!
 //! Scale sweep: `[1, 10, 100, 1000]` on LocalFS. The S3 variant caps at 100
-//! because 1000-tenant setup on R2 takes too long.
+//! because 1000-project setup on R2 takes too long.
 //!
 //! Implementation notes:
 //! - We use one shared `Engine` and a single `TempDir` for all scales so the
-//!   measurement reflects *additional* per-tenant cost on a warm process.
-//! - `TenantSession`s are dropped between scale points to avoid accumulating
+//!   measurement reflects *additional* per-project cost on a warm process.
+//! - `ProjectSession`s are dropped between scale points to avoid accumulating
 //!   per-session state — each scale's quiet point query opens a fresh
-//!   session for the chosen tenant.
+//!   session for the chosen project.
 //! - We avoid the disk + page caches so the quiet point-query latency
 //!   reflects the cold-ish path; otherwise the second sample after a warm-up
 //!   cache hit would dominate.
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
@@ -44,14 +44,14 @@ use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
 
-/// Scale sweep. The "1" point gives the per-tenant overhead with no
+/// Scale sweep. The "1" point gives the per-project overhead with no
 /// neighbours; the "1000" point amplifies any superlinear cost.
 const SCALES: [usize; 4] = [1, 10, 100, 1000];
 const QUIET_SAMPLES: usize = 5;
 /// Bar: quiet p50 at the max scale must be within 5x of the quiet p50 at
 /// the smallest scale. Generous enough that allocator drift / DataFusion
 /// planner state doesn't trip a false fail; tight enough that any
-/// per-tenant linear scan would blow it out.
+/// per-project linear scan would blow it out.
 const BAR_LATENCY_RATIO: f64 = 5.0;
 
 fn rss_kib() -> u64 {
@@ -73,10 +73,10 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scaling_tenant_count() {
+async fn scaling_project_count() {
     let dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-    // Caches OFF so quiet-tenant p50 reflects the honest cold-ish path.
+    // Caches OFF so quiet-project p50 reflects the honest cold-ish path.
     let storage = Storage::new(StorageConfig {
         object_store: Arc::new(fs),
         root_prefix: None,
@@ -92,7 +92,7 @@ async fn scaling_tenant_count() {
 
     // Warm the allocator + DataFusion planner before any measurement.
     {
-        let warm = TenantId::new();
+        let warm = ProjectId::new();
         let s = engine.open_session(warm).await.unwrap();
         s.execute("CREATE TABLE events (id BIGINT NOT NULL, payload TEXT NOT NULL)")
             .await
@@ -109,45 +109,45 @@ async fn scaling_tenant_count() {
     struct Row {
         n: usize,
         rss_delta_kib: i64,
-        per_tenant_kib: f64,
+        per_project_kib: f64,
         quiet_p50_ms: f64,
     }
     let mut rows: Vec<Row> = Vec::new();
-    let mut all_tenants: Vec<TenantId> = Vec::new();
+    let mut all_projects: Vec<ProjectId> = Vec::new();
 
     for &n in SCALES.iter() {
-        let to_provision = n - all_tenants.len().min(n);
+        let to_provision = n - all_projects.len().min(n);
         let rss_before = rss_kib();
         for _ in 0..to_provision {
-            let t = TenantId::new();
+            let t = ProjectId::new();
             let s = engine.open_session(t).await.unwrap();
             s.execute("CREATE TABLE events (id BIGINT NOT NULL, payload TEXT NOT NULL)")
                 .await
                 .unwrap();
-            // One row per tenant so the point query has something to find.
+            // One row per project so the point query has something to find.
             s.execute("INSERT INTO events VALUES (1, 'p')")
                 .await
                 .unwrap();
-            // Drop the session. Idle tenants in this test should NOT hold a
-            // live session; that would contaminate the per-tenant RAM signal.
+            // Drop the session. Idle projects in this test should NOT hold a
+            // live session; that would contaminate the per-project RAM signal.
             drop(s);
-            all_tenants.push(t);
+            all_projects.push(t);
         }
         let rss_after = rss_kib();
         let rss_delta_kib = rss_after as i64 - rss_before as i64;
-        let per_tenant_kib = if to_provision == 0 {
+        let per_project_kib = if to_provision == 0 {
             0.0
         } else {
             (rss_delta_kib as f64).max(0.0) / to_provision as f64
         };
 
-        // Pick one quiet tenant (the first one provisioned) and run
+        // Pick one quiet project (the first one provisioned) and run
         // QUIET_SAMPLES point queries. Open the session fresh each time so
         // we measure the cold-ish path through the engine.
-        let quiet_tenant = all_tenants[0];
+        let quiet_project = all_projects[0];
         let mut samples_ms: Vec<f64> = Vec::with_capacity(QUIET_SAMPLES);
         for _ in 0..QUIET_SAMPLES {
-            let s = engine.open_session(quiet_tenant).await.unwrap();
+            let s = engine.open_session(quiet_project).await.unwrap();
             let started = Instant::now();
             let res = s
                 .execute("SELECT id FROM events WHERE id = 1")
@@ -157,7 +157,7 @@ async fn scaling_tenant_count() {
             match res {
                 ExecResult::Rows { batches, .. } => {
                     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    assert!(total >= 1, "quiet tenant should see at least one row");
+                    assert!(total >= 1, "quiet project should see at least one row");
                 }
                 ExecResult::Empty { .. } => panic!("expected Rows, got Empty"),
             }
@@ -169,22 +169,22 @@ async fn scaling_tenant_count() {
         rows.push(Row {
             n,
             rss_delta_kib,
-            per_tenant_kib,
+            per_project_kib,
             quiet_p50_ms,
         });
     }
 
-    // Don't let the compiler drop the live tenants before we read RSS.
-    assert!(all_tenants.len() >= *SCALES.last().unwrap());
+    // Don't let the compiler drop the live projects before we read RSS.
+    assert!(all_projects.len() >= *SCALES.last().unwrap());
 
     println!(
         "{:>10} {:>15} {:>15} {:>15}",
-        "N", "rss_delta_KiB", "per_tenant_KiB", "quiet_p50_ms"
+        "N", "rss_delta_KiB", "per_project_KiB", "quiet_p50_ms"
     );
     for r in &rows {
         println!(
             "{:>10} {:>15} {:>15.2} {:>15.2}",
-            r.n, r.rss_delta_kib, r.per_tenant_kib, r.quiet_p50_ms
+            r.n, r.rss_delta_kib, r.per_project_kib, r.quiet_p50_ms
         );
     }
 
@@ -194,7 +194,7 @@ async fn scaling_tenant_count() {
     let pass = latency_ratio <= BAR_LATENCY_RATIO;
 
     println!(
-        "[SCALING tenant_count] quiet_p50@1={:.2}ms, quiet_p50@{}={:.2}ms, ratio={:.2}x (bar <={}x) {}",
+        "[SCALING project_count] quiet_p50@1={:.2}ms, quiet_p50@{}={:.2}ms, ratio={:.2}x (bar <={}x) {}",
         p50_at_1,
         SCALES.last().unwrap(),
         p50_at_max,
@@ -207,8 +207,8 @@ async fn scaling_tenant_count() {
         .iter()
         .map(|r| {
             json!({
-                "tenant_count": r.n,
-                "per_tenant_ram_kib": r.per_tenant_kib,
+                "project_count": r.n,
+                "per_project_ram_kib": r.per_project_kib,
                 "quiet_p50_ms": r.quiet_p50_ms,
                 "rss_delta_kib": r.rss_delta_kib,
             })
@@ -216,18 +216,18 @@ async fn scaling_tenant_count() {
         .collect();
 
     report_scaling(
-        "tenant_count",
-        "Per-tenant cost vs tenant count",
-        "RAM and quiet point-query latency per tenant stay near-constant as tenant count grows.",
+        "project_count",
+        "Per-project cost vs project count",
+        "RAM and quiet point-query latency per project stay near-constant as project count grows.",
         pass,
         AxisSpec {
-            key: "tenant_count".into(),
-            label: "tenants".into(),
+            key: "project_count".into(),
+            label: "projects".into(),
         },
         vec![
             SeriesSpec {
-                key: "per_tenant_ram_kib".into(),
-                label: "Per-tenant RAM".into(),
+                key: "per_project_ram_kib".into(),
+                label: "Per-project RAM".into(),
                 unit: Some("KiB".into()),
             },
             SeriesSpec {

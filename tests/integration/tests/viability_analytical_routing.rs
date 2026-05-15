@@ -2,7 +2,7 @@
 //!
 //! Distinct from `viability_analytical`, which compares the two engines
 //! head-to-head by calling them directly. Here the SQL goes through the
-//! engine's `TenantSession::execute` only — we never touch
+//! engine's `ProjectSession::execute` only — we never touch
 //! `AnalyticalEngine::query` from the test. The hypothesis is:
 //!
 //!     If we attach the analytical engine via `Engine::with_analytical`
@@ -47,7 +47,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_analytical::{AnalyticalConfig, AnalyticalEngine};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
@@ -144,12 +144,12 @@ async fn viability_analytical_routing() {
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
 
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
@@ -157,13 +157,13 @@ async fn viability_analytical_routing() {
     for f in 0..FILES {
         let batch = build_batch(f * ROWS_PER_FILE, ROWS_PER_FILE);
         let df = storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
-        let meta = catalog.load_table(&tenant, &table).await.unwrap();
+        let meta = catalog.load_table(&project, &table).await.unwrap();
         catalog
             .append_data_files(
-                &tenant,
+                &project,
                 &table,
                 meta.current_snapshot,
                 vec![DataFileRef {
@@ -176,7 +176,7 @@ async fn viability_analytical_routing() {
             .await
             .unwrap();
     }
-    let files = storage.list_data_files(&tenant, &table).await.unwrap();
+    let files = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(
         files.len(),
         FILES as usize,
@@ -200,7 +200,7 @@ async fn viability_analytical_routing() {
         catalog: catalog.clone(),
         shard: None,
     });
-    let oltp_sess = oltp_engine.open_session(tenant).await.unwrap();
+    let oltp_sess = oltp_engine.open_session(project).await.unwrap();
     let _ = oltp_sess.execute(sql).await.unwrap(); // warmup
     let mut oltp_batches = Vec::new();
     let t0 = Instant::now();
@@ -235,7 +235,7 @@ async fn viability_analytical_routing() {
         shard: None,
     })
     .with_analytical(analytical);
-    let routed_sess = routed_engine.open_session(tenant).await.unwrap();
+    let routed_sess = routed_engine.open_session(project).await.unwrap();
     let _ = routed_sess.execute(sql).await.unwrap(); // warmup
     let routings_after_warmup = routed_engine.analytical_routing_count();
     assert!(

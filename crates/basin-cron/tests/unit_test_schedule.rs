@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cron::{CronStore, ScheduleError};
 use basin_engine::{Engine, EngineConfig};
 use object_store::local::LocalFileSystem;
@@ -30,11 +30,11 @@ async fn schedule_inserts_a_row_in_cron_job() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let store = CronStore::new(eng);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     let jobid = store
         .schedule(
-            &tenant,
+            &project,
             "alice",
             "audit-cleanup",
             "0 3 * * *",
@@ -44,7 +44,7 @@ async fn schedule_inserts_a_row_in_cron_job() {
         .unwrap();
     assert!(jobid >= 1, "first jobid should be >= 1, got {jobid}");
 
-    let jobs = store.list_jobs(&tenant).await.unwrap();
+    let jobs = store.list_jobs(&project).await.unwrap();
     assert_eq!(jobs.len(), 1, "expected exactly one job");
     let job = &jobs[0];
     assert_eq!(job.jobname, "audit-cleanup");
@@ -60,17 +60,17 @@ async fn unschedule_removes_the_row() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let store = CronStore::new(eng);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     store
-        .schedule(&tenant, "alice", "tmp", "* * * * *", "SELECT 1")
+        .schedule(&project, "alice", "tmp", "* * * * *", "SELECT 1")
         .await
         .unwrap();
-    assert_eq!(store.list_jobs(&tenant).await.unwrap().len(), 1);
+    assert_eq!(store.list_jobs(&project).await.unwrap().len(), 1);
 
-    let jobid = store.unschedule(&tenant, "tmp").await.unwrap();
+    let jobid = store.unschedule(&project, "tmp").await.unwrap();
     assert!(jobid >= 1);
-    let jobs = store.list_jobs(&tenant).await.unwrap();
+    let jobs = store.list_jobs(&project).await.unwrap();
     assert!(
         jobs.is_empty(),
         "expected zero jobs after unschedule, got {jobs:?}"
@@ -82,11 +82,11 @@ async fn invalid_cron_expression_is_rejected_at_schedule_time() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let store = CronStore::new(eng);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     let err = store
         .schedule(
-            &tenant,
+            &project,
             "alice",
             "bad",
             "this is not a cron expression",
@@ -97,7 +97,7 @@ async fn invalid_cron_expression_is_rejected_at_schedule_time() {
     assert!(matches!(err, ScheduleError::InvalidExpression { .. }));
 
     // Make sure no row leaked into cron_job after the rejection.
-    let jobs = store.list_jobs(&tenant).await.unwrap();
+    let jobs = store.list_jobs(&project).await.unwrap();
     assert!(jobs.is_empty());
 }
 
@@ -106,20 +106,20 @@ async fn duplicate_jobname_is_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let store = CronStore::new(eng);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     store
-        .schedule(&tenant, "alice", "dupe", "* * * * *", "SELECT 1")
+        .schedule(&project, "alice", "dupe", "* * * * *", "SELECT 1")
         .await
         .unwrap();
     let err = store
-        .schedule(&tenant, "alice", "dupe", "0 0 * * *", "SELECT 2")
+        .schedule(&project, "alice", "dupe", "0 0 * * *", "SELECT 2")
         .await
         .unwrap_err();
     assert!(matches!(err, ScheduleError::Duplicate(_)));
 
     // Only the original row should exist.
-    let jobs = store.list_jobs(&tenant).await.unwrap();
+    let jobs = store.list_jobs(&project).await.unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].command, "SELECT 1");
 }
@@ -129,8 +129,8 @@ async fn unschedule_unknown_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let store = CronStore::new(eng);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
-    let err = store.unschedule(&tenant, "ghost").await.unwrap_err();
+    let err = store.unschedule(&project, "ghost").await.unwrap_err();
     assert!(matches!(err, ScheduleError::NotFound(_)));
 }

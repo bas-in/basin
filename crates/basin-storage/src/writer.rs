@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use arrow_array::RecordBatch;
-use basin_common::{BasinError, PartitionKey, Result, TableName, TenantId};
+use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::PutPayload;
@@ -34,8 +34,8 @@ pub(crate) const WRAPPED_SIDECAR_SUFFIX: &str = ".wrapped";
 pub(crate) const AES_GCM_NONCE_LEN: usize = 12;
 
 /// Build the sidecar key for an envelope-encrypted data file. The format
-/// is `<data-file-path>.wrapped`; tenant-prefix enforcement is implicit
-/// because the input key already lives under the tenant prefix.
+/// is `<data-file-path>.wrapped`; project-prefix enforcement is implicit
+/// because the input key already lives under the project prefix.
 pub(crate) fn wrapped_sidecar_key(data_key: &object_store::path::Path) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}{}", data_key.as_ref(), WRAPPED_SIDECAR_SUFFIX))
 }
@@ -114,14 +114,14 @@ pub struct WriteOptions {
 
 pub(crate) async fn write_batch(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     partition: &PartitionKey,
     batch: &RecordBatch,
 ) -> Result<DataFile> {
     write_batch_with_options(
         storage,
-        tenant,
+        project,
         table,
         partition,
         batch,
@@ -132,7 +132,7 @@ pub(crate) async fn write_batch(
 
 pub(crate) async fn write_batch_with_options(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     partition: &PartitionKey,
     batch: &RecordBatch,
@@ -141,7 +141,7 @@ pub(crate) async fn write_batch_with_options(
     let data_ulid = Ulid::new();
     let key = data_file_key(
         storage.root_prefix(),
-        tenant,
+        project,
         table,
         partition,
         Utc::now(),
@@ -175,18 +175,18 @@ pub(crate) async fn write_batch_with_options(
     // provider attached, the file is the plaintext Parquet bytes —
     // byte-for-byte the legacy path.
     //
-    // When a catalog is also attached and the tenant has a
-    // [`TenantStorageConfig`] persisted, we route through
-    // `wrap_key_with_config` so the provider can resolve a per-tenant
+    // When a catalog is also attached and the project has a
+    // [`ProjectStorageConfig`] persisted, we route through
+    // `wrap_key_with_config` so the provider can resolve a per-project
     // CMK; otherwise we fall back to plain `wrap_key`. The cache means
-    // the catalog round-trip happens at most once per tenant per
-    // process (until invalidated by `set_tenant_storage_config`).
+    // the catalog round-trip happens at most once per project per
+    // process (until invalidated by `set_project_storage_config`).
     let (body_to_put, wrapped_for_sidecar) = match storage.encryption_provider() {
         Some(provider) => {
-            let cfg = storage.tenant_storage_config_cached(tenant).await?;
+            let cfg = storage.project_storage_config_cached(project).await?;
             let (data_key, wrapped) = match cfg {
-                Some(cfg) => provider.wrap_key_with_config(tenant, &cfg).await?,
-                None => provider.wrap_key(tenant).await?,
+                Some(cfg) => provider.wrap_key_with_config(project, &cfg).await?,
+                None => provider.wrap_key(project).await?,
             };
             let envelope = encrypt_envelope(&data_key, &bytes)?;
             (envelope, Some(wrapped))
@@ -196,7 +196,7 @@ pub(crate) async fn write_batch_with_options(
     let size = body_to_put.len() as u64;
 
     storage
-        .tenant_store(tenant)
+        .project_store(project)
         .put(&key, PutPayload::from_bytes(Bytes::from(body_to_put)))
         .await
         .map_err(|e| BasinError::storage(format!("put {key}: {e}")))?;
@@ -204,22 +204,22 @@ pub(crate) async fn write_batch_with_options(
     if let Some(wrapped) = wrapped_for_sidecar {
         let sidecar_key = wrapped_sidecar_key(&key);
         storage
-            .tenant_store(tenant)
+            .project_store(project)
             .put(&sidecar_key, PutPayload::from_bytes(Bytes::from(wrapped.0)))
             .await
             .map_err(|e| BasinError::storage(format!("put sidecar {sidecar_key}: {e}")))?;
     }
 
-    // Per-tenant byte counter (Phase 6 telemetry). No-op when no registry is
+    // Per-project byte counter (Phase 6 telemetry). No-op when no registry is
     // attached. Bumped after a successful PUT — failed writes don't count.
-    if let Some(tc) = storage.tenant_counters(tenant) {
+    if let Some(tc) = storage.project_counters(project) {
         tc.record_bytes_written(size);
     }
 
     // Build and persist HNSW sidecars for any FixedSizeList<Float32> columns
     // in the batch. One sidecar per Parquet write, mirroring the data-file
     // pattern; merging across writes is deferred to the future compactor.
-    crate::vector_index::build_indexes_for_batch(storage, tenant, table, batch_to_write, data_ulid)
+    crate::vector_index::build_indexes_for_batch(storage, project, table, batch_to_write, data_ulid)
         .await?;
 
     Ok(DataFile {

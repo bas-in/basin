@@ -23,7 +23,7 @@ pub enum BasinError {
     #[error("invalid schema: {0}")]
     InvalidSchema(String),
 
-    /// The named tenant / table / partition / object does not exist.
+    /// The named project / table / partition / object does not exist.
     #[error("not found: {0}")]
     NotFound(String),
 
@@ -43,7 +43,7 @@ pub enum BasinError {
     #[error("wal error: {0}")]
     Wal(String),
 
-    /// Tenant isolation invariant was about to be violated. **This is fatal.**
+    /// Project isolation invariant was about to be violated. **This is fatal.**
     /// Treat any occurrence as a P0 incident: dump context, page on-call.
     #[error("ISOLATION VIOLATION: {0}")]
     IsolationViolation(String),
@@ -58,10 +58,10 @@ pub enum BasinError {
 
     /// User's query was rejected at planning time because its estimated
     /// cost (rows scanned, bytes read, etc.) exceeds the configured
-    /// per-tenant cap. The router maps this to Postgres SQLSTATE 54000
+    /// per-project cap. The router maps this to Postgres SQLSTATE 54000
     /// (`program_limit_exceeded`) so drivers surface a distinct
     /// retry-with-backoff exception class. Configured via
-    /// `BASIN_QUERY_COST_LIMIT_ROWS` (or future per-tenant overrides);
+    /// `BASIN_QUERY_COST_LIMIT_ROWS` (or future per-project overrides);
     /// unset / `0` disables the check entirely.
     #[error("query cost exceeded: {0}")]
     QueryCostExceeded(String),

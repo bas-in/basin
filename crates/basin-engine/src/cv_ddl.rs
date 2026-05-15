@@ -53,7 +53,7 @@ use basin_common::{BasinError, PartitionKey, Result, TableName};
 use chrono::Utc;
 
 use crate::session::refresh_table;
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Continuous-aggregate options lifted out of a `CREATE MATERIALIZED VIEW
 /// ... WITH (...)` clause.
@@ -568,7 +568,7 @@ pub(crate) fn match_drop_materialized_view(sql: &str) -> Result<Option<(String, 
 /// refresh; a CV created by this path is byte-identical to one created
 /// by the Rust API.
 pub(crate) async fn exec_create_materialized_view(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     source_sql: &str,
     refresh_interval_secs: u64,
@@ -582,7 +582,7 @@ pub(crate) async fn exec_create_materialized_view(
         .engine
         .config()
         .catalog
-        .list_tables(&sess.tenant)
+        .list_tables(&sess.project)
         .await?;
     if existing.iter().any(|t| t.as_str() == table.as_str()) {
         return Err(BasinError::InvalidSchema(format!(
@@ -590,7 +590,7 @@ pub(crate) async fn exec_create_materialized_view(
         )));
     }
 
-    // 1. Run the source query against the calling session's tenant.
+    // 1. Run the source query against the calling session's project.
     //    Box::pin breaks the async recursion through `crate::executor::execute`.
     let res = Box::pin(crate::executor::execute(sess, source_sql)).await?;
     let (schema, batches) = match res {
@@ -610,7 +610,7 @@ pub(crate) async fn exec_create_materialized_view(
     // 2. Create the catalog table with the inferred schema.
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     catalog
-        .create_table(&sess.tenant, &table, schema.as_ref())
+        .create_table(&sess.project, &table, schema.as_ref())
         .await?;
 
     // 3. Write the bootstrap rows as a single Parquet file.
@@ -626,11 +626,11 @@ pub(crate) async fn exec_create_materialized_view(
         .engine
         .config()
         .storage
-        .write_batch(&sess.tenant, &table, &part, &merged)
+        .write_batch(&sess.project, &table, &part, &merged)
         .await?;
     catalog
         .append_data_files(
-            &sess.tenant,
+            &sess.project,
             &table,
             SnapshotId::GENESIS,
             vec![DataFileRef {
@@ -652,10 +652,10 @@ pub(crate) async fn exec_create_materialized_view(
         last_bucket_max_unix_ms: None,
     };
     catalog
-        .set_continuous_aggregate(&sess.tenant, &table, Some(def))
+        .set_continuous_aggregate(&sess.project, &table, Some(def))
         .await?;
 
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
     Ok(ExecResult::Empty {
         tag: "CREATE MATERIALIZED VIEW".into(),
@@ -671,7 +671,7 @@ pub(crate) async fn exec_create_materialized_view(
 /// Errors if the source query returns no rows (the schema cannot be inferred
 /// from an empty result).
 pub(crate) async fn exec_create_snapshot_materialized_view(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     source_sql: &str,
 ) -> Result<ExecResult> {
@@ -681,7 +681,7 @@ pub(crate) async fn exec_create_snapshot_materialized_view(
         .engine
         .config()
         .catalog
-        .list_tables(&sess.tenant)
+        .list_tables(&sess.project)
         .await?;
     if existing.iter().any(|t| t.as_str() == table.as_str()) {
         return Err(BasinError::InvalidSchema(format!(
@@ -701,7 +701,7 @@ pub(crate) async fn exec_create_snapshot_materialized_view(
 
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     catalog
-        .create_table(&sess.tenant, &table, schema.as_ref())
+        .create_table(&sess.project, &table, schema.as_ref())
         .await?;
 
     if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) {
@@ -718,11 +718,11 @@ pub(crate) async fn exec_create_snapshot_materialized_view(
             .engine
             .config()
             .storage
-            .write_batch(&sess.tenant, &table, &part, &merged)
+            .write_batch(&sess.project, &table, &part, &merged)
             .await?;
         catalog
             .append_data_files(
-                &sess.tenant,
+                &sess.project,
                 &table,
                 SnapshotId::GENESIS,
                 vec![DataFileRef {
@@ -735,7 +735,7 @@ pub(crate) async fn exec_create_snapshot_materialized_view(
             .await?;
     }
 
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
     Ok(ExecResult::Empty {
         tag: "CREATE MATERIALIZED VIEW".into(),
@@ -763,7 +763,7 @@ pub(crate) async fn exec_create_snapshot_materialized_view(
 /// `refresh_interval` is **not** consulted. A user-issued `REFRESH
 /// MATERIALIZED VIEW` always re-materialises (matching PG's semantics).
 pub(crate) async fn exec_refresh_materialized_view(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     force_full: bool,
 ) -> Result<ExecResult> {
@@ -773,7 +773,7 @@ pub(crate) async fn exec_refresh_materialized_view(
     // Load the CV definition. A non-CV table or a missing one are both
     // user-visible errors.
     let meta = catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await
         .map_err(|e| match e {
             BasinError::NotFound(_) => {
@@ -801,7 +801,7 @@ pub(crate) async fn exec_refresh_materialized_view(
 }
 
 async fn do_refresh_full(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     meta: &basin_catalog::TableMetadata,
     def: CvDef,
@@ -835,9 +835,9 @@ async fn do_refresh_full(
             ..def
         };
         catalog
-            .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
+            .set_continuous_aggregate(&sess.project, table, Some(new_def))
             .await?;
-        refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+        refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
         return Ok(ExecResult::Empty {
             tag: "REFRESH MATERIALIZED VIEW".into(),
         });
@@ -852,7 +852,7 @@ async fn do_refresh_full(
     };
     let part = PartitionKey::default_key();
     let written = storage
-        .write_batch(&sess.tenant, table, &part, &merged)
+        .write_batch(&sess.project, table, &part, &merged)
         .await?;
 
     let removed_paths: Vec<String> = meta
@@ -868,7 +868,7 @@ async fn do_refresh_full(
     }];
     catalog
         .replace_data_files(
-            &sess.tenant,
+            &sess.project,
             table,
             meta.current_snapshot,
             removed_paths.clone(),
@@ -881,7 +881,7 @@ async fn do_refresh_full(
             continue;
         }
         let p = object_store::path::Path::from(path.as_str());
-        let _ = storage.delete_file(&sess.tenant, &p).await;
+        let _ = storage.delete_file(&sess.project, &p).await;
     }
 
     let new_def = CvDef {
@@ -890,9 +890,9 @@ async fn do_refresh_full(
         ..def
     };
     catalog
-        .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
+        .set_continuous_aggregate(&sess.project, table, Some(new_def))
         .await?;
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
 
     Ok(ExecResult::Empty {
         tag: "REFRESH MATERIALIZED VIEW".into(),
@@ -900,7 +900,7 @@ async fn do_refresh_full(
 }
 
 async fn do_refresh_incremental(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     meta: &basin_catalog::TableMetadata,
     def: CvDef,
@@ -963,9 +963,9 @@ async fn do_refresh_incremental(
             ..def
         };
         catalog
-            .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
+            .set_continuous_aggregate(&sess.project, table, Some(new_def))
             .await?;
-        refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+        refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
         return Ok(ExecResult::Empty {
             tag: "REFRESH MATERIALIZED VIEW".into(),
         });
@@ -980,7 +980,7 @@ async fn do_refresh_incremental(
     };
     let part = PartitionKey::default_key();
     let written = storage
-        .write_batch(&sess.tenant, table, &part, &merged)
+        .write_batch(&sess.project, table, &part, &merged)
         .await?;
 
     let removed_paths: Vec<String> = meta
@@ -996,7 +996,7 @@ async fn do_refresh_incremental(
     }];
     catalog
         .replace_data_files(
-            &sess.tenant,
+            &sess.project,
             table,
             meta.current_snapshot,
             removed_paths.clone(),
@@ -1008,7 +1008,7 @@ async fn do_refresh_incremental(
             continue;
         }
         let p = object_store::path::Path::from(path.as_str());
-        let _ = storage.delete_file(&sess.tenant, &p).await;
+        let _ = storage.delete_file(&sess.project, &p).await;
     }
 
     let new_def = CvDef {
@@ -1017,9 +1017,9 @@ async fn do_refresh_incremental(
         ..def
     };
     catalog
-        .set_continuous_aggregate(&sess.tenant, table, Some(new_def))
+        .set_continuous_aggregate(&sess.project, table, Some(new_def))
         .await?;
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
 
     Ok(ExecResult::Empty {
         tag: "REFRESH MATERIALIZED VIEW".into(),
@@ -1030,7 +1030,7 @@ async fn do_refresh_incremental(
 /// and return the result as Unix-epoch milliseconds. Returns `None` when
 /// the source is empty / the column type isn't a recognised timestamp.
 async fn compute_watermark_ms(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     source_table: &str,
     bucket: &crate::cv_time_bucket::BucketInfo,
 ) -> Option<i64> {
@@ -1223,7 +1223,7 @@ fn filter_below_watermark(
 /// perspective, a SELECT against the dropped view returns the same
 /// "relation does not exist" error a regular DROP TABLE produces.
 pub(crate) async fn exec_drop_materialized_view(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     if_exists: bool,
 ) -> Result<ExecResult> {
@@ -1233,7 +1233,7 @@ pub(crate) async fn exec_drop_materialized_view(
 
     // Look up the file set before dropping the catalog row, so we can
     // physically delete the bytes after the catalog commits.
-    let paths_to_delete: Vec<String> = match catalog.load_table(&sess.tenant, &table).await {
+    let paths_to_delete: Vec<String> = match catalog.load_table(&sess.project, &table).await {
         Ok(meta) => {
             // Confirm this is a CV — refusing to drop a regular table via
             // DROP MATERIALIZED VIEW matches PG's behaviour.
@@ -1260,7 +1260,7 @@ pub(crate) async fn exec_drop_materialized_view(
         Err(e) => return Err(e),
     };
 
-    catalog.drop_table(&sess.tenant, &table).await?;
+    catalog.drop_table(&sess.project, &table).await?;
     // De-register the listing table from the DataFusion session so a
     // subsequent SELECT against the dropped view surfaces a "relation does
     // not exist" error rather than reading a stale registration.
@@ -1268,7 +1268,7 @@ pub(crate) async fn exec_drop_materialized_view(
 
     for path in &paths_to_delete {
         let p = object_store::path::Path::from(path.as_str());
-        let _ = storage.delete_file(&sess.tenant, &p).await;
+        let _ = storage.delete_file(&sess.project, &p).await;
     }
 
     Ok(ExecResult::Empty {

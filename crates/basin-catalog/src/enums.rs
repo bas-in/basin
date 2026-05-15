@@ -1,4 +1,4 @@
-//! Per-tenant `CREATE TYPE … AS ENUM` catalog.
+//! Per-project `CREATE TYPE … AS ENUM` catalog.
 //!
 //! Customers will write
 //!
@@ -20,13 +20,13 @@
 //! `BASIN_ENUM_TYPE=<name>` field metadata marker so an INSERT path can
 //! validate the label against the catalog row before commit.
 //!
-//! The catalog is a single shared `HashMap<(TenantId, String),
-//! EnumTypeDef>` — same shape as [`crate::functions`] — so per-tenant
-//! cost stays `O(bytes)` with no per-tenant heavy resource.
+//! The catalog is a single shared `HashMap<(ProjectId, String),
+//! EnumTypeDef>` — same shape as [`crate::functions`] — so per-project
+//! cost stays `O(bytes)` with no per-project heavy resource.
 
 use serde::{Deserialize, Serialize};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 /// Field-metadata key set on every Arrow column whose declared type is
 /// a user-defined enum. The value is the catalog-side `EnumTypeDef::name`.
@@ -35,12 +35,12 @@ use basin_common::TenantId;
 pub const BASIN_ENUM_TYPE_KEY: &str = "BASIN_ENUM_TYPE";
 
 /// Catalog row for a `CREATE TYPE … AS ENUM` declaration. Stored
-/// per-tenant; two tenants registering the same type name are
+/// per-project; two projects registering the same type name are
 /// independent rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumTypeDef {
-    pub tenant: TenantId,
-    /// Unqualified type name within the tenant. Validated to be a SQL
+    pub project: ProjectId,
+    /// Unqualified type name within the project. Validated to be a SQL
     /// identifier and to not collide with a built-in PG type at
     /// registration.
     pub name: String,
@@ -62,7 +62,7 @@ pub enum EnumError {
     EmptyLabelList,
     /// A label was the empty string (PG accepts non-empty strings).
     EmptyLabel,
-    /// Type with that name already exists for this tenant.
+    /// Type with that name already exists for this project.
     Duplicate,
     /// Type referenced by `add_enum_value` / `drop_enum_type` /
     /// `lookup_enum_type` does not exist.
@@ -99,7 +99,7 @@ mod tests {
 
     fn def(labels: &[&str]) -> EnumTypeDef {
         EnumTypeDef {
-            tenant: TenantId::new(),
+            project: ProjectId::new(),
             name: "t".into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }

@@ -1,7 +1,7 @@
 //! `basin-auth` — opinionated auth crate for Basin.
 //!
 //! See [ADR 0005](../../../docs/decisions/0005-auth-system.md) for the full
-//! design + rationale. The short version: per-tenant `auth.users` rows,
+//! design + rationale. The short version: per-project `auth.users` rows,
 //! email/password (bcrypt), JWT (HS256), refresh tokens, magic link,
 //! password reset, email verification.
 //!
@@ -10,34 +10,34 @@
 //!
 //! ## What's in v1
 //!
-//! - `signup(tenant, email, password)`
-//! - `signin(tenant, email, password) -> Tokens`
-//! - `verify_email(tenant, token)`
-//! - `request_password_reset(tenant, email)` (sends email)
-//! - `reset_password(tenant, token, new_password)`
-//! - `request_magic_link(tenant, email)` (sends email)
-//! - `signin_with_magic_link(tenant, token) -> Tokens`
+//! - `signup(project, email, password)`
+//! - `signin(project, email, password) -> Tokens`
+//! - `verify_email(project, token)`
+//! - `request_password_reset(project, email)` (sends email)
+//! - `reset_password(project, token, new_password)`
+//! - `request_magic_link(project, email)` (sends email)
+//! - `signin_with_magic_link(project, token) -> Tokens`
 //! - `verify_jwt(token) -> Claims` (used by `basin-router` and `basin-rest`)
 //! - `refresh(refresh_token) -> Tokens`
 //! - `signout(refresh_token)`
 //!
 //! ## Cross-crate trait integration
 //!
-//! `basin_router::TenantResolver` lives in the `basin-router` crate. Rust's
+//! `basin_router::ProjectResolver` lives in the `basin-router` crate. Rust's
 //! orphan rule prevents us from impl'ing it for `AuthService` from here, so
 //! this crate exposes [`AuthService::verify_jwt`] and the
-//! [`jwt_tenant_resolver`] helper. The basin-router integration PR will wrap
-//! one of these into its own `TenantResolver` impl on its side.
+//! [`jwt_project_resolver`] helper. The basin-router integration PR will wrap
+//! one of these into its own `ProjectResolver` impl on its side.
 
 #![forbid(unsafe_code)]
 
 pub mod api_keys;
 pub mod config;
 pub mod store;
-pub mod tenant_credentials;
+pub mod project_credentials;
 
 pub use store::AuthStore;
-pub use tenant_credentials::{is_legacy_pgwire_user, ConnectionInfo, TenantCredentialDescriptor};
+pub use project_credentials::{is_legacy_pgwire_user, ConnectionInfo, ProjectCredentialDescriptor};
 pub mod email;
 pub mod jwt;
 pub mod password;
@@ -60,7 +60,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::{DateTime, Utc};
 use rustls::ClientConfig;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -69,7 +69,7 @@ use uuid::Uuid;
 
 pub use crate::api_keys::{ApiKeyDescriptor, ApiKeySecret, IssuedApiKey};
 pub use crate::config::{
-    AuthConfig, SmtpConfig, SmtpTls, DEFAULT_LOOPBACK_CATALOG_DSN, INTERNAL_AUTH_TENANT_ID,
+    AuthConfig, SmtpConfig, SmtpTls, DEFAULT_LOOPBACK_CATALOG_DSN, INTERNAL_AUTH_PROJECT_ID,
     INTERNAL_AUTH_USERNAME,
 };
 pub use crate::email::{Mailer, Outbound, SmtpMailer, StubMailer};
@@ -257,24 +257,24 @@ impl AuthService {
 
     // --- public flows -------------------------------------------------------
 
-    #[instrument(skip(self, password), fields(tenant = %tenant, email = %email))]
-    pub async fn signup(&self, tenant: &TenantId, email: &str, password: &str) -> Result<UserId> {
-        flows::signup::signup(&self.inner, tenant, email, password).await
+    #[instrument(skip(self, password), fields(project = %project, email = %email))]
+    pub async fn signup(&self, project: &ProjectId, email: &str, password: &str) -> Result<UserId> {
+        flows::signup::signup(&self.inner, project, email, password).await
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, user_id = %user))]
-    pub async fn request_email_verification(&self, tenant: &TenantId, user: UserId) -> Result<()> {
-        flows::signup::request_email_verification(&self.inner, tenant, user).await
+    #[instrument(skip(self), fields(project = %project, user_id = %user))]
+    pub async fn request_email_verification(&self, project: &ProjectId, user: UserId) -> Result<()> {
+        flows::signup::request_email_verification(&self.inner, project, user).await
     }
 
-    #[instrument(skip(self, token), fields(tenant = %tenant))]
-    pub async fn verify_email(&self, tenant: &TenantId, token: &str) -> Result<()> {
-        flows::signup::verify_email(&self.inner, tenant, token).await
+    #[instrument(skip(self, token), fields(project = %project))]
+    pub async fn verify_email(&self, project: &ProjectId, token: &str) -> Result<()> {
+        flows::signup::verify_email(&self.inner, project, token).await
     }
 
-    #[instrument(skip(self, password), fields(tenant = %tenant, email = %email))]
-    pub async fn signin(&self, tenant: &TenantId, email: &str, password: &str) -> Result<Tokens> {
-        flows::signin::signin(&self.inner, tenant, email, password).await
+    #[instrument(skip(self, password), fields(project = %project, email = %email))]
+    pub async fn signin(&self, project: &ProjectId, email: &str, password: &str) -> Result<Tokens> {
+        flows::signin::signin(&self.inner, project, email, password).await
     }
 
     #[instrument(skip(self, refresh_token))]
@@ -287,35 +287,35 @@ impl AuthService {
         flows::refresh::signout(&self.inner, refresh_token).await
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, email = %email))]
-    pub async fn request_password_reset(&self, tenant: &TenantId, email: &str) -> Result<()> {
-        flows::reset::request_password_reset(&self.inner, tenant, email).await
+    #[instrument(skip(self), fields(project = %project, email = %email))]
+    pub async fn request_password_reset(&self, project: &ProjectId, email: &str) -> Result<()> {
+        flows::reset::request_password_reset(&self.inner, project, email).await
     }
 
-    #[instrument(skip(self, token, new_password), fields(tenant = %tenant))]
+    #[instrument(skip(self, token, new_password), fields(project = %project))]
     pub async fn reset_password(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         token: &str,
         new_password: &str,
     ) -> Result<()> {
-        flows::reset::reset_password(&self.inner, tenant, token, new_password).await
+        flows::reset::reset_password(&self.inner, project, token, new_password).await
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, email = %email))]
-    pub async fn request_magic_link(&self, tenant: &TenantId, email: &str) -> Result<()> {
-        flows::magic::request_magic_link(&self.inner, tenant, email).await
+    #[instrument(skip(self), fields(project = %project, email = %email))]
+    pub async fn request_magic_link(&self, project: &ProjectId, email: &str) -> Result<()> {
+        flows::magic::request_magic_link(&self.inner, project, email).await
     }
 
     /// True iff outbound mail is wired up. Routes that depend on email
-    /// (the new tenant-agnostic `/auth/v1/magic-link`) check this and
+    /// (the new project-agnostic `/auth/v1/magic-link`) check this and
     /// return 503 with `E_EMAIL_DISABLED` instead of attempting a doomed
     /// SMTP send.
     pub fn is_email_enabled(&self) -> bool {
         self.inner.cfg.is_email_enabled()
     }
 
-    /// Tenant-agnostic email-link login (request). Body is just an email;
+    /// Project-agnostic email-link login (request). Body is just an email;
     /// the user is resolved at consume time. Always returns Ok on a
     /// well-formed email — a missing user is silently dropped to defeat
     /// enumeration probes.
@@ -324,15 +324,15 @@ impl AuthService {
         flows::email_link::request(&self.inner, email).await
     }
 
-    /// Tenant-agnostic email-link login (consume). Single-use.
+    /// Project-agnostic email-link login (consume). Single-use.
     #[instrument(skip(self, token))]
     pub async fn consume_email_link(&self, token: &str) -> Result<Tokens> {
         flows::email_link::consume(&self.inner, token).await
     }
 
-    #[instrument(skip(self, token), fields(tenant = %tenant))]
-    pub async fn signin_with_magic_link(&self, tenant: &TenantId, token: &str) -> Result<Tokens> {
-        flows::magic::signin_with_magic_link(&self.inner, tenant, token).await
+    #[instrument(skip(self, token), fields(project = %project))]
+    pub async fn signin_with_magic_link(&self, project: &ProjectId, token: &str) -> Result<Tokens> {
+        flows::magic::signin_with_magic_link(&self.inner, project, token).await
     }
 
     /// Decode and verify a JWT issued by this service. Cheap — no DB lookup.
@@ -344,56 +344,56 @@ impl AuthService {
 
     /// Mint a long-lived API key. The plaintext secret is returned exactly
     /// once — store it client-side or hand it to the user immediately.
-    #[instrument(skip(self), fields(tenant = %tenant, user_id = %user_id))]
+    #[instrument(skip(self), fields(project = %project, user_id = %user_id))]
     pub async fn issue_api_key(
         &self,
         user_id: UserId,
-        tenant: &TenantId,
+        project: &ProjectId,
         name: &str,
     ) -> Result<IssuedApiKey> {
-        api_keys::issue(&self.inner, tenant, user_id, name).await
+        api_keys::issue(&self.inner, project, user_id, name).await
     }
 
     /// Look up an API key by its plaintext secret and return the owning
-    /// `(tenant, user)`. Bumps `last_used_at` on success.
+    /// `(project, user)`. Bumps `last_used_at` on success.
     #[instrument(skip(self, raw))]
-    pub async fn validate_api_key(&self, raw: &str) -> Result<(TenantId, UserId)> {
+    pub async fn validate_api_key(&self, raw: &str) -> Result<(ProjectId, UserId)> {
         api_keys::validate(&self.inner, raw).await
     }
 
-    /// Revoke an API key by id within a tenant. NotFound if the key doesn't
-    /// belong to `tenant`. Idempotent if already revoked.
-    #[instrument(skip(self), fields(tenant = %tenant, key_id))]
-    pub async fn revoke_api_key(&self, key_id: i64, tenant: &TenantId) -> Result<()> {
-        api_keys::revoke(&self.inner, key_id, tenant).await
+    /// Revoke an API key by id within a project. NotFound if the key doesn't
+    /// belong to `project`. Idempotent if already revoked.
+    #[instrument(skip(self), fields(project = %project, key_id))]
+    pub async fn revoke_api_key(&self, key_id: i64, project: &ProjectId) -> Result<()> {
+        api_keys::revoke(&self.inner, key_id, project).await
     }
 
     /// List a user's API keys. Never returns the secret.
-    #[instrument(skip(self), fields(tenant = %tenant, user_id = %user_id))]
+    #[instrument(skip(self), fields(project = %project, user_id = %user_id))]
     pub async fn list_api_keys(
         &self,
         user_id: UserId,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<Vec<ApiKeyDescriptor>> {
-        api_keys::list(&self.inner, tenant, user_id).await
+        api_keys::list(&self.inner, project, user_id).await
     }
 
-    // --- per-tenant pgwire credentials -------------------------------------
+    // --- per-project pgwire credentials -------------------------------------
 
-    /// Provision a fresh `(pgwire_user, password)` pair for a tenant.
+    /// Provision a fresh `(pgwire_user, password)` pair for a project.
     /// Returns the connection URL; the plaintext password is part of this
     /// response and **not stored anywhere**.
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    pub async fn provision_tenant_db(
+    #[instrument(skip(self), fields(project = %project))]
+    pub async fn provision_project_db(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         dbname: Option<&str>,
-    ) -> Result<tenant_credentials::ConnectionInfo> {
-        tenant_credentials::provision(&self.inner, tenant, dbname).await
+    ) -> Result<project_credentials::ConnectionInfo> {
+        project_credentials::provision(&self.inner, project, dbname).await
     }
 
     /// Validate a `(pgwire_user, password)` pair from a pgwire startup
-    /// handshake. Returns the resolved `TenantId` on success;
+    /// handshake. Returns the resolved `ProjectId` on success;
     /// `BasinError::InvalidIdent("invalid pgwire credentials")` on any
     /// failure (uniform — no user-existence leak).
     #[instrument(skip(self, password), fields(user))]
@@ -401,8 +401,8 @@ impl AuthService {
         &self,
         user: &str,
         password: &str,
-    ) -> Result<TenantId> {
-        tenant_credentials::validate(&self.inner, user, password).await
+    ) -> Result<ProjectId> {
+        project_credentials::validate(&self.inner, user, password).await
     }
 
     /// Rotate the password for an existing pgwire credential row. Returns
@@ -412,29 +412,29 @@ impl AuthService {
     pub async fn rotate_pgwire_password(
         &self,
         pgwire_user: &str,
-    ) -> Result<tenant_credentials::ConnectionInfo> {
-        tenant_credentials::rotate(&self.inner, pgwire_user).await
+    ) -> Result<project_credentials::ConnectionInfo> {
+        project_credentials::rotate(&self.inner, pgwire_user).await
     }
 
-    /// Public-facing descriptors for every credential row a tenant owns.
+    /// Public-facing descriptors for every credential row a project owns.
     /// Never includes the bcrypt hash or the plaintext password.
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    pub async fn list_tenant_credentials(
+    #[instrument(skip(self), fields(project = %project))]
+    pub async fn list_project_credentials(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Vec<tenant_credentials::TenantCredentialDescriptor>> {
-        tenant_credentials::list(&self.inner, tenant).await
+        project: &ProjectId,
+    ) -> Result<Vec<project_credentials::ProjectCredentialDescriptor>> {
+        project_credentials::list(&self.inner, project).await
     }
 
-    /// Returns all credentials across all tenants that are in the legacy
-    /// `tenant_<hex>` format. Used by the upgrade migration to discover rows
-    /// that need to be rotated to the new `{tenant_id}_{hex}` format.
-    pub async fn list_legacy_credentials(&self) -> Result<Vec<(TenantId, String)>> {
-        tenant_credentials::list_legacy(&self.inner).await
+    /// Returns all credentials across all projects that are in the legacy
+    /// `project_<hex>` format. Used by the upgrade migration to discover rows
+    /// that need to be rotated to the new `{project_id}_{hex}` format.
+    pub async fn list_legacy_credentials(&self) -> Result<Vec<(ProjectId, String)>> {
+        project_credentials::list_legacy(&self.inner).await
     }
 
-    /// Rotates a single credential from the legacy `tenant_<hex>` format to
-    /// the new `{tenant_id}_{hex}` format. Inserts the new credential row
+    /// Rotates a single credential from the legacy `project_<hex>` format to
+    /// the new `{project_id}_{hex}` format. Inserts the new credential row
     /// first, then deletes the old row — safe to retry if interrupted.
     ///
     /// Returns `(new_pgwire_user, plaintext_password)`. The caller is
@@ -442,15 +442,15 @@ impl AuthService {
     /// (e.g. basin-cloud's `project_pgwire_credentials` table).
     pub async fn migrate_legacy_credential(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         old_pgwire_user: &str,
     ) -> Result<(String, String)> {
-        tenant_credentials::migrate_legacy_credential(&self.inner, tenant, old_pgwire_user).await
+        project_credentials::migrate_legacy_credential(&self.inner, project, old_pgwire_user).await
     }
 
-    /// Startup migration: scans for all `tenant_<hex>`-format pgwire credentials
+    /// Startup migration: scans for all `project_<hex>`-format pgwire credentials
     /// (pre-ADR-0013) and rotates each one to the new `{ulid}_{hex}` format that
-    /// encodes the tenant ULID for self-routing. Per-credential failures are
+    /// encodes the project ULID for self-routing. Per-credential failures are
     /// logged but do not abort the batch, so partial progress is persisted and
     /// the next startup attempt resumes from where this one left off. Returns
     /// the count of successfully migrated rows.
@@ -465,11 +465,11 @@ impl AuthService {
             "legacy pgwire credentials found; rotating to new format"
         );
         let mut migrated: u64 = 0;
-        for (tenant, old_user) in legacy {
-            match self.migrate_legacy_credential(&tenant, &old_user).await {
+        for (project, old_user) in legacy {
+            match self.migrate_legacy_credential(&project, &old_user).await {
                 Ok((new_user, _plaintext)) => {
                     tracing::info!(
-                        tenant = %tenant,
+                        project = %project,
                         old_pgwire_user = %old_user,
                         new_pgwire_user = %new_user,
                         "migrated legacy pgwire credential"
@@ -478,7 +478,7 @@ impl AuthService {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        tenant = %tenant,
+                        project = %project,
                         old_pgwire_user = %old_user,
                         error = %e,
                         "failed to migrate legacy pgwire credential; will retry on next startup"
@@ -493,45 +493,45 @@ impl AuthService {
 
     /// Upsert a per-user session setting. `key` must be in
     /// [`session_settings::ALLOWED_KEYS`]; the value is validated per-key.
-    #[instrument(skip(self, value), fields(tenant = %tenant, user_id = %user_id, key))]
+    #[instrument(skip(self, value), fields(project = %project, user_id = %user_id, key))]
     pub async fn set_session_setting(
         &self,
         user_id: UserId,
-        tenant: &TenantId,
+        project: &ProjectId,
         key: &str,
         value: &str,
     ) -> Result<()> {
-        session_settings::set(&self.inner, tenant, user_id, key, value).await
+        session_settings::set(&self.inner, project, user_id, key, value).await
     }
 
     /// Read every session setting for a user. Empty map means "no
     /// overrides; engine defaults apply".
-    #[instrument(skip(self), fields(tenant = %tenant, user_id = %user_id))]
+    #[instrument(skip(self), fields(project = %project, user_id = %user_id))]
     pub async fn get_session_settings(
         &self,
         user_id: UserId,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<HashMap<String, String>> {
-        session_settings::get_all(&self.inner, tenant, user_id).await
+        session_settings::get_all(&self.inner, project, user_id).await
     }
 }
 
 /// Helper that bundles `AuthService` into a closure usable by
-/// `basin-router::TenantResolver`-shaped code.
+/// `basin-router::ProjectResolver`-shaped code.
 ///
-/// `basin-router` defines an async `TenantResolver` trait we can't impl
+/// `basin-router` defines an async `ProjectResolver` trait we can't impl
 /// from this side of the orphan rule. The follow-up integration PR will
 /// either:
 ///
-/// 1. Add a `JwtTenantResolver(Arc<AuthService>)` newtype inside
-///    `basin-router` and impl `TenantResolver` for it, calling
-///    `svc.verify_jwt(...)` and returning `claims.tenant_id`; or
-/// 2. Generalise `TenantResolver` to take a closure, in which case this
+/// 1. Add a `JwtProjectResolver(Arc<AuthService>)` newtype inside
+///    `basin-router` and impl `ProjectResolver` for it, calling
+///    `svc.verify_jwt(...)` and returning `claims.project_id`; or
+/// 2. Generalise `ProjectResolver` to take a closure, in which case this
 ///    helper plugs in directly.
 ///
 /// Either way, the cross-crate seam is `AuthService::verify_jwt`.
-pub fn jwt_tenant_resolver(svc: AuthService) -> impl Fn(&str) -> Result<TenantId> + Send + Sync {
-    move |jwt: &str| -> Result<TenantId> { svc.verify_jwt(jwt).map(|c| c.tenant_id) }
+pub fn jwt_project_resolver(svc: AuthService) -> impl Fn(&str) -> Result<ProjectId> + Send + Sync {
+    move |jwt: &str| -> Result<ProjectId> { svc.verify_jwt(jwt).map(|c| c.project_id) }
 }
 
 /// Marker async trait the integration PR can implement on its side. Kept
@@ -588,7 +588,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use basin_common::TenantId;
+    use basin_common::ProjectId;
     use tokio_postgres::NoTls;
     use ulid::Ulid;
 
@@ -711,7 +711,7 @@ mod tests {
         let Some((svc, _m, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "alice@example.com", "longenoughpassword")
             .await
@@ -735,7 +735,7 @@ mod tests {
         let Some((svc, _m, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let err = svc
             .signup(&t, "alice@example.com", "short")
             .await
@@ -748,7 +748,7 @@ mod tests {
         let Some((svc, _m, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         svc.signup(&t, "dup@example.com", "longenoughpassword")
             .await
             .unwrap();
@@ -764,12 +764,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn signup_allows_same_email_different_tenants() {
+    async fn signup_allows_same_email_different_projects() {
         let Some((svc, _m, _g)) = try_connect().await else {
             return;
         };
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         svc.signup(&a, "shared@example.com", "longenoughpassword")
             .await
             .unwrap();
@@ -783,7 +783,7 @@ mod tests {
         let Some((svc, _m, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         svc.signup(&t, "u@example.com", "longenoughpassword")
             .await
             .unwrap();
@@ -802,7 +802,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "u2@example.com", "longenoughpassword")
             .await
@@ -815,7 +815,7 @@ mod tests {
             .await
             .unwrap();
         let claims = svc.verify_jwt(&toks.access_token).unwrap();
-        assert_eq!(claims.tenant_id, t);
+        assert_eq!(claims.project_id, t);
         assert_eq!(claims.user_id, user);
     }
 
@@ -824,7 +824,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "wp@example.com", "longenoughpassword")
             .await
@@ -844,7 +844,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "rf@example.com", "longenoughpassword")
             .await
@@ -872,7 +872,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "so@example.com", "longenoughpassword")
             .await
@@ -892,7 +892,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "pr@example.com", "longenoughpassword")
             .await
@@ -928,7 +928,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "ml@example.com", "longenoughpassword")
             .await
@@ -947,7 +947,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = svc
             .signup(&t, "ex@example.com", "longenoughpassword")
             .await
@@ -991,7 +991,7 @@ mod tests {
         let Some((svc, _m, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let now = chrono::Utc::now();
         let (jwt, exp) = svc
             .inner
@@ -1006,7 +1006,7 @@ mod tests {
             )
             .unwrap();
         let c = svc.verify_jwt(&jwt).unwrap();
-        assert_eq!(c.tenant_id, t);
+        assert_eq!(c.project_id, t);
         assert_eq!(c.exp, exp.timestamp());
     }
 
@@ -1020,7 +1020,7 @@ mod tests {
             .inner
             .jwt
             .issue(
-                &TenantId::new(),
+                &ProjectId::new(),
                 Uuid::new_v4(),
                 "j@example.com",
                 &[],
@@ -1041,16 +1041,16 @@ mod tests {
     async fn make_verified_user(
         svc: &AuthService,
         mailer: &StubMailer,
-        tenant: &TenantId,
+        project: &ProjectId,
         email: &str,
     ) -> UserId {
         let user = svc
-            .signup(tenant, email, "longenoughpassword")
+            .signup(project, email, "longenoughpassword")
             .await
             .unwrap();
-        svc.request_email_verification(tenant, user).await.unwrap();
+        svc.request_email_verification(project, user).await.unwrap();
         let token = last_token(mailer);
-        svc.verify_email(tenant, &token).await.unwrap();
+        svc.verify_email(project, &token).await.unwrap();
         user
     }
 
@@ -1059,7 +1059,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "ak@example.com").await;
         let issued = svc.issue_api_key(user, &t, "ci pipeline").await.unwrap();
         assert!(!issued.secret.is_empty());
@@ -1075,7 +1075,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "ak2@example.com").await;
         let issued = svc.issue_api_key(user, &t, "deploy").await.unwrap();
         svc.validate_api_key(&issued.secret).await.unwrap();
@@ -1102,7 +1102,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "akl@example.com").await;
         let _ = svc.issue_api_key(user, &t, "one").await.unwrap();
         let _ = svc.issue_api_key(user, &t, "two").await.unwrap();
@@ -1118,14 +1118,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn api_key_revoke_wrong_tenant_not_found() {
+    async fn api_key_revoke_wrong_project_not_found() {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
-        let other = TenantId::new();
+        let t = ProjectId::new();
+        let other = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "akw@example.com").await;
-        let issued = svc.issue_api_key(user, &t, "wrong-tenant").await.unwrap();
+        let issued = svc.issue_api_key(user, &t, "wrong-project").await.unwrap();
         let err = svc.revoke_api_key(issued.id, &other).await.unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
@@ -1135,7 +1135,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "akd@example.com").await;
         let _ = svc.issue_api_key(user, &t, "dup").await.unwrap();
         let err = svc.issue_api_key(user, &t, "dup").await.unwrap_err();
@@ -1151,7 +1151,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "aklu@example.com").await;
         let issued = svc.issue_api_key(user, &t, "ts").await.unwrap();
         // Before validation, last_used_at must be NULL.
@@ -1180,7 +1180,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "sess@example.com").await;
         svc.set_session_setting(user, &t, "timezone", "America/New_York")
             .await
@@ -1201,7 +1201,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "sess2@example.com").await;
         svc.set_session_setting(user, &t, "language", "en")
             .await
@@ -1219,7 +1219,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "sess3@example.com").await;
         let err = svc
             .set_session_setting(user, &t, "search_path", "public")
@@ -1270,21 +1270,21 @@ mod tests {
         }
     }
 
-    // --- email-link login (tenant-agnostic) ---------------------------------
+    // --- email-link login (project-agnostic) ---------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn email_link_round_trip() {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let user = make_verified_user(&svc, &mailer, &t, "el@example.com").await;
         svc.request_email_link("el@example.com").await.unwrap();
         let raw = last_token(&mailer);
         let toks = svc.consume_email_link(&raw).await.unwrap();
         let claims = svc.verify_jwt(&toks.access_token).unwrap();
         assert_eq!(claims.user_id, user);
-        assert_eq!(claims.tenant_id, t);
+        assert_eq!(claims.project_id, t);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1292,7 +1292,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let _ = make_verified_user(&svc, &mailer, &t, "el2@example.com").await;
         svc.request_email_link("el2@example.com").await.unwrap();
         let raw = last_token(&mailer);
@@ -1360,7 +1360,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let _ = make_verified_user(&svc, &mailer, &t, "rt1@example.com").await;
         let toks = svc
             .signin(&t, "rt1@example.com", "longenoughpassword")
@@ -1384,7 +1384,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let _ = make_verified_user(&svc, &mailer, &t, "reuse@example.com").await;
         let a = svc
             .signin(&t, "reuse@example.com", "longenoughpassword")
@@ -1416,7 +1416,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let _ = make_verified_user(&svc, &mailer, &t, "aud@example.com").await;
         let toks = svc
             .signin(&t, "aud@example.com", "longenoughpassword")
@@ -1434,7 +1434,7 @@ mod tests {
         let Some((svc, mailer, _g)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let _ = make_verified_user(&svc, &mailer, &t, "so2@example.com").await;
         let toks = svc
             .signin(&t, "so2@example.com", "longenoughpassword")

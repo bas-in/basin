@@ -1,18 +1,18 @@
-//! End-to-end test for per-tenant pgwire connection URLs.
+//! End-to-end test for per-project pgwire connection URLs.
 //!
-//! Boots Basin in-process: pgwire router with `TenantCredentialsResolver`
-//! stacked alongside `StaticTenantResolver`, and a basin-rest service for
+//! Boots Basin in-process: pgwire router with `ProjectCredentialsResolver`
+//! stacked alongside `StaticProjectResolver`, and a basin-rest service for
 //! the admin endpoints. Then:
 //!
 //! 1. Mint an admin JWT with `is_admin=true`.
-//! 2. `POST /admin/v1/tenants` to provision a fresh tenant + URL.
+//! 2. `POST /admin/v1/projects` to provision a fresh project + URL.
 //! 3. Connect with `tokio_postgres::connect(url, NoTls)`, run CREATE +
 //!    INSERT + SELECT — proves bcrypt validation worked AND the resolved
-//!    `TenantId` is consistent across reconnects (the second connection
+//!    `ProjectId` is consistent across reconnects (the second connection
 //!    sees the row from the first).
-//! 4. Rotate via `POST /admin/v1/tenants/{user}/rotate`. Old URL must now
+//! 4. Rotate via `POST /admin/v1/projects/{user}/rotate`. Old URL must now
 //!    fail with `28P01`. New URL works.
-//! 5. Path-injection: `pgwire_user = "tenant_../etc"` rejected at provision
+//! 5. Path-injection: `pgwire_user = "project_../etc"` rejected at provision
 //!    time (validated server-side; we sanity-check the format directly).
 //!
 //! Skip-cleanly: Postgres must be reachable on `127.0.0.1:5432` for the
@@ -28,10 +28,10 @@ use std::time::Duration;
 use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
 // `AuthService` is used both inside `boot` and inside the standalone tests
 // that exercise the AuthService directly without booting the full stack.
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_router::{
-    ServerConfig, StackedTenantResolver, StaticTenantResolver, TenantCredentialsResolver,
-    TenantResolver,
+    ServerConfig, StackedProjectResolver, StaticProjectResolver, ProjectCredentialsResolver,
+    ProjectResolver,
 };
 use object_store::local::LocalFileSystem;
 use serde_json::Value;
@@ -46,7 +46,7 @@ const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 
 fn unique_schema() -> String {
     format!(
-        "basin_pertenant_creds_{}",
+        "basin_perproject_creds_{}",
         Ulid::new().to_string().to_lowercase()
     )
 }
@@ -139,7 +139,7 @@ fn admin_jwt(secret: &[u8]) -> String {
     let now = chrono::Utc::now();
     let (jwt, _) = keys
         .issue_with_admin(
-            &TenantId::new(),
+            &ProjectId::new(),
             Uuid::new_v4(),
             "admin@example.com",
             &[],
@@ -163,7 +163,7 @@ struct Servers {
 
 async fn boot() -> Option<Servers> {
     if !pg_alive().await {
-        eprintln!("postgres unreachable, skipping per_tenant_credentials test");
+        eprintln!("postgres unreachable, skipping per_project_credentials test");
         return None;
     }
 
@@ -207,20 +207,20 @@ async fn boot() -> Option<Servers> {
         shard: None,
     });
 
-    // Static fallback so `BASIN_TENANTS=alice=*` style demos still work.
+    // Static fallback so `BASIN_PROJECTS=alice=*` style demos still work.
     let mut static_map = HashMap::new();
-    static_map.insert("alice".to_owned(), TenantId::new());
-    let static_resolver = StaticTenantResolver::new(static_map);
+    static_map.insert("alice".to_owned(), ProjectId::new());
+    let static_resolver = StaticProjectResolver::new(static_map);
 
-    let resolver: Arc<dyn TenantResolver> = Arc::new(StackedTenantResolver::new(vec![
-        Arc::new(TenantCredentialsResolver::new(auth.clone())),
+    let resolver: Arc<dyn ProjectResolver> = Arc::new(StackedProjectResolver::new(vec![
+        Arc::new(ProjectCredentialsResolver::new(auth.clone())),
         Arc::new(static_resolver),
     ]));
 
     let router = basin_router::run_until_bound(ServerConfig {
         bind_addr: pgwire_addr,
         engine: engine.clone(),
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -306,16 +306,16 @@ async fn http_request(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn per_tenant_credentials_round_trip() {
+async fn per_project_credentials_round_trip() {
     let Some(s) = boot().await else {
         return;
     };
 
-    // 1. POST /admin/v1/tenants -> get a fresh URL.
+    // 1. POST /admin/v1/projects -> get a fresh URL.
     let r = http_request(
         s.rest_addr,
         "POST",
-        "/admin/v1/tenants",
+        "/admin/v1/projects",
         &[
             ("Content-Type", "application/json"),
             ("Authorization", &format!("Bearer {}", s.admin_jwt)),
@@ -336,10 +336,10 @@ async fn per_tenant_credentials_round_trip() {
         .expect("connection_url")
         .to_owned();
     let pgwire_user = v["pgwire_user"].as_str().expect("pgwire_user").to_owned();
-    let tenant_id = v["tenant_id"].as_str().expect("tenant_id").to_owned();
-    assert!(pgwire_user.starts_with("tenant_"));
-    // The URL parses tenant id as ULID; sanity check it does.
-    let _: TenantId = tenant_id.parse().expect("tenant_id parses as ULID");
+    let project_id = v["project_id"].as_str().expect("project_id").to_owned();
+    assert!(pgwire_user.starts_with("project_"));
+    // The URL parses project id as ULID; sanity check it does.
+    let _: ProjectId = project_id.parse().expect("project_id parses as ULID");
 
     // 2. Rewrite the URL host to point at our test pgwire port. The
     //    AuthConfig was built with the bound port baked in, so this is a
@@ -361,15 +361,15 @@ async fn per_tenant_credentials_round_trip() {
 
     // 4. CREATE + INSERT + SELECT round-trip.
     client
-        .simple_query("CREATE TABLE pertenant (id BIGINT NOT NULL, body TEXT NOT NULL)")
+        .simple_query("CREATE TABLE perproject (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
         .expect("create");
     client
-        .simple_query("INSERT INTO pertenant VALUES (42, 'hello')")
+        .simple_query("INSERT INTO perproject VALUES (42, 'hello')")
         .await
         .expect("insert");
     let rows = client
-        .simple_query("SELECT * FROM pertenant")
+        .simple_query("SELECT * FROM perproject")
         .await
         .expect("select");
     let n = rows
@@ -380,7 +380,7 @@ async fn per_tenant_credentials_round_trip() {
     drop(client);
     let _ = driver.await;
 
-    // 5. Reconnect using the same URL — proves the resolved TenantId is
+    // 5. Reconnect using the same URL — proves the resolved ProjectId is
     //    stable across reconnects (the row inserted above is visible).
     let (client2, conn2) = tokio_postgres::connect(&conn_url, NoTls)
         .await
@@ -389,7 +389,7 @@ async fn per_tenant_credentials_round_trip() {
         let _ = conn2.await;
     });
     let rows = client2
-        .simple_query("SELECT * FROM pertenant")
+        .simple_query("SELECT * FROM perproject")
         .await
         .expect("select after reconnect");
     let n = rows
@@ -407,7 +407,7 @@ async fn per_tenant_credentials_round_trip() {
     let r = http_request(
         s.rest_addr,
         "POST",
-        &format!("/admin/v1/tenants/{pgwire_user}/rotate"),
+        &format!("/admin/v1/projects/{pgwire_user}/rotate"),
         &[
             ("Content-Type", "application/json"),
             ("Authorization", &format!("Bearer {}", s.admin_jwt)),
@@ -454,7 +454,7 @@ async fn per_tenant_credentials_round_trip() {
         let _ = conn3.await;
     });
     let rows = client3
-        .simple_query("SELECT * FROM pertenant")
+        .simple_query("SELECT * FROM perproject")
         .await
         .expect("select with rotated URL");
     let n = rows
@@ -469,7 +469,7 @@ async fn per_tenant_credentials_round_trip() {
     let r = http_request(
         s.rest_addr,
         "GET",
-        &format!("/admin/v1/tenants/{tenant_id}/credentials"),
+        &format!("/admin/v1/projects/{project_id}/credentials"),
         &[("Authorization", &format!("Bearer {}", s.admin_jwt))],
         None,
     )
@@ -516,9 +516,9 @@ async fn provision_rejects_invalid_dbname() {
         _ => return,
     };
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let err = auth
-        .provision_tenant_db(&tenant, Some("../etc"))
+        .provision_project_db(&project, Some("../etc"))
         .await
         .expect_err("must reject path-injecting dbname");
     assert!(
@@ -531,7 +531,7 @@ async fn provision_rejects_invalid_dbname() {
 async fn rotate_rejects_invalid_pgwire_user_format() {
     // The path-injection invariant on the pgwire_user format. `rotate`
     // accepts a user string from the URL path, so the format check is
-    // load-bearing — a malicious operator can't smuggle "tenant_../etc"
+    // load-bearing — a malicious operator can't smuggle "project_../etc"
     // past the validator.
     if !pg_alive().await {
         return;
@@ -553,7 +553,7 @@ async fn rotate_rejects_invalid_pgwire_user_format() {
     };
 
     let err = auth
-        .rotate_pgwire_password("tenant_../etc")
+        .rotate_pgwire_password("project_../etc")
         .await
         .expect_err("must reject path-injecting pgwire_user");
     assert!(
@@ -562,24 +562,24 @@ async fn rotate_rejects_invalid_pgwire_user_format() {
     );
 }
 
-/// Cross-tenant isolation when each tenant has their own URL. The wedge
+/// Cross-project isolation when each project has their own URL. The wedge
 /// claim: hand customer A their URL, customer B theirs; B's URL must never
 /// reach A's data — not via direct SELECT, not via UNION, not via CTE.
 ///
-/// Per-tenant prefix isolation makes this *structural*: the engine session
-/// is bound to a `TenantId` at startup, and every `TableScan` resolves
-/// inside that tenant's namespace. This test proves the structural claim
+/// Per-project prefix isolation makes this *structural*: the engine session
+/// is bound to a `ProjectId` at startup, and every `TableScan` resolves
+/// inside that project's namespace. This test proves the structural claim
 /// end-to-end through the credential-validated pgwire path so a future
 /// regression that accidentally shared session state across pgwire
 /// connections would be caught.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn per_tenant_credentials_isolate_cross_tenant_data() {
+async fn per_project_credentials_isolate_cross_project_data() {
     let Some(s) = boot().await else {
         return;
     };
 
-    // Provision two tenants. Both POSTs hit the same admin endpoint with
-    // the same admin JWT, but each issues a fresh `tenant_id` + URL.
+    // Provision two projects. Both POSTs hit the same admin endpoint with
+    // the same admin JWT, but each issues a fresh `project_id` + URL.
     let provision = |name: &'static str| {
         let s_addr = s.rest_addr;
         let admin = s.admin_jwt.clone();
@@ -587,7 +587,7 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
             let r = http_request(
                 s_addr,
                 "POST",
-                "/admin/v1/tenants",
+                "/admin/v1/projects",
                 &[
                     ("Content-Type", "application/json"),
                     ("Authorization", &format!("Bearer {admin}")),
@@ -604,14 +604,14 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
             let v = r.json();
             (
                 v["connection_url"].as_str().unwrap().to_owned(),
-                v["tenant_id"].as_str().unwrap().to_owned(),
+                v["project_id"].as_str().unwrap().to_owned(),
             )
         }
     };
-    let (url_a, tid_a) = provision("tenant_a").await;
-    let (url_b, tid_b) = provision("tenant_b").await;
-    assert_ne!(tid_a, tid_b, "two tenants must have distinct ids");
-    assert_ne!(url_a, url_b, "two tenants must have distinct URLs");
+    let (url_a, tid_a) = provision("project_a").await;
+    let (url_b, tid_b) = provision("project_b").await;
+    assert_ne!(tid_a, tid_b, "two projects must have distinct ids");
+    assert_ne!(url_a, url_b, "two projects must have distinct URLs");
 
     // Helper: connect via a URL, drive simple-query operations, return
     // the row count from a SELECT * style query.
@@ -631,10 +631,10 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
         (client, driver)
     };
 
-    let (client_a, driver_a) = connect_and_setup(url_a.clone(), "tenant_a_secret").await;
-    let (client_b, driver_b) = connect_and_setup(url_b.clone(), "tenant_b_secret").await;
+    let (client_a, driver_a) = connect_and_setup(url_a.clone(), "project_a_secret").await;
+    let (client_b, driver_b) = connect_and_setup(url_b.clone(), "project_b_secret").await;
 
-    // From tenant A's URL: see only A's row.
+    // From project A's URL: see only A's row.
     let collect_bodies = |msgs: &[tokio_postgres::SimpleQueryMessage]| -> Vec<String> {
         msgs.iter()
             .filter_map(|m| match m {
@@ -649,18 +649,18 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
         .await
         .expect("a select");
     let bodies = collect_bodies(&rows);
-    assert_eq!(bodies, vec!["tenant_a_secret".to_string()]);
+    assert_eq!(bodies, vec!["project_a_secret".to_string()]);
 
     let rows = client_b
         .simple_query("SELECT * FROM secrets")
         .await
         .expect("b select");
     let bodies = collect_bodies(&rows);
-    assert_eq!(bodies, vec!["tenant_b_secret".to_string()]);
+    assert_eq!(bodies, vec!["project_b_secret".to_string()]);
 
-    // Cross-tenant attack via UNION ALL: tenant B's session can only
-    // resolve `secrets` in *its own* tenant namespace. UNION just unions
-    // tenant B's row twice; tenant A's row is structurally unreachable.
+    // Cross-project attack via UNION ALL: project B's session can only
+    // resolve `secrets` in *its own* project namespace. UNION just unions
+    // project B's row twice; project A's row is structurally unreachable.
     let rows = client_b
         .simple_query("SELECT body FROM secrets UNION ALL SELECT body FROM secrets")
         .await
@@ -668,21 +668,21 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
     let bodies = collect_bodies(&rows);
     assert_eq!(
         bodies,
-        vec!["tenant_b_secret".to_string(), "tenant_b_secret".to_string()],
-        "UNION must not cross tenants"
+        vec!["project_b_secret".to_string(), "project_b_secret".to_string()],
+        "UNION must not cross projects"
     );
     for body in &bodies {
-        assert_ne!(body, "tenant_a_secret", "tenant A data leaked via UNION");
+        assert_ne!(body, "project_a_secret", "project A data leaked via UNION");
     }
 
-    // Cross-tenant attack via CTE: same structural guarantee.
+    // Cross-project attack via CTE: same structural guarantee.
     let rows = client_b
         .simple_query("WITH peek AS (SELECT body FROM secrets) SELECT body FROM peek")
         .await
         .expect("b cte");
     let bodies = collect_bodies(&rows);
     for body in &bodies {
-        assert_ne!(body, "tenant_a_secret", "tenant A data leaked via CTE");
+        assert_ne!(body, "project_a_secret", "project A data leaked via CTE");
     }
 
     drop(client_a);
@@ -691,13 +691,13 @@ async fn per_tenant_credentials_isolate_cross_tenant_data() {
     let _ = driver_b.await;
 }
 
-/// Within a single tenant, RLS still works after credential-based pgwire
-/// auth. Provisioning two URLs for the same tenant is the v0.2 follow-up;
+/// Within a single project, RLS still works after credential-based pgwire
+/// auth. Provisioning two URLs for the same project is the v0.2 follow-up;
 /// for v0.1 we prove RLS is unaffected by the new credential validator
-/// path by enabling RLS on a tenant's table and confirming the policy
+/// path by enabling RLS on a project's table and confirming the policy
 /// filter fires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn per_tenant_credentials_keep_rls_within_tenant() {
+async fn per_project_credentials_keep_rls_within_project() {
     let Some(s) = boot().await else {
         return;
     };
@@ -705,7 +705,7 @@ async fn per_tenant_credentials_keep_rls_within_tenant() {
     let r = http_request(
         s.rest_addr,
         "POST",
-        "/admin/v1/tenants",
+        "/admin/v1/projects",
         &[
             ("Content-Type", "application/json"),
             ("Authorization", &format!("Bearer {}", s.admin_jwt)),
@@ -727,7 +727,7 @@ async fn per_tenant_credentials_keep_rls_within_tenant() {
     // Insert two rows with different "owner" values, then enable RLS with
     // a policy that always filters to id=1. With RLS active, `SELECT *`
     // must return only the matching row even though both rows are in the
-    // same tenant's table.
+    // same project's table.
     client
         .simple_query("CREATE TABLE orders (id BIGINT NOT NULL, owner TEXT NOT NULL)")
         .await

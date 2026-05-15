@@ -1,5 +1,5 @@
-//! `GET /rest/v1/_openapi.json` — per-tenant OpenAPI 3.0 spec generated from
-//! the live catalog. The spec lists every table the calling tenant owns with
+//! `GET /rest/v1/_openapi.json` — per-project OpenAPI 3.0 spec generated from
+//! the live catalog. The spec lists every table the calling project owns with
 //! the four CRUD operations and a `components.schemas` entry derived from the
 //! Arrow `Schema` for that table.
 
@@ -28,14 +28,14 @@ pub(crate) async fn openapi(
     let catalog = &state.cfg.engine.config().catalog;
 
     let table_names: Vec<TableName> = catalog
-        .list_tables(&claims.tenant_id)
+        .list_tables(&claims.project_id)
         .await
         .map_err(ApiError::from)?;
 
     let mut paths = Map::new();
     let mut schemas = Map::new();
     for tn in &table_names {
-        let meta = match catalog.load_table(&claims.tenant_id, tn).await {
+        let meta = match catalog.load_table(&claims.project_id, tn).await {
             Ok(m) => m,
             // Racing dropper between list_tables and load_table — skip.
             Err(basin_common::BasinError::NotFound(_)) => continue,
@@ -58,7 +58,7 @@ pub(crate) async fn openapi(
         "info": {
             "title": "Basin REST",
             "version": "v0.1",
-            "description": "Auto-generated per-tenant OpenAPI spec for the Basin REST surface. Every table the tenant owns is exposed under /rest/v1/{table} with GET / POST / PATCH / DELETE.",
+            "description": "Auto-generated per-project OpenAPI spec for the Basin REST surface. Every table the project owns is exposed under /rest/v1/{table} with GET / POST / PATCH / DELETE.",
         },
         "paths": Value::Object(paths),
         "components": { "schemas": Value::Object(schemas) },

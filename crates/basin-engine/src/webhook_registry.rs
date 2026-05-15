@@ -1,15 +1,15 @@
 //! In-memory webhook subscription registry.
 //!
 //! Holds a single `RwLock<HashMap<WebhookSubscriptionId, WebhookSubscription>>`
-//! shared across the whole process. Per-tenant cost is **O(bytes per active
+//! shared across the whole process. Per-project cost is **O(bytes per active
 //! subscription)** — one map entry, one URL string, one per-row enum, no
-//! per-tenant pooled resource (file, worker, channel). See crate docs for
-//! the per-tenant cost discipline this honours.
+//! per-project pooled resource (file, worker, channel). See crate docs for
+//! the per-project cost discipline this honours.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -63,7 +63,7 @@ impl WebhookOps {
 #[derive(Clone, Debug)]
 pub struct WebhookSubscription {
     pub id: WebhookSubscriptionId,
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: TableName,
     pub url: String,
     pub ops: WebhookOps,
@@ -164,7 +164,7 @@ impl WebhookRegistry {
         if sub.max_retries == 0 {
             return Err(SubscriptionError::InvalidMaxRetries);
         }
-        // Cheap structural URL check. The full per-tenant allowlist
+        // Cheap structural URL check. The full per-project allowlist
         // gate runs in basin-net at delivery time; here we only catch
         // garbage that would never even parse.
         if url::Url::parse(&sub.url).is_err() {
@@ -179,26 +179,26 @@ impl WebhookRegistry {
         Ok(id)
     }
 
-    /// Find a subscription by `(tenant, table, name)` where the
+    /// Find a subscription by `(project, table, name)` where the
     /// "name" is the user-supplied subscription label (the
     /// `<subscription_name>` from `ALTER TABLE ... SUBSCRIBE WEBHOOK
     /// <name> ...`). v0.1 stores the label inside [`WebhookSubscription`]
     /// only as part of the URL — but the SQL surface needs a stable
     /// way to unsubscribe by name. Until subscriptions carry an
     /// explicit `label` field (catalog-persistence work), the engine
-    /// treats `(tenant, table, url)` as the unique key and asks the
+    /// treats `(project, table, url)` as the unique key and asks the
     /// SQL-surface caller to plumb through the URL recorded at
     /// SUBSCRIBE time. This helper returns the first matching
     /// subscription's id.
     pub async fn find_by_url(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         url: &str,
     ) -> Option<WebhookSubscriptionId> {
         let g = self.inner.subs.read().await;
         for (id, s) in g.iter() {
-            if s.tenant == *tenant && &s.table == table && s.url == url {
+            if s.project == *project && &s.table == table && s.url == url {
                 return Some(*id);
             }
         }
@@ -218,13 +218,13 @@ impl WebhookRegistry {
         self.inner.subs.read().await.get(&id).cloned()
     }
 
-    /// All subscriptions for `tenant`, in id order. Used by the sink's
+    /// All subscriptions for `project`, in id order. Used by the sink's
     /// match path on every `publish`.
-    pub async fn list(&self, tenant: &TenantId) -> Vec<WebhookSubscription> {
+    pub async fn list(&self, project: &ProjectId) -> Vec<WebhookSubscription> {
         let g = self.inner.subs.read().await;
         let mut out: Vec<WebhookSubscription> = g
             .values()
-            .filter(|s| s.tenant == *tenant)
+            .filter(|s| s.project == *project)
             .cloned()
             .collect();
         out.sort_by(|a, b| a.id.0.cmp(&b.id.0));

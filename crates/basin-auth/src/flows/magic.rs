@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::Utc;
 
 use crate::email::{magic_link_template, Outbound};
@@ -18,10 +18,10 @@ const MAGIC_TTL: Duration = Duration::from_secs(60 * 15);
 
 pub(crate) async fn request_magic_link(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     email: &str,
 ) -> Result<()> {
-    inner.ip_limiter.check(&format!("magic:{tenant}"))?;
+    inner.ip_limiter.check(&format!("magic:{project}"))?;
     inner.email_limiter.check(&format!("magic:{email}"))?;
 
     let email = crate::normalise_email(email)?;
@@ -29,7 +29,7 @@ pub(crate) async fn request_magic_link(
     let (raw, h) = generate();
     let expires_at = Utc::now() + crate::ttl_or_default(MAGIC_TTL);
 
-    let user_row = inner.store.find_user_by_email(tenant, &email).await?;
+    let user_row = inner.store.find_user_by_email(project, &email).await?;
     let Some(user_row) = user_row else {
         // Same OWASP-friendly silence as the reset flow.
         return Ok(());
@@ -38,7 +38,7 @@ pub(crate) async fn request_magic_link(
     inner
         .store
         .insert_email_token(
-            tenant,
+            project,
             user_row.user_id,
             &h,
             EmailTokenPurpose::MagicLink.as_str(),
@@ -54,12 +54,12 @@ pub(crate) async fn request_magic_link(
 
 pub(crate) async fn signin_with_magic_link(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     raw_token: &str,
 ) -> Result<Tokens> {
     let h = hash_token(raw_token);
 
-    let row = inner.store.find_magic_link_email_token(tenant, &h).await?;
+    let row = inner.store.find_magic_link_email_token(project, &h).await?;
     let Some(row) = row else {
         return Err(BasinError::not_found("invalid magic-link token"));
     };
@@ -76,7 +76,7 @@ pub(crate) async fn signin_with_magic_link(
         return Err(BasinError::InvalidIdent("magic-link token expired".into()));
     }
 
-    let updated = inner.store.consume_email_token(tenant, &h).await?;
+    let updated = inner.store.consume_email_token(project, &h).await?;
     if updated == 0 {
         return Err(BasinError::InvalidIdent(
             "magic-link token already consumed".into(),
@@ -87,8 +87,8 @@ pub(crate) async fn signin_with_magic_link(
     // the inbox is the proof. Mark the user verified if they weren't already.
     inner
         .store
-        .mark_email_verified_if_null(tenant, row.user_id)
+        .mark_email_verified_if_null(project, row.user_id)
         .await?;
 
-    issue_tokens_for(inner, tenant, row.user_id, &row.email).await
+    issue_tokens_for(inner, project, row.user_id, &row.email).await
 }

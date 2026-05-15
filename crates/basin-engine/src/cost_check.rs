@@ -1,10 +1,10 @@
 //! Cost-based query rejection (Phase 6).
 //!
 //! Reject queries at planning time when their estimated cost exceeds the
-//! configured per-tenant cap. The wedge story is multi-tenant SaaS: a
-//! single tenant's runaway `SELECT * FROM huge_table` (no LIMIT, no
+//! configured per-project cap. The wedge story is multi-project SaaS: a
+//! single project's runaway `SELECT * FROM huge_table` (no LIMIT, no
 //! WHERE) can saturate a shard's IO budget and steal latency from
-//! every other tenant on the same shard. Pre-emptive rejection keeps
+//! every other project on the same shard. Pre-emptive rejection keeps
 //! the noisy-neighbour blast radius bounded — drivers see PG SQLSTATE
 //! `54000` (`program_limit_exceeded`), an explicit retry-with-backoff
 //! signal that's distinct from a parse / permission error.
@@ -33,7 +33,7 @@
 use std::sync::OnceLock;
 
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use sqlparser::ast::{Statement, TableFactor};
 
 /// Process-wide cost cap. `None` = unbounded; `Some(n)` = reject queries
@@ -62,14 +62,14 @@ fn parse_cost_limit(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// Estimate how many rows `stmt` will scan against `tenant`'s catalog.
+/// Estimate how many rows `stmt` will scan against `project`'s catalog.
 /// Returns `Ok(None)` when v0.1 can't estimate (multi-FROM / JOIN /
 /// subquery / non-Query statement / explicit LIMIT) — callers treat
 /// `None` as "pass through unchecked." A genuine catalog failure
 /// propagates as `Err`.
 pub async fn estimate_query_rows(
     catalog: &dyn Catalog,
-    tenant: &TenantId,
+    project: &ProjectId,
     stmt: &Statement,
 ) -> Result<Option<u64>> {
     let q = match stmt {
@@ -101,7 +101,7 @@ pub async fn estimate_query_rows(
         Ok(t) => t,
         Err(_) => return Ok(None),
     };
-    let meta = match catalog.load_table(tenant, &table).await {
+    let meta = match catalog.load_table(project, &table).await {
         Ok(m) => m,
         // A missing table isn't a cost-check failure; let the regular
         // planner produce its own `relation does not exist` error so the

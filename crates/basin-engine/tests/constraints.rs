@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::{BasinError, TenantId};
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::{BasinError, ProjectId};
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -25,7 +25,7 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("unexpected: {other:?}"),
@@ -72,7 +72,7 @@ fn col_i32(batches: &[RecordBatch], name: &str) -> Vec<i32> {
 async fn pk_simple_unique_enforced() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -93,7 +93,7 @@ async fn pk_simple_unique_enforced() {
 async fn pk_composite_unique_enforced() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE order_items (order_id BIGINT NOT NULL, item_id BIGINT NOT NULL, \
@@ -121,7 +121,7 @@ async fn pk_composite_unique_enforced() {
 async fn pk_column_must_be_not_null_at_create() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute("CREATE TABLE t (id BIGINT NULL PRIMARY KEY)")
@@ -136,7 +136,7 @@ async fn pk_column_must_be_not_null_at_create() {
 async fn pk_update_to_existing_pk_value_fails() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -157,7 +157,7 @@ async fn pk_update_to_existing_pk_value_fails() {
 async fn check_constraint_enforced_on_insert() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE products (id BIGINT NOT NULL, price BIGINT CHECK (price > 0))")
         .await
@@ -173,7 +173,7 @@ async fn check_constraint_enforced_on_insert() {
 async fn check_constraint_passes_when_true() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE products (id BIGINT NOT NULL, price BIGINT CHECK (price > 0))")
         .await
@@ -187,7 +187,7 @@ async fn check_constraint_passes_when_true() {
 async fn check_constraint_table_level_two_columns() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE shipments (start_day BIGINT NOT NULL, end_day BIGINT NOT NULL, \
@@ -209,7 +209,7 @@ async fn check_constraint_table_level_two_columns() {
 async fn check_constraint_in_pg_constraint_view() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE products (id BIGINT NOT NULL, price BIGINT CHECK (price > 0))")
         .await
@@ -227,7 +227,7 @@ async fn check_constraint_in_pg_constraint_view() {
 async fn check_constraint_named_per_pg_convention() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE products (id BIGINT NOT NULL, price BIGINT CHECK (price > 0))")
         .await
@@ -246,7 +246,7 @@ async fn check_constraint_named_per_pg_convention() {
 async fn fk_insert_with_existing_referenced_row() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -268,7 +268,7 @@ async fn fk_insert_with_existing_referenced_row() {
 async fn fk_insert_without_referenced_row_fails() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -292,7 +292,7 @@ async fn fk_insert_without_referenced_row_fails() {
 async fn fk_delete_referenced_no_action_blocks() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -322,7 +322,7 @@ async fn fk_delete_referenced_no_action_blocks() {
 async fn fk_delete_referenced_cascade() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -350,7 +350,7 @@ async fn fk_delete_referenced_cascade() {
 async fn fk_referenced_must_be_pk_or_unique() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL)")
         .await
@@ -363,17 +363,17 @@ async fn fk_referenced_must_be_pk_or_unique() {
 }
 
 #[tokio::test]
-async fn fk_cross_tenant_rejected() {
+async fn fk_cross_project_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess_a = eng.open_session(TenantId::new()).await.unwrap();
-    let sess_b = eng.open_session(TenantId::new()).await.unwrap();
+    let sess_a = eng.open_session(ProjectId::new()).await.unwrap();
+    let sess_b = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess_a
         .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
         .unwrap();
-    // Tenant B has no `users` table; FK pointing at it must fail.
+    // Project B has no `users` table; FK pointing at it must fail.
     let err = sess_b
         .execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id))")
         .await
@@ -385,7 +385,7 @@ async fn fk_cross_tenant_rejected() {
 async fn fk_in_information_schema_referential_constraints() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -416,7 +416,7 @@ async fn fk_in_information_schema_referential_constraints() {
 async fn pg_constraint_lists_pk_check_fk_rows() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -445,7 +445,7 @@ async fn pg_constraint_lists_pk_check_fk_rows() {
 async fn information_schema_table_constraints_lists_all_kinds() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
         .await
@@ -472,7 +472,7 @@ async fn information_schema_table_constraints_lists_all_kinds() {
 async fn key_column_usage_lists_pk_and_fk_columns() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE order_items (order_id BIGINT NOT NULL, item_id BIGINT NOT NULL, \

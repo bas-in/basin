@@ -32,13 +32,13 @@
 //!
 //! - Subscription label storage. The `<subscription_name>` is parsed
 //!   and used by `UNSUBSCRIBE` but not currently persisted on the
-//!   `WebhookSubscription` row (the registry stores `(tenant, table,
+//!   `WebhookSubscription` row (the registry stores `(project, table,
 //!   url)` as the unique key). The exec function looks up by
-//!   `(tenant, table)` for now; a follow-up adds an explicit `label`
+//!   `(project, table)` for now; a follow-up adds an explicit `label`
 //!   field when catalog-persistence lands.
 //! - Schema-qualified table names are out of scope.
 
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -52,7 +52,7 @@ pub struct SubscribeIntent {
     /// `<table>` from the `ALTER TABLE <table>` head.
     pub table: String,
     /// Optional `<subscription_name>` after `SUBSCRIBE WEBHOOK`. v0.1
-    /// is informational; the unsubscribe path uses `(tenant, table)`
+    /// is informational; the unsubscribe path uses `(project, table)`
     /// match.
     pub label: Option<String>,
     /// Quote-stripped URL.
@@ -217,13 +217,13 @@ pub fn match_alter_table_unsubscribe_webhook(sql: &str) -> Result<Option<Unsubsc
 /// freshly-minted subscription id.
 pub async fn exec_subscribe_webhook(
     intent: SubscribeIntent,
-    tenant: &TenantId,
+    project: &ProjectId,
     registry: &WebhookRegistry,
 ) -> Result<WebhookSubscriptionId> {
     let table = TableName::new(&intent.table)?;
     let sub = WebhookSubscription {
         id: WebhookSubscriptionId(uuid::Uuid::nil()),
-        tenant: *tenant,
+        project: *project,
         table,
         url: intent.url.clone(),
         ops: intent.ops,
@@ -243,16 +243,16 @@ pub async fn exec_subscribe_webhook(
 }
 
 /// Apply an [`UnsubscribeIntent`] against `registry`. v0.1 looks up
-/// by `(tenant, table)` because the registry row does not yet carry
+/// by `(project, table)` because the registry row does not yet carry
 /// a label column; the first matching subscription is removed.
 /// Returns `Err(NotFound)` when no matching subscription exists.
 pub async fn exec_unsubscribe_webhook(
     intent: UnsubscribeIntent,
-    tenant: &TenantId,
+    project: &ProjectId,
     registry: &WebhookRegistry,
 ) -> Result<()> {
     let table = TableName::new(&intent.table)?;
-    let subs = registry.list(tenant).await;
+    let subs = registry.list(project).await;
     let candidate = subs.into_iter().find(|s| s.table == table).ok_or_else(|| {
         BasinError::not_found(format!(
             "subscription {:?} on {:?} does not exist",

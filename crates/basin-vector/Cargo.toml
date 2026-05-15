@@ -19,7 +19,7 @@ tracing.workspace = true
 
 # HNSW. instant-distance is small, well-maintained, pure Rust, and exposes
 # the index as a serialisable structure — what we need for the
-# /tenants/{id}/tables/{name}/index/{col}.hnsw file format. The `with-serde`
+# /projects/{id}/tables/{name}/index/{col}.hnsw file format. The `with-serde`
 # feature is required so HnswMap implements Serialize/Deserialize.
 instant-distance = { version = "0.6", features = ["with-serde"] }
 

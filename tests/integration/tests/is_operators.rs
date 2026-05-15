@@ -23,7 +23,7 @@
 //! - `CASE expr WHEN val THEN … END` (simple form)
 //!
 //! Each test is one `#[tokio::test]`, boots an in-memory engine, runs SQL
-//! directly against a `TenantSession`, and asserts the returned Arrow array
+//! directly against a `ProjectSession`, and asserts the returned Arrow array
 //! matches expectations.
 
 #![allow(clippy::print_stdout)]
@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -62,7 +62,7 @@ fn make_engine(dir: &TempDir) -> Engine {
 async fn bool_val(sql: &str) -> Option<bool> {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     let res = sess
         .execute(sql)
         .await
@@ -90,7 +90,7 @@ async fn bool_val(sql: &str) -> Option<bool> {
 async fn i64_val(sql: &str) -> i64 {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     let res = sess
         .execute(sql)
         .await
@@ -114,7 +114,7 @@ async fn i64_val(sql: &str) -> i64 {
 async fn str_val(sql: &str) -> Option<String> {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     let res = sess
         .execute(sql)
         .await
@@ -369,7 +369,7 @@ async fn is_not_null_on_value() {
 async fn is_null_filters_table_rows() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE nullable_t (id BIGINT NOT NULL, val BIGINT)")
         .await
@@ -408,7 +408,7 @@ async fn is_null_filters_table_rows() {
 async fn is_not_null_filters_table_rows() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE not_null_t (id BIGINT NOT NULL, val BIGINT)")
         .await
@@ -483,7 +483,7 @@ async fn nullif_equal_returns_null() {
     // NULLIF returns NULL when both args equal — cast result to check.
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     let res = sess
         .execute("SELECT NULLIF(1::bigint, 1::bigint) AS v")
         .await
@@ -619,7 +619,7 @@ async fn case_searched_multi_branch() {
 async fn case_searched_no_else_returns_null() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     let res = sess
         .execute("SELECT CASE WHEN 1 < 0 THEN 'yes' END AS v")
         .await
@@ -680,7 +680,7 @@ async fn case_simple_form_falls_to_else() {
 async fn case_in_select_projection() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE grades (id BIGINT NOT NULL, score BIGINT NOT NULL)")
         .await
@@ -725,7 +725,7 @@ async fn case_in_select_projection() {
 async fn is_true_filters_table_rows() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE flags (id BIGINT NOT NULL, active BOOLEAN)",
@@ -766,7 +766,7 @@ async fn is_true_filters_table_rows() {
 async fn is_not_true_filters_table_rows() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE flags2 (id BIGINT NOT NULL, active BOOLEAN)",
@@ -864,7 +864,7 @@ async fn is_not_distinct_from_null_null() {
 async fn coalesce_in_where_clause() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE items (id BIGINT NOT NULL, qty BIGINT)")
         .await

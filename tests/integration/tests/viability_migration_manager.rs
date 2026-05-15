@@ -14,7 +14,7 @@
 //!
 //! 1. Calls `list_snapshots_project_wide` directly on the catalog handle and
 //!    asserts every table's snapshots appear.
-//! 2. Calls `rollback_to_snapshot_project_wide(tenant, cutoff)` and asserts
+//! 2. Calls `rollback_to_snapshot_project_wide(project, cutoff)` and asserts
 //!    every table's `SELECT count(*)` matches the first-batch row count
 //!    (i.e. the second batch is gone).
 
@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
@@ -68,8 +68,8 @@ async fn viability_migration_manager() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let session = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let session = engine.open_session(project).await.unwrap();
 
     // 1. Create 5 tables.
     let table_names: Vec<&str> = vec!["t_a", "t_b", "t_c", "t_d", "t_e"];
@@ -126,7 +126,7 @@ async fn viability_migration_manager() {
     // 4. Project-wide list: every table's snapshots should appear in one
     // sorted timeline.
     let entries = catalog
-        .list_snapshots_project_wide(&tenant)
+        .list_snapshots_project_wide(&project)
         .await
         .expect("list_snapshots_project_wide");
     let observed_tables: std::collections::BTreeSet<String> =
@@ -150,7 +150,7 @@ async fn viability_migration_manager() {
 
     // 5. Project-wide rollback to the captured wall time.
     let pairs = catalog
-        .rollback_to_snapshot_project_wide(&tenant, cutoff)
+        .rollback_to_snapshot_project_wide(&project, cutoff)
         .await
         .expect("rollback_to_snapshot_project_wide");
     assert_eq!(

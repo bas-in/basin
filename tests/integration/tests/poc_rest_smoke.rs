@@ -137,7 +137,7 @@ async fn spawn_with_rest_and_auth() -> Option<(
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.env("BASIN_BIND", pg_addr.to_string())
         .env("BASIN_DATA_DIR", data_dir.path())
-        .env("BASIN_TENANTS", "alice=*")
+        .env("BASIN_PROJECTS", "alice=*")
         .env("BASIN_CATALOG", "memory")
         .env("BASIN_AUTH_ENABLED", "1")
         .env("BASIN_REST_ENABLED", "1")
@@ -337,11 +337,11 @@ async fn poc_rest_signup_signin_crud_round_trip() {
         return;
     };
 
-    let tenant = basin_common::TenantId::new().to_string();
+    let project = basin_common::ProjectId::new().to_string();
 
     // 1. signup via /auth/v1/signup
     let body = serde_json::json!({
-        "tenant_id": tenant,
+        "project_id": project,
         "email": "smoke@example.com",
         "password": "longenoughpassword",
     })
@@ -370,7 +370,7 @@ async fn poc_rest_signup_signin_crud_round_trip() {
 
     // 3. signin via /auth/v1/signin
     let body = serde_json::json!({
-        "tenant_id": tenant,
+        "project_id": project,
         "email": "smoke@example.com",
         "password": "longenoughpassword",
     })
@@ -395,23 +395,23 @@ async fn poc_rest_signup_signin_crud_round_trip() {
     let bearer = format!("Bearer {access}");
 
     // 4. CREATE TABLE via pgwire (REST has no DDL endpoint). The pgwire user
-    //    `alice` was provisioned at startup with a fresh tenant id; that
-    //    isn't the same tenant the JWT carries, so we instead use the
+    //    `alice` was provisioned at startup with a fresh project id; that
+    //    isn't the same project the JWT carries, so we instead use the
     //    pgwire connection that the auth-aware resolver would accept — but
-    //    the binary's pgwire path is still using StaticTenantResolver
-    //    (PR 2 ships `JwtTenantResolver` but doesn't auto-mount it). For a
-    //    smoke test of the REST path we DDL via the same tenant the JWT
+    //    the binary's pgwire path is still using StaticProjectResolver
+    //    (PR 2 ships `JwtProjectResolver` but doesn't auto-mount it). For a
+    //    smoke test of the REST path we DDL via the same project the JWT
     //    was issued for: the engine creates the namespace on first use, so
     //    a `POST /rest/v1/<table>` to a table we POST as the first operation
     //    will fail because the table doesn't exist.
     //
     //    Workaround: issue the CREATE TABLE through a second pgwire
-    //    connection but use the `tenant_id` directly in `BASIN_TENANTS`.
+    //    connection but use the `project_id` directly in `BASIN_PROJECTS`.
     //    Since the test binary doesn't expose that, we instead write a row
     //    via REST and tolerate a 4xx if the table doesn't exist — the
     //    important assertion is that the signup + signin path round-trips.
     //
-    //    A future PR will mount `JwtTenantResolver` by default when
+    //    A future PR will mount `JwtProjectResolver` by default when
     //    auth is enabled; once that lands, the same JWT works on both
     //    surfaces and this whole branch collapses. For now we assert the
     //    REST endpoint reaches the engine (status 4xx with engine-shaped
@@ -429,7 +429,7 @@ async fn poc_rest_signup_signin_crud_round_trip() {
         Some(br#"{"id": 1, "name": "smoke"}"#),
     )
     .await;
-    // The table doesn't exist (no CREATE TABLE was issued for this tenant
+    // The table doesn't exist (no CREATE TABLE was issued for this project
     // through any surface that talks to its namespace); the engine will
     // surface a structured error. The point of the smoke test is to prove
     // the request *reached* the engine — i.e. we got past JWT auth.

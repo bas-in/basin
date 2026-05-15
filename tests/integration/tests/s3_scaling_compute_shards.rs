@@ -1,7 +1,7 @@
 //! S3 port of `scaling_compute_shards.rs`.
 //!
 //! Same shape — N shard owners share one Storage + one in-memory catalog,
-//! a front router fans tenant connections to them via stable hashing — but
+//! a front router fans project connections to them via stable hashing — but
 //! the shared storage is real S3 instead of a LocalFS tempdir. Cluster
 //! topology stays local (4 in-process shard listeners on ephemeral ports);
 //! only the storage backend is remote.
@@ -12,19 +12,19 @@
 //!
 //! ## Scale
 //!
-//! WAN latency to the S3 endpoint is ~500ms-1s per RPC. A 100-tenant /
+//! WAN latency to the S3 endpoint is ~500ms-1s per RPC. A 100-project /
 //! 5-reconnect run like the LocalFS variant would take 5-10 minutes and
-//! exhaust the test's budget. We scale to 25 tenants × 1 connection each
+//! exhaust the test's budget. We scale to 25 projects × 1 connection each
 //! (no reconnect pass) — enough samples to verify hash-uniformity (peak
 //! load expected ~30%, well under the 50% bar) and consistent-routing
-//! (every tenant lands on exactly one shard).
+//! (every project lands on exactly one shard).
 
 #![allow(clippy::print_stdout)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -38,7 +38,7 @@ use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 const TEST_NAME: &str = "s3_scaling_compute_shards";
 const N_SHARDS: usize = 4;
-const N_TENANTS: usize = 25;
+const N_PROJECTS: usize = 25;
 const BAR_MAX_SHARD_LOAD_PCT: f64 = 50.0;
 const BAR_CONSISTENT_ROUTING_PCT: f64 = 100.0;
 
@@ -62,10 +62,10 @@ async fn connect(addr: SocketAddr, user: &str) -> tokio_postgres::Client {
     client
 }
 
-async fn shard_for_tenant(cluster: &Cluster, tenant: &TenantId) -> Option<usize> {
+async fn shard_for_project(cluster: &Cluster, project: &ProjectId) -> Option<usize> {
     for (idx, shard) in cluster.shards.iter().enumerate() {
-        let map = shard.stats.snapshot_per_tenant().await;
-        if map.contains_key(tenant) {
+        let map = shard.stats.snapshot_per_project().await;
+        if map.contains_key(project) {
             return Some(idx);
         }
     }
@@ -113,20 +113,20 @@ async fn s3_scaling_compute_shards() {
         cluster.shard_endpoints
     );
 
-    let mut tenants: Vec<(String, TenantId)> = Vec::with_capacity(N_TENANTS);
-    for i in 0..N_TENANTS {
-        let user = format!("tenant_{i:03}");
-        let t = TenantId::new();
+    let mut projects: Vec<(String, ProjectId)> = Vec::with_capacity(N_PROJECTS);
+    for i in 0..N_PROJECTS {
+        let user = format!("project_{i:03}");
+        let t = ProjectId::new();
         cluster.resolver.insert(user.clone(), t).await;
-        tenants.push((user, t));
+        projects.push((user, t));
     }
 
-    // First pass: every tenant runs CREATE / INSERT / SELECT through the
-    // front router. With N_TENANTS=25 and a 4-shard cluster the round-trip
-    // cost per tenant is dominated by the S3 PUT for the INSERT (~500ms-1s
+    // First pass: every project runs CREATE / INSERT / SELECT through the
+    // front router. With N_PROJECTS=25 and a 4-shard cluster the round-trip
+    // cost per project is dominated by the S3 PUT for the INSERT (~500ms-1s
     // RTT on APAC R2). Total budget: ~30-60s.
-    let mut placement: HashMap<TenantId, usize> = HashMap::new();
-    for (user, tenant) in &tenants {
+    let mut placement: HashMap<ProjectId, usize> = HashMap::new();
+    for (user, project) in &projects {
         let client = connect(router_addr, user).await;
         client
             .simple_query("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
@@ -150,22 +150,22 @@ async fn s3_scaling_compute_shards() {
         );
         drop(client);
 
-        let shard_idx = shard_for_tenant(&cluster, tenant)
+        let shard_idx = shard_for_project(&cluster, project)
             .await
-            .unwrap_or_else(|| panic!("no shard saw tenant {tenant} after first round"));
-        placement.insert(*tenant, shard_idx);
+            .unwrap_or_else(|| panic!("no shard saw project {project} after first round"));
+        placement.insert(*project, shard_idx);
     }
 
-    // Consistent routing: every tenant lands on exactly one shard. We don't
+    // Consistent routing: every project lands on exactly one shard. We don't
     // do a reconnect pass on real S3 (that would multiply the WAN budget by
-    // RECONNECTS_PER_TENANT for no extra signal). Stable hashing is a
+    // RECONNECTS_PER_PROJECT for no extra signal). Stable hashing is a
     // function of (username, shard_count) — proven by the LocalFS variant —
-    // so on real S3 we just verify each tenant has a single observed shard.
+    // so on real S3 we just verify each project has a single observed shard.
     let mut consistent_count: u64 = 0;
-    for (_, tenant) in &tenants {
+    for (_, project) in &projects {
         let mut hits = 0;
         for shard in cluster.shards.iter() {
-            if shard.stats.snapshot_per_tenant().await.contains_key(tenant) {
+            if shard.stats.snapshot_per_project().await.contains_key(project) {
                 hits += 1;
             }
         }
@@ -173,17 +173,17 @@ async fn s3_scaling_compute_shards() {
             consistent_count += 1;
         }
     }
-    let consistent_routing_pct = 100.0 * consistent_count as f64 / N_TENANTS as f64;
+    let consistent_routing_pct = 100.0 * consistent_count as f64 / N_PROJECTS as f64;
 
     let mut load_per_shard: Vec<usize> = vec![0; N_SHARDS];
     for idx in placement.values() {
         load_per_shard[*idx] += 1;
     }
     let max_load: usize = *load_per_shard.iter().max().unwrap();
-    let max_shard_load_pct = 100.0 * max_load as f64 / N_TENANTS as f64;
+    let max_shard_load_pct = 100.0 * max_load as f64 / N_PROJECTS as f64;
 
     println!(
-        "[S3 scaling_compute_shards] tenants={N_TENANTS} shards={N_SHARDS} \
+        "[S3 scaling_compute_shards] projects={N_PROJECTS} shards={N_SHARDS} \
          load_per_shard={load_per_shard:?} \
          max_shard_load_pct={max_shard_load_pct:.1}% \
          consistent_routing_pct={consistent_routing_pct:.1}%",
@@ -199,8 +199,8 @@ async fn s3_scaling_compute_shards() {
         .map(|(i, count)| {
             json!({
                 "shard": i,
-                "tenants": *count,
-                "load_pct": 100.0 * (*count as f64) / N_TENANTS as f64,
+                "projects": *count,
+                "load_pct": 100.0 * (*count as f64) / N_PROJECTS as f64,
             })
         })
         .collect();
@@ -208,9 +208,9 @@ async fn s3_scaling_compute_shards() {
     report_real_scaling(
         "compute_shards",
         "Compute sharding (router -> shard owners) on real S3",
-        "Hash tenant_id -> shard_id; pgwire connections route to the owning shard. \
+        "Hash project_id -> shard_id; pgwire connections route to the owning shard. \
          Shards share one S3-backed Storage; load distributes evenly across shards. \
-         Scaled to 25 tenants on real S3 to fit the WAN test budget.",
+         Scaled to 25 projects on real S3 to fit the WAN test budget.",
         passed,
         AxisSpec {
             key: "shard".into(),
@@ -218,13 +218,13 @@ async fn s3_scaling_compute_shards() {
         },
         vec![
             SeriesSpec {
-                key: "tenants".into(),
-                label: "tenants on shard".into(),
+                key: "projects".into(),
+                label: "projects on shard".into(),
                 unit: Some("count".into()),
             },
             SeriesSpec {
                 key: "load_pct".into(),
-                label: "share of tenants".into(),
+                label: "share of projects".into(),
                 unit: Some("%".into()),
             },
         ],

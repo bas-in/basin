@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
@@ -94,26 +94,26 @@ async fn s3_scaling_noisy_neighbor() {
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
 
-    let quiet_tenant = TenantId::new();
-    let noisy_tenant = TenantId::new();
+    let quiet_project = ProjectId::new();
+    let noisy_project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
-    catalog.create_namespace(&quiet_tenant).await.unwrap();
+    catalog.create_namespace(&quiet_project).await.unwrap();
     catalog
-        .create_table(&quiet_tenant, &table, &schema())
+        .create_table(&quiet_project, &table, &schema())
         .await
         .unwrap();
     let q_batch = build_batch(0, QUIET_ROWS);
     let q_df = storage
-        .write_batch(&quiet_tenant, &table, &part, &q_batch)
+        .write_batch(&quiet_project, &table, &part, &q_batch)
         .await
         .unwrap();
     {
-        let meta = catalog.load_table(&quiet_tenant, &table).await.unwrap();
+        let meta = catalog.load_table(&quiet_project, &table).await.unwrap();
         catalog
             .append_data_files(
-                &quiet_tenant,
+                &quiet_project,
                 &table,
                 meta.current_snapshot,
                 vec![DataFileRef {
@@ -127,9 +127,9 @@ async fn s3_scaling_noisy_neighbor() {
             .unwrap();
     }
 
-    catalog.create_namespace(&noisy_tenant).await.unwrap();
+    catalog.create_namespace(&noisy_project).await.unwrap();
     catalog
-        .create_table(&noisy_tenant, &table, &schema())
+        .create_table(&noisy_project, &table, &schema())
         .await
         .unwrap();
     let n_batches = NOISY_ROWS / NOISY_BATCH;
@@ -138,7 +138,7 @@ async fn s3_scaling_noisy_neighbor() {
         let start = (b * NOISY_BATCH) as i64;
         let batch = build_batch(start, NOISY_BATCH);
         let df = storage
-            .write_batch(&noisy_tenant, &table, &part, &batch)
+            .write_batch(&noisy_project, &table, &part, &batch)
             .await
             .unwrap();
         noisy_files.push(DataFileRef {
@@ -149,9 +149,9 @@ async fn s3_scaling_noisy_neighbor() {
         });
     }
     {
-        let meta = catalog.load_table(&noisy_tenant, &table).await.unwrap();
+        let meta = catalog.load_table(&noisy_project, &table).await.unwrap();
         catalog
-            .append_data_files(&noisy_tenant, &table, meta.current_snapshot, noisy_files)
+            .append_data_files(&noisy_project, &table, meta.current_snapshot, noisy_files)
             .await
             .unwrap();
     }
@@ -161,7 +161,7 @@ async fn s3_scaling_noisy_neighbor() {
         catalog: catalog.clone(),
         shard: None,
     });
-    let quiet_sess = engine.open_session(quiet_tenant).await.unwrap();
+    let quiet_sess = engine.open_session(quiet_project).await.unwrap();
     let _ = quiet_sess
         .execute("SELECT id FROM events WHERE id = 1")
         .await
@@ -186,7 +186,7 @@ async fn s3_scaling_noisy_neighbor() {
                     .unwrap();
                 hits += arr.len();
             }
-            assert!(hits >= 1, "expected hit on quiet tenant for id={id}");
+            assert!(hits >= 1, "expected hit on quiet project for id={id}");
         }
         baseline.push(elapsed_ms);
     }
@@ -198,7 +198,7 @@ async fn s3_scaling_noisy_neighbor() {
         let stop = stop.clone();
         let engine = engine.clone();
         noisy_set.spawn(async move {
-            let sess = engine.open_session(noisy_tenant).await.unwrap();
+            let sess = engine.open_session(noisy_project).await.unwrap();
             let mut count = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 // Tolerate transient S3 read errors under heavy concurrent
@@ -291,7 +291,7 @@ async fn s3_scaling_noisy_neighbor() {
     report_real_scaling(
         "noisy_neighbor",
         "Noisy-neighbor degradation (real S3)",
-        "On real S3, a heavy noisy tenant doesn't crater a quiet tenant's p99 latency.",
+        "On real S3, a heavy noisy project doesn't crater a quiet project's p99 latency.",
         pass,
         AxisSpec {
             key: "scenario".into(),

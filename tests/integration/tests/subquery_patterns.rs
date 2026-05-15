@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use arrow_array::Int64Array;
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -90,7 +90,7 @@ fn i64_col(res: ExecResult, col: &str) -> Vec<i64> {
 ///   items(id BIGINT, order_id BIGINT, price BIGINT)  — 5 rows
 ///
 /// items.order_id links back to orders.id (ids 1, 2, 3 have items; 4, 5 do not).
-async fn seed(sess: &basin_engine::TenantSession) {
+async fn seed(sess: &basin_engine::ProjectSession) {
     sess.execute(
         "CREATE TABLE orders (id BIGINT NOT NULL, amount BIGINT NOT NULL, name TEXT NOT NULL)",
     )
@@ -125,7 +125,7 @@ async fn seed(sess: &basin_engine::TenantSession) {
 async fn subq_exists_correlated() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess
@@ -150,7 +150,7 @@ async fn subq_exists_correlated() {
 async fn subq_not_exists_correlated() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess
@@ -175,7 +175,7 @@ async fn subq_not_exists_correlated() {
 async fn subq_in_subquery() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess
@@ -200,7 +200,7 @@ async fn subq_in_subquery() {
 async fn subq_not_in_subquery() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess
@@ -228,7 +228,7 @@ async fn subq_not_in_subquery() {
 async fn subq_row_constructor_in() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let result = sess
@@ -272,7 +272,7 @@ async fn subq_row_constructor_in() {
 async fn subq_any_greater_than() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let result = sess
@@ -317,7 +317,7 @@ async fn subq_any_greater_than() {
 async fn subq_all_greater_eq() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let result = sess
@@ -364,7 +364,7 @@ async fn subq_all_greater_eq() {
 async fn subq_eq_any() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let result = sess
@@ -399,7 +399,7 @@ async fn subq_eq_any() {
 async fn subq_scalar_in_select() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess
@@ -426,7 +426,7 @@ async fn subq_scalar_in_select() {
 async fn subq_correlated_scalar_in_select() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let result = sess
@@ -486,7 +486,7 @@ async fn subq_correlated_scalar_in_select() {
 async fn subq_scalar_in_where() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess
@@ -511,7 +511,7 @@ async fn subq_scalar_in_where() {
 async fn subq_derived_table_simple() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess
@@ -535,7 +535,7 @@ async fn subq_derived_table_simple() {
 async fn subq_derived_table_join() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
     let res = sess

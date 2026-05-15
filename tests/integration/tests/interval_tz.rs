@@ -45,7 +45,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -74,7 +74,7 @@ async fn open_engine() -> (TempDir, Engine) {
 }
 
 /// Run `sql`, return first-row first-column as String. Panics on error.
-async fn one_str(sess: &basin_engine::TenantSession, sql: &str) -> String {
+async fn one_str(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap_or_else(|| panic!("no batch: {sql}"));
@@ -88,7 +88,7 @@ async fn one_str(sess: &basin_engine::TenantSession, sql: &str) -> String {
 }
 
 /// Assert `sql` executes without error (result shape ignored).
-async fn assert_ok(sess: &basin_engine::TenantSession, sql: &str) {
+async fn assert_ok(sess: &basin_engine::ProjectSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(_) => {}
         Err(e) => panic!("error for [{sql}]: {e}"),
@@ -97,7 +97,7 @@ async fn assert_ok(sess: &basin_engine::TenantSession, sql: &str) {
 
 /// Assert `sql` returns a single Boolean true.
 #[allow(dead_code)]
-async fn assert_true(sess: &basin_engine::TenantSession, sql: &str) {
+async fn assert_true(sess: &basin_engine::ProjectSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap_or_else(|| panic!("no batch: {sql}"));
@@ -158,7 +158,7 @@ fn render_col(arr: &dyn Array, i: usize) -> String {
 #[tokio::test]
 async fn interval_ts_plus_interval() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // 2024-01-01 + 1 day = 2024-01-02 (same wall-clock hour)
     assert_ok(
         &s,
@@ -170,7 +170,7 @@ async fn interval_ts_plus_interval() {
 #[tokio::test]
 async fn interval_ts_minus_interval() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(
         &s,
         "SELECT TIMESTAMP '2024-01-01 02:00:00' - INTERVAL '2 hours'",
@@ -181,7 +181,7 @@ async fn interval_ts_minus_interval() {
 #[tokio::test]
 async fn interval_plus_interval() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // 1 day + 2 hours — both as interval literals
     assert_ok(&s, "SELECT INTERVAL '1 day' + INTERVAL '2 hours'").await;
 }
@@ -190,7 +190,7 @@ async fn interval_plus_interval() {
 #[tokio::test]
 async fn interval_minus_interval() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT INTERVAL '3 days' - INTERVAL '1 day'").await;
 }
 
@@ -199,7 +199,7 @@ async fn interval_minus_interval() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn interval_times_numeric() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT INTERVAL '1 day' * 3").await;
 }
 
@@ -208,7 +208,7 @@ async fn interval_times_numeric() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn interval_divide_numeric() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT INTERVAL '6 hours' / 2").await;
 }
 
@@ -216,7 +216,7 @@ async fn interval_divide_numeric() {
 #[tokio::test]
 async fn interval_sql_standard_day() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT INTERVAL '1' DAY").await;
 }
 
@@ -225,7 +225,7 @@ async fn interval_sql_standard_day() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn interval_sql_standard_year_to_month() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT INTERVAL '1-6' YEAR TO MONTH").await;
 }
 
@@ -233,7 +233,7 @@ async fn interval_sql_standard_year_to_month() {
 #[tokio::test]
 async fn interval_chained_addition() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(
         &s,
         "SELECT INTERVAL '1 day 2 hours' + INTERVAL '30 minutes'",
@@ -249,7 +249,7 @@ async fn interval_chained_addition() {
 #[tokio::test]
 async fn date_trunc_quarter() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // We just assert it executes without error; the exact format varies by tz annotation.
     assert_ok(
         &s,
@@ -261,7 +261,7 @@ async fn date_trunc_quarter() {
 #[tokio::test]
 async fn date_trunc_week() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(
         &s,
         "SELECT date_trunc('week', TIMESTAMP '2024-05-09 12:34:56')",
@@ -273,7 +273,7 @@ async fn date_trunc_week() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn date_trunc_decade() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(
         &s,
         "SELECT date_trunc('decade', TIMESTAMP '2024-05-09 12:34:56')",
@@ -289,7 +289,7 @@ async fn date_trunc_decade() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn generate_series_date_range() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s
         .execute(
             "SELECT generate_series(\
@@ -319,7 +319,7 @@ async fn generate_series_date_range() {
 #[tokio::test]
 async fn extract_epoch_from_timestamp() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // 2024-05-09 12:34:56 UTC = 1715258096 seconds
     assert_eq!(
         one_str(&s, "SELECT extract(epoch FROM TIMESTAMP '2024-05-09 12:34:56')").await,
@@ -332,7 +332,7 @@ async fn extract_epoch_from_timestamp() {
 #[tokio::test]
 async fn extract_epoch_from_interval() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT extract_epoch_from_interval(INTERVAL '1 day')").await,
         "86400"
@@ -343,7 +343,7 @@ async fn extract_epoch_from_interval() {
 #[tokio::test]
 async fn extract_epoch_from_interval_hours() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // 2 hours = 7200 seconds
     assert_eq!(
         one_str(&s, "SELECT extract_epoch_from_interval(INTERVAL '2 hours')").await,
@@ -359,7 +359,7 @@ async fn extract_epoch_from_interval_hours() {
 #[tokio::test]
 async fn age_returns_interval() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s
         .execute("SELECT age(TIMESTAMP '2025-01-01', TIMESTAMP '2024-01-01')")
         .await
@@ -385,7 +385,7 @@ async fn age_returns_interval() {
 #[tokio::test]
 async fn justify_days_basic() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s
         .execute("SELECT justify_days(INTERVAL '47 days')")
         .await
@@ -416,7 +416,7 @@ async fn justify_days_basic() {
 #[tokio::test]
 async fn justify_hours_basic() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s
         .execute("SELECT justify_hours(INTERVAL '30 hours')")
         .await
@@ -450,7 +450,7 @@ async fn justify_hours_basic() {
 #[tokio::test]
 async fn justify_interval_combined() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // Input: 0 months, 0 days, 30 hours in nanoseconds.
     // After justify_hours: 1 day, 6 hours ns.
     // After justify_days: 1 day still < 30, so months=0, days=1.
@@ -476,7 +476,7 @@ async fn justify_interval_combined() {
 #[tokio::test]
 async fn justify_days_zero() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s.execute("SELECT justify_days(INTERVAL '0 days')").await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap();
@@ -502,7 +502,7 @@ async fn justify_days_zero() {
 #[tokio::test]
 async fn to_char_interval_hh24_mi_ss() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(
             &s,
@@ -517,7 +517,7 @@ async fn to_char_interval_hh24_mi_ss() {
 #[tokio::test]
 async fn to_char_interval_zero() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(
             &s,
@@ -536,7 +536,7 @@ async fn to_char_interval_zero() {
 #[tokio::test]
 async fn timezone_function_form() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s
         .execute("SELECT timezone('UTC', TIMESTAMP '2024-05-09 12:00:00')")
         .await
@@ -565,7 +565,7 @@ async fn timezone_function_form() {
 #[tokio::test]
 async fn at_time_zone_udf_direct() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s
         .execute("SELECT at_time_zone(TIMESTAMP '2024-05-09 12:00:00', 'UTC')")
         .await
@@ -588,7 +588,7 @@ async fn at_time_zone_udf_direct() {
 #[tokio::test]
 async fn at_time_zone_sql_rewrite_form() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // The SQL-string rewrite maps `now() AT TIME ZONE 'UTC'` to
     // `at_time_zone(now(), 'UTC')`.
     match s
@@ -613,7 +613,7 @@ async fn at_time_zone_sql_rewrite_form() {
 #[tokio::test]
 async fn timestamptz_column_round_trip() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE tz_test (id BIGINT, ts TIMESTAMPTZ)")
         .await
@@ -642,7 +642,7 @@ async fn timestamptz_column_round_trip() {
 #[tokio::test]
 async fn current_timestamp_at_utc() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     match s
         .execute("SELECT current_timestamp AT TIME ZONE 'UTC'")
         .await
@@ -668,7 +668,7 @@ async fn current_timestamp_at_utc() {
 #[tokio::test]
 async fn date_add_int_basic() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // CURRENT_DATE + 7 days via our UDF
     // Use a literal date cast for determinism.
     let result = one_str(
@@ -684,7 +684,7 @@ async fn date_add_int_basic() {
 #[tokio::test]
 async fn date_sub_int_basic() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     let result = one_str(
         &s,
         "SELECT date_sub_int(CAST('2024-01-08' AS DATE), 7)",
@@ -697,7 +697,7 @@ async fn date_sub_int_basic() {
 #[tokio::test]
 async fn date_diff_days_basic() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     let result = one_str(
         &s,
         "SELECT date_diff_days(CAST('2024-01-08' AS DATE), CAST('2024-01-01' AS DATE))",
@@ -710,7 +710,7 @@ async fn date_diff_days_basic() {
 #[tokio::test]
 async fn date_diff_days_same_date() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     let result = one_str(
         &s,
         "SELECT date_diff_days(CAST('2024-01-01' AS DATE), CAST('2024-01-01' AS DATE))",
@@ -723,7 +723,7 @@ async fn date_diff_days_same_date() {
 #[tokio::test]
 async fn date_plus_interval_ts() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT CAST('2024-01-01' AS DATE) + INTERVAL '1 day'").await;
 }
 
@@ -736,7 +736,7 @@ async fn date_plus_interval_ts() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn to_timestamp_numeric() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // to_timestamp(0) should give 1970-01-01
     assert_ok(&s, "SELECT to_timestamp(0)").await;
     assert_ok(&s, "SELECT to_timestamp(1715258096)").await;
@@ -752,7 +752,7 @@ async fn to_timestamp_numeric() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn localtime_localtimestamp_smoke() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT localtime").await;
     assert_ok(&s, "SELECT localtimestamp").await;
 }
@@ -762,7 +762,7 @@ async fn localtime_localtimestamp_smoke() {
 #[ignore = "v0.2: interval/datetime gap — DataFusion arithmetic / invoke_no_args / granularity coverage"]
 async fn clock_transaction_statement_timestamp_smoke() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT clock_timestamp()").await;
     assert_ok(&s, "SELECT transaction_timestamp()").await;
     assert_ok(&s, "SELECT statement_timestamp()").await;
@@ -776,7 +776,7 @@ async fn clock_transaction_statement_timestamp_smoke() {
 #[tokio::test]
 async fn interval_sql_standard_day_to_second() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // sqlparser may or may not support this — we document the outcome.
     match s
         .execute("SELECT INTERVAL '1 12:00:00' DAY TO SECOND")

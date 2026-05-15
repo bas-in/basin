@@ -1,9 +1,9 @@
 //! Cron tick loop. Once every 60 seconds (in production) or once per
-//! [`CronRunner::tick`] (in tests), walk every resident tenant's `cron_job`
+//! [`CronRunner::tick`] (in tests), walk every resident project's `cron_job`
 //! table, compute due jobs since the last tick, and execute each one.
 //!
-//! Per-tenant per-minute rate limiting is enforced before the engine call:
-//! a tenant that has issued [`CronRunner::PER_MINUTE_RATE_LIMIT`] runs in
+//! Per-project per-minute rate limiting is enforced before the engine call:
+//! a project that has issued [`CronRunner::PER_MINUTE_RATE_LIMIT`] runs in
 //! the past 60-second window has additional jobs recorded as
 //! `RateLimited` instead of executed. A future bucketed token-bucket would
 //! sharpen this; the v0.1 sliding window is good enough for the smoke test.
@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use basin_common::{Result, TenantId};
+use basin_common::{Result, ProjectId};
 use basin_engine::{Engine, ExecResult};
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Mutex;
@@ -79,7 +79,7 @@ impl Clock for TestClock {
 /// assert without re-reading `cron_job_run_details`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunOutcome {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub jobid: i64,
     pub jobname: String,
     pub status: JobStatus,
@@ -99,21 +99,21 @@ pub struct CronRunner {
 struct RunnerInner {
     store: CronStore,
     clock: Arc<dyn Clock>,
-    /// Tenants the runner is responsible for. Cron is opt-in per tenant —
-    /// the router (or test) registers each tenant once via
-    /// [`CronRunner::register_tenant`].
-    tenants: Mutex<Vec<TenantId>>,
-    /// Per-tenant timestamp of the most recent tick. New runs only fire for
+    /// Projects the runner is responsible for. Cron is opt-in per project —
+    /// the router (or test) registers each project once via
+    /// [`CronRunner::register_project`].
+    projects: Mutex<Vec<ProjectId>>,
+    /// Per-project timestamp of the most recent tick. New runs only fire for
     /// schedule-times strictly after this anchor.
-    last_tick: Mutex<HashMap<TenantId, DateTime<Utc>>>,
-    /// Per-tenant rolling 60-second log of run-start timestamps. When the
+    last_tick: Mutex<HashMap<ProjectId, DateTime<Utc>>>,
+    /// Per-project rolling 60-second log of run-start timestamps. When the
     /// log has [`CronRunner::PER_MINUTE_RATE_LIMIT`] entries within 60s,
     /// further runs in that window are recorded as rate-limited.
-    rate_log: Mutex<HashMap<TenantId, VecDeque<DateTime<Utc>>>>,
+    rate_log: Mutex<HashMap<ProjectId, VecDeque<DateTime<Utc>>>>,
 }
 
 impl CronRunner {
-    /// Soft cap on runs per tenant per 60-second window.
+    /// Soft cap on runs per project per 60-second window.
     pub const PER_MINUTE_RATE_LIMIT: usize = 60;
 
     /// Build a runner over `engine` with `clock`.
@@ -122,7 +122,7 @@ impl CronRunner {
             inner: Arc::new(RunnerInner {
                 store: CronStore::new(engine),
                 clock,
-                tenants: Mutex::new(Vec::new()),
+                projects: Mutex::new(Vec::new()),
                 last_tick: Mutex::new(HashMap::new()),
                 rate_log: Mutex::new(HashMap::new()),
             }),
@@ -140,36 +140,36 @@ impl CronRunner {
         &self.inner.store
     }
 
-    /// Mark `tenant` as resident. Idempotent. The first registration also
-    /// anchors the per-tenant `last_tick` to "now" so jobs don't fire for
+    /// Mark `project` as resident. Idempotent. The first registration also
+    /// anchors the per-project `last_tick` to "now" so jobs don't fire for
     /// schedule-times in the past.
-    pub async fn register_tenant(&self, tenant: TenantId) {
-        let mut tenants = self.inner.tenants.lock().await;
-        if !tenants.contains(&tenant) {
-            tenants.push(tenant);
+    pub async fn register_project(&self, project: ProjectId) {
+        let mut projects = self.inner.projects.lock().await;
+        if !projects.contains(&project) {
+            projects.push(project);
             let mut anchors = self.inner.last_tick.lock().await;
             anchors
-                .entry(tenant)
+                .entry(project)
                 .or_insert_with(|| self.inner.clock.now());
         }
     }
 
-    /// Run one tick. Walks every registered tenant, computes due jobs, and
+    /// Run one tick. Walks every registered project, computes due jobs, and
     /// executes each due job through the engine. Returns the per-job
     /// outcomes for direct test assertions; `cron_job_run_details` is
     /// also updated.
     ///
     /// "Due" means: there exists a schedule-time `t` such that
-    /// `last_tick(tenant) < t <= now()`. The first matching `t` per job
+    /// `last_tick(project) < t <= now()`. The first matching `t` per job
     /// per tick fires once; multiple matches in one tick still fire once
     /// (Postgres pg_cron has the same coalescing behaviour for missed ticks).
     pub async fn tick(&self) -> Result<Vec<RunOutcome>> {
         let now = self.inner.clock.now();
-        let tenants = self.inner.tenants.lock().await.clone();
+        let projects = self.inner.projects.lock().await.clone();
         let mut outcomes = Vec::new();
-        for tenant in tenants {
-            let tenant_outcomes = self.tick_tenant(&tenant, now).await?;
-            outcomes.extend(tenant_outcomes);
+        for project in projects {
+            let project_outcomes = self.tick_project(&project, now).await?;
+            outcomes.extend(project_outcomes);
         }
         Ok(outcomes)
     }
@@ -180,28 +180,28 @@ impl CronRunner {
         self.tick().await
     }
 
-    async fn tick_tenant(&self, tenant: &TenantId, now: DateTime<Utc>) -> Result<Vec<RunOutcome>> {
+    async fn tick_project(&self, project: &ProjectId, now: DateTime<Utc>) -> Result<Vec<RunOutcome>> {
         let last = {
             let mut anchors = self.inner.last_tick.lock().await;
-            let anchor = anchors.entry(*tenant).or_insert(now);
+            let anchor = anchors.entry(*project).or_insert(now);
             let prev = *anchor;
             *anchor = now;
             prev
         };
 
-        let jobs = self.inner.store.list_jobs(tenant).await?;
+        let jobs = self.inner.store.list_jobs(project).await?;
         let mut outcomes = Vec::new();
         for job in jobs {
             // Inactive jobs: record a Skipped row so the audit log is
             // honest, but don't run the SQL.
             if !job.active {
-                let id = self.inner.store.next_run_detail_id(tenant).await?;
+                let id = self.inner.store.next_run_detail_id(project).await?;
                 let detail = CronRunDetail {
                     id,
                     jobid: job.jobid,
                     runid: id,
                     job_pid: None,
-                    database: tenant.as_prefix(),
+                    database: project.as_prefix(),
                     username: String::new(),
                     command: job.command.clone(),
                     status: JobStatus::Skipped,
@@ -209,9 +209,9 @@ impl CronRunner {
                     start_time: now,
                     end_time: now,
                 };
-                self.inner.store.record_run(tenant, &detail).await?;
+                self.inner.store.record_run(project, &detail).await?;
                 outcomes.push(RunOutcome {
-                    tenant: *tenant,
+                    project: *project,
                     jobid: job.jobid,
                     jobname: job.jobname.clone(),
                     status: JobStatus::Skipped,
@@ -225,13 +225,13 @@ impl CronRunner {
             let schedule = match crate::store::parse_schedule(&job.schedule) {
                 Ok(s) => s,
                 Err(e) => {
-                    let id = self.inner.store.next_run_detail_id(tenant).await?;
+                    let id = self.inner.store.next_run_detail_id(project).await?;
                     let detail = CronRunDetail {
                         id,
                         jobid: job.jobid,
                         runid: id,
                         job_pid: None,
-                        database: tenant.as_prefix(),
+                        database: project.as_prefix(),
                         username: String::new(),
                         command: job.command.clone(),
                         status: JobStatus::Failed,
@@ -239,9 +239,9 @@ impl CronRunner {
                         start_time: now,
                         end_time: now,
                     };
-                    self.inner.store.record_run(tenant, &detail).await?;
+                    self.inner.store.record_run(project, &detail).await?;
                     outcomes.push(RunOutcome {
-                        tenant: *tenant,
+                        project: *project,
                         jobid: job.jobid,
                         jobname: job.jobname.clone(),
                         status: JobStatus::Failed,
@@ -264,10 +264,10 @@ impl CronRunner {
                 continue;
             }
 
-            // Per-tenant rate limit. Window is 60s.
+            // Per-project rate limit. Window is 60s.
             let rate_ok = {
                 let mut log = self.inner.rate_log.lock().await;
-                let entry = log.entry(*tenant).or_default();
+                let entry = log.entry(*project).or_default();
                 let cutoff = now - Duration::seconds(60);
                 while entry.front().is_some_and(|t| *t < cutoff) {
                     entry.pop_front();
@@ -281,13 +281,13 @@ impl CronRunner {
             };
 
             if !rate_ok {
-                let id = self.inner.store.next_run_detail_id(tenant).await?;
+                let id = self.inner.store.next_run_detail_id(project).await?;
                 let detail = CronRunDetail {
                     id,
                     jobid: job.jobid,
                     runid: id,
                     job_pid: None,
-                    database: tenant.as_prefix(),
+                    database: project.as_prefix(),
                     username: String::new(),
                     command: job.command.clone(),
                     status: JobStatus::RateLimited,
@@ -298,9 +298,9 @@ impl CronRunner {
                     start_time: now,
                     end_time: now,
                 };
-                self.inner.store.record_run(tenant, &detail).await?;
+                self.inner.store.record_run(project, &detail).await?;
                 outcomes.push(RunOutcome {
-                    tenant: *tenant,
+                    project: *project,
                     jobid: job.jobid,
                     jobname: job.jobname.clone(),
                     status: JobStatus::RateLimited,
@@ -315,11 +315,11 @@ impl CronRunner {
             let username = self
                 .inner
                 .store
-                .job_username(tenant, job.jobid)
+                .job_username(project, job.jobid)
                 .await?
                 .unwrap_or_else(|| basin_engine::ANONYMOUS_USER.to_string());
             let start = self.inner.clock.now();
-            let res = self.run_one(*tenant, &username, &job.command).await;
+            let res = self.run_one(*project, &username, &job.command).await;
             let end = self.inner.clock.now();
             let (status, message) = match res {
                 Ok(tag) => (JobStatus::Succeeded, tag),
@@ -327,13 +327,13 @@ impl CronRunner {
             };
 
             // Record run-detail audit row.
-            let id = self.inner.store.next_run_detail_id(tenant).await?;
+            let id = self.inner.store.next_run_detail_id(project).await?;
             let detail = CronRunDetail {
                 id,
                 jobid: job.jobid,
                 runid: id,
                 job_pid: None,
-                database: tenant.as_prefix(),
+                database: project.as_prefix(),
                 username: username.clone(),
                 command: job.command.clone(),
                 status,
@@ -341,16 +341,16 @@ impl CronRunner {
                 start_time: start,
                 end_time: end,
             };
-            self.inner.store.record_run(tenant, &detail).await?;
+            self.inner.store.record_run(project, &detail).await?;
             // Touch last_run on the job row.
             let _ = self
                 .inner
                 .store
-                .touch_last_run(tenant, job.jobid, start, status.as_str())
+                .touch_last_run(project, job.jobid, start, status.as_str())
                 .await;
 
             outcomes.push(RunOutcome {
-                tenant: *tenant,
+                project: *project,
                 jobid: job.jobid,
                 jobname: job.jobname.clone(),
                 status,
@@ -362,14 +362,14 @@ impl CronRunner {
         Ok(outcomes)
     }
 
-    /// Execute one statement under `tenant` as `username`. Returns the
+    /// Execute one statement under `project` as `username`. Returns the
     /// command tag on success.
-    async fn run_one(&self, tenant: TenantId, username: &str, sql: &str) -> Result<String> {
+    async fn run_one(&self, project: ProjectId, username: &str, sql: &str) -> Result<String> {
         let sess = self
             .inner
             .store
             .engine()
-            .open_session_as(tenant, username)
+            .open_session_as(project, username)
             .await?;
         match sess.execute(sql).await? {
             ExecResult::Empty { tag } => Ok(tag),

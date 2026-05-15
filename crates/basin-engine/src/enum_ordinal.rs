@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use basin_catalog::{Catalog, EnumTypeDef};
-use basin_common::{Result, TableName, TenantId};
+use basin_common::{Result, TableName, ProjectId};
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableFactor, Value,
 };
@@ -53,7 +53,7 @@ use crate::types::BASIN_ENUM_TYPE_KEY;
 /// the caller's own parse pass will surface the error).
 pub(crate) async fn rewrite_enum_ordering(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     sql: &str,
 ) -> Result<String> {
     // Cheap pre-gate: only Query statements have ORDER BY / WHERE
@@ -74,7 +74,7 @@ pub(crate) async fn rewrite_enum_ordering(
 
     let mut ctx = RewriteCtx {
         catalog,
-        tenant,
+        project,
         // (table, schema_columns) — looked up lazily and cached so
         // a query that references the same table twice only costs one
         // catalog hop.
@@ -97,7 +97,7 @@ pub(crate) async fn rewrite_enum_ordering(
 /// pays one catalog hop per name.
 struct RewriteCtx<'a> {
     catalog: &'a Arc<dyn Catalog>,
-    tenant: &'a TenantId,
+    project: &'a ProjectId,
     /// `(unqualified table name) -> resolved (Schema, optional alias)`.
     /// `None` means resolution failed (the load_table call returned
     /// NotFound or the name isn't a TableName).
@@ -113,7 +113,7 @@ impl<'a> RewriteCtx<'a> {
             return cached.clone();
         }
         let resolved = match TableName::new(table.to_string()) {
-            Ok(t) => match self.catalog.load_table(self.tenant, &t).await {
+            Ok(t) => match self.catalog.load_table(self.project, &t).await {
                 Ok(meta) => Some(meta.schema),
                 Err(_) => None,
             },
@@ -127,7 +127,7 @@ impl<'a> RewriteCtx<'a> {
         if let Some(cached) = self.enums.get(name) {
             return cached.clone();
         }
-        let resolved = self.catalog.lookup_enum_type(self.tenant, name).await;
+        let resolved = self.catalog.lookup_enum_type(self.project, name).await;
         self.enums.insert(name.to_string(), resolved.clone());
         resolved
     }
@@ -429,11 +429,11 @@ mod tests {
     use basin_catalog::InMemoryCatalog;
     use std::collections::HashMap;
 
-    async fn fixture() -> (Arc<dyn Catalog>, TenantId) {
+    async fn fixture() -> (Arc<dyn Catalog>, ProjectId) {
         let cat: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         cat.register_enum_type(EnumTypeDef {
-            tenant,
+            project,
             name: "status".into(),
             labels: vec![
                 "pending".into(),
@@ -452,15 +452,15 @@ mod tests {
         let name_field = Field::new("name", DataType::Utf8, true);
         let schema = Schema::new(vec![id_field, status_field, name_field]);
         let table = TableName::new("orders".to_string()).unwrap();
-        cat.create_table(&tenant, &table, &schema).await.unwrap();
+        cat.create_table(&project, &table, &schema).await.unwrap();
         // A second table with no enum column, for negative tests.
         let plain = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("note", DataType::Utf8, true),
         ]);
         let plain_t = TableName::new("notes".to_string()).unwrap();
-        cat.create_table(&tenant, &plain_t, &plain).await.unwrap();
-        (cat, tenant)
+        cat.create_table(&project, &plain_t, &plain).await.unwrap();
+        (cat, project)
     }
 
     #[tokio::test]

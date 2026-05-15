@@ -4,7 +4,7 @@
 //! added. If contention (mutex, single-threaded executor, IO serialization)
 //! dominates, this test catches it — adding more cores wouldn't help.
 //!
-//! Setup: one tenant, one table, 1M rows in a single Parquet file.
+//! Setup: one project, one table, 1M rows in a single Parquet file.
 //! For C in [1, 4, 16, 64], spawn C tasks. Each task runs random-id point
 //! queries on a shared deadline (3 seconds). At deadline they return their
 //! count. total_qps = sum / 3.
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -81,14 +81,14 @@ async fn scaling_3_concurrency() {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
     // Seed: one big Parquet file with 1M rows.
     let batch = build_batch(0, ROWS);
     storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .unwrap();
 
@@ -125,7 +125,7 @@ async fn scaling_3_concurrency() {
                         ..Default::default()
                     };
                     let q_start = Instant::now();
-                    let mut stream = storage.read(&tenant, &table, opts).await.unwrap();
+                    let mut stream = storage.read(&project, &table, opts).await.unwrap();
                     while let Some(b) = stream.next().await {
                         let _ = b.unwrap();
                     }

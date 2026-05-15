@@ -80,7 +80,7 @@ Adding projects beyond 100: $0.50/mo each.
 - **Compliance** — SOC2 Type II report, HIPAA BAA, GDPR DPA on request
 - **99.99% uptime SLA**
 - **Audit log export** to your SIEM (Splunk, Datadog, Sumo Logic)
-- **Dedicated compute** — single-tenant Fly Machine pools, no shared neighbours
+- **Dedicated compute** — single-project Fly Machine pools, no shared neighbours
 - **Custom data residency** — pick which regions your data lives in; cross-region replication on request
 - Custom contracts, MSA, indemnification
 - Named TAM, 1-hour P1 response
@@ -246,4 +246,4 @@ customers run on whatever object store they bring.
 - [Self-host the OSS engine](./README.md#quickstart) — Apache-2.0, run anywhere
 - [Read the architecture](./docs/architecture.md) — full stack, four layers
 - [Compare capabilities](./CAPABILITIES.md) — every feature, status-tagged
-- [Multi-project SaaS story](./docs/multi-tenancy.md) — per-project isolation, scheduler, cost math
+- [Multi-project SaaS story](./docs/multi-project.md) — per-project isolation, scheduler, cost math

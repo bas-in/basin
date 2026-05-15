@@ -1045,13 +1045,15 @@ mod tests {
 
     #[test]
     fn test_rewrite_every() {
+        // The rewriter preserves PG's output column label (`every`) via an
+        // explicit alias so result-set column names match Postgres.
         assert_eq!(
             rewrite_every_to_bool_and("SELECT every(x) FROM t"),
-            "SELECT bool_and(x) FROM t"
+            "SELECT bool_and(x) AS every FROM t"
         );
         assert_eq!(
             rewrite_every_to_bool_and("SELECT EVERY(x) FROM t"),
-            "SELECT bool_and(x) FROM t"
+            "SELECT bool_and(x) AS every FROM t"
         );
         // Should not rewrite when part of a larger identifier.
         assert_eq!(

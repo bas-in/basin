@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cron::{CronRunner, JobStatus, TestClock};
 use basin_engine::{Engine, EngineConfig};
 use chrono::{Duration, TimeZone, Utc};
@@ -32,17 +32,17 @@ async fn tick_at_t0_runs_due_minutely_job_once() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     // Anchor the test clock at a known instant. We pick a moment one second
     // before the start of a minute so the next minute boundary lies between
     // T0 and T0+60s.
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 30, 59).unwrap();
     let clock = TestClock::new(t0);
     let runner = CronRunner::new(eng.clone(), Arc::new(clock.clone()));
-    runner.register_tenant(tenant).await;
+    runner.register_project(project).await;
 
     // Seed a side-effect target table for the job to write into.
-    let admin = eng.open_session(tenant).await.unwrap();
+    let admin = eng.open_session(project).await.unwrap();
     admin
         .execute("CREATE TABLE markers (id BIGINT NOT NULL)")
         .await
@@ -52,7 +52,7 @@ async fn tick_at_t0_runs_due_minutely_job_once() {
     runner
         .store()
         .schedule(
-            &tenant,
+            &project,
             "alice",
             "every-minute",
             "* * * * *",
@@ -80,13 +80,13 @@ async fn tick_at_t30s_does_not_run_again_within_the_same_minute() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 31, 5).unwrap();
     let clock = TestClock::new(t0);
     let runner = CronRunner::new(eng.clone(), Arc::new(clock.clone()));
-    runner.register_tenant(tenant).await;
+    runner.register_project(project).await;
 
-    let admin = eng.open_session(tenant).await.unwrap();
+    let admin = eng.open_session(project).await.unwrap();
     admin
         .execute("CREATE TABLE markers (id BIGINT NOT NULL)")
         .await
@@ -94,7 +94,7 @@ async fn tick_at_t30s_does_not_run_again_within_the_same_minute() {
     runner
         .store()
         .schedule(
-            &tenant,
+            &project,
             "alice",
             "every-minute",
             "* * * * *",
@@ -130,13 +130,13 @@ async fn tick_at_t60s_runs_again_after_one_minute() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 32, 5).unwrap();
     let clock = TestClock::new(t0);
     let runner = CronRunner::new(eng.clone(), Arc::new(clock.clone()));
-    runner.register_tenant(tenant).await;
+    runner.register_project(project).await;
 
-    let admin = eng.open_session(tenant).await.unwrap();
+    let admin = eng.open_session(project).await.unwrap();
     admin
         .execute("CREATE TABLE markers (id BIGINT NOT NULL)")
         .await
@@ -144,7 +144,7 @@ async fn tick_at_t60s_runs_again_after_one_minute() {
     runner
         .store()
         .schedule(
-            &tenant,
+            &project,
             "alice",
             "every-minute",
             "* * * * *",

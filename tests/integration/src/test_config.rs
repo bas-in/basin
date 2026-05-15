@@ -54,7 +54,7 @@ pub struct S3Config {
     pub allow_http: bool,
     /// Force HTTP/2-only on the S3 client. When true, reqwest multiplexes
     /// many concurrent streams over a single TCP socket — eliminates
-    /// HTTP/1.1 head-of-line blocking when a single tenant's bulk reads
+    /// HTTP/1.1 head-of-line blocking when a single project's bulk reads
     /// would otherwise tie up every keep-alive connection. Default false:
     /// HTTP/1.1 with the connection pool. Real AWS S3 / R2 / GCS support
     /// HTTP/2 over TLS and benefit from this; local MinIO over plain HTTP
@@ -202,17 +202,17 @@ impl S3Config {
         use object_store::ClientOptions;
 
         // Bump the per-host idle pool floor well above reqwest's default
-        // (~32). Real-S3 multi-tenant workloads otherwise serialise behind
-        // the pool's limit and a noisy tenant's full scan starves a quiet
-        // tenant's point reads. 256 is generous enough that the pool is
+        // (~32). Real-S3 multi-project workloads otherwise serialise behind
+        // the pool's limit and a noisy project's full scan starves a quiet
+        // project's point reads. 256 is generous enough that the pool is
         // never the proximate bottleneck on the workloads in
-        // `tests/integration/tests/s3_*`; tenant fairness is then
-        // guaranteed by `basin-storage`'s per-tenant semaphore on top.
+        // `tests/integration/tests/s3_*`; project fairness is then
+        // guaranteed by `basin-storage`'s per-project semaphore on top.
         let mut client_opts = ClientOptions::new().with_pool_max_idle_per_host(256);
 
         // HTTP/2 multiplexes many concurrent requests over a single TCP
         // socket — eliminates HTTP/1.1 head-of-line blocking that would
-        // otherwise let a single tenant's bulk transfer tie up the pool.
+        // otherwise let a single project's bulk transfer tie up the pool.
         // See `S3Config::http2_only`. Auto-enable h2 over HTTPS endpoints
         // (ALPN negotiates safely; h2-over-TLS is the universal mode for
         // AWS S3 / R2 / GCS). Only h2c (cleartext h2) over plain HTTP is

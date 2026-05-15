@@ -1,10 +1,10 @@
 # Basin — Build Task List
 
-Bucket-native, multi-tenant, Postgres-compatible database. Phased build per the
+Bucket-native, multi-project, Postgres-compatible database. Phased build per the
 project brief. Every box should be small enough that a single PR closes it.
 
 **Scope:** this file is the **core DB / open-source** roadmap — pgwire /
-SQL / storage / catalog / query engine / multi-tenancy / caches /
+SQL / storage / catalog / query engine / multi-project / caches /
 indexes / WAL / compactor / vector search / Postgres-extension
 equivalents / **basin-auth** (identity) / **basin-rest** (PostgREST
 equivalent). The full open-source bundle a self-hoster gets when they
@@ -31,8 +31,8 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred / out of
 ## Local PoC milestone — reached 2026-04-30
 
 A single-process Basin server speaks pgwire end-to-end. CREATE TABLE / INSERT
-/ SELECT round-trip via `psql`; tenant data lands as Parquet under
-`/tenants/{ulid}/...`; a multi-tenant smoke test proves cross-tenant
+/ SELECT round-trip via `psql`; project data lands as Parquet under
+`/projects/{ulid}/...`; a multi-project smoke test proves cross-project
 isolation across the real TCP path. Binary is `services/basin-server`.
 
 This collapses Phase 2/3/4 production layers (Raft WAL, distributed shard
@@ -46,7 +46,7 @@ See `README.md` "Try the PoC" for usage.
 ## Phase 0 — Validate the wedge (1 month)
 
 - [ ] Identify 20 candidate companies in the three target segments
-      (multi-tenant SaaS, agent platforms, audit-heavy fintech)
+      (multi-project SaaS, agent platforms, audit-heavy fintech)
 - [ ] Run 20 customer interviews on the wedge question
 - [ ] Sign 3–5 named design partners willing to try the alpha
 - [ ] Write the PRD: pains, target ICP, non-goals, success metrics
@@ -55,9 +55,9 @@ See `README.md` "Try the PoC" for usage.
 ## Phase 1 — Storage substrate (2–3 months)
 
 - [x] Cargo workspace + crate skeletons (`crates/basin-*`, `services/*`)
-- [x] `basin-common`: `TenantId`, `PartitionKey`, error enum, telemetry init
+- [x] `basin-common`: `ProjectId`, `PartitionKey`, error enum, telemetry init
 - [x] `basin-storage`: write Arrow `RecordBatch` → Parquet under
-      `/tenants/{id}/tables/{table}/data/yyyy/mm/dd/{ulid}.parquet`
+      `/projects/{id}/tables/{table}/data/yyyy/mm/dd/{ulid}.parquet`
 - [x] `basin-storage`: read with predicate + projection pushdown
 - [x] `basin-storage`: pluggable `object_store` backend (local fs, S3, R2, GCS
       — backend is whatever `dyn ObjectStore` the caller passes)
@@ -68,8 +68,8 @@ See `README.md` "Try the PoC" for usage.
       — trait shape locked, `RestCatalog` is a stub. Wire up in Phase 2/3.
 - [x] `basin-catalog`: atomic `append_data_files` commits, snapshot listing
       (in-memory; same semantics will apply to the REST impl)
-- [x] Per-tenant prefix enforcement at the storage API boundary
-- [x] Integration test: 1M rows × 100 tenants, round-trip + cross-tenant isolation
+- [x] Per-project prefix enforcement at the storage API boundary
+- [x] Integration test: 1M rows × 100 projects, round-trip + cross-project isolation
       (`tests/integration/tests/phase1_substrate.rs`, runs in <2s)
 - [x] Bench: predicate pushdown reduces bytes read by ≥ 10× for selective
       scans — `tests/integration/tests/viability_predicate_pushdown.rs`
@@ -82,7 +82,7 @@ See `README.md` "Try the PoC" for usage.
       cross-process Raft WAL remains v0.2; v0.1 ships single-node/object-store
       WAL behind the same `Wal` trait so the swap is a backend change
 - [x] `basin-wal`: file-backed single-node WAL, append keyed by
-      `(tenant_id, partition)` with monotonic per-partition LSN
+      `(project_id, partition)` with monotonic per-partition LSN
 - [x] Batched flush to object storage every 200 ms or 1 MB
 - [x] Recovery: list segments and replay on `Wal::open`
 - [x] Bench: **57k writes/sec debug, 954k writes/sec release** (well over
@@ -91,8 +91,8 @@ See `README.md` "Try the PoC" for usage.
 
 ## Phase 3 — Shard owners (2–3 months) — **v0.1 shipped**
 
-- [x] `basin-shard`: in-process map `(tenant, partition) → in-mem state`
-- [x] Lazy load tenant state from WAL + Parquet on first request
+- [x] `basin-shard`: in-process map `(project, partition) → in-mem state`
+- [x] Lazy load project state from WAL + Parquet on first request
 - [x] Idle eviction (default 5 min) with metrics
 - [x] Write path: WAL append → ack → in-mem state update
 - [x] Read path: in-RAM tail merged with Parquet base; predicate eval on tail
@@ -142,28 +142,28 @@ See `README.md` "Try the PoC" for usage.
       (aggregate / GROUP BY / `/*+ analytical */` hint)
 - [-] Bench: 10 TB Iceberg scan — deferred (1M-row covers the wedge)
 
-## Phase 5.5 — Sharding axes beyond per-tenant (1–3 months)
+## Phase 5.5 — Sharding axes beyond per-project (1–3 months)
 
-The primary sharding axis is per-tenant prefix (already structural). At
+The primary sharding axis is per-project prefix (already structural). At
 scale, four secondary axes show up; each gets its own work item with
 explicit tests.
 
-- [x] **Within-tenant time-based partitioning**: `CREATE TABLE … PARTITION
+- [x] **Within-project time-based partitioning**: `CREATE TABLE … PARTITION
       BY RANGE (ts)`; reader prunes partitions for time-range predicates.
 - [x] **Compute sharding (router → shard owners)**: consistent hashing
-      tenant_id → shard_id; 28% max load skew measured; restart survival.
+      project_id → shard_id; 28% max load skew measured; restart survival.
       Cross-shard JOIN deferred.
 - [x] **Tiered storage (hot/cold)**: `ALTER TABLE … SET cold_after = N`;
       compactor moves files between tiers on a sweep. Provider-level
       infrequent-access lifecycle rules wired in.
-- [x] **Within-tenant whale handling (sub-shard)**: tenant pinning via
-      `BASIN_TENANT_PINS=ulid:idx,...` env var; pinned tenants always
+- [x] **Within-project whale handling (sub-shard)**: project pinning via
+      `BASIN_PROJECT_PINS=ulid:idx,...` env var; pinned projects always
       land on the configured shard endpoint regardless of consistent
       hash. v0.2 will move pins into the catalog so they survive cluster
       restart and can be edited at runtime. Original line preserved
       below for context:
-      **Within-tenant whale handling (sub-shard)**: a 100×-larger
-      tenant gets pinned to a dedicated shard owner with bigger
+      **Within-project whale handling (sub-shard)**: a 100×-larger
+      project gets pinned to a dedicated shard owner with bigger
       compute. Cheap because data stays in shared object storage. Folds into the
       compute-sharding work — same router, just pinned mapping.
 
@@ -193,9 +193,9 @@ risk/effort, ordered to ship value early.
       bars not moved here pending that.**
 
 **B. Indexing + clustering (8 weeks, real Postgres-class point queries):**
-- [ ] **B1 Per-tenant secondary indexes** — B-tree mapping
+- [ ] **B1 Per-project secondary indexes** — B-tree mapping
       `(table, indexed_col) → (file, row_group, row)`. Stored as a
-      separate per-tenant file. Cached in RAM. `CREATE INDEX` SQL.
+      separate per-project file. Cached in RAM. `CREATE INDEX` SQL.
       **Flagged as the biggest remaining point-query win in CAPABILITIES.md.**
 - [x] **B2 Range-partitioned / Z-ordered files** — physically sorts data
       so related rows live in the same file; combined with A3 bloom
@@ -214,14 +214,14 @@ risk/effort, ordered to ship value early.
       ships; small row groups for point-heavy tables.
 
 **C. Hot tier (6-8 weeks, the architectural commitment):**
-- [ ] **C1 In-memory hot ring** — per-tenant ring buffer for recent
+- [ ] **C1 In-memory hot ring** — per-project ring buffer for recent
       writes (last 5 min or 100k rows, whichever first). Flushes to
       Parquet on threshold or timer. Reads check ring first, fall
       through to Parquet. Solves "90% of reads are on last week of
       data" for audit-log / event-store / time-series shapes.
-- [ ] **C2 Embedded RocksDB hot tier (alt path)** — for tenants with
+- [ ] **C2 Embedded RocksDB hot tier (alt path)** — for projects with
       larger hot working sets that don't fit in RAM. Optional, gated
-      by tenant config.
+      by project config.
 
 Decision points:
 - A1+A2+A3 alone may be enough to ship sub-10ms warm point queries —
@@ -235,18 +235,18 @@ Decision points:
       `cron.unschedule` + `cron.job` + `cron.job_run_details`.
       Background runner per shard. SQL surface (`cron_glue`) lands in v0.2.
 - [x] **basin-net** — sync `http_get`/`http_post`; async `net.http_post`
-      with `net._http_response` table. Per-tenant URL allowlist (DENY-ALL
+      with `net._http_response` table. Per-project URL allowlist (DENY-ALL
       default), 10 req/s rate limit (burst 30), 10 MiB body cap, 30s timeout.
       SQL surface lands in v0.2.
 
 ## Phase 5.6 — Row-level security (1 month) — **v0.1 shipped**
 
 - [x] `CREATE POLICY` SQL surface (Postgres-compatible syntax).
-- [x] Catalog stores per-tenant per-table policies.
+- [x] Catalog stores per-project per-table policies.
 - [x] Engine injects predicate filters for `current_user` /
       `current_role` at the logical-plan layer.
 - [x] Tests: same-table queries return different rows for different
-      authenticated principals; cross-tenant leak invariant verified.
+      authenticated principals; cross-project leak invariant verified.
 
 ## Phase 5.9 — Postgres-extension equivalents (ongoing) — **v0.1 shipped**
 
@@ -256,7 +256,7 @@ surface lands in v0.2 once engine planner is extended to register
 the corresponding `ScalarUDF`s.
 
 - [x] **basin-cv** — TimescaleDB continuous-aggregate equivalent. `CvSpec`
-      + `CvRefresher::tick`; per-tenant materialization. v0.1 full
+      + `CvRefresher::tick`; per-project materialization. v0.1 full
       re-execution; incremental refresh deferred to v0.2.
 - [x] **basin-trgm** — pg_trgm equivalent. `similarity`,
       `word_similarity`, `extract`. v0.1 brute-force; GIN trigram index
@@ -283,36 +283,36 @@ this OSS roadmap.
 
 - [x] Postgres-backed user store, bcrypt password hashing, JWT
       issuance + verification (HS256), role/membership tables,
-      `current_user`-aware tenant resolution.
-- [x] `JwtTenantResolver`, `ApiKeyTenantResolver`, and
-      `TenantCredentialsResolver` auto-mount on pgwire when
+      `current_user`-aware project resolution.
+- [x] `JwtProjectResolver`, `ApiKeyProjectResolver`, and
+      `ProjectCredentialsResolver` auto-mount on pgwire when
       `BASIN_AUTH_ENABLED=1`; provisioned pgwire credentials are
-      bcrypt-validated and static `BASIN_TENANTS` users are limited to
+      bcrypt-validated and static `BASIN_PROJECTS` users are limited to
       auth bootstrap/internal use instead of accepting arbitrary passwords.
 - [x] REST endpoints for issue / verify / refresh.
-- [x] Email-link login — tenant-agnostic `auth_magic_links` table +
+- [x] Email-link login — project-agnostic `auth_magic_links` table +
       `AuthService::{request,consume}_email_link`; REST endpoints
       `POST /auth/v1/magic-link` (204 No Content; never confirms whether
       the email exists) and `POST /auth/v1/magic-link/consume`. Returns
       503 / `E_EMAIL_DISABLED` when SMTP is unconfigured.
-- [x] Per-tenant API-key tokens (long-lived, revocable, separate from
+- [x] Per-project API-key tokens (long-lived, revocable, separate from
       session JWTs) — `auth_api_keys` table + `AuthService::{issue,
-      validate, revoke, list}_api_key`; `ApiKeyTenantResolver` stacks
+      validate, revoke, list}_api_key`; `ApiKeyProjectResolver` stacks
       with the JWT resolver in `basin-server/src/main.rs`; REST
       endpoints `POST/GET /auth/v1/api-keys` and `DELETE /auth/v1/api-keys/{id}`.
-- [x] Per-tenant pgwire connection URLs (the managed-Postgres feel) —
-      `auth_tenant_credentials` table + `AuthService::{provision,
-      validate, rotate, list}_tenant_credentials` (public methods on
-      `AuthService`); `TenantCredentialsResolver` extends the resolver
+- [x] Per-project pgwire connection URLs (the managed-Postgres feel) —
+      `auth_project_credentials` table + `AuthService::{provision,
+      validate, rotate, list}_project_credentials` (public methods on
+      `AuthService`); `ProjectCredentialsResolver` extends the resolver
       trait with `resolve_credentials(user, password)` so the pgwire
       startup handler bcrypt-validates and rejects with SQLSTATE
       `28P01` on mismatch (uniform error — no user-existence leak).
       `Claims::is_admin` gates three new REST endpoints under
-      `/admin/v1/tenants/*`: provision returns `postgres://...`, rotate
+      `/admin/v1/projects/*`: provision returns `postgres://...`, rotate
       invalidates the old password, list emits descriptors only.
-      Cross-tenant isolation under per-tenant URLs is integration-tested
-      (UNION + CTE bypass blocked); within-tenant RLS still applies.
-      `BASIN_TENANTS=alice=*` remains a dev/bootstrap map when auth is
+      Cross-project isolation under per-project URLs is integration-tested
+      (UNION + CTE bypass blocked); within-project RLS still applies.
+      `BASIN_PROJECTS=alice=*` remains a dev/bootstrap map when auth is
       disabled, and no longer acts as a passwordless customer fallback when
       auth is enabled.
       `BASIN_AUTH_PGWIRE_PUBLIC_HOST` env var configures the host:port
@@ -338,17 +338,17 @@ this OSS roadmap.
       sentinel that invalidates every outstanding refresh JWT for that
       user. Stale rows are filtered out at lookup (`expires_at > now()`);
       a periodic GC daemon is deferred.
-- [x] **Auth per-tenant schema** — migrate auth tables from reserved
-      internal tenant to each tenant's own storage namespace; provisioned
-      at tenant creation via `Engine::open_session_as`. See ADR 0013.
+- [x] **Auth per-project schema** — migrate auth tables from reserved
+      internal project to each project's own storage namespace; provisioned
+      at project creation via `Engine::open_session_as`. See ADR 0013.
 - [x] **`AuthStore` trait** — `basin-auth` defines trait + `PostgresAuthStore`;
       `EngineAuthStore` lives in `basin-server` (passed as `Arc<dyn AuthStore>`).
       `AuthService::with_store(cfg, Arc<dyn AuthStore>)` replaces `Mutex<Client>`.
-- [x] **Self-routing credentials** — `pgwire_user` format → `{tenant_id}_{hex}`;
-      API keys embed tenant prefix. Removes global credential lookup table.
+- [x] **Self-routing credentials** — `pgwire_user` format → `{project_id}_{hex}`;
+      API keys embed project prefix. Removes global credential lookup table.
 - [x] **Remove loopback startup** — delete `DeferredAuthResolver`,
-      `wait_for_pgwire_accept`, `INTERNAL_AUTH_TENANT_ID` static injection.
-      Auth starts before pgwire; `StackedTenantResolver` built directly.
+      `wait_for_pgwire_accept`, `INTERNAL_AUTH_PROJECT_ID` static injection.
+      Auth starts before pgwire; `StackedProjectResolver` built directly.
 - [x] **`auth.uid()` / `auth.role()` / `auth.jwt()`** — SQL session functions
       in the `auth` schema, set from JWT claims at connection time. Enables
       Supabase-style `CREATE POLICY … USING (user_id = auth.uid())`.
@@ -358,7 +358,7 @@ this OSS roadmap.
       **Shipped. Supabase-compatible session functions. Both `auth.uid()` and
       `auth_uid()` spellings work.**
 - [ ] **Conformance tests** — against `EngineAuthStore` and `PostgresAuthStore`
-      (skip PG if unavailable): user uniqueness per tenant, cross-tenant same
+      (skip PG if unavailable): user uniqueness per project, cross-project same
       email, single-use tokens, refresh rotation, API key lifecycle,
       self-routing credential parsing.
 
@@ -366,7 +366,7 @@ this OSS roadmap.
 
 Requires `BASIN_AUTH_ENABLED=1` per ADR.
 
-- [x] CRUD endpoints over the JWT-resolved tenant (GET / POST / DELETE)
+- [x] CRUD endpoints over the JWT-resolved project (GET / POST / DELETE)
 - [x] Engine `UPDATE` / `DELETE` (Iceberg copy-on-write) — unblocks the
       REST `PATCH` codec
 - [x] `PATCH` codec wired to engine `UPDATE` — `build_update_sql`
@@ -387,9 +387,9 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
       lands as a final `{"_basin_next_cursor":"…"}` NDJSON line.
       Asserted by `streaming_response_for_large_payload`.
 - [x] OpenAPI / Swagger schema generation from catalog metadata —
-      `GET /rest/v1/_openapi.json` returns a per-tenant OpenAPI 3.0.3
+      `GET /rest/v1/_openapi.json` returns a per-project OpenAPI 3.0.3
       spec built from `Catalog::list_tables` + `load_table`. Auth-gated
-      so each tenant only sees its own tables. Type mapping covers
+      so each project only sees its own tables. Type mapping covers
       every Arrow `DataType` Basin's DDL produces (incl. JSONB / UUID
       via the `BASIN_TYPE` field metadata, and `VECTOR(N)` via
       `FixedSizeList<Float32>`).
@@ -457,7 +457,7 @@ Forward-compat substrate. Tier 1 phases don't depend on this; Tier 2
 phases (reactors + webhooks) do. Cheap to ship now so the executor
 commit path doesn't get re-touched repeatedly.
 
-- [ ] `ChangeEvent { tenant, table, op, before, after, committed_at,
+- [ ] `ChangeEvent { project, table, op, before, after, committed_at,
       seq, causation_user }` in `basin-common::events`. Stable public
       contract — adding fields fine, renaming breaking.
 - [ ] `ChangeEventSink` trait (async `publish(&ChangeEvent) -> Result<()>`)
@@ -470,7 +470,7 @@ commit path doesn't get re-touched repeatedly.
 - [ ] `Engine::attach_pre_commit_sink` + `Engine::attach_post_commit_sink`.
 - [ ] Capture point in executor's INSERT/UPDATE/DELETE path — exactly
       once per committed mutation; serialized by the existing
-      per-`(tenant, table)` snapshot ID ordering.
+      per-`(project, table)` snapshot ID ordering.
 - [ ] One trivial `TracingSink` (logs each event via `tracing::info!`)
       for debug demos; opt-in via env var, default off.
 - [ ] Test: zero-sink path is byte-identical to today (no allocation,
@@ -551,7 +551,7 @@ Reusable typed constraints. Every modern PG schema uses enums for
 status columns; domains for reusable validations.
 
 - [ ] `CREATE TYPE order_status AS ENUM ('pending', 'paid', ...)` parser
-      + catalog (`enum_types` table; one row per `(tenant, name,
+      + catalog (`enum_types` table; one row per `(project, name,
       ordered_labels)`).
 - [ ] `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)` parser +
       catalog.
@@ -592,7 +592,7 @@ attached as **pre-commit** so reactor failures abort the mutation.
 - [ ] `ALTER TABLE … REACT ON {INSERT|UPDATE|DELETE} [WHEN (predicate)]
       EXECUTE <sql_statement>` parser surface.
 - [ ] Reactor registry in catalog (`reactors` table; one row per
-      `(tenant, table, name, ops, when_predicate, body)`).
+      `(project, table, name, ops, when_predicate, body)`).
 - [ ] `ReactorSink` impl: on event, evaluate `WHEN` predicate, run body
       via existing engine path with `NEW` / `OLD` / `TG_OP` /
       `TG_TABLE_NAME` substituted.
@@ -603,8 +603,8 @@ attached as **pre-commit** so reactor failures abort the mutation.
 
 #### 5.11.C2 — Constraint-shaped reactors (`REACT … CONSTRAINT`) (~1 week, depends on 5.11.C)
 
-Tenant-scoped invariant enforcement without a body. Covers "max 100
-rows per tenant", "free-tier caps", "hierarchical depth limit".
+Project-scoped invariant enforcement without a body. Covers "max 100
+rows per project", "free-tier caps", "hierarchical depth limit".
 
 - [ ] `ALTER TABLE … REACT ON INSERT CONSTRAINT (predicate)` —
       predicate evaluated against NEW + the current table state; if
@@ -612,7 +612,7 @@ rows per tenant", "free-tier caps", "hierarchical depth limit".
 - [ ] Test: cap-at-N rejection works; cap-at-N allows under the cap;
       constraint with subquery against a sibling table works.
 
-#### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0) ✅ shipped (machinery: `crates/basin-webhooks` ships `WebhookSink` + retry queue + dead-letter + per-tenant counters/p99-latency observability; `ALTER TABLE … SUBSCRIBE WEBHOOK` / `UNSUBSCRIBE WEBHOOK` SQL surface; predicate evaluation via `predicate_eval` module against ChangeEvent JSON payload)
+#### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0) ✅ shipped (machinery: `crates/basin-webhooks` ships `WebhookSink` + retry queue + dead-letter + per-project counters/p99-latency observability; `ALTER TABLE … SUBSCRIBE WEBHOOK` / `UNSUBSCRIBE WEBHOOK` SQL surface; predicate evaluation via `predicate_eval` module against ChangeEvent JSON payload)
 
 Replaces "trigger fires HTTP" with a retryable, idempotency-keyed
 fanout. `WebhookSink` implements `ChangeEventSink`, attached as
@@ -627,7 +627,7 @@ the actual HTTP path.
       exponential backoff to the configured URL via `basin-net`.
 - [ ] Dead-letter after `max_retries` (configurable, default 16);
       surface dead letters via a `webhook_dead_letters` table.
-- [ ] Reuses basin-net's URL allowlist + per-tenant rate limit + body
+- [ ] Reuses basin-net's URL allowlist + per-project rate limit + body
       cap + timeout — already tested.
 - [ ] Stale-subscription cleanup: customer endpoint down for > 24h →
       auto-pause subscription + audit log entry; resume requires
@@ -658,7 +658,7 @@ Sequence of SQL statements with parameter binding, no control flow.
 - [ ] `CALL name(args)` — runs each statement in order with arguments
       substituted; transactional once Phase 5 single-shard transactions
       ship; until then, best-effort sequential.
-- [ ] Test: `CALL archive_tenant(t)` round-trip; multi-tenant isolation
+- [ ] Test: `CALL archive_project(t)` round-trip; multi-project isolation
       preserved through the call; failure mid-procedure leaves earlier
       statements applied (until single-shard transactions ship).
 
@@ -684,17 +684,17 @@ Custom auto-increment, gap-tolerant counters. Most new SaaS uses ULID/
 UUID, but a real slice still wants sequences for human-readable IDs.
 
 - [ ] `CREATE SEQUENCE name [START n] [INCREMENT n]` parser + catalog
-      (`sequences` table; per-tenant; persisted current value).
+      (`sequences` table; per-project; persisted current value).
 - [ ] `nextval(name)`, `currval(name)`, `setval(name, n)` functions.
 - [ ] `DEFAULT nextval('seq_name')` column default integration.
-- [ ] Concurrent-safety: per-`(tenant, sequence)` mutex around the
+- [ ] Concurrent-safety: per-`(project, sequence)` mutex around the
       increment; cached blocks of N for high-rate sequences (cache
       size from `WITH CACHE n` clause).
 - [ ] `DROP SEQUENCE` (cascade if columns reference it).
 - [ ] Test: 10 concurrent `nextval` calls produce 10 distinct values;
       cache flushed on engine restart (gap is acceptable, duplicate
-      is not); cross-tenant isolation (tenant A's `nextval` doesn't
-      touch tenant B's sequence).
+      is not); cross-project isolation (project A's `nextval` doesn't
+      touch project B's sequence).
 
 ### Tier 3 — Larger asks
 
@@ -711,7 +711,7 @@ catalog queries on startup.**
       `.parameters`, `.views`, `.schemata`.
 - [ ] `pg_catalog.pg_class`, `.pg_attribute`, `.pg_namespace`,
       `.pg_index`, `.pg_constraint`, `.pg_type`, `.pg_proc`, `.pg_am`.
-- [ ] Tenant-scoped: each tenant sees only its own objects in catalog
+- [ ] Project-scoped: each project sees only its own objects in catalog
       views (RLS-style filter built into the view definition).
 - [ ] Tooling integration tests: PostgREST startup against Basin
       succeeds; pgAdmin schema-browser populates correctly; a
@@ -764,7 +764,7 @@ The trade-offs:
 
 - **Lose:** the "drop in any PG schema unchanged" claim. Customers
   with deeply legacy enterprise PG schemas are not Basin's wedge.
-- **Win:** wedge clarity ("the multi-tenant DB designed for new
+- **Win:** wedge clarity ("the multi-project DB designed for new
   SaaS"), bounded engineering scope, no permanent PL/pgSQL maintenance
   load, clean trait-shaped extensibility for future sinks, no novel
   realtime infrastructure shipped speculatively.
@@ -785,7 +785,7 @@ conditions in its "Trigger to revisit" section are met.
       logical replication); implementation phases tracked there. v0.1
       implementation deferred per the ADR's own milestone gating.
 - [~] Point-in-time restore via Iceberg snapshots — v0.1 catalog-level
-      `Catalog::rollback_to_snapshot(tenant, table, snapshot_id)` ships
+      `Catalog::rollback_to_snapshot(project, table, snapshot_id)` ships
       (InMemory + Postgres impls; truncates history to ≤ target,
       rewinds head pointer). v0.2 follow-up: physical file GC of
       orphaned post-rollback Parquet files (today the OLTP listing-based
@@ -795,24 +795,24 @@ conditions in its "Trigger to revisit" section are met.
       replaced files are physically deleted at commit (soft-delete is
       a v0.2 prerequisite for cross-DML rollback).
 - [~] Branching / forking via copy-on-write catalog metadata — v0.1
-      catalog-level `Catalog::fork_table(tenant, src, dst)` ships
+      catalog-level `Catalog::fork_table(project, src, dst)` ships
       (InMemory + Postgres impls). New table inherits source's schema /
       snapshot history / partition spec / RLS / tier / bloom / row-group
       / CV settings; data files are *shared by reference* (no Parquet
-      copy). v0.2: cross-tenant forking (needs refcount-aware GC).
+      copy). v0.2: cross-project forking (needs refcount-aware GC).
 - [x] Migration Manager v0.2 catalog ops shipped (project-wide list /
       diff / rollback; default fan-out + Postgres single-query
       optimisation).
 - [ ] Cross-shard 2PC
 - [x] Connection pooling (✅ ADR 0007), rate limiting (✅ pgwire side:
-      `BASIN_PGWIRE_RATE_LIMIT_QPS=100` token-bucket per tenant via
+      `BASIN_PGWIRE_RATE_LIMIT_QPS=100` token-bucket per project via
       `governor`, mapped to SQLSTATE 53400; basin-net side ✅), cost-based
       query rejection (✅ v0.1: `BASIN_QUERY_COST_LIMIT_ROWS=N` rejects
       single-table SELECTs that estimate above the cap with SQLSTATE
       54000; multi-FROM / JOIN / sub-query / explicit-LIMIT pass through
       unchecked. v0.2 will use A4 catalog `ColumnStats` for selectivity-
       aware estimates on multi-table shapes.)
-- [x] Per-tenant + per-query + per-shard + per-WAL telemetry — `basin_common::TenantCounterRegistry` aggregates ops/bytes_read/bytes_written/errors + ring-window p99 latency per tenant; `Engine::tenant_counters(&TenantId) -> TenantCountersSnapshot` exposes a cheap snapshot. Storage writer/reader and WAL append are wired to bump per-tenant byte counters; engine `TenantSession::execute` bumps op + latency + error.
+- [x] Per-project + per-query + per-shard + per-WAL telemetry — `basin_common::ProjectCounterRegistry` aggregates ops/bytes_read/bytes_written/errors + ring-window p99 latency per project; `Engine::project_counters(&ProjectId) -> ProjectCountersSnapshot` exposes a cheap snapshot. Storage writer/reader and WAL append are wired to bump per-project byte counters; engine `ProjectSession::execute` bumps op + latency + error.
 - [~] BYO-key envelope-encryption hooks — `EncryptionProvider` trait shipped in `basin-storage::encryption`; `Storage::attach_encryption_provider` is the additive opt-in (default `None` = byte-for-byte plaintext path). Writer envelope-encrypts the Parquet body with a fresh per-file AES-256-GCM data key and persists the wrapped key as a `<path>.wrapped` sidecar; reader transparently unwraps. External callers plug their own KMS adapter into the trait — the OSS engine ships only the trait + envelope hooks.
 
 > Hosted-product hardening items (BYO-bucket, Stripe billing,
@@ -824,7 +824,7 @@ conditions in its "Trigger to revisit" section are met.
 
 - [ ] Onboard the Phase 0 design partners
 - [~] CLI (`basinctl`) + engineering docs — CLI ✅ shipped:
-      `services/basinctl/` with `ping`, `tenants`, `tables`, `query`,
+      `services/basinctl/` with `ping`, `projects`, `tables`, `query`,
       `version`. Engineering docs continuation: ADRs / architecture
       overview / operator runbook still open.
 - [ ] Open beta after 3–6 months of design partner usage
@@ -834,10 +834,10 @@ conditions in its "Trigger to revisit" section are met.
 
 ## Cross-cutting (start now, never finish)
 
-- [x] Per-tenant metrics from day one (ops/s, p50/p99, RAM, S3 IO, active hours) — public `Engine::tenant_counters` API surfaces ops/bytes/errors + p99 ms estimate aggregated across engine + storage + WAL; viability test `tests/integration/tests/viability_per_tenant_counters.rs` asserts per-tenant byte isolation.
+- [x] Per-project metrics from day one (ops/s, p50/p99, RAM, S3 IO, active hours) — public `Engine::project_counters` API surfaces ops/bytes/errors + p99 ms estimate aggregated across engine + storage + WAL; viability test `tests/integration/tests/viability_per_project_counters.rs` asserts per-project byte isolation.
 - [x] OpenTelemetry traces wired through router → shard → WAL — `#[tracing::instrument]` spans on every layer (router/engine/shard/storage::{read,write_batch,read_paths}/WAL append/flush/read_from/truncate); OTLP export available via `BASIN_OTLP_ENDPOINT`.
-- [x] Cross-tenant fuzz tests (find a bug → file a P0) — `tests/integration/tests/fuzz_cross_tenant_isolation.rs` runs a seed-reproducible (`BASIN_FUZZ_SEED`) StdRng fuzzer of 1000 random query shapes across 8 tenants, asserts every returned row carries the calling tenant's payload prefix, and verifies `TableName::new` rejects path-traversal inputs. No isolation breach found.
-- [x] Feature-coverage + security suite — shipped at `tests/integration/tests/feature_coverage.rs` (one assertion per CAPABILITIES.md ✅ row, with audit comment cross-referencing the test that already covers each row) and `tests/integration/tests/security.rs` (OWASP-shaped pgwire SQL-injection probes through both simple and extended-bind paths, path-injection on `TableName`/`TenantId`/`PartitionKey`, RLS bypass attempts via UNION/CTE, structural cross-tenant fork rejection, and pgwire rate-limit enforcement). All 12 security tests pass — `collect_table_refs_from_query` in `executor.rs` walks `SetExpr::SetOperation`, `query.with` CTEs, `TableFactor::Derived` subqueries, `TableFactor::NestedJoin`, and embedded subqueries (EXISTS/IN/scalar) so RLS predicate injection cannot be bypassed via UNION / CTE / subquery shapes.
+- [x] Cross-project fuzz tests (find a bug → file a P0) — `tests/integration/tests/fuzz_cross_project_isolation.rs` runs a seed-reproducible (`BASIN_FUZZ_SEED`) StdRng fuzzer of 1000 random query shapes across 8 projects, asserts every returned row carries the calling project's payload prefix, and verifies `TableName::new` rejects path-traversal inputs. No isolation breach found.
+- [x] Feature-coverage + security suite — shipped at `tests/integration/tests/feature_coverage.rs` (one assertion per CAPABILITIES.md ✅ row, with audit comment cross-referencing the test that already covers each row) and `tests/integration/tests/security.rs` (OWASP-shaped pgwire SQL-injection probes through both simple and extended-bind paths, path-injection on `TableName`/`ProjectId`/`PartitionKey`, RLS bypass attempts via UNION/CTE, structural cross-project fork rejection, and pgwire rate-limit enforcement). All 12 security tests pass — `collect_table_refs_from_query` in `executor.rs` walks `SetExpr::SetOperation`, `query.with` CTEs, `TableFactor::Derived` subqueries, `TableFactor::NestedJoin`, and embedded subqueries (EXISTS/IN/scalar) so RLS predicate injection cannot be bypassed via UNION / CTE / subquery shapes.
 - [ ] Bug bounty program before public beta
 - [ ] Security review at each phase boundary
 
@@ -849,7 +849,7 @@ exercises CREATE/INSERT/SELECT/JOIN/GROUP BY/UPDATE/DROP against a 3-table
 schema with foreign keys. **What worked:** multi-row VALUES inserts (100
 rows in 907 ms), 2-table JOINs (400-500 ms), 3-table JOINs (215-900 ms),
 GROUP BY (220 ms), foreign-key enforcement on INSERT (`23503` rejected
-correctly), per-tenant pgwire credential auth, persistence across sessions.
+correctly), per-project pgwire credential auth, persistence across sessions.
 **What didn't:**
 
 - [ ] `BEGIN TRANSACTION READ WRITE` — driver-implicit tx around prepared-statement bulk inserts (`lib/pq`, JDBC, npgsql, …) rejected with `unsupported in PoC: BEGIN TRANSACTION READ WRITE` (SQLSTATE XX000). Tracked in Phase 5 single-shard transactions; see CAPABILITIES.md Transactions row.
@@ -870,6 +870,6 @@ Bench artefacts: the patched harness lives at `basin-cloud/backend/cmd/neonbench
 - Don't build Raft, the SQL parser, the table format, or the analytical engine.
 - The WAL is the durability boundary, **not** S3.
 - Cold start under 200 ms or hobbyists pick Turso.
-- One leaked row across tenants and the project dies.
+- One leaked row across projects and the project dies.
 - If you start implementing distributed 2PC + MVCC + a SQL planner from scratch,
   stop — you've drifted from the wedge.

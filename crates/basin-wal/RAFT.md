@@ -16,7 +16,7 @@ when it lands.
   `RaftWal::new(RaftWalConfig).await?` spins up a raft node; `initialize` /
   `add_learner` / `change_membership` form the cluster; `append`,
   `read_from`, `high_water`, `truncate`, `flush`, `close` implement the
-  `Wal` trait via openraft's `client_write` + a per-`(tenant, partition)`
+  `Wal` trait via openraft's `client_write` + a per-`(project, partition)`
   state machine.
 - In-process simulation network ([`SimCluster`]) — every node in a test
   cluster shares one handle map; RPCs dispatch by direct method call. Lets
@@ -35,7 +35,7 @@ when it lands.
 
 `openraft = "=0.9.24"` is pinned in `crates/basin-wal/Cargo.toml`. The
 deciding factors: async-first API matches the tokio-based stack, trait-based
-storage / network plug cleanly into Basin's per-`(tenant, partition)` log
+storage / network plug cleanly into Basin's per-`(project, partition)` log
 keying, and `Adaptor::new(...)` lets a single `RaftStorage` impl satisfy
 both `RaftLogStorage` and `RaftStateMachine` so v0.1 stays small. `raft-rs`
 (TiKV's sync-callback library) and a custom raft remain the documented
@@ -45,7 +45,7 @@ Original table preserved here for the ADR audit trail:
 
 | Candidate  | Pros | Cons |
 |------------|------|------|
-| `raft-rs` (TiKV) | Most production miles; well-understood ops shape; battle-tested logging + snapshot transfer | Sync-callback API; harder to integrate Basin's per-`(tenant, partition)` log keying without a parallel state machine; integrating async object_store flushes is awkward |
+| `raft-rs` (TiKV) | Most production miles; well-understood ops shape; battle-tested logging + snapshot transfer | Sync-callback API; harder to integrate Basin's per-`(project, partition)` log keying without a parallel state machine; integrating async object_store flushes is awkward |
 | `openraft` ✅ chosen | Async-first; trait-based storage / network; cleaner custom log structures; good docs | Younger; smaller production footprint; some operational gotchas still being learned |
 | Custom Raft      | Full control of log keying, batching, dedicated tokio runtime | Multi-week build; consensus bugs are catastrophic; not the wedge |
 
@@ -54,23 +54,23 @@ Original table preserved here for the ADR audit trail:
 Two reasonable shapes:
 
 - **One Raft group per region.** A single shard group replicates every
-  `(tenant, partition)` log entry. Fastest consensus (1 group's metadata,
-  warm leader, batched proposals). Trade-off: noisy tenants share the leader
-  with quiet tenants — leader fanout becomes the bottleneck.
-- **One Raft group per `(tenant, partition)`.** Each shard owner is its
-  own raft cluster. Highest isolation (one tenant's writes can't congest
-  another's leader). Trade-off: O(tenants × partitions) raft groups, each
+  `(project, partition)` log entry. Fastest consensus (1 group's metadata,
+  warm leader, batched proposals). Trade-off: noisy projects share the leader
+  with quiet projects — leader fanout becomes the bottleneck.
+- **One Raft group per `(project, partition)`.** Each shard owner is its
+  own raft cluster. Highest isolation (one project's writes can't congest
+  another's leader). Trade-off: O(projects × partitions) raft groups, each
   with their own heartbeats — metadata-heavy at >10k partitions.
 
-**Recommended default: per-region**, with a per-tenant escape hatch (a
+**Recommended default: per-region**, with a per-project escape hatch (a
 "premium" tier that gets its own raft group). This matches the way
 [`ADR 0008`](../../docs/decisions/0008-noisy-neighbor-fairness.md) handles
-fair-share at the engine layer — a shared resource with cheap per-tenant
+fair-share at the engine layer — a shared resource with cheap per-project
 primitives.
 
 The trait shape supports both; per-region is just one `RaftWal` instance
-behind `Arc<dyn Wal>`, and per-tenant is a small registry of `RaftWal`s
-keyed by tenant.
+behind `Arc<dyn Wal>`, and per-project is a small registry of `RaftWal`s
+keyed by project.
 
 ### 3. Recovery semantics
 
@@ -85,11 +85,11 @@ On leader failure:
 
 The shard owner sees `BasinError::Wal("leader unavailable")` for the duration
 of the election; the engine retries idempotently because INSERT through the
-shard is already idempotent on `(tenant, partition, lsn)`.
+shard is already idempotent on `(project, partition, lsn)`.
 
 ### 4. Integration with shard owners
 
-Today's shard owners own `(tenant, partition)`. The Raft layer must not
+Today's shard owners own `(project, partition)`. The Raft layer must not
 duplicate that ownership. Two options:
 
 - **Shard owners are raft proposers.** The shard owner calls
@@ -103,8 +103,8 @@ duplicate that ownership. Two options:
 **Recommended: option 1.** Shard owners stay the durability gateway; the
 WAL just gains a "wait for quorum" step inside `append`.
 
-This integrates with the per-`(tenant, partition)` keying because the WAL
-entry already carries `(tenant, partition, lsn)`; the raft state machine
+This integrates with the per-`(project, partition)` keying because the WAL
+entry already carries `(project, partition, lsn)`; the raft state machine
 applies entries by routing them back to the same key. Nothing about the
 shard owner's data model changes.
 
@@ -143,6 +143,6 @@ Real numbers in the integration PR; the stub doesn't claim them.
   tokio runtime through `SimCluster`; the wire-protocol decision waits.
 - Persist the raft log to disk. State lives in RAM until snapshot. The
   segment-file format from `LocalWal` will absorb raft logs when v0.2 lands.
-- Wire per-tenant counters through `RaftWal::append`. The `attach_tenant_counters`
+- Wire per-project counters through `RaftWal::append`. The `attach_project_counters`
   no-op is acceptable for v0.1; counter plumbing is a small follow-up.
 - Implement multi-region replication semantics. Separate phase.

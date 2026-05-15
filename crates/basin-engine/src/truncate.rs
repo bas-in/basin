@@ -37,11 +37,11 @@ use std::str::FromStr;
 
 use crate::session::refresh_table;
 use crate::types::BASIN_COLUMN_DEFAULT;
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Execute `TRUNCATE [TABLE] t1, t2 [CASCADE|RESTRICT] [RESTART IDENTITY|CONTINUE IDENTITY]`.
 pub(crate) async fn exec_truncate(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     tree: &crate::pg_ast::ParseTree,
 ) -> Result<ExecResult> {
     // Extract the TruncateStmt from the parse tree.
@@ -95,12 +95,12 @@ pub(crate) async fn exec_truncate(
 
     for table in &tables {
         // Load current metadata (snapshot id + schema).
-        let meta = catalog.load_table(&sess.tenant, table).await?;
+        let meta = catalog.load_table(&sess.project, table).await?;
         let schema = meta.schema.clone();
 
         // Collect all current data file paths — these become `removed_paths`.
         let data_files = storage
-            .list_data_files_with_stats(&sess.tenant, table)
+            .list_data_files_with_stats(&sess.project, table)
             .await?;
 
         let removed_paths: Vec<String> = data_files.iter().map(|f| f.path.as_ref().to_string()).collect();
@@ -108,7 +108,7 @@ pub(crate) async fn exec_truncate(
         if removed_paths.is_empty() {
             // Nothing to do for this table — it's already empty.
             // Still refresh the session listing to be safe.
-            refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+            refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
             continue;
         }
 
@@ -117,16 +117,16 @@ pub(crate) async fn exec_truncate(
         // for TRUNCATE we don't care about the content — we want empty).
         let current_snap = meta.current_snapshot;
         match catalog
-            .replace_data_files(&sess.tenant, table, current_snap, removed_paths.clone(), vec![])
+            .replace_data_files(&sess.project, table, current_snap, removed_paths.clone(), vec![])
             .await
         {
             Ok(_) => {}
             Err(BasinError::CommitConflict(_)) => {
                 // Reload and retry with the fresh snapshot id.
-                let fresh = catalog.load_table(&sess.tenant, table).await?;
+                let fresh = catalog.load_table(&sess.project, table).await?;
                 catalog
                     .replace_data_files(
-                        &sess.tenant,
+                        &sess.project,
                         table,
                         fresh.current_snapshot,
                         removed_paths.clone(),
@@ -138,7 +138,7 @@ pub(crate) async fn exec_truncate(
         }
 
         // Best-effort physical deletion (mirrors DELETE's delete_objects).
-        let store = storage.tenant_object_store(&sess.tenant);
+        let store = storage.project_object_store(&sess.project);
         let root = storage.root_prefix_handle();
         let vector_columns: Vec<String> = schema
             .fields()
@@ -163,7 +163,7 @@ pub(crate) async fn exec_truncate(
                 if let Some(sidecar_path) =
                     basin_storage::vector_index_segment_key_for_data_file(
                         root.as_ref(),
-                        &sess.tenant,
+                        &sess.project,
                         table,
                         col,
                         path_str,
@@ -182,7 +182,7 @@ pub(crate) async fn exec_truncate(
         }
 
         // Refresh the DataFusion session listing.
-        refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+        refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
     }
 
     Ok(ExecResult::Empty {
@@ -199,7 +199,7 @@ pub(crate) async fn exec_truncate(
 /// Errors from `setval` are swallowed (the table was already truncated; a
 /// failed sequence restart is a nuisance but not a correctness bug).
 async fn restart_sequences_for_table(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     schema: &arrow_schema::Schema,
 ) {
@@ -218,7 +218,7 @@ async fn restart_sequences_for_table(
         };
 
         // Look up the sequence definition to find the start value.
-        let def = match catalog.lookup_sequence(&sess.tenant, &seq_name).await {
+        let def = match catalog.lookup_sequence(&sess.project, &seq_name).await {
             Some(d) => d,
             None => continue,
         };
@@ -227,7 +227,7 @@ async fn restart_sequences_for_table(
         // means the NEXT nextval() returns start.
         let reset_to = def.start.saturating_sub(def.increment);
         if let Err(e) = catalog
-            .setval(&sess.tenant, &seq_name, reset_to, true)
+            .setval(&sess.project, &seq_name, reset_to, true)
             .await
         {
             tracing::warn!(

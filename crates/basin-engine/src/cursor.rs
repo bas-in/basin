@@ -12,7 +12,7 @@
 //!   CURSOR FOR SELECT * FROM huge_table` will OOM before it returns.  A
 //!   streaming variant (backed by a DataFusion physical plan) is the v0.2 path.
 //! - **WITH HOLD not supported**: cursors survive only as long as their
-//!   `TenantSession`.  The `WITH HOLD` clause (PG-specific, allows the cursor
+//!   `ProjectSession`.  The `WITH HOLD` clause (PG-specific, allows the cursor
 //!   to outlive a transaction commit) is parsed and silently ignored in v0.1.
 //! - **SCROLL / NO SCROLL**: all cursors support backward motion regardless of
 //!   the `SCROLL` keyword — we materialise everything so backward seeks are

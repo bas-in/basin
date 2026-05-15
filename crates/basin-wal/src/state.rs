@@ -1,8 +1,8 @@
-//! Per-`(tenant, partition)` mutable state for the file-backed WAL.
+//! Per-`(project, partition)` mutable state for the file-backed WAL.
 
 use std::collections::BTreeMap;
 
-use basin_common::{PartitionKey, TenantId};
+use basin_common::{PartitionKey, ProjectId};
 use object_store::path::Path as ObjectPath;
 use ulid::Ulid;
 
@@ -22,13 +22,13 @@ pub(crate) struct ClosedSegment {
     pub segment_id: Ulid,
 }
 
-/// All mutable state for a single `(tenant, partition)`.
+/// All mutable state for a single `(project, partition)`.
 ///
 /// The buffer holds entries that have been assigned an LSN but may not yet
 /// have been flushed to object storage. The flush task drains it.
 #[derive(Debug)]
 pub(crate) struct PartitionState {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub partition: PartitionKey,
     /// LSN to assign to the next [`crate::Wal::append`] call. Recovered on
     /// open from the maximum `last_lsn` across closed segments.
@@ -46,9 +46,9 @@ pub(crate) struct PartitionState {
 }
 
 impl PartitionState {
-    pub fn new(tenant: TenantId, partition: PartitionKey) -> Self {
+    pub fn new(project: ProjectId, partition: PartitionKey) -> Self {
         Self {
-            tenant,
+            project,
             partition,
             next_lsn: Lsn(1),
             buffer: Vec::new(),

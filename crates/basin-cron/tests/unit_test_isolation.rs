@@ -1,9 +1,9 @@
-//! Unit tests confirming tenant isolation across the cron surface.
+//! Unit tests confirming project isolation across the cron surface.
 
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cron::{CronRunner, TestClock};
 use basin_engine::{Engine, EngineConfig};
 use chrono::{Duration, TimeZone, Utc};
@@ -27,14 +27,14 @@ fn engine_in(dir: &TempDir) -> Engine {
 }
 
 #[tokio::test]
-async fn each_tenant_only_sees_its_own_jobs() {
+async fn each_project_only_sees_its_own_jobs() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let runner = CronRunner::with_system_clock(eng);
     let store = runner.store();
 
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
 
     store
         .schedule(&a, "alice", "a-job", "* * * * *", "SELECT 'a'")
@@ -65,8 +65,8 @@ async fn each_tenant_only_sees_its_own_jobs() {
 }
 
 #[tokio::test]
-async fn jobs_only_run_against_their_owning_tenant() {
-    // Tenant A schedules an INSERT into a `markers` table. Tenant B has its
+async fn jobs_only_run_against_their_owning_project() {
+    // Project A schedules an INSERT into a `markers` table. Project B has its
     // own `markers` table. After ticking, A's table has one row and B's
     // has zero — the runner must never have touched B's table.
     let dir = TempDir::new().unwrap();
@@ -76,14 +76,14 @@ async fn jobs_only_run_against_their_owning_tenant() {
     let clock = TestClock::new(t0);
     let runner = CronRunner::new(eng.clone(), Arc::new(clock.clone()));
 
-    let a = TenantId::new();
-    let b = TenantId::new();
-    runner.register_tenant(a).await;
-    runner.register_tenant(b).await;
+    let a = ProjectId::new();
+    let b = ProjectId::new();
+    runner.register_project(a).await;
+    runner.register_project(b).await;
 
-    // Both tenants get a `markers` table, both empty.
-    for tenant in [a, b] {
-        let s = eng.open_session(tenant).await.unwrap();
+    // Both projects get a `markers` table, both empty.
+    for project in [a, b] {
+        let s = eng.open_session(project).await.unwrap();
         s.execute("CREATE TABLE markers (id BIGINT NOT NULL)")
             .await
             .unwrap();
@@ -107,10 +107,10 @@ async fn jobs_only_run_against_their_owning_tenant() {
     let _outcomes = runner.tick().await.unwrap();
 
     // A's `markers` should have exactly one row; B's should be empty.
-    let count_markers = |tenant: TenantId| {
+    let count_markers = |project: ProjectId| {
         let eng = eng.clone();
         async move {
-            let s = eng.open_session(tenant).await.unwrap();
+            let s = eng.open_session(project).await.unwrap();
             let res = s.execute("SELECT id FROM markers").await.unwrap();
             match res {
                 basin_engine::ExecResult::Rows { batches, .. } => {

@@ -12,7 +12,7 @@ use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, InMemoryCatalog, SqlArgType, SqlFunctionArg,
     SqlFunctionDef, SqlFunctionLanguage, SqlProcedureDef, SqlReturnType,
 };
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
@@ -33,14 +33,14 @@ fn col_i64<'a>(b: &'a RecordBatch, n: &str) -> &'a Int64Array {
 }
 
 fn make_func(
-    tenant: TenantId,
+    project: ProjectId,
     name: &str,
     args: Vec<(&str, SqlArgType)>,
     ret: SqlArgType,
     body: &str,
 ) -> SqlFunctionDef {
     SqlFunctionDef {
-        tenant,
+        project,
         name: name.to_string(),
         args: args
             .into_iter()
@@ -56,13 +56,13 @@ fn make_func(
 }
 
 fn make_proc(
-    tenant: TenantId,
+    project: ProjectId,
     name: &str,
     args: Vec<(&str, SqlArgType)>,
     body: &str,
 ) -> SqlProcedureDef {
     SqlProcedureDef {
-        tenant,
+        project,
         name: name.to_string(),
         args: args
             .into_iter()
@@ -78,7 +78,7 @@ fn make_proc(
 #[tokio::test]
 async fn pg_proc_lists_user_functions() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     cat.register_sql_function(make_func(
         t,
@@ -106,7 +106,7 @@ async fn pg_proc_lists_user_functions() {
 #[tokio::test]
 async fn pg_proc_lists_user_procedures() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     cat.register_procedure(make_proc(
         t,
@@ -132,10 +132,10 @@ async fn pg_proc_lists_user_procedures() {
 #[tokio::test]
 async fn pg_proc_oid_stable_per_tuple() {
     // Two consecutive calls must produce the same oid for the same
-    // (tenant, name). Stability is the property pgAdmin / DataGrip rely on
+    // (project, name). Stability is the property pgAdmin / DataGrip rely on
     // when caching catalog rows across reconnects.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     cat.register_sql_function(make_func(t, "f", vec![], SqlArgType::BigInt, "SELECT 1"))
         .await
@@ -152,7 +152,7 @@ async fn pg_proc_oid_stable_per_tuple() {
 #[tokio::test]
 async fn routines_returns_correct_routine_type() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     cat.register_sql_function(make_func(
         t,
@@ -186,7 +186,7 @@ async fn routines_returns_correct_routine_type() {
 #[tokio::test]
 async fn routines_data_type_null_for_procedures() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     cat.register_sql_function(make_func(t, "f", vec![], SqlArgType::Text, "SELECT 'hi'"))
         .await
@@ -219,7 +219,7 @@ async fn routines_data_type_null_for_procedures() {
 #[tokio::test]
 async fn routines_is_deterministic_heuristic() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     // Pure SELECT — deterministic.
@@ -289,10 +289,10 @@ async fn routines_is_deterministic_heuristic() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
     cat.register_sql_function(make_func(
@@ -342,7 +342,7 @@ async fn cross_tenant_isolation() {
 async fn argtypes_format() {
     // (BIGINT, TEXT) → proargtypes = "20 25" (space-separated PG OIDs).
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     cat.register_sql_function(make_func(
         t,
@@ -361,9 +361,9 @@ async fn argtypes_format() {
 }
 
 #[tokio::test]
-async fn empty_tenant_returns_empty_pg_proc_and_routines() {
+async fn empty_project_returns_empty_pg_proc_and_routines() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let p = InfoSchemaQuery::pg_proc(&cat, &t).await.unwrap();

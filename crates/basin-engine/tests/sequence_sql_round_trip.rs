@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -52,7 +52,7 @@ fn first_i64(res: ExecResult) -> i64 {
 async fn create_sequence_full_grammar_round_trip() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // Multi-option CREATE SEQUENCE: this is the form sqlparser 0.52
     // cannot parse natively (it bails at the second option). The
@@ -85,7 +85,7 @@ async fn create_sequence_full_grammar_round_trip() {
 async fn create_sequence_if_not_exists_idempotent() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE SEQUENCE foo START 10 INCREMENT 2")
         .await
@@ -103,7 +103,7 @@ async fn create_sequence_if_not_exists_idempotent() {
 async fn create_temporary_sequence_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute("CREATE TEMPORARY SEQUENCE foo START 1")
@@ -111,7 +111,7 @@ async fn create_temporary_sequence_rejected() {
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("TEMPORARY") || msg.contains("tenant-scoped"),
+        msg.contains("TEMPORARY") || msg.contains("project-scoped"),
         "unexpected error: {msg}"
     );
 }

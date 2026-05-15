@@ -40,7 +40,7 @@
 //!   `GEOMETRYCOLLECTION`** — not modelled. v0.2.
 //! - **R-tree / GIST spatial index** — without one, `ST_DWithin` is a
 //!   brute-force scan of the partition. That's fine for tens of
-//!   thousands of points per tenant but quadratic on N×M joins.
+//!   thousands of points per project but quadratic on N×M joins.
 //!   The fix in v0.2 is a basin-storage-side spatial-index segment
 //!   format mirrored on the HNSW vector index.
 //! - **EWKB / non-WGS84 SRIDs** — every point is interpreted as

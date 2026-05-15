@@ -1,9 +1,9 @@
-# Multi-tenant SaaS on Basin
+# Multi-project SaaS on Basin
 
 Basin's primary positioning is "cheap Postgres on object storage." A direct
 consequence of that architecture is that running thousands of isolated
 projects on one cluster gets very cheap — which makes Basin a natural fit
-for multi-tenant SaaS, where each customer is one project. This page is the
+for multi-project SaaS, where each customer is one project. This page is the
 detailed story for that workload shape.
 
 If you're a single-app developer building a side project, ignore this page —
@@ -11,10 +11,10 @@ the [main README](../README.md) is the right entry point.
 
 ---
 
-## The economic problem with multi-tenant on Postgres
+## The economic problem with multi-project on Postgres
 
 Postgres-as-a-Service vendors charge per project because Postgres can't
-multi-tenant cheaply:
+multi-project cheaply:
 
 - A fresh Postgres process holds **~10 MB of RAM minimum** — even with zero
   rows.
@@ -22,9 +22,9 @@ multi-tenant cheaply:
   memory**.
 - One Postgres cluster per customer means N customers cost roughly N times
   the per-customer fixed overhead.
-- "Logical multi-tenant" via schemas + RLS works but: RLS is logical-only
-  (one bad query plan can leak), schema-per-tenant breaks ORMs that assume
-  `public`, and pg_dump per tenant becomes a custom data pipeline.
+- "Logical multi-project" via schemas + RLS works but: RLS is logical-only
+  (one bad query plan can leak), schema-per-project breaks ORMs that assume
+  `public`, and pg_dump per project becomes a custom data pipeline.
 
 The wedge cases hit hardest at:
 
@@ -42,7 +42,7 @@ The wedge cases hit hardest at:
 ## How Basin handles it structurally
 
 **One project = one bucket prefix.** A project's data lives under
-`tenants/<project_id>/...` in your object store. The prefix is the IAM
+`projects/<project_id>/...` in your object store. The prefix is the IAM
 boundary — a single bucket policy revokes all access to a project's data
 even if every other layer is bypassed. Cross-project access is not a
 software check that could be wrong; it's an IAM denial.
@@ -59,11 +59,11 @@ RAM per active project is **~1.2 KiB** versus Postgres's ~10 MB — a 10,000×
 reduction. One Fly Machine running Basin handles workloads that would need
 50–100 Fly Machines running Postgres.
 
-**Per-project credentials work like managed Postgres.** `POST /admin/v1/tenants`
+**Per-project credentials work like managed Postgres.** `POST /admin/v1/projects`
 returns `postgres://<user>:<password>@host:5433/<db>` for each project.
 Customer apps connect with their own URL; Basin parses the project ID out of
 the username (no global lookup table, no cross-project leakage path).
-Rotation is `POST /admin/v1/tenants/{user}/rotate` with the old password
+Rotation is `POST /admin/v1/projects/{user}/rotate` with the old password
 invalidating immediately.
 
 **Per-project fairness.** A semaphore caps each project at 16 concurrent
@@ -72,7 +72,7 @@ sensitive ops (HEAD, list, small range) over bulk PUTs. One bursting customer
 cannot starve every other customer. See
 [ADR 0008](./decisions/0008-noisy-neighbor-fairness.md).
 
-**Project deletion is a prefix delete.** `Storage::delete_tenant(project_id)`
+**Project deletion is a prefix delete.** `Storage::delete_project(project_id)`
 issues a parallel LIST + bulk `DeleteObjects` under the prefix plus a
 `drop_namespace` on the catalog. 100K rows / 100 files deletes in
 ~4 ms on local FS, ~1.5–2 s on a real S3-compatible store — versus Postgres's
@@ -146,7 +146,7 @@ CREATE POLICY "own rows" ON items
 Both `auth.uid()` (schema-qualified) and `auth_uid()` (underscore) spellings
 work. Anonymous sessions return `NULL` / `'anon'` matching Supabase
 behaviour. See [ADR 0005](./decisions/0005-auth-system.md) and
-[ADR 0013](./decisions/0013-auth-per-tenant-schema.md).
+[ADR 0013](./decisions/0013-auth-per-project-schema.md).
 
 ---
 
@@ -175,7 +175,7 @@ account) and their own KMS:
   wrapped key, never the plaintext data key. Rotation is your KMS's
   rotation. The OSS engine ships the `EncryptionProvider` trait
   ([`basin-storage/src/encryption.rs`](../crates/basin-storage/src/encryption.rs))
-  plus per-project `TenantStorageConfig` registry; external callers plug in
+  plus per-project `ProjectStorageConfig` registry; external callers plug in
   their own KMS adapter.
 
 This satisfies the SOC2 / HIPAA blast-radius story: customer auditors can
@@ -186,7 +186,7 @@ See [`PRICING.md`](../PRICING.md#plans) for the plans that include these.
 
 ---
 
-## Where multi-tenant on Basin is *not* the answer
+## Where multi-project on Basin is *not* the answer
 
 - **Each project needs the full Postgres extension ecosystem** (PL/pgPython,
   loadable .so extensions, every-niche extension on PGXN). Basin's wedge is
@@ -195,7 +195,7 @@ See [`PRICING.md`](../PRICING.md#plans) for the plans that include these.
 - **Each project needs strong cross-region transactional consistency**.
   That's Spanner-class. Basin's multi-region story is read replicas with
   region-local writes — see [ADR 0001](./decisions/0001-single-region-only.md).
-- **Single-tenant high-frequency OLTP** — Postgres / Aurora is the right
+- **Single-project high-frequency OLTP** — Postgres / Aurora is the right
   answer. Basin's per-row write path is competitive but not
   Postgres-internal-page-cache fast for a one-DB hot workload.
 - **PL/pgSQL embedded data-science workloads** — Basin's trigger / function

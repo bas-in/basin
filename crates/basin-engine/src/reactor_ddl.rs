@@ -24,7 +24,7 @@
 //! 3. ```sql
 //!    DROP REACTOR <reactor_name> ON <table>;
 //!    ```
-//!    Removes a reactor by `(tenant, table, name)`.
+//!    Removes a reactor by `(project, table, name)`.
 //!
 //! sqlparser 0.52 has no `REACT` arm on `ALTER TABLE` and no `DROP
 //! REACTOR` statement, so we recognise the three shapes textually
@@ -79,7 +79,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, ReactorDef, ReactorOps};
-use basin_common::{BasinError, ChangeOp, Result, TableName, TenantId};
+use basin_common::{BasinError, ChangeOp, Result, TableName, ProjectId};
 
 /// Parsed `ALTER TABLE ... REACT ON ... EXECUTE <body>` statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,7 +263,7 @@ pub fn match_drop_reactor(sql: &str) -> Result<Option<DropIntent>> {
 /// `Catalog::register_reactor` with intent-shape validation.
 pub async fn exec_react_on(
     intent: ReactIntent,
-    tenant: &TenantId,
+    project: &ProjectId,
     catalog: &Arc<dyn Catalog>,
 ) -> Result<()> {
     let table = TableName::new(&intent.table)?;
@@ -273,7 +273,7 @@ pub async fn exec_react_on(
         ));
     }
     let def = ReactorDef {
-        tenant: *tenant,
+        project: *project,
         table,
         name: intent.name,
         ops: intent.ops,
@@ -289,7 +289,7 @@ pub async fn exec_react_on(
 /// doc for the design rationale.
 pub async fn exec_react_constraint(
     intent: ConstraintReactIntent,
-    tenant: &TenantId,
+    project: &ProjectId,
     catalog: &Arc<dyn Catalog>,
 ) -> Result<()> {
     let table = TableName::new(&intent.table)?;
@@ -328,7 +328,7 @@ pub async fn exec_react_constraint(
         pred_lit = escaped_pred,
     );
     let def = ReactorDef {
-        tenant: *tenant,
+        project: *project,
         table,
         name: intent.name,
         ops: intent.ops,
@@ -343,11 +343,11 @@ pub async fn exec_react_constraint(
 /// reactor doesn't exist.
 pub async fn exec_drop_reactor(
     intent: DropIntent,
-    tenant: &TenantId,
+    project: &ProjectId,
     catalog: &Arc<dyn Catalog>,
 ) -> Result<()> {
     let table = TableName::new(&intent.table)?;
-    catalog.drop_reactor(tenant, &table, &intent.name).await
+    catalog.drop_reactor(project, &table, &intent.name).await
 }
 
 // --- Common parser plumbing ------------------------------------------

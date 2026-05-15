@@ -1,12 +1,12 @@
-//! S3 port of `scaling_tenant_count.rs`.
+//! S3 port of `scaling_project_count.rs`.
 //!
-//! Same shape — provision N tenants each with a one-row `events` table,
-//! measure per-tenant RAM and the p50 of 5 quiet point-query samples — but
-//! capped at SCALES = [1, 10, 100]. The 1000-tenant scale point on R2 takes
+//! Same shape — provision N projects each with a one-row `events` table,
+//! measure per-project RAM and the p50 of 5 quiet point-query samples — but
+//! capped at SCALES = [1, 10, 100]. The 1000-project scale point on R2 takes
 //! several minutes per provision pass and is not worth the wall time for
 //! the dashboard story; the same trend is visible at 100.
 //!
-//! Card id: `tenant_count` (real-cloud dashboard).
+//! Card id: `project_count` (real-cloud dashboard).
 //! Bar: same as LocalFS — `quiet_p50_at_max <= 5 * quiet_p50_at_1`.
 //!
 //! Skips cleanly when `[s3]` is missing.
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
@@ -28,7 +28,7 @@ use basin_storage::{Storage, StorageConfig};
 use object_store::path::Path as ObjectPath;
 use serde_json::json;
 
-const TEST_NAME: &str = "s3_scaling_tenant_count";
+const TEST_NAME: &str = "s3_scaling_project_count";
 /// Capped at 100 — see module docs.
 const SCALES: [usize; 3] = [1, 10, 100];
 const QUIET_SAMPLES: usize = 5;
@@ -54,7 +54,7 @@ fn median(samples: &[f64]) -> f64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
-async fn s3_scaling_tenant_count() {
+async fn s3_scaling_project_count() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,
         Err(e) => panic!("parse .basin-test.toml: {e}"),
@@ -90,7 +90,7 @@ async fn s3_scaling_tenant_count() {
     });
 
     {
-        let warm = TenantId::new();
+        let warm = ProjectId::new();
         let s = engine.open_session(warm).await.unwrap();
         s.execute("CREATE TABLE events (id BIGINT NOT NULL, payload TEXT NOT NULL)")
             .await
@@ -107,17 +107,17 @@ async fn s3_scaling_tenant_count() {
     struct Row {
         n: usize,
         rss_delta_kib: i64,
-        per_tenant_kib: f64,
+        per_project_kib: f64,
         quiet_p50_ms: f64,
     }
     let mut rows: Vec<Row> = Vec::new();
-    let mut all_tenants: Vec<TenantId> = Vec::new();
+    let mut all_projects: Vec<ProjectId> = Vec::new();
 
     for &n in SCALES.iter() {
-        let to_provision = n - all_tenants.len().min(n);
+        let to_provision = n - all_projects.len().min(n);
         let rss_before = rss_kib();
         for _ in 0..to_provision {
-            let t = TenantId::new();
+            let t = ProjectId::new();
             let s = engine.open_session(t).await.unwrap();
             s.execute("CREATE TABLE events (id BIGINT NOT NULL, payload TEXT NOT NULL)")
                 .await
@@ -126,20 +126,20 @@ async fn s3_scaling_tenant_count() {
                 .await
                 .unwrap();
             drop(s);
-            all_tenants.push(t);
+            all_projects.push(t);
         }
         let rss_after = rss_kib();
         let rss_delta_kib = rss_after as i64 - rss_before as i64;
-        let per_tenant_kib = if to_provision == 0 {
+        let per_project_kib = if to_provision == 0 {
             0.0
         } else {
             (rss_delta_kib as f64).max(0.0) / to_provision as f64
         };
 
-        let quiet_tenant = all_tenants[0];
+        let quiet_project = all_projects[0];
         let mut samples_ms: Vec<f64> = Vec::with_capacity(QUIET_SAMPLES);
         for _ in 0..QUIET_SAMPLES {
-            let s = engine.open_session(quiet_tenant).await.unwrap();
+            let s = engine.open_session(quiet_project).await.unwrap();
             let started = Instant::now();
             let res = s
                 .execute("SELECT id FROM events WHERE id = 1")
@@ -149,7 +149,7 @@ async fn s3_scaling_tenant_count() {
             match res {
                 ExecResult::Rows { batches, .. } => {
                     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    assert!(total >= 1, "quiet tenant should see at least one row");
+                    assert!(total >= 1, "quiet project should see at least one row");
                 }
                 ExecResult::Empty { .. } => panic!("expected Rows, got Empty"),
             }
@@ -161,21 +161,21 @@ async fn s3_scaling_tenant_count() {
         rows.push(Row {
             n,
             rss_delta_kib,
-            per_tenant_kib,
+            per_project_kib,
             quiet_p50_ms,
         });
     }
 
-    assert!(all_tenants.len() >= *SCALES.last().unwrap());
+    assert!(all_projects.len() >= *SCALES.last().unwrap());
 
     println!(
         "{:>10} {:>15} {:>15} {:>15}",
-        "N", "rss_delta_KiB", "per_tenant_KiB", "quiet_p50_ms"
+        "N", "rss_delta_KiB", "per_project_KiB", "quiet_p50_ms"
     );
     for r in &rows {
         println!(
             "{:>10} {:>15} {:>15.2} {:>15.2}",
-            r.n, r.rss_delta_kib, r.per_tenant_kib, r.quiet_p50_ms
+            r.n, r.rss_delta_kib, r.per_project_kib, r.quiet_p50_ms
         );
     }
 
@@ -185,7 +185,7 @@ async fn s3_scaling_tenant_count() {
     let pass = latency_ratio <= BAR_LATENCY_RATIO;
 
     println!(
-        "[S3 scaling_tenant_count] quiet_p50@1={:.2}ms, quiet_p50@{}={:.2}ms, ratio={:.2}x (bar <={}x) {}",
+        "[S3 scaling_project_count] quiet_p50@1={:.2}ms, quiet_p50@{}={:.2}ms, ratio={:.2}x (bar <={}x) {}",
         p50_at_1,
         SCALES.last().unwrap(),
         p50_at_max,
@@ -198,8 +198,8 @@ async fn s3_scaling_tenant_count() {
         .iter()
         .map(|r| {
             json!({
-                "tenant_count": r.n,
-                "per_tenant_ram_kib": r.per_tenant_kib,
+                "project_count": r.n,
+                "per_project_ram_kib": r.per_project_kib,
                 "quiet_p50_ms": r.quiet_p50_ms,
                 "rss_delta_kib": r.rss_delta_kib,
             })
@@ -207,18 +207,18 @@ async fn s3_scaling_tenant_count() {
         .collect();
 
     report_real_scaling(
-        "tenant_count",
-        "Per-tenant cost vs tenant count (real S3)",
-        "RAM and quiet point-query latency per tenant stay near-constant as tenant count grows on a real S3-compatible backend.",
+        "project_count",
+        "Per-project cost vs project count (real S3)",
+        "RAM and quiet point-query latency per project stay near-constant as project count grows on a real S3-compatible backend.",
         pass,
         AxisSpec {
-            key: "tenant_count".into(),
-            label: "tenants".into(),
+            key: "project_count".into(),
+            label: "projects".into(),
         },
         vec![
             SeriesSpec {
-                key: "per_tenant_ram_kib".into(),
-                label: "Per-tenant RAM".into(),
+                key: "per_project_ram_kib".into(),
+                label: "Per-project RAM".into(),
                 unit: Some("KiB".into()),
             },
             SeriesSpec {

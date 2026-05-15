@@ -20,8 +20,8 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use futures::stream::BoxStream;
@@ -167,7 +167,7 @@ impl ObjectStore for CountingStore {
     }
 }
 
-async fn total_select_rows(sess: &TenantSession, sql: &str) -> usize {
+async fn total_select_rows(sess: &ProjectSession, sql: &str) -> usize {
     let res = sess.execute(sql).await.unwrap();
     match res {
         ExecResult::Rows { batches, .. } => {
@@ -215,8 +215,8 @@ async fn s3_viability_partition_pruning() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     sess.execute(
         "CREATE TABLE events (\
@@ -249,7 +249,7 @@ async fn s3_viability_partition_pruning() {
 
     let table = basin_common::TableName::new("events").unwrap();
     let storage = engine.config().storage.clone();
-    let listed = storage.list_data_files(&tenant, &table).await.unwrap();
+    let listed = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(
         listed.len(),
         12,
@@ -289,7 +289,7 @@ async fn s3_viability_partition_pruning() {
 
     report_real_viability(
         "partition_pruning",
-        "Within-tenant time-based partition pruning (real S3)",
+        "Within-project time-based partition pruning (real S3)",
         "A 1-month range query against 12 months of partitioned data, hosted on real S3, reads at most one partition's worth of bytes (range/full bytes ratio < 0.2).",
         pass,
         PrimaryMetric {

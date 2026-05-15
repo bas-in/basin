@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::{BasinError, TenantId};
-use basin_engine::{Engine, EngineConfig, TenantSession};
+use basin_common::{BasinError, ProjectId};
+use basin_engine::{Engine, EngineConfig, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -29,8 +29,8 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-async fn open(eng: &Engine) -> TenantSession {
-    eng.open_session(TenantId::new()).await.unwrap()
+async fn open(eng: &Engine) -> ProjectSession {
+    eng.open_session(ProjectId::new()).await.unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -92,9 +92,9 @@ async fn composite_unique_distinct_tuples_succeed() {
     sess.execute(
         "CREATE TABLE users (\
              id BIGINT PRIMARY KEY, \
-             tenant_id BIGINT NOT NULL, \
+             project_id BIGINT NOT NULL, \
              email TEXT NOT NULL, \
-             UNIQUE (tenant_id, email))",
+             UNIQUE (project_id, email))",
     )
     .await
     .unwrap();
@@ -102,11 +102,11 @@ async fn composite_unique_distinct_tuples_succeed() {
     sess.execute("INSERT INTO users VALUES (1, 1, 'a@x.com')")
         .await
         .unwrap();
-    // Same email, different tenant — fine.
+    // Same email, different project — fine.
     sess.execute("INSERT INTO users VALUES (2, 2, 'a@x.com')")
         .await
         .unwrap();
-    // Same tenant, different email — fine.
+    // Same project, different email — fine.
     sess.execute("INSERT INTO users VALUES (3, 1, 'b@x.com')")
         .await
         .unwrap();
@@ -121,9 +121,9 @@ async fn composite_unique_duplicate_tuple_rejected() {
     sess.execute(
         "CREATE TABLE users (\
              id BIGINT PRIMARY KEY, \
-             tenant_id BIGINT NOT NULL, \
+             project_id BIGINT NOT NULL, \
              email TEXT NOT NULL, \
-             UNIQUE (tenant_id, email))",
+             UNIQUE (project_id, email))",
     )
     .await
     .unwrap();
@@ -137,7 +137,7 @@ async fn composite_unique_duplicate_tuple_rejected() {
         .unwrap_err();
     assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
     let msg = err.to_string();
-    assert!(msg.contains("users_tenant_id_email_key"), "msg = {msg}");
+    assert!(msg.contains("users_project_id_email_key"), "msg = {msg}");
 }
 
 #[tokio::test]
@@ -149,9 +149,9 @@ async fn named_unique_constraint_uses_user_name() {
     sess.execute(
         "CREATE TABLE users (\
              id BIGINT PRIMARY KEY, \
-             tenant_id BIGINT NOT NULL, \
+             project_id BIGINT NOT NULL, \
              email TEXT NOT NULL, \
-             CONSTRAINT users_tenant_email_uk UNIQUE (tenant_id, email))",
+             CONSTRAINT users_project_email_uk UNIQUE (project_id, email))",
     )
     .await
     .unwrap();
@@ -165,7 +165,7 @@ async fn named_unique_constraint_uses_user_name() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("users_tenant_email_uk"),
+        msg.contains("users_project_email_uk"),
         "user-supplied constraint name must surface in error, got: {msg}"
     );
 }

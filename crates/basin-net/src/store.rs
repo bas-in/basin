@@ -1,4 +1,4 @@
-//! Per-tenant store for async HTTP responses, backed by ordinary Basin
+//! Per-project store for async HTTP responses, backed by ordinary Basin
 //! tables.
 //!
 //! Three tables get created lazily on first use:
@@ -15,14 +15,14 @@
 //!
 //! All reads and writes go through `Engine::open_session`, so:
 //!
-//! 1. Tenant isolation is the same as for user SQL.
+//! 1. Project isolation is the same as for user SQL.
 //! 2. RLS policies on `_net_http_response` itself are honoured (you can
-//!    shape who can read which response under a single tenant).
+//!    shape who can read which response under a single project).
 
 use std::sync::Arc;
 
 use arrow_array::Array;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use basin_engine::{Engine, ExecResult};
 use chrono::{DateTime, Utc};
 
@@ -33,7 +33,7 @@ use crate::types::{HttpResponse, RequestId, ResponseRow};
 /// to `net._http_response` to match pg_net byte-for-byte.
 pub(crate) const RESPONSE_TABLE: &str = "_net_http_response";
 
-/// Store front for the per-tenant response table.
+/// Store front for the per-project response table.
 ///
 /// Cheap to clone (`Arc` inside).
 #[derive(Clone)]
@@ -57,10 +57,10 @@ impl ResponseStore {
         &self.inner.engine
     }
 
-    /// Idempotently create the response table under `tenant`. Safe to call
+    /// Idempotently create the response table under `project`. Safe to call
     /// before every operation.
-    pub async fn ensure_tables(&self, tenant: &TenantId) -> Result<()> {
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    pub async fn ensure_tables(&self, project: &ProjectId) -> Result<()> {
+        let sess = self.inner.engine.open_session(*project).await?;
         let existing = list_table_names(&sess).await?;
         if !existing.contains(&RESPONSE_TABLE.to_string()) {
             sess.execute(&format!(
@@ -83,13 +83,13 @@ impl ResponseStore {
     /// (or once a terminal failure has been classified).
     pub async fn record(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         id: RequestId,
         request_id: RequestId,
         resp: &HttpResponse,
     ) -> Result<()> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         let headers_json = serde_json::to_string(&resp.headers)
             .map_err(|e| BasinError::internal(format!("headers serialise: {e}")))?;
         let body_text = String::from_utf8_lossy(&resp.body).into_owned();
@@ -115,9 +115,9 @@ impl ResponseStore {
 
     /// Fetch one response row by id. Returns `None` until the runner has
     /// recorded it.
-    pub async fn get(&self, tenant: &TenantId, id: RequestId) -> Result<Option<ResponseRow>> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    pub async fn get(&self, project: &ProjectId, id: RequestId) -> Result<Option<ResponseRow>> {
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT id, request_id, status, headers, body, error, completed_unix_ms \
@@ -155,10 +155,10 @@ impl ResponseStore {
         Ok(None)
     }
 
-    /// List every recorded response for `tenant`. Useful for tests.
-    pub async fn list(&self, tenant: &TenantId) -> Result<Vec<ResponseRow>> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    /// List every recorded response for `project`. Useful for tests.
+    pub async fn list(&self, project: &ProjectId) -> Result<Vec<ResponseRow>> {
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT id, request_id, status, headers, body, error, completed_unix_ms \
@@ -210,7 +210,7 @@ fn parse_uuid(s: &str) -> Result<RequestId> {
     uuid::Uuid::parse_str(s).map_err(|e| BasinError::internal(format!("uuid: {e}")))
 }
 
-async fn list_table_names(sess: &basin_engine::TenantSession) -> Result<Vec<String>> {
+async fn list_table_names(sess: &basin_engine::ProjectSession) -> Result<Vec<String>> {
     let res = sess.execute("SHOW TABLES").await?;
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,

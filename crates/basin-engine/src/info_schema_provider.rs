@@ -2,21 +2,21 @@
 //! `pg_catalog.pg_class` (Phase 5.11.M, follow-up to the catalog starter).
 //!
 //! The catalog half — `basin_catalog::info_schema::InfoSchemaQuery::tables`
-//! and `pg_class` — already produces tenant-filtered Arrow `RecordBatch`es.
+//! and `pg_class` — already produces project-filtered Arrow `RecordBatch`es.
 //! This module is the DataFusion glue: a pair of [`TableProvider`]s that
-//! plug into a `SessionContext` so a tenant SELECT statement against
+//! plug into a `SessionContext` so a project SELECT statement against
 //! `information_schema.tables` (or `pg_catalog.pg_class`) lands on the same
 //! catalog code path as the Rust API.
 //!
-//! ## Per-tenant cost discipline
+//! ## Per-project cost discipline
 //!
-//! Both providers hold `Arc<dyn Catalog>` + `TenantId` only — that's the
-//! cheap per-tenant primitive on top of the shared catalog handle. We do
+//! Both providers hold `Arc<dyn Catalog>` + `ProjectId` only — that's the
+//! cheap per-project primitive on top of the shared catalog handle. We do
 //! **not** cache `RecordBatch`es: each `scan()` call re-runs
 //! `InfoSchemaQuery` against the live catalog state. This costs one
 //! `list_tables` + one `load_table` per row per query, which is O(rows
-//! visible to this tenant) — a few microseconds for tenants with O(10)
-//! tables and bounded by the per-tenant table count, never by the global
+//! visible to this project) — a few microseconds for projects with O(10)
+//! tables and bounded by the per-project table count, never by the global
 //! pool. Caching is a v0.2 optimisation (it'd need invalidation hooks on
 //! every CREATE/DROP/ALTER, which is more complexity than the current
 //! cost justifies).
@@ -25,7 +25,7 @@
 //!
 //! Not implemented in v0.1. We hand DataFusion the full `RecordBatch`
 //! built from `InfoSchemaQuery::*`, and let DataFusion filter / project
-//! on top. For the v0.1 shape (≤ thousands of tables per tenant) this is
+//! on top. For the v0.1 shape (≤ thousands of tables per project) this is
 //! cheap enough; the overhead is a transient ~32 KB Arrow buffer and a
 //! linear scan inside DataFusion's filter operator. v0.2 can wire
 //! [`TableProvider::supports_filters_pushdown`] and a custom `ExecutionPlan`
@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use datafusion::arrow::datatypes::SchemaRef as DfSchemaRef;
 use datafusion::catalog::{SchemaProvider, Session};
 use datafusion::datasource::TableProvider;
@@ -57,12 +57,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use crate::convert::{batch_ws_to_df, schema_ws_to_df};
 
 /// `TableProvider` for `information_schema.tables` filtered to the calling
-/// tenant. Each `scan()` call rebuilds the row set from
+/// project. Each `scan()` call rebuilds the row set from
 /// [`InfoSchemaQuery::tables`] so newly created / dropped tables become
 /// visible without any per-session cache invalidation step.
 pub(crate) struct InfoSchemaTablesProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     /// Cached df-arrow schema. Built once at construction time so
     /// `schema()` (which DataFusion calls synchronously during planning)
     /// doesn't have to do the ws→df conversion on every plan.
@@ -72,24 +72,24 @@ pub(crate) struct InfoSchemaTablesProvider {
 // `dyn Catalog` doesn't carry a `Debug` bound (the trait is intentionally
 // unconstrained on Debug to keep test doubles simple), so derive(Debug)
 // can't see through the `Arc<dyn Catalog>`. DataFusion's `TableProvider`
-// requires `Debug` though, so we hand-roll one that prints the tenant and
+// requires `Debug` though, so we hand-roll one that prints the project and
 // elides the catalog handle.
 impl std::fmt::Debug for InfoSchemaTablesProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InfoSchemaTablesProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl InfoSchemaTablesProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::tables_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -118,7 +118,7 @@ impl TableProvider for InfoSchemaTablesProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::tables(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::tables(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -133,31 +133,31 @@ impl TableProvider for InfoSchemaTablesProvider {
 }
 
 /// `TableProvider` for `information_schema.columns` filtered to the
-/// calling tenant. One row per (table, column) the tenant owns.
-/// Mirrors [`InfoSchemaTablesProvider`] in shape and per-tenant cost
-/// discipline (`Arc<dyn Catalog>` + `TenantId`, no caching).
+/// calling project. One row per (table, column) the project owns.
+/// Mirrors [`InfoSchemaTablesProvider`] in shape and per-project cost
+/// discipline (`Arc<dyn Catalog>` + `ProjectId`, no caching).
 pub(crate) struct InfoSchemaColumnsProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for InfoSchemaColumnsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InfoSchemaColumnsProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl InfoSchemaColumnsProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::columns_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -184,7 +184,7 @@ impl TableProvider for InfoSchemaColumnsProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::columns(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::columns(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -196,31 +196,31 @@ impl TableProvider for InfoSchemaColumnsProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_attribute` filtered to the calling
-/// tenant. One row per (table, column) the tenant owns. `attrelid`
+/// project. One row per (table, column) the project owns. `attrelid`
 /// shares its hashing scheme with `pg_class.oid` so a JOIN against
 /// `pg_class` is direct.
 pub(crate) struct PgAttributeProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgAttributeProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgAttributeProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgAttributeProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_attribute_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -247,7 +247,7 @@ impl TableProvider for PgAttributeProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_attribute(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_attribute(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -259,30 +259,30 @@ impl TableProvider for PgAttributeProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_namespace` filtered to the calling
-/// tenant. v0.1 emits exactly one row (`"public"`) — single-schema-per
-/// -tenant is the v0.1 invariant.
+/// project. v0.1 emits exactly one row (`"public"`) — single-schema-per
+/// -project is the v0.1 invariant.
 pub(crate) struct PgNamespaceProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgNamespaceProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgNamespaceProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgNamespaceProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_namespace_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -309,7 +309,7 @@ impl TableProvider for PgNamespaceProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_namespace(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_namespace(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -321,29 +321,29 @@ impl TableProvider for PgNamespaceProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_class` filtered to the calling
-/// tenant. Mirrors [`InfoSchemaTablesProvider`].
+/// project. Mirrors [`InfoSchemaTablesProvider`].
 pub(crate) struct PgClassProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgClassProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgClassProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgClassProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_class_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -370,7 +370,7 @@ impl TableProvider for PgClassProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_class(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_class(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -382,32 +382,32 @@ impl TableProvider for PgClassProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_proc` filtered to the calling
-/// tenant. One row per user-defined function (prokind='f') and procedure
+/// project. One row per user-defined function (prokind='f') and procedure
 /// (prokind='p'). Mirrors [`InfoSchemaTablesProvider`] in shape and
-/// per-tenant cost discipline (`Arc<dyn Catalog>` + `TenantId`, no
+/// per-project cost discipline (`Arc<dyn Catalog>` + `ProjectId`, no
 /// caching).
 pub(crate) struct PgProcProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgProcProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgProcProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgProcProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_proc_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -434,7 +434,7 @@ impl TableProvider for PgProcProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_proc(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_proc(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -446,31 +446,31 @@ impl TableProvider for PgProcProvider {
 }
 
 /// `TableProvider` for `information_schema.routines` filtered to the
-/// calling tenant. One row per user-defined function and procedure.
+/// calling project. One row per user-defined function and procedure.
 /// Mirrors [`PgProcProvider`] in shape; the columns differ
 /// (SQL-standard vs. PG-flavoured) but the data sources are the same.
 pub(crate) struct RoutinesProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for RoutinesProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RoutinesProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl RoutinesProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::routines_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -497,7 +497,7 @@ impl TableProvider for RoutinesProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::routines(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::routines(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -509,32 +509,32 @@ impl TableProvider for RoutinesProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_index` filtered to the calling
-/// tenant. Always emits zero rows in v0.1 (no user-defined indexes —
+/// project. Always emits zero rows in v0.1 (no user-defined indexes —
 /// Phase 5.7 B1 secondary indexes are queued). Mirrors
 /// [`PgProcProvider`] in shape so the v0.2 expansion (one row per
 /// declared index) is a non-breaking row-builder change.
 pub(crate) struct PgIndexProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgIndexProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgIndexProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgIndexProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_index_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -561,7 +561,7 @@ impl TableProvider for PgIndexProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_index(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_index(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -573,30 +573,30 @@ impl TableProvider for PgIndexProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_constraint` filtered to the calling
-/// tenant. Always emits zero rows in v0.1 (no FK / explicit PK / CHECK /
+/// project. Always emits zero rows in v0.1 (no FK / explicit PK / CHECK /
 /// UNIQUE constraint surfaces yet). Mirrors [`PgProcProvider`].
 pub(crate) struct PgConstraintProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgConstraintProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgConstraintProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgConstraintProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_constraint_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -623,7 +623,7 @@ impl TableProvider for PgConstraintProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_constraint(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_constraint(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -635,31 +635,31 @@ impl TableProvider for PgConstraintProvider {
 }
 
 /// `TableProvider` for `information_schema.views` filtered to the calling
-/// tenant. One row per continuous materialized view (5.11.D2); plain
-/// `CREATE VIEW` is not in v0.1, so a tenant with no matviews sees zero
+/// project. One row per continuous materialized view (5.11.D2); plain
+/// `CREATE VIEW` is not in v0.1, so a project with no matviews sees zero
 /// rows. Mirrors [`InfoSchemaTablesProvider`].
 pub(crate) struct InfoSchemaViewsProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for InfoSchemaViewsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InfoSchemaViewsProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl InfoSchemaViewsProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::views_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -686,7 +686,7 @@ impl TableProvider for InfoSchemaViewsProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::views(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::views(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -697,30 +697,30 @@ impl TableProvider for InfoSchemaViewsProvider {
     }
 }
 
-/// `TableProvider` for `pg_catalog.pg_views` filtered to the calling tenant.
+/// `TableProvider` for `pg_catalog.pg_views` filtered to the calling project.
 /// Surfaces both plain views (`CREATE VIEW`) and continuous materialized views.
 pub(crate) struct PgViewsProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgViewsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgViewsProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgViewsProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_views_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -747,7 +747,7 @@ impl TableProvider for PgViewsProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_views(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_views(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -759,29 +759,29 @@ impl TableProvider for PgViewsProvider {
 }
 
 /// `TableProvider` for `information_schema.schemata` filtered to the
-/// calling tenant. v0.1 emits exactly one row (`"public"`).
+/// calling project. v0.1 emits exactly one row (`"public"`).
 pub(crate) struct InfoSchemaSchemataProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for InfoSchemaSchemataProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InfoSchemaSchemataProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl InfoSchemaSchemataProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::schemata_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -808,7 +808,7 @@ impl TableProvider for InfoSchemaSchemataProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::schemata(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::schemata(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -820,32 +820,32 @@ impl TableProvider for InfoSchemaSchemataProvider {
 }
 
 /// `TableProvider` for `information_schema.table_constraints` filtered
-/// to the calling tenant. One row per declared constraint; v0.1 only
-/// emits `NOT NULL` rows. Same per-tenant cost discipline as
-/// [`InfoSchemaTablesProvider`] (`Arc<dyn Catalog>` + `TenantId`, no
+/// to the calling project. One row per declared constraint; v0.1 only
+/// emits `NOT NULL` rows. Same per-project cost discipline as
+/// [`InfoSchemaTablesProvider`] (`Arc<dyn Catalog>` + `ProjectId`, no
 /// caching).
 pub(crate) struct TableConstraintsProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for TableConstraintsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableConstraintsProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl TableConstraintsProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::table_constraints_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -872,7 +872,7 @@ impl TableProvider for TableConstraintsProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::table_constraints(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::table_constraints(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -884,30 +884,30 @@ impl TableProvider for TableConstraintsProvider {
 }
 
 /// `TableProvider` for `information_schema.key_column_usage` filtered to
-/// the calling tenant. Always empty in v0.1 (no PK / UNIQUE / FK
+/// the calling project. Always empty in v0.1 (no PK / UNIQUE / FK
 /// surfaces yet). Mirrors [`TableConstraintsProvider`].
 pub(crate) struct KeyColumnUsageProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for KeyColumnUsageProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeyColumnUsageProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl KeyColumnUsageProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::key_column_usage_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -934,7 +934,7 @@ impl TableProvider for KeyColumnUsageProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::key_column_usage(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::key_column_usage(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -946,30 +946,30 @@ impl TableProvider for KeyColumnUsageProvider {
 }
 
 /// `TableProvider` for `information_schema.referential_constraints`
-/// filtered to the calling tenant. Always empty in v0.1 (FOREIGN KEY
+/// filtered to the calling project. Always empty in v0.1 (FOREIGN KEY
 /// queued). Mirrors [`TableConstraintsProvider`].
 pub(crate) struct ReferentialConstraintsProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for ReferentialConstraintsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReferentialConstraintsProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl ReferentialConstraintsProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::referential_constraints_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -997,7 +997,7 @@ impl TableProvider for ReferentialConstraintsProvider {
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let ws_batch =
-            InfoSchemaQuery::referential_constraints(self.catalog.as_ref(), &self.tenant)
+            InfoSchemaQuery::referential_constraints(self.catalog.as_ref(), &self.project)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -1009,31 +1009,31 @@ impl TableProvider for ReferentialConstraintsProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_type` filtered to the calling
-/// tenant. Static row set listing the PG built-in types Basin's pgwire
+/// project. Static row set listing the PG built-in types Basin's pgwire
 /// layer advertises; pgAdmin's column-detail query JOINs against this
 /// view to render type names. Mirrors [`PgClassProvider`].
 pub(crate) struct PgTypeProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgTypeProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgTypeProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgTypeProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_type_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -1060,7 +1060,7 @@ impl TableProvider for PgTypeProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_type(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_type(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -1072,30 +1072,30 @@ impl TableProvider for PgTypeProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_depend` filtered to the calling
-/// tenant. Surfaces continuous-matview → source-table edges and
+/// project. Surfaces continuous-matview → source-table edges and
 /// function → arg/return type edges. Mirrors [`PgTypeProvider`].
 pub(crate) struct PgDependProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgDependProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgDependProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgDependProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_depend_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -1122,7 +1122,7 @@ impl TableProvider for PgDependProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_depend(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_depend(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -1134,31 +1134,31 @@ impl TableProvider for PgDependProvider {
 }
 
 /// `TableProvider` for `pg_catalog.pg_authid` filtered to the calling
-/// tenant. Always emits exactly one row — the calling tenant rendered as
-/// a PG-style role; cross-tenant role enumeration is intentionally
+/// project. Always emits exactly one row — the calling project rendered as
+/// a PG-style role; cross-project role enumeration is intentionally
 /// absent. Mirrors [`PgNamespaceProvider`].
 pub(crate) struct PgAuthidProvider {
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
     schema: DfSchemaRef,
 }
 
 impl std::fmt::Debug for PgAuthidProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgAuthidProvider")
-            .field("tenant", &self.tenant)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
 }
 
 impl PgAuthidProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, tenant: TenantId) -> DfResult<Self> {
+    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_authid_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
             catalog,
-            tenant,
+            project,
             schema: Arc::new(df_schema),
         })
     }
@@ -1185,7 +1185,7 @@ impl TableProvider for PgAuthidProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::pg_authid(self.catalog.as_ref(), &self.tenant)
+        let ws_batch = InfoSchemaQuery::pg_authid(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let df_batch =
@@ -1206,14 +1206,14 @@ macro_rules! simple_provider {
     ($struct_name:ident, $query_schema:ident, $query_fn:ident, $debug_name:literal) => {
         pub(crate) struct $struct_name {
             catalog: Arc<dyn Catalog>,
-            tenant: TenantId,
+            project: ProjectId,
             schema: DfSchemaRef,
         }
 
         impl std::fmt::Debug for $struct_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.debug_struct($debug_name)
-                    .field("tenant", &self.tenant)
+                    .field("project", &self.project)
                     .finish_non_exhaustive()
             }
         }
@@ -1221,14 +1221,14 @@ macro_rules! simple_provider {
         impl $struct_name {
             pub(crate) fn new(
                 catalog: Arc<dyn Catalog>,
-                tenant: TenantId,
+                project: ProjectId,
             ) -> DfResult<Self> {
                 let ws_schema = InfoSchemaQuery::$query_schema();
                 let df_schema = schema_ws_to_df(ws_schema.as_ref())
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 Ok(Self {
                     catalog,
-                    tenant,
+                    project,
                     schema: Arc::new(df_schema),
                 })
             }
@@ -1257,7 +1257,7 @@ macro_rules! simple_provider {
             ) -> DfResult<Arc<dyn ExecutionPlan>> {
                 let ws_batch = InfoSchemaQuery::$query_fn(
                     self.catalog.as_ref(),
-                    &self.tenant,
+                    &self.project,
                 )
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1345,7 +1345,7 @@ simple_provider!(UserMappingOptionsProvider, user_mapping_options_schema, user_m
 pub(crate) fn register_info_schema_providers(
     ctx: &datafusion::prelude::SessionContext,
     catalog: Arc<dyn Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
 ) -> DfResult<()> {
     use datafusion::catalog_common::memory::MemorySchemaProvider;
 
@@ -1366,13 +1366,13 @@ pub(crate) fn register_info_schema_providers(
     // providers.
     let info_schema = Arc::new(MemorySchemaProvider::new());
     let tables_provider: Arc<dyn TableProvider> =
-        Arc::new(InfoSchemaTablesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(InfoSchemaTablesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("tables".to_string(), tables_provider)?;
     let columns_provider: Arc<dyn TableProvider> =
-        Arc::new(InfoSchemaColumnsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(InfoSchemaColumnsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("columns".to_string(), columns_provider)?;
     let routines_provider: Arc<dyn TableProvider> =
-        Arc::new(RoutinesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(RoutinesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("routines".to_string(), routines_provider)?;
     df_catalog.register_schema("information_schema", info_schema.clone())?;
 
@@ -1380,16 +1380,16 @@ pub(crate) fn register_info_schema_providers(
     // + `pg_proc`.
     let pg_catalog_schema = Arc::new(MemorySchemaProvider::new());
     let pg_class_provider: Arc<dyn TableProvider> =
-        Arc::new(PgClassProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgClassProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_class".to_string(), pg_class_provider)?;
     let pg_attribute_provider: Arc<dyn TableProvider> =
-        Arc::new(PgAttributeProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgAttributeProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_attribute".to_string(), pg_attribute_provider)?;
     let pg_namespace_provider: Arc<dyn TableProvider> =
-        Arc::new(PgNamespaceProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgNamespaceProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_namespace".to_string(), pg_namespace_provider)?;
     let pg_proc_provider: Arc<dyn TableProvider> =
-        Arc::new(PgProcProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgProcProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_proc".to_string(), pg_proc_provider)?;
     df_catalog.register_schema("pg_catalog", pg_catalog_schema.clone())?;
 
@@ -1398,16 +1398,16 @@ pub(crate) fn register_info_schema_providers(
     // at the tail so concurrent agent extensions (table_constraints /
     // key_column_usage / referential_constraints) merge cleanly.
     let pg_index_provider: Arc<dyn TableProvider> =
-        Arc::new(PgIndexProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgIndexProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_index".to_string(), pg_index_provider)?;
     let pg_constraint_provider: Arc<dyn TableProvider> =
-        Arc::new(PgConstraintProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgConstraintProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_constraint".to_string(), pg_constraint_provider)?;
     let views_provider: Arc<dyn TableProvider> =
-        Arc::new(InfoSchemaViewsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(InfoSchemaViewsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("views".to_string(), views_provider)?;
     let schemata_provider: Arc<dyn TableProvider> =
-        Arc::new(InfoSchemaSchemataProvider::new(catalog.clone(), tenant)?);
+        Arc::new(InfoSchemaSchemataProvider::new(catalog.clone(), project)?);
     info_schema.register_table("schemata".to_string(), schemata_provider)?;
 
     // Phase 5.11.M Tier 3 (constraint introspection):
@@ -1415,13 +1415,13 @@ pub(crate) fn register_info_schema_providers(
     // .referential_constraints. Registered last so concurrent-agent
     // additions above merge cleanly.
     let table_constraints_provider: Arc<dyn TableProvider> =
-        Arc::new(TableConstraintsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(TableConstraintsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("table_constraints".to_string(), table_constraints_provider)?;
     let key_column_usage_provider: Arc<dyn TableProvider> =
-        Arc::new(KeyColumnUsageProvider::new(catalog.clone(), tenant)?);
+        Arc::new(KeyColumnUsageProvider::new(catalog.clone(), project)?);
     info_schema.register_table("key_column_usage".to_string(), key_column_usage_provider)?;
     let referential_constraints_provider: Arc<dyn TableProvider> = Arc::new(
-        ReferentialConstraintsProvider::new(catalog.clone(), tenant)?,
+        ReferentialConstraintsProvider::new(catalog.clone(), project)?,
     );
     info_schema.register_table(
         "referential_constraints".to_string(),
@@ -1433,7 +1433,7 @@ pub(crate) fn register_info_schema_providers(
     // pgAdmin's column-detail query joins against this view to resolve
     // type names from `pg_attribute.atttypid`.
     let pg_type_provider: Arc<dyn TableProvider> =
-        Arc::new(PgTypeProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgTypeProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_type".to_string(), pg_type_provider)?;
 
     // Phase 5.11.M tail: pg_catalog.pg_depend + pg_catalog.pg_authid.
@@ -1441,160 +1441,160 @@ pub(crate) fn register_info_schema_providers(
     // resolution paths land here. Tail-appended so concurrent agents
     // adding more views earlier in the chain merge cleanly.
     let pg_depend_provider: Arc<dyn TableProvider> =
-        Arc::new(PgDependProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgDependProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_depend".to_string(), pg_depend_provider)?;
     let pg_authid_provider: Arc<dyn TableProvider> =
-        Arc::new(PgAuthidProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgAuthidProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_authid".to_string(), pg_authid_provider)?;
 
     // Bulk catalog expansion: pg_catalog additions
     // Bulk catalog expansion: pg_catalog base views (agent-bulk-catalog-views pattern)
     let pg_database_provider: Arc<dyn TableProvider> =
-        Arc::new(PgDatabaseProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgDatabaseProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_database".to_string(), pg_database_provider)?;
     let pg_roles_provider: Arc<dyn TableProvider> =
-        Arc::new(PgRolesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgRolesProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_roles".to_string(), pg_roles_provider)?;
     let pg_views_provider: Arc<dyn TableProvider> =
-        Arc::new(PgViewsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgViewsProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_views".to_string(), pg_views_provider)?;
     let pg_indexes_provider: Arc<dyn TableProvider> =
-        Arc::new(PgIndexesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgIndexesProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_indexes".to_string(), pg_indexes_provider)?;
     let pg_tables_provider: Arc<dyn TableProvider> =
-        Arc::new(PgTablesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgTablesProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_tables".to_string(), pg_tables_provider)?;
     let pg_settings_provider: Arc<dyn TableProvider> =
-        Arc::new(PgSettingsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgSettingsProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_settings".to_string(), pg_settings_provider)?;
     let pg_extension_provider: Arc<dyn TableProvider> =
-        Arc::new(PgExtensionProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgExtensionProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_extension".to_string(), pg_extension_provider)?;
     let pg_description_provider: Arc<dyn TableProvider> =
-        Arc::new(PgDescriptionProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgDescriptionProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_description".to_string(), pg_description_provider)?;
     let pg_stat_user_tables_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatUserTablesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatUserTablesProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_user_tables".to_string(), pg_stat_user_tables_provider)?;
     let pg_stat_user_indexes_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatUserIndexesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatUserIndexesProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_user_indexes".to_string(), pg_stat_user_indexes_provider)?;
     let pg_locks_provider: Arc<dyn TableProvider> =
-        Arc::new(PgLocksProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgLocksProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_locks".to_string(), pg_locks_provider)?;
     let pg_stat_activity_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatActivityProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatActivityProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_activity".to_string(), pg_stat_activity_provider)?;
 
     // Bulk catalog expansion: information_schema additions
     // New pg_stat_* views (agent-bulk-catalog-extras)
     let pg_stat_database_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatDatabaseProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatDatabaseProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_database".to_string(), pg_stat_database_provider)?;
     let pg_stat_bgwriter_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatBgwriterProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatBgwriterProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_bgwriter".to_string(), pg_stat_bgwriter_provider)?;
     let pg_stat_replication_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatReplicationProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatReplicationProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_replication".to_string(), pg_stat_replication_provider)?;
     let pg_stat_archiver_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatArchiverProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatArchiverProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_archiver".to_string(), pg_stat_archiver_provider)?;
     let pg_stat_wal_receiver_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatWalReceiverProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatWalReceiverProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_wal_receiver".to_string(), pg_stat_wal_receiver_provider)?;
     let pg_stat_subscription_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatSubscriptionProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatSubscriptionProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_subscription".to_string(), pg_stat_subscription_provider)?;
     let pg_stat_user_functions_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatUserFunctionsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatUserFunctionsProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_user_functions".to_string(), pg_stat_user_functions_provider)?;
     let pg_stat_progress_vacuum_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatProgressVacuumProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatProgressVacuumProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_progress_vacuum".to_string(), pg_stat_progress_vacuum_provider)?;
     let pg_stat_progress_create_index_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatProgressCreateIndexProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatProgressCreateIndexProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_progress_create_index".to_string(), pg_stat_progress_create_index_provider)?;
     let pg_stat_progress_analyze_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatProgressAnalyzeProvider::new(catalog.clone(), tenant)?);
+        Arc::new(PgStatProgressAnalyzeProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_progress_analyze".to_string(), pg_stat_progress_analyze_provider)?;
 
     // information_schema additions: check_constraints, triggers
     let check_constraints_provider: Arc<dyn TableProvider> =
-        Arc::new(CheckConstraintsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(CheckConstraintsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("check_constraints".to_string(), check_constraints_provider)?;
     let triggers_provider: Arc<dyn TableProvider> =
-        Arc::new(TriggersProvider::new(catalog.clone(), tenant)?);
+        Arc::new(TriggersProvider::new(catalog.clone(), project)?);
     info_schema.register_table("triggers".to_string(), triggers_provider)?;
     let sequences_provider: Arc<dyn TableProvider> =
-        Arc::new(SequencesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(SequencesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("sequences".to_string(), sequences_provider)?;
     let domains_provider: Arc<dyn TableProvider> =
-        Arc::new(DomainsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(DomainsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("domains".to_string(), domains_provider)?;
     let parameters_provider: Arc<dyn TableProvider> =
-        Arc::new(ParametersProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ParametersProvider::new(catalog.clone(), project)?);
     info_schema.register_table("parameters".to_string(), parameters_provider)?;
     let role_table_grants_provider: Arc<dyn TableProvider> =
-        Arc::new(RoleTableGrantsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(RoleTableGrantsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("role_table_grants".to_string(), role_table_grants_provider)?;
     let user_defined_types_provider: Arc<dyn TableProvider> =
-        Arc::new(UserDefinedTypesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(UserDefinedTypesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("user_defined_types".to_string(), user_defined_types_provider)?;
     let column_domain_usage_provider: Arc<dyn TableProvider> =
-        Arc::new(ColumnDomainUsageProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ColumnDomainUsageProvider::new(catalog.clone(), project)?);
     info_schema.register_table("column_domain_usage".to_string(), column_domain_usage_provider)?;
     let column_udt_usage_provider: Arc<dyn TableProvider> =
-        Arc::new(ColumnUdtUsageProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ColumnUdtUsageProvider::new(catalog.clone(), project)?);
     info_schema.register_table("column_udt_usage".to_string(), column_udt_usage_provider)?;
 
     // information_schema privilege views
     let usage_privileges_provider: Arc<dyn TableProvider> =
-        Arc::new(UsagePrivilegesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(UsagePrivilegesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("usage_privileges".to_string(), usage_privileges_provider)?;
     let table_privileges_provider: Arc<dyn TableProvider> =
-        Arc::new(TablePrivilegesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(TablePrivilegesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("table_privileges".to_string(), table_privileges_provider)?;
     let column_privileges_provider: Arc<dyn TableProvider> =
-        Arc::new(ColumnPrivilegesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ColumnPrivilegesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("column_privileges".to_string(), column_privileges_provider)?;
     let role_column_grants_provider: Arc<dyn TableProvider> =
-        Arc::new(RoleColumnGrantsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(RoleColumnGrantsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("role_column_grants".to_string(), role_column_grants_provider)?;
     let role_routine_grants_provider: Arc<dyn TableProvider> =
-        Arc::new(RoleRoutineGrantsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(RoleRoutineGrantsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("role_routine_grants".to_string(), role_routine_grants_provider)?;
     let applicable_roles_provider: Arc<dyn TableProvider> =
-        Arc::new(ApplicableRolesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ApplicableRolesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("applicable_roles".to_string(), applicable_roles_provider)?;
     let enabled_roles_provider: Arc<dyn TableProvider> =
-        Arc::new(EnabledRolesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(EnabledRolesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("enabled_roles".to_string(), enabled_roles_provider)?;
 
     // information_schema FDW stubs
     let foreign_data_wrappers_provider: Arc<dyn TableProvider> =
-        Arc::new(ForeignDataWrappersProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ForeignDataWrappersProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_data_wrappers".to_string(), foreign_data_wrappers_provider)?;
     let foreign_data_wrapper_options_provider: Arc<dyn TableProvider> =
-        Arc::new(ForeignDataWrapperOptionsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ForeignDataWrapperOptionsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_data_wrapper_options".to_string(), foreign_data_wrapper_options_provider)?;
     let foreign_servers_provider: Arc<dyn TableProvider> =
-        Arc::new(ForeignServersProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ForeignServersProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_servers".to_string(), foreign_servers_provider)?;
     let foreign_server_options_provider: Arc<dyn TableProvider> =
-        Arc::new(ForeignServerOptionsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ForeignServerOptionsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_server_options".to_string(), foreign_server_options_provider)?;
     let foreign_tables_provider: Arc<dyn TableProvider> =
-        Arc::new(ForeignTablesProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ForeignTablesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_tables".to_string(), foreign_tables_provider)?;
     let foreign_table_options_provider: Arc<dyn TableProvider> =
-        Arc::new(ForeignTableOptionsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(ForeignTableOptionsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_table_options".to_string(), foreign_table_options_provider)?;
     let user_mappings_provider: Arc<dyn TableProvider> =
-        Arc::new(UserMappingsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(UserMappingsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("user_mappings".to_string(), user_mappings_provider)?;
     let user_mapping_options_provider: Arc<dyn TableProvider> =
-        Arc::new(UserMappingOptionsProvider::new(catalog.clone(), tenant)?);
+        Arc::new(UserMappingOptionsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("user_mapping_options".to_string(), user_mapping_options_provider)?;
 
     Ok(())

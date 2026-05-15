@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::pg_ast::{self, StmtKind};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
@@ -166,7 +166,7 @@ fn security_label_kind() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Helper: execute `sql` and assert it returns an Empty result (noop-accept).
-async fn assert_noop(sess: &basin_engine::TenantSession, sql: &str) {
+async fn assert_noop(sess: &basin_engine::ProjectSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(ExecResult::Empty { .. }) => {}
         Ok(ExecResult::Rows { .. }) => {}
@@ -178,7 +178,7 @@ async fn assert_noop(sess: &basin_engine::TenantSession, sql: &str) {
 async fn fdw_statements_accepted() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_noop(
         &sess,
@@ -216,7 +216,7 @@ async fn fdw_statements_accepted() {
 async fn ownership_statements_accepted() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_noop(&sess, "REASSIGN OWNED BY old_role TO new_role").await;
     assert_noop(&sess, "DROP OWNED BY old_role").await;
@@ -226,7 +226,7 @@ async fn ownership_statements_accepted() {
 async fn default_privileges_accepted() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_noop(
         &sess,
@@ -244,7 +244,7 @@ async fn default_privileges_accepted() {
 async fn set_constraints_accepted() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_noop(&sess, "SET CONSTRAINTS ALL DEFERRED").await;
     assert_noop(&sess, "SET CONSTRAINTS ALL IMMEDIATE").await;
@@ -254,7 +254,7 @@ async fn set_constraints_accepted() {
 async fn security_label_accepted() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_noop(
         &sess,
@@ -269,7 +269,7 @@ async fn security_label_accepted() {
 
 /// Helper: count rows in `table` by executing `SELECT count(*) FROM <table>`.
 /// Returns 0 if the table is empty.
-async fn count_rows(sess: &basin_engine::TenantSession, table: &str) -> i64 {
+async fn count_rows(sess: &basin_engine::ProjectSession, table: &str) -> i64 {
     let sql = format!("SELECT COUNT(*) as n FROM {table}");
     match sess.execute(&sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => {
@@ -296,7 +296,7 @@ async fn count_rows(sess: &basin_engine::TenantSession, table: &str) -> i64 {
 async fn truncate_removes_all_rows() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
@@ -318,7 +318,7 @@ async fn truncate_removes_all_rows() {
 async fn truncate_empty_table_is_noop() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE empty_tbl (id BIGINT NOT NULL)")
         .await
@@ -333,7 +333,7 @@ async fn truncate_empty_table_is_noop() {
 async fn truncate_table_then_insert() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE log (id BIGINT NOT NULL, msg TEXT NOT NULL)")
         .await
@@ -356,7 +356,7 @@ async fn truncate_table_then_insert() {
 async fn truncate_with_cascade_and_continue_identity_accepted() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE msgs (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
@@ -376,7 +376,7 @@ async fn truncate_with_cascade_and_continue_identity_accepted() {
 async fn truncate_restart_identity_resets_sequence() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // BIGSERIAL creates an implicit sequence <table>_<col>_seq starting at 1.
     sess.execute("CREATE TABLE items (id BIGSERIAL, name TEXT NOT NULL)")

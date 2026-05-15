@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -2965,18 +2965,18 @@ fn short_note(msg: &str) -> String {
 // Single-pass executor
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run one pass of the matrix against a fresh engine+tenant for each row.
+/// Run one pass of the matrix against a fresh engine+project for each row.
 /// Returns `(outcomes, notes)` parallel to MATRIX indices.
 async fn run_pass() -> Vec<(Outcome, String)> {
     let mut results = Vec::with_capacity(MATRIX.len());
 
     for (_, sql, setup, _teardown) in MATRIX.iter() {
-        // Each row gets its own fresh tenant so prior failures don't bleed.
+        // Each row gets its own fresh project so prior failures don't bleed.
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
 
-        let sess = match eng.open_session(tenant).await {
+        let sess = match eng.open_session(project).await {
             Ok(s) => s,
             Err(e) => {
                 results.push((Outcome::ExecFailed, short_note(&format!("{e}"))));

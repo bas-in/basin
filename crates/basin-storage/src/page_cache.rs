@@ -59,11 +59,11 @@
 //! of (projection, filter) variants we cached against it. This mirrors
 //! the disk cache's `by_path` pattern.
 //!
-//! # Tenant isolation
+//! # Project isolation
 //!
 //! Cache keys derive from `ObjectPath`, which always starts with the
-//! tenant's prefix. Two tenants reading paths with otherwise-identical
-//! suffixes produce different keys; cross-tenant key collisions are
+//! project's prefix. Two projects reading paths with otherwise-identical
+//! suffixes produce different keys; cross-project key collisions are
 //! mechanically impossible.
 
 use std::collections::HashMap;
@@ -98,7 +98,7 @@ impl PageCacheConfig {
 }
 
 impl Default for PageCacheConfig {
-    /// Default budget of 1 GiB. Sized so that for a typical multi-tenant
+    /// Default budget of 1 GiB. Sized so that for a typical multi-project
     /// SaaS workload the working-set hot tables fit; the cap is
     /// configurable per-deployment if more is needed.
     fn default() -> Self {
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn hit_returns_cached_batches() {
         let cache = PageCache::new(PageCacheConfig::new(1024 * 1024));
-        let k = key("tenants/x/tables/t/data/a.parquet", 1, 2);
+        let k = key("projects/x/tables/t/data/a.parquet", 1, 2);
         let batches = vec![small_batch(0, 100), small_batch(100, 100)];
         cache.insert(k.clone(), batches.clone());
 
@@ -434,7 +434,7 @@ mod tests {
 
         // Different projection hash on the same path is a separate
         // entry; verify it misses.
-        let k2 = key("tenants/x/tables/t/data/a.parquet", 99, 2);
+        let k2 = key("projects/x/tables/t/data/a.parquet", 99, 2);
         assert!(cache.get(&k2).is_none());
         let c = cache.counters();
         assert_eq!(c.misses, 1);
@@ -445,13 +445,13 @@ mod tests {
     #[test]
     fn file_deletion_invalidates_all_variants() {
         let cache = PageCache::new(PageCacheConfig::new(1024 * 1024));
-        let path = "tenants/x/tables/t/data/a.parquet";
+        let path = "projects/x/tables/t/data/a.parquet";
         // Three projection/filter variants on the same file.
         for (p, f) in [(1, 1), (1, 2), (2, 1)] {
             cache.insert(key(path, p, f), vec![small_batch(0, 100)]);
         }
         // And one entry on a different file that must NOT be evicted.
-        let other_key = key("tenants/x/tables/t/data/b.parquet", 1, 1);
+        let other_key = key("projects/x/tables/t/data/b.parquet", 1, 1);
         cache.insert(other_key.clone(), vec![small_batch(0, 50)]);
 
         assert_eq!(cache.len(), 4);
@@ -479,9 +479,9 @@ mod tests {
         // them to age out before we're done.
         let cache = PageCache::new(PageCacheConfig::new(entry_size + entry_size / 2));
 
-        let k1 = key("tenants/x/tables/t/data/1.parquet", 1, 1);
-        let k2 = key("tenants/x/tables/t/data/2.parquet", 1, 1);
-        let k3 = key("tenants/x/tables/t/data/3.parquet", 1, 1);
+        let k1 = key("projects/x/tables/t/data/1.parquet", 1, 1);
+        let k2 = key("projects/x/tables/t/data/2.parquet", 1, 1);
+        let k3 = key("projects/x/tables/t/data/3.parquet", 1, 1);
 
         cache.insert(k1.clone(), vec![small_batch(0, 100)]);
         // After inserting k1 we should be at exactly entry_size bytes.

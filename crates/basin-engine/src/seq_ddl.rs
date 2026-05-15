@@ -27,7 +27,7 @@
 //! DROP SEQUENCE [IF EXISTS] <name>;
 //! ```
 //!
-//! `TEMPORARY` is rejected (sequences are tenant-scoped, not session-
+//! `TEMPORARY` is rejected (sequences are project-scoped, not session-
 //! scoped, in v0.1). `OWNED BY` is parsed by sqlparser as
 //! `Statement::CreateSequence::owned_by` but ignored here — the
 //! sequence catalog has no concept of column-attached ownership in
@@ -48,10 +48,10 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SequenceDef};
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use sqlparser::ast::{Expr, ObjectName, SequenceOptions, UnaryOperator, Value};
 
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Text-based intent for the textual `match_create_sequence` pre-screen.
 /// Mirrors the variants of `sqlparser::ast::SequenceOptions` we care
@@ -88,7 +88,7 @@ pub(crate) struct CreateSequenceIntent {
 /// [`SequenceDef`] and register it via
 /// [`Catalog::create_sequence`].
 pub(crate) async fn exec_create_sequence(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     temporary: bool,
     if_not_exists: bool,
     name: ObjectName,
@@ -96,12 +96,12 @@ pub(crate) async fn exec_create_sequence(
 ) -> Result<ExecResult> {
     if temporary {
         return Err(BasinError::InvalidSchema(
-            "CREATE TEMPORARY SEQUENCE is not supported; sequences are tenant-scoped".into(),
+            "CREATE TEMPORARY SEQUENCE is not supported; sequences are project-scoped".into(),
         ));
     }
     let seq_name = single_part_object_name(&name)?;
 
-    let mut def = SequenceDef::with_defaults(sess.tenant, seq_name.clone());
+    let mut def = SequenceDef::with_defaults(sess.project, seq_name.clone());
     apply_options(&mut def, &sequence_options)?;
 
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
@@ -119,11 +119,11 @@ pub(crate) async fn exec_create_sequence(
     })
 }
 
-/// Drop a sequence by `(tenant, name)`. Mirrors the rest of the DDL
+/// Drop a sequence by `(project, name)`. Mirrors the rest of the DDL
 /// surface in routing each name in a multi-name `DROP` through the
 /// same catalog method one at a time.
 pub(crate) async fn exec_drop_sequence(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     if_exists: bool,
     names: &[ObjectName],
 ) -> Result<ExecResult> {
@@ -135,7 +135,7 @@ pub(crate) async fn exec_drop_sequence(
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     for name in names {
         let seq_name = single_part_object_name(name)?;
-        match catalog.drop_sequence(&sess.tenant, &seq_name).await {
+        match catalog.drop_sequence(&sess.project, &seq_name).await {
             Ok(()) => {}
             Err(BasinError::NotFound(_)) if if_exists => {}
             Err(BasinError::NotFound(_)) => {
@@ -296,7 +296,7 @@ fn single_part_object_name(name: &ObjectName) -> Result<String> {
 /// on the original SQL string, which contained no `nextval` if the
 /// user wrote `INSERT INTO t (other_col) VALUES ('a')`).
 pub(crate) async fn evaluate_default_expression(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     default_text: &str,
 ) -> Result<Expr> {
     use sqlparser::dialect::PostgreSqlDialect;
@@ -304,7 +304,7 @@ pub(crate) async fn evaluate_default_expression(
 
     let seq_ctx = crate::seq_udf::SequenceContext {
         catalog: &sess.engine.config().catalog,
-        tenant: sess.tenant,
+        project: sess.project,
         session_cache: &sess.state.sequence_cache,
     };
     let rewritten = crate::seq_udf::rewrite_sequence_calls(default_text, &seq_ctx).await?;
@@ -327,7 +327,7 @@ pub(crate) async fn evaluate_default_expression(
 // Quiet `dead_code` while we land the SQL surface; the
 // `evaluate_default_expression` path is referenced from `executor.rs`.
 #[allow(dead_code)]
-fn _suppress_unused_tenant_id(_: TenantId) {}
+fn _suppress_unused_project_id(_: ProjectId) {}
 
 /// Recognise `CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] <name> [opt …]`
 /// textually before sqlparser sees the SQL. sqlparser 0.52 only parses a
@@ -463,12 +463,12 @@ pub(crate) fn match_create_sequence(sql: &str) -> Result<Option<CreateSequenceIn
 /// [`exec_create_sequence`] (the AST-driven path) but routes through
 /// the text-based intent so it's reachable without sqlparser.
 pub(crate) async fn exec_create_sequence_pre_screen(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     intent: CreateSequenceIntent,
 ) -> Result<ExecResult> {
     if intent.temporary {
         return Err(BasinError::InvalidSchema(
-            "CREATE TEMPORARY SEQUENCE is not supported; sequences are tenant-scoped".into(),
+            "CREATE TEMPORARY SEQUENCE is not supported; sequences are project-scoped".into(),
         ));
     }
     // Translate intent options into the same `SequenceOptions` shape
@@ -479,7 +479,7 @@ pub(crate) async fn exec_create_sequence_pre_screen(
         .into_iter()
         .map(intent_option_to_sequence_options)
         .collect::<Vec<_>>();
-    let mut def = SequenceDef::with_defaults(sess.tenant, intent.name.clone());
+    let mut def = SequenceDef::with_defaults(sess.project, intent.name.clone());
     apply_options(&mut def, &parsed)?;
 
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
@@ -774,14 +774,14 @@ pub(crate) fn match_alter_sequence(sql: &str) -> Result<Option<AlterSequenceInte
 /// catalog supports atomic def updates. For now those options are
 /// parsed and validated but produce a clear "not yet supported" error.
 pub(crate) async fn exec_alter_sequence(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     intent: AlterSequenceIntent,
 ) -> Result<ExecResult> {
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
 
     // Check existence before applying any option.
     let def = catalog
-        .lookup_sequence(&sess.tenant, &intent.name)
+        .lookup_sequence(&sess.project, &intent.name)
         .await;
     if def.is_none() {
         if intent.if_exists {
@@ -805,7 +805,7 @@ pub(crate) async fn exec_alter_sequence(
                 // setval(seq, restart_at, false) arms the sequence so the
                 // next nextval returns exactly restart_at.
                 catalog
-                    .setval(&sess.tenant, &intent.name, restart_at, false)
+                    .setval(&sess.project, &intent.name, restart_at, false)
                     .await?;
             }
             SequenceOption::Increment(_)
@@ -1069,7 +1069,7 @@ mod tests {
             .into_iter()
             .map(intent_option_to_sequence_options)
             .collect();
-        let mut def = SequenceDef::with_defaults(TenantId::new(), "foo".to_string());
+        let mut def = SequenceDef::with_defaults(ProjectId::new(), "foo".to_string());
         apply_options(&mut def, &opts).unwrap();
         assert_eq!(def.increment, -1);
         assert_eq!(def.min_value, i64::MIN + 1);
@@ -1190,7 +1190,7 @@ mod tests {
             opt_cache(4),
             opt_cycle(false),
         ];
-        let mut def = SequenceDef::with_defaults(TenantId::new(), "foo".to_string());
+        let mut def = SequenceDef::with_defaults(ProjectId::new(), "foo".to_string());
         apply_options(&mut def, &opts).unwrap();
         assert_eq!(def.start, 100);
         assert_eq!(def.increment, 5);
@@ -1209,7 +1209,7 @@ mod tests {
         else {
             panic!()
         };
-        let mut def = SequenceDef::with_defaults(TenantId::new(), "foo".to_string());
+        let mut def = SequenceDef::with_defaults(ProjectId::new(), "foo".to_string());
         apply_options(&mut def, &sequence_options).unwrap();
         assert_eq!(def.increment, -1);
         assert_eq!(def.min_value, i64::MIN + 1);
@@ -1223,7 +1223,7 @@ mod tests {
         // the option list directly. This exercises the apply_options
         // path that handles `MINVALUE 100` followed by `NO MINVALUE`.
         let opts = vec![opt_minvalue(Some(100)), opt_minvalue(None)];
-        let mut def = SequenceDef::with_defaults(TenantId::new(), "foo".to_string());
+        let mut def = SequenceDef::with_defaults(ProjectId::new(), "foo".to_string());
         apply_options(&mut def, &opts).unwrap();
         assert_eq!(def.min_value, 1);
     }
@@ -1237,7 +1237,7 @@ mod tests {
         else {
             panic!()
         };
-        let mut def = SequenceDef::with_defaults(TenantId::new(), "foo".to_string());
+        let mut def = SequenceDef::with_defaults(ProjectId::new(), "foo".to_string());
         let err = apply_options(&mut def, &sequence_options).unwrap_err();
         assert!(matches!(err, BasinError::InvalidSchema(_)));
     }

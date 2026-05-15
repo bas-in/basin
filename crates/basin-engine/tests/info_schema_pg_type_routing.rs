@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -62,7 +62,7 @@ fn col_i64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
     out
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -73,7 +73,7 @@ async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> 
 async fn select_pg_type_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // Filter to numeric types — `int2`, `int4`, `int8`, `float4`,
     // `float8`, `numeric` all carry typcategory='N'.
@@ -95,7 +95,7 @@ async fn select_pg_type_routes() {
 async fn pg_type_join_pg_attribute_works() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE accounts (\
@@ -137,12 +137,12 @@ async fn pg_type_join_pg_attribute_works() {
 
 #[tokio::test]
 async fn pg_type_oid_stable_across_calls() {
-    // A tenant must see the same `pg_type.oid` for `int4` (and friends)
+    // A project must see the same `pg_type.oid` for `int4` (and friends)
     // across multiple session SELECTs. The static row set guarantees this;
     // the test pins the contract.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let b1 = rows(
         &sess,

@@ -1,7 +1,7 @@
 //! Integration tests for the noop-accept dispatch layer (ADR 0014 Phase 1).
 //!
 //! Each test sends a statement in the noop-accept set through the full engine
-//! path (`TenantSession::execute`) and asserts that:
+//! path (`ProjectSession::execute`) and asserts that:
 //!
 //! 1. No error is returned (the statement is accepted, not rejected with 0A000).
 //! 2. The result is `ExecResult::Empty` with the expected Postgres-style
@@ -29,8 +29,8 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -57,11 +57,11 @@ async fn open_engine() -> (TempDir, Engine) {
     (dir, engine)
 }
 
-async fn open_session_with_engine(engine: &Engine) -> TenantSession {
-    engine.open_session(TenantId::new()).await.unwrap()
+async fn open_session_with_engine(engine: &Engine) -> ProjectSession {
+    engine.open_session(ProjectId::new()).await.unwrap()
 }
 
-async fn open_session() -> (TempDir, TenantSession) {
+async fn open_session() -> (TempDir, ProjectSession) {
     let (dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
     (dir, sess)
@@ -69,7 +69,7 @@ async fn open_session() -> (TempDir, TenantSession) {
 
 /// Assert that `sql` executes without error and returns an empty tag matching
 /// `expected_tag`. Panics with a descriptive message on failure.
-async fn assert_noop(sess: &TenantSession, sql: &str, expected_tag: &str) {
+async fn assert_noop(sess: &ProjectSession, sql: &str, expected_tag: &str) {
     match sess.execute(sql).await {
         Ok(ExecResult::Empty { tag }) => {
             assert_eq!(
@@ -344,7 +344,7 @@ async fn unlisten_is_still_rejected_with_0a000() {
 }
 
 /// Assert that `sql` executes without error and returns `ExecResult::Empty`.
-async fn assert_empty(sess: &basin_engine::TenantSession, sql: &str) {
+async fn assert_empty(sess: &basin_engine::ProjectSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(ExecResult::Empty { .. }) => {}
         Ok(other) => panic!("expected Empty for [{sql}], got: {other:?}"),

@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_net::{HttpClient, HttpRequest, RequestQueue, ResponseStore};
@@ -73,24 +73,24 @@ async fn viability_basin_net() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let addr = spawn_ok_server().await;
 
     let client = HttpClient::new();
     // Equivalent to `INSERT INTO _net_allowed_hosts VALUES ('127.0.0.1')`.
-    client.allow_host(&tenant, "127.0.0.1").await;
+    client.allow_host(&project, "127.0.0.1").await;
 
     // -- 1. Sync round-trip: `SELECT * FROM http_get('http://addr/ok')` --
     let url = format!("http://{addr}/ok");
     let resp = client
-        .http_get(&tenant, &url)
+        .http_get(&project, &url)
         .await
         .expect("sync GET should succeed against allowlisted mock");
     let roundtrip_passed = resp.status == 200 && resp.body_as_text() == "ok";
 
     // -- 2. Allowlist blocks unknown hosts --
     let denied = client
-        .http_get(&tenant, "http://192.0.2.1/secret")
+        .http_get(&project, "http://192.0.2.1/secret")
         .await
         .err()
         .map(|e| format!("{e}"))
@@ -102,11 +102,11 @@ async fn viability_basin_net() {
     let queue = RequestQueue::new(client.clone(), store.clone());
     let req = HttpRequest::post(&url, b"{\"k\":1}".to_vec(), "application/json")
         .with_header("authorization", "Bearer test");
-    let id = queue.submit(&tenant, req);
+    let id = queue.submit(&project, req);
     // Step the runner deterministically.
     queue.run_one().await;
     let row = store
-        .get(&tenant, id)
+        .get(&project, id)
         .await
         .expect("get response row")
         .expect("row not yet present");

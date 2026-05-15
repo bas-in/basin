@@ -1,12 +1,12 @@
-//! Viability benchmarks for the per-tenant pgwire connection-URL feature.
+//! Viability benchmarks for the per-project pgwire connection-URL feature.
 //!
 //! Three claims this test makes measurable, dashboard-trackable, and fail-loud
 //! on regression. All three skip cleanly when the local Postgres dev catalog
-//! is unreachable — the existing pattern from `per_tenant_credentials.rs`.
+//! is unreachable — the existing pattern from `per_project_credentials.rs`.
 //!
 //! ## Claims
 //!
-//! 1. **Provision throughput** — `AuthService::provision_tenant_db` issues
+//! 1. **Provision throughput** — `AuthService::provision_project_db` issues
 //!    a fresh `(pgwire_user, password)` row + bcrypt-hashed password in
 //!    under 50 ms p99 at the test bcrypt-cost (4). Production cost-12 is
 //!    documented inline; this card tracks the test-cost number so a
@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_auth::{config::SmtpConfig, config::SmtpTls, AuthConfig, AuthService};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig, WriteOptions};
 use object_store::local::LocalFileSystem;
@@ -89,7 +89,7 @@ fn auth_cfg(schema: &str) -> AuthConfig {
 
 async fn try_auth() -> Option<(AuthService, String)> {
     if !pg_alive().await {
-        eprintln!("postgres unreachable, skipping viability_per_tenant_provisioning");
+        eprintln!("postgres unreachable, skipping viability_per_project_provisioning");
         return None;
     }
     let schema = unique_schema();
@@ -106,7 +106,7 @@ async fn try_auth() -> Option<(AuthService, String)> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn viability_per_tenant_provision_throughput() {
+async fn viability_per_project_provision_throughput() {
     let Some((auth, _schema)) = try_auth().await else {
         return;
     };
@@ -116,10 +116,10 @@ async fn viability_per_tenant_provision_throughput() {
 
     let mut samples_ms: Vec<f64> = Vec::with_capacity(N);
     for _ in 0..N {
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let started = Instant::now();
         let _ = auth
-            .provision_tenant_db(&tenant, None)
+            .provision_project_db(&project, None)
             .await
             .expect("provision");
         samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
@@ -131,15 +131,15 @@ async fn viability_per_tenant_provision_throughput() {
 
     let pass = p99 < BAR_P99_MS;
     println!(
-        "[VIABILITY per_tenant_provision_throughput] N={N} \
+        "[VIABILITY per_project_provision_throughput] N={N} \
          p50={p50:.2}ms p99={p99:.2}ms mean={mean:.2}ms (bar p99 < {BAR_P99_MS}ms) \
          {}",
         if pass { "PASS" } else { "FAIL" }
     );
 
     report_viability(
-        "per_tenant_provision_throughput",
-        "Per-tenant connection-URL provision latency",
+        "per_project_provision_throughput",
+        "Per-project connection-URL provision latency",
         "Issuing a fresh pgwire (user, password) row + bcrypt hash + URL \
          finishes within p99 < 50 ms at test bcrypt-cost (4). Production \
          cost-12 is documented inline; this card tracks the test-cost \
@@ -173,7 +173,7 @@ async fn viability_per_tenant_provision_throughput() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn viability_per_tenant_bcrypt_validate_cost() {
+async fn viability_per_project_bcrypt_validate_cost() {
     let Some((auth, _schema)) = try_auth().await else {
         return;
     };
@@ -184,9 +184,9 @@ async fn viability_per_tenant_bcrypt_validate_cost() {
     // Provision once; reuse the same pgwire credentials across many
     // validations. This isolates the bcrypt-verify path from the
     // provision path.
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let info = auth
-        .provision_tenant_db(&tenant, None)
+        .provision_project_db(&project, None)
         .await
         .expect("provision");
     let user = info.pgwire_user.clone();
@@ -208,14 +208,14 @@ async fn viability_per_tenant_bcrypt_validate_cost() {
 
     let pass = p99 < BAR_P99_MS;
     println!(
-        "[VIABILITY per_tenant_bcrypt_validate_cost] N={N} \
+        "[VIABILITY per_project_bcrypt_validate_cost] N={N} \
          p50={p50:.2}ms p99={p99:.2}ms mean={mean:.2}ms (bar p99 < {BAR_P99_MS}ms) \
          {}",
         if pass { "PASS" } else { "FAIL" }
     );
 
     report_viability(
-        "per_tenant_bcrypt_validate_cost",
+        "per_project_bcrypt_validate_cost",
         "bcrypt validation cost on pgwire connect",
         "Every cold pgwire connection pays one bcrypt-verify on the way \
          in. At test bcrypt-cost (4) p99 stays under 300 ms across 50 \
@@ -276,7 +276,7 @@ fn shuffled_batch(rows: usize) -> RecordBatch {
 
 async fn write_with_options(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     batch: &RecordBatch,
     opts: &WriteOptions,
@@ -284,7 +284,7 @@ async fn write_with_options(
     let part = PartitionKey::default_key();
     let started = Instant::now();
     storage
-        .write_batch_with_options(tenant, table, &part, batch, opts)
+        .write_batch_with_options(project, table, &part, batch, opts)
         .await
         .expect("write");
     started.elapsed().as_secs_f64() * 1000.0
@@ -319,7 +319,7 @@ async fn viability_cluster_by_sort_overhead() {
     let mut no_cluster_ms: Vec<f64> = Vec::with_capacity(N);
     let mut with_cluster_ms: Vec<f64> = Vec::with_capacity(N);
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     for i in 0..N {
         // Different table per iteration so the writer doesn't merge into
         // a single Parquet file across runs.
@@ -327,9 +327,9 @@ async fn viability_cluster_by_sort_overhead() {
         let table_b = TableName::new(format!("cl_{i}")).unwrap();
         let batch = shuffled_batch(ROWS);
         no_cluster_ms
-            .push(write_with_options(&storage, &tenant, &table_a, &batch, &no_cluster).await);
+            .push(write_with_options(&storage, &project, &table_a, &batch, &no_cluster).await);
         with_cluster_ms
-            .push(write_with_options(&storage, &tenant, &table_b, &batch, &with_cluster).await);
+            .push(write_with_options(&storage, &project, &table_b, &batch, &with_cluster).await);
     }
 
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;

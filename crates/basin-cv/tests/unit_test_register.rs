@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cv::{CvSpec, CvStore};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
@@ -39,8 +39,8 @@ async fn register_then_list_returns_same_spec() {
     let eng = engine_in(&dir);
     let store = CvStore::new(eng.clone());
 
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL, payload TEXT NOT NULL)")
         .await
         .unwrap();
@@ -59,10 +59,10 @@ async fn register_then_list_returns_same_spec() {
         last_bucket_max: None,
     };
 
-    store.register_cv(&tenant, spec.clone()).await.unwrap();
+    store.register_cv(&project, spec.clone()).await.unwrap();
 
     // Round-trip via list.
-    let listed = store.list_cvs(&tenant).await.unwrap();
+    let listed = store.list_cvs(&project).await.unwrap();
     assert_eq!(listed.len(), 1, "exactly one CV should be registered");
     assert_eq!(listed[0].name, spec.name);
     assert_eq!(listed[0].source_table, spec.source_table);
@@ -74,7 +74,7 @@ async fn register_then_list_returns_same_spec() {
     );
 
     // Round-trip via get.
-    let got = store.get_cv(&tenant, &spec.name).await.unwrap();
+    let got = store.get_cv(&project, &spec.name).await.unwrap();
     assert!(got.is_some());
     assert_eq!(got.unwrap().query_sql, spec.query_sql);
 }
@@ -85,8 +85,8 @@ async fn registered_cv_appears_as_a_readable_table() {
     let eng = engine_in(&dir);
     let store = CvStore::new(eng.clone());
 
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL, payload TEXT NOT NULL)")
         .await
         .unwrap();
@@ -102,10 +102,10 @@ async fn registered_cv_appears_as_a_readable_table() {
         last_refreshed_at: None,
         last_bucket_max: None,
     };
-    store.register_cv(&tenant, spec).await.unwrap();
+    store.register_cv(&project, spec).await.unwrap();
 
     // Open a fresh session so the CV's catalog table is picked up.
-    let observer = eng.open_session(tenant).await.unwrap();
+    let observer = eng.open_session(project).await.unwrap();
     let res = observer.execute("SELECT c FROM event_count").await.unwrap();
     let total: i64 = match res {
         ExecResult::Rows { batches, .. } => {
@@ -134,8 +134,8 @@ async fn duplicate_name_rejected() {
     let eng = engine_in(&dir);
     let store = CvStore::new(eng.clone());
 
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -151,8 +151,8 @@ async fn duplicate_name_rejected() {
         last_refreshed_at: None,
         last_bucket_max: None,
     };
-    store.register_cv(&tenant, spec.clone()).await.unwrap();
-    let err = store.register_cv(&tenant, spec).await.unwrap_err();
+    store.register_cv(&project, spec.clone()).await.unwrap();
+    let err = store.register_cv(&project, spec).await.unwrap_err();
     assert!(
         matches!(err, basin_cv::RegisterError::Duplicate(_)),
         "got {err:?}"

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::instrument;
@@ -27,7 +27,7 @@ use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::reactors::{self, ReactorDef, ReactorError};
 use crate::sequences::{advance_one, SequenceDef, SequenceError, SequenceState};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
-use crate::tenant_storage_config::TenantStorageConfig;
+use crate::project_storage_config::ProjectStorageConfig;
 use crate::views::ViewDef;
 use crate::Catalog;
 
@@ -93,7 +93,7 @@ impl TableState {
     }
 }
 
-type TableMap = HashMap<(TenantId, TableName), Arc<Mutex<TableState>>>;
+type TableMap = HashMap<(ProjectId, TableName), Arc<Mutex<TableState>>>;
 
 /// In-memory implementation of [`Catalog`]. Cheap to clone via `Arc`.
 ///
@@ -101,8 +101,8 @@ type TableMap = HashMap<(TenantId, TableName), Arc<Mutex<TableState>>>;
 /// * `tables` is a `tokio::sync::Mutex<HashMap<...>>`. We hold this lock only
 ///   long enough to look up (or insert) the per-table `Arc<Mutex<TableState>>`
 ///   then drop it before doing any real work.
-/// * Commits and reads on a single `(tenant, table)` serialize on that table's
-///   own mutex. Two tenants — or two different tables in the same tenant —
+/// * Commits and reads on a single `(project, table)` serialize on that table's
+///   own mutex. Two projects — or two different tables in the same project —
 ///   never block each other.
 ///
 /// We use `tokio::sync::Mutex` (not `std::sync::Mutex`) because async code
@@ -110,44 +110,44 @@ type TableMap = HashMap<(TenantId, TableName), Arc<Mutex<TableState>>>;
 /// mutex would force every method to handle poisoning.
 pub struct InMemoryCatalog {
     tables: Mutex<TableMap>,
-    namespaces: Mutex<HashSet<TenantId>>,
-    /// Per-tenant registered SQL functions. One shared `HashMap` keyed by
-    /// `(TenantId, name)` so per-tenant cost stays `O(bytes)` — no
-    /// per-tenant heavy resource.
-    sql_functions: Mutex<HashMap<(TenantId, String), SqlFunctionDef>>,
-    /// Per-tenant registered sequences. Same shape rule as `sql_functions`:
-    /// one shared `HashMap` keyed by `(TenantId, name)`. Each value is a
+    namespaces: Mutex<HashSet<ProjectId>>,
+    /// Per-project registered SQL functions. One shared `HashMap` keyed by
+    /// `(ProjectId, name)` so per-project cost stays `O(bytes)` — no
+    /// per-project heavy resource.
+    sql_functions: Mutex<HashMap<(ProjectId, String), SqlFunctionDef>>,
+    /// Per-project registered sequences. Same shape rule as `sql_functions`:
+    /// one shared `HashMap` keyed by `(ProjectId, name)`. Each value is a
     /// pair of (immutable definition, per-sequence Mutex around the
     /// counter state). The outer mutex is held only long enough to look
     /// up (or insert) the per-sequence handle; concurrent `nextval` calls
     /// on different sequences never block each other.
-    sequences: Mutex<HashMap<(TenantId, String), Arc<SequenceEntry>>>,
-    /// Per-tenant registered reactors. Same shape rule as
-    /// `sql_functions`: one shared `HashMap` keyed by `(TenantId,
+    sequences: Mutex<HashMap<(ProjectId, String), Arc<SequenceEntry>>>,
+    /// Per-project registered reactors. Same shape rule as
+    /// `sql_functions`: one shared `HashMap` keyed by `(ProjectId,
     /// composite)` where `composite = "<table>:<reactor_name>"` —
-    /// reactor names are unique per `(tenant, table)`, not per tenant.
-    /// Per-tenant cost stays `O(bytes)` with no per-tenant heavy
+    /// reactor names are unique per `(project, table)`, not per project.
+    /// Per-project cost stays `O(bytes)` with no per-project heavy
     /// resource. Each value carries a monotonic `seq` so
     /// `lookup_reactors_for` can replay reactors in registration order.
     reactors: Mutex<ReactorState>,
-    /// Per-tenant `CREATE TYPE … AS ENUM` declarations. Same shape
+    /// Per-project `CREATE TYPE … AS ENUM` declarations. Same shape
     /// rule as `sql_functions`.
-    enum_types: Mutex<HashMap<(TenantId, String), EnumTypeDef>>,
-    /// Per-tenant `CREATE DOMAIN` declarations.
-    domains: Mutex<HashMap<(TenantId, String), DomainDef>>,
-    /// Per-tenant `CREATE PROCEDURE … LANGUAGE sql` declarations.
+    enum_types: Mutex<HashMap<(ProjectId, String), EnumTypeDef>>,
+    /// Per-project `CREATE DOMAIN` declarations.
+    domains: Mutex<HashMap<(ProjectId, String), DomainDef>>,
+    /// Per-project `CREATE PROCEDURE … LANGUAGE sql` declarations.
     /// Same shape rule as `sql_functions`: one shared `HashMap` keyed
-    /// by `(TenantId, name)` so per-tenant cost stays `O(bytes)` with
-    /// no per-tenant heavy resource.
-    procedures: Mutex<HashMap<(TenantId, String), SqlProcedureDef>>,
-    /// Per-tenant storage config (KMS routing + provider extras).
-    /// Single shared `HashMap` keyed by `TenantId`; lazy entry creation;
-    /// per-tenant cost stays `O(bytes)` with no per-tenant heavy
+    /// by `(ProjectId, name)` so per-project cost stays `O(bytes)` with
+    /// no per-project heavy resource.
+    procedures: Mutex<HashMap<(ProjectId, String), SqlProcedureDef>>,
+    /// Per-project storage config (KMS routing + provider extras).
+    /// Single shared `HashMap` keyed by `ProjectId`; lazy entry creation;
+    /// per-project cost stays `O(bytes)` with no per-project heavy
     /// resource. Cleared in `drop_namespace`.
-    tenant_storage_config: Mutex<HashMap<TenantId, TenantStorageConfig>>,
-    /// Per-tenant plain-view definitions (`CREATE VIEW … AS SELECT …`).
-    /// Same shape as `sql_functions`: keyed by `(TenantId, lower-name)`.
-    views: Mutex<HashMap<(TenantId, String), ViewDef>>,
+    project_storage_config: Mutex<HashMap<ProjectId, ProjectStorageConfig>>,
+    /// Per-project plain-view definitions (`CREATE VIEW … AS SELECT …`).
+    /// Same shape as `sql_functions`: keyed by `(ProjectId, lower-name)`.
+    views: Mutex<HashMap<(ProjectId, String), ViewDef>>,
 }
 
 /// Aggregate reactor state. The seq counter assigns each newly-
@@ -156,8 +156,8 @@ pub struct InMemoryCatalog {
 /// order.
 #[derive(Default)]
 struct ReactorState {
-    /// Composite key = `(tenant, "<table>:<name>")`.
-    map: HashMap<(TenantId, String), ReactorEntry>,
+    /// Composite key = `(project, "<table>:<name>")`.
+    map: HashMap<(ProjectId, String), ReactorEntry>,
     next_seq: u64,
 }
 
@@ -188,27 +188,27 @@ impl InMemoryCatalog {
             enum_types: Mutex::new(HashMap::new()),
             domains: Mutex::new(HashMap::new()),
             procedures: Mutex::new(HashMap::new()),
-            tenant_storage_config: Mutex::new(HashMap::new()),
+            project_storage_config: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
         }
     }
 
     async fn get_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
     ) -> Result<Arc<Mutex<TableState>>> {
-        let key = (*tenant, table.clone());
+        let key = (*project, table.clone());
         let guard = self.tables.lock().await;
         guard
             .get(&key)
             .cloned()
-            .ok_or_else(|| BasinError::not_found(format!("{tenant}/{table}")))
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{table}")))
     }
 
-    fn build_metadata(tenant: &TenantId, table: &TableName, state: &TableState) -> TableMetadata {
+    fn build_metadata(project: &ProjectId, table: &TableName, state: &TableState) -> TableMetadata {
         TableMetadata {
-            tenant: *tenant,
+            project: *project,
             table: table.clone(),
             schema: state.schema.clone(),
             current_snapshot: state.current,
@@ -241,66 +241,66 @@ impl Default for InMemoryCatalog {
 
 #[async_trait]
 impl Catalog for InMemoryCatalog {
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn create_namespace(&self, tenant: &TenantId) -> Result<()> {
-        self.namespaces.lock().await.insert(*tenant);
+    #[instrument(skip(self), fields(project = %project))]
+    async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
+        self.namespaces.lock().await.insert(*project);
         Ok(())
     }
 
-    #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, schema), fields(project = %project, table = %table))]
     async fn create_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         schema: &Schema,
     ) -> Result<TableMetadata> {
         // Auto-create the namespace on first table; the dedicated
         // `create_namespace` call is for callers that want the explicit step.
-        self.namespaces.lock().await.insert(*tenant);
+        self.namespaces.lock().await.insert(*project);
 
-        let key = (*tenant, table.clone());
+        let key = (*project, table.clone());
         let mut tables = self.tables.lock().await;
         if tables.contains_key(&key) {
             return Err(BasinError::catalog(format!(
-                "table {tenant}/{table} already exists"
+                "table {project}/{table} already exists"
             )));
         }
         let state = TableState::genesis(Arc::new(schema.clone()));
-        let meta = Self::build_metadata(tenant, table, &state);
+        let meta = Self::build_metadata(project, table, &state);
         tables.insert(key, Arc::new(Mutex::new(state)));
         Ok(meta)
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn load_table(&self, tenant: &TenantId, table: &TableName) -> Result<TableMetadata> {
-        let state = self.get_table(tenant, table).await?;
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata> {
+        let state = self.get_table(project, table).await?;
         let guard = state.lock().await;
-        Ok(Self::build_metadata(tenant, table, &guard))
+        Ok(Self::build_metadata(project, table, &guard))
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn drop_table(&self, tenant: &TenantId, table: &TableName) -> Result<()> {
-        let key = (*tenant, table.clone());
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
+        let key = (*project, table.clone());
         let mut tables = self.tables.lock().await;
         tables
             .remove(&key)
-            .ok_or_else(|| BasinError::not_found(format!("{tenant}/{table}")))?;
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{table}")))?;
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, old = %old, new = %new))]
+    #[instrument(skip(self), fields(project = %project, old = %old, new = %new))]
     async fn rename_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         old: &TableName,
         new: &TableName,
     ) -> Result<()> {
-        let old_key = (*tenant, old.clone());
-        let new_key = (*tenant, new.clone());
+        let old_key = (*project, old.clone());
+        let new_key = (*project, new.clone());
         let mut tables = self.tables.lock().await;
         if tables.contains_key(&new_key) {
             return Err(BasinError::catalog(format!(
-                "rename_table: target {tenant}/{new} already exists"
+                "rename_table: target {project}/{new} already exists"
             )));
         }
         // Look up the old entry and *alias* the new key to its Arc.
@@ -314,51 +314,51 @@ impl Catalog for InMemoryCatalog {
         let entry = tables
             .get(&old_key)
             .cloned()
-            .ok_or_else(|| BasinError::not_found(format!("{tenant}/{old}")))?;
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{old}")))?;
         tables.insert(new_key, entry);
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_tables(&self, tenant: &TenantId) -> Result<Vec<TableName>> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>> {
         let tables = self.tables.lock().await;
         let mut out: Vec<TableName> = tables
             .keys()
-            .filter(|(t, _)| t == tenant)
+            .filter(|(t, _)| t == project)
             .map(|(_, name)| name.clone())
             .collect();
         out.sort();
         Ok(out)
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn drop_namespace(&self, tenant: &TenantId) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn drop_namespace(&self, project: &ProjectId) -> Result<()> {
         // Single-pass: hold the table-map mutex once, drop every entry whose
-        // tenant matches. Cheaper than the default-impl loop (N small awaits)
+        // project matches. Cheaper than the default-impl loop (N small awaits)
         // and atomic w.r.t. concurrent list_tables on the same in-memory map.
         let mut tables = self.tables.lock().await;
-        tables.retain(|(t, _), _| t != tenant);
+        tables.retain(|(t, _), _| t != project);
         let mut namespaces = self.namespaces.lock().await;
-        namespaces.remove(tenant);
+        namespaces.remove(project);
         let mut funcs = self.sql_functions.lock().await;
-        funcs.retain(|(t, _), _| t != tenant);
+        funcs.retain(|(t, _), _| t != project);
         let mut seqs = self.sequences.lock().await;
-        seqs.retain(|(t, _), _| t != tenant);
+        seqs.retain(|(t, _), _| t != project);
         let mut reactors = self.reactors.lock().await;
-        reactors.map.retain(|(t, _), _| t != tenant);
+        reactors.map.retain(|(t, _), _| t != project);
         let mut enums = self.enum_types.lock().await;
-        enums.retain(|(t, _), _| t != tenant);
+        enums.retain(|(t, _), _| t != project);
         let mut doms = self.domains.lock().await;
-        doms.retain(|(t, _), _| t != tenant);
+        doms.retain(|(t, _), _| t != project);
         let mut procs = self.procedures.lock().await;
-        procs.retain(|(t, _), _| t != tenant);
-        let mut storage_cfg = self.tenant_storage_config.lock().await;
-        storage_cfg.remove(tenant);
+        procs.retain(|(t, _), _| t != project);
+        let mut storage_cfg = self.project_storage_config.lock().await;
+        storage_cfg.remove(project);
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_tenant_data_files(&self, tenant: &TenantId) -> Result<Vec<DataFileRef>> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_project_data_files(&self, project: &ProjectId) -> Result<Vec<DataFileRef>> {
         // Walk every table's full snapshot history under one map-lock-free
         // pass: clone the per-table Arc<Mutex> handles up front, then drain
         // each snapshot list while holding only that table's mutex. Avoids
@@ -368,7 +368,7 @@ impl Catalog for InMemoryCatalog {
             let tables = self.tables.lock().await;
             tables
                 .iter()
-                .filter(|((t, _), _)| t == tenant)
+                .filter(|((t, _), _)| t == project)
                 .map(|(_, state)| state.clone())
                 .collect()
         };
@@ -385,7 +385,7 @@ impl Catalog for InMemoryCatalog {
     #[instrument(
         skip(self, files),
         fields(
-            tenant = %tenant,
+            project = %project,
             table = %table,
             expected_snapshot = %expected_snapshot,
             file_count = files.len(),
@@ -393,17 +393,17 @@ impl Catalog for InMemoryCatalog {
     )]
     async fn append_data_files(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         expected_snapshot: SnapshotId,
         files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
 
         if state.current != expected_snapshot {
             return Err(BasinError::CommitConflict(format!(
-                "{tenant}/{table}: expected snapshot {expected_snapshot}, current is {}",
+                "{project}/{table}: expected snapshot {expected_snapshot}, current is {}",
                 state.current
             )));
         }
@@ -429,13 +429,13 @@ impl Catalog for InMemoryCatalog {
         };
         state.snapshots.push(snap);
         state.current = new_id;
-        Ok(Self::build_metadata(tenant, table, &state))
+        Ok(Self::build_metadata(project, table, &state))
     }
 
     #[instrument(
         skip(self, removed_paths, added_files),
         fields(
-            tenant = %tenant,
+            project = %project,
             table = %table,
             expected_snapshot = %expected_snapshot,
             removed = removed_paths.len(),
@@ -444,18 +444,18 @@ impl Catalog for InMemoryCatalog {
     )]
     async fn replace_data_files(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         expected_snapshot: SnapshotId,
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
 
         if state.current != expected_snapshot {
             return Err(BasinError::CommitConflict(format!(
-                "{tenant}/{table}: expected snapshot {expected_snapshot}, current is {}",
+                "{project}/{table}: expected snapshot {expected_snapshot}, current is {}",
                 state.current
             )));
         }
@@ -493,27 +493,27 @@ impl Catalog for InMemoryCatalog {
         let _ = removed_paths;
         state.snapshots.push(snap);
         state.current = new_id;
-        Ok(Self::build_metadata(tenant, table, &state))
+        Ok(Self::build_metadata(project, table, &state))
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn list_snapshots(&self, tenant: &TenantId, table: &TableName) -> Result<Vec<Snapshot>> {
-        let state = self.get_table(tenant, table).await?;
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn list_snapshots(&self, project: &ProjectId, table: &TableName) -> Result<Vec<Snapshot>> {
+        let state = self.get_table(project, table).await?;
         let guard = state.lock().await;
         Ok(guard.snapshots.clone())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, src = %src_table, dst = %dst_table))]
+    #[instrument(skip(self), fields(project = %project, src = %src_table, dst = %dst_table))]
     async fn fork_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         src_table: &TableName,
         dst_table: &TableName,
     ) -> Result<TableMetadata> {
         // Read source state then drop the per-table guard before grabbing
         // the table-map guard for the insert.
         let cloned_state = {
-            let src_arc = self.get_table(tenant, src_table).await?;
+            let src_arc = self.get_table(project, src_table).await?;
             let src = src_arc.lock().await;
             TableState {
                 schema: src.schema.clone(),
@@ -537,11 +537,11 @@ impl Catalog for InMemoryCatalog {
             }
         };
 
-        let dst_key = (*tenant, dst_table.clone());
+        let dst_key = (*project, dst_table.clone());
         let mut tables = self.tables.lock().await;
         if tables.contains_key(&dst_key) {
             return Err(BasinError::catalog(format!(
-                "fork_table: {tenant}/{dst_table} already exists",
+                "fork_table: {project}/{dst_table} already exists",
             )));
         }
         let dst_arc = Arc::new(Mutex::new(cloned_state));
@@ -549,22 +549,22 @@ impl Catalog for InMemoryCatalog {
         drop(tables);
 
         let dst = dst_arc.lock().await;
-        Ok(Self::build_metadata(tenant, dst_table, &dst))
+        Ok(Self::build_metadata(project, dst_table, &dst))
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, snapshot = %snapshot_id))]
+    #[instrument(skip(self), fields(project = %project, table = %table, snapshot = %snapshot_id))]
     async fn rollback_to_snapshot(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         snapshot_id: SnapshotId,
     ) -> Result<TableMetadata> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
 
         if !state.snapshots.iter().any(|s| s.id == snapshot_id) {
             return Err(BasinError::not_found(format!(
-                "{tenant}/{table}: snapshot {snapshot_id} not in history",
+                "{project}/{table}: snapshot {snapshot_id} not in history",
             )));
         }
 
@@ -573,135 +573,135 @@ impl Catalog for InMemoryCatalog {
         state.snapshots.retain(|s| s.id <= snapshot_id);
         state.current = snapshot_id;
 
-        Ok(Self::build_metadata(tenant, table, &state))
+        Ok(Self::build_metadata(project, table, &state))
     }
 
-    #[instrument(skip(self, spec), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, spec), fields(project = %project, table = %table))]
     async fn set_partition_spec(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         spec: PartitionSpec,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.partition_spec = spec;
         Ok(())
     }
 
-    #[instrument(skip(self, policies), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, policies), fields(project = %project, table = %table))]
     async fn set_rls_state(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         rls_enabled: bool,
         policies: Vec<Policy>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.rls_enabled = rls_enabled;
         state.policies = policies;
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_tier_policy(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         cold_after_seconds: Option<u64>,
         cold_age_column: Option<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.cold_after_seconds = cold_after_seconds;
         state.cold_age_column = cold_age_column;
         Ok(())
     }
 
-    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, n = columns.len()))]
+    #[instrument(skip(self, columns), fields(project = %project, table = %table, n = columns.len()))]
     async fn set_bloom_filter_columns(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.bloom_filter_columns = columns;
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_row_group_rows(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         rows: Option<usize>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.row_group_rows = rows;
         Ok(())
     }
 
-    #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
-    async fn set_schema(&self, tenant: &TenantId, table: &TableName, schema: Schema) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+    #[instrument(skip(self, schema), fields(project = %project, table = %table))]
+    async fn set_schema(&self, project: &ProjectId, table: &TableName, schema: Schema) -> Result<()> {
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.schema = Arc::new(schema);
         Ok(())
     }
 
-    #[instrument(skip(self, def), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, def), fields(project = %project, table = %table))]
     async fn set_continuous_aggregate(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         def: Option<CvDef>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.continuous_aggregate = def;
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_cluster_columns(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.cluster_columns = columns;
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_home_region(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         region: Option<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.home_region = region;
         Ok(())
     }
 
-    #[instrument(skip(self, check_constraints, foreign_keys), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, check_constraints, foreign_keys), fields(project = %project, table = %table))]
     async fn set_table_constraints(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         pk_columns: Vec<String>,
         check_constraints: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKeyDef>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.pk_columns = pk_columns;
         state.check_constraints = check_constraints;
@@ -709,29 +709,29 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self, unique_constraints), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, unique_constraints), fields(project = %project, table = %table))]
     async fn set_unique_constraints(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         unique_constraints: Vec<UniqueConstraint>,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.unique_constraints = unique_constraints;
         Ok(())
     }
 
-    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, name = %name))]
+    #[instrument(skip(self, columns), fields(project = %project, table = %table, name = %name))]
     async fn create_index(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         name: &str,
         columns: &[String],
         if_not_exists: bool,
     ) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         if columns.is_empty() {
             return Err(BasinError::InvalidSchema(
@@ -743,7 +743,7 @@ impl Catalog for InMemoryCatalog {
         for col in columns {
             if state.schema.field_with_name(col).is_err() {
                 return Err(BasinError::InvalidSchema(format!(
-                    "create_index: column {col:?} not in table {tenant}/{table} schema"
+                    "create_index: column {col:?} not in table {project}/{table} schema"
                 )));
             }
         }
@@ -752,7 +752,7 @@ impl Catalog for InMemoryCatalog {
                 return Ok(());
             }
             return Err(BasinError::catalog(format!(
-                "create_index: {tenant}/{table}: index {name:?} already exists"
+                "create_index: {project}/{table}: index {name:?} already exists"
             )));
         }
         state.indexes.push(SecondaryIndex {
@@ -762,69 +762,69 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
-    async fn drop_index(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
-        let state_arc = self.get_table(tenant, table).await?;
+    #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
+    async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
+        let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         let before = state.indexes.len();
         state.indexes.retain(|i| i.name != name);
         if state.indexes.len() == before {
             return Err(BasinError::not_found(format!(
-                "{tenant}/{table}: index {name:?}"
+                "{project}/{table}: index {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_sql_function(&self, def: SqlFunctionDef) -> Result<()> {
-        let key = (def.tenant, def.name.clone());
+        let key = (def.project, def.name.clone());
         let mut map = self.sql_functions.lock().await;
         map.insert(key, def);
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_sql_function(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_sql_function(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let key = (*project, name.to_string());
         let mut map = self.sql_functions.lock().await;
         if map.remove(&key).is_none() {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sql function {name:?}"
+                "{project}: sql function {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_sql_function(&self, tenant: &TenantId, name: &str) -> Option<SqlFunctionDef> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_sql_function(&self, project: &ProjectId, name: &str) -> Option<SqlFunctionDef> {
+        let key = (*project, name.to_string());
         let map = self.sql_functions.lock().await;
         map.get(&key).cloned()
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_sql_functions(&self, tenant: &TenantId) -> Vec<SqlFunctionDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_sql_functions(&self, project: &ProjectId) -> Vec<SqlFunctionDef> {
         let map = self.sql_functions.lock().await;
         map.iter()
-            .filter(|((t, _), _)| t == tenant)
+            .filter(|((t, _), _)| t == project)
             .map(|(_, def)| def.clone())
             .collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn create_sequence(&self, def: SequenceDef) -> Result<()> {
         if def.increment == 0 {
             return Err(BasinError::InvalidSchema(
                 "sequence increment must be non-zero".into(),
             ));
         }
-        let key = (def.tenant, def.name.clone());
+        let key = (def.project, def.name.clone());
         let mut map = self.sequences.lock().await;
         if map.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "sequence {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         let state = SequenceState::genesis(&def);
@@ -836,81 +836,81 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_sequence(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_sequence(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let key = (*project, name.to_string());
         let mut map = self.sequences.lock().await;
         if map.remove(&key).is_none() {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sequence {name:?}"
+                "{project}: sequence {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_sequence(&self, tenant: &TenantId, name: &str) -> Option<SequenceDef> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_sequence(&self, project: &ProjectId, name: &str) -> Option<SequenceDef> {
+        let key = (*project, name.to_string());
         let map = self.sequences.lock().await;
         map.get(&key).map(|e| e.def.clone())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn nextval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn nextval(&self, project: &ProjectId, name: &str) -> Result<i64> {
         let entry = {
-            let key = (*tenant, name.to_string());
+            let key = (*project, name.to_string());
             let map = self.sequences.lock().await;
             map.get(&key)
                 .cloned()
-                .ok_or_else(|| BasinError::not_found(format!("{tenant}: sequence {name:?}")))?
+                .ok_or_else(|| BasinError::not_found(format!("{project}: sequence {name:?}")))?
         };
         // Per-sequence mutex serialises increments; concurrent callers
-        // see distinct values, but two sequences (or two tenants) never
+        // see distinct values, but two sequences (or two projects) never
         // block each other beyond the top-level HashMap probe above.
         let mut state = entry.state.lock().await;
         match advance_one(&entry.def, &mut state) {
             Ok(v) => Ok(v),
             Err(SequenceError::Exhausted) => Err(BasinError::catalog(format!(
-                "{tenant}: sequence {name:?} exhausted"
+                "{project}: sequence {name:?} exhausted"
             ))),
             Err(SequenceError::InvalidIncrement) => Err(BasinError::InvalidSchema(format!(
-                "{tenant}: sequence {name:?} has zero increment"
+                "{project}: sequence {name:?} has zero increment"
             ))),
         }
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn currval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn currval(&self, project: &ProjectId, name: &str) -> Result<i64> {
         let entry = {
-            let key = (*tenant, name.to_string());
+            let key = (*project, name.to_string());
             let map = self.sequences.lock().await;
             map.get(&key)
                 .cloned()
-                .ok_or_else(|| BasinError::not_found(format!("{tenant}: sequence {name:?}")))?
+                .ok_or_else(|| BasinError::not_found(format!("{project}: sequence {name:?}")))?
         };
         let state = entry.state.lock().await;
         if !state.started {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sequence {name:?} has not been advanced"
+                "{project}: sequence {name:?} has not been advanced"
             )));
         }
         Ok(state.current.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = value, advance = advance))]
+    #[instrument(skip(self), fields(project = %project, name = %name, value = value, advance = advance))]
     async fn setval(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         name: &str,
         value: i64,
         advance: bool,
     ) -> Result<i64> {
         let entry = {
-            let key = (*tenant, name.to_string());
+            let key = (*project, name.to_string());
             let map = self.sequences.lock().await;
             map.get(&key)
                 .cloned()
-                .ok_or_else(|| BasinError::not_found(format!("{tenant}: sequence {name:?}")))?
+                .ok_or_else(|| BasinError::not_found(format!("{project}: sequence {name:?}")))?
         };
         let mut state = entry.state.lock().await;
         // PG's `setval(seq, n, true)` (the default) makes `n` the most
@@ -936,7 +936,7 @@ impl Catalog for InMemoryCatalog {
         Ok(value)
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, table = %def.table, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, table = %def.table, name = %def.name))]
     async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
         if def.ops.is_empty() {
             return Err(BasinError::InvalidSchema(
@@ -948,12 +948,12 @@ impl Catalog for InMemoryCatalog {
             reactors::validate_predicate(p).map_err(reactor_err_to_basin)?;
         }
 
-        let key = (def.tenant, format!("{}:{}", def.table, def.name));
+        let key = (def.project, format!("{}:{}", def.table, def.name));
         let mut state = self.reactors.lock().await;
         if state.map.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "reactor {:?} on {}/{} already exists",
-                def.name, def.tenant, def.table
+                def.name, def.project, def.table
             )));
         }
         state.next_seq += 1;
@@ -962,22 +962,22 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
-    async fn drop_reactor(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
-        let key = (*tenant, format!("{table}:{name}"));
+    #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
+    async fn drop_reactor(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
+        let key = (*project, format!("{table}:{name}"));
         let mut state = self.reactors.lock().await;
         if state.map.remove(&key).is_none() {
             return Err(BasinError::not_found(format!(
-                "{tenant}/{table}: reactor {name:?}"
+                "{project}/{table}: reactor {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, op = ?op))]
+    #[instrument(skip(self), fields(project = %project, table = %table, op = ?op))]
     async fn lookup_reactors_for(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         op: ChangeOp,
     ) -> Vec<ReactorDef> {
@@ -986,7 +986,7 @@ impl Catalog for InMemoryCatalog {
             .map
             .iter()
             .filter(|((t, _), entry)| {
-                t == tenant && &entry.def.table == table && entry.def.ops.matches(op)
+                t == project && &entry.def.table == table && entry.def.ops.matches(op)
             })
             .map(|(_, entry)| entry)
             .collect();
@@ -994,38 +994,38 @@ impl Catalog for InMemoryCatalog {
         hits.into_iter().map(|e| e.def.clone()).collect()
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_reactors(&self, tenant: &TenantId) -> Vec<ReactorDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_reactors(&self, project: &ProjectId) -> Vec<ReactorDef> {
         let state = self.reactors.lock().await;
         let mut hits: Vec<&ReactorEntry> = state
             .map
             .iter()
-            .filter(|((t, _), _)| t == tenant)
+            .filter(|((t, _), _)| t == project)
             .map(|(_, entry)| entry)
             .collect();
         hits.sort_by_key(|e| e.seq);
         hits.into_iter().map(|e| e.def.clone()).collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_enum_type(&self, def: EnumTypeDef) -> Result<()> {
         enums::validate_new(&def).map_err(enum_err_to_basin)?;
-        let key = (def.tenant, def.name.clone());
+        let key = (def.project, def.name.clone());
         let mut enums_map = self.enum_types.lock().await;
         if enums_map.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "enum type {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         // Cross-namespace collision: a domain with the same name on the
-        // same tenant is rejected so column resolution stays
+        // same project is rejected so column resolution stays
         // unambiguous.
         let doms = self.domains.lock().await;
         if doms.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "type {}/{} collides with an existing domain",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         drop(doms);
@@ -1033,25 +1033,25 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_enum_type(&self, tenant: &TenantId, name: &str) -> Option<EnumTypeDef> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_enum_type(&self, project: &ProjectId, name: &str) -> Option<EnumTypeDef> {
+        let key = (*project, name.to_string());
         let map = self.enum_types.lock().await;
         map.get(&key).cloned()
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = %value))]
-    async fn add_enum_value(&self, tenant: &TenantId, name: &str, value: &str) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, name = %name, value = %value))]
+    async fn add_enum_value(&self, project: &ProjectId, name: &str, value: &str) -> Result<()> {
         if value.is_empty() {
             return Err(BasinError::InvalidSchema(
                 "ALTER TYPE ADD VALUE: label cannot be empty".into(),
             ));
         }
-        let key = (*tenant, name.to_string());
+        let key = (*project, name.to_string());
         let mut map = self.enum_types.lock().await;
         let def = map
             .get_mut(&key)
-            .ok_or_else(|| BasinError::not_found(format!("{tenant}: enum type {name:?}")))?;
+            .ok_or_else(|| BasinError::not_found(format!("{project}: enum type {name:?}")))?;
         if def.labels.iter().any(|l| l == value) {
             return Err(BasinError::catalog(format!(
                 "enum {name:?} already contains value {value:?}"
@@ -1061,54 +1061,54 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_enum_type(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        // Refcount: scan every table the tenant owns and reject the
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_enum_type(&self, project: &ProjectId, name: &str) -> Result<()> {
+        // Refcount: scan every table the project owns and reject the
         // drop when any column carries `BASIN_ENUM_TYPE=<name>`. v0.1
         // has no CASCADE; the message tells the caller to drop the
         // columns first.
-        let referencing = self.tables_referencing_type(tenant, name, true).await;
+        let referencing = self.tables_referencing_type(project, name, true).await;
         if !referencing.is_empty() {
             return Err(BasinError::catalog(format!(
                 "cannot drop enum {name:?}: still referenced by table column(s) {referencing:?}; \
                  drop the column(s) first (v0.1 has no CASCADE)"
             )));
         }
-        let key = (*tenant, name.to_string());
+        let key = (*project, name.to_string());
         let mut map = self.enum_types.lock().await;
         if map.remove(&key).is_none() {
             return Err(BasinError::not_found(format!(
-                "{tenant}: enum type {name:?}"
+                "{project}: enum type {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_enum_types(&self, tenant: &TenantId) -> Vec<EnumTypeDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_enum_types(&self, project: &ProjectId) -> Vec<EnumTypeDef> {
         let map = self.enum_types.lock().await;
         map.iter()
-            .filter(|((t, _), _)| t == tenant)
+            .filter(|((t, _), _)| t == project)
             .map(|(_, def)| def.clone())
             .collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_domain(&self, def: DomainDef) -> Result<()> {
         domains::validate_new(&def).map_err(domain_err_to_basin)?;
-        let key = (def.tenant, def.name.clone());
+        let key = (def.project, def.name.clone());
         let mut doms = self.domains.lock().await;
         if doms.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "domain {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         let enums_map = self.enum_types.lock().await;
         if enums_map.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "domain {}/{} collides with an existing enum type",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         drop(enums_map);
@@ -1116,113 +1116,113 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_domain(&self, tenant: &TenantId, name: &str) -> Option<DomainDef> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_domain(&self, project: &ProjectId, name: &str) -> Option<DomainDef> {
+        let key = (*project, name.to_string());
         let map = self.domains.lock().await;
         map.get(&key).cloned()
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_domain(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let referencing = self.tables_referencing_type(tenant, name, false).await;
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_domain(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let referencing = self.tables_referencing_type(project, name, false).await;
         if !referencing.is_empty() {
             return Err(BasinError::catalog(format!(
                 "cannot drop domain {name:?}: still referenced by table column(s) {referencing:?}; \
                  drop the column(s) first (v0.1 has no CASCADE)"
             )));
         }
-        let key = (*tenant, name.to_string());
+        let key = (*project, name.to_string());
         let mut map = self.domains.lock().await;
         if map.remove(&key).is_none() {
-            return Err(BasinError::not_found(format!("{tenant}: domain {name:?}")));
+            return Err(BasinError::not_found(format!("{project}: domain {name:?}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_domains(&self, tenant: &TenantId) -> Vec<DomainDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_domains(&self, project: &ProjectId) -> Vec<DomainDef> {
         let map = self.domains.lock().await;
         map.iter()
-            .filter(|((t, _), _)| t == tenant)
+            .filter(|((t, _), _)| t == project)
             .map(|(_, def)| def.clone())
             .collect()
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_sequences(&self, tenant: &TenantId) -> Vec<SequenceDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_sequences(&self, project: &ProjectId) -> Vec<SequenceDef> {
         let map = self.sequences.lock().await;
         map.iter()
-            .filter(|((t, _), _)| t == tenant)
+            .filter(|((t, _), _)| t == project)
             .map(|(_, entry)| entry.def.clone())
             .collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
         procedures::validate_new(&def).map_err(procedure_err_to_basin)?;
-        let key = (def.tenant, def.name.clone());
+        let key = (def.project, def.name.clone());
         let mut map = self.procedures.lock().await;
         if map.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "procedure {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         map.insert(key, def);
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_procedure(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_procedure(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let key = (*project, name.to_string());
         let mut map = self.procedures.lock().await;
         if map.remove(&key).is_none() {
             return Err(BasinError::not_found(format!(
-                "{tenant}: procedure {name:?}"
+                "{project}: procedure {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_procedure(&self, tenant: &TenantId, name: &str) -> Option<SqlProcedureDef> {
-        let key = (*tenant, name.to_string());
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_procedure(&self, project: &ProjectId, name: &str) -> Option<SqlProcedureDef> {
+        let key = (*project, name.to_string());
         let map = self.procedures.lock().await;
         map.get(&key).cloned()
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_procedures(&self, tenant: &TenantId) -> Vec<SqlProcedureDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_procedures(&self, project: &ProjectId) -> Vec<SqlProcedureDef> {
         let map = self.procedures.lock().await;
         map.iter()
-            .filter(|((t, _), _)| t == tenant)
+            .filter(|((t, _), _)| t == project)
             .map(|(_, def)| def.clone())
             .collect()
     }
 
-    #[instrument(skip(self, config), fields(tenant = %tenant))]
-    async fn set_tenant_storage_config(
+    #[instrument(skip(self, config), fields(project = %project))]
+    async fn set_project_storage_config(
         &self,
-        tenant: &TenantId,
-        config: TenantStorageConfig,
+        project: &ProjectId,
+        config: ProjectStorageConfig,
     ) -> Result<()> {
-        let mut map = self.tenant_storage_config.lock().await;
-        map.insert(*tenant, config);
+        let mut map = self.project_storage_config.lock().await;
+        map.insert(*project, config);
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn get_tenant_storage_config(
+    #[instrument(skip(self), fields(project = %project))]
+    async fn get_project_storage_config(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Option<TenantStorageConfig>> {
-        let map = self.tenant_storage_config.lock().await;
-        Ok(map.get(tenant).cloned())
+        project: &ProjectId,
+    ) -> Result<Option<ProjectStorageConfig>> {
+        let map = self.project_storage_config.lock().await;
+        Ok(map.get(project).cloned())
     }
 
     async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {
-        let key = (def.tenant, def.name.to_ascii_lowercase());
+        let key = (def.project, def.name.to_ascii_lowercase());
         let mut map = self.views.lock().await;
         if !or_replace && map.contains_key(&key) {
             return Err(BasinError::Catalog(format!(
@@ -1234,8 +1234,8 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    async fn drop_view(&self, tenant: &TenantId, name: &str, if_exists: bool) -> Result<()> {
-        let key = (*tenant, name.to_ascii_lowercase());
+    async fn drop_view(&self, project: &ProjectId, name: &str, if_exists: bool) -> Result<()> {
+        let key = (*project, name.to_ascii_lowercase());
         let mut map = self.views.lock().await;
         if map.remove(&key).is_none() && !if_exists {
             return Err(BasinError::NotFound(format!("view {name:?} does not exist")));
@@ -1243,23 +1243,23 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    async fn lookup_view(&self, tenant: &TenantId, name: &str) -> Option<ViewDef> {
-        let key = (*tenant, name.to_ascii_lowercase());
+    async fn lookup_view(&self, project: &ProjectId, name: &str) -> Option<ViewDef> {
+        let key = (*project, name.to_ascii_lowercase());
         let map = self.views.lock().await;
         map.get(&key).cloned()
     }
 
-    async fn list_views(&self, tenant: &TenantId) -> Vec<ViewDef> {
+    async fn list_views(&self, project: &ProjectId) -> Vec<ViewDef> {
         let map = self.views.lock().await;
         map.iter()
-            .filter(|((t, _), _)| t == tenant)
+            .filter(|((t, _), _)| t == project)
             .map(|(_, v)| v.clone())
             .collect()
     }
 }
 
 impl InMemoryCatalog {
-    /// Walk every table owned by `tenant`, returning `<table>.<column>`
+    /// Walk every table owned by `project`, returning `<table>.<column>`
     /// labels for every column whose Arrow `Field` carries the
     /// requested type metadata. `is_enum == true` checks the
     /// `BASIN_ENUM_TYPE` key; `false` checks `BASIN_DOMAIN`. Used by
@@ -1267,7 +1267,7 @@ impl InMemoryCatalog {
     /// orphan a column type.
     async fn tables_referencing_type(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         type_name: &str,
         is_enum: bool,
     ) -> Vec<String> {
@@ -1282,7 +1282,7 @@ impl InMemoryCatalog {
             let tables = self.tables.lock().await;
             tables
                 .iter()
-                .filter(|((t, _), _)| t == tenant)
+                .filter(|((t, _), _)| t == project)
                 .map(|((_, name), state)| (name.clone(), state.clone()))
                 .collect()
         };
@@ -1367,7 +1367,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{BasinError, TableName, TenantId};
+    use basin_common::{BasinError, TableName, ProjectId};
 
     use super::*;
 
@@ -1390,7 +1390,7 @@ mod tests {
     #[tokio::test]
     async fn create_load_drop_table() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("users").unwrap();
 
         cat.create_namespace(&t).await.unwrap();
@@ -1404,7 +1404,7 @@ mod tests {
         );
 
         let loaded = cat.load_table(&t, &tbl).await.unwrap();
-        assert_eq!(loaded.tenant, t);
+        assert_eq!(loaded.project, t);
         assert_eq!(loaded.table, tbl);
         assert_eq!(loaded.current_snapshot, SnapshotId::GENESIS);
 
@@ -1414,7 +1414,7 @@ mod tests {
     #[tokio::test]
     async fn drop_then_load_returns_not_found() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("ghost").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         cat.drop_table(&t, &tbl).await.unwrap();
@@ -1426,17 +1426,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_isolation() {
+    async fn project_isolation() {
         let cat = InMemoryCatalog::new();
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let tbl = TableName::new("orders").unwrap();
 
         let meta_a = cat.create_table(&a, &tbl, &schema()).await.unwrap();
         let meta_b = cat.create_table(&b, &tbl, &schema()).await.unwrap();
-        assert_eq!(meta_a.tenant, a);
-        assert_eq!(meta_b.tenant, b);
-        assert_ne!(meta_a.tenant, meta_b.tenant);
+        assert_eq!(meta_a.project, a);
+        assert_eq!(meta_b.project, b);
+        assert_ne!(meta_a.project, meta_b.project);
 
         // Independent advance: appending to A does not change B.
         cat.append_data_files(
@@ -1463,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn append_advances_snapshot() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("events").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -1493,7 +1493,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_append_one_wins() {
         let cat = Arc::new(InMemoryCatalog::new());
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("race").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -1544,7 +1544,7 @@ mod tests {
     #[tokio::test]
     async fn optimistic_retry() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("retry").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -1588,7 +1588,7 @@ mod tests {
     #[tokio::test]
     async fn replace_data_files_advances_snapshot() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("rep").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         cat.append_data_files(
@@ -1623,7 +1623,7 @@ mod tests {
     #[tokio::test]
     async fn replace_data_files_concurrent_one_wins() {
         let cat = Arc::new(InMemoryCatalog::new());
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("repmix").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         // Seed a real file so removed_paths references something concrete.
@@ -1685,7 +1685,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_to_earlier_snapshot() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("pitr").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -1737,7 +1737,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_to_genesis_is_supported() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("pitr_genesis").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         cat.append_data_files(
@@ -1759,7 +1759,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_to_unknown_snapshot_is_not_found() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("pitr_404").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         let err = cat
@@ -1777,7 +1777,7 @@ mod tests {
     #[tokio::test]
     async fn fork_table_clones_source_state() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let src = TableName::new("src").unwrap();
         let dst = TableName::new("dst").unwrap();
         cat.create_table(&t, &src, &schema()).await.unwrap();
@@ -1815,7 +1815,7 @@ mod tests {
     #[tokio::test]
     async fn fork_then_commit_diverges_from_source() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let src = TableName::new("orig").unwrap();
         let dst = TableName::new("clone").unwrap();
         cat.create_table(&t, &src, &schema()).await.unwrap();
@@ -1857,7 +1857,7 @@ mod tests {
     #[tokio::test]
     async fn set_cluster_columns_round_trip() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("clustered").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -1885,7 +1885,7 @@ mod tests {
     #[tokio::test]
     async fn fork_to_existing_dst_errors() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let src = TableName::new("src2").unwrap();
         let dst = TableName::new("dst2").unwrap();
         cat.create_table(&t, &src, &schema()).await.unwrap();
@@ -1900,7 +1900,7 @@ mod tests {
     #[tokio::test]
     async fn fork_from_missing_source_is_not_found() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let src = TableName::new("missing").unwrap();
         let dst = TableName::new("clone").unwrap();
         let err = cat.fork_table(&t, &src, &dst).await.unwrap_err();
@@ -1913,7 +1913,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_to_current_is_a_noop() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("pitr_noop").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         cat.append_data_files(
@@ -1937,7 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn create_drop_secondary_index() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("idx_tbl").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -1992,7 +1992,7 @@ mod tests {
     #[tokio::test]
     async fn list_snapshots_project_wide_returns_all_tables() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbls = ["alpha", "beta", "gamma"]
             .iter()
             .map(|n| TableName::new(*n).unwrap())
@@ -2040,7 +2040,7 @@ mod tests {
     #[tokio::test]
     async fn diff_snapshots_window() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let a = TableName::new("a").unwrap();
         let b = TableName::new("b").unwrap();
         cat.create_table(&t, &a, &schema()).await.unwrap();
@@ -2085,7 +2085,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_to_snapshot_project_wide_rewinds_all() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbls: Vec<TableName> = ["x", "y", "z"]
             .iter()
             .map(|n| TableName::new(*n).unwrap())
@@ -2149,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_to_snapshot_project_wide_skips_tables_created_after() {
         let cat = InMemoryCatalog::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let early = TableName::new("early").unwrap();
         cat.create_table(&t, &early, &schema()).await.unwrap();
         cat.append_data_files(

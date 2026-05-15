@@ -31,7 +31,7 @@ use crate::types::{
 /// `nextval('<table>_<col>_seq')` so subsequent INSERTs find it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImplicitSequence {
-    /// Tenant-scoped sequence name (`<table>_<col>_seq`, PG convention).
+    /// Project-scoped sequence name (`<table>_<col>_seq`, PG convention).
     pub name: String,
     /// Column the sequence backs — kept for diagnostics / future
     /// owned-by tracking.

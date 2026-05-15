@@ -1,8 +1,8 @@
 //! Newtypes for the IDs that flow through every layer.
 //!
 //! These exist so the type system tells us when a query is mis-routed (e.g.
-//! a [`TenantId`] used where a [`TableName`] is expected) instead of silently
-//! crossing a tenant boundary. Every public constructor validates.
+//! a [`ProjectId`] used where a [`TableName`] is expected) instead of silently
+//! crossing a project boundary. Every public constructor validates.
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,15 +16,15 @@ use crate::error::{BasinError, Result};
 /// Postgres caps at 63; we mirror that so user data ports cleanly.
 pub const MAX_IDENT_LEN: usize = 63;
 
-/// Opaque tenant identifier.
+/// Opaque project identifier.
 ///
 /// Internally a [`Ulid`] so it sorts by creation time. Display form is the
 /// 26-char Crockford base-32 ULID. Never log raw bytes — always Display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct TenantId(Ulid);
+pub struct ProjectId(Ulid);
 
-impl TenantId {
+impl ProjectId {
     pub fn new() -> Self {
         Self(Ulid::new())
     }
@@ -43,22 +43,22 @@ impl TenantId {
     }
 }
 
-impl fmt::Display for TenantId {
+impl fmt::Display for ProjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl FromStr for TenantId {
+impl FromStr for ProjectId {
     type Err = BasinError;
     fn from_str(s: &str) -> Result<Self> {
         Ulid::from_string(s)
             .map(Self)
-            .map_err(|e| BasinError::InvalidIdent(format!("tenant_id: {e}")))
+            .map_err(|e| BasinError::InvalidIdent(format!("project_id: {e}")))
     }
 }
 
-impl Default for TenantId {
+impl Default for ProjectId {
     fn default() -> Self {
         Self::new()
     }
@@ -126,7 +126,7 @@ impl FromStr for TableName {
     }
 }
 
-/// Logical partition key for a tenant's table.
+/// Logical partition key for a project's table.
 ///
 /// Used to route writes/reads to a single shard owner. Bounded to keep object
 /// keys reasonable. Empty is allowed and means "the default partition" for
@@ -151,7 +151,7 @@ impl PartitionKey {
         // `/` is allowed as a path-segment separator so a Hive-style key like
         // `year=2026/month=04` round-trips through the storage layout. We
         // still reject path-traversal segments and empty segments so the key
-        // can never escape the tenant prefix or produce malformed paths.
+        // can never escape the project prefix or produce malformed paths.
         if s.starts_with('/') || s.ends_with('/') {
             return Err(BasinError::InvalidIdent(
                 "partition key may not start or end with '/'".into(),
@@ -226,10 +226,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tenant_id_roundtrip() {
-        let id = TenantId::new();
+    fn project_id_roundtrip() {
+        let id = ProjectId::new();
         let s = id.to_string();
-        let parsed: TenantId = s.parse().unwrap();
+        let parsed: ProjectId = s.parse().unwrap();
         assert_eq!(id, parsed);
         assert_eq!(s.len(), 26);
     }

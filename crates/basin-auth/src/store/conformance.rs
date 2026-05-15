@@ -4,7 +4,7 @@
 //! the full `AuthStore` contract against any implementation. Call it from a
 //! `#[tokio::test]` block and supply an already-migrated store.
 //!
-//! The suite is intentionally self-contained: it generates its own tenant
+//! The suite is intentionally self-contained: it generates its own project
 //! ULIDs and UUIDs so concurrent test runs don't collide. Every sub-test is
 //! documented with the invariant it verifies.
 //!
@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use basin_common::{BasinError, TenantId};
+use basin_common::{BasinError, ProjectId};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -50,14 +50,14 @@ fn bcrypt_hash(plain: &str) -> String {
 /// runner — they are tested by the `AuthService::connect_with_mailer` path in
 /// `lib.rs`).
 pub async fn test_auth_store_conformance(store: Arc<dyn AuthStore>) {
-    user_uniqueness_per_tenant(&store).await;
+    user_uniqueness_per_project(&store).await;
     find_user_by_email_tests(&store).await;
     email_token_single_use(&store).await;
     email_token_expiry(&store).await;
     api_key_lifecycle(&store).await;
-    api_key_tenant_scoping(&store).await;
-    tenant_credential_uniqueness(&store).await;
-    tenant_credential_self_routing(&store).await;
+    api_key_project_scoping(&store).await;
+    project_credential_uniqueness(&store).await;
+    project_credential_self_routing(&store).await;
     session_settings_upsert(&store).await;
 }
 
@@ -65,48 +65,48 @@ pub async fn test_auth_store_conformance(store: Arc<dyn AuthStore>) {
 // Individual invariants
 // ---------------------------------------------------------------------------
 
-/// `(tenant, email)` pairs are unique; the same email in two different tenants
+/// `(project, email)` pairs are unique; the same email in two different projects
 /// must succeed.
-async fn user_uniqueness_per_tenant(store: &Arc<dyn AuthStore>) {
-    let tenant_a = TenantId::new();
-    let tenant_b = TenantId::new();
+async fn user_uniqueness_per_project(store: &Arc<dyn AuthStore>) {
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
     let email = "shared@conformance.test";
     let hash = bcrypt_hash("testpassword");
 
-    // First insert into tenant_a → Ok.
+    // First insert into project_a → Ok.
     let uid_a = Uuid::new_v4();
     store
-        .create_user(&tenant_a, email, &hash, uid_a)
+        .create_user(&project_a, email, &hash, uid_a)
         .await
         .expect("first create_user must succeed");
 
-    // Duplicate (tenant_a, email) → Err / conflict.
+    // Duplicate (project_a, email) → Err / conflict.
     let uid_dup = Uuid::new_v4();
-    let dup_result = store.create_user(&tenant_a, email, &hash, uid_dup).await;
+    let dup_result = store.create_user(&project_a, email, &hash, uid_dup).await;
     assert!(
         dup_result.is_err(),
-        "duplicate (tenant, email) must fail, got Ok"
+        "duplicate (project, email) must fail, got Ok"
     );
 
-    // Same email in tenant_b → Ok (different tenant).
+    // Same email in project_b → Ok (different project).
     let uid_b = Uuid::new_v4();
     store
-        .create_user(&tenant_b, email, &hash, uid_b)
+        .create_user(&project_b, email, &hash, uid_b)
         .await
-        .expect("same email in different tenant must succeed");
+        .expect("same email in different project must succeed");
 }
 
 /// `find_user_by_email` returns `None` for unknown users, `Some` for known
-/// ones, and `None` when queried in the wrong tenant.
+/// ones, and `None` when queried in the wrong project.
 async fn find_user_by_email_tests(store: &Arc<dyn AuthStore>) {
-    let tenant = TenantId::new();
-    let other_tenant = TenantId::new();
+    let project = ProjectId::new();
+    let other_project = ProjectId::new();
     let email = format!("find-{}@conformance.test", Uuid::new_v4());
     let hash = bcrypt_hash("testpassword");
 
     // Non-existent → None.
     let not_found = store
-        .find_user_by_email(&tenant, &email)
+        .find_user_by_email(&project, &email)
         .await
         .expect("find_user_by_email must not error on miss");
     assert!(not_found.is_none(), "expected None for non-existent user");
@@ -114,11 +114,11 @@ async fn find_user_by_email_tests(store: &Arc<dyn AuthStore>) {
     // Create then find → Some.
     let uid = Uuid::new_v4();
     store
-        .create_user(&tenant, &email, &hash, uid)
+        .create_user(&project, &email, &hash, uid)
         .await
         .expect("create_user");
     let found = store
-        .find_user_by_email(&tenant, &email)
+        .find_user_by_email(&project, &email)
         .await
         .expect("find_user_by_email must not error")
         .expect("user must exist after create");
@@ -130,26 +130,26 @@ async fn find_user_by_email_tests(store: &Arc<dyn AuthStore>) {
         "email_verified_at must be NULL immediately after create"
     );
 
-    // Find in wrong tenant → None.
+    // Find in wrong project → None.
     let wrong = store
-        .find_user_by_email(&other_tenant, &email)
+        .find_user_by_email(&other_project, &email)
         .await
-        .expect("find_user_by_email in wrong tenant must not error");
+        .expect("find_user_by_email in wrong project must not error");
     assert!(
         wrong.is_none(),
-        "user must not be visible in a different tenant"
+        "user must not be visible in a different project"
     );
 }
 
 /// An email token can be consumed exactly once; a second attempt returns 0
 /// updated rows (the flow layer maps this to an error — we test the count).
 async fn email_token_single_use(store: &Arc<dyn AuthStore>) {
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let user_id = Uuid::new_v4();
     let email = format!("token-{}@conformance.test", Uuid::new_v4());
     let hash = bcrypt_hash("testpassword");
     store
-        .create_user(&tenant, &email, &hash, user_id)
+        .create_user(&project, &email, &hash, user_id)
         .await
         .expect("create_user for token test");
 
@@ -157,20 +157,20 @@ async fn email_token_single_use(store: &Arc<dyn AuthStore>) {
     let expires_at = Utc::now() + chrono::Duration::minutes(30);
 
     store
-        .insert_email_token(&tenant, user_id, &token_hash, "verify", expires_at)
+        .insert_email_token(&project, user_id, &token_hash, "verify", expires_at)
         .await
         .expect("insert_email_token");
 
     // First consume → 1 row updated.
     let n = store
-        .consume_email_token(&tenant, &token_hash)
+        .consume_email_token(&project, &token_hash)
         .await
         .expect("consume_email_token first call");
     assert_eq!(n, 1, "first consume must update 1 row");
 
     // Second consume → 0 rows updated (already consumed).
     let n2 = store
-        .consume_email_token(&tenant, &token_hash)
+        .consume_email_token(&project, &token_hash)
         .await
         .expect("consume_email_token second call must not error");
     assert_eq!(
@@ -190,12 +190,12 @@ async fn email_token_single_use(store: &Arc<dyn AuthStore>) {
 /// would reject it. The conformance test verifies the *row shape* here; full
 /// rejection semantics are tested in `lib.rs::expired_token_rejected`.
 async fn email_token_expiry(store: &Arc<dyn AuthStore>) {
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let user_id = Uuid::new_v4();
     let email = format!("expiry-{}@conformance.test", Uuid::new_v4());
     let hash = bcrypt_hash("testpassword");
     store
-        .create_user(&tenant, &email, &hash, user_id)
+        .create_user(&project, &email, &hash, user_id)
         .await
         .expect("create_user");
 
@@ -203,13 +203,13 @@ async fn email_token_expiry(store: &Arc<dyn AuthStore>) {
     // Insert with expiry 1 second in the past.
     let past = Utc::now() - chrono::Duration::seconds(1);
     store
-        .insert_email_token(&tenant, user_id, &token_hash, "reset", past)
+        .insert_email_token(&project, user_id, &token_hash, "reset", past)
         .await
         .expect("insert expired token");
 
     // The row must be findable — the store doesn't auto-delete expired rows.
     let row: Option<EmailTokenRow> = store
-        .find_email_token(&tenant, &token_hash)
+        .find_email_token(&project, &token_hash)
         .await
         .expect("find_email_token must not error");
     let row = row.expect("expired token row must exist in store");
@@ -229,17 +229,17 @@ async fn email_token_expiry(store: &Arc<dyn AuthStore>) {
 /// API key lifecycle: insert → find-by-hash (not revoked) → revoke →
 /// find-by-hash (revoked_at is set).
 async fn api_key_lifecycle(store: &Arc<dyn AuthStore>) {
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let user_id = Uuid::new_v4();
     let _email = format!("apikey-{}@conformance.test", Uuid::new_v4());
     let hash = bcrypt_hash("testpassword");
     store
-        .create_user(&tenant, &user_id.to_string(), &hash, user_id)
+        .create_user(&project, &user_id.to_string(), &hash, user_id)
         .await
         .ok(); // user existence is needed only for FK in Postgres; memory store may not care
 
     // Use a stable fake key so the sha256 hash is predictable.
-    let raw_key = format!("basin_{tenant}_testkey{}", Uuid::new_v4());
+    let raw_key = format!("basin_{project}_testkey{}", Uuid::new_v4());
     let key_sha = {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(raw_key.as_bytes()))
@@ -247,7 +247,7 @@ async fn api_key_lifecycle(store: &Arc<dyn AuthStore>) {
     let key_bcrypt = bcrypt_hash(&raw_key);
 
     let (id, created_at) = store
-        .insert_api_key(&tenant, user_id, "conformance-key", &key_sha, &key_bcrypt)
+        .insert_api_key(&project, user_id, "conformance-key", &key_sha, &key_bcrypt)
         .await
         .expect("insert_api_key");
     assert!(id > 0, "api key id must be positive");
@@ -274,7 +274,7 @@ async fn api_key_lifecycle(store: &Arc<dyn AuthStore>) {
 
     // Revoke.
     store
-        .revoke_api_key(&tenant, id)
+        .revoke_api_key(&project, id)
         .await
         .expect("revoke_api_key");
 
@@ -289,27 +289,27 @@ async fn api_key_lifecycle(store: &Arc<dyn AuthStore>) {
         "revoked_at must be set after revoke_api_key"
     );
 
-    // Revoke in a different tenant → NotFound.
-    let other_tenant = TenantId::new();
+    // Revoke in a different project → NotFound.
+    let other_project = ProjectId::new();
     let err = store
-        .revoke_api_key(&other_tenant, id)
+        .revoke_api_key(&other_project, id)
         .await
-        .expect_err("revoking a key belonging to another tenant must fail");
+        .expect_err("revoking a key belonging to another project must fail");
     assert!(
         matches!(err, BasinError::NotFound(_)),
         "expected NotFound, got {err:?}"
     );
 }
 
-/// `list_api_keys(tenant_a, user)` must not return keys belonging to
-/// `tenant_b`.
-async fn api_key_tenant_scoping(store: &Arc<dyn AuthStore>) {
-    let tenant_a = TenantId::new();
-    let tenant_b = TenantId::new();
+/// `list_api_keys(project_a, user)` must not return keys belonging to
+/// `project_b`.
+async fn api_key_project_scoping(store: &Arc<dyn AuthStore>) {
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
     let user = Uuid::new_v4();
 
-    let insert = |tenant: &TenantId, name: &str| {
-        let raw_key = format!("basin_{tenant}_{name}");
+    let insert = |project: &ProjectId, name: &str| {
+        let raw_key = format!("basin_{project}_{name}");
         let key_sha = {
             use sha2::{Digest, Sha256};
             hex::encode(Sha256::digest(raw_key.as_bytes()))
@@ -318,93 +318,93 @@ async fn api_key_tenant_scoping(store: &Arc<dyn AuthStore>) {
         (key_sha, key_bcrypt)
     };
 
-    let (sha_a, bcrypt_a) = insert(&tenant_a, "key-a");
-    let (sha_b, bcrypt_b) = insert(&tenant_b, "key-b");
+    let (sha_a, bcrypt_a) = insert(&project_a, "key-a");
+    let (sha_b, bcrypt_b) = insert(&project_b, "key-b");
     store
-        .insert_api_key(&tenant_a, user, "key-a", &sha_a, &bcrypt_a)
+        .insert_api_key(&project_a, user, "key-a", &sha_a, &bcrypt_a)
         .await
         .expect("insert key-a");
     store
-        .insert_api_key(&tenant_b, user, "key-b", &sha_b, &bcrypt_b)
+        .insert_api_key(&project_b, user, "key-b", &sha_b, &bcrypt_b)
         .await
         .expect("insert key-b");
 
     let list_a = store
-        .list_api_keys(&tenant_a, user)
+        .list_api_keys(&project_a, user)
         .await
-        .expect("list_api_keys tenant_a");
-    assert_eq!(list_a.len(), 1, "tenant_a must have exactly 1 key");
+        .expect("list_api_keys project_a");
+    assert_eq!(list_a.len(), 1, "project_a must have exactly 1 key");
     assert_eq!(list_a[0].name, "key-a");
 
     let list_b = store
-        .list_api_keys(&tenant_b, user)
+        .list_api_keys(&project_b, user)
         .await
-        .expect("list_api_keys tenant_b");
-    assert_eq!(list_b.len(), 1, "tenant_b must have exactly 1 key");
+        .expect("list_api_keys project_b");
+    assert_eq!(list_b.len(), 1, "project_b must have exactly 1 key");
     assert_eq!(list_b[0].name, "key-b");
 }
 
 /// Inserting the same `pgwire_user` twice must return `false` the second time
 /// (the row already exists).
-async fn tenant_credential_uniqueness(store: &Arc<dyn AuthStore>) {
-    let tenant = TenantId::new();
-    let pgwire_user = format!("{}_conformance", tenant.to_string());
+async fn project_credential_uniqueness(store: &Arc<dyn AuthStore>) {
+    let project = ProjectId::new();
+    let pgwire_user = format!("{}_conformance", project.to_string());
     let hash = bcrypt_hash("somepgpassword");
 
     let first = store
-        .insert_tenant_credential(&tenant, &pgwire_user, &hash, "basin")
+        .insert_project_credential(&project, &pgwire_user, &hash, "basin")
         .await
-        .expect("first insert_tenant_credential");
+        .expect("first insert_project_credential");
     assert!(first, "first insert must return true (inserted)");
 
     let second = store
-        .insert_tenant_credential(&tenant, &pgwire_user, &hash, "basin")
+        .insert_project_credential(&project, &pgwire_user, &hash, "basin")
         .await
-        .expect("second insert_tenant_credential must not error");
+        .expect("second insert_project_credential must not error");
     assert!(
         !second,
         "second insert with same pgwire_user must return false (conflict)"
     );
 }
 
-/// A pgwire_user generated by the production format carries the tenant_id,
-/// and `parse_tenant_from_pgwire_user` must recover it.
-async fn tenant_credential_self_routing(store: &Arc<dyn AuthStore>) {
-    use crate::tenant_credentials::parse_tenant_from_pgwire_user;
+/// A pgwire_user generated by the production format carries the project_id,
+/// and `parse_project_from_pgwire_user` must recover it.
+async fn project_credential_self_routing(store: &Arc<dyn AuthStore>) {
+    use crate::project_credentials::parse_project_from_pgwire_user;
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     // Generate a user in the production format: {26-char-ulid}_{8-hex}.
-    let pgwire_user = format!("{}_{:08x}", tenant, 0xdeadbeef_u32);
+    let pgwire_user = format!("{}_{:08x}", project, 0xdeadbeef_u32);
     let hash = bcrypt_hash("routingpwd");
 
     store
-        .insert_tenant_credential(&tenant, &pgwire_user, &hash, "basin")
+        .insert_project_credential(&project, &pgwire_user, &hash, "basin")
         .await
         .expect("insert for self-routing test");
 
-    let parsed = parse_tenant_from_pgwire_user(&pgwire_user)
-        .expect("generated pgwire_user must parse tenant from username");
+    let parsed = parse_project_from_pgwire_user(&pgwire_user)
+        .expect("generated pgwire_user must parse project from username");
     assert_eq!(
         parsed,
-        tenant.to_string().as_str(),
-        "self-routing: parsed tenant must match original; got {parsed:?}"
+        project.to_string().as_str(),
+        "self-routing: parsed project must match original; got {parsed:?}"
     );
 }
 
 /// Upserting the same key twice must not create duplicate rows — only the
 /// value is updated. The session-settings map must have exactly one entry.
 async fn session_settings_upsert(store: &Arc<dyn AuthStore>) {
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let user = Uuid::new_v4();
 
     // Initial upsert.
     store
-        .upsert_session_setting(&tenant, user, "timezone", "UTC")
+        .upsert_session_setting(&project, user, "timezone", "UTC")
         .await
         .expect("first upsert");
 
     let m1: HashMap<String, String> = store
-        .list_session_settings(&tenant, user)
+        .list_session_settings(&project, user)
         .await
         .expect("list after first upsert");
     assert_eq!(
@@ -416,12 +416,12 @@ async fn session_settings_upsert(store: &Arc<dyn AuthStore>) {
 
     // Update the same key.
     store
-        .upsert_session_setting(&tenant, user, "timezone", "America/New_York")
+        .upsert_session_setting(&project, user, "timezone", "America/New_York")
         .await
         .expect("second upsert");
 
     let m2: HashMap<String, String> = store
-        .list_session_settings(&tenant, user)
+        .list_session_settings(&project, user)
         .await
         .expect("list after second upsert");
     assert_eq!(
@@ -437,11 +437,11 @@ async fn session_settings_upsert(store: &Arc<dyn AuthStore>) {
 
     // Add a second key to prove it's additive, not a full replace.
     store
-        .upsert_session_setting(&tenant, user, "language", "en")
+        .upsert_session_setting(&project, user, "language", "en")
         .await
         .expect("upsert language");
     let m3: HashMap<String, String> = store
-        .list_session_settings(&tenant, user)
+        .list_session_settings(&project, user)
         .await
         .expect("list after third upsert");
     assert_eq!(m3.len(), 2, "two distinct keys must produce two entries");

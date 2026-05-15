@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -27,11 +27,11 @@ use crate::predicate::{self, Predicate, ScalarValue};
 use crate::tier::Tier;
 use crate::writer::wrapped_sidecar_key;
 use crate::{ReadCounters, ReadOptions, Storage};
-use basin_catalog::TenantStorageConfig;
+use basin_catalog::ProjectStorageConfig;
 
 pub(crate) async fn list_data_files(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
 ) -> Result<Vec<DataFile>> {
     // Walk both tier prefixes. Phase 5.5 introduces `tables/<t>/cold/`
@@ -39,10 +39,10 @@ pub(crate) async fn list_data_files(
     // files migrated by the tiering compactor. Each file's `tier` field is
     // derived from its path so callers don't have to know which prefix the
     // listing came from.
-    let store = storage.tenant_store(tenant);
+    let store = storage.project_store(project);
     let mut files = Vec::new();
     for tier in [Tier::Hot, Tier::Cold] {
-        let prefix = table_tier_prefix(storage.root_prefix(), tenant, table, tier);
+        let prefix = table_tier_prefix(storage.root_prefix(), project, table, tier);
         let mut stream = store.list(Some(&prefix));
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
@@ -69,11 +69,11 @@ pub(crate) async fn list_data_files(
 /// repeated listings are footer-fetch-free.
 pub(crate) async fn list_data_files_with_stats(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
 ) -> Result<Vec<DataFile>> {
-    let mut files = list_data_files(storage, tenant, table).await?;
-    let store = storage.tenant_store(tenant);
+    let mut files = list_data_files(storage, project, table).await?;
+    let store = storage.project_store(project);
     let cache = storage.parquet_meta_cache().clone();
 
     // Fan out per-file footer reads with bounded concurrency. Each cache
@@ -269,19 +269,19 @@ fn decode_le_f64(b: &[u8]) -> Option<f64> {
 
 pub(crate) async fn read(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     opts: ReadOptions,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-    let store = storage.tenant_store(tenant);
-    let tenant_id_string = tenant.as_prefix();
+    let store = storage.project_store(project);
+    let project_id_string = project.as_prefix();
 
     let mut paths: Vec<ObjectPath> = Vec::new();
     // Walk hot and cold tiers in turn. The reader is tier-agnostic — files
     // live wherever the (compactor-driven) tier policy put them; here we
     // just consume both prefixes.
     for tier in [Tier::Hot, Tier::Cold] {
-        let prefix = table_tier_prefix(storage.root_prefix(), tenant, table, tier);
+        let prefix = table_tier_prefix(storage.root_prefix(), project, table, tier);
         let mut s = store.list(Some(&prefix));
         while let Some(meta) = s.next().await {
             let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
@@ -289,9 +289,9 @@ pub(crate) async fn read(
                 continue;
             }
             // Belt-and-braces: never read a file whose key isn't under the
-            // tenant prefix. If this ever fired we'd want a P0; we treat it
+            // project prefix. If this ever fired we'd want a P0; we treat it
             // as `IsolationViolation`, not `Storage`.
-            let expected = format!("tenants/{tenant_id_string}/");
+            let expected = format!("projects/{project_id_string}/");
             if !meta.location.as_ref().contains(&expected) {
                 return Err(BasinError::isolation(format!(
                     "listed object {} does not contain {}",
@@ -302,7 +302,7 @@ pub(crate) async fn read(
         }
     }
 
-    read_paths_inner(storage, tenant, paths, opts).await
+    read_paths_inner(storage, project, paths, opts).await
 }
 
 /// Like [`read`] but reads only the supplied `paths` instead of LIST'ing
@@ -313,16 +313,16 @@ pub(crate) async fn read(
 /// then hand the survivors here. Skips one LIST RPC and (for files
 /// pruned at the catalog layer) one footer fetch each.
 ///
-/// Tenant-prefix enforcement happens here too: every supplied path must
-/// contain the tenant prefix or the call returns
+/// Project-prefix enforcement happens here too: every supplied path must
+/// contain the project prefix or the call returns
 /// [`BasinError::IsolationViolation`].
 pub(crate) async fn read_paths(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     paths: Vec<ObjectPath>,
     opts: ReadOptions,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-    let expected = format!("tenants/{}/", tenant.as_prefix());
+    let expected = format!("projects/{}/", project.as_prefix());
     for p in &paths {
         if !p.as_ref().contains(&expected) {
             return Err(BasinError::isolation(format!(
@@ -330,33 +330,33 @@ pub(crate) async fn read_paths(
             )));
         }
     }
-    read_paths_inner(storage, tenant, paths, opts).await
+    read_paths_inner(storage, project, paths, opts).await
 }
 
 async fn read_paths_inner(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     paths: Vec<ObjectPath>,
     opts: ReadOptions,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-    let store = storage.tenant_store(tenant);
+    let store = storage.project_store(project);
     let opts = Arc::new(opts);
     let store_for_stream = store.clone();
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
-    let tenant_counters = storage.tenant_counters(tenant);
+    let project_counters = storage.project_counters(project);
     let encryption = storage.encryption_provider();
-    // Resolve the per-tenant storage config once for the whole batch of
+    // Resolve the per-project storage config once for the whole batch of
     // paths (cache hit on every path after the first); threaded through
     // `read_one` so envelope-decrypt can use `unwrap_key_with_config`
     // when present.
-    let tenant_config = if encryption.is_some() {
-        storage.tenant_storage_config_cached(tenant).await?
+    let project_config = if encryption.is_some() {
+        storage.project_storage_config_cached(project).await?
     } else {
         None
     };
-    let tenant_owned = *tenant;
+    let project_owned = *project;
     let stream = futures::stream::iter(paths)
         .map(move |p| {
             let store = store_for_stream.clone();
@@ -364,9 +364,9 @@ async fn read_paths_inner(
             let cache = cache.clone();
             let counters = counters.clone();
             let page_cache = page_cache.clone();
-            let tenant_counters = tenant_counters.clone();
+            let project_counters = project_counters.clone();
             let encryption = encryption.clone();
-            let tenant_config = tenant_config.clone();
+            let project_config = project_config.clone();
             async move {
                 read_one(
                     store,
@@ -375,10 +375,10 @@ async fn read_paths_inner(
                     cache,
                     counters,
                     page_cache,
-                    tenant_counters,
+                    project_counters,
                     encryption,
-                    tenant_config,
-                    tenant_owned,
+                    project_config,
+                    project_owned,
                 )
                 .await
             }
@@ -399,22 +399,22 @@ async fn read_paths_inner(
 /// the table-wide reader does per-file (footer cache hit, projection on,
 /// row-group pruning by stats), but skipped projection + zero filters
 /// because the UPDATE/DELETE rewrite path needs every row of the chosen
-/// file. Tenant-prefix enforcement is the caller's responsibility — this
+/// file. Project-prefix enforcement is the caller's responsibility — this
 /// function trusts the path it's handed.
 pub(crate) async fn read_file(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     path: &ObjectPath,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     let opts = Arc::new(ReadOptions::default());
-    let store = storage.tenant_store(tenant);
+    let store = storage.project_store(project);
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
-    let tenant_counters = storage.tenant_counters(tenant);
+    let project_counters = storage.project_counters(project);
     let encryption = storage.encryption_provider();
-    let tenant_config = if encryption.is_some() {
-        storage.tenant_storage_config_cached(tenant).await?
+    let project_config = if encryption.is_some() {
+        storage.project_storage_config_cached(project).await?
     } else {
         None
     };
@@ -425,10 +425,10 @@ pub(crate) async fn read_file(
         cache,
         counters,
         page_cache,
-        tenant_counters,
+        project_counters,
         encryption,
-        tenant_config,
-        *tenant,
+        project_config,
+        *project,
     )
     .await
 }
@@ -441,10 +441,10 @@ async fn read_one(
     meta_cache: Arc<ParquetMetaCache>,
     counters: Arc<ReadCounters>,
     page_cache: Option<Arc<PageCache>>,
-    tenant_counters: Option<Arc<basin_common::TenantCounters>>,
+    project_counters: Option<Arc<basin_common::ProjectCounters>>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
-    tenant_config: Option<TenantStorageConfig>,
-    tenant: TenantId,
+    project_config: Option<ProjectStorageConfig>,
+    project: ProjectId,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     // Page-cache fast path. Composes with everything below: a hit
     // means we skip the parquet decode entirely and yield the cached
@@ -480,8 +480,8 @@ async fn read_one(
             &store,
             &path,
             provider.as_ref(),
-            tenant_config.as_ref(),
-            &tenant,
+            project_config.as_ref(),
+            &project,
         )
         .await?
         {
@@ -492,7 +492,7 @@ async fn read_one(
                 counters,
                 page_cache,
                 cache_key,
-                tenant_counters,
+                project_counters,
             )
             .await;
         }
@@ -547,11 +547,11 @@ async fn read_one(
         )
     };
 
-    // Per-tenant bytes_read counter (Phase 6 telemetry). Bumped by the file
+    // Per-project bytes_read counter (Phase 6 telemetry). Bumped by the file
     // size as an upper bound — the parquet reader prunes row groups so actual
     // bytes pulled are typically a subset; this is a defensible scaling
-    // signal per tenant without per-range bookkeeping in the object_store.
-    if let Some(tc) = tenant_counters.as_ref() {
+    // signal per project without per-range bookkeeping in the object_store.
+    if let Some(tc) = project_counters.as_ref() {
         tc.record_bytes_read(file_size);
     }
 
@@ -767,8 +767,8 @@ async fn try_load_encrypted(
     store: &Arc<dyn ObjectStore>,
     path: &ObjectPath,
     provider: &dyn EncryptionProvider,
-    tenant_config: Option<&TenantStorageConfig>,
-    tenant: &TenantId,
+    project_config: Option<&ProjectStorageConfig>,
+    project: &ProjectId,
 ) -> Result<Option<Vec<u8>>> {
     let sidecar = wrapped_sidecar_key(path);
     let head_res = store.head(&sidecar).await;
@@ -788,13 +788,13 @@ async fn try_load_encrypted(
         .await
         .map_err(|e| BasinError::storage(format!("read sidecar {sidecar}: {e}")))?;
     let wrapped = WrappedKey(wrapped_bytes.to_vec());
-    let data_key = match tenant_config {
+    let data_key = match project_config {
         Some(cfg) => {
             provider
-                .unwrap_key_with_config(tenant, &wrapped, cfg)
+                .unwrap_key_with_config(project, &wrapped, cfg)
                 .await?
         }
-        None => provider.unwrap_key(tenant, &wrapped).await?,
+        None => provider.unwrap_key(project, &wrapped).await?,
     };
     let envelope = store
         .get(path)
@@ -820,10 +820,10 @@ async fn finalize_encrypted_stream(
     counters: Arc<ReadCounters>,
     page_cache: Option<Arc<PageCache>>,
     cache_key: Option<CacheKey>,
-    tenant_counters: Option<Arc<basin_common::TenantCounters>>,
+    project_counters: Option<Arc<basin_common::ProjectCounters>>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     let file_size = plaintext.len() as u64;
-    if let Some(tc) = tenant_counters.as_ref() {
+    if let Some(tc) = project_counters.as_ref() {
         tc.record_bytes_read(file_size);
     }
 

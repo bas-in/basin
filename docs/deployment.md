@@ -16,7 +16,7 @@ This doc is the practical "where do I put the bytes and which Fly/AWS region" gu
 
 ## TL;DR
 
-- **One Basin cluster per region. Not per customer.** That's the wedge — Postgres can't multi-tenant cheaply, Basin can.
+- **One Basin cluster per region. Not per customer.** That's the wedge — Postgres can't multi-project cheaply, Basin can.
 - **Recommended cloud:** Fly.io machines + Tigris (or another S3-compatible store) in the same metro. ~5–30 ms RTT, zero egress fees.
 - **Multi-region is by deployment, not by code:** spin up an independent cluster per region, customers pin to one region at signup.
 - **Cross-region read replicas:** built when first paid customer asks ([ADR 0004](./decisions/0004-multi-region-read-replicas.md)). Cross-region strong-consistency writes: deferred ([ADR 0001](./decisions/0001-single-region-only.md)) — Spanner-class, not until a paying customer demands it.
@@ -32,7 +32,7 @@ basin-server is a single process. To deploy it you set:
 | `BASIN_BIND` | pgwire listener, e.g. `0.0.0.0:5433` |
 | `BASIN_DATA_DIR` | Parquet + catalog directory (durable volume) |
 | `BASIN_WAL_DIR` | WAL directory (durable volume, ideally NVMe) |
-| `BASIN_TENANTS` | Static tenant list, e.g. `acme=*,beta=*`. basin-auth's reserved entry `basin_auth=<reserved-ulid>` is auto-injected, so operators do not list it. |
+| `BASIN_PROJECTS` | Static project list, e.g. `acme=*,beta=*`. basin-auth's reserved entry `basin_auth=<reserved-ulid>` is auto-injected, so operators do not list it. |
 | `BASIN_AUTH_ENABLED=1` | Enables the auth subsystem (signup, JWT, refresh). Auth state lives in the embedded catalog over the loopback pgwire — no separate database. SMTP vars from [ADR 0005](./decisions/0005-auth-system.md) become required when this is on. |
 
 That is the full required surface for a single-region deploy. No external
@@ -43,25 +43,25 @@ in [`../README.md`](../README.md) for the boot example.
 
 ## Why shared-cluster, not instance-per-customer
 
-Supabase and Neon charge per project (~$25/mo each). They have to — Postgres is fundamentally bad at multi-tenancy:
+Supabase and Neon charge per project (~$25/mo each). They have to — Postgres is fundamentally bad at multi-project:
 
 | Postgres pain point | Forces them to spin a new instance per project |
 |---|---|
 | Schemas share buffer pool, WAL, autovacuum | Noisy-neighbor inevitable |
-| Connection slots are global (~200 useful) | Multi-tenant connection pool collapses fast |
-| RLS is logical-only (one bug = cross-tenant leak) | Per-project DB is the only real isolation |
+| Connection slots are global (~200 useful) | Multi-project connection pool collapses fast |
+| RLS is logical-only (one bug = cross-project leak) | Per-project DB is the only real isolation |
 | ~10k schemas before catalog tables choke | Hard scaling wall |
 
 Basin has none of these:
 
 | Basin design | Why shared cluster works |
 |---|---|
-| Per-tenant bucket prefix | Structural data isolation; one bug ≠ leak |
+| Per-project bucket prefix | Structural data isolation; one bug ≠ leak |
 | Tokio task per connection (~few KB) | 10k+ connections per process easily |
-| Per-tenant Semaphore + scheduler ([ADR 0008](./decisions/0008-noisy-neighbor-fairness.md)) | Fairness without spawning processes |
-| Catalog scales linearly with tenant count | No 10k limit |
+| Per-project Semaphore + scheduler ([ADR 0008](./decisions/0008-noisy-neighbor-fairness.md)) | Fairness without spawning processes |
+| Catalog scales linearly with project count | No 10k limit |
 
-**Cost per tenant:** essentially `bytes × $0.015/GB + microseconds of CPU per query`. At 10,000 tenants × 100 MB each, total cost is ~$1k/month all-in. Same workload on Supabase costs $25k/month minimum.
+**Cost per project:** essentially `bytes × $0.015/GB + microseconds of CPU per query`. At 10,000 projects × 100 MB each, total cost is ~$1k/month all-in. Same workload on Supabase costs $25k/month minimum.
 
 ---
 
@@ -83,15 +83,15 @@ Basin has none of these:
   │ pgwire   │         │ pgwire   │         │ pgwire   │   load-balanced
   └─────┬────┘         └─────┬────┘         └─────┬────┘
         │                    │                    │
-        └────── consistent-hash (tenant_id) ──────┘
+        └────── consistent-hash (project_id) ──────┘
                              │
         ┌────────────────────┼────────────────────┐
         ▼                    ▼                    ▼
   ┌──────────┐         ┌──────────┐         ┌──────────┐
   │ shard    │         │ shard    │         │ shard    │   stateful;
   │ owner 1  │         │ owner 2  │         │ owner M  │   each owns
-  │ (~5k     │         │ (~5k     │         │ (~5k     │   ~5k tenants'
-  │ tenants) │         │ tenants) │         │ tenants) │   in-mem state
+  │ (~5k     │         │ (~5k     │         │ (~5k     │   ~5k projects'
+  │ projects) │         │ projects) │         │ projects) │   in-mem state
   └─────┬────┘         └─────┬────┘         └─────┬────┘
         │                    │                    │
         └─────── shared bucket per region ────────┘
@@ -100,9 +100,9 @@ Basin has none of these:
                    ┌──────────────────────┐
                    │  S3-compatible store  │
                    │  (us-east region)    │
-                   │  tenants/<id1>/...   │
-                   │  tenants/<id2>/...   │
-                   │  tenants/<id3>/...   │
+                   │  projects/<id1>/...   │
+                   │  projects/<id2>/...   │
+                   │  projects/<id3>/...   │
                    └──────────────────────┘
 ```
 
@@ -110,9 +110,9 @@ Basin has none of these:
 
 1. **One object-store bucket per region.** Storage stays anchored. EU customer's bytes never leave EU.
 2. **Routers are stateless.** Scale horizontally on connection count.
-3. **Shard owners are stateful.** Each owns a subset of tenants' in-memory state. Consistent-hash routing.
+3. **Shard owners are stateful.** Each owns a subset of projects' in-memory state. Consistent-hash routing.
 4. **All shard owners share the same bucket.** Compute scales independently of storage.
-5. **basin-auth issues JWTs scoped to a tenant.** Router decodes, hashes tenant_id → shard.
+5. **basin-auth issues JWTs scoped to a project.** Router decodes, hashes project_id → shard.
 
 ### Concrete: Fly.io + Tigris (recommended)
 
@@ -122,17 +122,17 @@ Best fit for Basin's design today:
 - **Tigris** (Fly's native S3-compatible store) has zero egress within Fly's network and no per-region bucket management overhead.
 - **Cloudflare R2**, **Backblaze B2**, **AWS S3** also work; pick by cost/latency/compliance.
 
-Per-region resource shape, rough sizing for the first 1k–10k tenants:
+Per-region resource shape, rough sizing for the first 1k–10k projects:
 
 | Resource | Tier | Notes |
 |---|---|---|
 | Router | Fly Performance 1× × 2 (HA) | ~$30/mo. Stateless; scales linearly with connection count. |
-| Shard owners | Fly Performance 4× × 2 | ~$240/mo. Each handles ~5k tenants' working set. Add more as tenant count grows. |
+| Shard owners | Fly Performance 4× × 2 | ~$240/mo. Each handles ~5k projects' working set. Add more as project count grows. |
 | Object store bucket | regional, public-bucket-disabled | Tigris: ~$0.02/GB + $0.01/GB egress (Fly-internal is free). Cloudflare R2: $0.015/GB zero egress. AWS S3: $0.023/GB + $0.09/GB egress. |
-| Catalog backend | none — embedded | Catalog state (tenant list, table schemas, snapshot manifests, file refs, plus `basin-auth`'s `auth.users` / `auth.refresh_tokens`) lives in the engine's own pgwire loopback, durable on the WAL volume. ~50 MB per 10k tenants. No external Postgres to provision. |
+| Catalog backend | none — embedded | Catalog state (project list, table schemas, snapshot manifests, file refs, plus `basin-auth`'s `auth.users` / `auth.refresh_tokens`) lives in the engine's own pgwire loopback, durable on the WAL volume. ~50 MB per 10k projects. No external Postgres to provision. |
 | Optional: NVMe disk cache | Fly volume, 50 GB | Phase 5.7-A1 cache. ~$5/mo. Cuts cold S3 fetches from ~50 ms → ~100 µs. |
 
-**Total cost for one region with 10k tenants × 100 MB each, mostly cached:** ~$300–500/month all-in.
+**Total cost for one region with 10k projects × 100 MB each, mostly cached:** ~$300–500/month all-in.
 
 ---
 
@@ -140,7 +140,7 @@ Per-region resource shape, rough sizing for the first 1k–10k tenants:
 
 ### What works without code changes
 
-✅ **Single-region multi-tenant** — that's the default. Deploy one Basin cluster per region, each with its own object-store bucket. Customers connect to the regional endpoint. Their tenant_id pins them to that region's bucket prefix.
+✅ **Single-region multi-project** — that's the default. Deploy one Basin cluster per region, each with its own object-store bucket. Customers connect to the regional endpoint. Their project_id pins them to that region's bucket prefix.
 
 You can ship this today. It's "multi-region by deployment", not by code.
 
@@ -148,9 +148,9 @@ You can ship this today. It's "multi-region by deployment", not by code.
 
 To ship multi-region cleanly:
 
-1. **Add `region` to `TenantMetadata`** in catalog. Used at signup, recorded forever.
+1. **Add `region` to `ProjectMetadata`** in catalog. Used at signup, recorded forever.
 2. **Reject signups without a region.**
-3. **Region check in tenant resolver** so misrouted requests fail fast with a clear error.
+3. **Region check in project resolver** so misrouted requests fail fast with a clear error.
 4. **DNS routing layer**: `<region>.basin.example.com` → that region's router fleet.
 
 These are operational glue. Documented as Phase 1 below.
@@ -174,18 +174,18 @@ For cross-region **read replicas** ([ADR 0004](./decisions/0004-multi-region-rea
 
 ## Rollout phases
 
-### Phase 1 — ship single-region multi-tenant (this week)
+### Phase 1 — ship single-region multi-project (this week)
 
 - Pick 2–3 regions to launch (e.g. `us-east-1`, `eu-west-1`, `ap-southeast-1`).
 - Deploy independent Basin clusters in each, one object-store bucket per region.
-- Customer signup picks region; record `tenant.region` in catalog.
+- Customer signup picks region; record `project.region` in catalog.
 - DNS: `<region>.basin.example.com` → regional router fleet.
 
 This covers ~95% of B2B SaaS shapes (data residency + low local latency).
 
 ### Phase 2 — cross-region read replicas (when first paid customer asks)
 
-- Enable cross-region replication for that tenant's bucket (provider-level configuration).
+- Enable cross-region replication for that project's bucket (provider-level configuration).
 - Replicate catalog state (snapshot+pull of embedded catalog; PG logical only if operator opted into `BASIN_AUTH_CATALOG_DSN`).
 - Add `replica` role marker to basin-router; read-only sessions land on replicas.
 - Surface replica lag in stats and as a `WARNING` if stale > N seconds.
@@ -202,7 +202,7 @@ Spanner-class engineering. ADR 0001 documents the deferral and the trigger.
 
 Three legitimate reasons (none "by default"):
 
-1. **Whale tenant** — one customer with 100× the load of others. **Pin them to their own shard owner with bigger compute.** Same bucket, different in-memory shard. Cheap because storage is shared.
+1. **Whale project** — one customer with 100× the load of others. **Pin them to their own shard owner with bigger compute.** Same bucket, different in-memory shard. Cheap because storage is shared.
 2. **Compliance customer** — needs BYO-bucket or BYO-key (Phase 6, [TASK.md](../TASK.md)). They get their own bucket; data never touches Basin's bucket. Same Basin process, different storage backend per session.
 3. **Region-restricted** — solved by per-region cluster, not per-customer instance. Customer picks region at signup.
 
@@ -232,9 +232,9 @@ This mirrors what Snowflake and BigQuery do. Supabase / Neon's per-project prici
 - [ ] `BASIN_DATA_DIR` + `BASIN_WAL_DIR` volumes attached (the embedded catalog lives here — no external Postgres to provision)
 - [ ] DNS: `<region>.basin.example.com` → router fleet
 - [ ] Auth signing key (one global key OR per-region keys)
-- [ ] Monitoring: per-tenant ops/s, p50/p99, RAM, IO via OTLP
+- [ ] Monitoring: per-project ops/s, p50/p99, RAM, IO via OTLP
 - [ ] Backup: bucket versioning enabled (Iceberg snapshots are the data; no `pg_dump` needed)
-- [ ] Rate limit: per-tenant guard for compute and `basin-net` outbound HTTP
+- [ ] Rate limit: per-project guard for compute and `basin-net` outbound HTTP
 - [ ] Disaster recovery: bucket replication target (manual cross-region copy if Phase 2 not yet built)
 
 ---
@@ -294,12 +294,12 @@ that into one safe call.
 **What it does**
 
 ```sh
-# Wipe users, sessions, api keys, magic links, … but keep tenant-pgwire creds.
+# Wipe users, sessions, api keys, magic links, … but keep project-pgwire creds.
 basinctl reset-auth --yes
 
-# Same, but also clear the per-tenant pgwire-credentials table — this logs
+# Same, but also clear the per-project pgwire-credentials table — this logs
 # every customer out of the pgwire endpoint until creds are re-issued.
-basinctl reset-auth --yes --include-tenant-creds
+basinctl reset-auth --yes --include-project-creds
 
 # Point at a non-default engine endpoint.
 basinctl reset-auth --yes \
@@ -308,10 +308,10 @@ basinctl reset-auth --yes \
 
 The command refuses to run without `--yes`. It connects as the reserved
 `basin_auth` user (whose creds the static resolver maps via the
-auto-injected reserved tenant) and runs `DROP TABLE IF EXISTS` for each
+auto-injected reserved project) and runs `DROP TABLE IF EXISTS` for each
 `basin_auth_*` table in child-before-parent order. By default the
-per-tenant pgwire-credentials table (`basin_auth_auth_tenant_credentials`)
-is left intact — pass `--include-tenant-creds` to drop it as well.
+per-project pgwire-credentials table (`basin_auth_auth_project_credentials`)
+is left intact — pass `--include-project-creds` to drop it as well.
 
 **What it does not touch**
 
@@ -319,7 +319,7 @@ is left intact — pass `--include-tenant-creds` to drop it as well.
   `basin_auth_*` namespace are affected.
 - WAL segments, Iceberg snapshots, object-store buckets — there is no object-store
   cleanup involved.
-- The reserved `basin_auth` tenant entry on the router — that is
+- The reserved `basin_auth` project entry on the router — that is
   auto-injected on every start.
 
 **After running**

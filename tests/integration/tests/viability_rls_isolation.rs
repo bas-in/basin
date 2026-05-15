@@ -1,20 +1,20 @@
-//! Viability test: RLS does not replace tenant prefix isolation.
+//! Viability test: RLS does not replace project prefix isolation.
 //!
 //! Card: `viability_rls_isolation`
-//! Bar: `cross_tenant_leak == 0`.
+//! Bar: `cross_project_leak == 0`.
 //!
-//! Two tenants (A, B) each declare their own RLS policy on a same-named
-//! table. The principal `"shared"` exists in both tenants. The test
-//! exhaustively queries every (tenant, RLS-state) combination and
+//! Two projects (A, B) each declare their own RLS policy on a same-named
+//! table. The principal `"shared"` exists in both projects. The test
+//! exhaustively queries every (project, RLS-state) combination and
 //! confirms:
 //!
-//! 1. Tenant A's session never returns a row tagged with tenant B's
+//! 1. Project A's session never returns a row tagged with project B's
 //!    sentinel marker, regardless of RLS state on either side.
-//! 2. RLS state on tenant A does not leak into tenant B (and vice-versa).
+//! 2. RLS state on project A does not leak into project B (and vice-versa).
 //!
-//! What this proves: the structural per-tenant prefix isolation that
+//! What this proves: the structural per-project prefix isolation that
 //! Phase 1 substrate ships continues to bind even when an RLS layer is
-//! active. Cross-tenant leakage under any RLS configuration is a P0.
+//! active. Cross-project leakage under any RLS configuration is a P0.
 
 #![allow(clippy::print_stdout)]
 
@@ -22,16 +22,16 @@ use std::sync::Arc;
 
 use arrow_array::{Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
 
 /// Inspect every `marker` cell returned by `sql` in `sess`, count the cells
-/// matching `forbidden_marker`. Any non-zero count is a cross-tenant leak.
-async fn count_forbidden_marker(sess: &TenantSession, sql: &str, forbidden_marker: &str) -> usize {
+/// matching `forbidden_marker`. Any non-zero count is a cross-project leak.
+async fn count_forbidden_marker(sess: &ProjectSession, sql: &str, forbidden_marker: &str) -> usize {
     let res = sess.execute(sql).await.expect("query failed");
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
@@ -71,18 +71,18 @@ async fn viability_rls_isolation() {
         shard: None,
     });
 
-    // Two tenants, each with the same-named table `events`. Markers are
-    // unique per tenant so any cross-tenant leak is unambiguous.
-    let tenant_a = TenantId::new();
-    let tenant_b = TenantId::new();
-    let marker_a = format!("A-{}", tenant_a);
-    let marker_b = format!("B-{}", tenant_b);
+    // Two projects, each with the same-named table `events`. Markers are
+    // unique per project so any cross-project leak is unambiguous.
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
+    let marker_a = format!("A-{}", project_a);
+    let marker_b = format!("B-{}", project_b);
 
     // Schema setup runs through admin sessions (no auth) so the principal
     // sessions can be opened *after* the table exists and pick it up
     // through the engine's per-session listing-table registration.
-    let admin_a = engine.open_session(tenant_a).await.unwrap();
-    let admin_b = engine.open_session(tenant_b).await.unwrap();
+    let admin_a = engine.open_session(project_a).await.unwrap();
+    let admin_b = engine.open_session(project_b).await.unwrap();
 
     for s in [&admin_a, &admin_b] {
         s.execute(
@@ -92,14 +92,14 @@ async fn viability_rls_isolation() {
         .unwrap();
     }
 
-    // Use the same principal name (`"shared"`) in both tenants. This is the
-    // attack surface: if RLS were to leak across tenants (say, by sharing a
-    // policy table), shared's session under tenant A could see tenant B's
+    // Use the same principal name (`"shared"`) in both projects. This is the
+    // attack surface: if RLS were to leak across projects (say, by sharing a
+    // policy table), shared's session under project A could see project B's
     // rows. The test asserts that doesn't happen.
-    let shared_a = engine.open_session_as(tenant_a, "shared").await.unwrap();
-    let shared_b = engine.open_session_as(tenant_b, "shared").await.unwrap();
+    let shared_a = engine.open_session_as(project_a, "shared").await.unwrap();
+    let shared_b = engine.open_session_as(project_b, "shared").await.unwrap();
 
-    // Seed: each tenant gets 5 rows, all with owner='shared' so the
+    // Seed: each project gets 5 rows, all with owner='shared' so the
     // RLS policy matches the principal. The marker is what we count for
     // leak detection.
     for i in 0..5_i64 {
@@ -120,11 +120,11 @@ async fn viability_rls_isolation() {
     let mut leak_count: usize = 0;
 
     // Phase 1: RLS off everywhere. `shared@A` queries only A's rows by
-    // tenant prefix; A's session must see *zero* B markers.
+    // project prefix; A's session must see *zero* B markers.
     leak_count += count_forbidden_marker(&shared_a, "SELECT marker FROM events", &marker_b).await;
     leak_count += count_forbidden_marker(&shared_b, "SELECT marker FROM events", &marker_a).await;
 
-    // Phase 2: enable RLS on tenant A only. The policy is permissive for
+    // Phase 2: enable RLS on project A only. The policy is permissive for
     // owner='shared'; A's session sees its own rows; B's session under no
     // policy still sees its own rows. Neither sees the other's.
     admin_a
@@ -139,7 +139,7 @@ async fn viability_rls_isolation() {
     leak_count += count_forbidden_marker(&shared_a, "SELECT marker FROM events", &marker_b).await;
     leak_count += count_forbidden_marker(&shared_b, "SELECT marker FROM events", &marker_a).await;
 
-    // Phase 3: enable RLS on tenant B with a *different* policy expression
+    // Phase 3: enable RLS on project B with a *different* policy expression
     // that still happens to permit owner='shared'. This rules out any
     // accidental coupling between policies in the in-memory catalog.
     admin_b
@@ -157,7 +157,7 @@ async fn viability_rls_isolation() {
     leak_count += count_forbidden_marker(&shared_b, "SELECT marker FROM events", &marker_a).await;
 
     // Phase 4: drop A's policy with RLS still on (deny-default for
-    // tenant A). A's session should see 0 rows; B is unaffected and still
+    // project A). A's session should see 0 rows; B is unaffected and still
     // sees its own rows. Critically, A still sees no B rows.
     admin_a
         .execute("DROP POLICY a_shared ON events")
@@ -174,7 +174,7 @@ async fn viability_rls_isolation() {
     };
     assert_eq!(
         a_post_drop, 0,
-        "tenant A under RLS-on + no policy should see 0 rows; got {a_post_drop}"
+        "project A under RLS-on + no policy should see 0 rows; got {a_post_drop}"
     );
     // B is unaffected: still sees its own 5 rows.
     let b_unaffected = match shared_b.execute("SELECT marker FROM events").await.unwrap() {
@@ -183,35 +183,35 @@ async fn viability_rls_isolation() {
     };
     assert_eq!(
         b_unaffected, 5,
-        "tenant B unaffected by tenant A's policy drop; got {b_unaffected} rows"
+        "project B unaffected by project A's policy drop; got {b_unaffected} rows"
     );
 
     let pass = leak_count == 0;
     println!(
-        "[VIABILITY RLS isolation] cross_tenant_leak={leak_count} (bar=0) {}",
+        "[VIABILITY RLS isolation] cross_project_leak={leak_count} (bar=0) {}",
         if pass { "PASS" } else { "FAIL" }
     );
 
     report_viability(
         "rls_isolation",
-        "RLS preserves tenant prefix isolation",
-        "Cross-tenant row leakage is zero across every RLS configuration combination.",
+        "RLS preserves project prefix isolation",
+        "Cross-project row leakage is zero across every RLS configuration combination.",
         pass,
         PrimaryMetric {
-            label: "cross_tenant_leak".into(),
+            label: "cross_project_leak".into(),
             value: leak_count as f64,
             unit: "rows".into(),
             bar: BarOp::eq(0.0),
         },
         json!({
-            "cross_tenant_leak": leak_count,
-            "tenant_a": tenant_a.to_string(),
-            "tenant_b": tenant_b.to_string(),
+            "cross_project_leak": leak_count,
+            "project_a": project_a.to_string(),
+            "project_b": project_b.to_string(),
         }),
     );
 
     assert_eq!(
         leak_count, 0,
-        "{leak_count} cross-tenant rows leaked under RLS"
+        "{leak_count} cross-project rows leaked under RLS"
     );
 }

@@ -6,7 +6,7 @@ read **and write** Basin's table metadata via the Iceberg REST spec.
 
 ## Status (Phase 6 entry)
 
-- `GET /v1/{prefix}/namespaces` — implemented (returns the caller's tenant)
+- `GET /v1/{prefix}/namespaces` — implemented (returns the caller's project)
 - `GET /v1/{prefix}/namespaces/{ns}/tables` — implemented
 - `GET /v1/{prefix}/namespaces/{ns}/tables/{tbl}` — implemented
   (minimal Iceberg metadata shape — covers format-version=2, schemas,
@@ -34,7 +34,7 @@ known but the request is malformed).
 
 | Iceberg requirement              | Basin check                                          |
 | -------------------------------- | ---------------------------------------------------- |
-| `assert-table-uuid`              | UUIDv5 over `<tenant>/<table>` matches               |
+| `assert-table-uuid`              | UUIDv5 over `<project>/<table>` matches               |
 | `assert-current-schema-id`       | Basin tables are single-schema; only `0` is accepted |
 | `assert-ref-snapshot-id` (`main`)| `meta.current_snapshot.0 as i64` matches             |
 
@@ -110,14 +110,14 @@ corresponding primitives.
 ## Auth
 
 v0.1 ships an auth stub: the `Authorization: Bearer <token>` header is
-parsed as a Basin `TenantId` (ULID). The handler enforces that the URL
-`:namespace` segment matches the caller's tenant — cross-tenant
+parsed as a Basin `ProjectId` (ULID). The handler enforces that the URL
+`:namespace` segment matches the caller's project — cross-project
 isolation is preserved without yet wiring `basin-auth`'s JWT verifier.
 Production wiring will replace the stub with a call into
 `basin_auth::AuthService::verify_jwt` (the same path `basin-rest` uses)
-and pull `claims.tenant_id` from the verified token. The handler-side
+and pull `claims.project_id` from the verified token. The handler-side
 contract — "the URL `:namespace` segment must equal the caller's
-tenant" — stays the same; only the token decoder changes.
+project" — stays the same; only the token decoder changes.
 
 ## Integration plan
 
@@ -147,4 +147,4 @@ multi-deployment ships.
   carry both `added-files-paths` and `removed-files-paths`)
 - pyiceberg integration test (separate test crate; currently scaffolded)
 - Real auth (JWT verification via `basin-auth`) replacing the bearer-as-
-  tenant-id stub
+  project-id stub

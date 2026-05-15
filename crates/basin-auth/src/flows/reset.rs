@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::Utc;
 
 use crate::email::{reset_template, Outbound};
@@ -13,10 +13,10 @@ const RESET_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) async fn request_password_reset(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     email: &str,
 ) -> Result<()> {
-    inner.ip_limiter.check(&format!("reset:{tenant}"))?;
+    inner.ip_limiter.check(&format!("reset:{project}"))?;
     inner.email_limiter.check(&format!("reset:{email}"))?;
 
     let email = crate::normalise_email(email)?;
@@ -24,7 +24,7 @@ pub(crate) async fn request_password_reset(
     let (raw, h) = generate();
     let expires_at = Utc::now() + crate::ttl_or_default(RESET_TTL);
 
-    let user_row = inner.store.find_user_by_email(tenant, &email).await?;
+    let user_row = inner.store.find_user_by_email(project, &email).await?;
 
     // Per-OWASP: don't leak whether the email exists. We always return Ok,
     // but only insert a token + send the email if the user is real.
@@ -35,7 +35,7 @@ pub(crate) async fn request_password_reset(
     inner
         .store
         .insert_email_token(
-            tenant,
+            project,
             user_row.user_id,
             &h,
             EmailTokenPurpose::Reset.as_str(),
@@ -51,7 +51,7 @@ pub(crate) async fn request_password_reset(
 
 pub(crate) async fn reset_password(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     raw_token: &str,
     new_password: &str,
 ) -> Result<()> {
@@ -59,7 +59,7 @@ pub(crate) async fn reset_password(
     let h = hash_token(raw_token);
     let new_hash = password::hash(new_password, inner.cfg.bcrypt_cost)?;
 
-    let row = inner.store.find_email_token(tenant, &h).await?;
+    let row = inner.store.find_email_token(project, &h).await?;
     let Some(row) = row else {
         return Err(BasinError::not_found("invalid reset token"));
     };
@@ -76,7 +76,7 @@ pub(crate) async fn reset_password(
         return Err(BasinError::InvalidIdent("reset token expired".into()));
     }
 
-    let consumed = inner.store.consume_email_token(tenant, &h).await?;
+    let consumed = inner.store.consume_email_token(project, &h).await?;
     if consumed == 0 {
         return Err(BasinError::InvalidIdent(
             "reset token already consumed".into(),
@@ -85,7 +85,7 @@ pub(crate) async fn reset_password(
 
     inner
         .store
-        .update_password(tenant, row.user_id, &new_hash)
+        .update_password(project, row.user_id, &new_hash)
         .await?;
 
     // Invalidate every active refresh token for this user — a forgotten

@@ -12,7 +12,7 @@
 //! has been flipped to assert the JOIN returns the seeded table's columns
 //! tagged with PG type names.
 //!
-//! Each test spins a fresh server, opens a single tenant connection, creates
+//! Each test spins a fresh server, opens a single project connection, creates
 //! a small fixture (2-3 tables + 1 function + 1 procedure), then runs one
 //! tooling query.
 
@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use basin_common::TenantId;
-use basin_router::{ServerConfig, StaticTenantResolver};
+use basin_common::ProjectId;
+use basin_router::{ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls};
@@ -54,15 +54,15 @@ async fn start_server() -> TestServer {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let mut map = HashMap::new();
-    map.insert("alice".to_owned(), tenant);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    map.insert("alice".to_owned(), project);
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -133,7 +133,7 @@ async fn seed_fixture(client: &Client) {
 // =============================================================================
 
 /// Query 1 — schema discovery. PostgREST asks for namespaces excluding the
-/// system ones; in v0.1 Basin emits exactly `public` per tenant, so the
+/// system ones; in v0.1 Basin emits exactly `public` per project, so the
 /// filtered result must contain `public`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgrest_schema_discovery() {

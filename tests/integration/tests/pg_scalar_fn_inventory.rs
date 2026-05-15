@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -45,7 +45,7 @@ async fn open_engine() -> (TempDir, Engine) {
 }
 
 /// Run `sql`, return first-row first-column as String. Panics on error.
-async fn one_str(sess: &basin_engine::TenantSession, sql: &str) -> String {
+async fn one_str(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap_or_else(|| panic!("no batch: {sql}"));
@@ -60,7 +60,7 @@ async fn one_str(sess: &basin_engine::TenantSession, sql: &str) -> String {
 }
 
 /// Assert `sql` executes without error (result ignored).
-async fn assert_ok(sess: &basin_engine::TenantSession, sql: &str) {
+async fn assert_ok(sess: &basin_engine::ProjectSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(_) => {}
         Err(e) => panic!("error for [{sql}]: {e}"),
@@ -119,7 +119,7 @@ fn render_col(arr: &dyn Array, i: usize) -> String {
 #[tokio::test]
 async fn string_char_length() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT char_length('hello')").await, "5");
     assert_eq!(one_str(&s, "SELECT character_length('hello')").await, "5");
     assert_eq!(one_str(&s, "SELECT char_length('')").await, "0");
@@ -129,7 +129,7 @@ async fn string_char_length() {
 #[ignore = "v0.1 PG scalar fn stubs — invoke_no_args / LargeUtf8 bridge / int signature coercion; v0.2 work"]
 async fn string_octet_length() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // ASCII: octet_length == char_length
     assert_eq!(one_str(&s, "SELECT octet_length('hello')").await, "5");
     // 3-byte UTF-8 code point (€ = E2 82 AC)
@@ -139,7 +139,7 @@ async fn string_octet_length() {
 #[tokio::test]
 async fn string_concat_and_concat_ws() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT concat('foo', 'bar', 'baz')").await,
         "foobarbaz"
@@ -158,7 +158,7 @@ async fn string_concat_and_concat_ws() {
 #[tokio::test]
 async fn string_lpad_rpad() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT lpad('hi', 5, '*')").await,
         "***hi"
@@ -176,7 +176,7 @@ async fn string_lpad_rpad() {
 #[tokio::test]
 async fn string_initcap() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT initcap('hello world')").await,
         "Hello World"
@@ -190,7 +190,7 @@ async fn string_initcap() {
 #[tokio::test]
 async fn string_repeat() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT repeat('ab', 3)").await, "ababab");
     assert_eq!(one_str(&s, "SELECT repeat('x', 0)").await, "");
 }
@@ -198,14 +198,14 @@ async fn string_repeat() {
 #[tokio::test]
 async fn string_reverse() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT reverse('abcd')").await, "dcba");
 }
 
 #[tokio::test]
 async fn string_ascii_chr() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT ascii('A')").await, "65");
     assert_eq!(one_str(&s, "SELECT chr(65)").await, "A");
     assert_eq!(one_str(&s, "SELECT chr(9786)").await, "☺");
@@ -215,7 +215,7 @@ async fn string_ascii_chr() {
 #[ignore = "v0.1 PG scalar fn stubs — invoke_no_args / LargeUtf8 bridge / int signature coercion; v0.2 work"]
 async fn string_split_part() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT split_part('a,b,c', ',', 2)").await,
         "b"
@@ -233,7 +233,7 @@ async fn string_split_part() {
 #[tokio::test]
 async fn string_regexp_match() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // regexp_match returns a list; just assert it doesn't error.
     assert_ok(&s, "SELECT regexp_match('abc123', '([a-z]+)([0-9]+)')").await;
 }
@@ -241,14 +241,14 @@ async fn string_regexp_match() {
 #[tokio::test]
 async fn string_regexp_split_to_array() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT regexp_split_to_array('a,b,c', ',')").await;
 }
 
 #[tokio::test]
 async fn string_md5() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // Known MD5 of empty string.
     assert_eq!(
         one_str(&s, "SELECT md5('')").await,
@@ -259,7 +259,7 @@ async fn string_md5() {
 #[tokio::test]
 async fn string_encode_decode() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // encode(bytea, 'hex')
     assert_ok(&s, "SELECT encode('\\x01'::bytea, 'hex')").await;
     // decode(text, 'hex') → bytea
@@ -269,7 +269,7 @@ async fn string_encode_decode() {
 #[tokio::test]
 async fn string_format() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT format('Hello, %s!', 'world')").await,
         "Hello, world!"
@@ -283,7 +283,7 @@ async fn string_format() {
 #[tokio::test]
 async fn string_quote_ident_literal() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT quote_ident('table name')").await,
         "\"table name\""
@@ -300,7 +300,7 @@ async fn string_quote_ident_literal() {
 async fn math_ceiling_alias() {
     // `ceiling` is PG's alias for `ceil`.
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT ceiling(1.4)").await, "2");
     assert_eq!(one_str(&s, "SELECT ceiling(-1.4)").await, "-1");
 }
@@ -309,7 +309,7 @@ async fn math_ceiling_alias() {
 async fn math_sign_alias() {
     // `sign` is PG's name; DF calls it `signum`.
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT sign(-5.0)").await, "-1");
     assert_eq!(one_str(&s, "SELECT sign(0.0)").await, "0");
     assert_eq!(one_str(&s, "SELECT sign(42.0)").await, "1");
@@ -318,7 +318,7 @@ async fn math_sign_alias() {
 #[tokio::test]
 async fn math_trunc() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT trunc(3.7)").await, "3");
     assert_eq!(one_str(&s, "SELECT trunc(-3.7)").await, "-3");
 }
@@ -326,7 +326,7 @@ async fn math_trunc() {
 #[tokio::test]
 async fn math_ln_exp() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // ln(e) ≈ 1.0
     assert_ok(&s, "SELECT ln(2.71828182845904523536)").await;
     // exp(0) = 1.0
@@ -336,7 +336,7 @@ async fn math_ln_exp() {
 #[tokio::test]
 async fn math_log() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // log(b, x) — log base b of x
     assert_ok(&s, "SELECT log(10, 1000)").await;
     // log(x) — natural log
@@ -346,21 +346,21 @@ async fn math_log() {
 #[tokio::test]
 async fn math_pi() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT pi()").await;
 }
 
 #[tokio::test]
 async fn math_random() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT random()").await;
 }
 
 #[tokio::test]
 async fn math_degrees_radians() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // degrees(pi()) ≈ 180
     assert_ok(&s, "SELECT degrees(pi())").await;
     // radians(180) ≈ pi
@@ -370,7 +370,7 @@ async fn math_degrees_radians() {
 #[tokio::test]
 async fn math_trig() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT sin(0.0)").await;
     assert_ok(&s, "SELECT cos(0.0)").await;
     assert_ok(&s, "SELECT tan(0.0)").await;
@@ -384,14 +384,14 @@ async fn math_trig() {
 async fn math_pow_alias() {
     // `pow` is already a DF alias for `power`.
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(one_str(&s, "SELECT pow(2, 10)").await, "1024");
 }
 
 #[tokio::test]
 async fn math_width_bucket() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // PG: width_bucket(5.35, 0.024, 10.06, 5) = 3
     assert_eq!(
         one_str(&s, "SELECT width_bucket(5.35, 0.024, 10.06, 5)").await,
@@ -415,7 +415,7 @@ async fn math_width_bucket() {
 #[ignore = "v0.1 PG scalar fn stubs — invoke_no_args / LargeUtf8 bridge / int signature coercion; v0.2 work"]
 async fn datetime_clock_transaction_statement_timestamp() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT clock_timestamp()").await;
     assert_ok(&s, "SELECT transaction_timestamp()").await;
     assert_ok(&s, "SELECT statement_timestamp()").await;
@@ -425,7 +425,7 @@ async fn datetime_clock_transaction_statement_timestamp() {
 #[ignore = "v0.1 PG scalar fn stubs — invoke_no_args / LargeUtf8 bridge / int signature coercion; v0.2 work"]
 async fn datetime_localtime_localtimestamp() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT localtime()").await;
     assert_ok(&s, "SELECT localtimestamp()").await;
 }
@@ -433,7 +433,7 @@ async fn datetime_localtime_localtimestamp() {
 #[tokio::test]
 async fn datetime_make_date() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // DataFusion's built-in make_date.
     assert_ok(&s, "SELECT make_date(2024, 5, 9)").await;
 }
@@ -441,7 +441,7 @@ async fn datetime_make_date() {
 #[tokio::test]
 async fn datetime_make_time() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT make_time(12, 34, 56.0)").await,
         "12:34:56"
@@ -455,7 +455,7 @@ async fn datetime_make_time() {
 #[tokio::test]
 async fn datetime_make_timestamp() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // Should not error.
     assert_ok(&s, "SELECT make_timestamp(2024, 5, 9, 12, 34, 56.0)").await;
 }
@@ -464,7 +464,7 @@ async fn datetime_make_timestamp() {
 #[ignore = "v0.1 PG scalar fn stubs — invoke_no_args / LargeUtf8 bridge / int signature coercion; v0.2 work"]
 async fn datetime_make_interval_stub() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // Stub — just verify it doesn't error.
     assert_ok(&s, "SELECT make_interval(1, 2, 3, 4, 5, 6, 7)").await;
     assert_ok(&s, "SELECT make_interval(0)").await;
@@ -474,7 +474,7 @@ async fn datetime_make_interval_stub() {
 #[tokio::test]
 async fn datetime_to_date() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT to_date('2024-05-09', '%Y-%m-%d')").await;
 }
 
@@ -484,7 +484,7 @@ async fn datetime_to_date() {
 async fn null_coalesce_nullif_greatest_least() {
     // Already covered in viability_pg_compat_funcs.rs — brief smoke test only.
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_eq!(
         one_str(&s, "SELECT coalesce(NULL, 'x')").await,
         "x"
@@ -508,7 +508,7 @@ async fn null_coalesce_nullif_greatest_least() {
 #[tokio::test]
 async fn type_to_number() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     // to_number strips formatting and returns numeric.
     assert_eq!(
         one_str(&s, "SELECT to_number('12345.67', '99999.99')").await,
@@ -524,7 +524,7 @@ async fn type_to_number() {
 async fn type_format_type_stub() {
     // format_type(oid, mod) — registered by pg_catalog_udf.
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     assert_ok(&s, "SELECT format_type(23, NULL)").await;
 }
 
@@ -533,7 +533,7 @@ async fn type_format_type_stub() {
 #[tokio::test]
 async fn agg_count_sum_avg_min_max() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE agg_t (v INT NOT NULL)")
         .await
         .unwrap();
@@ -550,7 +550,7 @@ async fn agg_count_sum_avg_min_max() {
 #[tokio::test]
 async fn agg_bool_and_or_every() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE bool_t (b BOOLEAN NOT NULL)")
         .await
         .unwrap();
@@ -567,7 +567,7 @@ async fn agg_bool_and_or_every() {
 #[ignore = "v0.1 PG scalar fn stubs — invoke_no_args / LargeUtf8 bridge / int signature coercion; v0.2 work"]
 async fn agg_string_agg() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE str_t (v TEXT NOT NULL)")
         .await
         .unwrap();
@@ -580,7 +580,7 @@ async fn agg_string_agg() {
 #[tokio::test]
 async fn agg_array_agg() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE arr_t (v INT NOT NULL)")
         .await
         .unwrap();
@@ -593,7 +593,7 @@ async fn agg_array_agg() {
 #[tokio::test]
 async fn agg_bit_and_or() {
     let (_d, e) = open_engine().await;
-    let s = e.open_session(TenantId::new()).await.unwrap();
+    let s = e.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE bit_t (v BIGINT NOT NULL)")
         .await
         .unwrap();

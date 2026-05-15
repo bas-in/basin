@@ -1,18 +1,18 @@
-//! Per-tenant SQL sequence catalog.
+//! Per-project SQL sequence catalog.
 //!
 //! Customers will write `CREATE SEQUENCE` and `nextval('seq')` once the
 //! DDL surface lands; this module ships the underlying machinery: the
-//! sequence definition, the per-tenant Mutex-guarded counter state, and
+//! sequence definition, the per-project Mutex-guarded counter state, and
 //! the `nextval` / `currval` / `setval` operations on [`Catalog`]. The
 //! SQL-string entrypoint is wired by the engine via three scalar UDFs.
 //!
-//! The catalog is a single shared `HashMap<(TenantId, String),
+//! The catalog is a single shared `HashMap<(ProjectId, String),
 //! Arc<Mutex<SequenceState>>>` — same shape as [`crate::functions`] —
-//! so per-tenant cost stays `O(bytes-of-sequences)`. Registering a
+//! so per-project cost stays `O(bytes-of-sequences)`. Registering a
 //! sequence touches one HashMap entry and one Arc allocation; reading
 //! / advancing one is a single Mutex acquisition that never blocks
-//! another tenant's sequences (or even another sequence inside the
-//! same tenant).
+//! another project's sequences (or even another sequence inside the
+//! same project).
 //!
 //! ## Cache blocks
 //!
@@ -30,14 +30,14 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 /// Catalog row for a sequence. Field defaults match Postgres'
 /// `CREATE SEQUENCE` defaults except where called out.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceDef {
-    pub tenant: TenantId,
-    /// Unqualified name, scoped to the owning tenant. Validated to be
+    pub project: ProjectId,
+    /// Unqualified name, scoped to the owning project. Validated to be
     /// a SQL identifier.
     pub name: String,
     /// Starting value; the first `nextval` after creation returns this.
@@ -67,9 +67,9 @@ impl SequenceDef {
     /// Produce a sensible PG-shaped default for a sequence with the given
     /// `start` and `increment`. The min/max bounds match PG: `1..=i64::MAX`
     /// for positive steps; `i64::MIN+1..=-1` for negative.
-    pub fn with_defaults(tenant: TenantId, name: impl Into<String>) -> Self {
+    pub fn with_defaults(project: ProjectId, name: impl Into<String>) -> Self {
         Self {
-            tenant,
+            project,
             name: name.into(),
             start: 1,
             increment: 1,
@@ -81,7 +81,7 @@ impl SequenceDef {
     }
 }
 
-/// Mutable in-memory state for a sequence. The per-`(tenant, name)` value
+/// Mutable in-memory state for a sequence. The per-`(project, name)` value
 /// is `Arc<Mutex<SequenceState>>`; the mutex serialises every advance so
 /// concurrent `nextval` calls always observe distinct values.
 ///
@@ -220,7 +220,7 @@ mod tests {
 
     fn def_with(increment: i64, start: i64, cycle: bool) -> SequenceDef {
         SequenceDef {
-            tenant: TenantId::new(),
+            project: ProjectId::new(),
             name: "s".into(),
             start,
             increment,

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, RecordBatch};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -48,12 +48,12 @@ async fn open_engine() -> (TempDir, Engine) {
     (dir, engine)
 }
 
-async fn open_session(engine: &Engine) -> basin_engine::TenantSession {
-    engine.open_session(TenantId::new()).await.unwrap()
+async fn open_session(engine: &Engine) -> basin_engine::ProjectSession {
+    engine.open_session(ProjectId::new()).await.unwrap()
 }
 
 /// Execute `sql` and return the result batches, panicking on error.
-async fn exec_ok(sess: &basin_engine::TenantSession, sql: &str) -> Vec<RecordBatch> {
+async fn exec_ok(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<RecordBatch> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(ExecResult::Empty { .. }) => vec![],

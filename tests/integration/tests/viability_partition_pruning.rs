@@ -1,4 +1,4 @@
-//! Within-tenant time-based partitioning viability test.
+//! Within-project time-based partitioning viability test.
 //!
 //! Card: `viability_partition_pruning`
 //! Bar: a 1-month range query against a year of data must read at most one
@@ -12,7 +12,7 @@
 //!    INSERT time.
 //! 2. Inserting 12 months of data (100 rows per month, distinct months) emits
 //!    one Parquet file per partition under
-//!    `tenants/{id}/tables/events/data/year=YYYY/month=MM/...`.
+//!    `projects/{id}/tables/events/data/year=YYYY/month=MM/...`.
 //! 3. A `SELECT ... WHERE ts BETWEEN ...` covering exactly one month reads
 //!    *one* file's worth of bytes (not all twelve).
 //!
@@ -26,8 +26,8 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
@@ -197,7 +197,7 @@ fn engine_with_counting_store(dir: &TempDir) -> (Engine, Arc<CountingStore>) {
     (engine, counting)
 }
 
-async fn total_select_rows(sess: &TenantSession, sql: &str) -> usize {
+async fn total_select_rows(sess: &ProjectSession, sql: &str) -> usize {
     let res = sess.execute(sql).await.unwrap();
     match res {
         ExecResult::Rows { batches, .. } => {
@@ -213,8 +213,8 @@ async fn viability_partition_pruning_one_month_range_reads_one_partition() {
 
     let dir = TempDir::new().unwrap();
     let (engine, counting) = engine_with_counting_store(&dir);
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     sess.execute(
         "CREATE TABLE events (\
@@ -251,7 +251,7 @@ async fn viability_partition_pruning_one_month_range_reads_one_partition() {
     // before we measure any reads.
     let table = basin_common::TableName::new("events").unwrap();
     let storage = engine.config().storage.clone();
-    let listed = storage.list_data_files(&tenant, &table).await.unwrap();
+    let listed = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(
         listed.len(),
         12,
@@ -304,7 +304,7 @@ async fn viability_partition_pruning_one_month_range_reads_one_partition() {
 
     report_viability(
         "partition_pruning",
-        "Within-tenant time-based partition pruning",
+        "Within-project time-based partition pruning",
         "A 1-month range query against 12 months of partitioned data reads at most one partition's worth of bytes (range/full bytes ratio < 0.2).",
         pass,
         PrimaryMetric {

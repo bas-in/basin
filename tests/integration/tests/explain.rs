@@ -14,14 +14,14 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::cache_defaults;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 /// Set up a minimal engine with a single table containing a few rows.
-async fn make_engine_with_table() -> (Engine, TenantId, TempDir) {
+async fn make_engine_with_table() -> (Engine, ProjectId, TempDir) {
     let dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
@@ -37,8 +37,8 @@ async fn make_engine_with_table() -> (Engine, TenantId, TempDir) {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, val TEXT NOT NULL)")
         .await
         .unwrap();
@@ -46,7 +46,7 @@ async fn make_engine_with_table() -> (Engine, TenantId, TempDir) {
         .await
         .unwrap();
 
-    (engine, tenant, dir)
+    (engine, project, dir)
 }
 
 /// Extract all string values from the first column of the result.
@@ -78,8 +78,8 @@ fn plan_lines(result: ExecResult) -> Vec<String> {
 
 #[tokio::test]
 async fn explain_select_returns_plan_text() {
-    let (engine, tenant, _dir) = make_engine_with_table().await;
-    let sess = engine.open_session(tenant).await.unwrap();
+    let (engine, project, _dir) = make_engine_with_table().await;
+    let sess = engine.open_session(project).await.unwrap();
 
     let result = sess
         .execute("EXPLAIN SELECT * FROM t")
@@ -102,8 +102,8 @@ async fn explain_select_returns_plan_text() {
 
 #[tokio::test]
 async fn explain_analyze_returns_plan_text() {
-    let (engine, tenant, _dir) = make_engine_with_table().await;
-    let sess = engine.open_session(tenant).await.unwrap();
+    let (engine, project, _dir) = make_engine_with_table().await;
+    let sess = engine.open_session(project).await.unwrap();
 
     let result = sess
         .execute("EXPLAIN ANALYZE SELECT * FROM t")
@@ -121,8 +121,8 @@ async fn explain_analyze_returns_plan_text() {
 
 #[tokio::test]
 async fn explain_verbose_returns_plan_text() {
-    let (engine, tenant, _dir) = make_engine_with_table().await;
-    let sess = engine.open_session(tenant).await.unwrap();
+    let (engine, project, _dir) = make_engine_with_table().await;
+    let sess = engine.open_session(project).await.unwrap();
 
     let result = sess
         .execute("EXPLAIN VERBOSE SELECT id FROM t WHERE id > 1")
@@ -140,8 +140,8 @@ async fn explain_verbose_returns_plan_text() {
 
 #[tokio::test]
 async fn explain_format_json_returns_json() {
-    let (engine, tenant, _dir) = make_engine_with_table().await;
-    let sess = engine.open_session(tenant).await.unwrap();
+    let (engine, project, _dir) = make_engine_with_table().await;
+    let sess = engine.open_session(project).await.unwrap();
 
     let result = sess
         .execute("EXPLAIN (FORMAT JSON) SELECT * FROM t")
@@ -176,8 +176,8 @@ async fn explain_format_json_returns_json() {
 
 #[tokio::test]
 async fn explain_options_analyze_verbose() {
-    let (engine, tenant, _dir) = make_engine_with_table().await;
-    let sess = engine.open_session(tenant).await.unwrap();
+    let (engine, project, _dir) = make_engine_with_table().await;
+    let sess = engine.open_session(project).await.unwrap();
 
     // PG-style: EXPLAIN (ANALYZE, VERBOSE) <stmt>
     let result = sess

@@ -20,11 +20,11 @@
 //! the integration test harness, so the effect is correct anyway).
 
 use basin_catalog::{Catalog, ViewDef};
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Execute `CREATE [OR REPLACE] [TEMP] VIEW v AS <query>`.
 ///
@@ -32,7 +32,7 @@ use crate::{ExecResult, TenantSession};
 /// `or_replace` mirrors `CREATE OR REPLACE VIEW`.
 /// `query_sql` is the SELECT body as text.
 pub(crate) async fn exec_create_view(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     query_sql: &str,
     or_replace: bool,
@@ -43,7 +43,7 @@ pub(crate) async fn exec_create_view(
         .map_err(|e| BasinError::InvalidSchema(format!("view body is not valid SQL: {e}")))?;
 
     let def = ViewDef {
-        tenant: sess.tenant,
+        project: sess.project,
         name: name.to_string(),
         query_sql: query_sql.to_string(),
     };
@@ -63,14 +63,14 @@ pub(crate) async fn exec_create_view(
 /// `CASCADE` / `RESTRICT` are accepted syntactically but ignored in v0.1
 /// (plain views have no dependents tracked in the catalog).
 pub(crate) async fn exec_drop_view(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     if_exists: bool,
 ) -> Result<ExecResult> {
     sess.engine
         .config()
         .catalog
-        .drop_view(&sess.tenant, name, if_exists)
+        .drop_view(&sess.project, name, if_exists)
         .await?;
 
     Ok(ExecResult::Empty {
@@ -96,11 +96,11 @@ pub(crate) async fn exec_drop_view(
 /// appeared in the SQL).
 pub(crate) async fn rewrite_view_refs(
     catalog: &dyn Catalog,
-    tenant: &TenantId,
+    project: &ProjectId,
     sql: &str,
 ) -> Result<Option<String>> {
-    // Fast path: no views registered for this tenant → nothing to do.
-    let views = catalog.list_views(tenant).await;
+    // Fast path: no views registered for this project → nothing to do.
+    let views = catalog.list_views(project).await;
     if views.is_empty() {
         return Ok(None);
     }

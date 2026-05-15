@@ -1,11 +1,11 @@
 //! Scaling test 2: data-size curve (scale-up).
 //!
-//! Claim: As one tenant's data grows from 100k to 10M rows:
+//! Claim: As one project's data grows from 100k to 10M rows:
 //! - on-disk bytes scale linearly with row count (no nasty growth term)
 //! - point-query latency stays bounded (does not degrade with table size)
 //! - full-scan latency grows roughly linearly (the inevitable cost)
 //!
-//! This is the "scale up" half of the wedge — a single tenant getting big
+//! This is the "scale up" half of the wedge — a single project getting big
 //! shouldn't make their substrate fall apart.
 //!
 //! Bars:
@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -101,7 +101,7 @@ async fn scaling_2_data_size() {
             page_cache: None,
         });
 
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("events").unwrap();
         let part = PartitionKey::default_key();
 
@@ -111,7 +111,7 @@ async fn scaling_2_data_size() {
             let start = (b * BATCH_SIZE) as i64;
             let batch = build_batch(start, BATCH_SIZE);
             let df = storage
-                .write_batch(&tenant, &table, &part, &batch)
+                .write_batch(&project, &table, &part, &batch)
                 .await
                 .unwrap();
             total_disk += df.size_bytes;
@@ -128,7 +128,7 @@ async fn scaling_2_data_size() {
                 ..Default::default()
             };
             let started = Instant::now();
-            let mut stream = storage.read(&tenant, &table, opts).await.unwrap();
+            let mut stream = storage.read(&project, &table, opts).await.unwrap();
             let mut hits = 0usize;
             while let Some(b) = stream.next().await {
                 hits += b.unwrap().num_rows();
@@ -146,7 +146,7 @@ async fn scaling_2_data_size() {
         for _ in 0..3 {
             let started = Instant::now();
             let mut stream = storage
-                .read(&tenant, &table, ReadOptions::default())
+                .read(&project, &table, ReadOptions::default())
                 .await
                 .unwrap();
             let mut total = 0usize;
@@ -227,7 +227,7 @@ async fn scaling_2_data_size() {
 
     report_scaling(
         "data_size",
-        "Single-tenant data size scale-up",
+        "Single-project data size scale-up",
         "Storage is linear in row count; point-query latency stays bounded.",
         pass,
         AxisSpec {

@@ -2,15 +2,15 @@
 //! constraint introspection views: `information_schema.table_constraints`,
 //! `.key_column_usage`, and `.referential_constraints`.
 //!
-//! Each test opens a `TenantSession` and runs SQL through the same
+//! Each test opens a `ProjectSession` and runs SQL through the same
 //! `execute()` entry point a pgwire connection would hit.
 
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -54,7 +54,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -65,7 +65,7 @@ async fn rows(sess: &TenantSession, sql: &str) -> Vec<RecordBatch> {
 async fn select_information_schema_table_constraints_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE orders ( \
@@ -107,7 +107,7 @@ async fn select_information_schema_table_constraints_routes() {
 async fn select_information_schema_key_column_usage_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, payload TEXT)")
         .await
@@ -130,7 +130,7 @@ async fn select_information_schema_key_column_usage_routes() {
 async fn select_information_schema_referential_constraints_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
         .await
@@ -157,7 +157,7 @@ async fn where_predicate_filters_constraint_type() {
     // that the predicate doesn't filter them all out.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE t ( \

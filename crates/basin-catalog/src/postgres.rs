@@ -6,9 +6,9 @@
 //!
 //! Concurrency model mirrors the in-memory implementation: optimistic
 //! concurrency on `expected_snapshot`, monotonic `SnapshotId` per
-//! `(tenant, table)`. Atomicity for `append_data_files` is provided by a
+//! `(project, table)`. Atomicity for `append_data_files` is provided by a
 //! single Postgres transaction with `SELECT ... FOR UPDATE` on the table
-//! row, which serializes concurrent appenders on the same `(tenant, table)`
+//! row, which serializes concurrent appenders on the same `(project, table)`
 //! without blocking commits to other tables.
 //!
 //! TLS: `tokio_postgres::NoTls` is hard-coded for the PoC. Production
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, ChangeOp, Result, TableName, TenantId};
+use basin_common::{BasinError, ChangeOp, Result, TableName, ProjectId};
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
@@ -36,7 +36,7 @@ use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::reactors::{self, ReactorDef, ReactorError, ReactorOps};
 use crate::sequences::{compute_next, SequenceDef, SequenceError};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
-use crate::tenant_storage_config::TenantStorageConfig;
+use crate::project_storage_config::ProjectStorageConfig;
 use crate::{Catalog, ProjectSnapshotEntry};
 
 const DEFAULT_SCHEMA: &str = "basin_catalog";
@@ -98,24 +98,24 @@ impl PostgresCatalog {
             format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.namespaces (
-                    tenant_id  TEXT PRIMARY KEY,
+                    project_id  TEXT PRIMARY KEY,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )"
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.tables (
-                    tenant_id          TEXT NOT NULL REFERENCES {schema}.namespaces(tenant_id),
+                    project_id          TEXT NOT NULL REFERENCES {schema}.namespaces(project_id),
                     table_name         TEXT NOT NULL,
                     schema_json        JSONB NOT NULL,
                     current_snapshot   BIGINT NOT NULL DEFAULT 0,
                     format_version     SMALLINT NOT NULL DEFAULT 2,
                     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, table_name)
+                    PRIMARY KEY (project_id, table_name)
                 )"
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.snapshots (
-                    tenant_id     TEXT NOT NULL,
+                    project_id     TEXT NOT NULL,
                     table_name    TEXT NOT NULL,
                     snapshot_id   BIGINT NOT NULL,
                     parent_id     BIGINT,
@@ -123,9 +123,9 @@ impl PostgresCatalog {
                     committed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
                     summary_json  JSONB NOT NULL,
                     data_files    JSONB NOT NULL,
-                    PRIMARY KEY (tenant_id, table_name, snapshot_id),
-                    FOREIGN KEY (tenant_id, table_name)
-                        REFERENCES {schema}.tables(tenant_id, table_name)
+                    PRIMARY KEY (project_id, table_name, snapshot_id),
+                    FOREIGN KEY (project_id, table_name)
+                        REFERENCES {schema}.tables(project_id, table_name)
                         ON DELETE CASCADE
                 )"
             ),
@@ -233,23 +233,23 @@ impl PostgresCatalog {
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS indexes_json JSONB"
             ),
-            // Per-tenant SQL function definitions. One row per
-            // (tenant, name); body is stored as raw SQL, args/return as
+            // Per-project SQL function definitions. One row per
+            // (project, name); body is stored as raw SQL, args/return as
             // JSONB so future scalar / argument-type extensions don't
             // need another migration.
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.sql_functions (
-                    tenant_id    TEXT NOT NULL,
+                    project_id    TEXT NOT NULL,
                     name         TEXT NOT NULL,
                     args_json    JSONB NOT NULL,
                     return_json  JSONB NOT NULL,
                     body         TEXT NOT NULL,
                     language     TEXT NOT NULL,
                     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, name)
+                    PRIMARY KEY (project_id, name)
                 )"
             ),
-            // Per-tenant sequences. The persisted state is the row-locked
+            // Per-project sequences. The persisted state is the row-locked
             // `current_value` field; `nextval` does an UPDATE … RETURNING
             // inside a row lock so concurrent callers always see distinct
             // values without an ad-hoc mutex layer. `started` distinguishes
@@ -258,7 +258,7 @@ impl PostgresCatalog {
             // in-memory `SequenceState::started` flag.
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.sequences (
-                    tenant_id      TEXT NOT NULL,
+                    project_id      TEXT NOT NULL,
                     name           TEXT NOT NULL,
                     start_value    BIGINT NOT NULL,
                     increment      BIGINT NOT NULL,
@@ -269,18 +269,18 @@ impl PostgresCatalog {
                     current_value  BIGINT NOT NULL,
                     started        BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, name)
+                    PRIMARY KEY (project_id, name)
                 )"
             ),
-            // Per-tenant reactors. Composite-key shape mirrors
-            // [`crate::in_memory`]: name is unique per `(tenant, table)`,
-            // not per tenant. `seq` is a per-row monotonic counter so
+            // Per-project reactors. Composite-key shape mirrors
+            // [`crate::in_memory`]: name is unique per `(project, table)`,
+            // not per project. `seq` is a per-row monotonic counter so
             // `lookup_reactors_for` can replay reactors in registration
             // order. The bitset for ops is stored as a SMALLINT (`u8` is
             // the underlying repr).
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.reactors (
-                    tenant_id        TEXT NOT NULL,
+                    project_id        TEXT NOT NULL,
                     table_name       TEXT NOT NULL,
                     name             TEXT NOT NULL,
                     ops_bits         SMALLINT NOT NULL,
@@ -288,62 +288,62 @@ impl PostgresCatalog {
                     body             TEXT NOT NULL,
                     seq              BIGINT NOT NULL,
                     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, table_name, name)
+                    PRIMARY KEY (project_id, table_name, name)
                 )"
             ),
             // Sequence used to assign reactor `seq` registration indices.
             // One global sequence keeps assignment monotonic across all
-            // tenants without a per-tenant counter row; lookup orders by
-            // the value, so cross-tenant interleaving is fine.
+            // projects without a per-project counter row; lookup orders by
+            // the value, so cross-project interleaving is fine.
             format!("CREATE SEQUENCE IF NOT EXISTS {schema}.reactor_seq START 1"),
-            // Per-tenant `CREATE TYPE … AS ENUM` rows. `labels` is the
+            // Per-project `CREATE TYPE … AS ENUM` rows. `labels` is the
             // ordered JSONB array of label strings; `ALTER TYPE … ADD
             // VALUE` appends to it inside a row-locked transaction.
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.enum_types (
-                    tenant_id  TEXT NOT NULL,
+                    project_id  TEXT NOT NULL,
                     name       TEXT NOT NULL,
                     labels     JSONB NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, name)
+                    PRIMARY KEY (project_id, name)
                 )"
             ),
-            // Per-tenant `CREATE DOMAIN` rows. `base_type_json` is the
+            // Per-project `CREATE DOMAIN` rows. `base_type_json` is the
             // serialised `SqlArgType` so future variants don't require a
             // migration; `check_predicate` is nullable for "pure type
             // alias, no constraint".
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.domains (
-                    tenant_id        TEXT NOT NULL,
+                    project_id        TEXT NOT NULL,
                     name             TEXT NOT NULL,
                     base_type_json   JSONB NOT NULL,
                     check_predicate  TEXT,
                     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, name)
+                    PRIMARY KEY (project_id, name)
                 )"
             ),
-            // Per-tenant `CREATE PROCEDURE … LANGUAGE sql` rows. `args_json`
+            // Per-project `CREATE PROCEDURE … LANGUAGE sql` rows. `args_json`
             // is the serialised `Vec<SqlFunctionArg>`; `body` is stored
             // verbatim so the engine reparses on each `CALL`.
             format!(
                 "CREATE TABLE IF NOT EXISTS {schema}.procedures (
-                    tenant_id  TEXT NOT NULL,
+                    project_id  TEXT NOT NULL,
                     name       TEXT NOT NULL,
                     body       TEXT NOT NULL,
                     args_json  JSONB NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, name)
+                    PRIMARY KEY (project_id, name)
                 )"
             ),
-            // Per-tenant storage config (KMS routing + provider extras).
-            // One row per tenant; `config_json` carries the full
-            // `TenantStorageConfig` shape so future fields don't need
+            // Per-project storage config (KMS routing + provider extras).
+            // One row per project; `config_json` carries the full
+            // `ProjectStorageConfig` shape so future fields don't need
             // another migration. `INSERT … ON CONFLICT DO UPDATE` for
-            // `set_tenant_storage_config` matches the existing
+            // `set_project_storage_config` matches the existing
             // `register_sql_function` upsert pattern.
             format!(
-                "CREATE TABLE IF NOT EXISTS {schema}.tenant_storage_config (
-                    tenant_id   TEXT PRIMARY KEY,
+                "CREATE TABLE IF NOT EXISTS {schema}.project_storage_config (
+                    project_id   TEXT PRIMARY KEY,
                     config_json JSONB NOT NULL,
                     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 )"
@@ -362,25 +362,25 @@ impl PostgresCatalog {
 
 #[async_trait]
 impl Catalog for PostgresCatalog {
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn create_namespace(&self, tenant: &TenantId) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
         let sql = format!(
-            "INSERT INTO {schema}.namespaces (tenant_id) VALUES ($1)
-             ON CONFLICT (tenant_id) DO NOTHING",
+            "INSERT INTO {schema}.namespaces (project_id) VALUES ($1)
+             ON CONFLICT (project_id) DO NOTHING",
             schema = self.schema
         );
         let client = self.client.lock().await;
         client
-            .execute(&sql, &[&tenant.to_string()])
+            .execute(&sql, &[&project.to_string()])
             .await
             .map_err(|e| BasinError::catalog(format!("create_namespace: {e}")))?;
         Ok(())
     }
 
-    #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, schema), fields(project = %project, table = %table))]
     async fn create_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         schema: &Schema,
     ) -> Result<TableMetadata> {
@@ -401,7 +401,7 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("serialise data files: {e}")))?;
 
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let table_str = table.to_string();
 
         // Ensure namespace exists, then attempt table insert. ON CONFLICT
@@ -414,10 +414,10 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("begin: {e}")))?;
         tx.execute(
             &format!(
-                "INSERT INTO {sch}.namespaces (tenant_id) VALUES ($1)
-                 ON CONFLICT (tenant_id) DO NOTHING"
+                "INSERT INTO {sch}.namespaces (project_id) VALUES ($1)
+                 ON CONFLICT (project_id) DO NOTHING"
             ),
-            &[&tenant_str],
+            &[&project_str],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("ensure namespace: {e}")))?;
@@ -429,29 +429,29 @@ impl Catalog for PostgresCatalog {
         let inserted = tx
             .execute(
                 &format!(
-                    "INSERT INTO {sch}.tables (tenant_id, table_name, schema_json, current_snapshot, format_version, partition_spec_json, rls_enabled, policies_json)
+                    "INSERT INTO {sch}.tables (project_id, table_name, schema_json, current_snapshot, format_version, partition_spec_json, rls_enabled, policies_json)
                      VALUES ($1, $2, $3, 0, 2, $4, FALSE, $5)
-                     ON CONFLICT (tenant_id, table_name) DO NOTHING"
+                     ON CONFLICT (project_id, table_name) DO NOTHING"
                 ),
-                &[&tenant_str, &table_str, &schema_json, &default_spec_json, &empty_policies_json],
+                &[&project_str, &table_str, &schema_json, &default_spec_json, &empty_policies_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("insert table: {e}")))?;
         if inserted == 0 {
             tx.rollback().await.ok();
             return Err(BasinError::catalog(format!(
-                "table {tenant}/{table} already exists"
+                "table {project}/{table} already exists"
             )));
         }
 
         tx.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots
-                   (tenant_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
+                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
                  VALUES ($1, $2, 0, NULL, 'genesis', $3, $4, $5)"
             ),
             &[
-                &tenant_str,
+                &project_str,
                 &table_str,
                 &now,
                 &genesis_summary_json,
@@ -466,7 +466,7 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("commit create_table: {e}")))?;
 
         Ok(TableMetadata {
-            tenant: *tenant,
+            project: *project,
             table: table.clone(),
             schema: Arc::new(schema.clone()),
             current_snapshot: SnapshotId::GENESIS,
@@ -500,10 +500,10 @@ impl Catalog for PostgresCatalog {
         })
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn load_table(&self, tenant: &TenantId, table: &TableName) -> Result<TableMetadata> {
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let table_str = table.to_string();
 
         let client = self.client.lock().await;
@@ -518,14 +518,14 @@ impl Catalog for PostgresCatalog {
                             pk_columns_json, check_constraints_json, foreign_keys_json,
                             unique_constraints_json, indexes_json
                      FROM {sch}.tables
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant_str, &table_str],
+                &[&project_str, &table_str],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("load_table: {e}")))?;
         let Some(row) = row_opt else {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         };
         let schema_json: serde_json::Value = row.get(0);
         let current: i64 = row.get(1);
@@ -613,9 +613,9 @@ impl Catalog for PostgresCatalog {
             None => Vec::new(),
         };
 
-        let snapshots = fetch_snapshots(&client, sch, &tenant_str, &table_str).await?;
+        let snapshots = fetch_snapshots(&client, sch, &project_str, &table_str).await?;
         Ok(TableMetadata {
-            tenant: *tenant,
+            project: *project,
             table: table.clone(),
             schema: Arc::new(arrow_schema),
             current_snapshot: SnapshotId(current as u64),
@@ -639,33 +639,33 @@ impl Catalog for PostgresCatalog {
         })
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn drop_table(&self, tenant: &TenantId, table: &TableName) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let n = client
             .execute(
-                &format!("DELETE FROM {sch}.tables WHERE tenant_id = $1 AND table_name = $2"),
-                &[&tenant.to_string(), &table.to_string()],
+                &format!("DELETE FROM {sch}.tables WHERE project_id = $1 AND table_name = $2"),
+                &[&project.to_string(), &table.to_string()],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_table: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_tables(&self, tenant: &TenantId) -> Result<Vec<TableName>> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = client
             .query(
                 &format!(
-                    "SELECT table_name FROM {sch}.tables WHERE tenant_id = $1 ORDER BY table_name"
+                    "SELECT table_name FROM {sch}.tables WHERE project_id = $1 ORDER BY table_name"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("list_tables: {e}")))?;
@@ -679,8 +679,8 @@ impl Catalog for PostgresCatalog {
         Ok(out)
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn drop_namespace(&self, tenant: &TenantId) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn drop_namespace(&self, project: &ProjectId) -> Result<()> {
         // Single transaction: delete all tables (cascades to snapshots via
         // the FK) and the namespace row. One round-trip vs N from the
         // default impl. Idempotent: missing rows are not an error.
@@ -691,56 +691,56 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("begin drop_namespace: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.tables WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.tables WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace tables: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.sql_functions WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.sql_functions WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace sql_functions: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.sequences WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.sequences WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace sequences: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.reactors WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.reactors WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace reactors: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.enum_types WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.enum_types WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace enum_types: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.domains WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.domains WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace domains: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.procedures WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.procedures WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace procedures: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.tenant_storage_config WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.project_storage_config WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
-        .map_err(|e| BasinError::catalog(format!("drop_namespace tenant_storage_config: {e}")))?;
+        .map_err(|e| BasinError::catalog(format!("drop_namespace project_storage_config: {e}")))?;
         tx.execute(
-            &format!("DELETE FROM {sch}.namespaces WHERE tenant_id = $1"),
-            &[&tenant.to_string()],
+            &format!("DELETE FROM {sch}.namespaces WHERE project_id = $1"),
+            &[&project.to_string()],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace namespace: {e}")))?;
@@ -750,21 +750,21 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_tenant_data_files(&self, tenant: &TenantId) -> Result<Vec<DataFileRef>> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_project_data_files(&self, project: &ProjectId) -> Result<Vec<DataFileRef>> {
         // Single SELECT that union-flattens every table's snapshot.data_files
-        // for this tenant. Each row is one snapshot's JSONB array of file
+        // for this project. Each row is one snapshot's JSONB array of file
         // refs; we deserialise per-row and concatenate. One round-trip vs
         // the default impl's (list_tables, then N × load_table → fetch_snapshots).
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = client
             .query(
-                &format!("SELECT data_files FROM {sch}.snapshots WHERE tenant_id = $1"),
-                &[&tenant.to_string()],
+                &format!("SELECT data_files FROM {sch}.snapshots WHERE project_id = $1"),
+                &[&project.to_string()],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!("list_tenant_data_files: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("list_project_data_files: {e}")))?;
         let mut out: Vec<DataFileRef> = Vec::new();
         for row in rows {
             let files_json: serde_json::Value = row.get(0);
@@ -778,7 +778,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(
         skip(self, files),
         fields(
-            tenant = %tenant,
+            project = %project,
             table = %table,
             expected_snapshot = %expected_snapshot,
             file_count = files.len(),
@@ -786,13 +786,13 @@ impl Catalog for PostgresCatalog {
     )]
     async fn append_data_files(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         expected_snapshot: SnapshotId,
         files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let table_str = table.to_string();
 
         let added_files = files.len() as u64;
@@ -816,7 +816,7 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("begin append: {e}")))?;
 
-        // FOR UPDATE serializes appenders on this (tenant, table) without
+        // FOR UPDATE serializes appenders on this (project, table) without
         // blocking other tables. The row's `current_snapshot` is the
         // optimistic-concurrency token: caller must have observed the same
         // value as is currently in the database.
@@ -824,22 +824,22 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT current_snapshot FROM {sch}.tables
-                     WHERE tenant_id = $1 AND table_name = $2
+                     WHERE project_id = $1 AND table_name = $2
                      FOR UPDATE"
                 ),
-                &[&tenant_str, &table_str],
+                &[&project_str, &table_str],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("lock row: {e}")))?;
         let Some(row) = row else {
             tx.rollback().await.ok();
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         };
         let current: i64 = row.get(0);
         if (current as u64) != expected_snapshot.0 {
             tx.rollback().await.ok();
             return Err(BasinError::CommitConflict(format!(
-                "{tenant}/{table}: expected snapshot {expected_snapshot}, current is {current}"
+                "{project}/{table}: expected snapshot {expected_snapshot}, current is {current}"
             )));
         }
 
@@ -850,11 +850,11 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots
-                   (tenant_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
+                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
                  VALUES ($1, $2, $3, $4, 'append', $5, $6, $7)"
             ),
             &[
-                &tenant_str,
+                &project_str,
                 &table_str,
                 &new_id_pg,
                 &parent_id_pg,
@@ -869,9 +869,9 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "UPDATE {sch}.tables SET current_snapshot = $3
-                 WHERE tenant_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND table_name = $2"
             ),
-            &[&tenant_str, &table_str, &new_id_pg],
+            &[&project_str, &table_str, &new_id_pg],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("update current_snapshot: {e}")))?;
@@ -885,13 +885,13 @@ impl Catalog for PostgresCatalog {
         // Cheaper than reconstructing in-memory because schema_json
         // round-trip is the only network hop avoided, and correctness is
         // worth more than that microsecond.
-        self.load_table(tenant, table).await
+        self.load_table(project, table).await
     }
 
     #[instrument(
         skip(self, removed_paths, added_files),
         fields(
-            tenant = %tenant,
+            project = %project,
             table = %table,
             expected_snapshot = %expected_snapshot,
             removed = removed_paths.len(),
@@ -900,14 +900,14 @@ impl Catalog for PostgresCatalog {
     )]
     async fn replace_data_files(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         expected_snapshot: SnapshotId,
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let table_str = table.to_string();
 
         let added_files_count = added_files.len() as u64;
@@ -939,27 +939,27 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("begin replace: {e}")))?;
 
         // Same FOR UPDATE row-lock pattern as append: serialises commits on
-        // the same (tenant, table) without blocking other tables.
+        // the same (project, table) without blocking other tables.
         let row = tx
             .query_opt(
                 &format!(
                     "SELECT current_snapshot FROM {sch}.tables
-                     WHERE tenant_id = $1 AND table_name = $2
+                     WHERE project_id = $1 AND table_name = $2
                      FOR UPDATE"
                 ),
-                &[&tenant_str, &table_str],
+                &[&project_str, &table_str],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("lock row: {e}")))?;
         let Some(row) = row else {
             tx.rollback().await.ok();
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         };
         let current: i64 = row.get(0);
         if (current as u64) != expected_snapshot.0 {
             tx.rollback().await.ok();
             return Err(BasinError::CommitConflict(format!(
-                "{tenant}/{table}: expected snapshot {expected_snapshot}, current is {current}"
+                "{project}/{table}: expected snapshot {expected_snapshot}, current is {current}"
             )));
         }
 
@@ -970,11 +970,11 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots
-                   (tenant_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
+                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
                  VALUES ($1, $2, $3, $4, 'replace', $5, $6, $7)"
             ),
             &[
-                &tenant_str,
+                &project_str,
                 &table_str,
                 &new_id_pg,
                 &parent_id_pg,
@@ -989,9 +989,9 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "UPDATE {sch}.tables SET current_snapshot = $3
-                 WHERE tenant_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND table_name = $2"
             ),
-            &[&tenant_str, &table_str, &new_id_pg],
+            &[&project_str, &table_str, &new_id_pg],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("update current_snapshot: {e}")))?;
@@ -1001,13 +1001,13 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("commit replace: {e}")))?;
         drop(client);
 
-        self.load_table(tenant, table).await
+        self.load_table(project, table).await
     }
 
-    #[instrument(skip(self, spec), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, spec), fields(project = %project, table = %table))]
     async fn set_partition_spec(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         spec: PartitionSpec,
     ) -> Result<()> {
@@ -1019,22 +1019,22 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET partition_spec_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &json],
+                &[&project.to_string(), &table.to_string(), &json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_partition_spec: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, policies), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, policies), fields(project = %project, table = %table))]
     async fn set_rls_state(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         rls_enabled: bool,
         policies: Vec<Policy>,
@@ -1047,22 +1047,22 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET rls_enabled = $3, policies_json = $4
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &rls_enabled, &json],
+                &[&project.to_string(), &table.to_string(), &rls_enabled, &json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_rls_state: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_tier_policy(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         cold_after_seconds: Option<u64>,
         cold_age_column: Option<String>,
@@ -1082,10 +1082,10 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET cold_after_seconds = $3, cold_age_column = $4
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
                 &[
-                    &tenant.to_string(),
+                    &project.to_string(),
                     &table.to_string(),
                     &cas_pg,
                     &cold_age_column,
@@ -1094,15 +1094,15 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("set_tier_policy: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, n = columns.len()))]
+    #[instrument(skip(self, columns), fields(project = %project, table = %table, n = columns.len()))]
     async fn set_bloom_filter_columns(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
@@ -1114,22 +1114,22 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET bloom_filter_columns_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &json],
+                &[&project.to_string(), &table.to_string(), &json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_bloom_filter_columns: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_row_group_rows(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         rows: Option<usize>,
     ) -> Result<()> {
@@ -1148,22 +1148,22 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET row_group_rows = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &rows_pg],
+                &[&project.to_string(), &table.to_string(), &rows_pg],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_row_group_rows: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, def), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, def), fields(project = %project, table = %table))]
     async fn set_continuous_aggregate(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         def: Option<CvDef>,
     ) -> Result<()> {
@@ -1179,22 +1179,22 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET continuous_aggregate_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &json],
+                &[&project.to_string(), &table.to_string(), &json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_continuous_aggregate: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_cluster_columns(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
@@ -1216,22 +1216,22 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET cluster_columns_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &json],
+                &[&project.to_string(), &table.to_string(), &json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_cluster_columns: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_home_region(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         region: Option<String>,
     ) -> Result<()> {
@@ -1241,22 +1241,22 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET home_region = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &region],
+                &[&project.to_string(), &table.to_string(), &region],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_home_region: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, check_constraints, foreign_keys), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, check_constraints, foreign_keys), fields(project = %project, table = %table))]
     async fn set_table_constraints(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         pk_columns: Vec<String>,
         check_constraints: Vec<CheckConstraint>,
@@ -1295,10 +1295,10 @@ impl Catalog for PostgresCatalog {
                      SET pk_columns_json = $3,
                          check_constraints_json = $4,
                          foreign_keys_json = $5
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
                 &[
-                    &tenant.to_string(),
+                    &project.to_string(),
                     &table.to_string(),
                     &pk_json,
                     &check_json,
@@ -1308,15 +1308,15 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("set_table_constraints: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, unique_constraints), fields(tenant = %tenant, table = %table))]
+    #[instrument(skip(self, unique_constraints), fields(project = %project, table = %table))]
     async fn set_unique_constraints(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         unique_constraints: Vec<UniqueConstraint>,
     ) -> Result<()> {
@@ -1335,22 +1335,22 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "UPDATE {sch}.tables
                      SET unique_constraints_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &unique_json],
+                &[&project.to_string(), &table.to_string(), &unique_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_unique_constraints: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, columns), fields(tenant = %tenant, table = %table, name = %name))]
+    #[instrument(skip(self, columns), fields(project = %project, table = %table, name = %name))]
     async fn create_index(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         name: &str,
         columns: &[String],
@@ -1362,11 +1362,11 @@ impl Catalog for PostgresCatalog {
             ));
         }
 
-        let mut meta = self.load_table(tenant, table).await?;
+        let mut meta = self.load_table(project, table).await?;
         for col in columns {
             if meta.schema.field_with_name(col).is_err() {
                 return Err(BasinError::InvalidSchema(format!(
-                    "create_index: column {col:?} not in table {tenant}/{table} schema"
+                    "create_index: column {col:?} not in table {project}/{table} schema"
                 )));
             }
         }
@@ -1375,7 +1375,7 @@ impl Catalog for PostgresCatalog {
                 return Ok(());
             }
             return Err(BasinError::catalog(format!(
-                "create_index: {tenant}/{table}: index {name:?} already exists"
+                "create_index: {project}/{table}: index {name:?} already exists"
             )));
         }
         meta.indexes.push(SecondaryIndex {
@@ -1391,26 +1391,26 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "UPDATE {sch}.tables
                      SET indexes_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &indexes_json],
+                &[&project.to_string(), &table.to_string(), &indexes_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("create_index: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
-    async fn drop_index(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
-        let mut meta = self.load_table(tenant, table).await?;
+    #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
+    async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
+        let mut meta = self.load_table(project, table).await?;
         let before = meta.indexes.len();
         meta.indexes.retain(|i| i.name != name);
         if meta.indexes.len() == before {
             return Err(BasinError::not_found(format!(
-                "index {name:?} on {tenant}/{table}"
+                "index {name:?} on {project}/{table}"
             )));
         }
         let indexes_json: Option<serde_json::Value> = if meta.indexes.is_empty() {
@@ -1428,20 +1428,20 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "UPDATE {sch}.tables
                      SET indexes_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &indexes_json],
+                &[&project.to_string(), &table.to_string(), &indexes_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_index: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self, schema), fields(tenant = %tenant, table = %table))]
-    async fn set_schema(&self, tenant: &TenantId, table: &TableName, schema: Schema) -> Result<()> {
+    #[instrument(skip(self, schema), fields(project = %project, table = %table))]
+    async fn set_schema(&self, project: &ProjectId, table: &TableName, schema: Schema) -> Result<()> {
         let sch = &self.schema;
         let schema_json = serde_json::to_value(&schema)
             .map_err(|e| BasinError::catalog(format!("serialise arrow schema: {e}")))?;
@@ -1450,45 +1450,45 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET schema_json = $3
-                     WHERE tenant_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND table_name = $2"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &schema_json],
+                &[&project.to_string(), &table.to_string(), &schema_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_schema: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table))]
-    async fn list_snapshots(&self, tenant: &TenantId, table: &TableName) -> Result<Vec<Snapshot>> {
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn list_snapshots(&self, project: &ProjectId, table: &TableName) -> Result<Vec<Snapshot>> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let table_str = table.to_string();
         let client = self.client.lock().await;
         // Existence check so callers get NotFound (matching InMemoryCatalog)
         // rather than an empty list when the table is missing.
         let exists = client
             .query_opt(
-                &format!("SELECT 1 FROM {sch}.tables WHERE tenant_id = $1 AND table_name = $2"),
-                &[&tenant_str, &table_str],
+                &format!("SELECT 1 FROM {sch}.tables WHERE project_id = $1 AND table_name = $2"),
+                &[&project_str, &table_str],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("list_snapshots: {e}")))?;
         if exists.is_none() {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
-        fetch_snapshots(&client, sch, &tenant_str, &table_str).await
+        fetch_snapshots(&client, sch, &project_str, &table_str).await
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
+    #[instrument(skip(self), fields(project = %project))]
     async fn list_snapshots_project_wide(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<Vec<ProjectSnapshotEntry>> {
-        // Single-pass JOIN: fan-in every snapshot for this tenant in commit
+        // Single-pass JOIN: fan-in every snapshot for this project in commit
         // order. The outer ORDER BY mirrors the default impl's tie-breakers
         // so InMemory and Postgres produce byte-identical timelines.
         let sch = &self.schema;
@@ -1500,11 +1500,11 @@ impl Catalog for PostgresCatalog {
                             s.operation, s.summary_json
                      FROM {sch}.tables t
                      JOIN {sch}.snapshots s
-                       ON s.tenant_id = t.tenant_id AND s.table_name = t.table_name
-                     WHERE t.tenant_id = $1
+                       ON s.project_id = t.project_id AND s.table_name = t.table_name
+                     WHERE t.project_id = $1
                      ORDER BY s.committed_at ASC, t.table_name ASC, s.snapshot_id ASC"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("list_snapshots_project_wide: {e}")))?;
@@ -1533,15 +1533,15 @@ impl Catalog for PostgresCatalog {
         Ok(out)
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, src = %src_table, dst = %dst_table))]
+    #[instrument(skip(self), fields(project = %project, src = %src_table, dst = %dst_table))]
     async fn fork_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         src_table: &TableName,
         dst_table: &TableName,
     ) -> Result<TableMetadata> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let src_str = src_table.to_string();
         let dst_str = dst_table.to_string();
         let mut client = self.client.lock().await;
@@ -1555,15 +1555,15 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.tables \
-                     WHERE tenant_id = $1 AND table_name = $2 \
+                     WHERE project_id = $1 AND table_name = $2 \
                      FOR UPDATE"
                 ),
-                &[&tenant_str, &src_str],
+                &[&project_str, &src_str],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("fork src lookup: {e}")))?;
         if src_row.is_none() {
-            return Err(BasinError::not_found(format!("{tenant}/{src_table}")));
+            return Err(BasinError::not_found(format!("{project}/{src_table}")));
         }
 
         // 2. Copy the table row into the dst row (`INSERT … SELECT …`).
@@ -1573,7 +1573,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "INSERT INTO {sch}.tables (
-                        tenant_id, table_name, schema_json, current_snapshot,
+                        project_id, table_name, schema_json, current_snapshot,
                         format_version, partition_spec_json, rls_enabled,
                         policies_json, cold_after_seconds, cold_age_column,
                         bloom_filter_columns_json, row_group_rows,
@@ -1581,7 +1581,7 @@ impl Catalog for PostgresCatalog {
                         home_region,
                         pk_columns_json, check_constraints_json, foreign_keys_json
                      )
-                     SELECT tenant_id, $3, schema_json, current_snapshot,
+                     SELECT project_id, $3, schema_json, current_snapshot,
                             format_version, partition_spec_json, rls_enabled,
                             policies_json, cold_after_seconds, cold_age_column,
                             bloom_filter_columns_json, row_group_rows,
@@ -1589,16 +1589,16 @@ impl Catalog for PostgresCatalog {
                             home_region,
                             pk_columns_json, check_constraints_json, foreign_keys_json
                      FROM {sch}.tables
-                     WHERE tenant_id = $1 AND table_name = $2
-                     ON CONFLICT (tenant_id, table_name) DO NOTHING"
+                     WHERE project_id = $1 AND table_name = $2
+                     ON CONFLICT (project_id, table_name) DO NOTHING"
                 ),
-                &[&tenant_str, &src_str, &dst_str],
+                &[&project_str, &src_str, &dst_str],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("fork insert table: {e}")))?;
         if inserted == 0 {
             return Err(BasinError::catalog(format!(
-                "fork_table: {tenant}/{dst_table} already exists",
+                "fork_table: {project}/{dst_table} already exists",
             )));
         }
 
@@ -1608,15 +1608,15 @@ impl Catalog for PostgresCatalog {
         txn.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots (
-                    tenant_id, table_name, snapshot_id, parent_id,
+                    project_id, table_name, snapshot_id, parent_id,
                     operation, committed_at, summary_json, data_files
                  )
-                 SELECT tenant_id, $3, snapshot_id, parent_id,
+                 SELECT project_id, $3, snapshot_id, parent_id,
                         operation, committed_at, summary_json, data_files
                  FROM {sch}.snapshots
-                 WHERE tenant_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND table_name = $2"
             ),
-            &[&tenant_str, &src_str, &dst_str],
+            &[&project_str, &src_str, &dst_str],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("fork copy snapshots: {e}")))?;
@@ -1628,18 +1628,18 @@ impl Catalog for PostgresCatalog {
         // Re-fetch through the public API for a metadata value identical
         // to what `load_table` produces.
         drop(client);
-        self.load_table(tenant, dst_table).await
+        self.load_table(project, dst_table).await
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, snapshot = %snapshot_id))]
+    #[instrument(skip(self), fields(project = %project, table = %table, snapshot = %snapshot_id))]
     async fn rollback_to_snapshot(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         snapshot_id: SnapshotId,
     ) -> Result<TableMetadata> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let table_str = table.to_string();
         let snap_id_i64 = snapshot_id.0 as i64;
         let mut client = self.client.lock().await;
@@ -1654,30 +1654,30 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.tables \
-                     WHERE tenant_id = $1 AND table_name = $2 \
+                     WHERE project_id = $1 AND table_name = $2 \
                      FOR UPDATE"
                 ),
-                &[&tenant_str, &table_str],
+                &[&project_str, &table_str],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("rollback table lookup: {e}")))?;
         if row.is_none() {
-            return Err(BasinError::not_found(format!("{tenant}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{table}")));
         }
         let snap_row = txn
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.snapshots \
-                     WHERE tenant_id = $1 AND table_name = $2 \
+                     WHERE project_id = $1 AND table_name = $2 \
                        AND snapshot_id = $3"
                 ),
-                &[&tenant_str, &table_str, &snap_id_i64],
+                &[&project_str, &table_str, &snap_id_i64],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("rollback snapshot lookup: {e}")))?;
         if snap_row.is_none() {
             return Err(BasinError::not_found(format!(
-                "{tenant}/{table}: snapshot {snapshot_id} not in history",
+                "{project}/{table}: snapshot {snapshot_id} not in history",
             )));
         }
 
@@ -1685,10 +1685,10 @@ impl Catalog for PostgresCatalog {
         txn.execute(
             &format!(
                 "DELETE FROM {sch}.snapshots \
-                 WHERE tenant_id = $1 AND table_name = $2 \
+                 WHERE project_id = $1 AND table_name = $2 \
                    AND snapshot_id > $3"
             ),
-            &[&tenant_str, &table_str, &snap_id_i64],
+            &[&project_str, &table_str, &snap_id_i64],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("rollback snapshot delete: {e}")))?;
@@ -1697,9 +1697,9 @@ impl Catalog for PostgresCatalog {
         txn.execute(
             &format!(
                 "UPDATE {sch}.tables SET current_snapshot = $3 \
-                 WHERE tenant_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND table_name = $2"
             ),
-            &[&tenant_str, &table_str, &snap_id_i64],
+            &[&project_str, &table_str, &snap_id_i64],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("rollback head update: {e}")))?;
@@ -1712,13 +1712,13 @@ impl Catalog for PostgresCatalog {
         // grabs the lock). Re-fetch through the public API to keep the
         // returned metadata identical to what `load_table` would yield.
         drop(client);
-        self.load_table(tenant, table).await
+        self.load_table(project, table).await
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_sql_function(&self, def: SqlFunctionDef) -> Result<()> {
         let sch = &self.schema;
-        let tenant_str = def.tenant.to_string();
+        let project_str = def.project.to_string();
         let args_json = serde_json::to_value(&def.args)
             .map_err(|e| BasinError::catalog(format!("serialise fn args: {e}")))?;
         let return_json = serde_json::to_value(&def.return_type)
@@ -1733,16 +1733,16 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "INSERT INTO {sch}.sql_functions \
-                     (tenant_id, name, args_json, return_json, body, language) \
+                     (project_id, name, args_json, return_json, body, language) \
                      VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT (tenant_id, name) DO UPDATE \
+                     ON CONFLICT (project_id, name) DO UPDATE \
                      SET args_json = EXCLUDED.args_json, \
                          return_json = EXCLUDED.return_json, \
                          body = EXCLUDED.body, \
                          language = EXCLUDED.language"
                 ),
                 &[
-                    &tenant_str,
+                    &project_str,
                     &def.name,
                     &args_json,
                     &return_json,
@@ -1755,42 +1755,42 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_sql_function(&self, tenant: &TenantId, name: &str) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_sql_function(&self, project: &ProjectId, name: &str) -> Result<()> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let client = self.client.lock().await;
         let n = client
             .execute(
                 &format!(
                     "DELETE FROM {sch}.sql_functions \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant_str, &name],
+                &[&project_str, &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_sql_function: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sql function {name:?}"
+                "{project}: sql function {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_sql_function(&self, tenant: &TenantId, name: &str) -> Option<SqlFunctionDef> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_sql_function(&self, project: &ProjectId, name: &str) -> Option<SqlFunctionDef> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let client = self.client.lock().await;
         let row = client
             .query_opt(
                 &format!(
                     "SELECT args_json, return_json, body, language \
                      FROM {sch}.sql_functions \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant_str, &name],
+                &[&project_str, &name],
             )
             .await
             .ok()
@@ -1803,7 +1803,7 @@ impl Catalog for PostgresCatalog {
         let return_type = serde_json::from_value(return_json).ok()?;
         let language = serde_json::from_value(serde_json::Value::String(language_str)).ok()?;
         Some(SqlFunctionDef {
-            tenant: *tenant,
+            project: *project,
             name: name.to_string(),
             args,
             return_type,
@@ -1812,19 +1812,19 @@ impl Catalog for PostgresCatalog {
         })
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_sql_functions(&self, tenant: &TenantId) -> Vec<SqlFunctionDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_sql_functions(&self, project: &ProjectId) -> Vec<SqlFunctionDef> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let client = self.client.lock().await;
         let rows = match client
             .query(
                 &format!(
                     "SELECT name, args_json, return_json, body, language \
                      FROM {sch}.sql_functions \
-                     WHERE tenant_id = $1"
+                     WHERE project_id = $1"
                 ),
-                &[&tenant_str],
+                &[&project_str],
             )
             .await
         {
@@ -1843,7 +1843,7 @@ impl Catalog for PostgresCatalog {
                 let language =
                     serde_json::from_value(serde_json::Value::String(language_str)).ok()?;
                 Some(SqlFunctionDef {
-                    tenant: *tenant,
+                    project: *project,
                     name,
                     args,
                     return_type,
@@ -1854,7 +1854,7 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn create_sequence(&self, def: SequenceDef) -> Result<()> {
         if def.increment == 0 {
             return Err(BasinError::InvalidSchema(
@@ -1862,7 +1862,7 @@ impl Catalog for PostgresCatalog {
             ));
         }
         let sch = &self.schema;
-        let tenant_str = def.tenant.to_string();
+        let project_str = def.project.to_string();
         // Genesis stored value mirrors `SequenceState::genesis`: the
         // first hand-out lands on `start` after the standard advance.
         let stored = def.start.wrapping_sub(def.increment);
@@ -1872,13 +1872,13 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "INSERT INTO {sch}.sequences \
-                     (tenant_id, name, start_value, increment, min_value, max_value, \
+                     (project_id, name, start_value, increment, min_value, max_value, \
                       cache_size, cycle, current_value, started) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE) \
-                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                     ON CONFLICT (project_id, name) DO NOTHING"
                 ),
                 &[
-                    &tenant_str,
+                    &project_str,
                     &def.name,
                     &def.start,
                     &def.increment,
@@ -1894,36 +1894,36 @@ impl Catalog for PostgresCatalog {
         if n == 0 {
             return Err(BasinError::catalog(format!(
                 "sequence {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_sequence(&self, tenant: &TenantId, name: &str) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_sequence(&self, project: &ProjectId, name: &str) -> Result<()> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let n = client
             .execute(
                 &format!(
                     "DELETE FROM {sch}.sequences \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_sequence: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sequence {name:?}"
+                "{project}: sequence {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_sequence(&self, tenant: &TenantId, name: &str) -> Option<SequenceDef> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_sequence(&self, project: &ProjectId, name: &str) -> Option<SequenceDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let row = client
@@ -1931,9 +1931,9 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "SELECT start_value, increment, min_value, max_value, cache_size, cycle \
                      FROM {sch}.sequences \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .ok()
@@ -1945,7 +1945,7 @@ impl Catalog for PostgresCatalog {
         let cache_size_pg: i64 = row.get(4);
         let cycle: bool = row.get(5);
         Some(SequenceDef {
-            tenant: *tenant,
+            project: *project,
             name: name.to_string(),
             start,
             increment,
@@ -1956,10 +1956,10 @@ impl Catalog for PostgresCatalog {
         })
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn nextval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn nextval(&self, project: &ProjectId, name: &str) -> Result<i64> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let mut client = self.client.lock().await;
         let txn = client
             .transaction()
@@ -1967,8 +1967,8 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("nextval txn: {e}")))?;
 
         // FOR UPDATE serializes concurrent nextval calls on the same
-        // (tenant, name) without ad-hoc locks — the row lock is the
-        // serialisation primitive. Two sequences (or two tenants) never
+        // (project, name) without ad-hoc locks — the row lock is the
+        // serialisation primitive. Two sequences (or two projects) never
         // block each other beyond their respective row locks.
         let row = txn
             .query_opt(
@@ -1976,20 +1976,20 @@ impl Catalog for PostgresCatalog {
                     "SELECT start_value, increment, min_value, max_value, cache_size, \
                             cycle, current_value, started \
                      FROM {sch}.sequences \
-                     WHERE tenant_id = $1 AND name = $2 \
+                     WHERE project_id = $1 AND name = $2 \
                      FOR UPDATE"
                 ),
-                &[&tenant_str, &name],
+                &[&project_str, &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("nextval lookup: {e}")))?;
         let Some(row) = row else {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sequence {name:?}"
+                "{project}: sequence {name:?}"
             )));
         };
         let def = SequenceDef {
-            tenant: *tenant,
+            project: *project,
             name: name.to_string(),
             start: row.get(0),
             increment: row.get(1),
@@ -2004,12 +2004,12 @@ impl Catalog for PostgresCatalog {
             Ok(v) => v,
             Err(SequenceError::Exhausted) => {
                 return Err(BasinError::catalog(format!(
-                    "{tenant}: sequence {name:?} exhausted"
+                    "{project}: sequence {name:?} exhausted"
                 )));
             }
             Err(SequenceError::InvalidIncrement) => {
                 return Err(BasinError::InvalidSchema(format!(
-                    "{tenant}: sequence {name:?} has zero increment"
+                    "{project}: sequence {name:?} has zero increment"
                 )));
             }
         };
@@ -2017,9 +2017,9 @@ impl Catalog for PostgresCatalog {
             &format!(
                 "UPDATE {sch}.sequences \
                  SET current_value = $3, started = TRUE \
-                 WHERE tenant_id = $1 AND name = $2"
+                 WHERE project_id = $1 AND name = $2"
             ),
-            &[&tenant_str, &name, &v],
+            &[&project_str, &name, &v],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("nextval update: {e}")))?;
@@ -2029,44 +2029,44 @@ impl Catalog for PostgresCatalog {
         Ok(v)
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn currval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn currval(&self, project: &ProjectId, name: &str) -> Result<i64> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let row_opt = client
             .query_opt(
                 &format!(
                     "SELECT current_value, started FROM {sch}.sequences \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("currval: {e}")))?;
         let Some(row) = row_opt else {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sequence {name:?}"
+                "{project}: sequence {name:?}"
             )));
         };
         let started: bool = row.get(1);
         if !started {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sequence {name:?} has not been advanced"
+                "{project}: sequence {name:?} has not been advanced"
             )));
         }
         Ok(row.get(0))
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = value, advance = advance))]
+    #[instrument(skip(self), fields(project = %project, name = %name, value = value, advance = advance))]
     async fn setval(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         name: &str,
         value: i64,
         advance: bool,
     ) -> Result<i64> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let mut client = self.client.lock().await;
         let txn = client
             .transaction()
@@ -2076,16 +2076,16 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT increment FROM {sch}.sequences \
-                     WHERE tenant_id = $1 AND name = $2 \
+                     WHERE project_id = $1 AND name = $2 \
                      FOR UPDATE"
                 ),
-                &[&tenant_str, &name],
+                &[&project_str, &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("setval lookup: {e}")))?;
         let Some(row) = row else {
             return Err(BasinError::not_found(format!(
-                "{tenant}: sequence {name:?}"
+                "{project}: sequence {name:?}"
             )));
         };
         let increment: i64 = row.get(0);
@@ -2101,9 +2101,9 @@ impl Catalog for PostgresCatalog {
             &format!(
                 "UPDATE {sch}.sequences \
                  SET current_value = $3, started = TRUE \
-                 WHERE tenant_id = $1 AND name = $2"
+                 WHERE project_id = $1 AND name = $2"
             ),
-            &[&tenant_str, &name, &stored],
+            &[&project_str, &name, &stored],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("setval update: {e}")))?;
@@ -2113,7 +2113,7 @@ impl Catalog for PostgresCatalog {
         Ok(value)
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, table = %def.table, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, table = %def.table, name = %def.name))]
     async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
         if def.ops.is_empty() {
             return Err(BasinError::InvalidSchema(
@@ -2125,7 +2125,7 @@ impl Catalog for PostgresCatalog {
             reactors::validate_predicate(p).map_err(reactor_err_to_basin)?;
         }
         let sch = &self.schema;
-        let tenant_str = def.tenant.to_string();
+        let project_str = def.project.to_string();
         let table_str = def.table.to_string();
         let ops_bits: i16 = def.ops.bits() as i16;
         let mut client = self.client.lock().await;
@@ -2134,8 +2134,8 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("register_reactor txn: {e}")))?;
         // Allocate a registration index from the shared sequence; this is
-        // monotonic across all tenants which is sufficient for ordering
-        // within any single (tenant, table). Done before the INSERT so we
+        // monotonic across all projects which is sufficient for ordering
+        // within any single (project, table). Done before the INSERT so we
         // can roll the txn back cleanly on conflict.
         let seq_row = txn
             .query_one(&format!("SELECT nextval('{sch}.reactor_seq')"), &[])
@@ -2146,12 +2146,12 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "INSERT INTO {sch}.reactors \
-                     (tenant_id, table_name, name, ops_bits, when_predicate, body, seq) \
+                     (project_id, table_name, name, ops_bits, when_predicate, body, seq) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                     ON CONFLICT (tenant_id, table_name, name) DO NOTHING"
+                     ON CONFLICT (project_id, table_name, name) DO NOTHING"
                 ),
                 &[
-                    &tenant_str,
+                    &project_str,
                     &table_str,
                     &def.name,
                     &ops_bits,
@@ -2166,7 +2166,7 @@ impl Catalog for PostgresCatalog {
             txn.rollback().await.ok();
             return Err(BasinError::catalog(format!(
                 "reactor {:?} on {}/{} already exists",
-                def.name, def.tenant, def.table
+                def.name, def.project, def.table
             )));
         }
         txn.commit()
@@ -2175,32 +2175,32 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, name = %name))]
-    async fn drop_reactor(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
+    async fn drop_reactor(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let n = client
             .execute(
                 &format!(
                     "DELETE FROM {sch}.reactors \
-                     WHERE tenant_id = $1 AND table_name = $2 AND name = $3"
+                     WHERE project_id = $1 AND table_name = $2 AND name = $3"
                 ),
-                &[&tenant.to_string(), &table.to_string(), &name],
+                &[&project.to_string(), &table.to_string(), &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_reactor: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!(
-                "{tenant}/{table}: reactor {name:?}"
+                "{project}/{table}: reactor {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, table = %table, op = ?op))]
+    #[instrument(skip(self), fields(project = %project, table = %table, op = ?op))]
     async fn lookup_reactors_for(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         op: ChangeOp,
     ) -> Vec<ReactorDef> {
@@ -2211,10 +2211,10 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "SELECT name, ops_bits, when_predicate, body \
                      FROM {sch}.reactors \
-                     WHERE tenant_id = $1 AND table_name = $2 \
+                     WHERE project_id = $1 AND table_name = $2 \
                      ORDER BY seq ASC"
                 ),
-                &[&tenant.to_string(), &table.to_string()],
+                &[&project.to_string(), &table.to_string()],
             )
             .await
         {
@@ -2232,7 +2232,7 @@ impl Catalog for PostgresCatalog {
                     return None;
                 }
                 Some(ReactorDef {
-                    tenant: *tenant,
+                    project: *project,
                     table: table.clone(),
                     name,
                     ops,
@@ -2243,8 +2243,8 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_reactors(&self, tenant: &TenantId) -> Vec<ReactorDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_reactors(&self, project: &ProjectId) -> Vec<ReactorDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = match client
@@ -2252,10 +2252,10 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "SELECT table_name, name, ops_bits, when_predicate, body \
                      FROM {sch}.reactors \
-                     WHERE tenant_id = $1 \
+                     WHERE project_id = $1 \
                      ORDER BY seq ASC"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
         {
@@ -2272,7 +2272,7 @@ impl Catalog for PostgresCatalog {
                 let table = TableName::new(table_str).ok()?;
                 let ops = ReactorOps::from_bits(ops_bits as u8)?;
                 Some(ReactorDef {
-                    tenant: *tenant,
+                    project: *project,
                     table,
                     name,
                     ops,
@@ -2283,7 +2283,7 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_enum_type(&self, def: EnumTypeDef) -> Result<()> {
         // Validate first so duplicate-label / empty-list errors take
         // precedence over the SQL-level uniqueness check, matching the
@@ -2292,21 +2292,21 @@ impl Catalog for PostgresCatalog {
         let labels_json = serde_json::to_value(&def.labels)
             .map_err(|e| BasinError::catalog(format!("serialise enum labels: {e}")))?;
         let sch = &self.schema;
-        let tenant_str = def.tenant.to_string();
+        let project_str = def.project.to_string();
         let mut client = self.client.lock().await;
         let tx = client
             .transaction()
             .await
             .map_err(|e| BasinError::catalog(format!("register_enum_type txn: {e}")))?;
         // Cross-namespace collision: a domain with the same name on the
-        // same tenant is rejected so column resolution stays unambiguous.
+        // same project is rejected so column resolution stays unambiguous.
         let dom_row = tx
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.domains \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant_str, &def.name],
+                &[&project_str, &def.name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("register_enum_type collision: {e}")))?;
@@ -2314,17 +2314,17 @@ impl Catalog for PostgresCatalog {
             tx.rollback().await.ok();
             return Err(BasinError::catalog(format!(
                 "type {}/{} collides with an existing domain",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         let n = tx
             .execute(
                 &format!(
-                    "INSERT INTO {sch}.enum_types (tenant_id, name, labels) \
+                    "INSERT INTO {sch}.enum_types (project_id, name, labels) \
                      VALUES ($1, $2, $3) \
-                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                     ON CONFLICT (project_id, name) DO NOTHING"
                 ),
-                &[&tenant_str, &def.name, &labels_json],
+                &[&project_str, &def.name, &labels_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("register_enum_type: {e}")))?;
@@ -2332,7 +2332,7 @@ impl Catalog for PostgresCatalog {
             tx.rollback().await.ok();
             return Err(BasinError::catalog(format!(
                 "enum type {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         tx.commit()
@@ -2341,17 +2341,17 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_enum_type(&self, tenant: &TenantId, name: &str) -> Option<EnumTypeDef> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_enum_type(&self, project: &ProjectId, name: &str) -> Option<EnumTypeDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let row = client
             .query_opt(
                 &format!(
                     "SELECT labels FROM {sch}.enum_types \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .ok()
@@ -2359,21 +2359,21 @@ impl Catalog for PostgresCatalog {
         let labels_json: serde_json::Value = row.get(0);
         let labels: Vec<String> = serde_json::from_value(labels_json).ok()?;
         Some(EnumTypeDef {
-            tenant: *tenant,
+            project: *project,
             name: name.to_string(),
             labels,
         })
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name, value = %value))]
-    async fn add_enum_value(&self, tenant: &TenantId, name: &str, value: &str) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, name = %name, value = %value))]
+    async fn add_enum_value(&self, project: &ProjectId, name: &str, value: &str) -> Result<()> {
         if value.is_empty() {
             return Err(BasinError::InvalidSchema(
                 "ALTER TYPE ADD VALUE: label cannot be empty".into(),
             ));
         }
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let mut client = self.client.lock().await;
         let tx = client
             .transaction()
@@ -2386,16 +2386,16 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT labels FROM {sch}.enum_types \
-                     WHERE tenant_id = $1 AND name = $2 \
+                     WHERE project_id = $1 AND name = $2 \
                      FOR UPDATE"
                 ),
-                &[&tenant_str, &name],
+                &[&project_str, &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("add_enum_value lookup: {e}")))?;
         let Some(row) = row else {
             return Err(BasinError::not_found(format!(
-                "{tenant}: enum type {name:?}"
+                "{project}: enum type {name:?}"
             )));
         };
         let labels_json: serde_json::Value = row.get(0);
@@ -2415,9 +2415,9 @@ impl Catalog for PostgresCatalog {
             &format!(
                 "UPDATE {sch}.enum_types \
                  SET labels = labels || $3::jsonb \
-                 WHERE tenant_id = $1 AND name = $2"
+                 WHERE project_id = $1 AND name = $2"
             ),
-            &[&tenant_str, &name, &value_arr],
+            &[&project_str, &name, &value_arr],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("add_enum_value update: {e}")))?;
@@ -2427,13 +2427,13 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_enum_type(&self, tenant: &TenantId, name: &str) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_enum_type(&self, project: &ProjectId, name: &str) -> Result<()> {
         // Refcount enforcement: load every table's Arrow schema and
         // reject the drop if any column carries `BASIN_ENUM_TYPE=<name>`.
         // Mirrors the in-memory backend's `tables_referencing_type`
         // approach exactly — same metadata key, same lazy scan.
-        let referencing = self.tables_referencing_type(tenant, name, true).await?;
+        let referencing = self.tables_referencing_type(project, name, true).await?;
         if !referencing.is_empty() {
             return Err(BasinError::catalog(format!(
                 "cannot drop enum {name:?}: still referenced by table column(s) {referencing:?}; \
@@ -2446,31 +2446,31 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "DELETE FROM {sch}.enum_types \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_enum_type: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!(
-                "{tenant}: enum type {name:?}"
+                "{project}: enum type {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_enum_types(&self, tenant: &TenantId) -> Vec<EnumTypeDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_enum_types(&self, project: &ProjectId) -> Vec<EnumTypeDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = match client
             .query(
                 &format!(
                     "SELECT name, labels FROM {sch}.enum_types \
-                     WHERE tenant_id = $1"
+                     WHERE project_id = $1"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
         {
@@ -2483,7 +2483,7 @@ impl Catalog for PostgresCatalog {
                 let labels_json: serde_json::Value = row.get(1);
                 let labels: Vec<String> = serde_json::from_value(labels_json).ok()?;
                 Some(EnumTypeDef {
-                    tenant: *tenant,
+                    project: *project,
                     name,
                     labels,
                 })
@@ -2491,28 +2491,28 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_domain(&self, def: DomainDef) -> Result<()> {
         domains::validate_new(&def).map_err(domain_err_to_basin)?;
         let base_type_json = serde_json::to_value(def.base_type)
             .map_err(|e| BasinError::catalog(format!("serialise domain base_type: {e}")))?;
         let sch = &self.schema;
-        let tenant_str = def.tenant.to_string();
+        let project_str = def.project.to_string();
         let mut client = self.client.lock().await;
         let tx = client
             .transaction()
             .await
             .map_err(|e| BasinError::catalog(format!("register_domain txn: {e}")))?;
         // Cross-namespace collision: an enum with the same name on the
-        // same tenant is rejected — same rule as register_enum_type, in
+        // same project is rejected — same rule as register_enum_type, in
         // the opposite direction.
         let enum_row = tx
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.enum_types \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant_str, &def.name],
+                &[&project_str, &def.name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("register_domain collision: {e}")))?;
@@ -2520,18 +2520,18 @@ impl Catalog for PostgresCatalog {
             tx.rollback().await.ok();
             return Err(BasinError::catalog(format!(
                 "domain {}/{} collides with an existing enum type",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         let n = tx
             .execute(
                 &format!(
-                    "INSERT INTO {sch}.domains (tenant_id, name, base_type_json, check_predicate) \
+                    "INSERT INTO {sch}.domains (project_id, name, base_type_json, check_predicate) \
                      VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                     ON CONFLICT (project_id, name) DO NOTHING"
                 ),
                 &[
-                    &tenant_str,
+                    &project_str,
                     &def.name,
                     &base_type_json,
                     &def.check_predicate,
@@ -2543,7 +2543,7 @@ impl Catalog for PostgresCatalog {
             tx.rollback().await.ok();
             return Err(BasinError::catalog(format!(
                 "domain {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         tx.commit()
@@ -2552,17 +2552,17 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_domain(&self, tenant: &TenantId, name: &str) -> Option<DomainDef> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_domain(&self, project: &ProjectId, name: &str) -> Option<DomainDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let row = client
             .query_opt(
                 &format!(
                     "SELECT base_type_json, check_predicate FROM {sch}.domains \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .ok()
@@ -2571,16 +2571,16 @@ impl Catalog for PostgresCatalog {
         let base_type = serde_json::from_value(base_type_json).ok()?;
         let check_predicate: Option<String> = row.get(1);
         Some(DomainDef {
-            tenant: *tenant,
+            project: *project,
             name: name.to_string(),
             base_type,
             check_predicate,
         })
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_domain(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let referencing = self.tables_referencing_type(tenant, name, false).await?;
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_domain(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let referencing = self.tables_referencing_type(project, name, false).await?;
         if !referencing.is_empty() {
             return Err(BasinError::catalog(format!(
                 "cannot drop domain {name:?}: still referenced by table column(s) {referencing:?}; \
@@ -2593,29 +2593,29 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "DELETE FROM {sch}.domains \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_domain: {e}")))?;
         if n == 0 {
-            return Err(BasinError::not_found(format!("{tenant}: domain {name:?}")));
+            return Err(BasinError::not_found(format!("{project}: domain {name:?}")));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_domains(&self, tenant: &TenantId) -> Vec<DomainDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_domains(&self, project: &ProjectId) -> Vec<DomainDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = match client
             .query(
                 &format!(
                     "SELECT name, base_type_json, check_predicate FROM {sch}.domains \
-                     WHERE tenant_id = $1"
+                     WHERE project_id = $1"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
         {
@@ -2629,7 +2629,7 @@ impl Catalog for PostgresCatalog {
                 let base_type = serde_json::from_value(base_type_json).ok()?;
                 let check_predicate: Option<String> = row.get(2);
                 Some(DomainDef {
-                    tenant: *tenant,
+                    project: *project,
                     name,
                     base_type,
                     check_predicate,
@@ -2638,7 +2638,7 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
-    async fn list_sequences(&self, tenant: &TenantId) -> Vec<SequenceDef> {
+    async fn list_sequences(&self, project: &ProjectId) -> Vec<SequenceDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = match client
@@ -2646,9 +2646,9 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "SELECT name, start_value, increment, min_value, max_value, cache_size, cycle \
                      FROM {sch}.sequences \
-                     WHERE tenant_id = $1"
+                     WHERE project_id = $1"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
         {
@@ -2665,7 +2665,7 @@ impl Catalog for PostgresCatalog {
                 let cache_size_pg: i64 = row.get(5);
                 let cycle: bool = row.get(6);
                 SequenceDef {
-                    tenant: *tenant,
+                    project: *project,
                     name,
                     start,
                     increment,
@@ -2678,67 +2678,67 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
-    #[instrument(skip(self, def), fields(tenant = %def.tenant, name = %def.name))]
+    #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
         procedures::validate_new(&def).map_err(procedure_err_to_basin)?;
         let args_json = serde_json::to_value(&def.args)
             .map_err(|e| BasinError::catalog(format!("serialise procedure args: {e}")))?;
         let sch = &self.schema;
-        let tenant_str = def.tenant.to_string();
+        let project_str = def.project.to_string();
         let client = self.client.lock().await;
         let n = client
             .execute(
                 &format!(
-                    "INSERT INTO {sch}.procedures (tenant_id, name, body, args_json) \
+                    "INSERT INTO {sch}.procedures (project_id, name, body, args_json) \
                      VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (tenant_id, name) DO NOTHING"
+                     ON CONFLICT (project_id, name) DO NOTHING"
                 ),
-                &[&tenant_str, &def.name, &def.body, &args_json],
+                &[&project_str, &def.name, &def.body, &args_json],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("register_procedure: {e}")))?;
         if n == 0 {
             return Err(BasinError::catalog(format!(
                 "procedure {}/{} already exists",
-                def.tenant, def.name,
+                def.project, def.name,
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn drop_procedure(&self, tenant: &TenantId, name: &str) -> Result<()> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn drop_procedure(&self, project: &ProjectId, name: &str) -> Result<()> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let n = client
             .execute(
                 &format!(
                     "DELETE FROM {sch}.procedures \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("drop_procedure: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!(
-                "{tenant}: procedure {name:?}"
+                "{project}: procedure {name:?}"
             )));
         }
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant, name = %name))]
-    async fn lookup_procedure(&self, tenant: &TenantId, name: &str) -> Option<SqlProcedureDef> {
+    #[instrument(skip(self), fields(project = %project, name = %name))]
+    async fn lookup_procedure(&self, project: &ProjectId, name: &str) -> Option<SqlProcedureDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let row = client
             .query_opt(
                 &format!(
                     "SELECT body, args_json FROM {sch}.procedures \
-                     WHERE tenant_id = $1 AND name = $2"
+                     WHERE project_id = $1 AND name = $2"
                 ),
-                &[&tenant.to_string(), &name],
+                &[&project.to_string(), &name],
             )
             .await
             .ok()
@@ -2747,24 +2747,24 @@ impl Catalog for PostgresCatalog {
         let args_json: serde_json::Value = row.get(1);
         let args = serde_json::from_value(args_json).ok()?;
         Some(SqlProcedureDef {
-            tenant: *tenant,
+            project: *project,
             name: name.to_string(),
             args,
             body,
         })
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn list_procedures(&self, tenant: &TenantId) -> Vec<SqlProcedureDef> {
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_procedures(&self, project: &ProjectId) -> Vec<SqlProcedureDef> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = match client
             .query(
                 &format!(
                     "SELECT name, body, args_json FROM {sch}.procedures \
-                     WHERE tenant_id = $1"
+                     WHERE project_id = $1"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
         {
@@ -2778,7 +2778,7 @@ impl Catalog for PostgresCatalog {
                 let args_json: serde_json::Value = row.get(2);
                 let args = serde_json::from_value(args_json).ok()?;
                 Some(SqlProcedureDef {
-                    tenant: *tenant,
+                    project: *project,
                     name,
                     args,
                     body,
@@ -2787,71 +2787,71 @@ impl Catalog for PostgresCatalog {
             .collect()
     }
 
-    #[instrument(skip(self, config), fields(tenant = %tenant))]
-    async fn set_tenant_storage_config(
+    #[instrument(skip(self, config), fields(project = %project))]
+    async fn set_project_storage_config(
         &self,
-        tenant: &TenantId,
-        config: TenantStorageConfig,
+        project: &ProjectId,
+        config: ProjectStorageConfig,
     ) -> Result<()> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let config_json = serde_json::to_value(&config)
-            .map_err(|e| BasinError::catalog(format!("serialise tenant_storage_config: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("serialise project_storage_config: {e}")))?;
         let client = self.client.lock().await;
         client
             .execute(
                 &format!(
-                    "INSERT INTO {sch}.tenant_storage_config \
-                     (tenant_id, config_json, updated_at) \
+                    "INSERT INTO {sch}.project_storage_config \
+                     (project_id, config_json, updated_at) \
                      VALUES ($1, $2, now()) \
-                     ON CONFLICT (tenant_id) DO UPDATE \
+                     ON CONFLICT (project_id) DO UPDATE \
                      SET config_json = EXCLUDED.config_json, \
                          updated_at = now()"
                 ),
-                &[&tenant_str, &config_json],
+                &[&project_str, &config_json],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!("set_tenant_storage_config: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("set_project_storage_config: {e}")))?;
         Ok(())
     }
 
-    #[instrument(skip(self), fields(tenant = %tenant))]
-    async fn get_tenant_storage_config(
+    #[instrument(skip(self), fields(project = %project))]
+    async fn get_project_storage_config(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Option<TenantStorageConfig>> {
+        project: &ProjectId,
+    ) -> Result<Option<ProjectStorageConfig>> {
         let sch = &self.schema;
-        let tenant_str = tenant.to_string();
+        let project_str = project.to_string();
         let client = self.client.lock().await;
         let row = client
             .query_opt(
                 &format!(
-                    "SELECT config_json FROM {sch}.tenant_storage_config \
-                     WHERE tenant_id = $1"
+                    "SELECT config_json FROM {sch}.project_storage_config \
+                     WHERE project_id = $1"
                 ),
-                &[&tenant_str],
+                &[&project_str],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!("get_tenant_storage_config: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("get_project_storage_config: {e}")))?;
         let Some(row) = row else {
             return Ok(None);
         };
         let config_json: serde_json::Value = row.get(0);
-        let config: TenantStorageConfig = serde_json::from_value(config_json)
-            .map_err(|e| BasinError::catalog(format!("deserialise tenant_storage_config: {e}")))?;
+        let config: ProjectStorageConfig = serde_json::from_value(config_json)
+            .map_err(|e| BasinError::catalog(format!("deserialise project_storage_config: {e}")))?;
         Ok(Some(config))
     }
 }
 
 impl PostgresCatalog {
-    /// Walk every table owned by `tenant`, returning `<table>.<column>`
+    /// Walk every table owned by `project`, returning `<table>.<column>`
     /// labels for every column whose Arrow `Field` carries the requested
     /// type metadata. `is_enum == true` checks the `BASIN_ENUM_TYPE`
     /// key; `false` checks `BASIN_DOMAIN`. Mirrors
     /// `InMemoryCatalog::tables_referencing_type`.
     async fn tables_referencing_type(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         type_name: &str,
         is_enum: bool,
     ) -> Result<Vec<String>> {
@@ -2866,9 +2866,9 @@ impl PostgresCatalog {
             .query(
                 &format!(
                     "SELECT table_name, schema_json FROM {sch}.tables \
-                     WHERE tenant_id = $1"
+                     WHERE project_id = $1"
                 ),
-                &[&tenant.to_string()],
+                &[&project.to_string()],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("tables_referencing_type: {e}")))?;
@@ -2945,7 +2945,7 @@ fn procedure_err_to_basin(e: ProcedureError) -> BasinError {
 fn reactor_err_to_basin(e: ReactorError) -> BasinError {
     match e {
         ReactorError::Duplicate => {
-            BasinError::catalog("reactor already registered for this (tenant, table)")
+            BasinError::catalog("reactor already registered for this (project, table)")
         }
         ReactorError::InvalidBody(msg) => BasinError::InvalidSchema(format!("reactor body: {msg}")),
         ReactorError::InvalidPredicate(msg) => {
@@ -2962,7 +2962,7 @@ fn reactor_err_to_basin(e: ReactorError) -> BasinError {
 async fn fetch_snapshots(
     client: &Client,
     schema: &str,
-    tenant_str: &str,
+    project_str: &str,
     table_str: &str,
 ) -> Result<Vec<Snapshot>> {
     let rows = client
@@ -2970,10 +2970,10 @@ async fn fetch_snapshots(
             &format!(
                 "SELECT snapshot_id, parent_id, committed_at, summary_json, data_files
                  FROM {schema}.snapshots
-                 WHERE tenant_id = $1 AND table_name = $2
+                 WHERE project_id = $1 AND table_name = $2
                  ORDER BY snapshot_id ASC"
             ),
-            &[&tenant_str, &table_str],
+            &[&project_str, &table_str],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("fetch snapshots: {e}")))?;
@@ -3040,7 +3040,7 @@ mod tests {
     use std::time::Duration;
 
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{BasinError, TableName, TenantId};
+    use basin_common::{BasinError, TableName, ProjectId};
     use tokio_postgres::NoTls;
     use ulid::Ulid;
 
@@ -3150,7 +3150,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("users").unwrap();
 
         cat.create_namespace(&t).await.unwrap();
@@ -3164,7 +3164,7 @@ mod tests {
         );
 
         let loaded = cat.load_table(&t, &tbl).await.unwrap();
-        assert_eq!(loaded.tenant, t);
+        assert_eq!(loaded.project, t);
         assert_eq!(loaded.table, tbl);
         assert_eq!(loaded.current_snapshot, SnapshotId::GENESIS);
 
@@ -3176,7 +3176,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("ghost").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         cat.drop_table(&t, &tbl).await.unwrap();
@@ -3188,19 +3188,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_isolation() {
+    async fn project_isolation() {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let tbl = TableName::new("orders").unwrap();
 
         let meta_a = cat.create_table(&a, &tbl, &schema()).await.unwrap();
         let meta_b = cat.create_table(&b, &tbl, &schema()).await.unwrap();
-        assert_eq!(meta_a.tenant, a);
-        assert_eq!(meta_b.tenant, b);
-        assert_ne!(meta_a.tenant, meta_b.tenant);
+        assert_eq!(meta_a.project, a);
+        assert_eq!(meta_b.project, b);
+        assert_ne!(meta_a.project, meta_b.project);
 
         cat.append_data_files(
             &a,
@@ -3227,7 +3227,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("users").unwrap();
 
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
@@ -3272,7 +3272,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("events").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -3305,7 +3305,7 @@ mod tests {
             return;
         };
         let cat = Arc::new(cat);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("race").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -3356,7 +3356,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("retry").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
@@ -3416,7 +3416,7 @@ mod tests {
                 return;
             }
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("durable").unwrap();
         cat1.create_table(&t, &tbl, &schema()).await.unwrap();
         cat1.append_data_files(
@@ -3462,7 +3462,7 @@ mod tests {
             return;
         };
         let cat = Arc::new(cat);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("reprace").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
         cat.append_data_files(
@@ -3530,7 +3530,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let alpha = TableName::new("alpha").unwrap();
         let beta = TableName::new("beta").unwrap();
         cat.create_table(&t, &alpha, &schema()).await.unwrap();
@@ -3608,10 +3608,10 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         let def = SqlFunctionDef {
-            tenant: t,
+            project: t,
             name: "double_it".into(),
             args: vec![SqlFunctionArg {
                 name: "x".into(),
@@ -3637,9 +3637,9 @@ mod tests {
 
     // -------------------- Sequence round-trip --------------------
 
-    fn seq_def(tenant: TenantId, name: &str, start: i64, increment: i64) -> SequenceDef {
+    fn seq_def(project: ProjectId, name: &str, start: i64, increment: i64) -> SequenceDef {
         SequenceDef {
-            tenant,
+            project,
             name: name.into(),
             start,
             increment,
@@ -3655,7 +3655,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         let def = seq_def(t, "s", 1, 1);
         cat.create_sequence(def.clone()).await.unwrap();
@@ -3680,7 +3680,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         cat.create_sequence(seq_def(t, "s", 1, 1)).await.unwrap();
 
@@ -3723,7 +3723,7 @@ mod tests {
                 return;
             }
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat1.create_namespace(&t).await.unwrap();
         cat1.create_sequence(seq_def(t, "s", 1, 1)).await.unwrap();
         let mut pre = Vec::new();
@@ -3747,19 +3747,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequence_cross_tenant_isolation() {
+    async fn sequence_cross_project_isolation() {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         cat.create_namespace(&a).await.unwrap();
         cat.create_namespace(&b).await.unwrap();
         cat.create_sequence(seq_def(a, "shared", 1, 1))
             .await
             .unwrap();
 
-        // Tenant B can't see tenant A's sequence.
+        // Project B can't see project A's sequence.
         let err = cat.nextval(&b, "shared").await.unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)));
         assert!(cat.lookup_sequence(&b, "shared").await.is_none());
@@ -3781,7 +3781,7 @@ mod tests {
             return;
         };
         let cat = Arc::new(cat);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         cat.create_sequence(seq_def(t, "s", 1, 1)).await.unwrap();
 
@@ -3809,11 +3809,11 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("orders").unwrap();
         cat.create_namespace(&t).await.unwrap();
         let def = ReactorDef {
-            tenant: t,
+            project: t,
             table: tbl.clone(),
             name: "after_paid".into(),
             ops: ReactorOps::INSERT | ReactorOps::UPDATE,
@@ -3849,12 +3849,12 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("t").unwrap();
         cat.create_namespace(&t).await.unwrap();
         for n in ["one", "two", "three"] {
             let def = ReactorDef {
-                tenant: t,
+                project: t,
                 table: tbl.clone(),
                 name: n.into(),
                 ops: ReactorOps::INSERT,
@@ -3869,18 +3869,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_cross_tenant_isolation() {
+    async fn reactor_cross_project_isolation() {
         use basin_common::ChangeOp;
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let tbl = TableName::new("t").unwrap();
         cat.create_namespace(&a).await.unwrap();
         cat.create_namespace(&b).await.unwrap();
         let def = ReactorDef {
-            tenant: a,
+            project: a,
             table: tbl.clone(),
             name: "r".into(),
             ops: ReactorOps::INSERT,
@@ -3888,15 +3888,15 @@ mod tests {
             body: "SELECT 1".into(),
         };
         cat.register_reactor(def).await.unwrap();
-        // Tenant B sees nothing.
+        // Project B sees nothing.
         assert!(cat
             .lookup_reactors_for(&b, &tbl, ChangeOp::Insert)
             .await
             .is_empty());
         assert!(cat.list_reactors(&b).await.is_empty());
-        // Tenant B can register its own reactor with the same (table, name).
+        // Project B can register its own reactor with the same (table, name).
         let def_b = ReactorDef {
-            tenant: b,
+            project: b,
             table: tbl.clone(),
             name: "r".into(),
             ops: ReactorOps::INSERT,
@@ -3931,11 +3931,11 @@ mod tests {
                 return;
             }
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let tbl = TableName::new("t").unwrap();
         cat1.create_namespace(&t).await.unwrap();
         let def = ReactorDef {
-            tenant: t,
+            project: t,
             table: tbl.clone(),
             name: "r".into(),
             ops: ReactorOps::INSERT,
@@ -3955,22 +3955,22 @@ mod tests {
 
     // -------------------- Enum / domain round-trip --------------------
 
-    fn enum_def(t: TenantId, name: &str, labels: &[&str]) -> EnumTypeDef {
+    fn enum_def(t: ProjectId, name: &str, labels: &[&str]) -> EnumTypeDef {
         EnumTypeDef {
-            tenant: t,
+            project: t,
             name: name.into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     fn domain_def(
-        t: TenantId,
+        t: ProjectId,
         name: &str,
         base: crate::functions::SqlArgType,
         check: Option<&str>,
     ) -> DomainDef {
         DomainDef {
-            tenant: t,
+            project: t,
             name: name.into(),
             base_type: base,
             check_predicate: check.map(|s| s.to_string()),
@@ -3982,7 +3982,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         cat.register_enum_type(enum_def(t, "color", &["red", "green", "blue"]))
             .await
@@ -4010,7 +4010,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
 
         // Duplicate label at registration time is rejected before persisting.
@@ -4040,7 +4040,7 @@ mod tests {
             return;
         };
         let cat = Arc::new(cat);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         cat.register_enum_type(enum_def(t, "e", &["base"]))
             .await
@@ -4075,7 +4075,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         cat.register_domain(domain_def(
             t,
@@ -4120,7 +4120,7 @@ mod tests {
                 return;
             }
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat1.create_namespace(&t).await.unwrap();
         cat1.register_enum_type(enum_def(t, "color", &["red", "green"]))
             .await
@@ -4136,21 +4136,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enum_cross_tenant_isolation() {
+    async fn enum_cross_project_isolation() {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         cat.create_namespace(&a).await.unwrap();
         cat.create_namespace(&b).await.unwrap();
         cat.register_enum_type(enum_def(a, "shared", &["x", "y"]))
             .await
             .unwrap();
-        // Tenant B sees nothing.
+        // Project B sees nothing.
         assert!(cat.lookup_enum_type(&b, "shared").await.is_none());
         assert!(cat.list_enum_types(&b).await.is_empty());
-        // Tenant B can register the same name independently.
+        // Project B can register the same name independently.
         cat.register_enum_type(enum_def(b, "shared", &["one"]))
             .await
             .unwrap();
@@ -4161,13 +4161,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domain_cross_tenant_isolation() {
+    async fn domain_cross_project_isolation() {
         use crate::functions::SqlArgType;
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         cat.create_namespace(&a).await.unwrap();
         cat.create_namespace(&b).await.unwrap();
         cat.register_domain(domain_def(a, "d", SqlArgType::Int, Some("VALUE > 0")))
@@ -4191,7 +4191,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         cat.register_enum_type(enum_def(t, "status", &["a", "b"]))
             .await
@@ -4225,9 +4225,9 @@ mod tests {
 
     // -------------------- Procedure round-trip --------------------
 
-    fn proc_def(t: TenantId, name: &str, body: &str) -> SqlProcedureDef {
+    fn proc_def(t: ProjectId, name: &str, body: &str) -> SqlProcedureDef {
         SqlProcedureDef {
-            tenant: t,
+            project: t,
             name: name.into(),
             args: Vec::new(),
             body: body.into(),
@@ -4239,7 +4239,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         let def = proc_def(t, "p", "INSERT INTO log VALUES ('hi')");
         cat.register_procedure(def.clone()).await.unwrap();
@@ -4249,7 +4249,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0], def);
 
-        // Re-registering the same (tenant, name) is rejected.
+        // Re-registering the same (project, name) is rejected.
         let dup = cat.register_procedure(def.clone()).await.unwrap_err();
         assert!(matches!(dup, BasinError::Catalog(_)), "got {dup:?}");
 
@@ -4266,10 +4266,10 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         let def = SqlProcedureDef {
-            tenant: t,
+            project: t,
             name: "archive".into(),
             args: vec![
                 SqlFunctionArg {
@@ -4323,7 +4323,7 @@ mod tests {
                 return;
             }
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat1.create_namespace(&t).await.unwrap();
         let def = proc_def(
             t,
@@ -4341,21 +4341,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn procedure_cross_tenant_isolation() {
+    async fn procedure_cross_project_isolation() {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         cat.create_namespace(&a).await.unwrap();
         cat.create_namespace(&b).await.unwrap();
         cat.register_procedure(proc_def(a, "shared", "INSERT INTO log VALUES ('a')"))
             .await
             .unwrap();
-        // Tenant B sees nothing.
+        // Project B sees nothing.
         assert!(cat.lookup_procedure(&b, "shared").await.is_none());
         assert!(cat.list_procedures(&b).await.is_empty());
-        // Tenant B can register the same name independently.
+        // Project B can register the same name independently.
         cat.register_procedure(proc_def(b, "shared", "INSERT INTO log VALUES ('b')"))
             .await
             .unwrap();
@@ -4366,7 +4366,7 @@ mod tests {
         // A's listing only shows A's row.
         let listed_a = cat.list_procedures(&a).await;
         assert_eq!(listed_a.len(), 1);
-        assert_eq!(listed_a[0].tenant, a);
+        assert_eq!(listed_a[0].project, a);
     }
 
     #[tokio::test]
@@ -4374,7 +4374,7 @@ mod tests {
         let Some((cat, _guard)) = try_connect().await else {
             return;
         };
-        let t = TenantId::new();
+        let t = ProjectId::new();
         cat.create_namespace(&t).await.unwrap();
         cat.register_procedure(proc_def(t, "p1", "INSERT INTO log VALUES ('x')"))
             .await

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cv::{CvRefreshOutcome, CvRefresher, CvSpec, TestClock};
 use basin_engine::{Engine, EngineConfig};
 use chrono::{Duration, TimeZone, Utc};
@@ -36,8 +36,8 @@ async fn tick_within_interval_is_not_due() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
 
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -50,7 +50,7 @@ async fn tick_within_interval_is_not_due() {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
     let clock = TestClock::new(t0);
     let refresher = CvRefresher::new(eng.clone(), Arc::new(clock.clone()));
-    refresher.register_tenant(tenant).await;
+    refresher.register_project(project).await;
 
     let spec = CvSpec {
         name: "event_count".into(),
@@ -62,7 +62,7 @@ async fn tick_within_interval_is_not_due() {
     };
     refresher
         .store()
-        .register_cv_at(&tenant, spec, t0)
+        .register_cv_at(&project, spec, t0)
         .await
         .unwrap();
 
@@ -92,8 +92,8 @@ async fn refresh_picks_up_new_rows() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
 
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE events (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -104,12 +104,12 @@ async fn refresh_picks_up_new_rows() {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
     let clock = TestClock::new(t0);
     let refresher = CvRefresher::new(eng.clone(), Arc::new(clock.clone()));
-    refresher.register_tenant(tenant).await;
+    refresher.register_project(project).await;
 
     refresher
         .store()
         .register_cv_at(
-            &tenant,
+            &project,
             CvSpec {
                 name: "event_count".into(),
                 source_table: "events".into(),
@@ -124,7 +124,7 @@ async fn refresh_picks_up_new_rows() {
         .unwrap();
 
     // Insert more rows.
-    let writer = eng.open_session(tenant).await.unwrap();
+    let writer = eng.open_session(project).await.unwrap();
     writer
         .execute("INSERT INTO events VALUES (4), (5), (6), (7)")
         .await
@@ -141,7 +141,7 @@ async fn refresh_picks_up_new_rows() {
     assert_eq!(rows_written, 1, "count(*) returns one row");
 
     // Read the CV and check the count is 7 now.
-    let observer = eng.open_session(tenant).await.unwrap();
+    let observer = eng.open_session(project).await.unwrap();
     let res = observer.execute("SELECT c FROM event_count").await.unwrap();
     let total: i64 = match res {
         basin_engine::ExecResult::Rows { batches, .. } => {

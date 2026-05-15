@@ -42,7 +42,7 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use basin_storage::{evaluate_predicate, Predicate, ScalarValue};
 use basin_vector::Distance;
 use sqlparser::ast::{
@@ -103,12 +103,12 @@ pub struct VectorSearchPlan {
 
 /// Inspect `sql`, returning `Some(plan)` if every criterion holds. The
 /// catalog is consulted to confirm the target column is a vector column on
-/// the named table; tenants that don't have the table at all still safely
+/// the named table; projects that don't have the table at all still safely
 /// return `None` (caller falls back, the existing path produces the same
 /// "table not found" error).
 pub async fn rewrite_vector_order_by(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     sql: &str,
 ) -> Result<Option<VectorSearchPlan>> {
     // Cheap pre-gate: any of the three operator strings must appear in the
@@ -250,10 +250,10 @@ pub async fn rewrite_vector_order_by(
     };
 
     // Criterion 4: confirm `vec_col` is a `vector(N)` column on the table.
-    // A catalog miss here means the table doesn't exist in this tenant; we
+    // A catalog miss here means the table doesn't exist in this project; we
     // return `Ok(None)` so the existing pipeline produces the canonical
     // "table not found" error instead of a vector-routing-flavoured one.
-    let meta = match catalog.load_table(tenant, &table).await {
+    let meta = match catalog.load_table(project, &table).await {
         Ok(m) => m,
         Err(_) => return Ok(None),
     };

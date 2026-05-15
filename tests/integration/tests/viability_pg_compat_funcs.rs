@@ -23,7 +23,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, IntervalUnit};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -50,7 +50,7 @@ async fn open_engine() -> (TempDir, Engine) {
 /// Convenience: run `sql`, return the first row's first column rendered as
 /// a String. Panics on engine error or on shape mismatch — every callsite
 /// supplies a SELECT that produces exactly one row × one column.
-async fn one_string(sess: &basin_engine::TenantSession, sql: &str) -> String {
+async fn one_string(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches
@@ -144,7 +144,7 @@ fn render_scalar(arr: &dyn Array, i: usize) -> String {
 #[tokio::test]
 async fn pg_compat_string_functions() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(
         one_string(&sess, "SELECT lower('Hello WORLD')").await,
@@ -228,7 +228,7 @@ async fn pg_compat_string_functions() {
 #[tokio::test]
 async fn pg_compat_math_functions() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(one_string(&sess, "SELECT abs(-7)").await, "7");
     assert_eq!(one_string(&sess, "SELECT abs(7)").await, "7");
@@ -269,7 +269,7 @@ async fn pg_compat_math_functions() {
 #[tokio::test]
 async fn pg_compat_null_handling() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // COALESCE.
     assert_eq!(
@@ -322,7 +322,7 @@ async fn pg_compat_null_handling() {
 #[tokio::test]
 async fn pg_compat_datetime_functions() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // now() and current_timestamp must agree within a statement.
     let res = sess
@@ -526,7 +526,7 @@ async fn pg_compat_chrono_format_passthrough() {
     // format strings. The PG-format wrappers register under the same
     // names but pass `%`-prefixed directives through unchanged.
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(
         one_string(
@@ -551,7 +551,7 @@ async fn pg_compat_chrono_format_passthrough() {
 #[tokio::test]
 async fn coalesce_untyped_null() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let res = sess
         .execute("SELECT coalesce(NULL, NULL)")
@@ -583,7 +583,7 @@ async fn coalesce_untyped_null() {
 #[tokio::test]
 async fn age_returns_interval_type() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let res = sess
         .execute("SELECT age(TIMESTAMP '2024-12-31', TIMESTAMP '2024-01-01')")
@@ -608,7 +608,7 @@ async fn age_returns_interval_type() {
 #[tokio::test]
 async fn age_calendar_walk_edge_cases() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // The 5.11.A baseline: Dec 31 minus Jan 1 of the same year. No
     // borrowing required — straight component subtraction.
@@ -673,7 +673,7 @@ async fn age_calendar_walk_edge_cases() {
 #[tokio::test]
 async fn pg_compat_extract_second_precision() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Microsecond fraction must round-trip — PG: 42.123456.
     assert_eq!(

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -55,7 +55,7 @@ fn first_id_i64(res: ExecResult) -> i64 {
 async fn serial_column_creates_sequence_and_autonumbers() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // SERIAL pseudo-type expands to BIGINT + sequence + DEFAULT nextval.
     sess.execute("CREATE TABLE orders (id SERIAL PRIMARY KEY, name TEXT)")
@@ -105,7 +105,7 @@ async fn serial_column_creates_sequence_and_autonumbers() {
 async fn bigserial_is_int64_backed() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE evt (id BIGSERIAL, payload TEXT)")
         .await
@@ -127,7 +127,7 @@ async fn smallserial_works_end_to_end() {
     // the physical column width is widened.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE tiny (id SMALLSERIAL, label TEXT)")
         .await
@@ -144,7 +144,7 @@ async fn smallserial_works_end_to_end() {
 async fn serial_implies_not_null() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id SERIAL, n TEXT)")
         .await
@@ -170,7 +170,7 @@ async fn serial_aliases_serial4_serial8_serial2() {
     for (alias, table) in [("SERIAL4", "t4"), ("SERIAL8", "t8"), ("SERIAL2", "t2")] {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         let ddl = format!("CREATE TABLE {table} (id {alias}, n TEXT)");
         sess.execute(&ddl)
             .await

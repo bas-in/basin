@@ -1,8 +1,8 @@
 //! `basin-router` — pgwire v3 front-end for the Basin PoC.
 //!
 //! Stands up a TCP listener that speaks the Postgres simple-query protocol,
-//! authenticates each connection to a single `TenantId`, and runs SQL against
-//! that tenant's `basin_engine::TenantSession` for the lifetime of the
+//! authenticates each connection to a single `ProjectId`, and runs SQL against
+//! that project's `basin_engine::ProjectSession` for the lifetime of the
 //! connection.
 //!
 //! ## What's implemented
@@ -12,8 +12,8 @@
 //!   here intentionally because nothing about it is appropriate for
 //!   production. Production deployments will replace `BasinStartupHandler`
 //!   with one that delegates to a real auth source.
-//! - Username -> `TenantId` resolution via the pluggable [`TenantResolver`]
-//!   trait. The default [`StaticTenantResolver`] is a `HashMap` lookup.
+//! - Username -> `ProjectId` resolution via the pluggable [`ProjectResolver`]
+//!   trait. The default [`StaticProjectResolver`] is a `HashMap` lookup.
 //! - **Simple query protocol** (what `psql` uses for `SELECT 1` before
 //!   switching to prepared statements).
 //! - **Extended query protocol** v1: `Parse`/`Bind`/`Describe`/`Execute`/
@@ -28,14 +28,14 @@
 //! ## Out of scope
 //!
 //! - Transactions, `COPY`, binary format codes.
-//! - In-band tenant switching. The connection's tenant is fixed at startup;
-//!   any SQL trying to change it (e.g. `SET tenant TO ...`) routes through
+//! - In-band project switching. The connection's project is fixed at startup;
+//!   any SQL trying to change it (e.g. `SET project TO ...`) routes through
 //!   the engine, which will reject it.
 //!
 //! ## Public API
 //!
 //! - [`ServerConfig`]
-//! - [`TenantResolver`], [`StaticTenantResolver`]
+//! - [`ProjectResolver`], [`StaticProjectResolver`]
 //! - [`run`], [`run_with_shutdown`], [`run_until_bound`]
 //! - [`RunningServer`]
 
@@ -61,8 +61,8 @@ mod types;
 
 pub use rate_limit::{from_env_qps, PgRateLimit, BURST_FACTOR, DEFAULT_SUSTAINED_QPS};
 pub use resolver::{
-    ApiKeyTenantResolver, JwtTenantResolver, StackedTenantResolver, StaticTenantResolver,
-    TenantCredentialsResolver, TenantResolver,
+    ApiKeyProjectResolver, JwtProjectResolver, StackedProjectResolver, StaticProjectResolver,
+    ProjectCredentialsResolver, ProjectResolver,
 };
 pub use sharding::{parse_pins_env, ShardMap};
 pub use tls::{build_acceptor, TlsConfig};
@@ -82,7 +82,7 @@ use crate::remote_shard::RemoteShardSessionFactory;
 ///
 /// `shard_endpoints` is optional. When `Some(vec)`, the router runs in
 /// compute-sharded mode: every authenticated connection is mapped via
-/// stable hashing of `TenantId` to one of the supplied endpoints, and
+/// stable hashing of `ProjectId` to one of the supplied endpoints, and
 /// pgwire traffic is forwarded to the upstream basin-router listening at
 /// that endpoint. The local `engine` and `pool` are unused in this mode
 /// but must still be supplied (the field is part of the trait surface).
@@ -95,7 +95,7 @@ use crate::remote_shard::RemoteShardSessionFactory;
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub engine: basin_engine::Engine,
-    pub tenant_resolver: Arc<dyn TenantResolver>,
+    pub project_resolver: Arc<dyn ProjectResolver>,
     pub pool: Option<Arc<basin_pool::SessionPool>>,
     pub shard_endpoints: Option<Vec<String>>,
     pub tls: Option<Arc<TlsConfig>>,
@@ -119,7 +119,7 @@ pub async fn run_with_shutdown(cfg: ServerConfig, shutdown: oneshot::Receiver<()
     accept_loop(
         listener,
         cfg.engine,
-        cfg.tenant_resolver,
+        cfg.project_resolver,
         cfg.pool,
         cfg.shard_endpoints,
         cfg.tls,
@@ -140,7 +140,7 @@ pub async fn run_until_bound(cfg: ServerConfig) -> Result<RunningServer> {
         .map_err(|e| BasinError::Internal(format!("local_addr: {e}")))?;
     let (tx, rx) = oneshot::channel();
     let engine = cfg.engine;
-    let resolver = cfg.tenant_resolver;
+    let resolver = cfg.project_resolver;
     let pool = cfg.pool;
     let shard_endpoints = cfg.shard_endpoints;
     let tls = cfg.tls;
@@ -165,7 +165,7 @@ pub struct RunningServer {
 async fn accept_loop(
     listener: TcpListener,
     engine: basin_engine::Engine,
-    resolver: Arc<dyn TenantResolver>,
+    resolver: Arc<dyn ProjectResolver>,
     pool: Option<Arc<basin_pool::SessionPool>>,
     shard_endpoints: Option<Vec<String>>,
     tls: Option<Arc<TlsConfig>>,
@@ -182,7 +182,7 @@ async fn accept_loop(
         }
         None => None,
     };
-    // Per-tenant pgwire rate limiter (Phase 6). Read once at startup so
+    // Per-project pgwire rate limiter (Phase 6). Read once at startup so
     // the env var doesn't need to be re-parsed on every connection.
     // `0` / unset / empty = disabled. A typo (non-numeric) is a hard
     // startup error so the operator finds out immediately, not on the
@@ -214,18 +214,18 @@ async fn accept_loop(
             ));
         }
         // Whale pinning (Phase 5.5): operator can override the consistent
-        // hash for specific tenants via `BASIN_TENANT_PINS=ulid:idx,...`.
+        // hash for specific projects via `BASIN_PROJECT_PINS=ulid:idx,...`.
         // Parse failure is a hard startup error so a typo doesn't silently
         // route a whale onto the wrong (overloaded) shard.
-        let pins = match std::env::var("BASIN_TENANT_PINS") {
+        let pins = match std::env::var("BASIN_PROJECT_PINS") {
             Ok(s) => parse_pins_env(&s)
-                .map_err(|e| BasinError::Internal(format!("BASIN_TENANT_PINS: {e}")))?,
+                .map_err(|e| BasinError::Internal(format!("BASIN_PROJECT_PINS: {e}")))?,
             Err(_) => Default::default(),
         };
         let map = Arc::new(ShardMap::with_pins(endpoints, pins).map_err(BasinError::Internal)?);
         tracing::info!(
             shards = map.endpoints().len(),
-            pinned_tenants = map.pin_count(),
+            pinned_projects = map.pin_count(),
             "router running in compute-sharded mode"
         );
         let factory = Arc::new(RemoteShardSessionFactory::new(map));
@@ -272,7 +272,7 @@ async fn accept_loop(
 async fn run_accept_loop<F>(
     listener: TcpListener,
     factory: Arc<F>,
-    resolver: Arc<dyn TenantResolver>,
+    resolver: Arc<dyn ProjectResolver>,
     rate_limit: Option<Arc<PgRateLimit>>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     shutdown: &mut oneshot::Receiver<()>,
@@ -313,7 +313,7 @@ async fn handle_connection<F>(
     sock: tokio::net::TcpStream,
     peer: SocketAddr,
     factory: Arc<F>,
-    resolver: Arc<dyn TenantResolver>,
+    resolver: Arc<dyn ProjectResolver>,
     rate_limit: Option<Arc<PgRateLimit>>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 ) -> Result<()>

@@ -30,8 +30,8 @@
 //!
 //! - **GIN / GIST trigram index.** Without an inverted index over the
 //!   trigram column, `WHERE name % 'foo'` still scans every partition.
-//!   That's fine for tens of thousands of rows per tenant but quadratic
-//!   on cross-tenant joins. The fix in v0.2 is a basin-storage-side
+//!   That's fine for tens of thousands of rows per project but quadratic
+//!   on cross-project joins. The fix in v0.2 is a basin-storage-side
 //!   trigram-index segment format mirroring the HNSW vector index — the
 //!   trigram → row-id postings list is the only structural change
 //!   needed; everything else (similarity scoring, threshold filter)

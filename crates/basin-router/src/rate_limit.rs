@@ -1,16 +1,16 @@
-//! Per-tenant pgwire rate limiter.
+//! Per-project pgwire rate limiter.
 //!
 //! Mirrors `basin_net::guards::RateLimit` (which throttles outbound HTTP
 //! from `basin-net`), keeping the token-bucket implementation uniform
 //! across both the *inbound* pgwire protocol and the *outbound* HTTP
 //! protocol. The two limiters are separate instances with separate
-//! quotas so a tenant burning their HTTP budget doesn't starve their
+//! quotas so a project burning their HTTP budget doesn't starve their
 //! pgwire budget and vice versa.
 //!
 //! # Quota
 //!
 //! v0.1 hard-codes 100 statements/sec sustained, burst 300 (3× sustained,
-//! same shape as the basin-net default). A per-tenant override and a
+//! same shape as the basin-net default). A per-project override and a
 //! catalog-driven config are deferred to v0.2; the env var
 //! `BASIN_PGWIRE_RATE_LIMIT_QPS` lets the operator dial the global rate
 //! at startup, with `0` (the default) disabling the limiter entirely so
@@ -27,21 +27,21 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 
 /// Sustained statements/sec when the limiter is enabled. Matches the
 /// 10:30 ratio basin-net uses for outbound HTTP, scaled 10× because
-/// pgwire is inherently chattier than per-tenant HTTP egress.
+/// pgwire is inherently chattier than per-project HTTP egress.
 pub const DEFAULT_SUSTAINED_QPS: u32 = 100;
 
 /// Burst factor (peak allowance / sustained). Same 3× ratio as basin-net.
 pub const BURST_FACTOR: u32 = 3;
 
-/// Per-tenant pgwire rate limiter. Cheap to clone (Arc inside).
+/// Per-project pgwire rate limiter. Cheap to clone (Arc inside).
 #[derive(Clone)]
 pub struct PgRateLimit {
-    inner: Arc<RateLimiter<TenantId, DefaultKeyedStateStore<TenantId>, DefaultClock>>,
+    inner: Arc<RateLimiter<ProjectId, DefaultKeyedStateStore<ProjectId>, DefaultClock>>,
     sustained_qps: u32,
 }
 
@@ -82,12 +82,12 @@ impl PgRateLimit {
         self.sustained_qps
     }
 
-    /// One token check. Returns `Err(())` if the tenant has burned their
+    /// One token check. Returns `Err(())` if the project has burned their
     /// budget for the current window. The bare `()` keeps this module
     /// dependency-free of pgwire types; the call site does the
     /// SQLSTATE-53400 mapping.
-    pub fn check(&self, tenant: &TenantId) -> Result<(), ()> {
-        self.inner.check_key(tenant).map(|_| ()).map_err(|_| ())
+    pub fn check(&self, project: &ProjectId) -> Result<(), ()> {
+        self.inner.check_key(project).map(|_| ()).map_err(|_| ())
     }
 }
 
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn check_passes_within_burst() {
         let rl = PgRateLimit::with_qps(10);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         // At 10 qps sustained × 3 burst = 30 free tokens before throttle.
         // Hit it 20 times immediately — must all succeed.
         for i in 0..20 {
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn check_throttles_after_burst_exhausted() {
         let rl = PgRateLimit::with_qps(1);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         // 1 qps × 3 burst = 3 tokens. Drain them.
         for _ in 0..3 {
             rl.check(&t).unwrap();
@@ -151,19 +151,19 @@ mod tests {
     }
 
     #[test]
-    fn separate_tenants_have_separate_buckets() {
+    fn separate_projects_have_separate_buckets() {
         let rl = PgRateLimit::with_qps(1);
-        let a = TenantId::new();
-        let b = TenantId::new();
-        // Drain tenant A's bucket.
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+        // Drain project A's bucket.
         for _ in 0..3 {
             rl.check(&a).unwrap();
         }
-        // Tenant A is now (almost certainly) throttled — but tenant B
+        // Project A is now (almost certainly) throttled — but project B
         // must still pass on the very first call. The limiter is keyed
-        // per-TenantId; one tenant burning their quota cannot starve
+        // per-ProjectId; one project burning their quota cannot starve
         // another.
-        rl.check(&b).expect("tenant B starved by tenant A's burst");
+        rl.check(&b).expect("project B starved by project A's burst");
     }
 
     #[test]

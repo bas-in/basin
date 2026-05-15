@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use basin_common::{BasinError, PartitionKey, Result, TableName, TenantId};
+use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::encryption::{EncryptionProvider, WrappedKey};
 use basin_storage::{ReadOptions, Storage, StorageConfig};
@@ -41,7 +41,7 @@ struct MockProvider {
 
 #[async_trait]
 impl EncryptionProvider for MockProvider {
-    async fn wrap_key(&self, _tenant: &TenantId) -> Result<(Vec<u8>, WrappedKey)> {
+    async fn wrap_key(&self, _project: &ProjectId) -> Result<(Vec<u8>, WrappedKey)> {
         // 32 bytes = AES-256-GCM key. Drawn deterministically here so
         // re-wraps are reproducible across the test; production
         // adapters draw from `OsRng`.
@@ -52,7 +52,7 @@ impl EncryptionProvider for MockProvider {
         Ok((plaintext, WrappedKey(sidecar)))
     }
 
-    async fn unwrap_key(&self, _tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
+    async fn unwrap_key(&self, _project: &ProjectId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
         let bytes = &wrapped.0;
         if bytes.first().copied() != Some(0xC0) {
             return Err(BasinError::storage("mock unwrap: bad version byte"));
@@ -93,7 +93,7 @@ fn first_file_with_suffix(root: &std::path::Path, suffix: &str) -> Option<std::p
 async fn viability_kms_envelope() {
     basin_common::telemetry::try_init_for_tests();
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
     let batch = make_batch(0, 100);
@@ -110,7 +110,7 @@ async fn viability_kms_envelope() {
         page_cache: None,
     });
     let _ = plain_storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .expect("plain write");
     let plain_path =
@@ -136,7 +136,7 @@ async fn viability_kms_envelope() {
     storage.attach_encryption_provider(provider);
 
     let df = storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .expect("encrypted write");
 
@@ -167,7 +167,7 @@ async fn viability_kms_envelope() {
     // input rows. The reader transparently fetches the sidecar,
     // unwraps, AES-GCM-decrypts, and decodes Parquet.
     let stream = storage
-        .read(&tenant, &table, ReadOptions::default())
+        .read(&project, &table, ReadOptions::default())
         .await
         .expect("read");
     let batches: Vec<_> = stream.collect::<Vec<_>>().await;
@@ -202,7 +202,7 @@ async fn viability_kms_envelope() {
         page_cache: None,
     });
     let stream = plain_storage_2
-        .read(&tenant, &table, ReadOptions::default())
+        .read(&project, &table, ReadOptions::default())
         .await
         .expect("plain read");
     let batches: Vec<_> = stream.collect::<Vec<_>>().await;

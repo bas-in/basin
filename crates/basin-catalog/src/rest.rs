@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
-use basin_common::{Result, TableName, TenantId};
+use basin_common::{Result, TableName, ProjectId};
 
 use crate::metadata::{DataFileRef, PartitionSpec, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId};
@@ -42,34 +42,34 @@ impl RestCatalog {
 
 #[async_trait]
 impl Catalog for RestCatalog {
-    async fn create_namespace(&self, _tenant: &TenantId) -> Result<()> {
+    async fn create_namespace(&self, _project: &ProjectId) -> Result<()> {
         unimplemented!("RestCatalog::create_namespace lands in Phase 2")
     }
 
     async fn create_table(
         &self,
-        _tenant: &TenantId,
+        _project: &ProjectId,
         _table: &TableName,
         _schema: &arrow_schema::Schema,
     ) -> Result<TableMetadata> {
         unimplemented!("RestCatalog::create_table lands in Phase 2")
     }
 
-    async fn load_table(&self, _tenant: &TenantId, _table: &TableName) -> Result<TableMetadata> {
+    async fn load_table(&self, _project: &ProjectId, _table: &TableName) -> Result<TableMetadata> {
         unimplemented!("RestCatalog::load_table lands in Phase 2")
     }
 
-    async fn drop_table(&self, _tenant: &TenantId, _table: &TableName) -> Result<()> {
+    async fn drop_table(&self, _project: &ProjectId, _table: &TableName) -> Result<()> {
         unimplemented!("RestCatalog::drop_table lands in Phase 2")
     }
 
-    async fn list_tables(&self, _tenant: &TenantId) -> Result<Vec<TableName>> {
+    async fn list_tables(&self, _project: &ProjectId) -> Result<Vec<TableName>> {
         unimplemented!("RestCatalog::list_tables lands in Phase 2")
     }
 
     async fn append_data_files(
         &self,
-        _tenant: &TenantId,
+        _project: &ProjectId,
         _table: &TableName,
         _expected_snapshot: SnapshotId,
         _files: Vec<DataFileRef>,
@@ -79,7 +79,7 @@ impl Catalog for RestCatalog {
 
     async fn replace_data_files(
         &self,
-        _tenant: &TenantId,
+        _project: &ProjectId,
         _table: &TableName,
         _expected_snapshot: SnapshotId,
         _removed_paths: Vec<String>,
@@ -90,7 +90,7 @@ impl Catalog for RestCatalog {
 
     async fn list_snapshots(
         &self,
-        _tenant: &TenantId,
+        _project: &ProjectId,
         _table: &TableName,
     ) -> Result<Vec<Snapshot>> {
         unimplemented!("RestCatalog::list_snapshots lands in Phase 2")
@@ -98,7 +98,7 @@ impl Catalog for RestCatalog {
 
     async fn set_partition_spec(
         &self,
-        _tenant: &TenantId,
+        _project: &ProjectId,
         _table: &TableName,
         _spec: PartitionSpec,
     ) -> Result<()> {

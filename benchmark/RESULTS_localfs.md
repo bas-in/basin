@@ -34,23 +34,23 @@ python3 benchmark/bundle.py
 | **NVMe disk cache (Phase 5.7 A1)** | **PASS** | `2.42 ms` | `< 250` |
 | **Durable catalog: rows survive restart** | **PASS** | `1 bool` | `= 1` |
 | **Postgres extended-query protocol works end-to-end** | **PASS** | `1 fraction` | `≥ 1` |
-| **Idle-tenant RAM cost** | **PASS** | `0.93 KiB` | `< 500` |
-| **Tenant isolation under concurrent load** | **PASS** | `0 leaks` | `= 0` |
+| **Idle-project RAM cost** | **PASS** | `0.93 KiB` | `< 500` |
+| **Project isolation under concurrent load** | **PASS** | `0 leaks` | `= 0` |
 | **JSONB column type** | **PASS** | `1 boolean` | `= 1` |
 | **Large-dataset point query** | **PASS** | `5.16 ms` | `< 100` |
 | **ORM-style query patterns work end-to-end** | **PASS** | `1 fraction` | `≥ 0.85` |
 | **Parquet page cache (Phase 5.7 A2)** | **PASS** | `0.80 ms` | `< 75` |
-| **Within-tenant time-based partition pruning** | **PASS** | `0.071456 ratio` | `< 0.2` |
+| **Within-project time-based partition pruning** | **PASS** | `0.071456 ratio` | `< 0.2` |
 | **bcrypt validation cost on pgwire connect** | **PASS** | `2.31 ms` | `< 300` |
-| **Per-tenant connection-URL provision latency** | **PASS** | `4.06 ms` | `< 50` |
+| **Per-project connection-URL provision latency** | **PASS** | `4.06 ms` | `< 50` |
 | **pg_trgm-compatible fuzzy text matching (similarity, word_similarity)** | **PASS** | `3 checks` | `= 3` |
 | **PostGIS-compatible spatial subset (POINT, BOX2D, ST_Distance, ST_DWithin)** | **PASS** | `3 checks` | `= 3` |
 | **Predicate pushdown vs full scan** | **PASS** | `101.18×` | `≥ 10` |
 | **Row-level security: per-principal predicate injection** | **PASS** | `5 rows` | `= 5` |
-| **RLS preserves tenant prefix isolation** | **PASS** | `0 rows` | `= 0` |
+| **RLS preserves project prefix isolation** | **PASS** | `0 rows` | `= 0` |
 | **Per-table row-group sizing for point queries** | **PASS** | `0.0625 fraction` | `< 0.5` |
 | **Shard-acked INSERT path** | **PASS** | `15216 inserts/sec` | `≥ 50` |
-| **Tenant deletion latency** | **PASS** | `4.40 ms` | `< 3000` |
+| **Project deletion latency** | **PASS** | `4.40 ms` | `< 3000` |
 | **Per-table tiered storage (hot/cold)** | **PASS** | `1 files` | `= 1` |
 | **UPDATE / DELETE via copy-on-write** | **PASS** | `7.97 ms` | `< 2000` |
 | **UUID column type + uuid-ossp/pgcrypto built-in functions** | **PASS** | `1 boolean` | `= 1` |
@@ -72,23 +72,23 @@ python3 benchmark/bundle.py
 - **NVMe disk cache (Phase 5.7 A1)** — Cold p99 of a 1000-iteration random-working-set point-query workload, behind a 50 ms-per-RPC latency injector standing in for cross-region S3, finishes under 250 ms. The 'cold' phase starts with both the disk cache and the in-process metadata cache empty (every working-set id is a miss); the 'warm' phase repeats the same workload (caches now populated). The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache. Measured `cold p99 ms` = `2.42 ms`.
 - **Durable catalog: rows survive restart** — Catalog metadata persists across basin-server restarts. Measured `rows survived restart` = `1 bool`.
 - **Postgres extended-query protocol works end-to-end** — tokio-postgres / asyncpg / JDBC default extended-query path runs CREATE / INSERT($1,$2) / prepared SELECT against Basin without falling back to simple_query. Measured `Extended-protocol queries that succeed` = `1 fraction`.
-- **Idle-tenant RAM cost** — Basin holds many idle tenants in one process for under 500 KiB each. Measured `per_tenant_kib` = `0.93 KiB`.
-- **Tenant isolation under concurrent load** — Concurrent multi-tenant traffic produces zero cross-tenant row leakage. Measured `leaks` = `0 leaks`.
+- **Idle-project RAM cost** — Basin holds many idle projects in one process for under 500 KiB each. Measured `per_project_kib` = `0.93 KiB`.
+- **Project isolation under concurrent load** — Concurrent multi-project traffic produces zero cross-project row leakage. Measured `leaks` = `0 leaks`.
 - **JSONB column type** — JSONB column accepts JSON-string literals on INSERT, stores them canonically (keys sorted, no whitespace) as LargeBinary, and returns them on SELECT as binary bytes that round-trip through serde_json. Different key orders on INSERT produce byte-identical stored payloads. Measured `jsonb_roundtrip_and_canonical` = `1 boolean`.
 - **Large-dataset point query** — Cold p99 of a 1000-iteration random-working-set point-query workload on a 10 M-row, 10-file dataset finishes under 100 ms. Each query picks a different id from a fixed-seed pool of 1000 hot ids, so the cache is exercised at realistic granularity rather than re-asking the same row. The bar is on COLD p99 (page + disk cache empty at the start of the run); a 'warm' phase is reported alongside. Measured `cold p99 ms` = `5.16 ms`.
 - **ORM-style query patterns work end-to-end** — Seven representative query shapes that real ORMs (Diesel, SeaORM, Prisma, ActiveRecord, SQLAlchemy) emit through the Postgres extended-query protocol succeed against Basin. Failure mode is a clear protocol error, not a hang. Measured `Representative ORM patterns that succeed` = `1 fraction`.
 - **Parquet page cache (Phase 5.7 A2)** — Cold p99 of a 1000-iteration random-working-set point-query workload finishes under 75 ms. The 'cold' phase starts with an empty page cache (every working-set id is a miss); the 'warm' phase repeats the same workload (caches now populated) and is reported alongside as corroboration. The bar is set against COLD p99 so no implementation can pass by leaning on a pre-warmed cache. Workload: 100k rows across 10 Parquet files, 1000 hot ids drawn at fixed PRNG seed. Measured `cold p99 ms` = `0.80 ms`.
-- **Within-tenant time-based partition pruning** — A 1-month range query against 12 months of partitioned data reads at most one partition's worth of bytes (range/full bytes ratio < 0.2). Measured `partition_bytes_ratio (range / full)` = `0.071456 ratio`.
+- **Within-project time-based partition pruning** — A 1-month range query against 12 months of partitioned data reads at most one partition's worth of bytes (range/full bytes ratio < 0.2). Measured `partition_bytes_ratio (range / full)` = `0.071456 ratio`.
 - **bcrypt validation cost on pgwire connect** — Every cold pgwire connection pays one bcrypt-verify on the way in. At test bcrypt-cost (4) p99 stays under 300 ms across 50 validations. Production cost-12 will run ~50× higher; the connection pool keeps this off the hot path for warm reuse. The number we publish here tracks regressions in the validation path itself, not in bcrypt's CPU envelope. Measured `p99 validate latency` = `2.31 ms`.
-- **Per-tenant connection-URL provision latency** — Issuing a fresh pgwire (user, password) row + bcrypt hash + URL finishes within p99 < 50 ms at test bcrypt-cost (4). Production cost-12 is documented inline; this card tracks the test-cost number so a regression in the SQL / random-byte / URL-build path is caught. The bar is expressed against p99 across 100 provisions; mean / p50 are reported as distribution context. Measured `p99 provision latency` = `4.06 ms`.
+- **Per-project connection-URL provision latency** — Issuing a fresh pgwire (user, password) row + bcrypt hash + URL finishes within p99 < 50 ms at test bcrypt-cost (4). Production cost-12 is documented inline; this card tracks the test-cost number so a regression in the SQL / random-byte / URL-build path is caught. The bar is expressed against p99 across 100 provisions; mean / p50 are reported as distribution context. Measured `p99 provision latency` = `4.06 ms`.
 - **pg_trgm-compatible fuzzy text matching (similarity, word_similarity)** — 100 typo pairs: min similarity >= 0.3 (PG default pg_trgm.similarity_threshold), max unrelated < 0.2, word_similarity('smyth', 'alyce smyth') >= 0.6. Measured `checks_passed` = `3 checks`.
 - **PostGIS-compatible spatial subset (POINT, BOX2D, ST_Distance, ST_DWithin)** — 100 European points: Haversine within 1% of PostGIS ST_DistanceSphere; ST_DWithin matches truth set; WKB round-trip is byte-exact (21 B/point). Measured `checks_passed` = `3 checks`.
 - **Predicate pushdown vs full scan** — A point query reads at least 10x less than a full scan would. Measured `reduction_x (full_scan_bytes / point_query_bytes)` = `101.18×`.
 - **Row-level security: per-principal predicate injection** — RLS isolates rows per `current_user` while preserving full visibility when disabled. Measured `alice_rows_visible` = `5 rows`.
-- **RLS preserves tenant prefix isolation** — Cross-tenant row leakage is zero across every RLS configuration combination. Measured `cross_tenant_leak` = `0 rows`.
+- **RLS preserves project prefix isolation** — Cross-project row leakage is zero across every RLS configuration combination. Measured `cross_project_leak` = `0 rows`.
 - **Per-table row-group sizing for point queries** — A table with `row_group_rows = 4096` scans strictly fewer than half the rows of an identical table at the default 65,536-row group size when answering a `WHERE id = X` point query. Measured `small_rg_scan_rows / default_rg_scan_rows` = `0.0625 fraction`.
 - **Shard-acked INSERT path** — Single-row INSERTs route through the WAL + shard owner and acks fast enough that point INSERT throughput is no longer Parquet-bound. Measured `inserts_per_sec` = `15216 inserts/sec`.
-- **Tenant deletion latency** — Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel) completes in under 3 seconds (caches reset; cold path). Measured `deletion_ms` = `4.40 ms`.
+- **Project deletion latency** — Deleting a project of 100 small files via Storage::delete_project (catalog-first; LIST mop-up in parallel) completes in under 3 seconds (caches reset; cold path). Measured `deletion_ms` = `4.40 ms`.
 - **Per-table tiered storage (hot/cold)** — Files older than the configured threshold migrate from the default 'hot' object-store prefix to a cheaper 'cold' prefix. Reads transparently follow the catalog regardless of tier. Measured `cold_files_after_sweep` = `1 files`.
 - **UPDATE / DELETE via copy-on-write** — An UPDATE and a DELETE on a 10K-row table commit end-to-end (parser → executor → storage rewrite → catalog Replace snapshot) in under 2 seconds. Measured `UPDATE+DELETE elapsed (ms)` = `7.97 ms`.
 - **UUID column type + uuid-ossp/pgcrypto built-in functions** — UUID column accepts canonical hyphenated literals and gen_random_uuid()/uuid_generate_v4() function calls on INSERT, stores 16 bytes RFC 4122, returns canonical hyphenated text on SELECT. digest()/encode()/decode() cover md5/sha1/sha224/sha256/sha384/sha512 + hex/base64/escape. crypt()/gen_salt('bf') produce bcrypt-shaped 60-char `$2b$NN$...` hashes that verify cleanly. Measured `uuid_full_surface` = `1 boolean`.
@@ -98,11 +98,11 @@ python3 benchmark/bundle.py
 
 ### Compute sharding (router -> shard owners) — **PASS**
 
-_Hash tenant_id -> shard_id; pgwire connections route to the owning shard. Reconnects from the same tenant always land on the same shard, and load distributes evenly enough across shards._
+_Hash project_id -> shard_id; pgwire connections route to the owning shard. Reconnects from the same project always land on the same shard, and load distributes evenly enough across shards._
 
 **max shard load:** `30 %` (bar `< 50`)
 
-| shard index | tenants on shard (count) | share of tenants (%) |
+| shard index | projects on shard (count) | share of projects (%) |
 | --- | --- | --- |
 | 0 | 27 | 27.00 |
 | 1 | 28 | 28.00 |
@@ -122,7 +122,7 @@ _Read throughput scales as more concurrent readers are added._
 | 16 | 2647.67 | 165.48 | 571.00 |
 | 64 | 2462.33 | 38.47 | 13868.00 |
 
-### Single-tenant data size scale-up — **PASS**
+### Single-project data size scale-up — **PASS**
 
 _Storage is linear in row count; point-query latency stays bounded._
 
@@ -134,13 +134,13 @@ _Storage is linear in row count; point-query latency stays bounded._
 | 1,000,000 | 7.86 | 8.24 | 3.77 | 59.88 |
 | 10,000,000 | 78.59 | 8.24 | 4.49 | 589.41 |
 
-### Idle-tenant cost curve — **PASS**
+### Idle-project cost curve — **PASS**
 
-_RAM cost stays small per idle tenant as the tenant count grows._
+_RAM cost stays small per idle project as the project count grows._
 
-**max per_tenant_kib across scales:** `2.56 KiB` (bar `< 5`)
+**max per_project_kib across scales:** `2.56 KiB` (bar `< 5`)
 
-| tenants | Per-tenant RSS (KiB) | Provision time (ms) | RSS delta (KiB) |
+| projects | Per-project RSS (KiB) | Provision time (ms) | RSS delta (KiB) |
 | --- | --- | --- | --- |
 | 100 | 2.56 | 0.13 | 256 |
 | 1,000 | 0.93 | 0.92 | 928 |
@@ -149,7 +149,7 @@ _RAM cost stays small per idle tenant as the tenant count grows._
 
 ### Noisy-neighbor degradation — **PASS**
 
-_A heavy noisy tenant doesn't crater a quiet tenant's p99 latency._
+_A heavy noisy project doesn't crater a quiet project's p99 latency._
 
 **p99 ratio (under_load / baseline):** `1.27×` (bar `< 5`)
 
@@ -172,38 +172,38 @@ _Same SELECT … WHERE id = X measured four ways under a 1000-iteration random-w
 | c_disk_page | 1.95 | 604.02 |
 | d_full | 1.55 | 660.97 |
 
-### Per-tenant cost vs tenant count — **PASS**
+### Per-project cost vs project count — **PASS**
 
-_RAM and quiet point-query latency per tenant stay near-constant as tenant count grows._
+_RAM and quiet point-query latency per project stay near-constant as project count grows._
 
 **quiet_p50_at_max / quiet_p50_at_1:** `0.61×` (bar `< 5`)
 
-| tenants | Per-tenant RAM (KiB) | Quiet point query p50 (ms) |
+| projects | Per-project RAM (KiB) | Quiet point query p50 (ms) |
 | --- | --- | --- |
 | 1 | 32.00 | 0.26 |
 | 10 | 60.44 | 0.19 |
 | 100 | 11.91 | 0.17 |
 | 1,000 | 4.98 | 0.16 |
 
-### Tenant deletion at scale (Basin vs Postgres) — **PASS**
+### Project deletion at scale (Basin vs Postgres) — **PASS**
 
-_Basin's tenant teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows._
+_Basin's project teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows._
 
 **crossover file count (Basin <= PG):** `100 files` (bar `< 5001`)
 
-| files per tenant | Basin (ms) | Postgres (ms) |
+| files per project | Basin (ms) | Postgres (ms) |
 | --- | --- | --- |
 | 100 | 4.64 | 5.91 |
 | 1,000 | 34.09 | 6.15 |
 | 5,000 | 170.31 | 2.26 |
 
-### Tenant deletion at scale, realistic SaaS schema (Basin vs Postgres) — **FAIL**
+### Project deletion at scale, realistic SaaS schema (Basin vs Postgres) — **FAIL**
 
-_Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row × every index + validates every FK on the cascade; Basin's tenant teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile._
+_Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row × every index + validates every FK on the cascade; Basin's project teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile._
 
 **Basin/Postgres ratio at 5000 files (realistic schema):** `34.7844 ratio` (bar `< 1`)
 
-| files per tenant | Basin (ms) | Postgres (ms) |
+| files per project | Basin (ms) | Postgres (ms) |
 | --- | --- | --- |
 | 100 | 4.24 | 7.09 |
 | 1,000 | 36.60 | 24.63 |
@@ -220,13 +220,13 @@ _Basin's Iceberg-style snapshot is an O(1) manifest copy while pg_dump is O(data
 | Backup wall time | `0.00 s` | `0.19 s` | **Basin** | `pg / basin = 1251x` |
 | Backup byte size | `0.00 MiB` | `6.08 MiB` | **Basin** | `pg / basin = 6736x` |
 
-### Lifecycle ops: tenant deletion + ADD COLUMN
+### Lifecycle ops: project deletion + ADD COLUMN
 
-_Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap._
+_Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap._
 
 | Metric | Basin | Postgres | Winner | Ratio |
 |---|---|---|---|---|
-| Tenant deletion (1 tenant, 100K rows) | `4.88 ms` | `7.01 ms` | **Basin** | `pg / basin = 1.44x` |
+| Project deletion (1 project, 100K rows) | `4.88 ms` | `7.01 ms` | **Basin** | `pg / basin = 1.44x` |
 | ADD COLUMN on 100K rows | `0.20 ms` | `7.37 ms` | **Basin** | `pg / basin = 36.17x` |
 
 ### Basin vs Postgres 18 (no index, 1M rows)

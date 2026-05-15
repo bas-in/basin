@@ -1,25 +1,25 @@
-//! Per-tenant cron-state store, backed by ordinary Basin tables.
+//! Per-project cron-state store, backed by ordinary Basin tables.
 //!
-//! [`CronStore`] keeps two tables per tenant:
+//! [`CronStore`] keeps two tables per project:
 //!
 //! - `cron_job` — current schedule. (We use underscore rather than the
 //!   `cron.job` schema-qualified pg_cron name because Basin's table names
 //!   are flat identifiers in v0.1; a future `cron` schema is a TODO.)
 //! - `cron_job_run_details` — append-only audit log.
 //!
-//! Both are created lazily the first time the store is used for a tenant.
+//! Both are created lazily the first time the store is used for a project.
 //! All reads and writes go through `Engine::open_session`, so:
 //!
-//! 1. Tenant isolation is the same as for user SQL.
+//! 1. Project isolation is the same as for user SQL.
 //! 2. RLS policies on `cron_job` itself are honoured (you can shape who
-//!    can schedule under a single tenant).
+//!    can schedule under a single project).
 //! 3. Persistence is handled by the catalog and storage layers; no separate
 //!    durability story.
 
 use std::sync::Arc;
 
 use arrow_array::Array;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use basin_engine::{Engine, ExecResult};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 
 use crate::types::{CronJob, CronRunDetail, JobStatus};
 
-/// Names of the two tables we keep per tenant. Underscored because Basin's
+/// Names of the two tables we keep per project. Underscored because Basin's
 /// `Ident` validator rejects `.` characters in v0.1.
 pub(crate) const JOB_TABLE: &str = "cron_job";
 pub(crate) const RUN_DETAILS_TABLE: &str = "cron_job_run_details";
@@ -41,7 +41,7 @@ pub enum ScheduleError {
         #[source]
         source: cron::error::Error,
     },
-    #[error("tenant has reached the per-tenant job cap of {cap}")]
+    #[error("project has reached the per-project job cap of {cap}")]
     JobCapExceeded { cap: usize },
     #[error("job {0:?} already exists")]
     Duplicate(String),
@@ -51,7 +51,7 @@ pub enum ScheduleError {
     Engine(#[from] BasinError),
 }
 
-/// Store front for the per-tenant cron tables.
+/// Store front for the per-project cron tables.
 ///
 /// Cheap to clone (`Arc` inside).
 #[derive(Clone)]
@@ -61,16 +61,16 @@ pub struct CronStore {
 
 struct CronStoreInner {
     engine: Engine,
-    /// Per-tenant guard so two concurrent `schedule` calls into the same
-    /// tenant cannot race past the cap or generate the same `jobid`. Held
+    /// Per-project guard so two concurrent `schedule` calls into the same
+    /// project cannot race past the cap or generate the same `jobid`. Held
     /// only over the read-then-write window.
     schedule_guard: Mutex<()>,
 }
 
 impl CronStore {
-    /// Hard cap on jobs per tenant. Same default as pg_cron's deployments
+    /// Hard cap on jobs per project. Same default as pg_cron's deployments
     /// recommend; tunable if a deployment needs more.
-    pub const MAX_JOBS_PER_TENANT: usize = 100;
+    pub const MAX_JOBS_PER_PROJECT: usize = 100;
 
     pub fn new(engine: Engine) -> Self {
         Self {
@@ -86,11 +86,11 @@ impl CronStore {
         &self.inner.engine
     }
 
-    /// Idempotently create the two cron tables under `tenant`. Safe to call
+    /// Idempotently create the two cron tables under `project`. Safe to call
     /// before every operation; the underlying `CREATE TABLE` is a no-op
     /// once the table exists.
-    pub async fn ensure_tables(&self, tenant: &TenantId) -> Result<()> {
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    pub async fn ensure_tables(&self, project: &ProjectId) -> Result<()> {
+        let sess = self.inner.engine.open_session(*project).await?;
         // CREATE TABLE is currently not idempotent in basin-engine; we look
         // for the table first via SHOW TABLES so re-running is safe.
         let existing = list_table_names(&sess).await?;
@@ -129,14 +129,14 @@ impl CronStore {
         Ok(())
     }
 
-    /// Schedule a new job under `tenant`. Mirrors pg_cron's `cron.schedule`
+    /// Schedule a new job under `project`. Mirrors pg_cron's `cron.schedule`
     /// (3-arg form): `(jobname, schedule, command)`.
     ///
-    /// Errors if the cron expression is invalid, the per-tenant cap is hit,
-    /// or `jobname` already exists for this tenant.
+    /// Errors if the cron expression is invalid, the per-project cap is hit,
+    /// or `jobname` already exists for this project.
     pub async fn schedule(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         username: &str,
         jobname: &str,
         schedule: &str,
@@ -146,13 +146,13 @@ impl CronStore {
         // schedule time, not at the next tick.
         parse_schedule(schedule)?;
 
-        self.ensure_tables(tenant).await?;
+        self.ensure_tables(project).await?;
         let _g = self.inner.schedule_guard.lock().await;
 
-        let jobs = self.list_jobs(tenant).await?;
-        if jobs.len() >= Self::MAX_JOBS_PER_TENANT {
+        let jobs = self.list_jobs(project).await?;
+        if jobs.len() >= Self::MAX_JOBS_PER_PROJECT {
             return Err(ScheduleError::JobCapExceeded {
-                cap: Self::MAX_JOBS_PER_TENANT,
+                cap: Self::MAX_JOBS_PER_PROJECT,
             });
         }
         if jobs.iter().any(|j| j.jobname == jobname) {
@@ -161,7 +161,7 @@ impl CronStore {
 
         let jobid = jobs.iter().map(|j| j.jobid).max().unwrap_or(0) + 1;
 
-        let sess = self.inner.engine.open_session(*tenant).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         sess.execute(&format!(
             "INSERT INTO {JOB_TABLE} VALUES \
              ({jobid}, {jobname}, {schedule}, {command}, 1, {user}, NULL, NULL)",
@@ -178,30 +178,30 @@ impl CronStore {
     /// Returns the removed jobid.
     pub async fn unschedule(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         jobname: &str,
     ) -> std::result::Result<i64, ScheduleError> {
-        self.ensure_tables(tenant).await?;
+        self.ensure_tables(project).await?;
         let _g = self.inner.schedule_guard.lock().await;
 
-        let jobs = self.list_jobs(tenant).await?;
+        let jobs = self.list_jobs(project).await?;
         let job = jobs
             .iter()
             .find(|j| j.jobname == jobname)
             .ok_or_else(|| ScheduleError::NotFound(jobname.to_string()))?;
         let jobid = job.jobid;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         sess.execute(&format!("DELETE FROM {JOB_TABLE} WHERE jobid = {jobid}"))
             .await?;
         Ok(jobid)
     }
 
-    /// Read every job for `tenant`. The Postgres equivalent is
-    /// `SELECT * FROM cron.job` filtered to the current tenant by RLS; here
+    /// Read every job for `project`. The Postgres equivalent is
+    /// `SELECT * FROM cron.job` filtered to the current project by RLS; here
     /// the filter is structural.
-    pub async fn list_jobs(&self, tenant: &TenantId) -> Result<Vec<CronJob>> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    pub async fn list_jobs(&self, project: &ProjectId) -> Result<Vec<CronJob>> {
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT jobid, jobname, schedule, command, active, last_run_unix_ms, last_status \
@@ -243,9 +243,9 @@ impl CronStore {
     /// Return the principal `current_user` recorded for `jobid`. Used by
     /// the runner so each scheduled SQL runs as the principal that scheduled
     /// it.
-    pub async fn job_username(&self, tenant: &TenantId, jobid: i64) -> Result<Option<String>> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    pub async fn job_username(&self, project: &ProjectId, jobid: i64) -> Result<Option<String>> {
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT username FROM {JOB_TABLE} WHERE jobid = {jobid}"
@@ -265,9 +265,9 @@ impl CronStore {
     }
 
     /// Append one row to `cron_job_run_details`.
-    pub async fn record_run(&self, tenant: &TenantId, detail: &CronRunDetail) -> Result<()> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    pub async fn record_run(&self, project: &ProjectId, detail: &CronRunDetail) -> Result<()> {
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         sess.execute(&format!(
             "INSERT INTO {RUN_DETAILS_TABLE} VALUES \
              ({id}, {jobid}, {runid}, {database}, {username}, {command}, \
@@ -287,11 +287,11 @@ impl CronStore {
         Ok(())
     }
 
-    /// Read every run-detail row for `tenant`. Equivalent to
+    /// Read every run-detail row for `project`. Equivalent to
     /// `SELECT * FROM cron.job_run_details`.
-    pub async fn list_run_details(&self, tenant: &TenantId) -> Result<Vec<CronRunDetail>> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+    pub async fn list_run_details(&self, project: &ProjectId) -> Result<Vec<CronRunDetail>> {
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT id, jobid, runid, database, username, command, \
@@ -344,13 +344,13 @@ impl CronStore {
     /// without a roundabout copy-on-write rewrite, which is fine to lean on.
     pub async fn touch_last_run(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         jobid: i64,
         last_run: DateTime<Utc>,
         last_status: &str,
     ) -> Result<()> {
-        self.ensure_tables(tenant).await?;
-        let sess = self.inner.engine.open_session(*tenant).await?;
+        self.ensure_tables(project).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         // Use a parameterised UPDATE — Basin engine supports compound WHERE
         // with `=` on a literal i64.
         sess.execute(&format!(
@@ -364,8 +364,8 @@ impl CronStore {
     }
 
     /// Allocate the next id for `cron_job_run_details`.
-    pub(crate) async fn next_run_detail_id(&self, tenant: &TenantId) -> Result<i64> {
-        let details = self.list_run_details(tenant).await?;
+    pub(crate) async fn next_run_detail_id(&self, project: &ProjectId) -> Result<i64> {
+        let details = self.list_run_details(project).await?;
         Ok(details.iter().map(|d| d.id).max().unwrap_or(0) + 1)
     }
 }
@@ -411,7 +411,7 @@ fn status_from_str(s: &str) -> JobStatus {
     }
 }
 
-async fn list_table_names(sess: &basin_engine::TenantSession) -> Result<Vec<String>> {
+async fn list_table_names(sess: &basin_engine::ProjectSession) -> Result<Vec<String>> {
     let res = sess.execute("SHOW TABLES").await?;
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,

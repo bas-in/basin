@@ -44,7 +44,7 @@ foreseeable future, implement them. This includes:
 When a customer's primary tables need an extension, the recommended
 pattern is **Postgres alongside Basin**:
 
-- Basin holds the per-tenant transactional data, the audit logs, the
+- Basin holds the per-project transactional data, the audit logs, the
   cheap-retention tables.
 - Postgres (RDS, Neon, self-hosted) holds the extension-dependent
   tables.
@@ -94,7 +94,7 @@ decision, that ADR will own the architectural cost.
 
 We write a successor ADR when **all** of:
 
-1. Three or more wedge customers (multi-tenant SaaS / audit-heavy
+1. Three or more wedge customers (multi-project SaaS / audit-heavy
    fintech / agent platforms) name the same Postgres extension as a
    blocker, AND
 2. Their use case cannot be solved by the sidecar-Postgres pattern

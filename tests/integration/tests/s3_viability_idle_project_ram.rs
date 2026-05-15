@@ -1,13 +1,13 @@
-//! S3 port of `viability_idle_tenant_ram.rs`.
+//! S3 port of `viability_idle_project_ram.rs`.
 //!
-//! Idle-tenant RAM cost is a control-plane metric: it measures namespace +
+//! Idle-project RAM cost is a control-plane metric: it measures namespace +
 //! table catalog overhead, NOT storage I/O. We still wire a real-S3 `Storage`
 //! to mirror the LocalFS test's shape (and to keep the dashboard story
 //! consistent: the "real S3 backend" run actually touches the S3
 //! `ObjectStore`), but no Parquet is written here, so the only I/O on S3 is
 //! the implicit `Arc<dyn ObjectStore>` construction.
 //!
-//! Bar: <500 KiB / tenant, same as LocalFS.
+//! Bar: <500 KiB / project, same as LocalFS.
 //!
 //! Skips cleanly when `[s3]` is missing.
 
@@ -18,16 +18,16 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{Storage, StorageConfig};
 use object_store::path::Path as ObjectPath;
 use serde_json::json;
 
-const TEST_NAME: &str = "s3_viability_idle_tenant_ram";
-const TENANTS: usize = 1000;
-const BAR_KIB_PER_TENANT: u64 = 500;
+const TEST_NAME: &str = "s3_viability_idle_project_ram";
+const PROJECTS: usize = 1000;
+const BAR_KIB_PER_PROJECT: u64 = 500;
 
 fn rss_kib() -> u64 {
     let pid = std::process::id().to_string();
@@ -51,7 +51,7 @@ fn schema() -> Schema {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
-async fn s3_viability_idle_tenant_ram() {
+async fn s3_viability_idle_project_ram() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,
         Err(e) => panic!("parse .basin-test.toml: {e}"),
@@ -82,55 +82,55 @@ async fn s3_viability_idle_tenant_ram() {
 
     // Warm up the allocator.
     {
-        let warm = TenantId::new();
+        let warm = ProjectId::new();
         catalog.create_namespace(&warm).await.unwrap();
         catalog.create_table(&warm, &table, &sch).await.unwrap();
     }
 
     let rss_before = rss_kib();
 
-    let mut tenants: Vec<TenantId> = Vec::with_capacity(TENANTS);
-    for _ in 0..TENANTS {
-        let t = TenantId::new();
+    let mut projects: Vec<ProjectId> = Vec::with_capacity(PROJECTS);
+    for _ in 0..PROJECTS {
+        let t = ProjectId::new();
         catalog.create_namespace(&t).await.unwrap();
         catalog.create_table(&t, &table, &sch).await.unwrap();
-        tenants.push(t);
+        projects.push(t);
     }
 
     let rss_after = rss_kib();
     let delta_kib = rss_after.saturating_sub(rss_before);
-    let per_tenant_kib = delta_kib as f64 / TENANTS as f64;
-    let bar_kib = BAR_KIB_PER_TENANT as f64;
-    let pass = per_tenant_kib < bar_kib;
+    let per_project_kib = delta_kib as f64 / PROJECTS as f64;
+    let bar_kib = BAR_KIB_PER_PROJECT as f64;
+    let pass = per_project_kib < bar_kib;
 
-    assert_eq!(tenants.len(), TENANTS);
+    assert_eq!(projects.len(), PROJECTS);
 
     println!(
-        "[S3 idle_tenant_ram] tenants={}, rss_before={} KiB, rss_after={} KiB, per_tenant={:.1} KiB (bar <{} KiB/tenant) {}",
-        TENANTS,
+        "[S3 idle_project_ram] projects={}, rss_before={} KiB, rss_after={} KiB, per_project={:.1} KiB (bar <{} KiB/project) {}",
+        PROJECTS,
         rss_before,
         rss_after,
-        per_tenant_kib,
-        BAR_KIB_PER_TENANT,
+        per_project_kib,
+        BAR_KIB_PER_PROJECT,
         if pass { "PASS" } else { "FAIL" }
     );
 
-    let per_tenant_bytes = (delta_kib as f64 * 1024.0) / TENANTS as f64;
-    let bar_bytes = (BAR_KIB_PER_TENANT * 1024) as f64;
+    let per_project_bytes = (delta_kib as f64 * 1024.0) / PROJECTS as f64;
+    let bar_bytes = (BAR_KIB_PER_PROJECT * 1024) as f64;
 
     report_real_viability(
-        "idle_tenant_ram",
-        "Idle-tenant RAM cost (real S3)",
-        "Basin holds many idle tenants in one process for under 500 KiB each, with a real-S3 Storage attached to each tenant's control-plane state.",
+        "idle_project_ram",
+        "Idle-project RAM cost (real S3)",
+        "Basin holds many idle projects in one process for under 500 KiB each, with a real-S3 Storage attached to each project's control-plane state.",
         pass,
         PrimaryMetric {
-            label: "per_tenant_kib".into(),
-            value: per_tenant_kib,
+            label: "per_project_kib".into(),
+            value: per_project_kib,
             unit: "KiB".into(),
-            bar: BarOp::lt(BAR_KIB_PER_TENANT as f64),
+            bar: BarOp::lt(BAR_KIB_PER_PROJECT as f64),
         },
         json!({
-            "tenants": TENANTS,
+            "projects": PROJECTS,
             "rss_before_kib": rss_before,
             "rss_after_kib": rss_after,
             "endpoint": s3_cfg.endpoint.clone(),
@@ -139,7 +139,7 @@ async fn s3_viability_idle_tenant_ram() {
     );
 
     assert!(
-        per_tenant_bytes < bar_bytes,
-        "{per_tenant_bytes:.0} bytes/tenant >= {bar_bytes:.0} bytes/tenant bar"
+        per_project_bytes < bar_bytes,
+        "{per_project_bytes:.0} bytes/project >= {bar_bytes:.0} bytes/project bar"
     );
 }

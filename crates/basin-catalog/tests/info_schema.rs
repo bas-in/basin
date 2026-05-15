@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog, Policy, PolicyCommand,
 };
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 
 fn schema(cols: &[(&str, DataType)]) -> Arc<Schema> {
     Arc::new(Schema::new(
@@ -56,10 +56,10 @@ fn col_f32<'a>(b: &'a RecordBatch, n: &str) -> &'a Float32Array {
 }
 
 #[tokio::test]
-async fn tables_view_lists_only_calling_tenants_tables() {
+async fn tables_view_lists_only_calling_projects_tables() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
 
@@ -72,12 +72,12 @@ async fn tables_view_lists_only_calling_tenants_tables() {
     let names_a: Vec<&str> = (0..batch_a.num_rows())
         .map(|i| col_str(&batch_a, "table_name").value(i))
         .collect();
-    assert_eq!(batch_a.num_rows(), 2, "tenant A must see exactly 2 tables");
+    assert_eq!(batch_a.num_rows(), 2, "project A must see exactly 2 tables");
     assert!(names_a.contains(&"alpha"));
     assert!(names_a.contains(&"beta"));
     assert!(
         !names_a.contains(&"gamma"),
-        "tenant A must NOT see tenant B's table"
+        "project A must NOT see project B's table"
     );
 
     let batch_b = InfoSchemaQuery::tables(&cat, &b).await.unwrap();
@@ -87,7 +87,7 @@ async fn tables_view_lists_only_calling_tenants_tables() {
     assert_eq!(batch_b.num_rows(), 1);
     assert_eq!(names_b, vec!["gamma"]);
 
-    // Every row in tenant A's batch reports schema = "public" and
+    // Every row in project A's batch reports schema = "public" and
     // catalog = "basin"; that's the contract pgAdmin / PostgREST
     // assert against.
     for i in 0..batch_a.num_rows() {
@@ -100,7 +100,7 @@ async fn tables_view_lists_only_calling_tenants_tables() {
 #[tokio::test]
 async fn tables_view_includes_materialized_views_as_base_table() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let s = schema(&[("k", DataType::Int64)]);
@@ -144,7 +144,7 @@ async fn tables_view_includes_materialized_views_as_base_table() {
 #[tokio::test]
 async fn pg_class_returns_consistent_oid_per_tuple() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = schema(&[("k", DataType::Int64)]);
     cat.create_table(&t, &name("widgets"), &s).await.unwrap();
@@ -158,7 +158,7 @@ async fn pg_class_returns_consistent_oid_per_tuple() {
     let oid2 = col_i64(&b2, "oid").value(0);
     assert_eq!(
         oid1, oid2,
-        "oid must be stable across queries for the same (tenant, table)"
+        "oid must be stable across queries for the same (project, table)"
     );
     assert!(oid1 > 0, "oid must be positive (FNV masked to 63 bits)");
 }
@@ -166,7 +166,7 @@ async fn pg_class_returns_consistent_oid_per_tuple() {
 #[tokio::test]
 async fn pg_class_relkind_is_correct() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = schema(&[("k", DataType::Int64)]);
 
@@ -201,7 +201,7 @@ async fn pg_class_relkind_is_correct() {
 #[tokio::test]
 async fn pg_class_relrowsecurity_reflects_rls() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = schema(&[("k", DataType::Int64)]);
     cat.create_table(&t, &name("guarded"), &s).await.unwrap();
@@ -244,10 +244,10 @@ async fn pg_class_relrowsecurity_reflects_rls() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
 
@@ -256,7 +256,7 @@ async fn cross_tenant_isolation() {
     cat.create_table(&a, &name("a_only_2"), &s).await.unwrap();
     cat.create_table(&b, &name("b_only_1"), &s).await.unwrap();
 
-    // Tenant A's pg_class must contain ZERO rows belonging to tenant B.
+    // Project A's pg_class must contain ZERO rows belonging to project B.
     let batch_a = InfoSchemaQuery::pg_class(&cat, &a).await.unwrap();
     let names_a: Vec<&str> = (0..batch_a.num_rows())
         .map(|i| col_str(&batch_a, "relname").value(i))
@@ -264,7 +264,7 @@ async fn cross_tenant_isolation() {
     assert_eq!(batch_a.num_rows(), 2);
     assert!(!names_a.contains(&"b_only_1"));
 
-    // Symmetric: tenant B sees only its own tables.
+    // Symmetric: project B sees only its own tables.
     let batch_b = InfoSchemaQuery::pg_class(&cat, &b).await.unwrap();
     let names_b: Vec<&str> = (0..batch_b.num_rows())
         .map(|i| col_str(&batch_b, "relname").value(i))
@@ -272,8 +272,8 @@ async fn cross_tenant_isolation() {
     assert_eq!(batch_b.num_rows(), 1);
     assert_eq!(names_b, vec!["b_only_1"]);
 
-    // Same-name tables in different tenants get disjoint oids by
-    // construction (the tenant ULID is hashed in).
+    // Same-name tables in different projects get disjoint oids by
+    // construction (the project ULID is hashed in).
     cat.create_table(&b, &name("a_only_1"), &s).await.unwrap();
     let batch_a2 = InfoSchemaQuery::pg_class(&cat, &a).await.unwrap();
     let batch_b2 = InfoSchemaQuery::pg_class(&cat, &b).await.unwrap();
@@ -287,14 +287,14 @@ async fn cross_tenant_isolation() {
         .unwrap();
     assert_ne!(
         oid_a, oid_b,
-        "same table name across tenants must have disjoint oids"
+        "same table name across projects must have disjoint oids"
     );
 }
 
 #[tokio::test]
-async fn empty_tenant_returns_empty_batch() {
+async fn empty_project_returns_empty_batch() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let tables = InfoSchemaQuery::tables(&cat, &t).await.unwrap();
@@ -320,13 +320,13 @@ async fn empty_tenant_returns_empty_batch() {
     assert_eq!(s.field(6).data_type(), &DataType::Float32);
 }
 
-/// Tenant with no tables but no `create_namespace` either: the in-memory
+/// Project with no tables but no `create_namespace` either: the in-memory
 /// backend returns an empty `list_tables`, not an error. Locks in that
-/// the views don't crash on the truly-blank tenant.
+/// the views don't crash on the truly-blank project.
 #[tokio::test]
-async fn unknown_tenant_returns_empty_batch() {
+async fn unknown_project_returns_empty_batch() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let tables = InfoSchemaQuery::tables(&cat, &t).await.unwrap();
     assert_eq!(tables.num_rows(), 0);
     let pgc = InfoSchemaQuery::pg_class(&cat, &t).await.unwrap();
@@ -338,7 +338,7 @@ async fn unknown_tenant_returns_empty_batch() {
 #[tokio::test]
 async fn pg_class_relispartition_is_false() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = schema(&[("k", DataType::Int64)]);
     cat.create_table(&t, &name("t1"), &s).await.unwrap();
@@ -352,7 +352,7 @@ async fn pg_class_relispartition_is_false() {
 #[tokio::test]
 async fn pg_class_reltuples_zero_on_empty_table() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = schema(&[("k", DataType::Int64)]);
     cat.create_table(&t, &name("t1"), &s).await.unwrap();

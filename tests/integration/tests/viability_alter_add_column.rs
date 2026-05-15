@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
@@ -115,9 +115,9 @@ async fn viability_alter_add_column() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let _table = TableName::new("events").unwrap();
-    let session = engine.open_session(tenant).await.unwrap();
+    let session = engine.open_session(project).await.unwrap();
 
     // 1. CREATE TABLE.
     session

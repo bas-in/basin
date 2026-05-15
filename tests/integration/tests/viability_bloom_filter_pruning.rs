@@ -36,7 +36,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
 use futures::StreamExt;
@@ -99,7 +99,7 @@ async fn viability_bloom_filter_pruning() {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
@@ -113,14 +113,14 @@ async fn viability_bloom_filter_pruning() {
     // sit on top of it.
     let catalog = InMemoryCatalog::new();
     catalog
-        .create_table(&tenant, &table, &schema())
+        .create_table(&project, &table, &schema())
         .await
         .unwrap();
     catalog
-        .set_bloom_filter_columns(&tenant, &table, vec!["id".to_string()])
+        .set_bloom_filter_columns(&project, &table, vec!["id".to_string()])
         .await
         .unwrap();
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(meta.bloom_filter_columns, vec!["id".to_string()]);
 
     let batch = build_shuffled_batch();
@@ -130,7 +130,7 @@ async fn viability_bloom_filter_pruning() {
         max_row_group_size: Some(ROW_GROUP_SIZE),
     };
     let df = storage
-        .write_batch_with_options(&tenant, &table, &part, &batch, &opts)
+        .write_batch_with_options(&project, &table, &part, &batch, &opts)
         .await
         .unwrap();
     let total_groups_in_file = ROWS as usize / ROW_GROUP_SIZE;
@@ -143,7 +143,7 @@ async fn viability_bloom_filter_pruning() {
     // We rely on the writer honouring `max_row_group_size`. Assert via the
     // public list-with-stats helper.
     let listed = storage
-        .list_data_files_with_stats(&tenant, &table)
+        .list_data_files_with_stats(&project, &table)
         .await
         .unwrap();
     assert_eq!(listed.len(), 1, "exactly one parquet file expected");
@@ -162,7 +162,7 @@ async fn viability_bloom_filter_pruning() {
         )],
         ..Default::default()
     };
-    let mut stream = storage.read(&tenant, &table, opts_eq).await.unwrap();
+    let mut stream = storage.read(&project, &table, opts_eq).await.unwrap();
     let mut hit_rows = 0usize;
     while let Some(b) = stream.next().await {
         hit_rows += b.unwrap().num_rows();
@@ -189,7 +189,7 @@ async fn viability_bloom_filter_pruning() {
         )],
         ..Default::default()
     };
-    let mut stream = storage.read(&tenant, &table, opts_eq).await.unwrap();
+    let mut stream = storage.read(&project, &table, opts_eq).await.unwrap();
     let mut absent_rows = 0usize;
     while let Some(b) = stream.next().await {
         absent_rows += b.unwrap().num_rows();
@@ -316,7 +316,7 @@ async fn run_bloom_only_phase(
     storage: &Storage,
     counters: &Arc<basin_storage::ReadCounters>,
 ) -> basin_storage::ReadCountersSnapshot {
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("bloom_only").unwrap();
     let part = PartitionKey::default_key();
 
@@ -344,7 +344,7 @@ async fn run_bloom_only_phase(
         max_row_group_size: Some(ROW_GROUP_SIZE),
     };
     storage
-        .write_batch_with_options(&tenant, &table, &part, &batch, &opts)
+        .write_batch_with_options(&project, &table, &part, &batch, &opts)
         .await
         .unwrap();
 
@@ -354,7 +354,7 @@ async fn run_bloom_only_phase(
         filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(target))],
         ..Default::default()
     };
-    let mut stream = storage.read(&tenant, &table, opts).await.unwrap();
+    let mut stream = storage.read(&project, &table, opts).await.unwrap();
     let mut rows = 0usize;
     while let Some(b) = stream.next().await {
         rows += b.unwrap().num_rows();

@@ -1,6 +1,6 @@
-//! Unit test confirming tenant isolation across the CV refresh path.
+//! Unit test confirming project isolation across the CV refresh path.
 //!
-//! Tenant A registers a CV over its own `events` table. Tenant B has its own
+//! Project A registers a CV over its own `events` table. Project B has its own
 //! independent `events` table with a different number of rows. After the
 //! refresher ticks, A's CV reflects A's row count and B's table is
 //! untouched.
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cv::{CvRefreshOutcome, CvRefresher, CvSpec, TestClock};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use chrono::{Duration, TimeZone, Utc};
@@ -32,11 +32,11 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-fn count(eng: &Engine, tenant: TenantId, sql: &str) -> tokio::task::JoinHandle<i64> {
+fn count(eng: &Engine, project: ProjectId, sql: &str) -> tokio::task::JoinHandle<i64> {
     let eng = eng.clone();
     let sql = sql.to_string();
     tokio::spawn(async move {
-        let s = eng.open_session(tenant).await.unwrap();
+        let s = eng.open_session(project).await.unwrap();
         let res = s.execute(&sql).await.unwrap();
         let mut sum = 0i64;
         match res {
@@ -59,16 +59,16 @@ fn count(eng: &Engine, tenant: TenantId, sql: &str) -> tokio::task::JoinHandle<i
 }
 
 #[tokio::test]
-async fn cv_refresh_respects_tenant_isolation() {
+async fn cv_refresh_respects_project_isolation() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
 
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
 
-    // Both tenants get their own `events` table. A has 3 rows, B has 7.
-    for (tenant, n) in [(a, 3), (b, 7)] {
-        let s = eng.open_session(tenant).await.unwrap();
+    // Both projects get their own `events` table. A has 3 rows, B has 7.
+    for (project, n) in [(a, 3), (b, 7)] {
+        let s = eng.open_session(project).await.unwrap();
         s.execute("CREATE TABLE events (id BIGINT NOT NULL)")
             .await
             .unwrap();
@@ -85,7 +85,7 @@ async fn cv_refresh_respects_tenant_isolation() {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
     let clock = TestClock::new(t0);
     let refresher = CvRefresher::new(eng.clone(), Arc::new(clock.clone()));
-    refresher.register_tenant(a).await;
+    refresher.register_project(a).await;
     // Note: deliberately do NOT register B with the refresher. The point is
     // that A's CV refresh tick must not even open a session against B.
 

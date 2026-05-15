@@ -21,8 +21,8 @@ use std::sync::Arc;
 use arrow_array::{Array, Decimal128Array, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -42,7 +42,7 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -85,7 +85,7 @@ fn col_i64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
 async fn create_table_numeric_basic() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (price NUMERIC(10, 2))")
         .await
@@ -99,7 +99,7 @@ async fn create_table_numeric_default() {
     // Decimal128 max precision.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (qty NUMERIC)")
         .await
@@ -144,7 +144,7 @@ async fn create_table_numeric_default() {
 async fn create_table_numeric_only_precision() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (n NUMERIC(10))")
         .await
@@ -157,7 +157,7 @@ async fn numeric_decimal_synonym() {
     // them as separate AST variants but they map to the same Arrow type.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (price DECIMAL(10, 2))")
         .await
@@ -190,7 +190,7 @@ async fn numeric_precision_out_of_range_rejected() {
     // column.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute("CREATE TABLE t (n NUMERIC(50, 0))")
@@ -208,7 +208,7 @@ async fn numeric_scale_exceeds_precision_rejected() {
     // implicit padding); Arrow doesn't. Reject up front.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute("CREATE TABLE t (n NUMERIC(5, 10))")
@@ -226,7 +226,7 @@ async fn insert_numeric_literal() {
     // declared scale (the integer storage value is `1.50 * 10^2 = 150`).
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, price NUMERIC(10, 2))")
         .await
@@ -256,7 +256,7 @@ async fn insert_numeric_literal() {
 async fn insert_negative_and_high_precision_numeric() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, n NUMERIC(38, 6))")
         .await
@@ -288,7 +288,7 @@ async fn insert_negative_and_high_precision_numeric() {
 async fn numeric_in_information_schema_columns() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, price NUMERIC(10, 2))")
         .await
@@ -310,7 +310,7 @@ async fn numeric_in_information_schema_columns() {
 async fn numeric_in_pg_attribute() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, price NUMERIC(10, 2))")
         .await

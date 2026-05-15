@@ -1,10 +1,10 @@
 //! Telemetry init.
 //!
-//! Per-tenant metrics from day one (see TASK.md cross-cutting). This module
+//! Per-project metrics from day one (see TASK.md cross-cutting). This module
 //! sets up tracing-subscriber so logs are JSON in prod and pretty-printed in
 //! dev. OTLP export is feature-gated so unit tests don't need a collector.
 //!
-//! [`TenantCounterRegistry`] is the structured-aggregation surface: O(1) atomic
+//! [`ProjectCounterRegistry`] is the structured-aggregation surface: O(1) atomic
 //! bumps from the engine / storage / WAL hot paths, cheap snapshots from the
 //! public read API. The latency p99 is approximated from a fixed-size ring of
 //! recent samples; production deployments wanting full HDR histograms can swap
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::TenantId;
+use crate::ProjectId;
 
 /// Output format for the tracing subscriber.
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,16 +66,16 @@ pub fn try_init_for_tests() {
         .try_init();
 }
 
-/// Number of recent latency samples retained per tenant for the p99 estimate.
-/// Rolling-window approximation: cheap (~520 bytes/tenant) and stable enough
+/// Number of recent latency samples retained per project for the p99 estimate.
+/// Rolling-window approximation: cheap (~520 bytes/project) and stable enough
 /// that p99 over the last ~128 ops is informative; swap for HDR / t-digest if
 /// long-tail accuracy matters.
 const LATENCY_RING_SIZE: usize = 128;
 
-/// Per-tenant counters. Atomic bump points + a fixed-size ring of recent
+/// Per-project counters. Atomic bump points + a fixed-size ring of recent
 /// latency samples. Public API is `record_*` (bumps) and `snapshot()` (read).
 #[derive(Debug)]
-pub struct TenantCounters {
+pub struct ProjectCounters {
     ops_total: AtomicU64,
     bytes_read_total: AtomicU64,
     bytes_written_total: AtomicU64,
@@ -100,7 +100,7 @@ impl Default for LatencyRing {
     }
 }
 
-impl Default for TenantCounters {
+impl Default for ProjectCounters {
     fn default() -> Self {
         Self {
             ops_total: AtomicU64::new(0),
@@ -112,7 +112,7 @@ impl Default for TenantCounters {
     }
 }
 
-impl TenantCounters {
+impl ProjectCounters {
     pub fn record_op(&self) {
         self.ops_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -127,7 +127,7 @@ impl TenantCounters {
     }
     /// Record one latency observation in milliseconds. O(1).
     pub fn record_latency_ms(&self, ms: u32) {
-        let mut g = self.latency.lock().expect("tenant latency ring poisoned");
+        let mut g = self.latency.lock().expect("project latency ring poisoned");
         let head = g.head;
         g.samples[head] = ms;
         g.head = (head + 1) % LATENCY_RING_SIZE;
@@ -137,8 +137,8 @@ impl TenantCounters {
     }
 
     /// Cheap copy of the current values; p99 sorts the ring (≤128 elements).
-    pub fn snapshot(&self) -> TenantCountersSnapshot {
-        let g = self.latency.lock().expect("tenant latency ring poisoned");
+    pub fn snapshot(&self) -> ProjectCountersSnapshot {
+        let g = self.latency.lock().expect("project latency ring poisoned");
         let live = &g.samples[..g.len];
         let p99 = if live.is_empty() {
             0
@@ -148,7 +148,7 @@ impl TenantCounters {
             let idx = ((buf.len() as f64) * 0.99).ceil() as usize;
             buf[idx.saturating_sub(1).min(buf.len() - 1)]
         };
-        TenantCountersSnapshot {
+        ProjectCountersSnapshot {
             ops_total: self.ops_total.load(Ordering::Relaxed),
             bytes_read_total: self.bytes_read_total.load(Ordering::Relaxed),
             bytes_written_total: self.bytes_written_total.load(Ordering::Relaxed),
@@ -158,9 +158,9 @@ impl TenantCounters {
     }
 }
 
-/// Plain-data snapshot of [`TenantCounters`]. Cheap to clone / copy.
+/// Plain-data snapshot of [`ProjectCounters`]. Cheap to clone / copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TenantCountersSnapshot {
+pub struct ProjectCountersSnapshot {
     pub ops_total: u64,
     pub bytes_read_total: u64,
     pub bytes_written_total: u64,
@@ -168,46 +168,46 @@ pub struct TenantCountersSnapshot {
     pub latency_p99_ms_estimate: u32,
 }
 
-/// Process-wide registry of per-tenant counters. Lazy-allocates on first
-/// access so per-tenant cost is O(bytes), not O(active_tenants × buffer).
+/// Process-wide registry of per-project counters. Lazy-allocates on first
+/// access so per-project cost is O(bytes), not O(active_projects × buffer).
 #[derive(Debug, Default)]
-pub struct TenantCounterRegistry {
-    counters: RwLock<HashMap<TenantId, Arc<TenantCounters>>>,
+pub struct ProjectCounterRegistry {
+    counters: RwLock<HashMap<ProjectId, Arc<ProjectCounters>>>,
 }
 
-impl TenantCounterRegistry {
+impl ProjectCounterRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Get-or-insert the per-tenant counters. Returns an `Arc` so callers can
+    /// Get-or-insert the per-project counters. Returns an `Arc` so callers can
     /// hold their own handle without re-locking on every bump.
-    pub fn for_tenant(&self, tenant: &TenantId) -> Arc<TenantCounters> {
+    pub fn for_project(&self, project: &ProjectId) -> Arc<ProjectCounters> {
         {
             let map = self
                 .counters
                 .read()
-                .expect("tenant counter registry poisoned");
-            if let Some(c) = map.get(tenant) {
+                .expect("project counter registry poisoned");
+            if let Some(c) = map.get(project) {
                 return c.clone();
             }
         }
         let mut map = self
             .counters
             .write()
-            .expect("tenant counter registry poisoned");
-        map.entry(*tenant)
-            .or_insert_with(|| Arc::new(TenantCounters::default()))
+            .expect("project counter registry poisoned");
+        map.entry(*project)
+            .or_insert_with(|| Arc::new(ProjectCounters::default()))
             .clone()
     }
 
-    /// `None` for tenants with no recorded activity yet.
-    pub fn snapshot(&self, tenant: &TenantId) -> Option<TenantCountersSnapshot> {
+    /// `None` for projects with no recorded activity yet.
+    pub fn snapshot(&self, project: &ProjectId) -> Option<ProjectCountersSnapshot> {
         let map = self
             .counters
             .read()
-            .expect("tenant counter registry poisoned");
-        map.get(tenant).map(|c| c.snapshot())
+            .expect("project counter registry poisoned");
+        map.get(project).map(|c| c.snapshot())
     }
 }
 
@@ -216,20 +216,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_is_per_tenant_isolated() {
-        let r = TenantCounterRegistry::new();
-        let a = TenantId::new();
-        let b = TenantId::new();
-        r.for_tenant(&a).record_bytes_written(1000);
-        r.for_tenant(&b).record_bytes_written(7);
+    fn registry_is_per_project_isolated() {
+        let r = ProjectCounterRegistry::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+        r.for_project(&a).record_bytes_written(1000);
+        r.for_project(&b).record_bytes_written(7);
         assert_eq!(r.snapshot(&a).unwrap().bytes_written_total, 1000);
         assert_eq!(r.snapshot(&b).unwrap().bytes_written_total, 7);
-        assert!(r.snapshot(&TenantId::new()).is_none());
+        assert!(r.snapshot(&ProjectId::new()).is_none());
     }
 
     #[test]
     fn latency_p99_tracks_ring() {
-        let c = TenantCounters::default();
+        let c = ProjectCounters::default();
         for ms in 0..200u32 {
             c.record_latency_ms(ms);
         }

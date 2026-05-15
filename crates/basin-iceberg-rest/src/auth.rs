@@ -1,17 +1,17 @@
 //! Auth stub.
 //!
 //! v0.1 treats the `Authorization: Bearer <token>` header as the caller's
-//! [`basin_common::TenantId`]: the bearer must parse as a ULID, and that
-//! ULID is the tenant whose namespace the URL is allowed to address.
+//! [`basin_common::ProjectId`]: the bearer must parse as a ULID, and that
+//! ULID is the project whose namespace the URL is allowed to address.
 //! This is the smallest stub that's actually safe — it gives every
-//! integration test a way to assert cross-tenant isolation without
+//! integration test a way to assert cross-project isolation without
 //! wiring a real JWT issuer.
 //!
-//! Production wiring will replace [`extract_tenant`] with a call into
+//! Production wiring will replace [`extract_project`] with a call into
 //! `basin_auth::AuthService::verify_jwt` (the same path
-//! `basin_rest::server::authorize` uses) and pull `claims.tenant_id`
+//! `basin_rest::server::authorize` uses) and pull `claims.project_id`
 //! from the verified token. The handler-side contract — "the URL's
-//! `:namespace` segment must equal the caller's tenant" — stays the
+//! `:namespace` segment must equal the caller's project" — stays the
 //! same; only the token decoder changes.
 //!
 //! When [`crate::IcebergRestConfig::require_bearer`] is `false` (test
@@ -23,17 +23,17 @@ use std::str::FromStr;
 
 use axum::http::header::AUTHORIZATION;
 use axum::http::HeaderMap;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 use crate::error::IcebergRestError;
 use crate::IcebergRestConfig;
 
-/// Extract the caller's tenant from the bearer token. Returns `None`
+/// Extract the caller's project from the bearer token. Returns `None`
 /// when auth is disabled (the caller then trusts the URL `:namespace`).
-pub(crate) fn extract_tenant(
+pub(crate) fn extract_project(
     cfg: &IcebergRestConfig,
     headers: &HeaderMap,
-) -> Result<Option<TenantId>, IcebergRestError> {
+) -> Result<Option<ProjectId>, IcebergRestError> {
     if !cfg.require_bearer {
         return Ok(None);
     }
@@ -52,20 +52,20 @@ pub(crate) fn extract_tenant(
     if token.is_empty() {
         return Err(IcebergRestError::Unauthorized("empty bearer token".into()));
     }
-    let tenant = TenantId::from_str(token).map_err(|e| {
-        IcebergRestError::Unauthorized(format!("bearer token must be a ULID tenant id: {e}"))
+    let project = ProjectId::from_str(token).map_err(|e| {
+        IcebergRestError::Unauthorized(format!("bearer token must be a ULID project id: {e}"))
     })?;
-    Ok(Some(tenant))
+    Ok(Some(project))
 }
 
 /// Authorize a request whose URL `:namespace` segment must match the
-/// caller's tenant. Returns the resolved tenant id either way.
+/// caller's project. Returns the resolved project id either way.
 pub(crate) fn authorize_namespace(
     cfg: &IcebergRestConfig,
     headers: &HeaderMap,
-    url_namespace: &TenantId,
-) -> Result<TenantId, IcebergRestError> {
-    match extract_tenant(cfg, headers)? {
+    url_namespace: &ProjectId,
+) -> Result<ProjectId, IcebergRestError> {
+    match extract_project(cfg, headers)? {
         Some(caller) => {
             if &caller != url_namespace {
                 return Err(IcebergRestError::Unauthorized(

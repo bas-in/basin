@@ -1,4 +1,4 @@
-//! Per-tenant SQL function catalog.
+//! Per-project SQL function catalog.
 //!
 //! Stores `LANGUAGE sql` scalar functions registered via the engine's
 //! `register_sql_function` API. The shape is deliberately narrow for v0.1:
@@ -8,14 +8,14 @@
 //! * Only scalar argument types — composite-row arguments
 //!   (e.g. `display_name(u users)`) are rejected at registration. v0.2 work.
 //!
-//! The catalog is a single shared `HashMap<(TenantId, String), SqlFunctionDef>`
-//! gated by a tokio mutex so two tenants — or two functions in the same
-//! tenant — never block each other beyond the mutex hold (HashMap probe).
-//! Per-tenant cost is `O(bytes-of-functions)`, no per-tenant heavy resources.
+//! The catalog is a single shared `HashMap<(ProjectId, String), SqlFunctionDef>`
+//! gated by a tokio mutex so two projects — or two functions in the same
+//! project — never block each other beyond the mutex hold (HashMap probe).
+//! Per-project cost is `O(bytes-of-functions)`, no per-project heavy resources.
 
 use serde::{Deserialize, Serialize};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 /// Implementation language for a user-defined function. v0.1 ships
 /// `LANGUAGE sql` only; the variant is reserved for the future Wasm /
@@ -71,12 +71,12 @@ pub enum SqlReturnType {
 }
 
 /// Catalog row for a user-defined `LANGUAGE sql` function. Stored
-/// per-tenant; two tenants registering the same function name are
+/// per-project; two projects registering the same function name are
 /// independent rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlFunctionDef {
-    pub tenant: TenantId,
-    /// Unqualified function name within the tenant. Validated to be a
+    pub project: ProjectId,
+    /// Unqualified function name within the project. Validated to be a
     /// SQL identifier and to not collide with a built-in at registration.
     pub name: String,
     pub args: Vec<SqlFunctionArg>,

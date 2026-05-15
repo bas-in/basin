@@ -13,7 +13,7 @@
 //! pushdown, projection pushdown, the simple-select fast path, and every
 //! optimizer rule downstream all see the inlined body as a first-class
 //! sub-expression. The catalog is consulted once per query (not per
-//! function call); when no function is registered for the tenant the
+//! function call); when no function is registered for the project the
 //! whole pass is a no-op.
 //!
 //! Scope (v0.1):
@@ -23,7 +23,7 @@
 //!   registration.
 //! * Recursion (direct *and* mutual) is rejected at registration.
 //!   [`validate_for_registration`] catches `f → f`; the sibling
-//!   [`validate_no_mutual_recursion`] takes the tenant's existing
+//!   [`validate_no_mutual_recursion`] takes the project's existing
 //!   function map and walks the call-graph closure of the new body so
 //!   `f → g → f`, `f → g → h → f`, etc. are caught before the def is
 //!   persisted. The inliner's [`MAX_INLINE_DEPTH`] is now purely a
@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType};
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, Select, SelectItem,
     SetExpr, Statement,
@@ -165,13 +165,13 @@ pub fn validate_for_registration(def: SqlFunctionDef) -> Result<SqlFunctionDef> 
     Ok(def)
 }
 
-/// Walk the call-graph closure of `def`'s body across the tenant's
+/// Walk the call-graph closure of `def`'s body across the project's
 /// already-registered functions in `existing` and reject if `def.name`
 /// appears anywhere in the closure. Catches mutual recursion
 /// (`f → g → f`, `f → g → h → f`, ...) which `validate_for_registration`
 /// alone cannot see — it only inspects `def.body`.
 ///
-/// `existing` is a snapshot of the tenant's function map keyed by
+/// `existing` is a snapshot of the project's function map keyed by
 /// lowercased name. Built-in functions are not in this map and therefore
 /// don't trigger spurious rejections; the walker simply ignores any
 /// callee that isn't a registered key.
@@ -181,7 +181,7 @@ pub fn validate_for_registration(def: SqlFunctionDef) -> Result<SqlFunctionDef> 
 /// own name (the walker uses `def.body` as the starting point and only
 /// consults `existing` for *other* names).
 ///
-/// O(N) in the size of the tenant's function catalog: parsed bodies are
+/// O(N) in the size of the project's function catalog: parsed bodies are
 /// cached in `parsed` so each function is parsed at most once. Bounded
 /// by [`MUTUAL_RECURSION_WALK_CAP`] as a defensive backstop against a
 /// pre-existing cycle in the catalog.
@@ -328,14 +328,14 @@ fn projection_arity(q: &Query) -> Option<usize> {
     Some(n)
 }
 
-/// Inline every registered-SQL-function call in `sql` for the tenant.
-/// Returns the rewritten SQL string. When the tenant has no functions
+/// Inline every registered-SQL-function call in `sql` for the project.
+/// Returns the rewritten SQL string. When the project has no functions
 /// registered (and `sql` references no functions to expand) the input is
 /// returned unchanged via the early-out in
 /// [`maybe_inline_query_statement`].
 pub async fn rewrite_sql_inlining_functions(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     sql: &str,
 ) -> Result<String> {
     // Cheap parse to look for any function calls. If sqlparser fails or the
@@ -358,11 +358,11 @@ pub async fn rewrite_sql_inlining_functions(
         return Ok(sql.to_string());
     }
 
-    // Pre-load the tenant's full function catalog. Building the map up
+    // Pre-load the project's full function catalog. Building the map up
     // front avoids re-locking the catalog mutex for every inlined call;
-    // for tenants with one or two functions this is also cheaper than
+    // for projects with one or two functions this is also cheaper than
     // per-call lookups.
-    let funcs = catalog.list_sql_functions(tenant).await;
+    let funcs = catalog.list_sql_functions(project).await;
     if funcs.is_empty() {
         return Ok(sql.to_string());
     }
@@ -1279,7 +1279,7 @@ mod tests {
 
     fn dummy_def(name: &str, args: Vec<(&str, SqlArgType)>, body: &str) -> SqlFunctionDef {
         SqlFunctionDef {
-            tenant: TenantId::new(),
+            project: ProjectId::new(),
             name: name.into(),
             args: args
                 .into_iter()

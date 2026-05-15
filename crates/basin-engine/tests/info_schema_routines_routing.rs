@@ -1,7 +1,7 @@
 //! Integration tests for engine-side routing of the Phase 5.11.M Tier 3
 //! views: `pg_catalog.pg_proc` and `information_schema.routines`.
 //!
-//! Each test opens a `TenantSession` and runs SQL through the same
+//! Each test opens a `ProjectSession` and runs SQL through the same
 //! `execute()` entry point a pgwire connection would hit. The asserts
 //! cover:
 //!
@@ -10,14 +10,14 @@
 //! - SELECTs against information_schema.routines surface registered
 //!   FUNCTIONs and PROCEDUREs with the SQL-standard column shape.
 //! - WHERE-predicate filtering — `WHERE routine_type = 'FUNCTION'`.
-//! - Cross-tenant isolation: A's routines are invisible to B.
+//! - Cross-project isolation: A's routines are invisible to B.
 
 use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -77,7 +77,7 @@ fn total_rows(batches: &[arrow_array::RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -88,7 +88,7 @@ async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> 
 async fn select_pg_proc_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -122,7 +122,7 @@ async fn select_pg_proc_routes() {
 async fn select_information_schema_routines_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -164,7 +164,7 @@ async fn where_predicate_filters_correctly() {
     // the postgrest-predicate test for information_schema.columns.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -200,11 +200,11 @@ async fn where_predicate_filters_correctly() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_pg_proc() {
+async fn cross_project_isolation_pg_proc() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
@@ -247,11 +247,11 @@ async fn cross_tenant_isolation_pg_proc() {
     assert_eq!(names_b, vec!["secret_b".to_string()]);
     assert!(
         !names_a.contains(&"secret_b".to_string()),
-        "tenant A leaked tenant B's pg_proc row: {names_a:?}"
+        "project A leaked project B's pg_proc row: {names_a:?}"
     );
     assert!(
         !names_b.contains(&"secret_a".to_string()),
-        "tenant B leaked tenant A's pg_proc row: {names_b:?}"
+        "project B leaked project A's pg_proc row: {names_b:?}"
     );
 
     // Same isolation must hold for information_schema.routines.
@@ -282,7 +282,7 @@ async fn pg_proc_prorettype_matches_router_oid() {
     // prorettype.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE FUNCTION add_one(x BIGINT) RETURNS BIGINT \

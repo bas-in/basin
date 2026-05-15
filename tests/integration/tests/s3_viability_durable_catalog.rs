@@ -18,10 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop, PostgresConfig};
-use basin_router::{RunningServer, ServerConfig, StaticTenantResolver};
+use basin_router::{RunningServer, ServerConfig, StaticProjectResolver};
 use basin_storage::{Storage, StorageConfig};
 use object_store::path::Path as ObjectPath;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -92,7 +92,7 @@ async fn boot_server(
     pg_url: &str,
     schema_name: &str,
     user: &str,
-    tenant: TenantId,
+    project: ProjectId,
 ) -> RunningServer {
     basin_common::telemetry::try_init_for_tests();
 
@@ -113,13 +113,13 @@ async fn boot_server(
     });
 
     let mut map = HashMap::new();
-    map.insert(user.to_owned(), tenant);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    map.insert(user.to_owned(), project);
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -242,7 +242,7 @@ async fn s3_viability_durable_catalog() {
     };
 
     let user = "alice";
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // === Phase 1 ===
     let server1 = boot_server(
@@ -251,7 +251,7 @@ async fn s3_viability_durable_catalog() {
         &url,
         &schema_name,
         user,
-        tenant,
+        project,
     )
     .await;
     let addr1 = server1.local_addr;
@@ -284,7 +284,7 @@ async fn s3_viability_durable_catalog() {
         &url,
         &schema_name,
         user,
-        tenant,
+        project,
     )
     .await;
     let addr2 = server2.local_addr;

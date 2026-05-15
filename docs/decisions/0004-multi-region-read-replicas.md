@@ -22,8 +22,8 @@ class — those remain deferred per `0001`.
 
 Basin gains a region-aware deployment topology:
 
-1. **One primary region** per tenant (configured at provisioning time;
-   stored on the tenant's catalog row). All writes for that tenant route
+1. **One primary region** per project (configured at provisioning time;
+   stored on the project's catalog row). All writes for that project route
    to that region's WAL + shard owners.
 2. **N read-replica regions**. Each replica region runs its own router +
    shard-owner pool. The Parquet substrate is replicated via S3
@@ -33,7 +33,7 @@ Basin gains a region-aware deployment topology:
    in a replica region use the local catalog replica; writes (DDL and
    `append_data_files`) round-trip to the primary region.
 4. **A small region-routing layer** at the router that, given a
-   `(tenant_id, op_type)`, decides whether the operation can be served
+   `(project_id, op_type)`, decides whether the operation can be served
    locally (read) or must forward to the primary (write).
 
 Consistency model:
@@ -41,14 +41,14 @@ Consistency model:
 - Reads in a replica region: monotonic-but-bounded-stale. The bound is
   whatever S3 CRR + Postgres logical replication give us, typically
   seconds to a few minutes during steady state.
-- Writes: always region-local to the tenant's primary. A write submitted
+- Writes: always region-local to the project's primary. A write submitted
   to a replica region transparently forwards to the primary; the latency
   bill includes the cross-region RPC.
 
 What we are **not** doing:
 - No cross-region 2PC.
 - No active-active writes.
-- No automatic failover of a tenant's primary region. Primary failover is
+- No automatic failover of a project's primary region. Primary failover is
   a manual operator action with explicit data-loss-window guarantees.
 - No global secondary indexes or cross-region joins. Queries that touch
   both a primary's catalog and a replica's catalog should be rare and
@@ -59,14 +59,14 @@ What we are **not** doing:
 **Positive**
 
 - Audit-log readers in another region get sub-100ms reads on cached data.
-- Tenant data residency is unambiguous: the primary region is the legal
-  home of the tenant's data; replicas are best-effort copies.
+- Project data residency is unambiguous: the primary region is the legal
+  home of the project's data; replicas are best-effort copies.
 - Implementation cost is bounded: no consensus state machine, no global
   catalog, no clock-bound consistency machinery.
 
 **Negative**
 
-- Operators must explicitly choose a primary region per tenant. Bad
+- Operators must explicitly choose a primary region per project. Bad
   defaults (always us-east-1) will bias read latency for non-US customers.
 - A write submitted to a replica region pays cross-region RPC. We do not
   optimise this in v1; if it becomes painful, customers move their
@@ -78,10 +78,10 @@ What we are **not** doing:
 
 **Mitigations**
 
-- Replication lag is exposed as a per-tenant metric; alerts fire when
+- Replication lag is exposed as a per-project metric; alerts fire when
   > 5 minutes.
 - Dashboard adds a "replica freshness" card per region.
-- Tenants whose workload cannot tolerate lag are configured with
+- Projects whose workload cannot tolerate lag are configured with
   primary-only reads (one region).
 
 ## Architectural compatibility
@@ -90,14 +90,14 @@ The existing layered architecture (router / shard owner / WAL / storage
 + catalog) supports this without rewrites. The pieces that change:
 
 - `basin-router`: a new `Region` type carried in the connection metadata;
-  a routing decision per op based on `(tenant.primary_region, this_region)`.
+  a routing decision per op based on `(project.primary_region, this_region)`.
 - `basin-catalog::PostgresCatalog`: a `region` setting on the connection
   string; in replica regions it points at the local Postgres replica.
 - `basin-server`: `BASIN_REGION=us-east-1`-style env var. The
-  `tenant_resolver` carries the tenant's primary region.
+  `project_resolver` carries the project's primary region.
 - New crate `basin-region` (small): types + the cross-region forward path.
 
-Storage layout under `tenants/{tenant_id}/...` is unchanged; the prefix
+Storage layout under `projects/{project_id}/...` is unchanged; the prefix
 is region-agnostic so S3 CRR replicates it as-is.
 
 ## Trigger to expand to write-anywhere consistency
@@ -116,7 +116,7 @@ to Spanner-class engineering and we should not cross it on speculation.
 
 - **Skip multi-region entirely.** Was the previous ADR's stance.
   Founder direction overrides; document the new direction.
-- **Active-active writes via per-tenant Raft groups across regions.**
+- **Active-active writes via per-project Raft groups across regions.**
   Rejected for v1: ties write latency to cross-region quorum. The wedge
   customer doesn't need it; we can add it later if they pay for it.
 - **Cell-based architecture (one cell per region, no replication).**
@@ -130,10 +130,10 @@ to Spanner-class engineering and we should not cross it on speculation.
 
 ## Implementation order
 
-1. Add `region` to tenant catalog rows + `BASIN_REGION` env var.
+1. Add `region` to project catalog rows + `BASIN_REGION` env var.
 2. Region-aware router decision: read locally or forward to primary.
 3. Forwarding path: a thin pgwire-to-pgwire proxy from replica regions
-   to the primary region, holding the tenant's connection identity.
+   to the primary region, holding the project's connection identity.
 4. Catalog replication: turn on Postgres logical replication; update
    `PostgresCatalog::connect` to accept a `read_only` flag for replicas.
 5. S3 CRR config: documented bucket setup, no code change.

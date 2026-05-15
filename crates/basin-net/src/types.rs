@@ -21,7 +21,7 @@ pub type RequestId = Uuid;
 /// or [`crate::RequestQueue`] (async).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequest {
-    /// Absolute URL. Validated against the per-tenant allowlist before the
+    /// Absolute URL. Validated against the per-project allowlist before the
     /// outbound call.
     pub url: String,
     /// Always `"GET"` or `"POST"` in v0.1. PUT/DELETE/PATCH are TODO.

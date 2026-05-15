@@ -3,7 +3,7 @@
 //! ## Storage layout
 //!
 //! ```text
-//! {root_prefix}/wal/{tenant_id}/{partition_key}/
+//! {root_prefix}/wal/{project_id}/{partition_key}/
 //!     {ulid}.seg              # closed segment, immutable
 //! ```
 //!
@@ -14,7 +14,7 @@
 //! ## Durability guarantee
 //!
 //! `append` returns once the entry is in the in-RAM buffer for its
-//! `(tenant, partition)`. The buffer is uploaded to the configured
+//! `(project, partition)`. The buffer is uploaded to the configured
 //! [`ObjectStore`] either:
 //!
 //! 1. when the background flush task wakes (every `flush_interval`), or
@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, PartitionKey, Result, TenantId};
+use basin_common::{BasinError, PartitionKey, Result, ProjectId};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
@@ -54,7 +54,7 @@ use crate::{Lsn, WalConfig, WalEntry, WalImpl};
 /// to just the WAL.
 const WAL_SEGMENT: &str = "wal";
 
-type PartitionMap = HashMap<(TenantId, PartitionKey), Arc<Mutex<PartitionState>>>;
+type PartitionMap = HashMap<(ProjectId, PartitionKey), Arc<Mutex<PartitionState>>>;
 
 /// Shared state between the public `FileWal` handle and the background flush
 /// task. Holding it behind one `Arc` avoids the awkward "split a partitions
@@ -110,10 +110,10 @@ impl FileWal {
 impl Inner {
     async fn get_or_create_partition(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
     ) -> Arc<Mutex<PartitionState>> {
-        let key = (*tenant, partition.clone());
+        let key = (*project, partition.clone());
         {
             let map = self.partitions.read().await;
             if let Some(p) = map.get(&key) {
@@ -123,7 +123,7 @@ impl Inner {
         let mut map = self.partitions.write().await;
         map.entry(key)
             .or_insert_with(|| {
-                Arc::new(Mutex::new(PartitionState::new(*tenant, partition.clone())))
+                Arc::new(Mutex::new(PartitionState::new(*project, partition.clone())))
             })
             .clone()
     }
@@ -154,7 +154,7 @@ impl Inner {
         let last_lsn = guard.buffer.last().expect("non-empty").lsn;
         let header = SegmentHeader {
             format_version: FORMAT_VERSION,
-            tenant: guard.tenant,
+            project: guard.project,
             partition: guard.partition.clone(),
             first_lsn,
             segment_id,
@@ -167,7 +167,7 @@ impl Inner {
 
         let path = closed_segment_path(
             self.root_prefix.as_ref(),
-            &guard.tenant,
+            &guard.project,
             &guard.partition,
             segment_id,
         );
@@ -196,7 +196,7 @@ impl Inner {
                     },
                 );
                 tracing::debug!(
-                    tenant = %guard.tenant,
+                    project = %guard.project,
                     partition = %guard.partition,
                     %first_lsn,
                     %last_lsn,
@@ -251,16 +251,16 @@ fn spawn_flush_loop(
     })
 }
 
-/// Build `{root}/wal/{tenant}/{partition}/{ulid}.seg`.
+/// Build `{root}/wal/{project}/{partition}/{ulid}.seg`.
 fn closed_segment_path(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     partition: &PartitionKey,
     segment_id: Ulid,
 ) -> ObjectPath {
     let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
     p = p.child(WAL_SEGMENT);
-    p = p.child(tenant.as_prefix());
+    p = p.child(project.as_prefix());
     let part = if partition.as_str().is_empty() {
         PartitionKey::DEFAULT
     } else {
@@ -291,7 +291,7 @@ async fn recover_partitions(
 ) -> Result<PartitionMap> {
     let prefix = wal_root_prefix(root_prefix);
     let mut stream = object_store.list(Some(&prefix));
-    let mut closed: HashMap<(TenantId, PartitionKey), Vec<ClosedSegment>> = HashMap::new();
+    let mut closed: HashMap<(ProjectId, PartitionKey), Vec<ClosedSegment>> = HashMap::new();
     while let Some(meta) = stream.next().await {
         let meta = meta.map_err(|e| BasinError::storage(format!("wal recovery list: {e}")))?;
         if !meta.location.as_ref().ends_with(".seg") {
@@ -308,7 +308,7 @@ async fn recover_partitions(
             })?;
         let (header, entries) = decode_segment(&body)?;
         let last_lsn = entries.last().map(|e| e.lsn).unwrap_or(header.first_lsn);
-        let key = (header.tenant, header.partition.clone());
+        let key = (header.project, header.partition.clone());
         closed.entry(key).or_default().push(ClosedSegment {
             path: meta.location,
             first_lsn: header.first_lsn,
@@ -318,35 +318,35 @@ async fn recover_partitions(
     }
 
     let mut out: PartitionMap = HashMap::new();
-    for ((tenant, partition), mut segs) in closed {
+    for ((project, partition), mut segs) in closed {
         segs.sort_by_key(|s| s.first_lsn);
         let next_lsn = segs.last().map(|s| Lsn(s.last_lsn.0 + 1)).unwrap_or(Lsn(1));
-        let mut state = PartitionState::new(tenant, partition.clone());
+        let mut state = PartitionState::new(project, partition.clone());
         state.next_lsn = next_lsn;
         for s in segs {
             state.closed.insert(s.first_lsn, s);
         }
-        out.insert((tenant, partition), Arc::new(Mutex::new(state)));
+        out.insert((project, partition), Arc::new(Mutex::new(state)));
     }
     Ok(out)
 }
 
 #[async_trait]
 impl WalImpl for FileWal {
-    #[tracing::instrument(skip(self, payload), fields(tenant=%tenant, partition=%partition, bytes=payload.len()))]
+    #[tracing::instrument(skip(self, payload), fields(project=%project, partition=%partition, bytes=payload.len()))]
     async fn append(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn> {
-        let state = self.inner.get_or_create_partition(tenant, partition).await;
+        let state = self.inner.get_or_create_partition(project, partition).await;
         let (lsn, should_flush) = {
             let mut guard = state.lock().await;
             let lsn = guard.next_lsn;
             guard.next_lsn = lsn.next();
             let now = Utc::now();
-            let record = entry_record(tenant, partition, lsn, &payload, now);
+            let record = entry_record(project, partition, lsn, &payload, now);
             // Approximate framed size: 4 (length prefix) + bincode body. The
             // bincode body is roughly the payload + ~64 bytes for ids and
             // timestamp. The actual flush serialises again; this counter is
@@ -374,14 +374,14 @@ impl WalImpl for FileWal {
         self.inner.flush_all().await
     }
 
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, partition=%partition, %since_lsn))]
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %since_lsn))]
     async fn read_from(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>> {
-        let state = self.inner.get_or_create_partition(tenant, partition).await;
+        let state = self.inner.get_or_create_partition(project, partition).await;
         // Snapshot the closed-segment list and the in-RAM buffer under the
         // lock; do the (potentially slow) GETs without holding it.
         let (closed_paths, buffered): (Vec<ClosedSegment>, Vec<EntryRecord>) = {
@@ -430,21 +430,21 @@ impl WalImpl for FileWal {
         Ok(out)
     }
 
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, partition=%partition))]
-    async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn> {
-        let state = self.inner.get_or_create_partition(tenant, partition).await;
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition))]
+    async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn> {
+        let state = self.inner.get_or_create_partition(project, partition).await;
         let guard = state.lock().await;
         Ok(guard.high_water())
     }
 
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, partition=%partition, %up_to))]
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %up_to))]
     async fn truncate(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         up_to: Lsn,
     ) -> Result<()> {
-        let state = self.inner.get_or_create_partition(tenant, partition).await;
+        let state = self.inner.get_or_create_partition(project, partition).await;
         let to_delete: Vec<ObjectPath> = {
             let guard = state.lock().await;
             guard
@@ -489,7 +489,7 @@ impl WalImpl for FileWal {
 
 fn into_public_entry(e: EntryRecord) -> WalEntry {
     WalEntry {
-        tenant: e.tenant,
+        project: e.project,
         partition: e.partition,
         lsn: e.lsn,
         payload: Bytes::from(e.payload),
@@ -527,12 +527,12 @@ mod tests {
     async fn append_assigns_monotonic_lsn() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
 
         let mut prev = Lsn::ZERO;
         for i in 1..=100u64 {
-            let lsn = wal.append(&tenant, &part, payload(i)).await.unwrap();
+            let lsn = wal.append(&project, &part, payload(i)).await.unwrap();
             assert!(lsn > prev);
             assert_eq!(lsn, Lsn(i));
             prev = lsn;
@@ -544,21 +544,21 @@ mod tests {
     async fn read_from_returns_appended() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
 
         for i in 1..=50u64 {
-            wal.append(&tenant, &part, payload(i)).await.unwrap();
+            wal.append(&project, &part, payload(i)).await.unwrap();
         }
         wal.flush().await.unwrap();
 
-        let all = wal.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(all.len(), 50);
         for (i, e) in all.iter().enumerate() {
             assert_eq!(e.lsn, Lsn((i + 1) as u64));
         }
 
-        let tail = wal.read_from(&tenant, &part, Lsn(25)).await.unwrap();
+        let tail = wal.read_from(&project, &part, Lsn(25)).await.unwrap();
         assert_eq!(tail.len(), 25);
         for e in &tail {
             assert!(e.lsn > Lsn(25));
@@ -570,23 +570,23 @@ mod tests {
     async fn high_water_tracks_appends() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
 
-        assert_eq!(wal.high_water(&tenant, &part).await.unwrap(), Lsn::ZERO);
+        assert_eq!(wal.high_water(&project, &part).await.unwrap(), Lsn::ZERO);
         for i in 1..=20u64 {
-            let lsn = wal.append(&tenant, &part, payload(i)).await.unwrap();
-            assert_eq!(wal.high_water(&tenant, &part).await.unwrap(), lsn);
+            let lsn = wal.append(&project, &part, payload(i)).await.unwrap();
+            assert_eq!(wal.high_water(&project, &part).await.unwrap(), lsn);
         }
         wal.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn tenant_isolation() {
+    async fn project_isolation() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let part = PartitionKey::default_key();
 
         for i in 1..=10u64 {
@@ -602,10 +602,10 @@ mod tests {
         assert_eq!(a_all.len(), 10);
         assert_eq!(b_all.len(), 20);
         for e in &a_all {
-            assert_eq!(e.tenant, a);
+            assert_eq!(e.project, a);
         }
         for e in &b_all {
-            assert_eq!(e.tenant, b);
+            assert_eq!(e.project, b);
         }
         wal.close().await.unwrap();
     }
@@ -614,20 +614,20 @@ mod tests {
     async fn partition_isolation() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let p1 = PartitionKey::new("p1").unwrap();
         let p2 = PartitionKey::new("p2").unwrap();
 
         for i in 1..=15u64 {
-            wal.append(&tenant, &p1, payload(i)).await.unwrap();
+            wal.append(&project, &p1, payload(i)).await.unwrap();
         }
         for i in 1..=25u64 {
-            wal.append(&tenant, &p2, payload(i)).await.unwrap();
+            wal.append(&project, &p2, payload(i)).await.unwrap();
         }
         wal.flush().await.unwrap();
 
-        let p1_all = wal.read_from(&tenant, &p1, Lsn::ZERO).await.unwrap();
-        let p2_all = wal.read_from(&tenant, &p2, Lsn::ZERO).await.unwrap();
+        let p1_all = wal.read_from(&project, &p1, Lsn::ZERO).await.unwrap();
+        let p2_all = wal.read_from(&project, &p2, Lsn::ZERO).await.unwrap();
         assert_eq!(p1_all.len(), 15);
         assert_eq!(p2_all.len(), 25);
         for e in &p1_all {
@@ -642,21 +642,21 @@ mod tests {
     #[tokio::test]
     async fn recovery_after_reopen() {
         let dir = TempDir::new().unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
 
         {
             let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
             for i in 1..=30u64 {
-                wal.append(&tenant, &part, payload(i)).await.unwrap();
+                wal.append(&project, &part, payload(i)).await.unwrap();
             }
             wal.flush().await.unwrap();
             wal.close().await.unwrap();
         }
 
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        assert_eq!(wal.high_water(&tenant, &part).await.unwrap(), Lsn(30));
-        let all = wal.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(wal.high_water(&project, &part).await.unwrap(), Lsn(30));
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(all.len(), 30);
         for (i, e) in all.iter().enumerate() {
             assert_eq!(e.lsn, Lsn((i + 1) as u64));
@@ -668,21 +668,21 @@ mod tests {
     async fn truncate_removes_segments() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
 
         // Two segments: flush after 25 to force a segment boundary.
         for i in 1..=25u64 {
-            wal.append(&tenant, &part, payload(i)).await.unwrap();
+            wal.append(&project, &part, payload(i)).await.unwrap();
         }
         wal.flush().await.unwrap();
         for i in 26..=50u64 {
-            wal.append(&tenant, &part, payload(i)).await.unwrap();
+            wal.append(&project, &part, payload(i)).await.unwrap();
         }
         wal.flush().await.unwrap();
 
-        wal.truncate(&tenant, &part, Lsn(25)).await.unwrap();
-        let remaining = wal.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+        wal.truncate(&project, &part, Lsn(25)).await.unwrap();
+        let remaining = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(remaining.len(), 25);
         for e in &remaining {
             assert!(e.lsn > Lsn(25));
@@ -694,16 +694,16 @@ mod tests {
     async fn flush_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
 
         for i in 1..=10u64 {
-            wal.append(&tenant, &part, payload(i)).await.unwrap();
+            wal.append(&project, &part, payload(i)).await.unwrap();
         }
         wal.flush().await.unwrap();
         wal.flush().await.unwrap();
 
-        let all = wal.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(all.len(), 10);
         wal.close().await.unwrap();
     }
@@ -712,7 +712,7 @@ mod tests {
     async fn concurrent_append_serialised() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
 
         let start = Instant::now();
@@ -722,7 +722,7 @@ mod tests {
             let part = part.clone();
             handles.push(tokio::spawn(async move {
                 for i in 0..100u64 {
-                    wal.append(&tenant, &part, payload(i)).await.unwrap();
+                    wal.append(&project, &part, payload(i)).await.unwrap();
                 }
             }));
         }
@@ -733,7 +733,7 @@ mod tests {
         let elapsed = start.elapsed();
         eprintln!("concurrent_append_serialised: 1000 appends in {elapsed:?}");
 
-        let all = wal.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(all.len(), 1000);
         let mut seen: std::collections::HashSet<Lsn> = std::collections::HashSet::new();
         for e in &all {
@@ -750,13 +750,13 @@ mod tests {
     async fn bench_10k_writes() {
         let dir = TempDir::new().unwrap();
         let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let part = PartitionKey::default_key();
         let body = vec![0u8; 256];
 
         let start = Instant::now();
         for _ in 0..10_000 {
-            wal.append(&tenant, &part, Bytes::from(body.clone()))
+            wal.append(&project, &part, Bytes::from(body.clone()))
                 .await
                 .unwrap();
         }

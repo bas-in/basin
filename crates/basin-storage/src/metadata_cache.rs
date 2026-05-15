@@ -48,8 +48,8 @@ use parquet::file::metadata::ParquetMetaData;
 
 /// One entry: parsed parquet metadata plus the underlying file size in
 /// bytes. Caching the size lets the read path skip a `HEAD` round-trip on
-/// every cache hit, which matters under heavy multi-tenant pressure where
-/// a quiet tenant's point query would otherwise be one HEAD + one GET per
+/// every cache hit, which matters under heavy multi-project pressure where
+/// a quiet project's point query would otherwise be one HEAD + one GET per
 /// file.
 #[derive(Clone)]
 pub(crate) struct CachedParquetMeta {

@@ -36,8 +36,8 @@ These are tested in `tests/integration/tests/security.rs` and the suite
 must remain green for any release to ship. If you find a way to violate
 any of these, that's a P0 vulnerability.
 
-- **Cross-tenant data isolation.** No SQL path on a `TenantSession`
-  exposes another tenant's data. Bucket prefix isolation is enforced at
+- **Cross-project data isolation.** No SQL path on a `ProjectSession`
+  exposes another project's data. Bucket prefix isolation is enforced at
   the `basin-storage` API boundary, not at call sites.
 - **RLS bypass via UNION / CTE / subquery.** RLS predicate injection
   walks every query shape that can hide a `TableScan`:
@@ -47,13 +47,13 @@ any of these, that's a P0 vulnerability.
 - **pgwire SQL injection.** Both simple-query and extended-bind paths
   parameterise correctly; literal values arrive in `Bind` slots, not
   spliced into SQL strings.
-- **Path injection.** `TableName`, `TenantId`, `PartitionKey` constructors
+- **Path injection.** `TableName`, `ProjectId`, `PartitionKey` constructors
   reject `..`, `/`, and other traversal characters. `BASIN_COPY_PATH_ALLOWLIST`
   defaults to deny-all for `COPY … FROM/TO '<path>'`.
-- **Cross-tenant fork.** `Catalog::fork_table` is structurally
-  same-tenant only; cross-tenant fork is rejected at the API.
+- **Cross-project fork.** `Catalog::fork_table` is structurally
+  same-project only; cross-project fork is rejected at the API.
 - **Rate limit enforcement.** pgwire and basin-net both enforce
-  per-tenant rate limits via `governor` token-buckets; bucket-empty maps
+  per-project rate limits via `governor` token-buckets; bucket-empty maps
   to PG SQLSTATE `53400`.
 
 ## Secret handling

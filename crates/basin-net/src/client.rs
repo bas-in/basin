@@ -1,4 +1,4 @@
-//! Synchronous HTTP client. Wraps `reqwest::Client` plus the per-tenant
+//! Synchronous HTTP client. Wraps `reqwest::Client` plus the per-project
 //! [`AllowList`] / [`RateLimit`] / [`GuardConfig`] gates.
 //!
 //! Each call funnels through [`HttpClient::send`], which is the single
@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use reqwest::Method;
 use tokio::time::timeout;
 
@@ -78,28 +78,28 @@ impl HttpClient {
         &self.inner.cfg
     }
 
-    /// Convenience: opt `host` into `tenant`'s allowlist. Equivalent to
+    /// Convenience: opt `host` into `project`'s allowlist. Equivalent to
     /// `INSERT INTO _net_allowed_hosts VALUES ('host')` once the SQL
     /// surface lands.
-    pub async fn allow_host(&self, tenant: &TenantId, host: impl Into<String>) {
-        self.inner.allow.allow(tenant, host).await;
+    pub async fn allow_host(&self, project: &ProjectId, host: impl Into<String>) {
+        self.inner.allow.allow(project, host).await;
     }
 
     /// `http_get(url)` — synchronous GET. Mirrors the Postgres `http`
     /// extension's signature.
-    pub async fn http_get(&self, tenant: &TenantId, url: &str) -> Result<HttpResponse, HttpError> {
-        self.send(tenant, &HttpRequest::get(url)).await
+    pub async fn http_get(&self, project: &ProjectId, url: &str) -> Result<HttpResponse, HttpError> {
+        self.send(project, &HttpRequest::get(url)).await
     }
 
     /// `http_post(url, body, content_type)` — synchronous POST.
     pub async fn http_post(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         url: &str,
         body: impl Into<Vec<u8>>,
         content_type: &str,
     ) -> Result<HttpResponse, HttpError> {
-        self.send(tenant, &HttpRequest::post(url, body, content_type))
+        self.send(project, &HttpRequest::post(url, body, content_type))
             .await
     }
 
@@ -113,13 +113,13 @@ impl HttpClient {
     /// 5. Body cap on the *response*.
     pub async fn send(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         req: &HttpRequest,
     ) -> Result<HttpResponse, HttpError> {
         // 1. Allowlist.
-        self.inner.allow.check(tenant, &req.url).await?;
+        self.inner.allow.check(project, &req.url).await?;
         // 2. Rate limit.
-        self.inner.rate.check(tenant)?;
+        self.inner.rate.check(project)?;
         // 3. Outgoing body cap.
         if let Some(b) = &req.body {
             if b.len() > self.inner.cfg.max_body_bytes {

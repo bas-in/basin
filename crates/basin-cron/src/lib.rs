@@ -2,9 +2,9 @@
 //!
 //! Apps using PostgreSQL's [`pg_cron`](https://github.com/citusdata/pg_cron)
 //! extension drop in here. The scheduler ticks once a minute, scans every
-//! resident tenant's `cron.job` table for due rows, and runs each due job's
-//! SQL through the same per-tenant `Engine::open_session` path a user query
-//! would take. Job runs are recorded in the per-tenant `cron.job_run_details`
+//! resident project's `cron.job` table for due rows, and runs each due job's
+//! SQL through the same per-project `Engine::open_session` path a user query
+//! would take. Job runs are recorded in the per-project `cron.job_run_details`
 //! audit table.
 //!
 //! ## SQL surface (matches pg_cron)
@@ -19,15 +19,15 @@
 //!
 //! In v0.1 the SQL surface is exposed as Rust API on [`CronStore`] only;
 //! [`CronStore::schedule`] / [`CronStore::unschedule`] under the hood lower
-//! to plain `INSERT`/`DELETE` against the per-tenant `cron.job` table, so
-//! they share the same RLS/tenant-isolation guarantees as user SQL. A SQL
+//! to plain `INSERT`/`DELETE` against the per-project `cron.job` table, so
+//! they share the same RLS/project-isolation guarantees as user SQL. A SQL
 //! call-site rewriter that intercepts `SELECT cron.schedule(...)` is the
 //! follow-on work; see the crate-level TODOs.
 //!
-//! ## Per-tenant guardrails
+//! ## Per-project guardrails
 //!
-//! - Hard cap on jobs per tenant ([`CronStore::MAX_JOBS_PER_TENANT`], 100).
-//! - Per-tenant per-minute rate limit ([`CronRunner::PER_MINUTE_RATE_LIMIT`],
+//! - Hard cap on jobs per project ([`CronStore::MAX_JOBS_PER_PROJECT`], 100).
+//! - Per-project per-minute rate limit ([`CronRunner::PER_MINUTE_RATE_LIMIT`],
 //!   60). Once the budget is exhausted in a 60-second window, additional due
 //!   jobs are recorded with status `rate_limited` and skipped until the
 //!   window slides.
@@ -36,10 +36,10 @@
 //!
 //! ## Isolation
 //!
-//! Per-tenant `cron.job` tables live inside the tenant's namespace. Tenant A
-//! cannot see, schedule against, or run B's jobs. The runner walks tenants
-//! one at a time; each tenant's job set is read and executed under that
-//! tenant's session.
+//! Per-project `cron.job` tables live inside the project's namespace. Project A
+//! cannot see, schedule against, or run B's jobs. The runner walks projects
+//! one at a time; each project's job set is read and executed under that
+//! project's session.
 
 #![forbid(unsafe_code)]
 

@@ -5,13 +5,13 @@
 //! optional `WHEN` predicate; both can reference `NEW.col` / `OLD.col` /
 //! `TG_OP` / `TG_TABLE_NAME` bind variables. On each `publish`:
 //!
-//! 1. `Catalog::lookup_reactors_for(tenant, table, op)` returns matching
+//! 1. `Catalog::lookup_reactors_for(project, table, op)` returns matching
 //!    reactors in registration order.
 //! 2. For each reactor:
 //!    - Substitute the bind variables into the predicate text and
 //!      evaluate it via the engine (`SELECT ((predicate))::BOOLEAN`).
 //!    - If the predicate fires (or is absent), substitute into the body
-//!      text and execute it through the engine on a fresh tenant
+//!      text and execute it through the engine on a fresh project
 //!      session.
 //! 3. Any `Err` short-circuits and propagates up; Tier 0's
 //!    `dispatch_pre_commit` rolls back the source mutation. PG
@@ -70,7 +70,7 @@ impl ReactorSink {
     }
 
     /// Open a session as the engine and run one SQL statement against
-    /// the tenant of `event`. We use `open_session_as` with the event's
+    /// the project of `event`. We use `open_session_as` with the event's
     /// `causation_user` so RLS evaluation inside the reactor body sees
     /// the same principal that triggered the source mutation.
     async fn run_sql(&self, event: &ChangeEvent, sql: &str) -> Result<ExecResult> {
@@ -83,7 +83,7 @@ impl ReactorSink {
             .causation_user
             .clone()
             .unwrap_or_else(|| crate::ANONYMOUS_USER.to_string());
-        let session = engine.open_session_as(event.tenant, user).await?;
+        let session = engine.open_session_as(event.project, user).await?;
         session.execute(sql).await
     }
 
@@ -134,7 +134,7 @@ impl ChangeEventSink for ReactorSink {
     async fn publish(&self, event: &ChangeEvent) -> Result<()> {
         let reactors = self
             .catalog
-            .lookup_reactors_for(&event.tenant, &event.table, event.op)
+            .lookup_reactors_for(&event.project, &event.table, event.op)
             .await;
         if reactors.is_empty() {
             return Ok(());

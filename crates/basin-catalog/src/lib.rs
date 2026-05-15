@@ -18,9 +18,9 @@
 //! 3. [`RestCatalog`] — stub locking in the API shape; implemented in a later
 //!    phase against a real Iceberg REST catalog (Lakekeeper et al).
 //!
-//! Tenant scoping is part of the API: every method takes a [`TenantId`].
-//! There is intentionally no method that lists or enumerates across tenants;
-//! a future cross-tenant admin path will be a separate, capability-gated
+//! Project scoping is part of the API: every method takes a [`ProjectId`].
+//! There is intentionally no method that lists or enumerates across projects;
+//! a future cross-project admin path will be a separate, capability-gated
 //! interface.
 
 #![forbid(unsafe_code)]
@@ -37,11 +37,11 @@ mod reactors;
 mod rest;
 mod sequences;
 mod snapshot;
-mod tenant_storage_config;
+mod project_storage_config;
 mod views;
 
 use async_trait::async_trait;
-use basin_common::{ChangeOp, Result, TableName, TenantId};
+use basin_common::{ChangeOp, Result, TableName, ProjectId};
 
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
@@ -59,13 +59,13 @@ pub use reactors::{ReactorDef, ReactorError, ReactorOps};
 pub use rest::RestCatalog;
 pub use sequences::SequenceDef;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
-pub use tenant_storage_config::TenantStorageConfig;
+pub use project_storage_config::ProjectStorageConfig;
 pub use views::ViewDef;
 
 /// One row in the project-wide snapshot timeline returned by
 /// [`Catalog::list_snapshots_project_wide`]. Carries enough context (table,
 /// snapshot id, parent, commit time, summary) to render a unified
-/// migration-history view across every table a tenant owns.
+/// migration-history view across every table a project owns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSnapshotEntry {
     pub table: TableName,
@@ -89,74 +89,74 @@ pub struct ProjectSnapshotDiff {
     pub created_in_window: Vec<TableName>,
 }
 
-/// Iceberg-style catalog client. Every operation is tenant-scoped.
+/// Iceberg-style catalog client. Every operation is project-scoped.
 ///
 /// Implementations must be `Send + Sync` so a single instance can be cloned
 /// (or wrapped in [`std::sync::Arc`]) and shared across the shard owner,
 /// the router, and the analytical pool.
 #[async_trait]
 pub trait Catalog: Send + Sync {
-    /// Idempotently create the namespace for `tenant`. Catalog implementations
-    /// model a tenant as an Iceberg namespace (e.g. `tenants.<ulid>`).
-    async fn create_namespace(&self, tenant: &TenantId) -> Result<()>;
+    /// Idempotently create the namespace for `project`. Catalog implementations
+    /// model a project as an Iceberg namespace (e.g. `projects.<ulid>`).
+    async fn create_namespace(&self, project: &ProjectId) -> Result<()>;
 
     /// Create a new empty table. Returns the freshly minted metadata, including
     /// the genesis snapshot (id 0, no data files).
     async fn create_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         schema: &arrow_schema::Schema,
     ) -> Result<TableMetadata>;
 
-    /// Load the current metadata for `(tenant, table)`. Returns
+    /// Load the current metadata for `(project, table)`. Returns
     /// [`basin_common::BasinError::NotFound`] if the table does not exist.
-    async fn load_table(&self, tenant: &TenantId, table: &TableName) -> Result<TableMetadata>;
+    async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata>;
 
     /// Drop the table. Does not delete the underlying object-store data; that
     /// is the storage layer's responsibility (and may be deferred for
     /// time-travel / point-in-time-restore in Phase 6).
-    async fn drop_table(&self, tenant: &TenantId, table: &TableName) -> Result<()>;
+    async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()>;
 
-    /// Rename `(tenant, old)` to `(tenant, new)`. Used by
+    /// Rename `(project, old)` to `(project, new)`. Used by
     /// `ALTER TABLE … RENAME TO`. The table's identity (snapshot history,
     /// constraints, partition spec, etc.) is preserved — only the key
     /// changes. Returns [`basin_common::BasinError::NotFound`] if `old`
-    /// does not exist for `tenant`, [`basin_common::BasinError::Catalog`]
+    /// does not exist for `project`, [`basin_common::BasinError::Catalog`]
     /// if `new` is already taken. Default impl returns
     /// `Internal("not implemented")` so the stub `RestCatalog` stays
     /// buildable; in-memory and Postgres backends override.
     async fn rename_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         old: &TableName,
         new: &TableName,
     ) -> Result<()> {
-        let _ = (tenant, old, new);
+        let _ = (project, old, new);
         Err(basin_common::BasinError::Internal(
             "rename_table not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Tables visible to `tenant`. By construction this is *only* `tenant`'s
-    /// tables — there is no cross-tenant variant in this trait.
-    async fn list_tables(&self, tenant: &TenantId) -> Result<Vec<TableName>>;
+    /// Tables visible to `project`. By construction this is *only* `project`'s
+    /// tables — there is no cross-project variant in this trait.
+    async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>>;
 
-    /// Drop every catalog row owned by `tenant`: tables, snapshots, and the
+    /// Drop every catalog row owned by `project`: tables, snapshots, and the
     /// namespace itself. Does **not** delete the underlying object-store
     /// bytes; that is the storage layer's job. The default implementation
     /// iterates `list_tables` and calls `drop_table` on each; backends that
-    /// can issue a single statement (Postgres `DELETE … WHERE tenant_id = …`)
+    /// can issue a single statement (Postgres `DELETE … WHERE project_id = …`)
     /// override for one round-trip instead of N.
     ///
-    /// Idempotent: calling on a tenant with no tables / no namespace row is
-    /// a no-op (returns Ok). The engine's tenant-deletion path calls this
+    /// Idempotent: calling on a project with no tables / no namespace row is
+    /// a no-op (returns Ok). The engine's project-deletion path calls this
     /// last, after the storage bytes are gone.
-    async fn drop_namespace(&self, tenant: &TenantId) -> Result<()> {
-        let tables = self.list_tables(tenant).await?;
+    async fn drop_namespace(&self, project: &ProjectId) -> Result<()> {
+        let tables = self.list_tables(project).await?;
         for table in tables {
             // Drop best-effort: a NotFound from a racing dropper is fine.
-            match self.drop_table(tenant, &table).await {
+            match self.drop_table(project, &table).await {
                 Ok(()) => {}
                 Err(basin_common::BasinError::NotFound(_)) => {}
                 Err(e) => return Err(e),
@@ -165,26 +165,26 @@ pub trait Catalog: Send + Sync {
         Ok(())
     }
 
-    /// Enumerate every data file currently catalogued for `tenant`. The
+    /// Enumerate every data file currently catalogued for `project`. The
     /// returned set is the union of `DataFileRef`s recorded across every
-    /// snapshot of every table the tenant owns; in the snapshot-delta model
+    /// snapshot of every table the project owns; in the snapshot-delta model
     /// this is a *superset* of the live file set (paths swapped out by
     /// `replace_data_files` may still appear). For deletion that's fine —
     /// `DeleteObjects` is idempotent on already-deleted keys. Higher-level
     /// readers should keep using `list_data_files`, which goes through the
     /// LIST RPC and sees only physically-present files.
     ///
-    /// Used by `Storage::delete_tenant` to skip the LIST RPC for the bulk
+    /// Used by `Storage::delete_project` to skip the LIST RPC for the bulk
     /// of the bytes; a follow-up LIST mops up files the catalog doesn't
     /// know about (HNSW segments, orphans).
     ///
     /// Default impl: iterate `list_tables` then `load_table` per table.
     /// Postgres can do this in a single SELECT joining the snapshots table.
-    async fn list_tenant_data_files(&self, tenant: &TenantId) -> Result<Vec<DataFileRef>> {
-        let tables = self.list_tables(tenant).await?;
+    async fn list_project_data_files(&self, project: &ProjectId) -> Result<Vec<DataFileRef>> {
+        let tables = self.list_tables(project).await?;
         let mut out: Vec<DataFileRef> = Vec::new();
         for table in tables {
-            match self.load_table(tenant, &table).await {
+            match self.load_table(project, &table).await {
                 Ok(meta) => {
                     for snap in &meta.snapshots {
                         out.extend(snap.data_files.iter().cloned());
@@ -205,7 +205,7 @@ pub trait Catalog: Send + Sync {
     /// reload and retry.
     async fn append_data_files(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         expected_snapshot: SnapshotId,
         files: Vec<DataFileRef>,
@@ -225,7 +225,7 @@ pub trait Catalog: Send + Sync {
     /// must come from a prior `load_table`).
     async fn replace_data_files(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         expected_snapshot: SnapshotId,
         removed_paths: Vec<String>,
@@ -234,9 +234,9 @@ pub trait Catalog: Send + Sync {
 
     /// Snapshots in commit order (oldest first). Used by point-in-time-restore
     /// and the analytical reader.
-    async fn list_snapshots(&self, tenant: &TenantId, table: &TableName) -> Result<Vec<Snapshot>>;
+    async fn list_snapshots(&self, project: &ProjectId, table: &TableName) -> Result<Vec<Snapshot>>;
 
-    /// Copy-on-write table fork. Creates `dst_table` for `tenant` as a
+    /// Copy-on-write table fork. Creates `dst_table` for `project` as a
     /// clone of `src_table`'s current state: same schema, same snapshot
     /// history (same `DataFileRef` paths), same partition / RLS / tier /
     /// bloom / row-group / CV settings. From this point forward the two
@@ -250,11 +250,11 @@ pub trait Catalog: Send + Sync {
     /// `replace_data_files`) produce new files referenced by only the
     /// writing side.
     ///
-    /// Tenant deletion is the safety boundary: `Storage::delete_tenant`
-    /// scans the catalog's full file list, so deleting a tenant
-    /// correctly removes only files referenced by that tenant. The
+    /// Project deletion is the safety boundary: `Storage::delete_project`
+    /// scans the catalog's full file list, so deleting a project
+    /// correctly removes only files referenced by that project. The
     /// shared-file design assumes both fork and source live under the
-    /// same tenant; cross-tenant forking is a v0.2 extension that needs
+    /// same project; cross-project forking is a v0.2 extension that needs
     /// a refcount-aware GC story.
     ///
     /// Errors:
@@ -267,25 +267,25 @@ pub trait Catalog: Send + Sync {
     ///   explicitly. The in-memory and Postgres backends override.
     async fn fork_table(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         src_table: &TableName,
         dst_table: &TableName,
     ) -> Result<TableMetadata> {
-        let _ = (tenant, src_table, dst_table);
+        let _ = (project, src_table, dst_table);
         Err(basin_common::BasinError::Internal(
             "fork_table not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Point-in-time restore: rewind `(tenant, table)` to `snapshot_id`,
+    /// Point-in-time restore: rewind `(project, table)` to `snapshot_id`,
     /// discarding any snapshots with `id > snapshot_id`. The current
     /// snapshot pointer becomes `snapshot_id`; subsequent commits chain
     /// off it. Returns the updated [`TableMetadata`].
     ///
     /// **Data files written between `snapshot_id` and the previous head
     /// are not deleted by this method** — they become catalog-orphans.
-    /// The compactor's orphan sweep (or `Storage::delete_tenant` on
-    /// tenant teardown) is the GC path. Reads after rollback see only
+    /// The compactor's orphan sweep (or `Storage::delete_project` on
+    /// project teardown) is the GC path. Reads after rollback see only
     /// files referenced by snapshots `≤ snapshot_id`, so the orphans are
     /// invisible to queries.
     ///
@@ -302,18 +302,18 @@ pub trait Catalog: Send + Sync {
     ///   explicitly. The in-memory and Postgres backends override.
     async fn rollback_to_snapshot(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         snapshot_id: SnapshotId,
     ) -> Result<TableMetadata> {
-        let _ = (tenant, table, snapshot_id);
+        let _ = (project, table, snapshot_id);
         Err(basin_common::BasinError::Internal(
             "rollback_to_snapshot not implemented for this catalog backend".into(),
         ))
     }
 
     /// Project-wide snapshot listing: every (table, snapshot_id, committed_at,
-    /// summary) row across all tables this tenant owns, sorted by
+    /// summary) row across all tables this project owns, sorted by
     /// `committed_at` ascending. Used by the migration UI / `basinctl
     /// migrations list` to show one timeline for the whole project.
     ///
@@ -322,14 +322,14 @@ pub trait Catalog: Send + Sync {
     /// Postgres backend overrides to a single `SELECT … ORDER BY committed_at`.
     async fn list_snapshots_project_wide(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<Vec<ProjectSnapshotEntry>> {
-        let tables = self.list_tables(tenant).await?;
+        let tables = self.list_tables(project).await?;
         let mut out: Vec<ProjectSnapshotEntry> = Vec::new();
         for table in tables {
-            // Skip tables that vanished mid-iteration; tenant-scoped racing
+            // Skip tables that vanished mid-iteration; project-scoped racing
             // drops shouldn't poison the listing.
-            match self.list_snapshots(tenant, &table).await {
+            match self.list_snapshots(project, &table).await {
                 Ok(snaps) => {
                     for s in snaps {
                         out.push(ProjectSnapshotEntry {
@@ -366,11 +366,11 @@ pub trait Catalog: Send + Sync {
     /// diff.
     async fn diff_snapshots(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         from: chrono::DateTime<chrono::Utc>,
         to: chrono::DateTime<chrono::Utc>,
     ) -> Result<ProjectSnapshotDiff> {
-        let all = self.list_snapshots_project_wide(tenant).await?;
+        let all = self.list_snapshots_project_wide(project).await?;
         let mut per_table: std::collections::BTreeMap<TableName, Vec<ProjectSnapshotEntry>> =
             std::collections::BTreeMap::new();
         let mut created_in_window: Vec<TableName> = Vec::new();
@@ -413,13 +413,13 @@ pub trait Catalog: Send + Sync {
     /// error list.
     async fn rollback_to_snapshot_project_wide(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         as_of: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<(TableName, SnapshotId)>> {
-        let tables = self.list_tables(tenant).await?;
+        let tables = self.list_tables(project).await?;
         let mut out: Vec<(TableName, SnapshotId)> = Vec::new();
         for table in tables {
-            let snaps = match self.list_snapshots(tenant, &table).await {
+            let snaps = match self.list_snapshots(project, &table).await {
                 Ok(s) => s,
                 Err(basin_common::BasinError::NotFound(_)) => continue,
                 Err(e) => return Err(e),
@@ -432,13 +432,13 @@ pub trait Catalog: Send + Sync {
                 .max_by_key(|s| s.committed_at);
             let Some(target) = target else { continue };
             let target_id = target.id;
-            let meta = self.rollback_to_snapshot(tenant, &table, target_id).await?;
+            let meta = self.rollback_to_snapshot(project, &table, target_id).await?;
             out.push((table, meta.current_snapshot));
         }
         Ok(out)
     }
 
-    /// Set the partitioning declared for `(tenant, table)`. The engine calls
+    /// Set the partitioning declared for `(project, table)`. The engine calls
     /// this after a `CREATE TABLE … PARTITION BY …` so subsequent INSERTs
     /// see the spec via [`load_table`](Catalog::load_table).
     ///
@@ -448,12 +448,12 @@ pub trait Catalog: Send + Sync {
     /// catalog's "store whatever you're told" trapdoor.
     async fn set_partition_spec(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         spec: PartitionSpec,
     ) -> Result<()>;
 
-    /// Replace the full RLS state for `(tenant, table)`. The engine collapses
+    /// Replace the full RLS state for `(project, table)`. The engine collapses
     /// `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` and every
     /// `CREATE/ALTER/DROP POLICY` into one of these calls so the catalog
     /// has a single, atomic write surface for the policy set. Default impl
@@ -461,28 +461,28 @@ pub trait Catalog: Send + Sync {
     /// in-memory and Postgres backends override this.
     async fn set_rls_state(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         rls_enabled: bool,
         policies: Vec<Policy>,
     ) -> Result<()> {
-        let _ = (tenant, table, rls_enabled, policies);
+        let _ = (project, table, rls_enabled, policies);
         Ok(())
     }
 
-    /// Set the tiered-storage age policy for `(tenant, table)`. The compactor
+    /// Set the tiered-storage age policy for `(project, table)`. The compactor
     /// reads this on its periodic sweep. Passing `cold_after_seconds = None`
     /// disables the policy (the default). Default impl is a no-op so the
     /// stub `RestCatalog` and any future backends stay buildable; the
     /// in-memory and Postgres implementations override this.
     async fn set_tier_policy(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         cold_after_seconds: Option<u64>,
         cold_age_column: Option<String>,
     ) -> Result<()> {
-        let _ = (tenant, table, cold_after_seconds, cold_age_column);
+        let _ = (project, table, cold_after_seconds, cold_age_column);
         Ok(())
     }
 
@@ -497,15 +497,15 @@ pub trait Catalog: Send + Sync {
     /// override this.
     async fn set_bloom_filter_columns(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let _ = (tenant, table, columns);
+        let _ = (project, table, columns);
         Ok(())
     }
 
-    /// Override the writer's `max_row_group_size` for `(tenant, table)`.
+    /// Override the writer's `max_row_group_size` for `(project, table)`.
     /// `Some(n)` makes the next write group rows in chunks of `n`;
     /// `None` (the default) restores the writer-global default. The
     /// engine consults this on every INSERT and passes the value via
@@ -515,11 +515,11 @@ pub trait Catalog: Send + Sync {
     /// this. See `tests/integration/tests/viability_row_group_sizing.rs`.
     async fn set_row_group_rows(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         rows: Option<usize>,
     ) -> Result<()> {
-        let _ = (tenant, table, rows);
+        let _ = (project, table, rows);
         Ok(())
     }
 
@@ -537,16 +537,16 @@ pub trait Catalog: Send + Sync {
     /// stay buildable.
     async fn set_schema(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         schema: arrow_schema::Schema,
     ) -> Result<()> {
-        let _ = (tenant, table, schema);
+        let _ = (project, table, schema);
         Ok(())
     }
 
     /// Replace the continuous-aggregate definition (or clear it with `None`)
-    /// for `(tenant, table)`. The `basin-cv` refresher writes back a fresh
+    /// for `(project, table)`. The `basin-cv` refresher writes back a fresh
     /// `CvDef` each tick (with updated `last_refreshed_at_unix_ms` /
     /// `last_bucket_max_unix_ms`). Default impl is a no-op so the stub
     /// `RestCatalog` and any future backend stay buildable; the in-memory
@@ -554,15 +554,15 @@ pub trait Catalog: Send + Sync {
     /// for the refresh / read-path semantics.
     async fn set_continuous_aggregate(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         def: Option<metadata::CvDef>,
     ) -> Result<()> {
-        let _ = (tenant, table, def);
+        let _ = (project, table, def);
         Ok(())
     }
 
-    /// Phase 5.7 B2: replace the cluster-column list for `(tenant, table)`.
+    /// Phase 5.7 B2: replace the cluster-column list for `(project, table)`.
     /// Empty `columns` clears the cluster spec. The writer reads this on
     /// every put and physically sorts the batch by these columns before
     /// flushing to Parquet, so combined with A3 bloom filters and A4
@@ -572,15 +572,15 @@ pub trait Catalog: Send + Sync {
     /// and Postgres backends override this.
     async fn set_cluster_columns(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let _ = (tenant, table, columns);
+        let _ = (project, table, columns);
         Ok(())
     }
 
-    /// Phase 6 multi-region scaffolding (ADR 0009). Pin `(tenant, table)`
+    /// Phase 6 multi-region scaffolding (ADR 0009). Pin `(project, table)`
     /// to a home region (or clear the pin with `None`). v0.1 only
     /// *records* the value; the cross-region routing / replication that
     /// will eventually consume it is future work per ADR 0009. Default
@@ -588,15 +588,15 @@ pub trait Catalog: Send + Sync {
     /// stay buildable; the in-memory and Postgres backends override.
     async fn set_home_region(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         region: Option<String>,
     ) -> Result<()> {
-        let _ = (tenant, table, region);
+        let _ = (project, table, region);
         Ok(())
     }
 
-    /// Phase 5.7 B1: declare a per-tenant secondary index on `(table, columns)`.
+    /// Phase 5.7 B1: declare a per-project secondary index on `(table, columns)`.
     /// The catalog records the declaration; the storage reader materialises
     /// the physical (value → file/row_group/row) map lazily on first query.
     /// Returns [`basin_common::BasinError::InvalidSchema`] if any column is not
@@ -608,13 +608,13 @@ pub trait Catalog: Send + Sync {
     /// override.
     async fn create_index(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         name: &str,
         columns: &[String],
         if_not_exists: bool,
     ) -> Result<()> {
-        let _ = (tenant, table, name, columns, if_not_exists);
+        let _ = (project, table, name, columns, if_not_exists);
         Err(basin_common::BasinError::Internal(
             "create_index not implemented for this catalog backend".into(),
         ))
@@ -624,8 +624,8 @@ pub trait Catalog: Send + Sync {
     /// Returns [`basin_common::BasinError::NotFound`] if no index with that
     /// name exists on the table. Default impl returns `Internal("not
     /// implemented")` so the stub `RestCatalog` stays buildable.
-    async fn drop_index(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
-        let _ = (tenant, table, name);
+    async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
+        let _ = (project, table, name);
         Err(basin_common::BasinError::Internal(
             "drop_index not implemented for this catalog backend".into(),
         ))
@@ -634,7 +634,7 @@ pub trait Catalog: Send + Sync {
     /// Register a `LANGUAGE sql` user-defined scalar function. The catalog
     /// stores the definition verbatim; the engine's inliner reparses the
     /// body on each call site. Idempotent in the sense that re-registering
-    /// the same `(tenant, name)` replaces the prior definition (matches
+    /// the same `(project, name)` replaces the prior definition (matches
     /// `CREATE OR REPLACE FUNCTION` semantics).
     ///
     /// Default impl returns `Internal("not implemented")`. The in-memory
@@ -648,34 +648,34 @@ pub trait Catalog: Send + Sync {
 
     /// Drop a previously-registered SQL function. Returns
     /// [`basin_common::BasinError::NotFound`] if no function with the
-    /// given `(tenant, name)` exists.
-    async fn drop_sql_function(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let _ = (tenant, name);
+    /// given `(project, name)` exists.
+    async fn drop_sql_function(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let _ = (project, name);
         Err(basin_common::BasinError::Internal(
             "drop_sql_function not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Look up a registered SQL function by `(tenant, name)`. Returns
-    /// `None` for both "tenant has no functions" and "name is unknown" —
+    /// Look up a registered SQL function by `(project, name)`. Returns
+    /// `None` for both "project has no functions" and "name is unknown" —
     /// callers can't distinguish, mirroring the lookup semantics of
     /// `load_table` for tables. Default impl returns `None`.
-    async fn lookup_sql_function(&self, tenant: &TenantId, name: &str) -> Option<SqlFunctionDef> {
-        let _ = (tenant, name);
+    async fn lookup_sql_function(&self, project: &ProjectId, name: &str) -> Option<SqlFunctionDef> {
+        let _ = (project, name);
         None
     }
 
-    /// List every SQL function registered for `tenant`. Order is
+    /// List every SQL function registered for `project`. Order is
     /// unspecified; callers that need a stable order should sort by
     /// `name`. Default impl returns an empty list.
-    async fn list_sql_functions(&self, tenant: &TenantId) -> Vec<SqlFunctionDef> {
-        let _ = tenant;
+    async fn list_sql_functions(&self, project: &ProjectId) -> Vec<SqlFunctionDef> {
+        let _ = project;
         Vec::new()
     }
 
-    /// Register a sequence under `(def.tenant, def.name)`. Returns
+    /// Register a sequence under `(def.project, def.name)`. Returns
     /// [`basin_common::BasinError::Catalog`] if a sequence with the same
-    /// `(tenant, name)` already exists; PG semantics treat
+    /// `(project, name)` already exists; PG semantics treat
     /// `CREATE SEQUENCE` as non-idempotent (use `CREATE SEQUENCE IF
     /// NOT EXISTS` at the SQL surface to opt into idempotency once
     /// that path lands). Returns [`basin_common::BasinError::InvalidSchema`]
@@ -691,24 +691,24 @@ pub trait Catalog: Send + Sync {
 
     /// Drop a previously-created sequence. Returns
     /// [`basin_common::BasinError::NotFound`] if no sequence with that
-    /// `(tenant, name)` exists. Default impl: not-implemented.
-    async fn drop_sequence(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let _ = (tenant, name);
+    /// `(project, name)` exists. Default impl: not-implemented.
+    async fn drop_sequence(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let _ = (project, name);
         Err(basin_common::BasinError::Internal(
             "drop_sequence not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Look up a registered sequence by `(tenant, name)`. Returns
+    /// Look up a registered sequence by `(project, name)`. Returns
     /// `None` when the sequence does not exist (mirrors the lookup
     /// shape of [`Catalog::lookup_sql_function`] and [`Catalog::load_table`]
     /// for the no-entry case). Default impl: `None`.
-    async fn lookup_sequence(&self, tenant: &TenantId, name: &str) -> Option<SequenceDef> {
-        let _ = (tenant, name);
+    async fn lookup_sequence(&self, project: &ProjectId, name: &str) -> Option<SequenceDef> {
+        let _ = (project, name);
         None
     }
 
-    /// Allocate and return the next value of `(tenant, name)`. The first
+    /// Allocate and return the next value of `(project, name)`. The first
     /// call after `create_sequence` returns `def.start`; subsequent calls
     /// step by `def.increment`. Concurrent callers always see distinct
     /// values — the per-sequence mutex serialises the increment.
@@ -716,8 +716,8 @@ pub trait Catalog: Send + Sync {
     /// registered under that name; [`basin_common::BasinError::Catalog`]
     /// when the sequence is exhausted (no-cycle and would cross
     /// `max_value` / `min_value`). Default impl: not-implemented.
-    async fn nextval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
-        let _ = (tenant, name);
+    async fn nextval(&self, project: &ProjectId, name: &str) -> Result<i64> {
+        let _ = (project, name);
         Err(basin_common::BasinError::Internal(
             "nextval not implemented for this catalog backend".into(),
         ))
@@ -733,8 +733,8 @@ pub trait Catalog: Send + Sync {
     /// [`basin_common::BasinError::NotFound`] when the sequence does
     /// not exist or has never been advanced. Default impl:
     /// not-implemented.
-    async fn currval(&self, tenant: &TenantId, name: &str) -> Result<i64> {
-        let _ = (tenant, name);
+    async fn currval(&self, project: &ProjectId, name: &str) -> Result<i64> {
+        let _ = (project, name);
         Err(basin_common::BasinError::Internal(
             "currval not implemented for this catalog backend".into(),
         ))
@@ -748,12 +748,12 @@ pub trait Catalog: Send + Sync {
     /// not-implemented.
     async fn setval(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         name: &str,
         value: i64,
         advance: bool,
     ) -> Result<i64> {
-        let _ = (tenant, name, value, advance);
+        let _ = (project, name, value, advance);
         Err(basin_common::BasinError::Internal(
             "setval not implemented for this catalog backend".into(),
         ))
@@ -761,13 +761,13 @@ pub trait Catalog: Send + Sync {
 
     /// Register a SQL-bodied reactor. The catalog stores the definition
     /// verbatim; the engine's `ReactorSink` reparses the body / predicate
-    /// on each fire. Re-registering the same `(tenant, table, name)` is
+    /// on each fire. Re-registering the same `(project, table, name)` is
     /// rejected — the SQL surface routes that case through `DROP REACTOR`
     /// + a fresh `register_reactor`.
     ///
     /// Validates: body parses as a single SQL statement, optional `WHEN`
     /// predicate parses as a SQL expression, `ops` is non-empty, name is
-    /// unique per `(tenant, table)`. Default impl returns
+    /// unique per `(project, table)`. Default impl returns
     /// `Internal("not implemented")`. The in-memory backend overrides;
     /// the Postgres backend will override when the durable reactor row
     /// lands (the SQL surface is held back per the 5.11.C scope split).
@@ -780,40 +780,40 @@ pub trait Catalog: Send + Sync {
 
     /// Drop a previously-registered reactor. Returns
     /// [`basin_common::BasinError::NotFound`] if no reactor with that
-    /// `(tenant, table, name)` exists.
-    async fn drop_reactor(&self, tenant: &TenantId, table: &TableName, name: &str) -> Result<()> {
-        let _ = (tenant, table, name);
+    /// `(project, table, name)` exists.
+    async fn drop_reactor(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
+        let _ = (project, table, name);
         Err(basin_common::BasinError::Internal(
             "drop_reactor not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Look up every reactor that should fire for `(tenant, table, op)`.
+    /// Look up every reactor that should fire for `(project, table, op)`.
     /// Order is registration order — `ReactorSink` invokes them in this
     /// sequence and short-circuits on the first error. Default impl
     /// returns an empty vec, so backends that haven't opted in see no
     /// reactor activity.
     async fn lookup_reactors_for(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         op: ChangeOp,
     ) -> Vec<ReactorDef> {
-        let _ = (tenant, table, op);
+        let _ = (project, table, op);
         Vec::new()
     }
 
-    /// List every reactor registered for `tenant` across all tables.
+    /// List every reactor registered for `project` across all tables.
     /// Order is unspecified; callers that need a stable order should
     /// sort by `(table, name)`. Default impl returns an empty list.
-    async fn list_reactors(&self, tenant: &TenantId) -> Vec<ReactorDef> {
-        let _ = tenant;
+    async fn list_reactors(&self, project: &ProjectId) -> Vec<ReactorDef> {
+        let _ = project;
         Vec::new()
     }
 
     /// Register a `CREATE TYPE … AS ENUM` declaration. Returns
     /// [`basin_common::BasinError::Catalog`] when the name collides
-    /// with an existing enum / domain for the same tenant, and
+    /// with an existing enum / domain for the same project, and
     /// [`basin_common::BasinError::InvalidSchema`] when the label
     /// list fails [`enums::validate_new`]. Default impl returns
     /// `Internal("not implemented")` so non-default backends opt in
@@ -825,10 +825,10 @@ pub trait Catalog: Send + Sync {
         ))
     }
 
-    /// Look up a registered enum by `(tenant, name)`. Returns `None`
+    /// Look up a registered enum by `(project, name)`. Returns `None`
     /// when the name does not resolve. Default impl: `None`.
-    async fn lookup_enum_type(&self, tenant: &TenantId, name: &str) -> Option<EnumTypeDef> {
-        let _ = (tenant, name);
+    async fn lookup_enum_type(&self, project: &ProjectId, name: &str) -> Option<EnumTypeDef> {
+        let _ = (project, name);
         None
     }
 
@@ -839,8 +839,8 @@ pub trait Catalog: Send + Sync {
     /// registered under that name, and
     /// [`basin_common::BasinError::Catalog`] when `value` already
     /// exists in the label list. Default impl: not-implemented.
-    async fn add_enum_value(&self, tenant: &TenantId, name: &str, value: &str) -> Result<()> {
-        let _ = (tenant, name, value);
+    async fn add_enum_value(&self, project: &ProjectId, name: &str, value: &str) -> Result<()> {
+        let _ = (project, name, value);
         Err(basin_common::BasinError::Internal(
             "add_enum_value not implemented for this catalog backend".into(),
         ))
@@ -852,24 +852,24 @@ pub trait Catalog: Send + Sync {
     /// least one table column still references the type — v0.1 has no
     /// CASCADE; the caller must drop the column(s) first. Default
     /// impl: not-implemented.
-    async fn drop_enum_type(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let _ = (tenant, name);
+    async fn drop_enum_type(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let _ = (project, name);
         Err(basin_common::BasinError::Internal(
             "drop_enum_type not implemented for this catalog backend".into(),
         ))
     }
 
-    /// List every enum registered for `tenant`. Order is unspecified;
+    /// List every enum registered for `project`. Order is unspecified;
     /// callers that need a stable order should sort by `name`. Default
     /// impl returns an empty list.
-    async fn list_enum_types(&self, tenant: &TenantId) -> Vec<EnumTypeDef> {
-        let _ = tenant;
+    async fn list_enum_types(&self, project: &ProjectId) -> Vec<EnumTypeDef> {
+        let _ = project;
         Vec::new()
     }
 
     /// Register a `CREATE DOMAIN` declaration. Returns
     /// [`basin_common::BasinError::Catalog`] when the name collides
-    /// with an existing enum / domain for the same tenant, and
+    /// with an existing enum / domain for the same project, and
     /// [`basin_common::BasinError::InvalidSchema`] when the predicate
     /// fails to parse. Default impl: not-implemented.
     async fn register_domain(&self, def: DomainDef) -> Result<()> {
@@ -879,10 +879,10 @@ pub trait Catalog: Send + Sync {
         ))
     }
 
-    /// Look up a registered domain by `(tenant, name)`. Default impl:
+    /// Look up a registered domain by `(project, name)`. Default impl:
     /// `None`.
-    async fn lookup_domain(&self, tenant: &TenantId, name: &str) -> Option<DomainDef> {
-        let _ = (tenant, name);
+    async fn lookup_domain(&self, project: &ProjectId, name: &str) -> Option<DomainDef> {
+        let _ = (project, name);
         None
     }
 
@@ -890,29 +890,29 @@ pub trait Catalog: Send + Sync {
     /// [`basin_common::BasinError::NotFound`] when missing,
     /// [`basin_common::BasinError::Catalog`] when at least one table
     /// column still references the domain.
-    async fn drop_domain(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let _ = (tenant, name);
+    async fn drop_domain(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let _ = (project, name);
         Err(basin_common::BasinError::Internal(
             "drop_domain not implemented for this catalog backend".into(),
         ))
     }
 
-    /// List every domain registered for `tenant`. Default impl: empty.
-    async fn list_domains(&self, tenant: &TenantId) -> Vec<DomainDef> {
-        let _ = tenant;
+    /// List every domain registered for `project`. Default impl: empty.
+    async fn list_domains(&self, project: &ProjectId) -> Vec<DomainDef> {
+        let _ = project;
         Vec::new()
     }
 
-    /// List every sequence registered for `tenant`. Default impl: empty.
-    async fn list_sequences(&self, tenant: &TenantId) -> Vec<SequenceDef> {
-        let _ = tenant;
+    /// List every sequence registered for `project`. Default impl: empty.
+    async fn list_sequences(&self, project: &ProjectId) -> Vec<SequenceDef> {
+        let _ = project;
         Vec::new()
     }
 
     /// Register a `LANGUAGE sql` user-defined procedure. The catalog
     /// stores the definition verbatim; the engine reparses the body
     /// (and re-substitutes call-site arguments into each statement) on
-    /// every `CALL`. Re-registering the same `(tenant, name)` is
+    /// every `CALL`. Re-registering the same `(project, name)` is
     /// rejected — the SQL surface routes that case through `DROP
     /// PROCEDURE` + a fresh `register_procedure`.
     ///
@@ -927,83 +927,83 @@ pub trait Catalog: Send + Sync {
 
     /// Drop a previously-registered procedure. Returns
     /// [`basin_common::BasinError::NotFound`] if no procedure with that
-    /// `(tenant, name)` exists. Default impl: not-implemented.
-    async fn drop_procedure(&self, tenant: &TenantId, name: &str) -> Result<()> {
-        let _ = (tenant, name);
+    /// `(project, name)` exists. Default impl: not-implemented.
+    async fn drop_procedure(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let _ = (project, name);
         Err(basin_common::BasinError::Internal(
             "drop_procedure not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Look up a registered procedure by `(tenant, name)`. Returns
-    /// `None` for both "tenant has no procedures" and "name is
+    /// Look up a registered procedure by `(project, name)`. Returns
+    /// `None` for both "project has no procedures" and "name is
     /// unknown" — same lookup semantics as
     /// [`Catalog::lookup_sql_function`]. Default impl returns `None`.
-    async fn lookup_procedure(&self, tenant: &TenantId, name: &str) -> Option<SqlProcedureDef> {
-        let _ = (tenant, name);
+    async fn lookup_procedure(&self, project: &ProjectId, name: &str) -> Option<SqlProcedureDef> {
+        let _ = (project, name);
         None
     }
 
-    /// List every procedure registered for `tenant`. Order is
+    /// List every procedure registered for `project`. Order is
     /// unspecified; callers that need a stable order should sort by
     /// `name`. Default impl returns an empty list.
-    async fn list_procedures(&self, tenant: &TenantId) -> Vec<SqlProcedureDef> {
-        let _ = tenant;
+    async fn list_procedures(&self, project: &ProjectId) -> Vec<SqlProcedureDef> {
+        let _ = project;
         Vec::new()
     }
 
-    /// Persist `config` for `tenant`. Idempotent: a second call with the
-    /// same tenant replaces the prior config (mirrors the
+    /// Persist `config` for `project`. Idempotent: a second call with the
+    /// same project replaces the prior config (mirrors the
     /// `INSERT … ON CONFLICT DO UPDATE` shape of the durable backends).
     /// Read by the storage layer's encryption call path via
-    /// [`Catalog::get_tenant_storage_config`]; threaded into the
-    /// `EncryptionProvider` so external KMS adapters can route per-tenant
+    /// [`Catalog::get_project_storage_config`]; threaded into the
+    /// `EncryptionProvider` so external KMS adapters can route per-project
     /// CMK lookups without owning a registry of their own. Default impl
     /// returns `Internal("not implemented")` so non-default backends opt
     /// in explicitly.
-    async fn set_tenant_storage_config(
+    async fn set_project_storage_config(
         &self,
-        tenant: &TenantId,
-        config: TenantStorageConfig,
+        project: &ProjectId,
+        config: ProjectStorageConfig,
     ) -> Result<()> {
-        let _ = (tenant, config);
+        let _ = (project, config);
         Err(basin_common::BasinError::Internal(
-            "set_tenant_storage_config not implemented for this catalog backend".into(),
+            "set_project_storage_config not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Look up the persisted [`TenantStorageConfig`] for `tenant`.
+    /// Look up the persisted [`ProjectStorageConfig`] for `project`.
     /// Returns `None` when no config has been set — callers (the
-    /// encryption call path) interpret that as "no per-tenant routing,
+    /// encryption call path) interpret that as "no per-project routing,
     /// fall back to the provider's default behaviour". Default impl:
     /// `None`.
-    async fn get_tenant_storage_config(
+    async fn get_project_storage_config(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Option<TenantStorageConfig>> {
-        let _ = tenant;
+        project: &ProjectId,
+    ) -> Result<Option<ProjectStorageConfig>> {
+        let _ = project;
         Ok(None)
     }
 
     /// Persist the PRIMARY KEY column list, CHECK constraints, and
-    /// FOREIGN KEY definitions for `(tenant, table)`. Called by
+    /// FOREIGN KEY definitions for `(project, table)`. Called by
     /// `CREATE TABLE` after the table itself has been created. Empty
     /// vectors clear the corresponding constraint set. Default impl
     /// is a no-op so the stub `RestCatalog` and any future backend
     /// stay buildable; the in-memory and Postgres backends override.
     async fn set_table_constraints(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         pk_columns: Vec<String>,
         check_constraints: Vec<metadata::CheckConstraint>,
         foreign_keys: Vec<metadata::ForeignKeyDef>,
     ) -> Result<()> {
-        let _ = (tenant, table, pk_columns, check_constraints, foreign_keys);
+        let _ = (project, table, pk_columns, check_constraints, foreign_keys);
         Ok(())
     }
 
-    /// Persist the UNIQUE-constraint list for `(tenant, table)`. Called
+    /// Persist the UNIQUE-constraint list for `(project, table)`. Called
     /// by `CREATE TABLE` after the table has been created (only when at
     /// least one UNIQUE constraint was declared). An empty vector clears
     /// the set. Stored as a separate call from `set_table_constraints`
@@ -1012,11 +1012,11 @@ pub trait Catalog: Send + Sync {
     /// backend overrides.
     async fn set_unique_constraints(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         unique_constraints: Vec<metadata::UniqueConstraint>,
     ) -> Result<()> {
-        let _ = (tenant, table, unique_constraints);
+        let _ = (project, table, unique_constraints);
         Ok(())
     }
 
@@ -1032,22 +1032,22 @@ pub trait Catalog: Send + Sync {
 
     /// Drop a plain-view definition. Default impl returns
     /// `Internal("not implemented")`.
-    async fn drop_view(&self, tenant: &TenantId, name: &str, if_exists: bool) -> Result<()> {
-        let _ = (tenant, name, if_exists);
+    async fn drop_view(&self, project: &ProjectId, name: &str, if_exists: bool) -> Result<()> {
+        let _ = (project, name, if_exists);
         Err(basin_common::BasinError::Internal(
             "drop_view not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Look up a single view by (tenant, name). Default impl returns `None`.
-    async fn lookup_view(&self, tenant: &TenantId, name: &str) -> Option<ViewDef> {
-        let _ = (tenant, name);
+    /// Look up a single view by (project, name). Default impl returns `None`.
+    async fn lookup_view(&self, project: &ProjectId, name: &str) -> Option<ViewDef> {
+        let _ = (project, name);
         None
     }
 
-    /// List all views for `tenant`. Default impl returns an empty vec.
-    async fn list_views(&self, tenant: &TenantId) -> Vec<ViewDef> {
-        let _ = tenant;
+    /// List all views for `project`. Default impl returns an empty vec.
+    async fn list_views(&self, project: &ProjectId) -> Vec<ViewDef> {
+        let _ = project;
         vec![]
     }
 }

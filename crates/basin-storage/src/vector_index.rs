@@ -2,7 +2,7 @@
 //!
 //! Layout: every Parquet write that contains a `FixedSizeList<Float32>`
 //! column may produce a sibling `.hnsw` segment under
-//! `{tenant_prefix}/index/{column}.hnsw/{ulid}.hnsw`. The directory shape
+//! `{project_prefix}/index/{column}.hnsw/{ulid}.hnsw`. The directory shape
 //! mirrors the data-file-per-write convention so a future compactor can
 //! coalesce both sides as one operation.
 //!
@@ -12,7 +12,7 @@
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::DataType;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use basin_vector::{Distance, HnswIndex, HnswIndexBuilder};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -37,7 +37,7 @@ use crate::Storage;
 /// with — the index encodes it in its own header.
 pub(crate) async fn build_indexes_for_batch(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     batch: &RecordBatch,
     data_ulid: Ulid,
@@ -98,7 +98,7 @@ pub(crate) async fn build_indexes_for_batch(
         let index = builder.build();
         let key = index_segment_key(
             storage.root_prefix(),
-            tenant,
+            project,
             table,
             field.name(),
             data_ulid,
@@ -106,7 +106,7 @@ pub(crate) async fn build_indexes_for_batch(
         let mut buf: Vec<u8> = Vec::new();
         index.write_to(&mut buf)?;
         storage
-            .tenant_store(tenant)
+            .project_store(project)
             .put(&key, PutPayload::from_bytes(Bytes::from(buf)))
             .await
             .map_err(|e| BasinError::storage(format!("put hnsw {key}: {e}")))?;
@@ -122,7 +122,7 @@ pub struct VectorHit {
     pub distance: f32,
 }
 
-/// Search the HNSW segments for `(tenant, table, column)`, merging the per-
+/// Search the HNSW segments for `(project, table, column)`, merging the per-
 /// segment top-k into a global top-k by distance.
 ///
 /// `distance` is the metric the caller wants applied. The index file's own
@@ -132,22 +132,22 @@ pub struct VectorHit {
 /// silently get a different metric than they asked for.
 pub(crate) async fn vector_search(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     column: &str,
     query: &[f32],
     k: usize,
     distance: Distance,
 ) -> Result<Vec<VectorHit>> {
-    let prefix = column_index_prefix(storage.root_prefix(), tenant, table, column);
-    let store = storage.tenant_store(tenant);
+    let prefix = column_index_prefix(storage.root_prefix(), project, table, column);
+    let store = storage.project_store(project);
 
     // Build a map from data-file ULID to data-file path so we can return the
     // matching Parquet path with each hit. The two are linked by the shared
     // ULID embedded in both filenames.
     let mut data_paths: std::collections::HashMap<String, ObjectPath> =
         std::collections::HashMap::new();
-    for df in crate::reader::list_data_files(storage, tenant, table).await? {
+    for df in crate::reader::list_data_files(storage, project, table).await? {
         if let Some(stem) = df
             .path
             .as_ref()
@@ -231,18 +231,18 @@ pub(crate) async fn vector_search(
     Ok(hits)
 }
 
-/// `{root?}/tenants/{t}/tables/{tbl}/index/{col}.hnsw/`. Matches the layout
+/// `{root?}/projects/{t}/tables/{tbl}/index/{col}.hnsw/`. Matches the layout
 /// the ADR pins; the trailing `.hnsw/` is kept on the directory so listing
 /// for one column never picks up another column's segments.
 fn column_index_prefix(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     column: &str,
 ) -> ObjectPath {
     let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
-    p = p.child(crate::paths::TENANTS_SEGMENT);
-    p = p.child(tenant.as_prefix());
+    p = p.child(crate::paths::PROJECTS_SEGMENT);
+    p = p.child(project.as_prefix());
     p = p.child("tables");
     p = p.child(table.as_str());
     p = p.child("index");
@@ -251,16 +251,16 @@ fn column_index_prefix(
 
 fn index_segment_key(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     column: &str,
     file_id: Ulid,
 ) -> ObjectPath {
-    column_index_prefix(root, tenant, table, column).child(format!("{file_id}.hnsw"))
+    column_index_prefix(root, project, table, column).child(format!("{file_id}.hnsw"))
 }
 
 /// Public helper: given a data file path under the standard
-/// `tenants/{t}/tables/{tbl}/data/.../{ulid}.parquet` layout, return the
+/// `projects/{t}/tables/{tbl}/data/.../{ulid}.parquet` layout, return the
 /// HNSW sidecar path that *would* exist for `column` if that column had
 /// embeddings in this file. The engine uses this for best-effort cleanup
 /// after a copy-on-write rewrite drops the parent data file — stale
@@ -268,10 +268,10 @@ fn index_segment_key(
 /// segments) but they waste object-store quota over time.
 ///
 /// Returns `None` if the data path can't be parsed (e.g. a bare
-/// non-tenant path), so the caller can skip cleanup without an error.
+/// non-project path), so the caller can skip cleanup without an error.
 pub fn vector_index_segment_key_for_data_file(
     root: Option<&ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     column: &str,
     data_file_path: &str,
@@ -279,7 +279,7 @@ pub fn vector_index_segment_key_for_data_file(
     let last = data_file_path.rsplit('/').next()?;
     let stem = last.strip_suffix(".parquet")?;
     let ulid: Ulid = stem.parse().ok()?;
-    Some(index_segment_key(root, tenant, table, column, ulid))
+    Some(index_segment_key(root, project, table, column, ulid))
 }
 
 /// Map an index-segment path back to the source data-file path. Both files
@@ -301,7 +301,7 @@ mod tests {
     use arrow_array::types::Float32Type;
     use arrow_array::{FixedSizeListArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{PartitionKey, TableName, TenantId};
+    use basin_common::{PartitionKey, TableName, ProjectId};
     use basin_vector::Distance;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
@@ -353,14 +353,14 @@ mod tests {
             disk_cache: None,
             page_cache: None,
         });
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("docs").unwrap();
         let part = PartitionKey::default_key();
         let dim = 8usize;
 
         let batch = build_batch(0, 100, dim);
         storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
 
@@ -369,7 +369,7 @@ mod tests {
             .map(|d| (42_f32) * 0.001 + d as f32 * 0.01)
             .collect();
         let hits = storage
-            .vector_search(&tenant, &table, "embedding", &query, 5, Distance::L2)
+            .vector_search(&project, &table, "embedding", &query, 5, Distance::L2)
             .await
             .unwrap();
         assert!(!hits.is_empty(), "vector_search returned empty");

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, Int64Array, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -47,7 +47,7 @@ async fn open_engine() -> (TempDir, Engine) {
 
 /// Execute `sql`, expect exactly one row × one column. Return the single
 /// `ArrayRef` column from that batch so callers can downcast as needed.
-async fn single_col(sess: &basin_engine::TenantSession, sql: &str) -> arrow_array::ArrayRef {
+async fn single_col(sess: &basin_engine::ProjectSession, sql: &str) -> arrow_array::ArrayRef {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches
@@ -62,7 +62,7 @@ async fn single_col(sess: &basin_engine::TenantSession, sql: &str) -> arrow_arra
 }
 
 /// Execute `sql` and assert it completes without error. Rows are discarded.
-async fn assert_no_error(sess: &basin_engine::TenantSession, sql: &str) {
+async fn assert_no_error(sess: &basin_engine::ProjectSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(_) => {}
         Err(e) => panic!("unexpected error for query [{sql}]: {e}"),
@@ -76,7 +76,7 @@ async fn assert_no_error(sess: &basin_engine::TenantSession, sql: &str) {
 #[tokio::test]
 async fn pg_table_is_visible_bare_name() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_table_is_visible('foo'::text)").await;
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert_eq!(bools.len(), 1);
@@ -86,7 +86,7 @@ async fn pg_table_is_visible_bare_name() {
 #[tokio::test]
 async fn pg_table_is_visible_schema_qualified() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // Schema-qualified spelling: pg_catalog.pg_table_is_visible
     let col = single_col(&sess, "SELECT pg_catalog.pg_table_is_visible('foo'::text)").await;
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -101,7 +101,7 @@ async fn pg_table_is_visible_schema_qualified() {
 #[tokio::test]
 async fn pg_get_userbyid_returns_text() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_get_userbyid(0)").await;
     assert_eq!(col.data_type(), &DataType::Utf8);
     assert_eq!(col.len(), 1);
@@ -118,7 +118,7 @@ async fn pg_get_userbyid_returns_text() {
 #[tokio::test]
 async fn current_schema_returns_public() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT current_schema()").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "public");
@@ -127,7 +127,7 @@ async fn current_schema_returns_public() {
 #[tokio::test]
 async fn pg_catalog_current_schema_returns_public() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_catalog.current_schema()").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "public");
@@ -140,7 +140,7 @@ async fn pg_catalog_current_schema_returns_public() {
 #[tokio::test]
 async fn current_schemas_returns_list_with_public() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT current_schemas(true)").await;
     // Basin returns the PG text-array literal form as Utf8 (the df↔ws bridge
     // does not support List types).  Check that it contains 'public'.
@@ -160,7 +160,7 @@ async fn current_schemas_returns_list_with_public() {
 #[tokio::test]
 async fn pg_encoding_to_char_returns_utf8() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_encoding_to_char(6)").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "UTF8");
@@ -173,7 +173,7 @@ async fn pg_encoding_to_char_returns_utf8() {
 #[tokio::test]
 async fn format_type_known_oid() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // OID 25 = text, OID 23 = integer
     let col = single_col(&sess, "SELECT format_type(25, NULL)").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
@@ -183,7 +183,7 @@ async fn format_type_known_oid() {
 #[tokio::test]
 async fn format_type_unknown_oid() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT format_type(99999, NULL)").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "unknown");
@@ -196,7 +196,7 @@ async fn format_type_unknown_oid() {
 #[tokio::test]
 async fn pg_total_relation_size_returns_zero() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_total_relation_size('foo'::text)").await;
     let ints = col.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(ints.value(0), 0);
@@ -205,7 +205,7 @@ async fn pg_total_relation_size_returns_zero() {
 #[tokio::test]
 async fn pg_table_size_returns_zero() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_table_size('foo'::text)").await;
     let ints = col.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(ints.value(0), 0);
@@ -214,7 +214,7 @@ async fn pg_table_size_returns_zero() {
 #[tokio::test]
 async fn pg_relation_size_returns_zero() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_relation_size('foo'::text)").await;
     let ints = col.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(ints.value(0), 0);
@@ -227,7 +227,7 @@ async fn pg_relation_size_returns_zero() {
 #[tokio::test]
 async fn obj_description_returns_null() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT obj_description(1, 'pg_class')").await;
     assert!(col.is_null(0), "obj_description should return NULL");
 }
@@ -235,7 +235,7 @@ async fn obj_description_returns_null() {
 #[tokio::test]
 async fn col_description_returns_null() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT col_description(1, 1)").await;
     assert!(col.is_null(0), "col_description should return NULL");
 }
@@ -243,7 +243,7 @@ async fn col_description_returns_null() {
 #[tokio::test]
 async fn pg_get_partkeydef_returns_null() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_get_partkeydef(1)").await;
     assert!(col.is_null(0), "pg_get_partkeydef should return NULL");
 }
@@ -255,7 +255,7 @@ async fn pg_get_partkeydef_returns_null() {
 #[tokio::test]
 async fn has_table_privilege_returns_true() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT has_table_privilege('alice', 'pg_class', 'SELECT')").await;
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(bools.value(0));
@@ -264,7 +264,7 @@ async fn has_table_privilege_returns_true() {
 #[tokio::test]
 async fn has_schema_privilege_returns_true() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT has_schema_privilege('alice', 'public', 'USAGE')").await;
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(bools.value(0));
@@ -277,14 +277,14 @@ async fn has_schema_privilege_returns_true() {
 #[tokio::test]
 async fn pg_get_expr_two_arg() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT pg_get_expr(NULL::text, 0)").await;
 }
 
 #[tokio::test]
 async fn pg_get_indexdef_one_arg() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_get_indexdef(1)").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "");
@@ -293,7 +293,7 @@ async fn pg_get_indexdef_one_arg() {
 #[tokio::test]
 async fn pg_get_constraintdef_one_arg() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let col = single_col(&sess, "SELECT pg_get_constraintdef(1)").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "");
@@ -309,7 +309,7 @@ async fn pg_get_constraintdef_one_arg() {
 #[tokio::test]
 async fn psql_dt_style_probe_no_udf_error() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // This is the core of psql's \dt query: it joins pg_class with
     // pg_namespace and filters using pg_catalog.pg_table_is_visible.
@@ -327,7 +327,7 @@ async fn psql_dt_style_probe_no_udf_error() {
 #[tokio::test]
 async fn psql_dt_style_probe_with_relkind() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Extended probe including relkind filter (common in psql \dt output).
     // Note: Basin's pg_class view does not include relowner; we use

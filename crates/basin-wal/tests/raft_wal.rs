@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use basin_common::{PartitionKey, TenantId};
+use basin_common::{PartitionKey, ProjectId};
 use basin_wal::{Lsn, RaftWal, RaftWalConfig, SimCluster, Wal};
 use bytes::Bytes;
 use openraft::BasicNode;
@@ -81,14 +81,14 @@ async fn wait_for_leader(wal: &RaftWal, timeout: Duration) -> u64 {
 
 async fn wait_for_high_water(
     wal: &dyn Wal,
-    tenant: &TenantId,
+    project: &ProjectId,
     partition: &PartitionKey,
     target: Lsn,
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
     loop {
-        let hw = wal.high_water(tenant, partition).await.unwrap();
+        let hw = wal.high_water(project, partition).await.unwrap();
         if hw >= target {
             return;
         }
@@ -103,16 +103,16 @@ async fn wait_for_high_water(
 async fn single_node_initializes() {
     let (_cluster, nodes) = spin_up_cluster(1).await;
     let wal = nodes[0].clone();
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let lsn = wal
-        .append(&tenant, &part, Bytes::from("hello"))
+        .append(&project, &part, Bytes::from("hello"))
         .await
         .unwrap();
     assert_eq!(lsn, Lsn(1));
-    assert_eq!(wal.high_water(&tenant, &part).await.unwrap(), Lsn(1));
-    let entries = wal.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+    assert_eq!(wal.high_water(&project, &part).await.unwrap(), Lsn(1));
+    let entries = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
     assert_eq!(entries.len(), 1);
     wal.close().await.unwrap();
 }
@@ -120,7 +120,7 @@ async fn single_node_initializes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_appends() {
     let (_cluster, nodes) = spin_up_cluster(3).await;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
@@ -130,7 +130,7 @@ async fn three_node_cluster_appends() {
     let start = Instant::now();
     for i in 1..=10u64 {
         let lsn = leader
-            .append(&tenant, &part, Bytes::from(format!("payload-{i}")))
+            .append(&project, &part, Bytes::from(format!("payload-{i}")))
             .await
             .unwrap();
         assert_eq!(lsn, Lsn(i));
@@ -146,13 +146,13 @@ async fn three_node_cluster_appends() {
     for node in &nodes {
         wait_for_high_water(
             node.as_ref(),
-            &tenant,
+            &project,
             &part,
             Lsn(10),
             Duration::from_secs(2),
         )
         .await;
-        let entries = node.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+        let entries = node.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(entries.len(), 10);
     }
 
@@ -164,7 +164,7 @@ async fn three_node_cluster_appends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_node_cluster_appends() {
     let (_cluster, nodes) = spin_up_cluster(5).await;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
@@ -172,7 +172,7 @@ async fn five_node_cluster_appends() {
 
     for i in 1..=10u64 {
         let lsn = leader
-            .append(&tenant, &part, Bytes::from(format!("payload-{i}")))
+            .append(&project, &part, Bytes::from(format!("payload-{i}")))
             .await
             .unwrap();
         assert_eq!(lsn, Lsn(i));
@@ -181,7 +181,7 @@ async fn five_node_cluster_appends() {
     for node in &nodes {
         wait_for_high_water(
             node.as_ref(),
-            &tenant,
+            &project,
             &part,
             Lsn(10),
             Duration::from_secs(3),
@@ -197,7 +197,7 @@ async fn five_node_cluster_appends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_failure_triggers_election() {
     let (cluster, nodes) = spin_up_cluster(3).await;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
@@ -205,13 +205,13 @@ async fn leader_failure_triggers_election() {
     // Append one entry through the original leader to confirm steady state.
     let leader = &nodes[(leader_id - 1) as usize];
     leader
-        .append(&tenant, &part, Bytes::from("pre-failure"))
+        .append(&project, &part, Bytes::from("pre-failure"))
         .await
         .unwrap();
     for node in &nodes {
         wait_for_high_water(
             node.as_ref(),
-            &tenant,
+            &project,
             &part,
             Lsn(1),
             Duration::from_secs(2),
@@ -250,7 +250,7 @@ async fn leader_failure_triggers_election() {
 
     let new_leader = &nodes[(new_leader_id - 1) as usize];
     let lsn = new_leader
-        .append(&tenant, &part, Bytes::from("post-failure"))
+        .append(&project, &part, Bytes::from("post-failure"))
         .await
         .unwrap();
     assert_eq!(lsn, Lsn(2));
@@ -263,7 +263,7 @@ async fn leader_failure_triggers_election() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quorum_commit_required() {
     let (cluster, nodes) = spin_up_cluster(3).await;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
@@ -280,7 +280,7 @@ async fn quorum_commit_required() {
         }
     }
 
-    let append_fut = leader.append(&tenant, &part, Bytes::from("quorumless"));
+    let append_fut = leader.append(&project, &part, Bytes::from("quorumless"));
     // Give the append a short window. With no quorum it must not return.
     let res = tokio::time::timeout(Duration::from_millis(500), append_fut).await;
     assert!(
@@ -293,7 +293,7 @@ async fn quorum_commit_required() {
     // The previous append future was dropped; issue a fresh one.
     let lsn = tokio::time::timeout(
         Duration::from_secs(3),
-        leader.append(&tenant, &part, Bytes::from("now-quorum")),
+        leader.append(&project, &part, Bytes::from("now-quorum")),
     )
     .await
     .expect("append timed out even with quorum")
@@ -312,7 +312,7 @@ async fn quorum_commit_required() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_replicated_to_all_nodes() {
     let (_cluster, nodes) = spin_up_cluster(3).await;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
@@ -320,20 +320,20 @@ async fn log_replicated_to_all_nodes() {
 
     for i in 1..=100u64 {
         leader
-            .append(&tenant, &part, Bytes::from(format!("p{i}")))
+            .append(&project, &part, Bytes::from(format!("p{i}")))
             .await
             .unwrap();
     }
     for node in &nodes {
         wait_for_high_water(
             node.as_ref(),
-            &tenant,
+            &project,
             &part,
             Lsn(100),
             Duration::from_secs(5),
         )
         .await;
-        let entries = node.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+        let entries = node.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(entries.len(), 100);
         for (i, e) in entries.iter().enumerate() {
             assert_eq!(e.lsn, Lsn((i + 1) as u64));
@@ -348,7 +348,7 @@ async fn log_replicated_to_all_nodes() {
 #[ignore = "snapshot truncation requires snapshot worker timing tuning; v0.2 follow-up"]
 async fn truncate_with_snapshot() {
     let (_cluster, nodes) = spin_up_cluster(3).await;
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
@@ -356,14 +356,14 @@ async fn truncate_with_snapshot() {
 
     for i in 1..=1000u64 {
         leader
-            .append(&tenant, &part, Bytes::from(format!("p{i}")))
+            .append(&project, &part, Bytes::from(format!("p{i}")))
             .await
             .unwrap();
     }
     for node in &nodes {
         wait_for_high_water(
             node.as_ref(),
-            &tenant,
+            &project,
             &part,
             Lsn(1000),
             Duration::from_secs(10),
@@ -371,8 +371,8 @@ async fn truncate_with_snapshot() {
         .await;
     }
 
-    leader.truncate(&tenant, &part, Lsn(500)).await.unwrap();
-    let remaining = leader.read_from(&tenant, &part, Lsn::ZERO).await.unwrap();
+    leader.truncate(&project, &part, Lsn(500)).await.unwrap();
+    let remaining = leader.read_from(&project, &part, Lsn::ZERO).await.unwrap();
     for e in &remaining {
         assert!(
             e.lsn > Lsn(500),

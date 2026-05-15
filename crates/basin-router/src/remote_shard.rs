@@ -4,14 +4,14 @@
 //! ## Lifecycle
 //!
 //! 1. Router accepts a pgwire connection. Startup handler resolves the
-//!    incoming `user` parameter to a `TenantId` exactly as in single-process
+//!    incoming `user` parameter to a `ProjectId` exactly as in single-process
 //!    mode.
-//! 2. With shard mode on, the startup handler hands the resolved tenant
+//! 2. With shard mode on, the startup handler hands the resolved project
 //!    plus the original username to a [`RemoteShardSessionFactory`]. The
-//!    factory looks up which shard owns the tenant via `ShardMap`,
+//!    factory looks up which shard owns the project via `ShardMap`,
 //!    establishes a `tokio_postgres::Client` to that shard's pgwire
 //!    listener (forwarding `user=<original_username>` so the upstream can
-//!    re-resolve to the same tenant), and returns a [`RemoteShardSession`].
+//!    re-resolve to the same project), and returns a [`RemoteShardSession`].
 //! 3. The `RemoteShardSession` implements the router's internal `Session`
 //!    trait: `execute` forwards as `simple_query`, `prepare` records SQL +
 //!    placeholder count, `bind` substitutes literals into the SQL, and
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use basin_engine::{BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
@@ -44,7 +44,7 @@ use crate::sharding::ShardMap;
 
 /// Open a `tokio_postgres::Client` against a shard endpoint, forwarding
 /// the original pgwire `user` so the upstream router resolves the same
-/// `TenantId`. Spawn the connection driver task; if it returns an error
+/// `ProjectId`. Spawn the connection driver task; if it returns an error
 /// we surface it via tracing — a dropped client will fail subsequent
 /// operations, which is the behaviour we want.
 async fn connect_upstream(endpoint: &str, user: &str) -> Result<Client> {
@@ -82,7 +82,7 @@ fn parse_endpoint(ep: &str) -> Result<(&str, u16)> {
 ///   in by `prepare` and consumed by `bind`.
 pub(crate) struct RemoteShardSession {
     client: Client,
-    tenant: TenantId,
+    project: ProjectId,
     prepared: Mutex<std::collections::HashMap<StatementHandle, RemotePrepared>>,
 }
 
@@ -92,10 +92,10 @@ struct RemotePrepared {
 }
 
 impl RemoteShardSession {
-    fn new(client: Client, tenant: TenantId) -> Self {
+    fn new(client: Client, project: ProjectId) -> Self {
         Self {
             client,
-            tenant,
+            project,
             prepared: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -103,8 +103,8 @@ impl RemoteShardSession {
 
 #[async_trait]
 impl Session for RemoteShardSession {
-    fn tenant(&self) -> TenantId {
-        self.tenant
+    fn project(&self) -> ProjectId {
+        self.project
     }
 
     async fn execute(&self, sql: &str) -> Result<ExecResult> {
@@ -476,7 +476,7 @@ fn render(p: &ScalarParam) -> String {
 /// Factory used by the router when running in shard mode. Holds the
 /// `ShardMap`; the per-connection username arrives via `SessionFactory::open`
 /// and is forwarded as the upstream pgwire `user` parameter so the upstream
-/// router re-resolves it to the same `TenantId`.
+/// router re-resolves it to the same `ProjectId`.
 pub(crate) struct RemoteShardSessionFactory {
     map: Arc<ShardMap>,
 }
@@ -490,10 +490,10 @@ impl RemoteShardSessionFactory {
 #[async_trait]
 impl SessionFactory for RemoteShardSessionFactory {
     type Session = RemoteShardSession;
-    async fn open(&self, tenant: TenantId, username: &str) -> Result<Arc<RemoteShardSession>> {
-        let endpoint = self.map.shard_for(&tenant).to_owned();
+    async fn open(&self, project: ProjectId, username: &str) -> Result<Arc<RemoteShardSession>> {
+        let endpoint = self.map.shard_for(&project).to_owned();
         let client = connect_upstream(&endpoint, username).await?;
-        Ok(Arc::new(RemoteShardSession::new(client, tenant)))
+        Ok(Arc::new(RemoteShardSession::new(client, project)))
     }
 }
 

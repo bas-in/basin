@@ -3,7 +3,7 @@
 //! Card: `viability_rls_basic`
 //! Bar: `alice_rows_visible == 5 && bob_rows_visible == 5 && all_rows == 10`.
 //!
-//! Two principals (`alice`, `bob`) operate against the same tenant's `orders`
+//! Two principals (`alice`, `bob`) operate against the same project's `orders`
 //! table under identical RLS policy `owner_id = current_user`. Each inserts
 //! five rows tagged with their own owner. With RLS enabled:
 //!
@@ -13,8 +13,8 @@
 //! - Disabling RLS lets every session see all ten rows.
 //!
 //! What this proves: predicate injection is principal-scoped (uses
-//! `current_user`), tenant-local, and reversible — exactly what the spec
-//! demands of an RLS layer that sits on top of tenant prefix isolation.
+//! `current_user`), project-local, and reversible — exactly what the spec
+//! demands of an RLS layer that sits on top of project prefix isolation.
 
 #![allow(clippy::print_stdout)]
 
@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
@@ -55,11 +55,11 @@ async fn viability_rls_basic() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // 1) Schema setup. We do this via an admin (no-auth) session — the
     //    schema-shaping DDL doesn't depend on the principal.
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL, payload TEXT NOT NULL)")
         .await
@@ -69,8 +69,8 @@ async fn viability_rls_basic() {
     //    its own `current_user`. INSERTs do not yet enforce WITH CHECK in
     //    v0.1 (see TODO in `crates/basin-engine/src/rls.rs`), so this also
     //    tests that pre-existing data lands without restriction.
-    let alice = engine.open_session_as(tenant, "alice").await.unwrap();
-    let bob = engine.open_session_as(tenant, "bob").await.unwrap();
+    let alice = engine.open_session_as(project, "alice").await.unwrap();
+    let bob = engine.open_session_as(project, "bob").await.unwrap();
 
     for i in 1..=5_i64 {
         alice
@@ -123,10 +123,10 @@ async fn viability_rls_basic() {
         "bob should see his 5 rows under RLS, got {bob_rows}"
     );
 
-    // 6) An anonymous session under the same tenant sees zero rows (no
+    // 6) An anonymous session under the same project sees zero rows (no
     //    policy matches `current_user = 'anonymous'` for a row whose
     //    `owner_id` is `alice` or `bob`).
-    let anon = engine.open_session(tenant).await.unwrap();
+    let anon = engine.open_session(project).await.unwrap();
     let anon_rows = rows_seen(anon.execute("SELECT * FROM orders").await.unwrap());
     assert_eq!(
         anon_rows, 0,

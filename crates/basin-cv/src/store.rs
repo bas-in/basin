@@ -1,9 +1,9 @@
-//! Per-tenant continuous-aggregate registry, backed by [`basin_catalog`].
+//! Per-project continuous-aggregate registry, backed by [`basin_catalog`].
 //!
 //! [`CvStore`] is the primary write surface for the v0.1 Rust API. It
 //! registers a CV by:
 //!
-//! 1. Running the source SQL once against `tenant`'s engine session to
+//! 1. Running the source SQL once against `project`'s engine session to
 //!    learn the result schema.
 //! 2. Creating a regular Basin table under the CV's name with that
 //!    schema (so future SELECTs go through the engine's standard
@@ -16,7 +16,7 @@
 //!
 //! All reads and writes go through the catalog and the engine, so:
 //!
-//! - Tenant isolation is the same as for user SQL.
+//! - Project isolation is the same as for user SQL.
 //! - RLS on the source table is honoured at refresh time (the same
 //!   session that runs ad-hoc queries runs the refresh SQL).
 //! - Persistence is handled by the catalog and storage layers; no
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use basin_catalog::{CvDef, DataFileRef, SnapshotId, TableMetadata};
-use basin_common::{BasinError, PartitionKey, Result, TableName, TenantId};
+use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
 use basin_engine::{Engine, ExecResult};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -49,7 +49,7 @@ pub enum RegisterError {
     Engine(#[from] BasinError),
 }
 
-/// Per-tenant CV registry. Cheap to clone (`Arc` inside).
+/// Per-project CV registry. Cheap to clone (`Arc` inside).
 #[derive(Clone)]
 pub struct CvStore {
     inner: Arc<CvStoreInner>,
@@ -71,7 +71,7 @@ impl CvStore {
         &self.inner.engine
     }
 
-    /// Register a new CV under `tenant`. Errors if a table or CV with the
+    /// Register a new CV under `project`. Errors if a table or CV with the
     /// same name already exists, or if the source SQL fails to plan / run.
     ///
     /// Note: v0.1 runs the source query at registration time to learn the
@@ -83,10 +83,10 @@ impl CvStore {
     /// materialisation to the first tick.
     pub async fn register_cv(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         spec: CvSpec,
     ) -> std::result::Result<(), RegisterError> {
-        self.register_cv_at(tenant, spec, Utc::now()).await
+        self.register_cv_at(project, spec, Utc::now()).await
     }
 
     /// Like [`Self::register_cv`] but accepts an explicit `now` instant —
@@ -95,7 +95,7 @@ impl CvStore {
     /// refresher's tick reads.
     pub async fn register_cv_at(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         spec: CvSpec,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), RegisterError> {
@@ -110,15 +110,15 @@ impl CvStore {
             .engine
             .config()
             .catalog
-            .list_tables(tenant)
+            .list_tables(project)
             .await?;
         if existing.iter().any(|t| t.as_str() == name.as_str()) {
             return Err(RegisterError::Duplicate(spec.name.clone()));
         }
 
-        // 1. Run the source query in a session bound to `tenant` to learn
+        // 1. Run the source query in a session bound to `project` to learn
         //    the result schema and bootstrap rows.
-        let sess = self.inner.engine.open_session(*tenant).await?;
+        let sess = self.inner.engine.open_session(*project).await?;
         let res = sess.execute(&spec.query_sql).await?;
         let (schema, batches) = match res {
             ExecResult::Rows { schema, batches } => (schema, batches),
@@ -137,18 +137,18 @@ impl CvStore {
 
         // 2. Create the CV's catalog table.
         let catalog = self.inner.engine.config().catalog.clone();
-        let _meta = catalog.create_table(tenant, &name, schema.as_ref()).await?;
+        let _meta = catalog.create_table(project, &name, schema.as_ref()).await?;
 
         // 3. Write the bootstrap result as the CV's first Parquet file.
         let merged = concat_batches(&schema, &batches)?;
         let storage = self.inner.engine.config().storage.clone();
         let part = PartitionKey::default_key();
-        let written = storage.write_batch(tenant, &name, &part, &merged).await?;
+        let written = storage.write_batch(project, &name, &part, &merged).await?;
 
         // 4. Append the file to the catalog.
         let after = catalog
             .append_data_files(
-                tenant,
+                project,
                 &name,
                 SnapshotId::GENESIS,
                 vec![DataFileRef {
@@ -170,20 +170,20 @@ impl CvStore {
             last_bucket_max_unix_ms: spec.last_bucket_max.map(|t| t.timestamp_millis()),
         };
         catalog
-            .set_continuous_aggregate(tenant, &name, Some(def))
+            .set_continuous_aggregate(project, &name, Some(def))
             .await?;
 
         Ok(())
     }
 
-    /// Read every registered CV under `tenant`. Order is by `name` for
+    /// Read every registered CV under `project`. Order is by `name` for
     /// stable test assertions.
-    pub async fn list_cvs(&self, tenant: &TenantId) -> Result<Vec<CvSpec>> {
+    pub async fn list_cvs(&self, project: &ProjectId) -> Result<Vec<CvSpec>> {
         let catalog = self.inner.engine.config().catalog.clone();
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
         let mut out = Vec::new();
         for name in names {
-            let meta = catalog.load_table(tenant, &name).await?;
+            let meta = catalog.load_table(project, &name).await?;
             if let Some(def) = meta.continuous_aggregate.clone() {
                 out.push(spec_from_meta(&meta, def));
             }
@@ -194,13 +194,13 @@ impl CvStore {
     }
 
     /// Look up a single CV by name.
-    pub async fn get_cv(&self, tenant: &TenantId, name: &str) -> Result<Option<CvSpec>> {
+    pub async fn get_cv(&self, project: &ProjectId, name: &str) -> Result<Option<CvSpec>> {
         let catalog = self.inner.engine.config().catalog.clone();
         let table = match TableName::new(name.to_string()) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
-        let meta = match catalog.load_table(tenant, &table).await {
+        let meta = match catalog.load_table(project, &table).await {
             Ok(m) => m,
             Err(BasinError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -216,22 +216,22 @@ impl CvStore {
     /// `refresh_interval_secs`) are left alone.
     pub async fn update_refresh_state(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         name: &str,
         state: CvRefreshState,
     ) -> Result<()> {
         let catalog = self.inner.engine.config().catalog.clone();
         let table = TableName::new(name.to_string())
             .map_err(|e| BasinError::internal(format!("update_refresh_state: bad name: {e}")))?;
-        let meta = catalog.load_table(tenant, &table).await?;
+        let meta = catalog.load_table(project, &table).await?;
         let mut def = meta
             .continuous_aggregate
             .clone()
-            .ok_or_else(|| BasinError::not_found(format!("CV {name} on {tenant}")))?;
+            .ok_or_else(|| BasinError::not_found(format!("CV {name} on {project}")))?;
         def.last_refreshed_at_unix_ms = Some(state.last_refreshed_at.timestamp_millis());
         def.last_bucket_max_unix_ms = state.last_bucket_max.map(|t| t.timestamp_millis());
         catalog
-            .set_continuous_aggregate(tenant, &table, Some(def))
+            .set_continuous_aggregate(project, &table, Some(def))
             .await?;
         let _ = state.last_row_count;
         Ok(())

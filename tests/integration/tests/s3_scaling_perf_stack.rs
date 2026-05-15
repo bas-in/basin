@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -123,7 +123,7 @@ fn make_batch(seed: u64, batch_idx: usize) -> RecordBatch {
 
 async fn point_query(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     id: i64,
 ) -> Result<(), String> {
@@ -132,7 +132,7 @@ async fn point_query(
         ..Default::default()
     };
     let mut stream = storage
-        .read(tenant, table, opts)
+        .read(project, table, opts)
         .await
         .map_err(|e| format!("read({id}): {e}"))?;
     let mut rows = 0usize;
@@ -169,7 +169,7 @@ async fn s3_scaling_perf_stack() {
     };
     let prefix_path = ObjectPath::from(run_prefix.as_str());
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
     let no_bloom_table = TableName::new("events").unwrap();
@@ -195,11 +195,11 @@ async fn s3_scaling_perf_stack() {
     for b in 0..BATCHES {
         let batch = make_batch(0xCAFEBABE_DEAD_BEEFu64, b);
         writer_storage
-            .write_batch_with_options(&tenant, &no_bloom_table, &part, &batch, &no_bloom_opts)
+            .write_batch_with_options(&project, &no_bloom_table, &part, &batch, &no_bloom_opts)
             .await
             .expect("write no-bloom");
         writer_storage
-            .write_batch_with_options(&tenant, &with_bloom_table, &part, &batch, &bloom_opts)
+            .write_batch_with_options(&project, &with_bloom_table, &part, &batch, &bloom_opts)
             .await
             .expect("write with-bloom");
     }
@@ -220,9 +220,9 @@ async fn s3_scaling_perf_stack() {
     });
     let dist_a: LatencyDistribution = run_workload(&workload_cfg, TOTAL_ROWS, |id| {
         let storage = &storage_a;
-        let tenant = &tenant;
+        let project = &project;
         let table = &no_bloom_table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
 
@@ -239,9 +239,9 @@ async fn s3_scaling_perf_stack() {
     });
     let dist_b: LatencyDistribution = run_workload(&workload_cfg, TOTAL_ROWS, |id| {
         let storage = &storage_b;
-        let tenant = &tenant;
+        let project = &project;
         let table = &no_bloom_table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
 
@@ -258,9 +258,9 @@ async fn s3_scaling_perf_stack() {
     });
     let dist_c: LatencyDistribution = run_workload(&workload_cfg, TOTAL_ROWS, |id| {
         let storage = &storage_c;
-        let tenant = &tenant;
+        let project = &project;
         let table = &no_bloom_table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
 
@@ -277,9 +277,9 @@ async fn s3_scaling_perf_stack() {
     });
     let dist_d: LatencyDistribution = run_workload(&workload_cfg, TOTAL_ROWS, |id| {
         let storage = &storage_d;
-        let tenant = &tenant;
+        let project = &project;
         let table = &with_bloom_table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
 

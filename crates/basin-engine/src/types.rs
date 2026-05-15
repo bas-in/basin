@@ -89,7 +89,7 @@ pub const BASIN_GENERATED_AS: &str = "BASIN_GENERATED_AS";
 /// family which expands to `BY DEFAULT` semantics). Value is one of
 /// [`BASIN_IDENTITY_ALWAYS`] or [`BASIN_IDENTITY_BY_DEFAULT`].
 ///
-/// Identity columns ride on the same per-tenant sequence machinery as
+/// Identity columns ride on the same per-project sequence machinery as
 /// `DEFAULT nextval('seq')` — the backing sequence name is stored in
 /// [`BASIN_IDENTITY_SEQ`] and the INSERT path routes through
 /// `Catalog::nextval` to fill omitted slots. The `ALWAYS` variant

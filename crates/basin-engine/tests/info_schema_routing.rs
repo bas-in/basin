@@ -1,15 +1,15 @@
 //! Integration tests for engine-side routing of `information_schema.tables`
 //! and `pg_catalog.pg_class` (Phase 5.11.M follow-up).
 //!
-//! Each test opens a `TenantSession` and runs SQL through the same
+//! Each test opens a `ProjectSession` and runs SQL through the same
 //! `execute()` entry point a pgwire connection would hit. The asserts
 //! cover:
 //!
 //! - Basic SELECT works through the engine pipeline (planning, scan,
 //!   collect).
 //! - DataFusion's filter / projection operators compose with the
-//!   tenant-scoped row source.
-//! - The tenant boundary is structural: per-session providers see only
+//!   project-scoped row source.
+//! - The project boundary is structural: per-session providers see only
 //!   their owner's tables.
 //! - The pg_class oid hash is stable across calls inside one session,
 //!   matching the catalog-side guarantee in `InfoSchemaQuery`.
@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Float32Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -107,7 +107,7 @@ fn total_rows(batches: &[arrow_array::RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -118,7 +118,7 @@ async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> 
 async fn select_information_schema_tables_works() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
@@ -154,7 +154,7 @@ async fn select_information_schema_tables_works() {
 async fn select_pg_catalog_pg_class_works() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
@@ -182,14 +182,14 @@ async fn select_pg_catalog_pg_class_works() {
 }
 
 #[tokio::test]
-async fn tenant_filter_enforced_at_select_time() {
-    // Two tenants on the same engine: each session's
-    // information_schema.tables view must contain exactly that tenant's
+async fn project_filter_enforced_at_select_time() {
+    // Two projects on the same engine: each session's
+    // information_schema.tables view must contain exactly that project's
     // tables.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
@@ -230,7 +230,7 @@ async fn where_predicate_filters_correctly() {
     // pushdown-deferred behaviour documented on the providers.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE foo (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -266,7 +266,7 @@ async fn join_against_user_table() {
     // PostgREST-shaped clients issue when probing introspection.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -292,12 +292,12 @@ async fn join_against_user_table() {
 
 #[tokio::test]
 async fn pg_class_oid_stable_across_queries() {
-    // The oid is a deterministic hash of (tenant, table). Two SELECTs in
+    // The oid is a deterministic hash of (project, table). Two SELECTs in
     // the same session must produce the same oid for the same table — if
     // they don't, an upstream caching / re-init bug has crept in.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -325,17 +325,17 @@ async fn pg_class_oid_stable_across_queries() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_under_select() {
-    // A negative test: tenant A's information_schema.tables must NEVER
-    // include any of tenant B's tables, even when the underlying catalog
+async fn cross_project_isolation_under_select() {
+    // A negative test: project A's information_schema.tables must NEVER
+    // include any of project B's tables, even when the underlying catalog
     // backend physically holds both. This is the load-bearing P0
-    // invariant — the providers' tenant filter has to be wired up
+    // invariant — the providers' project filter has to be wired up
     // correctly at session-open time and not get accidentally widened
     // anywhere.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
@@ -355,7 +355,7 @@ async fn cross_tenant_isolation_under_select() {
     assert_eq!(names_a, vec!["alpha".to_string()]);
     assert!(
         !names_a.contains(&"leaked_b_table".to_string()),
-        "tenant A leaked tenant B's table: {names_a:?}"
+        "project A leaked project B's table: {names_a:?}"
     );
 
     // Same check via pg_class.
@@ -366,6 +366,6 @@ async fn cross_tenant_isolation_under_select() {
     assert_eq!(names_a_pg, vec!["alpha".to_string()]);
     assert!(
         !names_a_pg.contains(&"leaked_b_table".to_string()),
-        "tenant A leaked tenant B's pg_class row: {names_a_pg:?}"
+        "project A leaked project B's pg_class row: {names_a_pg:?}"
     );
 }

@@ -1,12 +1,12 @@
-//! S3 port of `scaling_idle_tenants.rs`.
+//! S3 port of `scaling_idle_projects.rs`.
 //!
-//! Idle-tenant cost is a control-plane metric: namespace + table catalog
+//! Idle-project cost is a control-plane metric: namespace + table catalog
 //! state with no Parquet writes. The S3 `ObjectStore` is wired into the
-//! `Storage` so the per-tenant "control plane" footprint includes the
+//! `Storage` so the per-project "control plane" footprint includes the
 //! Arc<dyn ObjectStore> overhead, but no S3 PUTs happen here.
 //!
 //! Bars (same as LocalFS):
-//! - per_tenant_KiB <= 5.0 at every scale point
+//! - per_project_KiB <= 5.0 at every scale point
 //! - provision_ms / N at N=10_000 within 5x of N=100
 //!
 //! Skips cleanly when `[s3]` is missing.
@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -28,9 +28,9 @@ use basin_storage::{Storage, StorageConfig};
 use object_store::path::Path as ObjectPath;
 use serde_json::json;
 
-const TEST_NAME: &str = "s3_scaling_idle_tenants";
+const TEST_NAME: &str = "s3_scaling_idle_projects";
 const SCALES: [usize; 4] = [100, 1_000, 5_000, 10_000];
-const BAR_PER_TENANT_KIB: f64 = 5.0;
+const BAR_PER_PROJECT_KIB: f64 = 5.0;
 const BAR_PROVISION_RATIO: f64 = 5.0;
 
 fn rss_kib() -> u64 {
@@ -55,7 +55,7 @@ fn schema() -> Schema {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
-async fn s3_scaling_idle_tenants() {
+async fn s3_scaling_idle_projects() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,
         Err(e) => panic!("parse .basin-test.toml: {e}"),
@@ -85,19 +85,19 @@ async fn s3_scaling_idle_tenants() {
     let sch = schema();
 
     {
-        let warm = TenantId::new();
+        let warm = ProjectId::new();
         catalog.create_namespace(&warm).await.unwrap();
         catalog.create_table(&warm, &table, &sch).await.unwrap();
     }
 
-    let mut tenants: Vec<TenantId> = Vec::with_capacity(SCALES.iter().sum::<usize>());
+    let mut projects: Vec<ProjectId> = Vec::with_capacity(SCALES.iter().sum::<usize>());
 
     struct Row {
         n: usize,
         rss_delta_kib: i64,
-        per_tenant_kib: f64,
+        per_project_kib: f64,
         provision_ms: f64,
-        per_tenant_provision_us: f64,
+        per_project_provision_us: f64,
     }
     let mut rows: Vec<Row> = Vec::new();
 
@@ -105,57 +105,57 @@ async fn s3_scaling_idle_tenants() {
         let rss_before = rss_kib();
         let started = Instant::now();
         for _ in 0..n {
-            let t = TenantId::new();
+            let t = ProjectId::new();
             catalog.create_namespace(&t).await.unwrap();
             catalog.create_table(&t, &table, &sch).await.unwrap();
-            tenants.push(t);
+            projects.push(t);
         }
         let provision_ms = started.elapsed().as_secs_f64() * 1000.0;
         let rss_after = rss_kib();
 
         let rss_delta_kib = rss_after as i64 - rss_before as i64;
-        let per_tenant_kib = (rss_delta_kib as f64).max(0.0) / n as f64;
-        let per_tenant_provision_us = (provision_ms * 1000.0) / n as f64;
+        let per_project_kib = (rss_delta_kib as f64).max(0.0) / n as f64;
+        let per_project_provision_us = (provision_ms * 1000.0) / n as f64;
 
         rows.push(Row {
             n,
             rss_delta_kib,
-            per_tenant_kib,
+            per_project_kib,
             provision_ms,
-            per_tenant_provision_us,
+            per_project_provision_us,
         });
     }
 
-    assert!(tenants.len() >= SCALES.iter().sum::<usize>());
+    assert!(projects.len() >= SCALES.iter().sum::<usize>());
 
     println!(
         "{:>10} {:>15} {:>15} {:>15}",
-        "N", "rss_delta_KiB", "per_tenant_KiB", "provision_ms"
+        "N", "rss_delta_KiB", "per_project_KiB", "provision_ms"
     );
     for r in &rows {
         println!(
             "{:>10} {:>15} {:>15.2} {:>15.1}",
-            r.n, r.rss_delta_kib, r.per_tenant_kib, r.provision_ms
+            r.n, r.rss_delta_kib, r.per_project_kib, r.provision_ms
         );
     }
 
-    let max_per_tenant = rows
+    let max_per_project = rows
         .iter()
-        .map(|r| r.per_tenant_kib)
+        .map(|r| r.per_project_kib)
         .fold(0.0_f64, f64::max);
-    let provision_us_first = rows.first().unwrap().per_tenant_provision_us;
-    let provision_us_last = rows.last().unwrap().per_tenant_provision_us;
+    let provision_us_first = rows.first().unwrap().per_project_provision_us;
+    let provision_us_last = rows.last().unwrap().per_project_provision_us;
     let provision_ratio = provision_us_last / provision_us_first.max(1e-9);
 
-    let pass_ram = max_per_tenant <= BAR_PER_TENANT_KIB;
+    let pass_ram = max_per_project <= BAR_PER_PROJECT_KIB;
     let pass_provision = provision_ratio <= BAR_PROVISION_RATIO;
     let pass = pass_ram && pass_provision;
 
     println!(
-        "[S3 scaling_idle_tenants] max_per_tenant={:.2} KiB, provision_ratio_10k_over_100={:.2}x (bar: per_tenant<={} KiB, provision_ratio<={}x) {}",
-        max_per_tenant,
+        "[S3 scaling_idle_projects] max_per_project={:.2} KiB, provision_ratio_10k_over_100={:.2}x (bar: per_project<={} KiB, provision_ratio<={}x) {}",
+        max_per_project,
         provision_ratio,
-        BAR_PER_TENANT_KIB,
+        BAR_PER_PROJECT_KIB,
         BAR_PROVISION_RATIO,
         if pass { "PASS" } else { "FAIL" }
     );
@@ -164,27 +164,27 @@ async fn s3_scaling_idle_tenants() {
         .iter()
         .map(|r| {
             json!({
-                "tenants": r.n,
+                "projects": r.n,
                 "rss_delta_kib": r.rss_delta_kib,
-                "per_tenant_kib": r.per_tenant_kib,
+                "per_project_kib": r.per_project_kib,
                 "provision_ms": r.provision_ms,
             })
         })
         .collect();
 
     report_real_scaling(
-        "idle_tenants",
-        "Idle-tenant cost curve (real S3)",
-        "RAM cost stays small per idle tenant as the tenant count grows, with a real-S3 Storage attached.",
+        "idle_projects",
+        "Idle-project cost curve (real S3)",
+        "RAM cost stays small per idle project as the project count grows, with a real-S3 Storage attached.",
         pass,
         AxisSpec {
-            key: "tenants".into(),
-            label: "tenants".into(),
+            key: "projects".into(),
+            label: "projects".into(),
         },
         vec![
             SeriesSpec {
-                key: "per_tenant_kib".into(),
-                label: "Per-tenant RSS".into(),
+                key: "per_project_kib".into(),
+                label: "Per-project RSS".into(),
                 unit: Some("KiB".into()),
             },
             SeriesSpec {
@@ -200,16 +200,16 @@ async fn s3_scaling_idle_tenants() {
         ],
         json_rows,
         Some(PrimaryMetric {
-            label: "max per_tenant_kib across scales".into(),
-            value: max_per_tenant,
+            label: "max per_project_kib across scales".into(),
+            value: max_per_project,
             unit: "KiB".into(),
-            bar: BarOp::lt(BAR_PER_TENANT_KIB),
+            bar: BarOp::lt(BAR_PER_PROJECT_KIB),
         }),
     );
 
     if !pass {
         panic!(
-            "FAIL: max_per_tenant_KiB={max_per_tenant:.2} (bar {BAR_PER_TENANT_KIB}), provision_ratio={provision_ratio:.2} (bar {BAR_PROVISION_RATIO})"
+            "FAIL: max_per_project_KiB={max_per_project:.2} (bar {BAR_PER_PROJECT_KIB}), provision_ratio={provision_ratio:.2} (bar {BAR_PROVISION_RATIO})"
         );
     }
 }

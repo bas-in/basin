@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow_array::Int64Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cron::{CronRunner, JobStatus, TestClock};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
@@ -63,13 +63,13 @@ async fn s3_viability_basin_cron() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 30, 59).unwrap();
     let clock = TestClock::new(t0);
     let runner = CronRunner::new(engine.clone(), Arc::new(clock.clone()));
-    runner.register_tenant(tenant).await;
+    runner.register_project(project).await;
 
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute("CREATE TABLE markers (id BIGINT NOT NULL)")
         .await
@@ -78,7 +78,7 @@ async fn s3_viability_basin_cron() {
     let jobid = runner
         .store()
         .schedule(
-            &tenant,
+            &project,
             "alice",
             "tick-marker",
             "* * * * *",
@@ -99,7 +99,7 @@ async fn s3_viability_basin_cron() {
             .count();
     }
 
-    let observer = engine.open_session(tenant).await.unwrap();
+    let observer = engine.open_session(project).await.unwrap();
     let res = observer.execute("SELECT id FROM markers").await.unwrap();
     let marker_rows = match res {
         ExecResult::Rows { batches, .. } => {
@@ -120,7 +120,7 @@ async fn s3_viability_basin_cron() {
         other => panic!("unexpected: {other:?}"),
     };
 
-    let details = runner.store().list_run_details(&tenant).await.unwrap();
+    let details = runner.store().list_run_details(&project).await.unwrap();
     let succeeded = details
         .iter()
         .filter(|d| d.status == JobStatus::Succeeded)

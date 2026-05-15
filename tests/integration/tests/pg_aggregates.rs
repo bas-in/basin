@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Float64Array, Int64Array, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -49,7 +49,7 @@ async fn open_engine() -> (TempDir, Engine) {
 }
 
 /// Run SQL, return the first row's first column as a String.
-async fn one_string(sess: &basin_engine::TenantSession, sql: &str) -> String {
+async fn one_string(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches
@@ -66,7 +66,7 @@ async fn one_string(sess: &basin_engine::TenantSession, sql: &str) -> String {
 }
 
 /// Try running SQL, returning Ok(string) or Err(error message).
-async fn try_one_string(sess: &basin_engine::TenantSession, sql: &str) -> Result<String, String> {
+async fn try_one_string(sess: &basin_engine::ProjectSession, sql: &str) -> Result<String, String> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = match batches.first() {
@@ -128,7 +128,7 @@ fn render_scalar(arr: &dyn Array, i: usize) -> String {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-async fn setup_nums(sess: &basin_engine::TenantSession) {
+async fn setup_nums(sess: &basin_engine::ProjectSession) {
     sess.execute("CREATE TABLE agg_nums (x DOUBLE)")
         .await
         .unwrap();
@@ -139,7 +139,7 @@ async fn setup_nums(sess: &basin_engine::TenantSession) {
     }
 }
 
-async fn setup_pairs(sess: &basin_engine::TenantSession) {
+async fn setup_pairs(sess: &basin_engine::ProjectSession) {
     sess.execute("CREATE TABLE agg_pairs (y DOUBLE, x DOUBLE)")
         .await
         .unwrap();
@@ -156,7 +156,7 @@ async fn setup_pairs(sess: &basin_engine::TenantSession) {
 #[tokio::test]
 async fn basic_count_sum_avg_min_max() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     setup_nums(&sess).await;
 
     // count(*)
@@ -188,7 +188,7 @@ async fn basic_count_sum_avg_min_max() {
 #[tokio::test]
 async fn basic_count_distinct() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_dup (v INT)").await.unwrap();
     for v in [1, 1, 2, 3, 3] {
         sess.execute(&format!("INSERT INTO agg_dup VALUES ({v})"))
@@ -204,7 +204,7 @@ async fn basic_count_distinct() {
 #[tokio::test]
 async fn basic_array_agg() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_arr (v INT)").await.unwrap();
     for v in [3, 1, 2] {
         sess.execute(&format!("INSERT INTO agg_arr VALUES ({v})"))
@@ -255,7 +255,7 @@ async fn basic_array_agg() {
 #[tokio::test]
 async fn basic_string_agg() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_str (v TEXT)").await.unwrap();
     for v in ["a", "b", "c"] {
         sess.execute(&format!("INSERT INTO agg_str VALUES ('{v}')"))
@@ -283,7 +283,7 @@ async fn basic_string_agg() {
 #[tokio::test]
 async fn basic_bool_aggregates() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_bool (v BOOLEAN)").await.unwrap();
     sess.execute("INSERT INTO agg_bool VALUES (true)").await.unwrap();
     sess.execute("INSERT INTO agg_bool VALUES (true)").await.unwrap();
@@ -320,7 +320,7 @@ async fn basic_bool_aggregates() {
 #[tokio::test]
 async fn basic_bit_aggregates() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_bit (v BIGINT)").await.unwrap();
     // 0b110 & 0b101 = 0b100 = 4; 0b110 | 0b101 = 0b111 = 7
     sess.execute("INSERT INTO agg_bit VALUES (6)").await.unwrap(); // 0b110
@@ -350,7 +350,7 @@ async fn basic_bit_aggregates() {
 #[tokio::test]
 async fn stat_variance_and_stddev() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     setup_nums(&sess).await;
 
     // PG `variance(x)` = sample variance = var_samp.
@@ -425,7 +425,7 @@ async fn stat_variance_and_stddev() {
 #[tokio::test]
 async fn stat_corr() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     setup_pairs(&sess).await;
 
     // corr(y, x) — y = 2*x+1 => perfect positive correlation = 1.0
@@ -442,7 +442,7 @@ async fn stat_corr() {
 #[tokio::test]
 async fn stat_covariance() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     setup_pairs(&sess).await;
 
     // covar_samp(y, x) — sample covariance; for y=2x+1, x in [1,2,3]: = 2.0
@@ -469,7 +469,7 @@ async fn stat_covariance() {
 #[tokio::test]
 async fn stat_regression() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     setup_pairs(&sess).await;
 
     // regr_slope(y, x) — for y=2x+1: slope = 2.0
@@ -526,7 +526,7 @@ async fn stat_regression() {
 #[tokio::test]
 async fn stat_approx_percentile() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     setup_nums(&sess).await;
 
     // DataFusion's approx_percentile_cont(x, percentile) — approx median
@@ -569,7 +569,7 @@ async fn stat_approx_percentile() {
 #[tokio::test]
 async fn stat_mode() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_mode (v INT)").await.unwrap();
     for v in [1, 2, 2, 3, 2] {
         sess.execute(&format!("INSERT INTO agg_mode VALUES ({v})"))
@@ -597,7 +597,7 @@ async fn stat_mode() {
 #[tokio::test]
 async fn json_agg_basic() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_json (id INT)").await.unwrap();
     for i in [1, 2, 3] {
         sess.execute(&format!("INSERT INTO agg_json VALUES ({i})"))
@@ -624,7 +624,7 @@ async fn json_agg_basic() {
 #[tokio::test]
 async fn jsonb_agg_basic() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_jsonb (id INT)").await.unwrap();
     for i in [1, 2, 3] {
         sess.execute(&format!("INSERT INTO agg_jsonb VALUES ({i})"))
@@ -648,7 +648,7 @@ async fn jsonb_agg_basic() {
 #[tokio::test]
 async fn json_object_agg_basic() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_kv (k TEXT, v INT)")
         .await
         .unwrap();
@@ -674,7 +674,7 @@ async fn json_object_agg_basic() {
 #[tokio::test]
 async fn jsonb_object_agg_basic() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE agg_kv2 (k TEXT, v INT)")
         .await
         .unwrap();
@@ -699,7 +699,7 @@ async fn jsonb_object_agg_basic() {
 #[tokio::test]
 async fn json_build_object_and_array() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // json_build_object(k1, v1, k2, v2)
     let r = try_one_string(&sess, "SELECT json_build_object('a', 1, 'b', 2)").await;

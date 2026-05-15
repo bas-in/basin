@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
@@ -78,8 +78,8 @@ async fn s3_viability_row_group_sizing() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     sess.execute("CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL)")
         .await
@@ -93,12 +93,12 @@ async fn s3_viability_row_group_sizing() {
         .expect("SET row_group_rows");
 
     let m_small = catalog
-        .load_table(&tenant, &TableName::new("events_small").unwrap())
+        .load_table(&project, &TableName::new("events_small").unwrap())
         .await
         .unwrap();
     assert_eq!(m_small.row_group_rows, Some(SMALL_RG_ROWS));
     let m_default = catalog
-        .load_table(&tenant, &TableName::new("events_default").unwrap())
+        .load_table(&project, &TableName::new("events_default").unwrap())
         .await
         .unwrap();
     assert_eq!(m_default.row_group_rows, None);
@@ -214,7 +214,7 @@ async fn s3_viability_row_group_sizing() {
 
 /// One INSERT statement per call, batched as `VALUES (id, 'payload-id'),
 /// …` so the engine writes one Parquet file per table.
-async fn insert_rows(sess: &basin_engine::TenantSession, table: &str, n: i64) {
+async fn insert_rows(sess: &basin_engine::ProjectSession, table: &str, n: i64) {
     let mut sql = String::with_capacity((n as usize) * 32 + 64);
     sql.push_str("INSERT INTO ");
     sql.push_str(table);

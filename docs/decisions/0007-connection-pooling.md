@@ -17,8 +17,8 @@ Lambda / Cloud Run / Kubernetes patterns where pgbouncer is normally
 deployed:
 
 1. **`Engine::open_session` does work.** It calls
-   `catalog.list_tables(tenant)` and registers each table as a
-   DataFusion `ListingTable`. For a tenant with 50 tables that is tens
+   `catalog.list_tables(project)` and registers each table as a
+   DataFusion `ListingTable`. For a project with 50 tables that is tens
    of milliseconds — fine for long-lived connections, but a hot loop
    for short-lived ones.
 2. **Per-session DataFusion state is ~50-200 KB.** At 10k idle sessions
@@ -27,16 +27,16 @@ deployed:
 
 Pgbouncer doesn't solve either problem cleanly. Its transaction-pooling
 mode rewrites session state across upstream connections — Basin's
-`TenantSession` carries cached `ListingTable` snapshots and prepared-
+`ProjectSession` carries cached `ListingTable` snapshots and prepared-
 statement registries that don't multiplex across users. Its
 session-pooling mode is just a queue with no real upside.
 
-The right answer is a small, native pooler that caches `TenantSession`
+The right answer is a small, native pooler that caches `ProjectSession`
 objects directly.
 
 ## Decision
 
-Basin will ship **`basin-pool`**, a `TenantSession` cache wired into
+Basin will ship **`basin-pool`**, a `ProjectSession` cache wired into
 the pgwire accept path.
 
 ### Public surface
@@ -45,7 +45,7 @@ the pgwire accept path.
 pub struct PoolConfig {
     pub max_sessions: usize,           // default 1024
     pub idle_ttl: Duration,            // default 5 min
-    pub per_tenant_cap: usize,         // default 64
+    pub per_project_cap: usize,         // default 64
 }
 
 pub struct SessionPool { /* Arc inside */ }
@@ -54,7 +54,7 @@ impl SessionPool {
     pub fn new(engine: basin_engine::Engine, cfg: PoolConfig) -> Self;
     pub async fn acquire(
         &self,
-        tenant: TenantId,
+        project: ProjectId,
         client_key: Option<String>,   // optional sticky key (e.g. JWT subject)
     ) -> Result<PooledSession>;
 }
@@ -66,7 +66,7 @@ pub struct PooledSession {
 
 ### Cache shape
 
-`HashMap<(TenantId, ClientKey), VecDeque<TenantSession>>` behind a
+`HashMap<(ProjectId, ClientKey), VecDeque<ProjectSession>>` behind a
 `tokio::sync::Mutex`. `acquire` pops the back (most-recently-used);
 `Drop` on `PooledSession` pushes it back (or drops it if the pool is
 beyond `max_sessions`).
@@ -78,10 +78,10 @@ sessions whose `last_returned` is older than `idle_ttl`. Same pattern
 as `basin-shard`'s eviction loop — they share an "idle eviction is a
 background tokio task" idiom.
 
-### Per-tenant cap
+### Per-project cap
 
-`per_tenant_cap` prevents one tenant's burst from starving others. A
-tenant exceeding their cap waits on a per-tenant `Semaphore` rather
+`per_project_cap` prevents one project's burst from starving others. A
+project exceeding their cap waits on a per-project `Semaphore` rather
 than getting a fresh session; once an existing session is returned,
 the waiter wakes.
 
@@ -90,13 +90,13 @@ the waiter wakes.
 The pgwire accept loop is the only call site:
 
 ```rust
-let session = pool.acquire(tenant, client_key).await?;
-// Today: open_session(tenant) returns a brand-new session every time.
+let session = pool.acquire(project, client_key).await?;
+// Today: open_session(project) returns a brand-new session every time.
 ```
 
-`client_key` defaults to `None` (any-session-for-this-tenant); when
-the JWT-aware tenant resolver lands (ADR 0005), the pool key becomes
-`(tenant_id, jwt.sub)` so each user gets their own session — keeping
+`client_key` defaults to `None` (any-session-for-this-project); when
+the JWT-aware project resolver lands (ADR 0005), the pool key becomes
+`(project_id, jwt.sub)` so each user gets their own session — keeping
 prepared-statement caches warm across reconnects.
 
 ### What's *out* of v1
@@ -123,8 +123,8 @@ prepared-statement caches warm across reconnects.
 - Sessions are now reused across client connections. A bug in
   session-state cleanup (e.g. a leaked transaction or a stale
   `prepared` cache entry) could leak between clients.
-- A burst of distinct tenants exceeding `max_sessions` evicts
-  long-tail tenants. Customers with very-many-tenants workloads need
+- A burst of distinct projects exceeding `max_sessions` evicts
+  long-tail projects. Customers with very-many-projects workloads need
   to size the pool carefully.
 
 **Mitigations**
@@ -132,7 +132,7 @@ prepared-statement caches warm across reconnects.
 - `PooledSession::Drop` calls a fixed `reset()` that clears any
   per-connection mutable state (open transactions, dirty prepared
   statements). Documented in `basin-engine` API.
-- Metrics expose hit rate / eviction count / per-tenant resident
+- Metrics expose hit rate / eviction count / per-project resident
   count so operators can tune the pool size based on actual traffic.
 
 ## Architectural compatibility
@@ -168,10 +168,10 @@ churn to optimize today.
 | Component | Effort |
 |---|---|
 | `basin-pool` crate scaffold + `SessionPool::acquire` + `PooledSession` | 1.5 days |
-| Idle eviction loop + per-tenant `Semaphore` cap | 1 day |
-| `TenantSession::reset()` for safe reuse | 0.5 day |
+| Idle eviction loop + per-project `Semaphore` cap | 1 day |
+| `ProjectSession::reset()` for safe reuse | 0.5 day |
 | Metrics integration | 0.5 day |
-| Tests (hit rate, eviction, per-tenant fairness, reset correctness) | 1.5 days |
+| Tests (hit rate, eviction, per-project fairness, reset correctness) | 1.5 days |
 | Smoke test: 1000 short-lived conns through 10 pool slots | 0.5 day |
 | **Total** | **~5 days calendar** |
 
@@ -189,5 +189,5 @@ churn to optimize today.
   `basin-pool` evolve (e.g. add cross-process pooling later) without
   churning the engine's public API.
 - **Use bb8 / deadpool-postgres / r2d2.** These pool client connections
-  *to* Postgres, not server-side `TenantSession` objects in a Rust
+  *to* Postgres, not server-side `ProjectSession` objects in a Rust
   process. Wrong layer.

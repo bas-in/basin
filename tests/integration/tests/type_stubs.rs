@@ -13,7 +13,7 @@ use std::sync::Arc;
 use arrow_array::{BooleanArray, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -26,7 +26,7 @@ use tempfile::TempDir;
 struct Harness {
     engine: Engine,
     catalog: Arc<dyn basin_catalog::Catalog>,
-    tenant: TenantId,
+    project: ProjectId,
 }
 
 impl Harness {
@@ -45,21 +45,21 @@ impl Harness {
             catalog: catalog.clone(),
             shard: None,
         });
-        let tenant = TenantId::new();
-        Harness { engine, catalog, tenant }
+        let project = ProjectId::new();
+        Harness { engine, catalog, project }
     }
 
-    async fn session(&self) -> basin_engine::TenantSession {
-        self.engine.open_session(self.tenant.clone()).await.unwrap()
+    async fn session(&self) -> basin_engine::ProjectSession {
+        self.engine.open_session(self.project.clone()).await.unwrap()
     }
 
-    async fn exec_ok(&self, sess: &basin_engine::TenantSession, sql: &str) -> ExecResult {
+    async fn exec_ok(&self, sess: &basin_engine::ProjectSession, sql: &str) -> ExecResult {
         sess.execute(sql).await.unwrap_or_else(|e| panic!("SQL failed: {e}\nSQL: {sql}"))
     }
 
     async fn field_for(&self, table: &str, col: &str) -> arrow_schema::Field {
         let tn = TableName::new(table).unwrap();
-        let meta = self.catalog.load_table(&self.tenant, &tn).await.unwrap();
+        let meta = self.catalog.load_table(&self.project, &tn).await.unwrap();
         meta.schema.field_with_name(col).unwrap().clone()
     }
 }

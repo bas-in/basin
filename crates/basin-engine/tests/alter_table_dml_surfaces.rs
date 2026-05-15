@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, TenantId};
+use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, ProjectId};
 use basin_engine::reactor_ddl::{
     exec_drop_reactor, exec_react_constraint, exec_react_on, match_alter_table_react_constraint,
     match_alter_table_react_on, match_drop_reactor,
@@ -75,7 +75,7 @@ fn total_rows(batches: &[arrow_array::RecordBatch]) -> usize {
 #[tokio::test]
 async fn subscribe_webhook_round_trip() {
     let registry = WebhookRegistry::new();
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     let intent = match_alter_table_subscribe_webhook(
         "ALTER TABLE orders SUBSCRIBE WEBHOOK my_hook \
@@ -86,7 +86,7 @@ async fn subscribe_webhook_round_trip() {
     assert_eq!(intent.label.as_deref(), Some("my_hook"));
     assert_eq!(intent.ops, WebhookOps::INSERT | WebhookOps::UPDATE);
 
-    let id = exec_subscribe_webhook(intent, &tenant, &registry)
+    let id = exec_subscribe_webhook(intent, &project, &registry)
         .await
         .unwrap();
     assert!(registry.get(id).await.is_some());
@@ -95,7 +95,7 @@ async fn subscribe_webhook_round_trip() {
         match_alter_table_unsubscribe_webhook("ALTER TABLE orders UNSUBSCRIBE WEBHOOK my_hook")
             .unwrap()
             .unwrap();
-    exec_unsubscribe_webhook(unsub, &tenant, &registry)
+    exec_unsubscribe_webhook(unsub, &project, &registry)
         .await
         .unwrap();
     assert!(registry.get(id).await.is_none());
@@ -104,7 +104,7 @@ async fn subscribe_webhook_round_trip() {
 #[tokio::test]
 async fn subscribe_webhook_validation_errors() {
     let registry = WebhookRegistry::new();
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // Empty URL (caught in match_*).
     let err =
@@ -131,7 +131,7 @@ async fn subscribe_webhook_validation_errors() {
     )
     .unwrap()
     .unwrap();
-    let err = exec_subscribe_webhook(intent, &tenant, &registry)
+    let err = exec_subscribe_webhook(intent, &project, &registry)
         .await
         .unwrap_err();
     assert!(
@@ -148,7 +148,7 @@ async fn subscribe_webhook_filter_predicate_works() {
     // assert only the matching event lands in the queue.
     let dir = TempDir::new().unwrap();
     let registry = WebhookRegistry::new();
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     let intent = match_alter_table_subscribe_webhook(
         "ALTER TABLE orders SUBSCRIBE WEBHOOK paid_hook \
@@ -158,7 +158,7 @@ async fn subscribe_webhook_filter_predicate_works() {
     .unwrap()
     .unwrap();
     assert_eq!(intent.predicate.as_deref(), Some("NEW.status = 'paid'"));
-    exec_subscribe_webhook(intent, &tenant, &registry)
+    exec_subscribe_webhook(intent, &project, &registry)
         .await
         .unwrap();
 
@@ -177,7 +177,7 @@ async fn subscribe_webhook_filter_predicate_works() {
 
     // Non-matching event — predicate is false, sink skips.
     let ev_skip = ChangeEvent {
-        tenant,
+        project,
         table: TableName::new("orders").unwrap(),
         op: ChangeOp::Insert,
         before: None,
@@ -195,7 +195,7 @@ async fn subscribe_webhook_filter_predicate_works() {
 
     // Matching event — predicate is true, sink enqueues.
     let ev_fire = ChangeEvent {
-        tenant,
+        project,
         table: TableName::new("orders").unwrap(),
         op: ChangeOp::Insert,
         before: None,
@@ -216,8 +216,8 @@ async fn subscribe_webhook_filter_predicate_works() {
 async fn react_on_insert_round_trip() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -231,7 +231,7 @@ async fn react_on_insert_round_trip() {
     )
     .unwrap()
     .unwrap();
-    exec_react_on(intent, &tenant, &cat).await.unwrap();
+    exec_react_on(intent, &project, &cat).await.unwrap();
 
     sess.execute("INSERT INTO orders VALUES (42)")
         .await
@@ -248,8 +248,8 @@ async fn react_on_insert_round_trip() {
 async fn react_when_predicate() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL, status TEXT NOT NULL)")
         .await
         .unwrap();
@@ -270,7 +270,7 @@ async fn react_when_predicate() {
         intent.when_predicate.as_deref(),
         Some("NEW.status = 'paid'")
     );
-    exec_react_on(intent, &tenant, &cat).await.unwrap();
+    exec_react_on(intent, &project, &cat).await.unwrap();
 
     // UPDATE with non-matching status — predicate false, no fire.
     sess.execute("UPDATE orders SET status = 'pending' WHERE id = 1")
@@ -299,8 +299,8 @@ async fn react_when_predicate() {
 async fn drop_reactor_works() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE src (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -314,7 +314,7 @@ async fn drop_reactor_works() {
     .unwrap()
     .unwrap();
     let reactor_name = intent.name.clone();
-    exec_react_on(intent, &tenant, &cat).await.unwrap();
+    exec_react_on(intent, &project, &cat).await.unwrap();
 
     sess.execute("INSERT INTO src VALUES (1)").await.unwrap();
     let res = sess.execute("SELECT id FROM log").await.unwrap();
@@ -327,7 +327,7 @@ async fn drop_reactor_works() {
     let drop_intent = match_drop_reactor(&format!("DROP REACTOR {reactor_name} ON src"))
         .unwrap()
         .unwrap();
-    exec_drop_reactor(drop_intent, &tenant, &cat).await.unwrap();
+    exec_drop_reactor(drop_intent, &project, &cat).await.unwrap();
 
     sess.execute("INSERT INTO src VALUES (2)").await.unwrap();
     let res = sess
@@ -353,8 +353,8 @@ async fn constraint_predicate_blocks_violating_insert() {
     // table stays at 2 rows.
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -365,7 +365,7 @@ async fn constraint_predicate_blocks_violating_insert() {
     )
     .unwrap()
     .unwrap();
-    exec_react_constraint(intent, &tenant, &cat).await.unwrap();
+    exec_react_constraint(intent, &project, &cat).await.unwrap();
 
     sess.execute("INSERT INTO orders VALUES (1)").await.unwrap();
     sess.execute("INSERT INTO orders VALUES (2)").await.unwrap();
@@ -393,14 +393,14 @@ async fn constraint_predicate_blocks_violating_insert() {
 
 #[tokio::test]
 async fn constraint_with_subquery_against_sibling_table() {
-    // Constraint references a sibling table in the same tenant. The
+    // Constraint references a sibling table in the same project. The
     // predicate is `(SELECT count(*) FROM siblings) <= 1`; once a
     // single row exists in siblings, further inserts into orders are
     // blocked.
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE siblings (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -413,7 +413,7 @@ async fn constraint_with_subquery_against_sibling_table() {
     )
     .unwrap()
     .unwrap();
-    exec_react_constraint(intent, &tenant, &cat).await.unwrap();
+    exec_react_constraint(intent, &project, &cat).await.unwrap();
 
     sess.execute("INSERT INTO siblings VALUES (1)")
         .await
@@ -443,8 +443,8 @@ async fn constraint_passes_under_cap() {
     // not error (and the row commits).
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -454,7 +454,7 @@ async fn constraint_passes_under_cap() {
     )
     .unwrap()
     .unwrap();
-    exec_react_constraint(intent, &tenant, &cat).await.unwrap();
+    exec_react_constraint(intent, &project, &cat).await.unwrap();
 
     for i in 0..5 {
         sess.execute(&format!("INSERT INTO orders VALUES ({i})"))

@@ -29,19 +29,19 @@ python3 benchmark/bundle.py
 | **NVMe disk cache (real S3)** | **PASS** | `5.35 ms` | `< 2500` |
 | **Durable catalog: rows survive restart (real S3)** | **PASS** | `1 bool` | `= 1` |
 | **Postgres extended-query protocol works end-to-end (real S3)** | **PASS** | `1 fraction` | `≥ 1` |
-| **Idle-tenant RAM cost (real S3)** | **PASS** | `0.64 KiB` | `< 500` |
-| **Tenant isolation under concurrent load (real S3)** | **PASS** | `0 leaks` | `= 0` |
+| **Idle-project RAM cost (real S3)** | **PASS** | `0.64 KiB` | `< 500` |
+| **Project isolation under concurrent load (real S3)** | **PASS** | `0 leaks` | `= 0` |
 | **Large-dataset point query (real S3)** | **PASS** | `3417.68 ms` | `< 8000` |
 | **ORM-style query patterns work end-to-end (real S3)** | **PASS** | `1 fraction` | `≥ 0.85` |
 | **Parquet page cache (real S3)** | **PASS** | `4.47 ms` | `< 2500` |
-| **Within-tenant time-based partition pruning (real S3)** | **PASS** | `0.071456 ratio` | `< 0.2` |
+| **Within-project time-based partition pruning (real S3)** | **PASS** | `0.071456 ratio` | `< 0.2` |
 | **Predicate pushdown vs full scan (real S3)** | **PASS** | `101.18×` | `≥ 10` |
 | **Row-level security: per-principal predicate injection (real S3)** | **PASS** | `5 rows` | `= 5` |
-| **RLS preserves tenant prefix isolation (real S3)** | **PASS** | `0 rows` | `= 0` |
+| **RLS preserves project prefix isolation (real S3)** | **PASS** | `0 rows` | `= 0` |
 | **Per-table row-group sizing for point queries (real S3)** | **PASS** | `0.0625 fraction` | `< 0.5` |
 | **S3 credentials and round-trip** | **FAIL** | `4131.00 ms` | `< 2000` |
 | **Shard-acked INSERT path (real S3 storage)** | **PASS** | `18248.9 inserts/sec` | `≥ 50` |
-| **Tenant deletion latency (real S3)** | **PASS** | `19.49 ms` | `< 3000` |
+| **Project deletion latency (real S3)** | **PASS** | `19.49 ms` | `< 3000` |
 | **Per-table tiered storage (hot/cold) on real S3** | **PASS** | `1 files` | `= 1` |
 | **UPDATE / DELETE via copy-on-write (real S3)** | **PASS** | `24.32 ms` | `< 2000` |
 | **Native vector search on real S3 (HNSW + brute-force agree)** | **PASS** | `10 matches` | `≥ 7` |
@@ -57,19 +57,19 @@ python3 benchmark/bundle.py
 - **NVMe disk cache (real S3)** — Cold p99 of a random-working-set point-query workload finishes under 2500 ms when Storage is backed by a real S3-compatible object store. Cold pass starts with empty disk cache + empty metadata cache; warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache. Measured `cold p99 ms` = `5.35 ms`.
 - **Durable catalog: rows survive restart (real S3)** — Catalog metadata + S3-resident parquet survives a basin-server restart: rows written through pgwire come back identical after the server is dropped and a fresh server is started against the same Postgres schema and the same S3 prefix. Measured `rows survived restart` = `1 bool`.
 - **Postgres extended-query protocol works end-to-end (real S3)** — tokio-postgres / asyncpg / JDBC default extended-query path runs CREATE / INSERT($1,$2) / prepared SELECT against Basin (real-S3 storage) without falling back to simple_query. Measured `Extended-protocol queries that succeed` = `1 fraction`.
-- **Idle-tenant RAM cost (real S3)** — Basin holds many idle tenants in one process for under 500 KiB each, with a real-S3 Storage attached to each tenant's control-plane state. Measured `per_tenant_kib` = `0.64 KiB`.
-- **Tenant isolation under concurrent load (real S3)** — Concurrent multi-tenant traffic on S3 produces zero cross-tenant row leakage. Measured `leaks` = `0 leaks`.
+- **Idle-project RAM cost (real S3)** — Basin holds many idle projects in one process for under 500 KiB each, with a real-S3 Storage attached to each project's control-plane state. Measured `per_project_kib` = `0.64 KiB`.
+- **Project isolation under concurrent load (real S3)** — Concurrent multi-project traffic on S3 produces zero cross-project row leakage. Measured `leaks` = `0 leaks`.
 - **Large-dataset point query (real S3)** — Cold p99 of a 1000-iteration random-working-set point-query workload on a 10 M-row dataset stored on S3 finishes under 8 seconds. Each query picks a different id from a fixed-seed pool of 1000 hot ids. The bar is on COLD p99 (caches empty at the start of the run); a 'warm' phase is reported alongside. Measured `cold p99 ms` = `3417.68 ms`.
 - **ORM-style query patterns work end-to-end (real S3)** — Seven representative query shapes that real ORMs (Diesel, SeaORM, Prisma, ActiveRecord, SQLAlchemy) emit through the Postgres extended-query protocol succeed against Basin with real-S3 storage. Failure mode is a clear protocol error, not a hang. Measured `Representative ORM patterns that succeed` = `1 fraction`.
 - **Parquet page cache (real S3)** — Cold p99 of a random-working-set point-query workload finishes under 2500 ms on a real S3-compatible backend. Cold pass starts with an empty page cache (every working-set id is a miss); warm pass repeats the same workload with the cache populated. The bar is set against COLD p99 so an implementation can't pass by leaning on a pre-warmed cache. Measured `cold p99 ms` = `4.47 ms`.
-- **Within-tenant time-based partition pruning (real S3)** — A 1-month range query against 12 months of partitioned data, hosted on real S3, reads at most one partition's worth of bytes (range/full bytes ratio < 0.2). Measured `partition_bytes_ratio (range / full)` = `0.071456 ratio`.
+- **Within-project time-based partition pruning (real S3)** — A 1-month range query against 12 months of partitioned data, hosted on real S3, reads at most one partition's worth of bytes (range/full bytes ratio < 0.2). Measured `partition_bytes_ratio (range / full)` = `0.071456 ratio`.
 - **Predicate pushdown vs full scan (real S3)** — On real S3, a point query reads at least 10x less than a full scan would. Measured `reduction_x (full_scan_bytes / point_query_bytes)` = `101.18×`.
 - **Row-level security: per-principal predicate injection (real S3)** — RLS isolates rows per `current_user` while preserving full visibility when disabled. Object store: real S3. Measured `alice_rows_visible` = `5 rows`.
-- **RLS preserves tenant prefix isolation (real S3)** — Cross-tenant row leakage is zero across every RLS configuration combination, with data hosted on real S3. Measured `cross_tenant_leak` = `0 rows`.
+- **RLS preserves project prefix isolation (real S3)** — Cross-project row leakage is zero across every RLS configuration combination, with data hosted on real S3. Measured `cross_project_leak` = `0 rows`.
 - **Per-table row-group sizing for point queries (real S3)** — A table with `row_group_rows = 4096` scans strictly fewer than half the rows of an identical table at the default 65,536-row group size when answering a `WHERE id = X` point query, on a real S3-compatible backend. Measured `small_rg_scan_rows / default_rg_scan_rows` = `0.0625 fraction`.
 - **S3 credentials and round-trip** — Real S3-compatible service handles PUT, GET, LIST, DELETE with byte-accurate body round-trip. Measured `PUT+GET+LIST+DELETE total` = `4131.00 ms`.
 - **Shard-acked INSERT path (real S3 storage)** — Single-row INSERTs route through the WAL + shard owner; WAL absorbs S3 latency so user-visible throughput stays >= 50 inserts/sec. Measured `inserts_per_sec` = `18248.9 inserts/sec`.
-- **Tenant deletion latency (real S3)** — Deleting a tenant of 100 small files via Storage::delete_tenant (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path). Measured `deletion_ms` = `19.49 ms`.
+- **Project deletion latency (real S3)** — Deleting a project of 100 small files via Storage::delete_project (catalog-first; LIST mop-up in parallel; drop_namespace) completes in under 3 seconds on real S3 (caches reset; cold path). Measured `deletion_ms` = `19.49 ms`.
 - **Per-table tiered storage (hot/cold) on real S3** — Files older than the configured threshold migrate from the default 'hot' object-store prefix to a cheaper 'cold' prefix on real S3. Reads transparently follow the catalog regardless of tier. Measured `cold_files_after_sweep` = `1 files`.
 - **UPDATE / DELETE via copy-on-write (real S3)** — An UPDATE and a DELETE on a 10K-row real-S3 table commit end-to-end (parser → executor → S3 rewrite → catalog Replace snapshot) in under 2 seconds. Measured `UPDATE+DELETE elapsed (ms)` = `24.32 ms`.
 - **Native vector search on real S3 (HNSW + brute-force agree)** — On real S3, HNSW top-10 overlaps brute-force top-10 by >=7. Measured `HNSW / brute-force overlap (out of 10)` = `10 matches`.
@@ -78,11 +78,11 @@ python3 benchmark/bundle.py
 
 ### Compute sharding (router -> shard owners) on real S3 — **PASS**
 
-_Hash tenant_id -> shard_id; pgwire connections route to the owning shard. Shards share one S3-backed Storage; load distributes evenly across shards. Scaled to 25 tenants on real S3 to fit the WAN test budget._
+_Hash project_id -> shard_id; pgwire connections route to the owning shard. Shards share one S3-backed Storage; load distributes evenly across shards. Scaled to 25 projects on real S3 to fit the WAN test budget._
 
 **max shard load:** `32 %` (bar `< 50`)
 
-| shard index | tenants on shard (count) | share of tenants (%) |
+| shard index | projects on shard (count) | share of projects (%) |
 | --- | --- | --- |
 | 0 | 4 | 16.00 |
 | 1 | 8 | 32.00 |
@@ -102,7 +102,7 @@ _On real S3, concurrent readers scale: per-query latency is network-bound, so ad
 | 16 | 12.67 | 0.79 | 1020430.00 |
 | 64 | 25.33 | 0.40 | 2568966.00 |
 
-### Single-tenant data size scale-up (real S3) — **PASS**
+### Single-project data size scale-up (real S3) — **PASS**
 
 _On real S3, storage is linear in row count and point-query latency stays bounded._
 
@@ -114,13 +114,13 @@ _On real S3, storage is linear in row count and point-query latency stays bounde
 | 100,000 | 0.85 | 8.96 | 2264.89 | 6669.14 |
 | 1,000,000 | 8.54 | 8.95 | 2686.85 | 56325.26 |
 
-### Idle-tenant cost curve (real S3) — **PASS**
+### Idle-project cost curve (real S3) — **PASS**
 
-_RAM cost stays small per idle tenant as the tenant count grows, with a real-S3 Storage attached._
+_RAM cost stays small per idle project as the project count grows, with a real-S3 Storage attached._
 
-**max per_tenant_kib across scales:** `0.94 KiB` (bar `< 5`)
+**max per_project_kib across scales:** `0.94 KiB` (bar `< 5`)
 
-| tenants | Per-tenant RSS (KiB) | Provision time (ms) | RSS delta (KiB) |
+| projects | Per-project RSS (KiB) | Provision time (ms) | RSS delta (KiB) |
 | --- | --- | --- | --- |
 | 100 | 0.32 | 0.06 | 32 |
 | 1,000 | 0.43 | 0.57 | 432 |
@@ -129,7 +129,7 @@ _RAM cost stays small per idle tenant as the tenant count grows, with a real-S3 
 
 ### Noisy-neighbor degradation (real S3) — **PASS**
 
-_On real S3, a heavy noisy tenant doesn't crater a quiet tenant's p99 latency._
+_On real S3, a heavy noisy project doesn't crater a quiet project's p99 latency._
 
 **p99 ratio (under_load / baseline):** `1.15×` (bar `< 5`)
 
@@ -152,37 +152,37 @@ _Same SELECT … WHERE id = X measured four ways under a random- working-set poi
 | c_disk_page | 1440.96 | 7468.41 |
 | d_full | 2004.61 | 7686.00 |
 
-### Per-tenant cost vs tenant count (real S3) — **PASS**
+### Per-project cost vs project count (real S3) — **PASS**
 
-_RAM and quiet point-query latency per tenant stay near-constant as tenant count grows on a real S3-compatible backend._
+_RAM and quiet point-query latency per project stay near-constant as project count grows on a real S3-compatible backend._
 
 **quiet_p50_at_max / quiet_p50_at_1:** `0.97×` (bar `< 5`)
 
-| tenants | Per-tenant RAM (KiB) | Quiet point query p50 (ms) |
+| projects | Per-project RAM (KiB) | Quiet point query p50 (ms) |
 | --- | --- | --- |
 | 1 | 160.00 | 1540.48 |
 | 10 | 174.22 | 1564.46 |
 | 100 | 0.00 | 1490.77 |
 
-### Tenant deletion at scale, real S3 (Basin vs Postgres) — **PASS**
+### Project deletion at scale, real S3 (Basin vs Postgres) — **PASS**
 
-_Basin's tenant teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows._
+_Basin's project teardown is a bulk catalog DELETE plus a single drop_namespace; PG's DROP SCHEMA CASCADE walks every row and index. Basin's slope is structurally flatter, so it overtakes PG as the file count grows._
 
 **basin delete_ms at largest scale:** `8008.60 ms` (bar `< ∞`)
 
-| files per tenant | Basin (ms) | Postgres (ms) |
+| files per project | Basin (ms) | Postgres (ms) |
 | --- | --- | --- |
 | 100 | 2357.63 | 2.62 |
 | 1,000 | 5512.46 | 8.09 |
 | 5,000 | 8008.60 | 1.84 |
 
-### Tenant deletion at scale, realistic SaaS schema, real S3 (Basin vs Postgres) — **FAIL**
+### Project deletion at scale, realistic SaaS schema, real S3 (Basin vs Postgres) — **FAIL**
 
-_Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row × every index + validates every FK on the cascade; Basin's tenant teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile._
+_Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row × every index + validates every FK on the cascade; Basin's project teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile._
 
 **Basin/Postgres ratio at 5000 files (realistic schema, real S3):** `103.202 ratio` (bar `< 1`)
 
-| files per tenant | Basin (ms) | Postgres (ms) |
+| files per project | Basin (ms) | Postgres (ms) |
 | --- | --- | --- |
 | 100 | 31.85 | 10.15 |
 | 1,000 | 710.35 | 17.23 |
@@ -199,16 +199,16 @@ _Basin's Iceberg-style snapshot is an O(1) manifest copy while pg_dump is O(data
 | Backup wall time | `0.00 s` | `0.16 s` | **Basin** | `pg / basin = 88x` |
 | Backup byte size | `0.00 MiB` | `6.08 MiB` | **Basin** | `pg / basin = 6329x` |
 
-### Lifecycle ops on real S3: tenant deletion + ADD COLUMN
+### Lifecycle ops on real S3: project deletion + ADD COLUMN
 
-_Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap._
+_Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap._
 
 | Metric | Basin | Postgres | Winner | Ratio |
 |---|---|---|---|---|
-| Tenant deletion (1 tenant, 100K rows in 100 files; basin on S3) | `1955.45 ms` | `5.74 ms` | **Postgres** | `pg / basin = 0.00x` |
+| Project deletion (1 project, 100K rows in 100 files; basin on S3) | `1955.45 ms` | `5.74 ms` | **Postgres** | `pg / basin = 0.00x` |
 | ADD COLUMN on 100K rows | `3.24 ms` | `4.18 ms` | **Basin** | `pg / basin = 1.29x` |
 
-> Basin storage on real S3 — tenant deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes.
+> Basin storage on real S3 — project deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes.
 
 ### Basin (real S3) vs Postgres 18 (no index, 100K rows)
 

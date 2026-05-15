@@ -2,7 +2,7 @@
 //!
 //! Auth is enforced at the per-request level (not via middleware) so the
 //! handler has direct access to the verified [`basin_auth::Claims`] and can
-//! open a tenant-scoped engine session itself. The pattern matches what
+//! open a project-scoped engine session itself. The pattern matches what
 //! basin-router does for pgwire connections.
 
 use std::collections::HashMap;
@@ -83,7 +83,7 @@ pub(crate) async fn get_table(
     let session = state
         .cfg
         .engine
-        .open_session(claims.tenant_id)
+        .open_session(claims.project_id)
         .await
         .map_err(ApiError::from)?;
     let res = session.execute(&sql).await.map_err(ApiError::from)?;
@@ -270,7 +270,7 @@ pub(crate) async fn post_table(
     let session = state
         .cfg
         .engine
-        .open_session(claims.tenant_id)
+        .open_session(claims.project_id)
         .await
         .map_err(ApiError::from)?;
     let res = session.execute(&sql).await.map_err(ApiError::from)?;
@@ -301,7 +301,7 @@ pub(crate) async fn patch_table(
     let session = state
         .cfg
         .engine
-        .open_session(claims.tenant_id)
+        .open_session(claims.project_id)
         .await
         .map_err(ApiError::from)?;
     let res = session.execute(&sql).await.map_err(ApiError::from)?;
@@ -325,7 +325,7 @@ pub(crate) async fn delete_table(
     let session = state
         .cfg
         .engine
-        .open_session(claims.tenant_id)
+        .open_session(claims.project_id)
         .await
         .map_err(ApiError::from)?;
     match session.execute(&sql).await {

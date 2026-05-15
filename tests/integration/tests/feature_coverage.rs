@@ -20,7 +20,7 @@
 //! - CREATE TABLE                         -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
 //! - INSERT VALUES (single + multi-row)   -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
 //! - SELECT WHERE (single table)          -> covered elsewhere: tests/integration/tests/viability_predicate_pushdown.rs
-//! - SHOW TABLES (per-tenant scoped)      -> covered by feature_coverage::show_tables_per_tenant_scoped
+//! - SHOW TABLES (per-project scoped)      -> covered by feature_coverage::show_tables_per_project_scoped
 //! - ORDER BY / LIMIT                     -> covered elsewhere: tests/integration/tests/poc_smoke.rs
 //! - ORDER BY … NULLS FIRST / LAST       -> covered elsewhere: tests/integration/tests/select_advanced.rs
 //! - SELECT DISTINCT ON (cols)            -> covered elsewhere: tests/integration/tests/select_advanced.rs
@@ -69,20 +69,20 @@
 //! - Range function range_adjacent       -> covered by feature_coverage::range_adjacent_operator
 //! - Range function range_merge          -> covered by feature_coverage::range_merge_udf
 //!
-//! ## Multi-tenancy
-//! - Per-tenant bucket prefix isolation   -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
-//! - Connection -> tenant via username    -> covered elsewhere: tests/integration/tests/poc_smoke.rs
-//! - Per-tenant snapshots                 -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
-//! - Per-tenant fairness (Semaphore)      -> covered elsewhere: tests/integration/tests/viability_isolation_under_load.rs
+//! ## Multi-project
+//! - Per-project bucket prefix isolation   -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
+//! - Connection -> project via username    -> covered elsewhere: tests/integration/tests/poc_smoke.rs
+//! - Per-project snapshots                 -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
+//! - Per-project fairness (Semaphore)      -> covered elsewhere: tests/integration/tests/viability_isolation_under_load.rs
 //! - Row-Level Security                   -> covered elsewhere: tests/integration/tests/viability_rls_isolation.rs
-//! - Tenant deletion                      -> covered elsewhere: tests/integration/tests/viability_tenant_deletion.rs
-//! - Table fork (catalog COW)             -> covered by feature_coverage::table_fork_clones_within_tenant
-//! - Within-tenant time partitioning      -> covered elsewhere: tests/integration/tests/viability_partition_pruning.rs
+//! - Project deletion                      -> covered elsewhere: tests/integration/tests/viability_project_deletion.rs
+//! - Table fork (catalog COW)             -> covered by feature_coverage::table_fork_clones_within_project
+//! - Within-project time partitioning      -> covered elsewhere: tests/integration/tests/viability_partition_pruning.rs
 //! - Tiered storage (hot/cold)            -> covered elsewhere: tests/integration/tests/viability_tiered_storage.rs
-//! - Whale-tenant pinning                 -> covered by feature_coverage::whale_tenant_pinning_routes_deterministically
+//! - Whale-project pinning                 -> covered by feature_coverage::whale_project_pinning_routes_deterministically
 //!
 //! ## Storage
-//! - Parquet under tenants/{id}/...       -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
+//! - Parquet under projects/{id}/...       -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
 //! - Predicate pushdown                   -> covered elsewhere: tests/integration/tests/viability_predicate_pushdown.rs
 //! - Projection pushdown                  -> covered elsewhere: tests/integration/tests/phase1_substrate.rs (uses ReadOptions.projection)
 //! - Bloom filters                        -> covered elsewhere: tests/integration/tests/viability_bloom_filter_pruning.rs
@@ -126,7 +126,7 @@
 //! - hstore (use JSONB)                   -> covered elsewhere: tests/integration/tests/viability_jsonb.rs
 //!
 //! ## Operations
-//! - Per-tenant metrics                   -> covered elsewhere: tests/integration/tests/viability_per_tenant_counters.rs
+//! - Per-project metrics                   -> covered elsewhere: tests/integration/tests/viability_per_project_counters.rs
 //! - OpenTelemetry traces                 -> covered elsewhere: every layer carries `#[tracing::instrument]`; OTLP export is a transport-only flag
 //! - Structured logs                      -> covered elsewhere: crates/basin-common/src/telemetry.rs (format selection at startup; no per-call assertion to write)
 //! - Connection pooling (basin-pool)      -> covered elsewhere: tests/integration/tests/poc_pool_smoke.rs
@@ -145,7 +145,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, Int64Array, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_router::{parse_pins_env, PgRateLimit, ShardMap};
 use basin_storage::{Storage, StorageConfig};
@@ -170,13 +170,13 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-/// SHOW TABLES is per-tenant scoped: tenant A never sees tenant B's table.
+/// SHOW TABLES is per-project scoped: project A never sees project B's table.
 #[tokio::test]
-async fn show_tables_per_tenant_scoped() {
+async fn show_tables_per_project_scoped() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let a = engine.open_session(TenantId::new()).await.unwrap();
-    let b = engine.open_session(TenantId::new()).await.unwrap();
+    let a = engine.open_session(ProjectId::new()).await.unwrap();
+    let b = engine.open_session(ProjectId::new()).await.unwrap();
     a.execute("CREATE TABLE only_a (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -188,11 +188,11 @@ async fn show_tables_per_tenant_scoped() {
     let names = collect_strings(res, "table_name");
     assert!(
         names.iter().any(|n| n == "only_a"),
-        "tenant A missing own: {names:?}"
+        "project A missing own: {names:?}"
     );
     assert!(
         !names.iter().any(|n| n == "only_b"),
-        "tenant A leaked tenant B's table: {names:?}"
+        "project A leaked project B's table: {names:?}"
     );
 }
 
@@ -201,7 +201,7 @@ async fn show_tables_per_tenant_scoped() {
 async fn double_precision_round_trips() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE m (id BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL)")
         .await
         .unwrap();
@@ -230,11 +230,11 @@ async fn double_precision_round_trips() {
 }
 
 /// `Catalog::fork_table` clones the source's snapshot history and schema
-/// within the same tenant, sharing data files by reference.
+/// within the same project, sharing data files by reference.
 #[tokio::test]
-async fn table_fork_clones_within_tenant() {
+async fn table_fork_clones_within_project() {
     let cat = Arc::new(InMemoryCatalog::new());
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let src = TableName::new("src").unwrap();
     let dst = TableName::new("dst").unwrap();
@@ -253,12 +253,12 @@ async fn table_fork_clones_within_tenant() {
     assert!(listed.contains(&src) && listed.contains(&dst));
 }
 
-/// Whale-tenant pinning: a pin hard-routes a tenant to its assigned shard
+/// Whale-project pinning: a pin hard-routes a project to its assigned shard
 /// regardless of consistent-hash bucketing.
 #[tokio::test]
-async fn whale_tenant_pinning_routes_deterministically() {
+async fn whale_project_pinning_routes_deterministically() {
     let endpoints: Vec<String> = (0..4).map(|i| format!("ep-{i}")).collect();
-    let whale = TenantId::new();
+    let whale = ProjectId::new();
     let mut pins = HashMap::new();
     pins.insert(whale, 3);
     let map = ShardMap::with_pins(endpoints.clone(), pins).unwrap();
@@ -279,7 +279,7 @@ async fn whale_tenant_pinning_routes_deterministically() {
 async fn vector_distance_operators_rewrite() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE v (id BIGINT NOT NULL, e VECTOR(3) NOT NULL)")
         .await
         .unwrap();
@@ -311,7 +311,7 @@ async fn vector_distance_operators_rewrite() {
 #[tokio::test]
 async fn pgwire_rate_limit_returns_53400() {
     let rl = PgRateLimit::with_qps(1);
-    let t = TenantId::new();
+    let t = ProjectId::new();
     // 1 qps × 3 burst = 3 free tokens; the 4th-onwards must reject.
     for _ in 0..3 {
         rl.check(&t).expect("burst should pass");
@@ -331,10 +331,10 @@ async fn pgwire_rate_limit_returns_53400() {
 // ---------------------------------------------------------------------------
 
 /// Helper: open a fresh in-process engine session.
-async fn range_session() -> (basin_engine::TenantSession, TempDir) {
+async fn range_session() -> (basin_engine::ProjectSession, TempDir) {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     (sess, dir)
 }
 

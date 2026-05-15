@@ -1,25 +1,25 @@
 //! Scaling test: compute sharding (router -> shard owners).
 //!
-//! Claim: Basin's router can fan tenant connections across N shard-owner
-//! processes via stable hashing. Reconnects from the same tenant always
+//! Claim: Basin's router can fan project connections across N shard-owner
+//! processes via stable hashing. Reconnects from the same project always
 //! land on the same shard (consistent routing); across many random
-//! tenants no single shard hoards the load.
+//! projects no single shard hoards the load.
 //!
 //! Setup:
 //!   - 4 in-process shard-owner pgwire listeners share one LocalFS-backed
 //!     storage tempdir + one in-memory catalog.
 //!   - 1 front router runs in `shard_endpoints` mode against those four.
-//!   - 100 distinct tenants (one pgwire username each) connect through
+//!   - 100 distinct projects (one pgwire username each) connect through
 //!     the front router; each runs CREATE TABLE / INSERT / SELECT.
 //!   - We capture which shard handled each connection by reading the
 //!     per-shard authentication counter wired into `test_cluster`.
-//!   - Each tenant reconnects 5× to verify it lands on the same shard
+//!   - Each project reconnects 5× to verify it lands on the same shard
 //!     every time.
 //!
 //! Bars (dashboard card `scaling_compute_shards`):
-//!   - `consistent_routing_pct == 100`: every reconnect for every tenant
+//!   - `consistent_routing_pct == 100`: every reconnect for every project
 //!     hit the same shard.
-//!   - `max_shard_load_pct < 50`: across the 100 random tenants, no shard
+//!   - `max_shard_load_pct < 50`: across the 100 random projects, no shard
 //!     handled more than 50% of them. (Expected ~25% with hash uniformity
 //!     across 4 buckets; 50% is wide enough to absorb ULID-derived noise
 //!     on small samples without flaking.)
@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -38,8 +38,8 @@ use serde_json::json;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 const N_SHARDS: usize = 4;
-const N_TENANTS: usize = 100;
-const RECONNECTS_PER_TENANT: usize = 5;
+const N_PROJECTS: usize = 100;
+const RECONNECTS_PER_PROJECT: usize = 5;
 const BAR_MAX_SHARD_LOAD_PCT: f64 = 50.0;
 const BAR_CONSISTENT_ROUTING_PCT: f64 = 100.0;
 
@@ -64,26 +64,26 @@ async fn connect(addr: SocketAddr, user: &str) -> tokio_postgres::Client {
     client
 }
 
-/// Read every shard's per-tenant authentication counters and return the
-/// shard index a given `tenant` was last seen on. Returns `None` if no
-/// shard has yet authenticated this tenant.
-async fn shard_for_tenant(cluster: &Cluster, tenant: &TenantId) -> Option<usize> {
+/// Read every shard's per-project authentication counters and return the
+/// shard index a given `project` was last seen on. Returns `None` if no
+/// shard has yet authenticated this project.
+async fn shard_for_project(cluster: &Cluster, project: &ProjectId) -> Option<usize> {
     for (idx, shard) in cluster.shards.iter().enumerate() {
-        let map = shard.stats.snapshot_per_tenant().await;
-        if map.contains_key(tenant) {
+        let map = shard.stats.snapshot_per_project().await;
+        if map.contains_key(project) {
             return Some(idx);
         }
     }
     None
 }
 
-/// Snapshot the per-tenant counter on shard `idx` for `tenant`.
-async fn shard_count_for_tenant(cluster: &Cluster, idx: usize, tenant: &TenantId) -> u64 {
+/// Snapshot the per-project counter on shard `idx` for `project`.
+async fn shard_count_for_project(cluster: &Cluster, idx: usize, project: &ProjectId) -> u64 {
     cluster.shards[idx]
         .stats
-        .snapshot_per_tenant()
+        .snapshot_per_project()
         .await
-        .get(tenant)
+        .get(project)
         .copied()
         .unwrap_or(0)
 }
@@ -99,21 +99,21 @@ async fn scaling_compute_shards() {
         cluster.shard_endpoints
     );
 
-    // Provision tenants. One pgwire username per tenant. The shared
+    // Provision projects. One pgwire username per project. The shared
     // resolver lives in `cluster.resolver`; both the router and every
     // shard delegate to it so resolution is consistent across processes.
-    let mut tenants: Vec<(String, TenantId)> = Vec::with_capacity(N_TENANTS);
-    for i in 0..N_TENANTS {
-        let user = format!("tenant_{i:03}");
-        let t = TenantId::new();
+    let mut projects: Vec<(String, ProjectId)> = Vec::with_capacity(N_PROJECTS);
+    for i in 0..N_PROJECTS {
+        let user = format!("project_{i:03}");
+        let t = ProjectId::new();
         cluster.resolver.insert(user.clone(), t).await;
-        tenants.push((user, t));
+        projects.push((user, t));
     }
 
-    // First pass: every tenant runs CREATE / INSERT / SELECT through the
+    // First pass: every project runs CREATE / INSERT / SELECT through the
     // front router. Capture which shard ended up handling each.
-    let mut placement: HashMap<TenantId, usize> = HashMap::new();
-    for (user, tenant) in &tenants {
+    let mut placement: HashMap<ProjectId, usize> = HashMap::new();
+    for (user, project) in &projects {
         let client = connect(router_addr, user).await;
         client
             .simple_query("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
@@ -140,32 +140,32 @@ async fn scaling_compute_shards() {
         // numbers crisp.
         drop(client);
 
-        let shard_idx = shard_for_tenant(&cluster, tenant)
+        let shard_idx = shard_for_project(&cluster, project)
             .await
-            .unwrap_or_else(|| panic!("no shard saw tenant {tenant} after first round"));
-        placement.insert(*tenant, shard_idx);
+            .unwrap_or_else(|| panic!("no shard saw project {project} after first round"));
+        placement.insert(*project, shard_idx);
     }
 
-    // Second pass: reconnect each tenant N more times; assert each lands
+    // Second pass: reconnect each project N more times; assert each lands
     // on the same shard as the first round did.
     let mut consistent_hits: u64 = 0;
     let mut total_reconnects: u64 = 0;
-    for (user, tenant) in &tenants {
-        let expected_idx = *placement.get(tenant).unwrap();
-        let baseline = shard_count_for_tenant(&cluster, expected_idx, tenant).await;
-        for _ in 0..RECONNECTS_PER_TENANT {
+    for (user, project) in &projects {
+        let expected_idx = *placement.get(project).unwrap();
+        let baseline = shard_count_for_project(&cluster, expected_idx, project).await;
+        for _ in 0..RECONNECTS_PER_PROJECT {
             let client = connect(router_addr, user).await;
             // Lightweight probe so we know auth landed.
             let _ = client.simple_query("SELECT 1").await;
             drop(client);
             total_reconnects += 1;
         }
-        let after = shard_count_for_tenant(&cluster, expected_idx, tenant).await;
+        let after = shard_count_for_project(&cluster, expected_idx, project).await;
         let delta = after.saturating_sub(baseline);
         // We expect every reconnect to land on the same shard, so the
-        // counter on that shard should advance by exactly RECONNECTS_PER_TENANT.
-        if delta == RECONNECTS_PER_TENANT as u64 {
-            consistent_hits += RECONNECTS_PER_TENANT as u64;
+        // counter on that shard should advance by exactly RECONNECTS_PER_PROJECT.
+        if delta == RECONNECTS_PER_PROJECT as u64 {
+            consistent_hits += RECONNECTS_PER_PROJECT as u64;
         } else {
             // Fall through: count every reconnect that actually landed on
             // the expected shard, regardless of whether some leaked elsewhere.
@@ -175,16 +175,16 @@ async fn scaling_compute_shards() {
 
     let consistent_routing_pct = 100.0 * consistent_hits as f64 / total_reconnects.max(1) as f64;
 
-    // Load distribution: how many tenants ended up on each shard?
+    // Load distribution: how many projects ended up on each shard?
     let mut load_per_shard: Vec<usize> = vec![0; N_SHARDS];
     for idx in placement.values() {
         load_per_shard[*idx] += 1;
     }
     let max_load: usize = *load_per_shard.iter().max().unwrap();
-    let max_shard_load_pct = 100.0 * max_load as f64 / N_TENANTS as f64;
+    let max_shard_load_pct = 100.0 * max_load as f64 / N_PROJECTS as f64;
 
     println!(
-        "[SCALING compute_shards] tenants={N_TENANTS} shards={N_SHARDS} \
+        "[SCALING compute_shards] projects={N_PROJECTS} shards={N_SHARDS} \
          load_per_shard={load_per_shard:?} \
          max_shard_load_pct={max_shard_load_pct:.1}% \
          consistent_routing_pct={consistent_routing_pct:.1}%",
@@ -200,8 +200,8 @@ async fn scaling_compute_shards() {
         .map(|(i, count)| {
             json!({
                 "shard": i,
-                "tenants": *count,
-                "load_pct": 100.0 * (*count as f64) / N_TENANTS as f64,
+                "projects": *count,
+                "load_pct": 100.0 * (*count as f64) / N_PROJECTS as f64,
             })
         })
         .collect();
@@ -209,8 +209,8 @@ async fn scaling_compute_shards() {
     report_scaling(
         "compute_shards",
         "Compute sharding (router -> shard owners)",
-        "Hash tenant_id -> shard_id; pgwire connections route to the owning shard. \
-         Reconnects from the same tenant always land on the same shard, and load \
+        "Hash project_id -> shard_id; pgwire connections route to the owning shard. \
+         Reconnects from the same project always land on the same shard, and load \
          distributes evenly enough across shards.",
         passed,
         AxisSpec {
@@ -219,13 +219,13 @@ async fn scaling_compute_shards() {
         },
         vec![
             SeriesSpec {
-                key: "tenants".into(),
-                label: "tenants on shard".into(),
+                key: "projects".into(),
+                label: "projects on shard".into(),
                 unit: Some("count".into()),
             },
             SeriesSpec {
                 key: "load_pct".into(),
-                label: "share of tenants".into(),
+                label: "share of projects".into(),
                 unit: Some("%".into()),
             },
         ],

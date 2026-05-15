@@ -7,7 +7,7 @@
 //! independently of `basin-common::events` (which is a stable Tier 0
 //! contract).
 
-use basin_common::{ChangeEvent, ChangeOp, TableName, TenantId};
+use basin_common::{ChangeEvent, ChangeOp, TableName, ProjectId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -43,7 +43,7 @@ impl From<ChangeOp> for WebhookOpStr {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebhookEnvelope {
     pub subscription_id: WebhookSubscriptionId,
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: String,
     pub op: WebhookOpStr,
     pub before: Option<Value>,
@@ -61,7 +61,7 @@ impl WebhookEnvelope {
     pub fn from_event(subscription_id: WebhookSubscriptionId, ev: &ChangeEvent) -> Self {
         Self {
             subscription_id,
-            tenant: ev.tenant,
+            project: ev.project,
             table: ev.table.to_string(),
             op: ev.op.into(),
             before: ev.before.clone(),

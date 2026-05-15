@@ -6,15 +6,15 @@
 //!
 //! 1. Holds a `basin_storage::Storage` (the Parquet substrate) and a
 //!    `basin_catalog::Catalog` (table metadata + snapshots).
-//! 2. Hands out per-tenant [`TenantSession`]s. Each session is the only API
+//! 2. Hands out per-project [`ProjectSession`]s. Each session is the only API
 //!    surface a router or test should program against.
-//! 3. Compiles and executes SQL via DataFusion against the calling tenant's
-//!    namespace. Tenant isolation is structural: there is no API path on
-//!    [`TenantSession`] that exposes another tenant's data.
+//! 3. Compiles and executes SQL via DataFusion against the calling project's
+//!    namespace. Project isolation is structural: there is no API path on
+//!    [`ProjectSession`] that exposes another project's data.
 //!
 //! The module-level types declared here are the *public contract* the router
 //! depends on. Their bodies are filled in by [`Engine::new`] /
-//! [`TenantSession::execute`].
+//! [`ProjectSession::execute`].
 //!
 //! ## Supported SQL (PoC scope)
 //!
@@ -25,8 +25,8 @@
 //!
 //! ## Prepared statements (extended-query support)
 //!
-//! [`TenantSession::prepare`] / [`TenantSession::bind`] /
-//! [`TenantSession::execute_bound`] back the Postgres extended-query path the
+//! [`ProjectSession::prepare`] / [`ProjectSession::bind`] /
+//! [`ProjectSession::execute_bound`] back the Postgres extended-query path the
 //! router speaks. The v1 implementation parses `$N` placeholders out of the
 //! SQL, substitutes literal values at bind time, and re-runs the simple-query
 //! pipeline. This unblocks every `tokio-postgres` / `asyncpg` / JDBC client
@@ -46,15 +46,15 @@ use std::sync::{Mutex, RwLock};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use basin_common::{
-    ChangeEventSink, EventSinkRegistry, Result, TableName, TenantCounterRegistry,
-    TenantCountersSnapshot, TenantId,
+    ChangeEventSink, EventSinkRegistry, Result, TableName, ProjectCounterRegistry,
+    ProjectCountersSnapshot, ProjectId,
 };
 use uuid::Uuid;
 
 /// Engine configuration.
 ///
-/// `storage` and `catalog` are shared across all tenant sessions; per-tenant
-/// scoping happens *inside* the engine, not by handing out per-tenant
+/// `storage` and `catalog` are shared across all project sessions; per-project
+/// scoping happens *inside* the engine, not by handing out per-project
 /// instances.
 ///
 /// `shard` is optional. When `Some`, INSERTs route through the shard owner's
@@ -97,30 +97,30 @@ pub(crate) struct EngineInner {
     /// pg_plan path (ADR 0014 Phase 1+). Tests assert this advances when
     /// they expect the new routing to engage.
     pub(crate) pg_plan_routing_count: AtomicU64,
-    /// Per-tenant noisy-tenant detector. Reads its bit when a session is
+    /// Per-project noisy-project detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
-    /// successful `TenantSession::execute`. See `noisy_detector` module
+    /// successful `ProjectSession::execute`. See `noisy_detector` module
     /// for the full rationale.
     pub(crate) noisy_detector: crate::noisy_detector::NoisyDetector,
-    /// Per-tenant ops/bytes/errors/latency aggregator (Phase 6 telemetry).
+    /// Per-project ops/bytes/errors/latency aggregator (Phase 6 telemetry).
     /// Shared with `Storage` and (when present) `Wal` so byte counters cover
     /// every layer.
-    pub(crate) tenant_counters: Arc<TenantCounterRegistry>,
+    pub(crate) project_counters: Arc<ProjectCounterRegistry>,
     /// Pluggable change-event sinks (pre/post-commit). With both lists
     /// empty the executor's mutation path is a single `is_empty()` check
     /// past the no-op branch — see `dml_events`.
     pub(crate) event_sinks: RwLock<EventSinkRegistry>,
-    /// Monotonic per-`(tenant, table)` event sequence numbers. Bumped
+    /// Monotonic per-`(project, table)` event sequence numbers. Bumped
     /// under this mutex once per emitted event, just before the
     /// pre-commit fan-out, so all sinks observe the same seq for one
     /// committed mutation.
-    pub(crate) event_seq: Mutex<HashMap<(TenantId, TableName), u64>>,
+    pub(crate) event_seq: Mutex<HashMap<(ProjectId, TableName), u64>>,
     /// Process-wide webhook subscription registry. Cheap to clone
     /// (`Arc` inside). The post-commit `WebhookSink` (in
     /// `basin-webhooks`) reads this same registry; the engine's
     /// `ALTER TABLE … SUBSCRIBE WEBHOOK …` SQL surface mutates it.
     pub(crate) webhook_registry: crate::webhook_registry::WebhookRegistry,
-    // additional state (DataFusion runtime, per-tenant context cache) lives
+    // additional state (DataFusion runtime, per-project context cache) lives
     // in the implementation module; intentionally not exposed here.
 }
 
@@ -130,16 +130,16 @@ impl Engine {
         crate::net_glue::install();
         crate::geo_glue::install();
         crate::trgm_glue::install();
-        let tenant_counters = Arc::new(TenantCounterRegistry::new());
+        let project_counters = Arc::new(ProjectCounterRegistry::new());
         // Share the registry with storage (and the shard's WAL when present)
-        // so per-tenant byte counters cover engine + storage + WAL.
-        cfg.storage.attach_tenant_counters(tenant_counters.clone());
+        // so per-project byte counters cover engine + storage + WAL.
+        cfg.storage.attach_project_counters(project_counters.clone());
         // Hand storage the catalog handle so the encryption call path can
-        // look up per-tenant `TenantStorageConfig` and route to the
-        // tenant's CMK without owning a registry of its own.
+        // look up per-project `ProjectStorageConfig` and route to the
+        // project's CMK without owning a registry of its own.
         cfg.storage.attach_catalog(cfg.catalog.clone());
         if let Some(shard) = cfg.shard.as_ref() {
-            shard.wal().attach_tenant_counters(tenant_counters.clone());
+            shard.wal().attach_project_counters(project_counters.clone());
         }
         let mut registry = EventSinkRegistry::new();
         // Opt-in debug helper: with `BASIN_TRACE_CHANGE_EVENTS=1` every
@@ -157,7 +157,7 @@ impl Engine {
             vector_routing_count: AtomicU64::new(0),
             pg_plan_routing_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
-            tenant_counters,
+            project_counters,
             event_sinks: RwLock::new(registry),
             event_seq: Mutex::new(HashMap::new()),
             webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
@@ -166,32 +166,32 @@ impl Engine {
         Self { inner }
     }
 
-    /// Persist a per-tenant storage config (KMS routing + provider
-    /// extras). Passthrough to [`basin_storage::Storage::set_tenant_storage_config`];
+    /// Persist a per-project storage config (KMS routing + provider
+    /// extras). Passthrough to [`basin_storage::Storage::set_project_storage_config`];
     /// invalidates the in-process cache so the next encryption call
     /// picks up the new config.
-    pub async fn set_tenant_storage_config(
+    pub async fn set_project_storage_config(
         &self,
-        tenant: &TenantId,
-        config: basin_storage::TenantStorageConfig,
+        project: &ProjectId,
+        config: basin_storage::ProjectStorageConfig,
     ) -> Result<(), basin_common::BasinError> {
         self.inner
             .cfg
             .storage
-            .set_tenant_storage_config(tenant, config)
+            .set_project_storage_config(project, config)
             .await
     }
 
-    /// Look up a tenant's persisted storage config. Passthrough to
-    /// [`basin_storage::Storage::get_tenant_storage_config`].
-    pub async fn get_tenant_storage_config(
+    /// Look up a project's persisted storage config. Passthrough to
+    /// [`basin_storage::Storage::get_project_storage_config`].
+    pub async fn get_project_storage_config(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Option<basin_storage::TenantStorageConfig>, basin_common::BasinError> {
+        project: &ProjectId,
+    ) -> Result<Option<basin_storage::ProjectStorageConfig>, basin_common::BasinError> {
         self.inner
             .cfg
             .storage
-            .get_tenant_storage_config(tenant)
+            .get_project_storage_config(project)
             .await
     }
 
@@ -207,7 +207,7 @@ impl Engine {
     /// the heuristic and the fallback contract.
     pub fn with_analytical(self, analytical: basin_analytical::AnalyticalEngine) -> Self {
         let cfg = self.inner.cfg.clone();
-        let tenant_counters = self.inner.tenant_counters.clone();
+        let project_counters = self.inner.project_counters.clone();
         let mut registry = EventSinkRegistry::new();
         if std::env::var("BASIN_TRACE_CHANGE_EVENTS").as_deref() == Ok("1") {
             registry.register_post_commit(Arc::new(crate::events::TracingSink));
@@ -220,7 +220,7 @@ impl Engine {
             vector_routing_count: AtomicU64::new(0),
             pg_plan_routing_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
-            tenant_counters,
+            project_counters,
             event_sinks: RwLock::new(registry),
             event_seq: Mutex::new(HashMap::new()),
             webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
@@ -255,53 +255,53 @@ impl Engine {
         &self.inner.event_sinks
     }
 
-    /// Allocate the next per-`(tenant, table)` sequence number. Crate-
+    /// Allocate the next per-`(project, table)` sequence number. Crate-
     /// private; used by the mutation path right before pre-commit fan-out.
-    pub(crate) fn next_event_seq(&self, tenant: &TenantId, table: &TableName) -> u64 {
+    pub(crate) fn next_event_seq(&self, project: &ProjectId, table: &TableName) -> u64 {
         let mut map = self
             .inner
             .event_seq
             .lock()
             .expect("event_seq lock poisoned");
-        let entry = map.entry((*tenant, table.clone())).or_insert(0);
+        let entry = map.entry((*project, table.clone())).or_insert(0);
         *entry += 1;
         *entry
     }
 
-    /// O(1) lookup: is `tenant`'s recent query rate above the noisy
-    /// threshold? Returns `false` for tenants we've never seen. See
+    /// O(1) lookup: is `project`'s recent query rate above the noisy
+    /// threshold? Returns `false` for projects we've never seen. See
     /// [`crate::noisy_detector`] for the threshold and decay constants.
     ///
     /// This is a *hint* the engine consumes when constructing a session
     /// (to downshift `target_partitions`); it is also intended to be read
-    /// by the `basin-storage` fair-share scheduler to demote a tenant's
+    /// by the `basin-storage` fair-share scheduler to demote a project's
     /// I/O priority. It is not a hard cap.
-    pub fn is_noisy(&self, tenant: &TenantId) -> bool {
-        self.inner.noisy_detector.is_noisy(tenant)
+    pub fn is_noisy(&self, project: &ProjectId) -> bool {
+        self.inner.noisy_detector.is_noisy(project)
     }
 
-    /// Crate-private: bump this tenant's query-rate counter. Called from
-    /// `TenantSession::execute` after the statement completes (successfully
+    /// Crate-private: bump this project's query-rate counter. Called from
+    /// `ProjectSession::execute` after the statement completes (successfully
     /// or not — every attempt counts toward the rate, since failed queries
     /// still consumed I/O budget).
-    pub(crate) fn record_query(&self, tenant: &TenantId) {
-        self.inner.noisy_detector.record_query(tenant);
+    pub(crate) fn record_query(&self, project: &ProjectId) {
+        self.inner.noisy_detector.record_query(project);
     }
 
-    /// Plain-data snapshot of `tenant`'s telemetry counters. Returns
-    /// `Default::default()` for tenants with no recorded activity yet.
+    /// Plain-data snapshot of `project`'s telemetry counters. Returns
+    /// `Default::default()` for projects with no recorded activity yet.
     /// Cheap (one HashMap probe + atomic loads + ≤128-element sort).
-    pub fn tenant_counters(&self, tenant: &TenantId) -> TenantCountersSnapshot {
+    pub fn project_counters(&self, project: &ProjectId) -> ProjectCountersSnapshot {
         self.inner
-            .tenant_counters
-            .snapshot(tenant)
+            .project_counters
+            .snapshot(project)
             .unwrap_or_default()
     }
 
     /// Crate-private shared registry handle so the executor / session can
     /// bump op + latency counters without re-locking the registry per call.
-    pub(crate) fn tenant_counters_registry(&self) -> &Arc<TenantCounterRegistry> {
-        &self.inner.tenant_counters
+    pub(crate) fn project_counters_registry(&self) -> &Arc<ProjectCounterRegistry> {
+        &self.inner.project_counters
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -365,24 +365,24 @@ impl Engine {
         self.inner.pg_plan_routing_count.load(Ordering::Relaxed)
     }
 
-    /// Open a session bound to `tenant`. The catalog namespace is created on
+    /// Open a session bound to `project`. The catalog namespace is created on
     /// demand if it does not yet exist.
     ///
     /// The session's `current_user` is the literal `"anonymous"` — RLS
     /// policies that rely on an authenticated principal will treat the
     /// session that way. To plumb a real principal through (e.g. from a
     /// pgwire handshake or JWT), use [`Engine::open_session_as`].
-    pub async fn open_session(&self, tenant: TenantId) -> Result<TenantSession> {
+    pub async fn open_session(&self, project: ProjectId) -> Result<ProjectSession> {
         crate::session::open(
             self.clone(),
-            tenant,
+            project,
             ANONYMOUS_USER.to_string(),
             Arc::new(AuthContext::anonymous()),
         )
         .await
     }
 
-    /// Open a session bound to `tenant` and stamp `current_user` with the
+    /// Open a session bound to `project` and stamp `current_user` with the
     /// given principal name. The principal is exactly the string returned
     /// by SQL's `current_user` / `current_role` (we don't distinguish them
     /// in v0.1 — both resolve to this same value).
@@ -395,19 +395,19 @@ impl Engine {
     /// JWT-derived claims, use [`Engine::open_session_with_auth`].
     pub async fn open_session_as(
         &self,
-        tenant: TenantId,
+        project: ProjectId,
         current_user: impl Into<String>,
-    ) -> Result<TenantSession> {
+    ) -> Result<ProjectSession> {
         crate::session::open(
             self.clone(),
-            tenant,
+            project,
             current_user.into(),
             Arc::new(AuthContext::anonymous()),
         )
         .await
     }
 
-    /// Open a session bound to `tenant`, setting both the `current_user`
+    /// Open a session bound to `project`, setting both the `current_user`
     /// principal and the auth context used by `auth.uid()`, `auth.role()`,
     /// and `auth.jwt()`. Called by the pgwire router when a JWT connection
     /// is authenticated — the JWT claims are decoded and carried into the
@@ -415,11 +415,11 @@ impl Engine {
     /// token on every query.
     pub async fn open_session_with_auth(
         &self,
-        tenant: TenantId,
+        project: ProjectId,
         current_user: impl Into<String>,
         auth: AuthContext,
-    ) -> Result<TenantSession> {
-        crate::session::open(self.clone(), tenant, current_user.into(), Arc::new(auth)).await
+    ) -> Result<ProjectSession> {
+        crate::session::open(self.clone(), project, current_user.into(), Arc::new(auth)).await
     }
 }
 
@@ -482,13 +482,13 @@ impl AuthContext {
     }
 }
 
-/// A handle to the engine scoped to a single tenant. All [`execute`] calls
-/// run as this tenant; there is no reset / impersonate API by design.
+/// A handle to the engine scoped to a single project. All [`execute`] calls
+/// run as this project; there is no reset / impersonate API by design.
 ///
-/// [`execute`]: TenantSession::execute
-pub struct TenantSession {
+/// [`execute`]: ProjectSession::execute
+pub struct ProjectSession {
     pub(crate) engine: Engine,
-    pub(crate) tenant: TenantId,
+    pub(crate) project: ProjectId,
     /// Principal name that resolves SQL's `current_user`. Stamped at session
     /// open time and never mutated thereafter. Read by the RLS predicate
     /// rewriter; the rest of the engine ignores it.
@@ -502,9 +502,9 @@ pub struct TenantSession {
     pub(crate) state: Arc<crate::session::SessionState>,
 }
 
-impl TenantSession {
-    pub fn tenant(&self) -> TenantId {
-        self.tenant
+impl ProjectSession {
+    pub fn project(&self) -> ProjectId {
+        self.project
     }
 
     /// Principal that resolves SQL's `current_user` for RLS predicates. For
@@ -516,19 +516,19 @@ impl TenantSession {
 
     /// Run one SQL statement. Returns either a result set ([`ExecResult::Rows`])
     /// or a side-effect tag for DML/DDL ([`ExecResult::Empty`]).
-    #[tracing::instrument(skip(self, sql), fields(tenant=%self.tenant, sql=%sql.lines().next().unwrap_or("")))]
+    #[tracing::instrument(skip(self, sql), fields(project=%self.project, sql=%sql.lines().next().unwrap_or("")))]
     pub async fn execute(&self, sql: &str) -> Result<ExecResult> {
         let started = std::time::Instant::now();
         let result = crate::executor::execute(self, sql).await;
-        // Bump the noisy-tenant rate estimator regardless of success: a
+        // Bump the noisy-project rate estimator regardless of success: a
         // failed query still consumed I/O permits + planner time, which is
         // exactly what the detector is meant to throttle. O(1).
-        self.engine.record_query(&self.tenant);
-        // Per-tenant op + latency + error counters (Phase 6 telemetry).
+        self.engine.record_query(&self.project);
+        // Per-project op + latency + error counters (Phase 6 telemetry).
         let tc = self
             .engine
-            .tenant_counters_registry()
-            .for_tenant(&self.tenant);
+            .project_counters_registry()
+            .for_project(&self.project);
         tc.record_op();
         let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
         tc.record_latency_ms(elapsed_ms);
@@ -542,7 +542,7 @@ impl TenantSession {
     /// a [`StatementHandle`] the caller can later [`bind`](Self::bind) and a
     /// [`StatementSchema`] describing parameter and result-column types as
     /// best they can be inferred up front (unknowns default to TEXT).
-    #[tracing::instrument(skip(self, sql), fields(tenant=%self.tenant, sql=%sql.lines().next().unwrap_or("")))]
+    #[tracing::instrument(skip(self, sql), fields(project=%self.project, sql=%sql.lines().next().unwrap_or("")))]
     pub async fn prepare(&self, sql: &str) -> Result<(StatementHandle, StatementSchema)> {
         crate::prepared::prepare(self, sql).await
     }
@@ -666,7 +666,7 @@ mod tests {
 
     use arrow_array::{Array, Int64Array, StringArray};
     use basin_catalog::InMemoryCatalog;
-    use basin_common::TenantId;
+    use basin_common::ProjectId;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
@@ -729,7 +729,7 @@ mod tests {
     async fn create_then_select_empty() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         let res = sess
             .execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)")
@@ -756,7 +756,7 @@ mod tests {
     async fn insert_then_select_returns_rows() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
@@ -791,7 +791,7 @@ mod tests {
     async fn insert_two_batches_select_returns_all() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
             .await
@@ -815,7 +815,7 @@ mod tests {
     async fn select_with_where_filter() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
@@ -839,11 +839,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_isolation_engine_level() {
+    async fn project_isolation_engine_level() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let sa = eng.open_session(a).await.unwrap();
         let sb = eng.open_session(b).await.unwrap();
 
@@ -887,7 +887,7 @@ mod tests {
     async fn show_tables_after_create() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE alpha (id BIGINT)")
             .await
@@ -909,7 +909,7 @@ mod tests {
     async fn prepare_bind_execute_roundtrip() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
             .await
@@ -963,7 +963,7 @@ mod tests {
     async fn prepare_infers_param_type_from_where_predicate() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, body TEXT NOT NULL)")
             .await
@@ -987,7 +987,7 @@ mod tests {
     async fn prepare_infers_param_types_from_insert_values() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, body TEXT NOT NULL)")
             .await
@@ -1005,13 +1005,13 @@ mod tests {
     async fn create_table_invalid_type_returns_error() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-        // INTERVAL is still unsupported in v0.1 (no Arrow physical mapping
-        // wired). Bare TIMESTAMP used to live here — it's now accepted (see
-        // tests/timestamp_no_tz.rs).
+        // A genuinely unmapped type name must still be rejected. (INTERVAL /
+        // TIMESTAMP / DATE / REAL etc. are now accepted after the type-coverage
+        // work; use a name no mapping will ever claim.)
         let err = sess
-            .execute("CREATE TABLE bad (i INTERVAL)")
+            .execute("CREATE TABLE bad (i NONEXISTENT_TYPE_XYZ)")
             .await
             .unwrap_err();
         assert!(
@@ -1022,7 +1022,7 @@ mod tests {
 
     // --- UPDATE / DELETE -------------------------------------------------------
 
-    async fn seed_five_rows(sess: &TenantSession) {
+    async fn seed_five_rows(sess: &ProjectSession) {
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
             .unwrap();
@@ -1035,7 +1035,7 @@ mod tests {
     async fn delete_removes_matching_rows() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let res = sess.execute("DELETE FROM t WHERE id = 3").await.unwrap();
@@ -1060,13 +1060,13 @@ mod tests {
     async fn delete_with_no_matches_is_noop() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         // Snapshot before to make sure no new file gets written.
         let cat = eng.config().catalog.clone();
         let table = basin_common::TableName::new("t").unwrap();
-        let before = cat.load_table(&sess.tenant(), &table).await.unwrap();
+        let before = cat.load_table(&sess.project(), &table).await.unwrap();
 
         let res = sess.execute("DELETE FROM t WHERE id = 999").await.unwrap();
         match res {
@@ -1074,7 +1074,7 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let after = cat.load_table(&sess.tenant(), &table).await.unwrap();
+        let after = cat.load_table(&sess.project(), &table).await.unwrap();
         assert_eq!(
             before.current_snapshot, after.current_snapshot,
             "no-op DELETE must not advance snapshot"
@@ -1085,7 +1085,7 @@ mod tests {
     async fn delete_all_rows_drops_files() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         // `WHERE id < 1000` matches every row in the table.
@@ -1106,7 +1106,7 @@ mod tests {
         let head = eng
             .config()
             .catalog
-            .load_table(&sess.tenant(), &table)
+            .load_table(&sess.project(), &table)
             .await
             .unwrap();
         let cur = head.current().unwrap();
@@ -1121,7 +1121,7 @@ mod tests {
     async fn update_changes_matching_rows() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let res = sess
@@ -1150,7 +1150,7 @@ mod tests {
     async fn update_does_not_touch_other_rows() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         sess.execute("UPDATE t SET name = 'X' WHERE id = 2")
@@ -1180,12 +1180,12 @@ mod tests {
     async fn update_with_no_matches_is_noop() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let cat = eng.config().catalog.clone();
         let table = basin_common::TableName::new("t").unwrap();
-        let before = cat.load_table(&sess.tenant(), &table).await.unwrap();
+        let before = cat.load_table(&sess.project(), &table).await.unwrap();
 
         let res = sess
             .execute("UPDATE t SET name = 'X' WHERE id = 999")
@@ -1196,7 +1196,7 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let after = cat.load_table(&sess.tenant(), &table).await.unwrap();
+        let after = cat.load_table(&sess.project(), &table).await.unwrap();
         assert_eq!(before.current_snapshot, after.current_snapshot);
     }
 
@@ -1207,7 +1207,7 @@ mod tests {
         // that puts the new file set in front of DataFusion's listing table.
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         sess.execute("DELETE FROM t WHERE id = 1").await.unwrap();
@@ -1229,7 +1229,7 @@ mod tests {
         // identically to INSERT/SELECT for ORM compatibility.
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let (h, schema) = sess
@@ -1260,7 +1260,7 @@ mod tests {
     async fn update_with_and_predicate() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let res = sess
@@ -1287,7 +1287,7 @@ mod tests {
     async fn update_with_or_predicate() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let res = sess
@@ -1314,7 +1314,7 @@ mod tests {
     async fn delete_with_in_predicate() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let res = sess
@@ -1341,7 +1341,7 @@ mod tests {
         // NOT NULL columns, so we build our own here.
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT)")
             .await
@@ -1375,7 +1375,7 @@ mod tests {
         // rather than a partial DELETE.
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let err = sess
@@ -1403,7 +1403,7 @@ mod tests {
         // compound predicate. Make sure the synthesis matches semantics.
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_five_rows(&sess).await;
 
         let res = sess
@@ -1443,7 +1443,7 @@ mod tests {
         // snapshot unchanged).
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
@@ -1474,7 +1474,7 @@ mod tests {
         let table = basin_common::TableName::new("t").unwrap();
         let storage = eng.config().storage.clone();
         let before_paths: std::collections::HashSet<String> = storage
-            .list_data_files(&sess.tenant(), &table)
+            .list_data_files(&sess.project(), &table)
             .await
             .unwrap()
             .into_iter()
@@ -1494,7 +1494,7 @@ mod tests {
         }
 
         let after_paths: std::collections::HashSet<String> = storage
-            .list_data_files(&sess.tenant(), &table)
+            .list_data_files(&sess.project(), &table)
             .await
             .unwrap()
             .into_iter()
@@ -1513,7 +1513,7 @@ mod tests {
         let after = eng
             .config()
             .catalog
-            .load_table(&sess.tenant(), &table)
+            .load_table(&sess.project(), &table)
             .await
             .unwrap();
         let head = after.current().unwrap();
@@ -1527,7 +1527,7 @@ mod tests {
         // file-level pruning kept them out of the rewrite loop entirely).
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
@@ -1552,7 +1552,7 @@ mod tests {
         let table = basin_common::TableName::new("t").unwrap();
         let storage = eng.config().storage.clone();
         let before_paths: std::collections::HashSet<String> = storage
-            .list_data_files(&sess.tenant(), &table)
+            .list_data_files(&sess.project(), &table)
             .await
             .unwrap()
             .into_iter()
@@ -1571,7 +1571,7 @@ mod tests {
         }
 
         let after_paths: std::collections::HashSet<String> = storage
-            .list_data_files(&sess.tenant(), &table)
+            .list_data_files(&sess.project(), &table)
             .await
             .unwrap()
             .into_iter()
@@ -1592,7 +1592,7 @@ mod tests {
         let after = eng
             .config()
             .catalog
-            .load_table(&sess.tenant(), &table)
+            .load_table(&sess.project(), &table)
             .await
             .unwrap();
         let head = after.current().unwrap();
@@ -1631,7 +1631,7 @@ mod tests {
     async fn auto_update_advances_on_update() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
         sess.execute(
             "CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL, \
@@ -1674,7 +1674,7 @@ mod tests {
     async fn auto_update_does_not_override_explicit_set() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, updated_at TIMESTAMPTZ AUTO_UPDATE)")
             .await
             .unwrap();
@@ -1704,7 +1704,7 @@ mod tests {
     async fn soft_delete_rewrites_to_update_and_filters_select() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         sess.execute(
             "CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL, \
              deleted_at TIMESTAMPTZ SOFT DELETE)",
@@ -1748,7 +1748,7 @@ mod tests {
     async fn second_soft_delete_column_rejected() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         let err = sess
             .execute(
                 "CREATE TABLE t (id BIGINT, a TIMESTAMPTZ SOFT DELETE, \
@@ -1763,7 +1763,7 @@ mod tests {
     async fn audit_to_logs_one_row_per_mutation() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         sess.execute(
             "CREATE TABLE foo (id BIGINT NOT NULL, name TEXT NOT NULL) AUDIT TO foo_audit",
         )
@@ -1799,11 +1799,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_isolation_per_tenant() {
+    async fn audit_isolation_per_project() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let sa = eng.open_session(a).await.unwrap();
         let sb = eng.open_session(b).await.unwrap();
         for s in [&sa, &sb] {
@@ -1835,7 +1835,7 @@ mod tests {
     async fn composition_auto_update_audit_soft_delete() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         sess.execute(
             "CREATE TABLE foo (\
              id BIGINT NOT NULL,\
@@ -1895,7 +1895,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         // `open_session` uses anonymous AuthContext.
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         let res = sess.execute("SELECT auth_uid()").await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
@@ -1914,7 +1914,7 @@ mod tests {
     async fn auth_uid_schema_dot_form_works() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         // `auth.uid()` should be rewritten to `auth_uid()` before reaching the engine.
         let res = sess.execute("SELECT auth.uid()").await.unwrap();
         match res {
@@ -1938,7 +1938,7 @@ mod tests {
     async fn auth_role_returns_anon_for_anonymous_session() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         let res = sess.execute("SELECT auth_role()").await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
@@ -1957,7 +1957,7 @@ mod tests {
     async fn auth_jwt_returns_null_for_anonymous_session() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         let res = sess.execute("SELECT auth_jwt()").await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
@@ -1986,7 +1986,7 @@ mod tests {
             serde_json::json!({"user_id": user_id.to_string()}),
         );
         let sess = eng
-            .open_session_with_auth(TenantId::new(), "alice", auth)
+            .open_session_with_auth(ProjectId::new(), "alice", auth)
             .await
             .unwrap();
         let res = sess.execute("SELECT auth_uid()").await.unwrap();
@@ -2011,7 +2011,7 @@ mod tests {
         let auth =
             AuthContext::from_jwt(uuid::Uuid::new_v4(), "authenticated", serde_json::json!({}));
         let sess = eng
-            .open_session_with_auth(TenantId::new(), "alice", auth)
+            .open_session_with_auth(ProjectId::new(), "alice", auth)
             .await
             .unwrap();
         let res = sess.execute("SELECT auth.role()").await.unwrap();

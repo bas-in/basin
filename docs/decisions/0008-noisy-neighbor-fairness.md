@@ -1,18 +1,18 @@
 # 0008 — Noisy-neighbor fairness on bounded backends
 
-- **Status:** Accepted v0.2 (per-tenant semaphore + fair-share scheduler). v0.3 work deferred behind a documented trigger.
+- **Status:** Accepted v0.2 (per-project semaphore + fair-share scheduler). v0.3 work deferred behind a documented trigger.
 - **Date:** 2026-05-01 (v0.1), revised 2026-05-04 (v0.2)
-- **Tags:** multi-tenancy, performance, isolation, scope
+- **Tags:** multi-project, performance, isolation, scope
 
 ## Context
 
-Basin's "structural per-tenant isolation" promise covers storage prefix
+Basin's "structural per-project isolation" promise covers storage prefix
 and access control. It does **not** yet extend to in-process
-fairness when many tenants share one process and one connection pool to
+fairness when many projects share one process and one connection pool to
 the object store.
 
 The `s3_scaling_noisy_neighbor` benchmark exposes the gap. A noisy
-tenant runs 4 concurrent full scans of a 1M-row table; a quiet tenant
+project runs 4 concurrent full scans of a 1M-row table; a quiet project
 issues 100 sequential point reads. Bar: quiet's `p99_under_load /
 p99_baseline < 5×`. Empirically:
 
@@ -22,7 +22,7 @@ p99_baseline < 5×`. Empirically:
 | Local MinIO (single-process) | **44×** | **fails the bar** |
 | Real AWS S3 | not yet measured; expected to pass |
 
-The architectural cause is clear: the noisy tenant's full-table scans
+The architectural cause is clear: the noisy project's full-table scans
 saturate the *server side* (single-process MinIO is CPU-bound at
 roughly 8–12 concurrent reads). Quiet point reads then sit in MinIO's
 own request queue behind the noisy ones, picking up 100ms+ tail spikes
@@ -30,8 +30,8 @@ on top of an otherwise 2ms baseline.
 
 ## What we shipped — v0.1 → v0.2 → v0.3 → v0.4 (reverted to v0.1+)
 
-**v0.1**: `basin-storage` wraps every tenant's `ObjectStore` in a
-`TenantScopedStore` that gates each underlying RPC on a per-tenant
+**v0.1**: `basin-storage` wraps every project's `ObjectStore` in a
+`ProjectScopedStore` that gates each underlying RPC on a per-project
 `tokio::sync::Semaphore` (cap = 16). reqwest pool floor bumped to
 `pool_max_idle_per_host = 256`. **Measured: 44× ratio.**
 
@@ -42,13 +42,13 @@ latency on the real test was 36×: server-side MinIO saturation, not
 client fairness, was the actual bottleneck.
 
 **v0.3** (attempted, reverted): rewrote scheduler as deadline-driven
-(EDF with per-tenant fairness cap). The implementation deadlocked
+(EDF with per-project fairness cap). The implementation deadlocked
 under the integration-test workload — the bug is somewhere in the
 queue-empty / RR re-enrollment plumbing and we couldn't reproduce it
 quickly. Reverted entirely. Code is left in `scheduler.rs` for v0.4
 work, not wired in.
 
-**v0.4 (currently shipped)**: per-tenant Semaphore floor (v0.1) +
+**v0.4 (currently shipped)**: per-project Semaphore floor (v0.1) +
 `SessionConfig::with_target_partitions(1)` in `basin-engine`.
 Pinning DataFusion to 1 partition serializes the per-query Parquet
 fan-out — instead of 4–8 concurrent range reads per scan, each query
@@ -67,9 +67,9 @@ and quiet's tail-latency improves substantially.
 **The Cloudflare R2 number (tested from APAC) is the cloud-backend measurement.**
 It validates the diagnosis directly: the 32× on local MinIO is single-process
 MinIO server saturation (~8–12 concurrent reads). On a backend with effectively
-unbounded server-side concurrency, the per-tenant Semaphore floor +
+unbounded server-side concurrency, the per-project Semaphore floor +
 `target_partitions=1` is sufficient — quiet's p99 stays within 1.3× of
-baseline even while a noisy tenant runs 4 concurrent 1M-row scans.
+baseline even while a noisy project runs 4 concurrent 1M-row scans.
 Tigris (the basin-cloud production backend) should land in the same range
 given similar server-side parallelism.
 
@@ -86,17 +86,17 @@ verified, so the toggle is for production backends only.
 
 ## What we tried and rejected
 
-- **cap=4 and cap=8 per tenant** — deadlocks. The Parquet reader's
-  per-query parallel range fan-out × concurrent queries per tenant
+- **cap=4 and cap=8 per project** — deadlocks. The Parquet reader's
+  per-query parallel range fan-out × concurrent queries per project
   exceeds the cap; futures park waiting for permits that never free.
   Lower bound for liveness on the benchmark workload is empirically
   cap=16.
-- **Adding a global cap** (`Semaphore` shared by all tenants, e.g.
-  global=12) on top of per-tenant=8 — still deadlocks. Multiple
-  concurrent queries × Parquet fan-out × tenant count exceeds 12.
-- **Per-tenant `ObjectStore` clients** — explicitly rejected by the
-  user: 1M tenants × 1 reqwest pool each is unacceptable connection
-  pool fragmentation and memory cost. Per-tenant cost must be O(bytes)
+- **Adding a global cap** (`Semaphore` shared by all projects, e.g.
+  global=12) on top of per-project=8 — still deadlocks. Multiple
+  concurrent queries × Parquet fan-out × project count exceeds 12.
+- **Per-project `ObjectStore` clients** — explicitly rejected by the
+  user: 1M projects × 1 reqwest pool each is unacceptable connection
+  pool fragmentation and memory cost. Per-project cost must be O(bytes)
   not O(connection-pool).
 
 ## What's left for v0.3
@@ -125,7 +125,7 @@ Trigger to ship #1: any production deployment where budget tuning
 cannot rely on the backend being AWS S3.
 
 **Trigger to build:** any prospective customer's workload that drives
-> 1 concurrent heavy tenant against the same backend (a multi-process
+> 1 concurrent heavy project against the same backend (a multi-process
 RustFS cluster moves the floor up; production AWS S3 erases the
 specific MinIO failure mode entirely). If the customer's deployment
 target is a single-process or constrained backend, build the scheduler
@@ -144,6 +144,6 @@ unbounded local concurrency.
 ## References
 
 - `crates/basin-storage/src/concurrency.rs` (the v0.1 wrapper)
-- `crates/basin-storage/src/lib.rs::DEFAULT_TENANT_CONCURRENCY` (the cap)
+- `crates/basin-storage/src/lib.rs::DEFAULT_PROJECT_CONCURRENCY` (the cap)
 - `tests/integration/tests/s3_scaling_noisy_neighbor.rs` (the benchmark)
 - `tests/integration/tests/scaling_noisy_neighbor.rs` (the LocalFS variant — passes)

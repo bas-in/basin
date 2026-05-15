@@ -5,7 +5,7 @@
 //!    a [`RequestId`] back synchronously.
 //! 2. A background tokio task pulls each pending request off the in-memory
 //!    channel, dispatches it through [`HttpClient`], and persists the
-//!    terminal response (or terminal error) to the per-tenant
+//!    terminal response (or terminal error) to the per-project
 //!    `_net_http_response` table via [`ResponseStore`].
 //! 3. The caller polls `_net_http_response` (or [`ResponseStore::get`]) by id.
 //!
@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use basin_common::{Result, TenantId};
+use basin_common::{Result, ProjectId};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -55,7 +55,7 @@ struct RequestQueueInner {
 
 #[derive(Debug)]
 struct QueuedRequest {
-    tenant: TenantId,
+    project: ProjectId,
     id: RequestId,
     req: HttpRequest,
 }
@@ -88,10 +88,10 @@ impl RequestQueue {
     /// here; the runner picks it up off the channel.
     ///
     /// This is the API behind `SELECT net.http_post(url := ..., body := ...)`.
-    pub fn submit(&self, tenant: &TenantId, req: HttpRequest) -> RequestId {
+    pub fn submit(&self, project: &ProjectId, req: HttpRequest) -> RequestId {
         let id = Uuid::new_v4();
         let qr = QueuedRequest {
-            tenant: *tenant,
+            project: *project,
             id,
             req,
         };
@@ -146,7 +146,7 @@ impl RequestQueue {
     }
 
     async fn dispatch(&self, qr: QueuedRequest) {
-        let resp = match self.inner.client.send(&qr.tenant, &qr.req).await {
+        let resp = match self.inner.client.send(&qr.project, &qr.req).await {
             Ok(r) => r,
             Err(e) => HttpResponse {
                 status: 0,
@@ -155,9 +155,9 @@ impl RequestQueue {
                 error: Some(format!("{e}")),
             },
         };
-        if let Err(e) = self.persist(&qr.tenant, qr.id, &resp).await {
+        if let Err(e) = self.persist(&qr.project, qr.id, &resp).await {
             tracing::warn!(
-                tenant = %qr.tenant,
+                project = %qr.project,
                 request_id = %qr.id,
                 error = %e,
                 "basin-net: failed to persist response row"
@@ -165,8 +165,8 @@ impl RequestQueue {
         }
     }
 
-    async fn persist(&self, tenant: &TenantId, id: RequestId, resp: &HttpResponse) -> Result<()> {
-        self.inner.store.record(tenant, id, id, resp).await
+    async fn persist(&self, project: &ProjectId, id: RequestId, resp: &HttpResponse) -> Result<()> {
+        self.inner.store.record(project, id, id, resp).await
     }
 }
 

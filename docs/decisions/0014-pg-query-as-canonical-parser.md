@@ -107,7 +107,7 @@ PG-specific constructs. Silly.
 **Fork PostgreSQL (CockroachDB / YugabyteDB path).**
 Full PG compatibility at the cost of permanently tracking PG source releases.
 ~10+ engineers to maintain. Not viable for a small team; not necessary for
-Basin's wedge (new multi-tenant SaaS, not legacy PG migrations).
+Basin's wedge (new multi-project SaaS, not legacy PG migrations).
 
 ## Consequences
 

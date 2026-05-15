@@ -2,26 +2,26 @@
 //! expansion views: `information_schema.columns`, `pg_catalog.pg_attribute`,
 //! and `pg_catalog.pg_namespace`.
 //!
-//! Each test opens a `TenantSession` and runs SQL through the same
+//! Each test opens a `ProjectSession` and runs SQL through the same
 //! `execute()` entry point a pgwire connection would hit. The asserts
 //! cover:
 //!
-//! - One row per (table, column) for the calling tenant.
+//! - One row per (table, column) for the calling project.
 //! - Postgres-flavoured type names (`"integer"`, `"text"`,
 //!   `"timestamp with time zone"`, `"jsonb"`, `"uuid"`) — never raw Arrow
 //!   names like `"Int64"` or `"LargeBinary"`.
 //! - `is_nullable` reports `"YES"` / `"NO"` (PG style, not bool).
 //! - `attnum` is 1-based and `attrelid` matches `pg_class.oid`.
 //! - `atttypid` matches what `basin-router` advertises in `RowDescription`.
-//! - Cross-tenant isolation: A's columns / pg_attribute rows / namespace
+//! - Cross-project isolation: A's columns / pg_attribute rows / namespace
 //!   oid are invisible to B.
 
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Int16Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -133,7 +133,7 @@ fn total_rows(batches: &[arrow_array::RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -144,7 +144,7 @@ async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> 
 async fn select_information_schema_columns_basic() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE orders (\
@@ -191,7 +191,7 @@ async fn select_information_schema_columns_basic() {
 async fn columns_show_correct_pg_type_names() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE wide (\
@@ -246,7 +246,7 @@ async fn columns_show_correct_pg_type_names() {
 async fn columns_show_nullable_correctly() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE mixed (\
@@ -279,7 +279,7 @@ async fn columns_show_nullable_correctly() {
 async fn pg_attribute_attnum_is_one_based() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE t (\
@@ -343,7 +343,7 @@ async fn pg_attribute_atttypid_matches_router() {
     // jsonb=3802, uuid=2950.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE typed (\
@@ -381,17 +381,17 @@ async fn pg_attribute_atttypid_matches_router() {
 }
 
 #[tokio::test]
-async fn pg_namespace_one_row_per_tenant() {
+async fn pg_namespace_one_row_per_project() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let batches = rows(
         &sess,
         "SELECT oid, nspname, nspowner FROM pg_catalog.pg_namespace",
     )
     .await;
-    assert_eq!(total_rows(&batches), 1, "exactly one namespace per tenant");
+    assert_eq!(total_rows(&batches), 1, "exactly one namespace per project");
     let names = col_string(&batches, "nspname");
     assert_eq!(names, vec!["public".to_string()]);
     let oids = col_i64(&batches, "oid");
@@ -401,11 +401,11 @@ async fn pg_namespace_one_row_per_tenant() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_columns() {
+async fn cross_project_isolation_columns() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
@@ -436,20 +436,20 @@ async fn cross_tenant_isolation_columns() {
     assert_eq!(cols_b, vec!["secret_b".to_string()]);
     assert!(
         !cols_a.contains(&"secret_b".to_string()),
-        "tenant A leaked tenant B's column: {cols_a:?}"
+        "project A leaked project B's column: {cols_a:?}"
     );
     assert!(
         !cols_b.contains(&"secret_a".to_string()),
-        "tenant B leaked tenant A's column: {cols_b:?}"
+        "project B leaked project A's column: {cols_b:?}"
     );
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_pg_attribute() {
+async fn cross_project_isolation_pg_attribute() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
@@ -480,18 +480,18 @@ async fn cross_tenant_isolation_pg_attribute() {
     assert_eq!(names_b, vec!["secret_b".to_string()]);
     assert!(
         !names_a.contains(&"secret_b".to_string()),
-        "tenant A leaked tenant B's pg_attribute row: {names_a:?}"
+        "project A leaked project B's pg_attribute row: {names_a:?}"
     );
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_pg_namespace() {
-    // Each tenant's namespace oid hashes (tenant, "public") so two tenants
+async fn cross_project_isolation_pg_namespace() {
+    // Each project's namespace oid hashes (project, "public") so two projects
     // must see distinct values.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
@@ -507,7 +507,7 @@ async fn cross_tenant_isolation_pg_namespace() {
     assert_eq!(oid_b.len(), 1);
     assert_ne!(
         oid_a[0], oid_b[0],
-        "two tenants must hash to disjoint namespace oids"
+        "two projects must hash to disjoint namespace oids"
     );
 }
 
@@ -519,7 +519,7 @@ async fn columns_postgrest_predicate_filters_correctly() {
     // the requested table's columns.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL, total BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -546,7 +546,7 @@ async fn columns_default_is_null_for_plain_column() {
     // SQL NULL, not the empty string.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -566,7 +566,7 @@ async fn columns_default_is_null_for_plain_column() {
 async fn pg_attribute_attisdropped_always_false_v01() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, label TEXT)")
         .await
         .unwrap();

@@ -15,7 +15,7 @@
 //! engine's own pgwire on loopback. Basin engine's DDL surface differs from
 //! upstream Postgres in the following ways that affect this file:
 //!
-//! - No `CREATE SCHEMA` — the catalog is single-namespace per tenant. The
+//! - No `CREATE SCHEMA` — the catalog is single-namespace per project. The
 //!   schema name is collapsed into a `<schema>_<table>` table-name prefix
 //!   so different deployments (prod / test / unit) can still
 //!   namespace-isolate. `auth_loopback_smoke.rs` is the safety net.
@@ -89,25 +89,25 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
     validate_schema_ident(schema)?;
 
     let stmts = [
-        // basin_auth_users: composite UNIQUE on (tenant_id, email) is the
-        // login-identity invariant — one row per (tenant, email) pair so
-        // `WHERE tenant_id = $1 AND email = $2` is a single hit.
+        // basin_auth_users: composite UNIQUE on (project_id, email) is the
+        // login-identity invariant — one row per (project, email) pair so
+        // `WHERE project_id = $1 AND email = $2` is a single hit.
         format!(
             "CREATE TABLE IF NOT EXISTS {schema}_users (
                 user_id           UUID PRIMARY KEY,
-                tenant_id         TEXT NOT NULL,
+                project_id         TEXT NOT NULL,
                 email             TEXT NOT NULL,
                 password_hash     TEXT NOT NULL,
                 email_verified_at TIMESTAMPTZ,
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-                UNIQUE (tenant_id, email)
+                UNIQUE (project_id, email)
             )"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {schema}_refresh_tokens (
                 token_hash   TEXT PRIMARY KEY,
                 user_id      UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
-                tenant_id    TEXT NOT NULL,
+                project_id    TEXT NOT NULL,
                 expires_at   TIMESTAMPTZ NOT NULL,
                 revoked_at   TIMESTAMPTZ,
                 created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -117,25 +117,25 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
             "CREATE TABLE IF NOT EXISTS {schema}_email_tokens (
                 token_hash   TEXT PRIMARY KEY,
                 user_id      UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
-                tenant_id    TEXT NOT NULL,
+                project_id    TEXT NOT NULL,
                 purpose      TEXT NOT NULL,
                 expires_at   TIMESTAMPTZ NOT NULL,
                 consumed_at  TIMESTAMPTZ,
                 created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
             )"
         ),
-        // Long-lived per-tenant API keys. `key_hash` is the sha256 of the
+        // Long-lived per-project API keys. `key_hash` is the sha256 of the
         // bearer secret (used as a fast-path lookup column); `key_bcrypt`
         // is the bcrypt of the same secret and is what we actually verify
         // against, defence-in-depth if the hash column ever leaks alone.
         //
-        // Composite UNIQUE (tenant_id, user_id, name) keeps key labels
-        // disambiguated per-(tenant, user). The `id` surrogate stays
+        // Composite UNIQUE (project_id, user_id, name) keeps key labels
+        // disambiguated per-(project, user). The `id` surrogate stays
         // because `api_keys.rs` returns it as a stable handle.
         format!(
             "CREATE TABLE IF NOT EXISTS {schema}_api_keys (
                 id            BIGSERIAL PRIMARY KEY,
-                tenant_id     TEXT NOT NULL,
+                project_id     TEXT NOT NULL,
                 user_id       UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
                 name          TEXT NOT NULL,
                 key_hash      TEXT NOT NULL,
@@ -143,7 +143,7 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
                 created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
                 last_used_at  TIMESTAMPTZ,
                 revoked_at    TIMESTAMPTZ,
-                UNIQUE (tenant_id, user_id, name)
+                UNIQUE (project_id, user_id, name)
             )"
         ),
         // Per-user `current_setting()` overrides. Hard-coded allowlist of
@@ -152,16 +152,16 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
         // primary-key uniqueness and the lookup path.
         format!(
             "CREATE TABLE IF NOT EXISTS {schema}_user_session_settings (
-                tenant_id   TEXT NOT NULL,
+                project_id   TEXT NOT NULL,
                 user_id     UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
                 key         TEXT NOT NULL,
                 value       TEXT NOT NULL,
                 updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (tenant_id, user_id, key)
+                PRIMARY KEY (project_id, user_id, key)
             )"
         ),
-        // Tenant-agnostic email-link login. Distinct from the existing
-        // `email_tokens` flow (which is per-tenant + bound to a known user
+        // Project-agnostic email-link login. Distinct from the existing
+        // `email_tokens` flow (which is per-project + bound to a known user
         // at issue time): the consumer POSTs only an email, and we resolve
         // the user at consume time. `token_hash` is bcrypt of the raw token.
         format!(
@@ -185,17 +185,17 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
                 expires_at   TIMESTAMPTZ NOT NULL
             )"
         ),
-        // Per-tenant pgwire credentials — one row maps a public
-        // `pgwire_user` (e.g. `tenant_a1b2c3d4`) to the tenant id, a
+        // Per-project pgwire credentials — one row maps a public
+        // `pgwire_user` (e.g. `project_a1b2c3d4`) to the project id, a
         // bcrypt'd password, and a `dbname`. `validate_pgwire_credentials`
         // bcrypt-verifies; `rotate_pgwire_password` rolls the row.
         //
         // Column-level UNIQUE on `pgwire_user` enforces the wire-login
         // namespace invariant: one identity per public username.
         format!(
-            "CREATE TABLE IF NOT EXISTS {schema}_auth_tenant_credentials (
+            "CREATE TABLE IF NOT EXISTS {schema}_auth_project_credentials (
                 id            BIGSERIAL PRIMARY KEY,
-                tenant_id     TEXT NOT NULL,
+                project_id     TEXT NOT NULL,
                 pgwire_user   TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 dbname        TEXT NOT NULL DEFAULT 'basin',
@@ -207,9 +207,9 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
         //   - api_keys (key_hash): bearer-token verification
         //   - auth_magic_links (token_hash): consume-flow lookup
         //   - auth_revoked_refresh_tokens (user_id): reuse-detection sweep
-        //   - auth_tenant_credentials (pgwire_user): pgwire startup auth
+        //   - auth_project_credentials (pgwire_user): pgwire startup auth
         //
-        // Note: users (tenant_id, email) is covered by the UNIQUE constraint
+        // Note: users (project_id, email) is covered by the UNIQUE constraint
         // on that table, which implies a unique index — no separate entry here.
         format!(
             "CREATE INDEX IF NOT EXISTS {schema}_api_keys_key_hash \
@@ -224,8 +224,8 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
              ON {schema}_auth_revoked_refresh_tokens (user_id)"
         ),
         format!(
-            "CREATE INDEX IF NOT EXISTS {schema}_auth_tenant_credentials_pgwire_user \
-             ON {schema}_auth_tenant_credentials (pgwire_user)"
+            "CREATE INDEX IF NOT EXISTS {schema}_auth_project_credentials_pgwire_user \
+             ON {schema}_auth_project_credentials (pgwire_user)"
         ),
     ];
 

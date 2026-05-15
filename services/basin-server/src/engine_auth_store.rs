@@ -1,8 +1,8 @@
 //! `EngineAuthStore` — the default in-process [`basin_auth::store::AuthStore`].
 //!
 //! Instead of opening an outbound TCP connection, every auth query is executed
-//! via [`basin_engine::Engine::open_session_as`]`(tenant_id,
-//! "basin_auth_service")`. Auth data lives in each tenant's own `basin_auth.*`
+//! via [`basin_engine::Engine::open_session_as`]`(project_id,
+//! "basin_auth_service")`. Auth data lives in each project's own `basin_auth.*`
 //! schema (using the flat-table-name convention `{schema}_<table>`). No TCP
 //! connection or pgwire listener is needed.
 //!
@@ -11,7 +11,7 @@
 //!  - Old: start pgwire listener → wait for bind → basin-auth connects back
 //!    over TCP → fill OnceLock → JWT/API-key paths live.
 //!  - New: build engine → build `EngineAuthStore` → build `AuthService` (via
-//!    [`basin_auth::AuthService::with_store`]) → build `StackedTenantResolver`
+//!    [`basin_auth::AuthService::with_store`]) → build `StackedProjectResolver`
 //!    → start pgwire (JWT/API-key active from first connection).
 //!
 //! ## Known engine limitations / workarounds
@@ -38,34 +38,34 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use basin_auth::store::{
     ApiKeyRow, AuthMagicLinkRow, AuthStore, AuthUser, EmailTokenRow, MagicLinkEmailTokenRow,
-    RefreshRevocationRow, TenantCredentialRow,
+    RefreshRevocationRow, ProjectCredentialRow,
 };
-use basin_auth::{api_keys::ApiKeyDescriptor, tenant_credentials::TenantCredentialDescriptor};
-use basin_common::{BasinError, Result, TenantId};
-use basin_engine::{Engine, ExecResult, ScalarParam, TenantSession};
+use basin_auth::{api_keys::ApiKeyDescriptor, project_credentials::ProjectCredentialDescriptor};
+use basin_common::{BasinError, Result, ProjectId};
+use basin_engine::{Engine, ExecResult, ScalarParam, ProjectSession};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// An [`AuthStore`] backed by the in-process [`Engine`] instead of an
 /// external Postgres connection. All auth tables are stored under the
-/// well-known [`basin_auth::INTERNAL_AUTH_TENANT_ID`] tenant.
+/// well-known [`basin_auth::INTERNAL_AUTH_PROJECT_ID`] project.
 pub struct EngineAuthStore {
     engine: Arc<Engine>,
     /// The table-name prefix used for every auth table. Corresponds to
     /// `AuthConfig::catalog_schema` (default `"basin_auth"`).
     schema: String,
-    /// Parsed form of `INTERNAL_AUTH_TENANT_ID`.
-    auth_tenant: TenantId,
+    /// Parsed form of `INTERNAL_AUTH_PROJECT_ID`.
+    auth_project: ProjectId,
 }
 
 impl EngineAuthStore {
     /// Build a store that talks to `engine` and uses `schema` as the table
     /// prefix (e.g. `"basin_auth"` → tables named `basin_auth_users`, etc.).
-    pub fn new(engine: Arc<Engine>, schema: String, auth_tenant: TenantId) -> Self {
+    pub fn new(engine: Arc<Engine>, schema: String, auth_project: ProjectId) -> Self {
         Self {
             engine,
             schema,
-            auth_tenant,
+            auth_project,
         }
     }
 
@@ -74,9 +74,9 @@ impl EngineAuthStore {
     }
 
     /// Open a session as the internal auth-service principal.
-    async fn session(&self) -> Result<TenantSession> {
+    async fn session(&self) -> Result<ProjectSession> {
         self.engine
-            .open_session_as(self.auth_tenant, "basin_auth_service")
+            .open_session_as(self.auth_project, "basin_auth_service")
             .await
     }
 
@@ -259,19 +259,19 @@ impl AuthStore for EngineAuthStore {
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_users (
                     user_id           UUID PRIMARY KEY,
-                    tenant_id         TEXT NOT NULL,
+                    project_id         TEXT NOT NULL,
                     email             TEXT NOT NULL,
                     password_hash     TEXT NOT NULL,
                     email_verified_at TIMESTAMPTZ,
                     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (tenant_id, email)
+                    UNIQUE (project_id, email)
                 )"
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_refresh_tokens (
                     token_hash   TEXT PRIMARY KEY,
                     user_id      UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
-                    tenant_id    TEXT NOT NULL,
+                    project_id    TEXT NOT NULL,
                     expires_at   TIMESTAMPTZ NOT NULL,
                     revoked_at   TIMESTAMPTZ,
                     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -281,7 +281,7 @@ impl AuthStore for EngineAuthStore {
                 "CREATE TABLE IF NOT EXISTS {sch}_email_tokens (
                     token_hash   TEXT PRIMARY KEY,
                     user_id      UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
-                    tenant_id    TEXT NOT NULL,
+                    project_id    TEXT NOT NULL,
                     purpose      TEXT NOT NULL,
                     expires_at   TIMESTAMPTZ NOT NULL,
                     consumed_at  TIMESTAMPTZ,
@@ -291,7 +291,7 @@ impl AuthStore for EngineAuthStore {
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_api_keys (
                     id            BIGSERIAL PRIMARY KEY,
-                    tenant_id     TEXT NOT NULL,
+                    project_id     TEXT NOT NULL,
                     user_id       UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
                     name          TEXT NOT NULL,
                     key_hash      TEXT NOT NULL,
@@ -299,17 +299,17 @@ impl AuthStore for EngineAuthStore {
                     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
                     last_used_at  TIMESTAMPTZ,
                     revoked_at    TIMESTAMPTZ,
-                    UNIQUE (tenant_id, user_id, name)
+                    UNIQUE (project_id, user_id, name)
                 )"
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_user_session_settings (
-                    tenant_id   TEXT NOT NULL,
+                    project_id   TEXT NOT NULL,
                     user_id     UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
                     key         TEXT NOT NULL,
                     value       TEXT NOT NULL,
                     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (tenant_id, user_id, key)
+                    PRIMARY KEY (project_id, user_id, key)
                 )"
             ),
             format!(
@@ -331,9 +331,9 @@ impl AuthStore for EngineAuthStore {
                 )"
             ),
             format!(
-                "CREATE TABLE IF NOT EXISTS {sch}_auth_tenant_credentials (
+                "CREATE TABLE IF NOT EXISTS {sch}_auth_project_credentials (
                     id            BIGSERIAL PRIMARY KEY,
-                    tenant_id     TEXT NOT NULL,
+                    project_id     TEXT NOT NULL,
                     pgwire_user   TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
                     dbname        TEXT NOT NULL DEFAULT 'basin',
@@ -342,8 +342,8 @@ impl AuthStore for EngineAuthStore {
                 )"
             ),
             format!(
-                "CREATE INDEX IF NOT EXISTS {sch}_users_tenant_email \
-                 ON {sch}_users (tenant_id, email)"
+                "CREATE INDEX IF NOT EXISTS {sch}_users_project_email \
+                 ON {sch}_users (project_id, email)"
             ),
             format!(
                 "CREATE INDEX IF NOT EXISTS {sch}_api_keys_key_hash \
@@ -358,8 +358,8 @@ impl AuthStore for EngineAuthStore {
                  ON {sch}_auth_revoked_refresh_tokens (user_id)"
             ),
             format!(
-                "CREATE INDEX IF NOT EXISTS {sch}_auth_tenant_credentials_pgwire_user \
-                 ON {sch}_auth_tenant_credentials (pgwire_user)"
+                "CREATE INDEX IF NOT EXISTS {sch}_auth_project_credentials_pgwire_user \
+                 ON {sch}_auth_project_credentials (pgwire_user)"
             ),
         ];
 
@@ -375,15 +375,15 @@ impl AuthStore for EngineAuthStore {
 
     async fn create_user(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         email: &str,
         password_hash: &str,
         user_id: Uuid,
     ) -> Result<Uuid> {
         let sql = format!(
-            "INSERT INTO {sch}_users (user_id, tenant_id, email, password_hash)
+            "INSERT INTO {sch}_users (user_id, project_id, email, password_hash)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (tenant_id, email) DO NOTHING",
+             ON CONFLICT (project_id, email) DO NOTHING",
             sch = self.sch()
         );
         let inserted = self
@@ -391,7 +391,7 @@ impl AuthStore for EngineAuthStore {
                 &sql,
                 vec![
                     p_uuid(user_id),
-                    p_text(tenant.to_string()),
+                    p_text(project.to_string()),
                     p_text(email),
                     p_text(password_hash),
                 ],
@@ -400,21 +400,21 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("create_user: {e}")))?;
         if inserted == 0 {
             return Err(BasinError::CommitConflict(format!(
-                "user {email} already exists for tenant {tenant}"
+                "user {email} already exists for project {project}"
             )));
         }
         Ok(user_id)
     }
 
-    async fn find_user_by_email(&self, tenant: &TenantId, email: &str) -> Result<Option<AuthUser>> {
+    async fn find_user_by_email(&self, project: &ProjectId, email: &str) -> Result<Option<AuthUser>> {
         let sql = format!(
             "SELECT user_id, email, password_hash, email_verified_at
              FROM {sch}_users
-             WHERE tenant_id = $1 AND email = $2",
+             WHERE project_id = $1 AND email = $2",
             sch = self.sch()
         );
         let (_, batches) = self
-            .query_params(&sql, vec![p_text(tenant.to_string()), p_text(email)])
+            .query_params(&sql, vec![p_text(project.to_string()), p_text(email)])
             .await
             .map_err(|e| BasinError::catalog(format!("find_user_by_email: {e}")))?;
         first_row_opt(&batches, |b, r| {
@@ -428,15 +428,15 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
-    async fn find_user_by_id(&self, tenant: &TenantId, user_id: Uuid) -> Result<Option<AuthUser>> {
+    async fn find_user_by_id(&self, project: &ProjectId, user_id: Uuid) -> Result<Option<AuthUser>> {
         let sql = format!(
             "SELECT user_id, email, password_hash, email_verified_at
              FROM {sch}_users
-             WHERE user_id = $1 AND tenant_id = $2",
+             WHERE user_id = $1 AND project_id = $2",
             sch = self.sch()
         );
         let (_, batches) = self
-            .query_params(&sql, vec![p_uuid(user_id), p_text(tenant.to_string())])
+            .query_params(&sql, vec![p_uuid(user_id), p_text(project.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("find_user_by_id: {e}")))?;
         first_row_opt(&batches, |b, r| {
@@ -462,9 +462,9 @@ impl AuthStore for EngineAuthStore {
         Ok(first_row_opt(&batches, |_, _| Ok(()))?)
     }
 
-    async fn latest_user_by_email(&self, email: &str) -> Result<Option<(Uuid, TenantId)>> {
+    async fn latest_user_by_email(&self, email: &str) -> Result<Option<(Uuid, ProjectId)>> {
         let sql = format!(
-            "SELECT user_id, tenant_id FROM {sch}_users
+            "SELECT user_id, project_id FROM {sch}_users
              WHERE email = $1
              ORDER BY created_at DESC
              LIMIT 1",
@@ -477,34 +477,34 @@ impl AuthStore for EngineAuthStore {
         first_row_opt(&batches, |b, r| {
             let user_id = get_uuid(b, r, 0)
                 .ok_or_else(|| BasinError::internal("latest_user_by_email: missing user_id"))?;
-            let tenant_str = get_text(b, r, 1)
-                .ok_or_else(|| BasinError::internal("latest_user_by_email: missing tenant_id"))?;
-            let tenant: TenantId = tenant_str.parse().map_err(|e| {
-                BasinError::internal(format!("latest_user_by_email tenant parse: {e}"))
+            let project_str = get_text(b, r, 1)
+                .ok_or_else(|| BasinError::internal("latest_user_by_email: missing project_id"))?;
+            let project: ProjectId = project_str.parse().map_err(|e| {
+                BasinError::internal(format!("latest_user_by_email project parse: {e}"))
             })?;
-            Ok((user_id, tenant))
+            Ok((user_id, project))
         })
     }
 
-    async fn mark_email_verified(&self, tenant: &TenantId, user_id: Uuid) -> Result<()> {
+    async fn mark_email_verified(&self, project: &ProjectId, user_id: Uuid) -> Result<()> {
         let sql = format!(
             "UPDATE {sch}_users SET email_verified_at = now()
-             WHERE user_id = $1 AND tenant_id = $2",
+             WHERE user_id = $1 AND project_id = $2",
             sch = self.sch()
         );
-        self.exec_params(&sql, vec![p_uuid(user_id), p_text(tenant.to_string())])
+        self.exec_params(&sql, vec![p_uuid(user_id), p_text(project.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("mark_email_verified: {e}")))?;
         Ok(())
     }
 
-    async fn mark_email_verified_if_null(&self, tenant: &TenantId, user_id: Uuid) -> Result<()> {
+    async fn mark_email_verified_if_null(&self, project: &ProjectId, user_id: Uuid) -> Result<()> {
         let sql = format!(
             "UPDATE {sch}_users SET email_verified_at = COALESCE(email_verified_at, now())
-             WHERE user_id = $1 AND tenant_id = $2",
+             WHERE user_id = $1 AND project_id = $2",
             sch = self.sch()
         );
-        self.exec_params(&sql, vec![p_uuid(user_id), p_text(tenant.to_string())])
+        self.exec_params(&sql, vec![p_uuid(user_id), p_text(project.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("mark_email_verified_if_null: {e}")))?;
         Ok(())
@@ -512,13 +512,13 @@ impl AuthStore for EngineAuthStore {
 
     async fn update_password(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: Uuid,
         password_hash: &str,
     ) -> Result<()> {
         let sql = format!(
             "UPDATE {sch}_users SET password_hash = $1
-             WHERE user_id = $2 AND tenant_id = $3",
+             WHERE user_id = $2 AND project_id = $3",
             sch = self.sch()
         );
         self.exec_params(
@@ -526,7 +526,7 @@ impl AuthStore for EngineAuthStore {
             vec![
                 p_text(password_hash),
                 p_uuid(user_id),
-                p_text(tenant.to_string()),
+                p_text(project.to_string()),
             ],
         )
         .await
@@ -538,7 +538,7 @@ impl AuthStore for EngineAuthStore {
 
     async fn insert_email_token(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: Uuid,
         token_hash: &str,
         purpose: &str,
@@ -546,7 +546,7 @@ impl AuthStore for EngineAuthStore {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO {sch}_email_tokens
-               (token_hash, user_id, tenant_id, purpose, expires_at)
+               (token_hash, user_id, project_id, purpose, expires_at)
              VALUES ($1, $2, $3, $4, $5)",
             sch = self.sch()
         );
@@ -555,7 +555,7 @@ impl AuthStore for EngineAuthStore {
             vec![
                 p_text(token_hash),
                 p_uuid(user_id),
-                p_text(tenant.to_string()),
+                p_text(project.to_string()),
                 p_text(purpose),
                 p_ts(expires_at),
             ],
@@ -567,17 +567,17 @@ impl AuthStore for EngineAuthStore {
 
     async fn find_email_token(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         token_hash: &str,
     ) -> Result<Option<EmailTokenRow>> {
         let sql = format!(
             "SELECT user_id, expires_at, consumed_at, purpose
              FROM {sch}_email_tokens
-             WHERE token_hash = $1 AND tenant_id = $2",
+             WHERE token_hash = $1 AND project_id = $2",
             sch = self.sch()
         );
         let (_, batches) = self
-            .query_params(&sql, vec![p_text(token_hash), p_text(tenant.to_string())])
+            .query_params(&sql, vec![p_text(token_hash), p_text(project.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("find_email_token: {e}")))?;
         first_row_opt(&batches, |b, r| {
@@ -597,7 +597,7 @@ impl AuthStore for EngineAuthStore {
     /// token row first, then looks up the user's email by `user_id`.
     async fn find_magic_link_email_token(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         token_hash: &str,
     ) -> Result<Option<MagicLinkEmailTokenRow>> {
         // Note: basin engine does not yet support JOIN across tables. To work
@@ -606,13 +606,13 @@ impl AuthStore for EngineAuthStore {
         let sql_token = format!(
             "SELECT user_id, expires_at, consumed_at, purpose
              FROM {sch}_email_tokens
-             WHERE token_hash = $1 AND tenant_id = $2",
+             WHERE token_hash = $1 AND project_id = $2",
             sch = self.sch()
         );
         let (_, batches) = self
             .query_params(
                 &sql_token,
-                vec![p_text(token_hash), p_text(tenant.to_string())],
+                vec![p_text(token_hash), p_text(project.to_string())],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("find_magic_link_email_token token: {e}")))?;
@@ -635,11 +635,11 @@ impl AuthStore for EngineAuthStore {
 
         // Look up the user's email.
         let sql_user = format!(
-            "SELECT email FROM {sch}_users WHERE user_id = $1 AND tenant_id = $2",
+            "SELECT email FROM {sch}_users WHERE user_id = $1 AND project_id = $2",
             sch = self.sch()
         );
         let (_, user_batches) = self
-            .query_params(&sql_user, vec![p_uuid(user_id), p_text(tenant.to_string())])
+            .query_params(&sql_user, vec![p_uuid(user_id), p_text(project.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("find_magic_link_email_token user: {e}")))?;
         let email = match first_row_opt(&user_batches, |b, r| {
@@ -661,13 +661,13 @@ impl AuthStore for EngineAuthStore {
     /// Atomically mark a token as consumed by filtering on `consumed_at IS NULL`.
     /// The single-row `UPDATE` is the serialisation point: concurrent callers
     /// receive a row-count of 0 and are rejected by the flow layer.
-    async fn consume_email_token(&self, tenant: &TenantId, token_hash: &str) -> Result<u64> {
+    async fn consume_email_token(&self, project: &ProjectId, token_hash: &str) -> Result<u64> {
         let sql = format!(
             "UPDATE {sch}_email_tokens SET consumed_at = now()
-             WHERE token_hash = $1 AND tenant_id = $2 AND consumed_at IS NULL",
+             WHERE token_hash = $1 AND project_id = $2 AND consumed_at IS NULL",
             sch = self.sch()
         );
-        self.exec_params(&sql, vec![p_text(token_hash), p_text(tenant.to_string())])
+        self.exec_params(&sql, vec![p_text(token_hash), p_text(project.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("consume_email_token: {e}")))
     }
@@ -761,30 +761,30 @@ impl AuthStore for EngineAuthStore {
 
     /// Workaround: uses INSERT followed by a SELECT to recover `(id,
     /// created_at)` because the engine does not yet support `RETURNING`
-    /// clauses. Returns `CommitConflict` if `(tenant, user, name)` already
+    /// clauses. Returns `CommitConflict` if `(project, user, name)` already
     /// exists.
     async fn insert_api_key(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: Uuid,
         name: &str,
         key_hash: &str,
         key_bcrypt: &str,
     ) -> Result<(i64, DateTime<Utc>)> {
         // `RETURNING` is not yet supported by the engine. Insert, then
-        // SELECT the row back by the unique (tenant, user, name) key.
+        // SELECT the row back by the unique (project, user, name) key.
         let sql_insert = format!(
             "INSERT INTO {sch}_api_keys
-               (tenant_id, user_id, name, key_hash, key_bcrypt)
+               (project_id, user_id, name, key_hash, key_bcrypt)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (tenant_id, user_id, name) DO NOTHING",
+             ON CONFLICT (project_id, user_id, name) DO NOTHING",
             sch = self.sch()
         );
         let inserted = self
             .exec_params(
                 &sql_insert,
                 vec![
-                    p_text(tenant.to_string()),
+                    p_text(project.to_string()),
                     p_uuid(user_id),
                     p_text(name),
                     p_text(key_hash),
@@ -801,14 +801,14 @@ impl AuthStore for EngineAuthStore {
 
         let sql_select = format!(
             "SELECT id, created_at FROM {sch}_api_keys
-             WHERE tenant_id = $1 AND user_id = $2 AND name = $3
+             WHERE project_id = $1 AND user_id = $2 AND name = $3
              LIMIT 1",
             sch = self.sch()
         );
         let (_, batches) = self
             .query_params(
                 &sql_select,
-                vec![p_text(tenant.to_string()), p_uuid(user_id), p_text(name)],
+                vec![p_text(project.to_string()), p_uuid(user_id), p_text(name)],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("insert_api_key select: {e}")))?;
@@ -827,7 +827,7 @@ impl AuthStore for EngineAuthStore {
 
     async fn find_api_keys_by_hash(&self, key_hash: &str) -> Result<Vec<ApiKeyRow>> {
         let sql = format!(
-            "SELECT id, tenant_id, user_id, key_bcrypt, revoked_at
+            "SELECT id, project_id, user_id, key_bcrypt, revoked_at
              FROM {sch}_api_keys
              WHERE key_hash = $1",
             sch = self.sch()
@@ -839,7 +839,7 @@ impl AuthStore for EngineAuthStore {
         all_rows(&batches, |b, r| {
             Ok(ApiKeyRow {
                 id: get_i64(b, r, 0).unwrap_or(0),
-                tenant_id: get_text(b, r, 1).unwrap_or_default(),
+                project_id: get_text(b, r, 1).unwrap_or_default(),
                 user_id: get_uuid(b, r, 2).unwrap_or_else(Uuid::nil),
                 key_bcrypt: get_text(b, r, 3).unwrap_or_default(),
                 revoked_at: get_ts(b, r, 4),
@@ -857,25 +857,25 @@ impl AuthStore for EngineAuthStore {
         Ok(())
     }
 
-    async fn revoke_api_key(&self, tenant: &TenantId, key_id: i64) -> Result<()> {
+    async fn revoke_api_key(&self, project: &ProjectId, key_id: i64) -> Result<()> {
         let sql = format!(
             "UPDATE {sch}_api_keys SET revoked_at = now()
-             WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+             WHERE id = $1 AND project_id = $2 AND revoked_at IS NULL",
             sch = self.sch()
         );
         let n = self
-            .exec_params(&sql, vec![p_i64(key_id), p_text(tenant.to_string())])
+            .exec_params(&sql, vec![p_i64(key_id), p_text(project.to_string())])
             .await
             .map_err(|e| BasinError::catalog(format!("revoke_api_key: {e}")))?;
         if n == 0 {
             // Check if the key exists at all (to distinguish NotFound vs.
             // already-revoked).
             let sql_exists = format!(
-                "SELECT 1 FROM {sch}_api_keys WHERE id = $1 AND tenant_id = $2",
+                "SELECT 1 FROM {sch}_api_keys WHERE id = $1 AND project_id = $2",
                 sch = self.sch()
             );
             let (_, batches) = self
-                .query_params(&sql_exists, vec![p_i64(key_id), p_text(tenant.to_string())])
+                .query_params(&sql_exists, vec![p_i64(key_id), p_text(project.to_string())])
                 .await
                 .map_err(|e| BasinError::catalog(format!("revoke_api_key check: {e}")))?;
             let exists = batches.iter().any(|b| b.num_rows() > 0);
@@ -889,18 +889,18 @@ impl AuthStore for EngineAuthStore {
 
     async fn list_api_keys(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: Uuid,
     ) -> Result<Vec<ApiKeyDescriptor>> {
         let sql = format!(
             "SELECT id, name, created_at, last_used_at, revoked_at
              FROM {sch}_api_keys
-             WHERE tenant_id = $1 AND user_id = $2
+             WHERE project_id = $1 AND user_id = $2
              ORDER BY id ASC",
             sch = self.sch()
         );
         let (_, batches) = self
-            .query_params(&sql, vec![p_text(tenant.to_string()), p_uuid(user_id)])
+            .query_params(&sql, vec![p_text(project.to_string()), p_uuid(user_id)])
             .await
             .map_err(|e| BasinError::catalog(format!("list_api_keys: {e}")))?;
         all_rows(&batches, |b, r| {
@@ -918,23 +918,23 @@ impl AuthStore for EngineAuthStore {
 
     async fn upsert_session_setting(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: Uuid,
         key: &str,
         value: &str,
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO {sch}_user_session_settings
-               (tenant_id, user_id, key, value)
+               (project_id, user_id, key, value)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (tenant_id, user_id, key)
+             ON CONFLICT (project_id, user_id, key)
              DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
             sch = self.sch()
         );
         self.exec_params(
             &sql,
             vec![
-                p_text(tenant.to_string()),
+                p_text(project.to_string()),
                 p_uuid(user_id),
                 p_text(key),
                 p_text(value),
@@ -947,17 +947,17 @@ impl AuthStore for EngineAuthStore {
 
     async fn list_session_settings(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: Uuid,
     ) -> Result<HashMap<String, String>> {
         let sql = format!(
             "SELECT key, value
              FROM {sch}_user_session_settings
-             WHERE tenant_id = $1 AND user_id = $2",
+             WHERE project_id = $1 AND user_id = $2",
             sch = self.sch()
         );
         let (_, batches) = self
-            .query_params(&sql, vec![p_text(tenant.to_string()), p_uuid(user_id)])
+            .query_params(&sql, vec![p_text(project.to_string()), p_uuid(user_id)])
             .await
             .map_err(|e| BasinError::catalog(format!("list_session_settings: {e}")))?;
         let mut map = HashMap::new();
@@ -971,18 +971,18 @@ impl AuthStore for EngineAuthStore {
         Ok(map)
     }
 
-    // --- Tenant credentials -------------------------------------------------
+    // --- Project credentials -------------------------------------------------
 
-    async fn insert_tenant_credential(
+    async fn insert_project_credential(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         pgwire_user: &str,
         password_hash: &str,
         dbname: &str,
     ) -> Result<bool> {
         let sql = format!(
-            "INSERT INTO {sch}_auth_tenant_credentials
-               (tenant_id, pgwire_user, password_hash, dbname)
+            "INSERT INTO {sch}_auth_project_credentials
+               (project_id, pgwire_user, password_hash, dbname)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (pgwire_user) DO NOTHING",
             sch = self.sch()
@@ -991,34 +991,34 @@ impl AuthStore for EngineAuthStore {
             .exec_params(
                 &sql,
                 vec![
-                    p_text(tenant.to_string()),
+                    p_text(project.to_string()),
                     p_text(pgwire_user),
                     p_text(password_hash),
                     p_text(dbname),
                 ],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!("insert_tenant_credential: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("insert_project_credential: {e}")))?;
         Ok(n > 0)
     }
 
-    async fn find_tenant_credential(
+    async fn find_project_credential(
         &self,
         pgwire_user: &str,
-    ) -> Result<Option<TenantCredentialRow>> {
+    ) -> Result<Option<ProjectCredentialRow>> {
         let sql = format!(
-            "SELECT tenant_id, password_hash, dbname
-             FROM {sch}_auth_tenant_credentials
+            "SELECT project_id, password_hash, dbname
+             FROM {sch}_auth_project_credentials
              WHERE pgwire_user = $1",
             sch = self.sch()
         );
         let (_, batches) = self
             .query_params(&sql, vec![p_text(pgwire_user)])
             .await
-            .map_err(|e| BasinError::catalog(format!("find_tenant_credential: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("find_project_credential: {e}")))?;
         first_row_opt(&batches, |b, r| {
-            Ok(TenantCredentialRow {
-                tenant_id: get_text(b, r, 0).unwrap_or_default(),
+            Ok(ProjectCredentialRow {
+                project_id: get_text(b, r, 0).unwrap_or_default(),
                 password_hash: get_text(b, r, 1).unwrap_or_default(),
                 dbname: get_text(b, r, 2).unwrap_or_default(),
             })
@@ -1027,14 +1027,14 @@ impl AuthStore for EngineAuthStore {
 
     /// Workaround: UPDATE followed by SELECT because the engine does not yet
     /// support `RETURNING`. Returns `None` if `pgwire_user` is not found.
-    async fn rotate_tenant_credential(
+    async fn rotate_project_credential(
         &self,
         pgwire_user: &str,
         password_hash: &str,
-    ) -> Result<Option<TenantCredentialRow>> {
+    ) -> Result<Option<ProjectCredentialRow>> {
         // Engine doesn't support RETURNING; update then select.
         let sql_update = format!(
-            "UPDATE {sch}_auth_tenant_credentials
+            "UPDATE {sch}_auth_project_credentials
                SET password_hash = $1, rotated_at = now()
              WHERE pgwire_user = $2",
             sch = self.sch()
@@ -1045,51 +1045,51 @@ impl AuthStore for EngineAuthStore {
                 vec![p_text(password_hash), p_text(pgwire_user)],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!("rotate_tenant_credential update: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("rotate_project_credential update: {e}")))?;
         if n == 0 {
             return Ok(None);
         }
         let sql_select = format!(
-            "SELECT tenant_id, dbname FROM {sch}_auth_tenant_credentials
+            "SELECT project_id, dbname FROM {sch}_auth_project_credentials
              WHERE pgwire_user = $1",
             sch = self.sch()
         );
         let (_, batches) = self
             .query_params(&sql_select, vec![p_text(pgwire_user)])
             .await
-            .map_err(|e| BasinError::catalog(format!("rotate_tenant_credential select: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("rotate_project_credential select: {e}")))?;
         first_row_opt(&batches, |b, r| {
-            Ok(TenantCredentialRow {
-                tenant_id: get_text(b, r, 0).unwrap_or_default(),
+            Ok(ProjectCredentialRow {
+                project_id: get_text(b, r, 0).unwrap_or_default(),
                 dbname: get_text(b, r, 1).unwrap_or_default(),
                 password_hash: String::new(), // Not returned after rotation.
             })
         })
     }
 
-    async fn list_tenant_credentials(
+    async fn list_project_credentials(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Vec<TenantCredentialDescriptor>> {
+        project: &ProjectId,
+    ) -> Result<Vec<ProjectCredentialDescriptor>> {
         let sql = format!(
-            "SELECT id, tenant_id, pgwire_user, dbname, created_at, rotated_at
-             FROM {sch}_auth_tenant_credentials
-             WHERE tenant_id = $1
+            "SELECT id, project_id, pgwire_user, dbname, created_at, rotated_at
+             FROM {sch}_auth_project_credentials
+             WHERE project_id = $1
              ORDER BY id ASC",
             sch = self.sch()
         );
         let (_, batches) = self
-            .query_params(&sql, vec![p_text(tenant.to_string())])
+            .query_params(&sql, vec![p_text(project.to_string())])
             .await
-            .map_err(|e| BasinError::catalog(format!("list_tenant_credentials: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("list_project_credentials: {e}")))?;
         all_rows(&batches, |b, r| {
             let t_str = get_text(b, r, 1).unwrap_or_default();
-            let t: TenantId = t_str.parse().map_err(|e| {
-                BasinError::internal(format!("list_tenant_credentials tenant parse: {e}"))
+            let t: ProjectId = t_str.parse().map_err(|e| {
+                BasinError::internal(format!("list_project_credentials project parse: {e}"))
             })?;
-            Ok(TenantCredentialDescriptor {
+            Ok(ProjectCredentialDescriptor {
                 id: get_i64(b, r, 0).unwrap_or(0),
-                tenant_id: t,
+                project_id: t,
                 pgwire_user: get_text(b, r, 2).unwrap_or_default(),
                 dbname: get_text(b, r, 3).unwrap_or_default(),
                 created_at: get_ts(b, r, 4).unwrap_or_else(Utc::now),
@@ -1098,37 +1098,37 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
-    async fn list_legacy_tenant_credentials(&self) -> Result<Vec<(TenantId, String)>> {
+    async fn list_legacy_project_credentials(&self) -> Result<Vec<(ProjectId, String)>> {
         let sql = format!(
-            "SELECT tenant_id, pgwire_user
-             FROM {sch}_auth_tenant_credentials
-             WHERE pgwire_user LIKE 'tenant_%'
+            "SELECT project_id, pgwire_user
+             FROM {sch}_auth_project_credentials
+             WHERE pgwire_user LIKE 'project_%'
              ORDER BY id ASC",
             sch = self.sch()
         );
         let (_, batches) = self
             .query_params(&sql, vec![])
             .await
-            .map_err(|e| BasinError::catalog(format!("list_legacy_tenant_credentials: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("list_legacy_project_credentials: {e}")))?;
         all_rows(&batches, |b, r| {
             let t_str = get_text(b, r, 0).unwrap_or_default();
-            let t: TenantId = t_str.parse().map_err(|e| {
-                BasinError::internal(format!("list_legacy_tenant_credentials tenant parse: {e}"))
+            let t: ProjectId = t_str.parse().map_err(|e| {
+                BasinError::internal(format!("list_legacy_project_credentials project parse: {e}"))
             })?;
             Ok((t, get_text(b, r, 1).unwrap_or_default()))
         })
     }
 
-    async fn delete_tenant_credential(&self, pgwire_user: &str) -> Result<()> {
+    async fn delete_project_credential(&self, pgwire_user: &str) -> Result<()> {
         let sql = format!(
-            "DELETE FROM {sch}_auth_tenant_credentials
+            "DELETE FROM {sch}_auth_project_credentials
              WHERE pgwire_user = $1",
             sch = self.sch()
         );
         let n = self
             .exec_params(&sql, vec![p_text(pgwire_user)])
             .await
-            .map_err(|e| BasinError::catalog(format!("delete_tenant_credential: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("delete_project_credential: {e}")))?;
         if n == 0 {
             return Err(BasinError::not_found(format!(
                 "pgwire_user {pgwire_user:?} not found for deletion"
@@ -1179,7 +1179,7 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
-    /// Atomically mark the tenant-agnostic magic-link row as consumed.
+    /// Atomically mark the project-agnostic magic-link row as consumed.
     /// Mirrors the `consume_email_token` invariant: the `consumed_at IS NULL`
     /// guard ensures single-use even under concurrent requests for the same link.
     async fn consume_auth_magic_link(&self, id: i64) -> Result<u64> {

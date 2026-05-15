@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -23,14 +23,14 @@ use crate::server::{authorize, Inner};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SignupRequest {
-    pub tenant_id: String,
+    pub project_id: String,
     pub email: String,
     pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SigninRequest {
-    pub tenant_id: String,
+    pub project_id: String,
     pub email: String,
     pub password: String,
 }
@@ -42,32 +42,32 @@ pub(crate) struct RefreshRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct VerifyEmailRequest {
-    pub tenant_id: String,
+    pub project_id: String,
     pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PasswordResetRequest {
-    pub tenant_id: String,
+    pub project_id: String,
     pub email: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PasswordResetConfirm {
-    pub tenant_id: String,
+    pub project_id: String,
     pub token: String,
     pub new_password: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MagicLinkRequest {
-    pub tenant_id: String,
+    pub project_id: String,
     pub email: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MagicLinkConfirm {
-    pub tenant_id: String,
+    pub project_id: String,
     pub token: String,
 }
 
@@ -81,9 +81,9 @@ pub(crate) struct EmailLinkConsume {
     pub token: String,
 }
 
-fn parse_tenant(s: &str) -> Result<TenantId, ApiError> {
+fn parse_project(s: &str) -> Result<ProjectId, ApiError> {
     s.parse()
-        .map_err(|_| ApiError::invalid(format!("invalid tenant_id: {s:?}")))
+        .map_err(|_| ApiError::invalid(format!("invalid project_id: {s:?}")))
 }
 
 #[axum::debug_handler]
@@ -91,11 +91,11 @@ pub(crate) async fn signup(
     State(state): State<Arc<Inner>>,
     Json(req): Json<SignupRequest>,
 ) -> Result<Response, ApiError> {
-    let tenant = parse_tenant(&req.tenant_id)?;
+    let project = parse_project(&req.project_id)?;
     let user = state
         .cfg
         .auth
-        .signup(&tenant, &req.email, &req.password)
+        .signup(&project, &req.email, &req.password)
         .await
         .map_err(ApiError::from)?;
     let body = json!({ "ok": true, "user_id": user.to_string() });
@@ -107,11 +107,11 @@ pub(crate) async fn signin(
     State(state): State<Arc<Inner>>,
     Json(req): Json<SigninRequest>,
 ) -> Result<Response, ApiError> {
-    let tenant = parse_tenant(&req.tenant_id)?;
+    let project = parse_project(&req.project_id)?;
     let toks = state
         .cfg
         .auth
-        .signin(&tenant, &req.email, &req.password)
+        .signin(&project, &req.email, &req.password)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(token_body(&toks)).into_response())
@@ -142,11 +142,11 @@ pub(crate) async fn verify_email(
     State(state): State<Arc<Inner>>,
     Json(req): Json<VerifyEmailRequest>,
 ) -> Result<Response, ApiError> {
-    let tenant = parse_tenant(&req.tenant_id)?;
+    let project = parse_project(&req.project_id)?;
     state
         .cfg
         .auth
-        .verify_email(&tenant, &req.token)
+        .verify_email(&project, &req.token)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })).into_response())
@@ -157,11 +157,11 @@ pub(crate) async fn request_password_reset(
     State(state): State<Arc<Inner>>,
     Json(req): Json<PasswordResetRequest>,
 ) -> Result<Response, ApiError> {
-    let tenant = parse_tenant(&req.tenant_id)?;
+    let project = parse_project(&req.project_id)?;
     state
         .cfg
         .auth
-        .request_password_reset(&tenant, &req.email)
+        .request_password_reset(&project, &req.email)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })).into_response())
@@ -172,20 +172,20 @@ pub(crate) async fn reset_password(
     State(state): State<Arc<Inner>>,
     Json(req): Json<PasswordResetConfirm>,
 ) -> Result<Response, ApiError> {
-    let tenant = parse_tenant(&req.tenant_id)?;
+    let project = parse_project(&req.project_id)?;
     state
         .cfg
         .auth
-        .reset_password(&tenant, &req.token, &req.new_password)
+        .reset_password(&project, &req.token, &req.new_password)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })).into_response())
 }
 
-/// Legacy per-tenant magic-link request. The HTTP routes now point at the
-/// tenant-agnostic email-link login; this handler stays for in-process
+/// Legacy per-project magic-link request. The HTTP routes now point at the
+/// project-agnostic email-link login; this handler stays for in-process
 /// callers (and to keep the AuthService surface easy to reach from Rust
-/// embeds). A future wedge customer that needs per-tenant magic links can
+/// embeds). A future wedge customer that needs per-project magic links can
 /// re-route it.
 #[axum::debug_handler]
 #[allow(dead_code)]
@@ -193,11 +193,11 @@ pub(crate) async fn request_magic_link(
     State(state): State<Arc<Inner>>,
     Json(req): Json<MagicLinkRequest>,
 ) -> Result<Response, ApiError> {
-    let tenant = parse_tenant(&req.tenant_id)?;
+    let project = parse_project(&req.project_id)?;
     state
         .cfg
         .auth
-        .request_magic_link(&tenant, &req.email)
+        .request_magic_link(&project, &req.email)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })).into_response())
@@ -209,17 +209,17 @@ pub(crate) async fn signin_magic_link(
     State(state): State<Arc<Inner>>,
     Json(req): Json<MagicLinkConfirm>,
 ) -> Result<Response, ApiError> {
-    let tenant = parse_tenant(&req.tenant_id)?;
+    let project = parse_project(&req.project_id)?;
     let toks = state
         .cfg
         .auth
-        .signin_with_magic_link(&tenant, &req.token)
+        .signin_with_magic_link(&project, &req.token)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(token_body(&toks)).into_response())
 }
 
-/// Tenant-agnostic email-link login (request). Body: `{ "email": "..." }`.
+/// Project-agnostic email-link login (request). Body: `{ "email": "..." }`.
 /// Always responds 204 (never confirm whether the email is known) unless
 /// outbound mail is disabled, in which case 503 + `E_EMAIL_DISABLED`.
 #[axum::debug_handler]
@@ -290,7 +290,7 @@ pub(crate) async fn create_api_key(
     let issued = state
         .cfg
         .auth
-        .issue_api_key(claims.user_id, &claims.tenant_id, &req.name)
+        .issue_api_key(claims.user_id, &claims.project_id, &req.name)
         .await
         .map_err(ApiError::from)?;
     let body = json!({
@@ -311,7 +311,7 @@ pub(crate) async fn list_api_keys(
     let keys = state
         .cfg
         .auth
-        .list_api_keys(claims.user_id, &claims.tenant_id)
+        .list_api_keys(claims.user_id, &claims.project_id)
         .await
         .map_err(ApiError::from)?;
     let body: Vec<serde_json::Value> = keys
@@ -339,7 +339,7 @@ pub(crate) async fn delete_api_key(
     state
         .cfg
         .auth
-        .revoke_api_key(id, &claims.tenant_id)
+        .revoke_api_key(id, &claims.project_id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })).into_response())

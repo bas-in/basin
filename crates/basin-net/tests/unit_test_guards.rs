@@ -3,15 +3,15 @@
 //! These complement the higher-level [`HttpClient`] tests by exercising the
 //! gate types in isolation. Useful when reviewing the safety story.
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_net::{AllowList, GuardConfig, HttpError, RateLimit};
 
 #[tokio::test]
 async fn allowlist_check_returns_host_denied_variant() {
     let allow = AllowList::new();
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let err = allow
-        .check(&tenant, "https://attacker.example.com/")
+        .check(&project, "https://attacker.example.com/")
         .await
         .unwrap_err();
     assert!(matches!(err, HttpError::HostDenied { .. }), "got {err:?}");
@@ -20,22 +20,22 @@ async fn allowlist_check_returns_host_denied_variant() {
 #[tokio::test]
 async fn allowlist_list_is_sorted() {
     let allow = AllowList::new();
-    let tenant = TenantId::new();
-    allow.allow(&tenant, "zeta.example").await;
-    allow.allow(&tenant, "alpha.example").await;
-    allow.allow(&tenant, "mu.example").await;
-    let v = allow.list(&tenant).await;
+    let project = ProjectId::new();
+    allow.allow(&project, "zeta.example").await;
+    allow.allow(&project, "alpha.example").await;
+    allow.allow(&project, "mu.example").await;
+    let v = allow.list(&project).await;
     assert_eq!(v, vec!["alpha.example", "mu.example", "zeta.example"]);
 }
 
 #[tokio::test]
 async fn allowlist_deny_removes_host() {
     let allow = AllowList::new();
-    let tenant = TenantId::new();
-    allow.allow(&tenant, "example.com").await;
-    assert!(allow.deny(&tenant, "example.com").await);
+    let project = ProjectId::new();
+    allow.allow(&project, "example.com").await;
+    assert!(allow.deny(&project, "example.com").await);
     let err = allow
-        .check(&tenant, "https://example.com/")
+        .check(&project, "https://example.com/")
         .await
         .unwrap_err();
     assert!(matches!(err, HttpError::HostDenied { .. }), "got {err:?}");

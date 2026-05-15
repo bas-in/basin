@@ -8,7 +8,7 @@ use basin_catalog::{
     Catalog, InMemoryCatalog, SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage,
     SqlReturnType,
 };
-use basin_common::{BasinError, TenantId};
+use basin_common::{BasinError, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -66,7 +66,7 @@ fn col_i64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
 async fn generated_column_round_trip() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE users (\
@@ -93,7 +93,7 @@ async fn generated_column_round_trip() {
 async fn generated_column_recomputes_on_update() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE users (\
@@ -133,7 +133,7 @@ async fn generated_column_recomputes_on_update() {
 async fn generated_column_with_builtin() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // Exercise `coalesce`, `lower`, and `||` together (Phase 5.11.A surface).
     sess.execute(
@@ -170,12 +170,12 @@ async fn generated_column_with_builtin() {
 async fn generated_column_with_user_function() {
     let dir = TempDir::new().unwrap();
     let (eng, catalog) = engine_in(&dir);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // Register a `LANGUAGE sql` function directly on the catalog so this
     // test doesn't depend on the parallel CREATE FUNCTION SQL surface.
     let def = SqlFunctionDef {
-        tenant,
+        project,
         name: "double_it".to_string(),
         args: vec![SqlFunctionArg {
             name: "x".to_string(),
@@ -187,7 +187,7 @@ async fn generated_column_with_user_function() {
     };
     catalog.register_sql_function(def).await.unwrap();
 
-    let sess = eng.open_session(tenant).await.unwrap();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute(
         "CREATE TABLE t (\
          id BIGINT NOT NULL,\
@@ -214,7 +214,7 @@ async fn generated_column_with_user_function() {
 async fn direct_insert_to_generated_col_rejected() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute(
         "CREATE TABLE users (\
          first_name TEXT NOT NULL,\
@@ -242,7 +242,7 @@ async fn direct_insert_to_generated_col_rejected() {
 async fn direct_update_to_generated_col_rejected() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute(
         "CREATE TABLE users (\
          first_name TEXT NOT NULL,\
@@ -272,7 +272,7 @@ async fn direct_update_to_generated_col_rejected() {
 async fn virtual_rejected() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute(
@@ -295,7 +295,7 @@ async fn virtual_rejected() {
 async fn missing_stored_keyword_rejected() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // GENERATED ALWAYS AS (...) without STORED isn't on the v0.1 surface
     // — sqlparser routes it through the same path with no expr-mode
@@ -319,7 +319,7 @@ async fn missing_stored_keyword_rejected() {
 async fn self_reference_rejected() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     let err = sess
         .execute(
             "CREATE TABLE t (\
@@ -335,7 +335,7 @@ async fn self_reference_rejected() {
 async fn composition_with_audit_to() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute(
         "CREATE TABLE users (\
          id BIGINT NOT NULL,\
@@ -379,7 +379,7 @@ async fn composition_with_audit_to() {
 async fn composition_with_soft_delete() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute(
         "CREATE TABLE users (\
          id BIGINT NOT NULL,\
@@ -434,11 +434,11 @@ async fn composition_with_soft_delete() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let a = eng.open_session(TenantId::new()).await.unwrap();
-    let b = eng.open_session(TenantId::new()).await.unwrap();
+    let a = eng.open_session(ProjectId::new()).await.unwrap();
+    let b = eng.open_session(ProjectId::new()).await.unwrap();
 
     for s in [&a, &b] {
         s.execute(
@@ -479,7 +479,7 @@ async fn cross_tenant_isolation() {
 async fn multi_column_arithmetic_expression() {
     let dir = TempDir::new().unwrap();
     let (eng, _cat) = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute(
         "CREATE TABLE t (\
          a BIGINT NOT NULL,\

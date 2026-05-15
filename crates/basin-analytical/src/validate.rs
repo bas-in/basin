@@ -2,8 +2,8 @@
 //!
 //! DuckDB has built-in functions that take a filesystem path or URI directly:
 //! `read_parquet`, `read_csv`, `read_json`, plus `ATTACH 'path'` and a handful
-//! of extension functions. Allowing any of these from a tenant-submitted query
-//! would let one tenant point DuckDB at another tenant's prefix (or, worse,
+//! of extension functions. Allowing any of these from a project-submitted query
+//! would let one project point DuckDB at another project's prefix (or, worse,
 //! `/etc/passwd` on the analytical worker).
 //!
 //! v0.1 takes the crude-but-effective approach: substring-match the SQL,

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::TableMetadata as BasinTableMetadata;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,7 +23,7 @@ use crate::error::IcebergRestError;
 ///
 /// Iceberg models a namespace as an *array* of strings (so a hierarchy
 /// like `["accounting", "us-east"]` round-trips); Basin flattens it to
-/// the single-element ULID array `[<tenant_id>]`.
+/// the single-element ULID array `[<project_id>]`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListNamespacesResponse {
     pub namespaces: Vec<Vec<String>>,
@@ -283,8 +283,8 @@ pub struct IcebergSnapshotRef {
     pub kind: String,
 }
 
-/// Map a [`TenantId`] onto Iceberg's array-of-strings namespace shape.
-pub(crate) fn tenant_to_namespace(t: &TenantId) -> Vec<String> {
+/// Map a [`ProjectId`] onto Iceberg's array-of-strings namespace shape.
+pub(crate) fn project_to_namespace(t: &ProjectId) -> Vec<String> {
     vec![t.to_string()]
 }
 
@@ -394,11 +394,11 @@ pub(crate) fn iceberg_schema_to_arrow(s: &IcebergSchema) -> Result<Schema, Icebe
     Ok(Schema::new(arrow_fields))
 }
 
-/// Stable UUID derived from `(tenant, table)`. Iceberg requires every
+/// Stable UUID derived from `(project, table)`. Iceberg requires every
 /// table metadata blob to carry a uuid; Basin doesn't store one
 /// internally so we hash a synthetic one. Stable across reloads
 /// because the input is deterministic.
 pub(crate) fn synthesise_table_uuid(meta: &BasinTableMetadata) -> String {
-    let key = format!("{}/{}", meta.tenant, meta.table);
+    let key = format!("{}/{}", meta.project, meta.table);
     Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()).to_string()
 }

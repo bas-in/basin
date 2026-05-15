@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, StringArray, TimestampMicrosecondArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -88,7 +88,7 @@ fn tag(res: ExecResult) -> String {
 async fn update_set_col_plus_literal() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE counters (id BIGINT NOT NULL, cnt BIGINT NOT NULL)")
         .await
@@ -131,7 +131,7 @@ async fn update_set_col_plus_literal() {
 async fn update_set_col_multiply() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE vals (id BIGINT NOT NULL, v BIGINT NOT NULL)")
         .await
@@ -165,7 +165,7 @@ async fn update_set_col_multiply() {
 async fn update_set_string_function() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE words (id BIGINT NOT NULL, w TEXT NOT NULL)")
         .await
@@ -207,7 +207,7 @@ async fn update_set_string_function() {
 async fn update_set_now_timestamp() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMPTZ)",
@@ -259,7 +259,7 @@ async fn update_set_now_timestamp() {
 async fn delete_returning_star() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE items (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
@@ -314,7 +314,7 @@ async fn delete_returning_star() {
 async fn delete_returning_column_subset() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE things (id BIGINT NOT NULL, label TEXT NOT NULL)")
         .await
@@ -352,7 +352,7 @@ async fn delete_returning_column_subset() {
 async fn delete_all_returning() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE scratch (id BIGINT NOT NULL)")
         .await

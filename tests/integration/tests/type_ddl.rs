@@ -1,15 +1,15 @@
 //! SQL-level coverage for `CREATE TYPE … AS ENUM`, `ALTER TYPE … ADD VALUE`,
 //! `DROP TYPE`, `CREATE DOMAIN … AS <type> [CHECK (…)]`, and `DROP DOMAIN`.
 //!
-//! Tests exercise the full path through `TenantSession::execute` so that
+//! Tests exercise the full path through `ProjectSession::execute` so that
 //! parser pre-screens, catalog registration, and INSERT-time enforcement
 //! are all covered.
 
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -32,19 +32,19 @@ async fn open_engine() -> (TempDir, Engine) {
     (dir, engine)
 }
 
-async fn open_session(engine: &Engine) -> TenantSession {
-    engine.open_session(TenantId::new()).await.unwrap()
+async fn open_session(engine: &Engine) -> ProjectSession {
+    engine.open_session(ProjectId::new()).await.unwrap()
 }
 
 /// Execute SQL and expect success, returning the result.
-async fn exec_ok(sess: &TenantSession, sql: &str) -> ExecResult {
+async fn exec_ok(sess: &ProjectSession, sql: &str) -> ExecResult {
     sess.execute(sql)
         .await
         .unwrap_or_else(|e| panic!("execute {sql:?}: {e}"))
 }
 
 /// Execute SQL and expect an error, returning the error message.
-async fn exec_err(sess: &TenantSession, sql: &str) -> String {
+async fn exec_err(sess: &ProjectSession, sql: &str) -> String {
     sess.execute(sql)
         .await
         .expect_err(&format!("expected error for {sql:?}"))

@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, ScalarParam, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ScalarParam, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -72,8 +72,8 @@ fn vec_lit(v: &[f32]) -> String {
 /// Seed `n_rows` rows into a fresh `embeddings` table. Each row gets a
 /// `vector(DIM)` value derived deterministically from its `id`. Returns the
 /// session.
-async fn seed_table(eng: &Engine, n_rows: usize) -> TenantSession {
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+async fn seed_table(eng: &Engine, n_rows: usize) -> ProjectSession {
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute(&format!(
         "CREATE TABLE embeddings (id BIGINT NOT NULL, category TEXT, embedding vector({DIM}))"
     ))

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -79,7 +79,7 @@ fn collect_i64_sorted(res: ExecResult) -> Vec<i64> {
 async fn set_op_union_deduplicates() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
     s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
@@ -99,7 +99,7 @@ async fn set_op_union_deduplicates() {
 async fn set_op_union_all_keeps_duplicates() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
     s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
@@ -123,7 +123,7 @@ async fn set_op_union_all_keeps_duplicates() {
 async fn set_op_intersect() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
     s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
@@ -144,7 +144,7 @@ async fn set_op_intersect() {
 async fn set_op_intersect_all() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
     s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
@@ -171,7 +171,7 @@ async fn set_op_intersect_all() {
 async fn set_op_except() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
     s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
@@ -200,7 +200,7 @@ async fn set_op_except() {
 async fn set_op_except_all() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
     s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
@@ -233,7 +233,7 @@ async fn set_op_except_all() {
 async fn cte_simple() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE items (id BIGINT NOT NULL, val BIGINT NOT NULL)")
         .await
@@ -255,7 +255,7 @@ async fn cte_simple() {
 async fn cte_multiple_with_join() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
@@ -302,7 +302,7 @@ async fn cte_multiple_with_join() {
 async fn cte_recursive() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let sql = "
         WITH RECURSIVE counter AS (
@@ -334,7 +334,7 @@ async fn cte_recursive() {
 async fn cte_materialized_hint() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE nums (n BIGINT NOT NULL)").await.unwrap();
     s.execute("INSERT INTO nums VALUES (10), (20), (30)").await.unwrap();

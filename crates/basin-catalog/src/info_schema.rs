@@ -12,8 +12,8 @@
 //! - Read existing [`Catalog`] methods only (`list_tables`, `load_table`).
 //!   No new trait methods; other agents are concurrently extending the
 //!   trait and we avoid contention.
-//! - Filter to the calling tenant's tables at query-construction time;
-//!   never materialise cross-tenant rows.
+//! - Filter to the calling project's tables at query-construction time;
+//!   never materialise cross-project rows.
 //!
 //! Oid-hashing scheme: see [`stable_oid`].
 
@@ -24,7 +24,7 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::{DataType, Field, IntervalUnit, Schema};
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 
 use crate::functions::{SqlArgType, SqlReturnType};
 use crate::Catalog;
@@ -39,7 +39,7 @@ impl InfoSchemaQuery {
     /// | column         | type | notes                                          |
     /// |----------------|------|------------------------------------------------|
     /// | table_catalog  | TEXT | always `"basin"` for v0.1                      |
-    /// | table_schema   | TEXT | always `"public"` (single-schema-per-tenant)   |
+    /// | table_schema   | TEXT | always `"public"` (single-schema-per-project)   |
     /// | table_name     | TEXT | the user-visible table name                    |
     /// | table_type     | TEXT | `"BASE TABLE"` for tables and continuous       |
     /// |                |      | aggregates (PG behaviour for matviews); `"VIEW"` |
@@ -57,8 +57,8 @@ impl InfoSchemaQuery {
     ///
     /// | column          | type   | notes                                   |
     /// |-----------------|--------|-----------------------------------------|
-    /// | oid             | BIGINT | stable per-(tenant, table) hash         |
-    /// | relname         | TEXT   | table name within the tenant            |
+    /// | oid             | BIGINT | stable per-(project, table) hash         |
+    /// | relname         | TEXT   | table name within the project            |
     /// | relnamespace    | BIGINT | hash of `"public"` namespace            |
     /// | relkind         | TEXT   | `'r'` table / `'v'` view / `'m'` matview |
     /// | relrowsecurity  | BOOL   | RLS-enabled flag                        |
@@ -76,12 +76,12 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `information_schema.tables` filtered to `tenant`'s tables.
+    /// Build `information_schema.tables` filtered to `project`'s tables.
     ///
-    /// Cross-tenant leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `tenant`.
-    pub async fn tables(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    /// Cross-project leak is a P0 invariant: this only ever calls
+    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `project`.
+    pub async fn tables(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
 
         let mut catalogs: Vec<&str> = Vec::with_capacity(names.len());
         let mut schemas: Vec<&str> = Vec::with_capacity(names.len());
@@ -93,7 +93,7 @@ impl InfoSchemaQuery {
         // `information_schema.tables` (the SQL-standard view doesn't
         // know about matviews); we mirror that for compatibility.
         for name in &names {
-            let _meta = catalog.load_table(tenant, name).await?;
+            let _meta = catalog.load_table(project, name).await?;
             catalogs.push(BASIN_CATALOG_NAME);
             schemas.push(DEFAULT_SCHEMA);
             table_names.push(name.as_str().to_string());
@@ -111,12 +111,12 @@ impl InfoSchemaQuery {
             .map_err(|e| BasinError::internal(format!("info_schema.tables build: {e}")))
     }
 
-    /// Build `pg_catalog.pg_class` filtered to `tenant`'s tables.
+    /// Build `pg_catalog.pg_class` filtered to `project`'s tables.
     ///
-    /// Cross-tenant leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `tenant`.
-    pub async fn pg_class(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    /// Cross-project leak is a P0 invariant: this only ever calls
+    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `project`.
+    pub async fn pg_class(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
 
         let mut oids: Vec<i64> = Vec::with_capacity(names.len());
         let mut relnames: Vec<String> = Vec::with_capacity(names.len());
@@ -126,11 +126,11 @@ impl InfoSchemaQuery {
         let mut partitioned: Vec<bool> = Vec::with_capacity(names.len());
         let mut reltuples: Vec<f32> = Vec::with_capacity(names.len());
 
-        let namespace_oid = namespace_oid_for(tenant, DEFAULT_SCHEMA);
+        let namespace_oid = namespace_oid_for(project, DEFAULT_SCHEMA);
 
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
-            oids.push(table_oid(tenant, name));
+            let meta = catalog.load_table(project, name).await?;
+            oids.push(table_oid(project, name));
             relnames.push(name.as_str().to_string());
             namespaces.push(namespace_oid);
             // v0.1 only knows base tables and materialized views (the
@@ -169,7 +169,7 @@ impl InfoSchemaQuery {
 
     /// Schema for `information_schema.columns` rows.
     ///
-    /// One row per (table, column) belonging to the calling tenant. Column
+    /// One row per (table, column) belonging to the calling project. Column
     /// names match the SQL-standard / PG layout exactly so PostgREST,
     /// pgAdmin, and ORMs that probe `information_schema.columns` for
     /// type / nullability / ordering metadata receive what they expect.
@@ -178,7 +178,7 @@ impl InfoSchemaQuery {
     /// |-------------------|---------|----------------------------------------|
     /// | table_catalog     | TEXT    | always `"basin"`                       |
     /// | table_schema      | TEXT    | always `"public"`                      |
-    /// | table_name        | TEXT    | tenant-local table name                |
+    /// | table_name        | TEXT    | project-local table name                |
     /// | column_name       | TEXT    | column name                            |
     /// | ordinal_position  | INT     | 1-based                                |
     /// | column_default    | TEXT?   | default expression text or NULL        |
@@ -201,7 +201,7 @@ impl InfoSchemaQuery {
 
     /// Schema for `pg_catalog.pg_attribute` rows.
     ///
-    /// One row per (table, column) belonging to the calling tenant.
+    /// One row per (table, column) belonging to the calling project.
     /// `attrelid` shares its hashing scheme with [`pg_class.oid`] so a
     /// JOIN between the two tables is direct.
     ///
@@ -228,12 +228,12 @@ impl InfoSchemaQuery {
 
     /// Schema for `pg_catalog.pg_namespace` rows.
     ///
-    /// v0.1 emits exactly one row per tenant (`"public"`); multi-schema
-    /// per tenant is a v0.2 extension.
+    /// v0.1 emits exactly one row per project (`"public"`); multi-schema
+    /// per project is a v0.2 extension.
     ///
     /// | column     | type   | notes                                       |
     /// |------------|--------|---------------------------------------------|
-    /// | oid        | BIGINT | namespace oid (FNV-1a of `(tenant, "public")`) |
+    /// | oid        | BIGINT | namespace oid (FNV-1a of `(project, "public")`) |
     /// | nspname    | TEXT   | always `"public"` for v0.1                   |
     /// | nspowner   | BIGINT | 0 (placeholder; v0.2 wires real owner)       |
     pub fn pg_namespace_schema() -> Arc<Schema> {
@@ -244,12 +244,12 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `information_schema.columns` filtered to `tenant`'s tables.
+    /// Build `information_schema.columns` filtered to `project`'s tables.
     ///
-    /// Cross-tenant leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `tenant`.
-    pub async fn columns(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    /// Cross-project leak is a P0 invariant: this only ever calls
+    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `project`.
+    pub async fn columns(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
 
         let mut catalogs: Vec<&str> = Vec::new();
         let mut schemas: Vec<&str> = Vec::new();
@@ -262,7 +262,7 @@ impl InfoSchemaQuery {
         let mut udt_names: Vec<&'static str> = Vec::new();
 
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             for (idx, field) in meta.schema.fields().iter().enumerate() {
                 catalogs.push(BASIN_CATALOG_NAME);
                 schemas.push(DEFAULT_SCHEMA);
@@ -304,12 +304,12 @@ impl InfoSchemaQuery {
             .map_err(|e| BasinError::internal(format!("info_schema.columns build: {e}")))
     }
 
-    /// Build `pg_catalog.pg_attribute` filtered to `tenant`'s tables.
+    /// Build `pg_catalog.pg_attribute` filtered to `project`'s tables.
     ///
-    /// Cross-tenant leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `tenant`.
-    pub async fn pg_attribute(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    /// Cross-project leak is a P0 invariant: this only ever calls
+    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `project`.
+    pub async fn pg_attribute(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
 
         let mut attrelids: Vec<i64> = Vec::new();
         let mut attnames: Vec<String> = Vec::new();
@@ -320,8 +320,8 @@ impl InfoSchemaQuery {
         let mut attisdroppeds: Vec<bool> = Vec::new();
 
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
-            let relid = table_oid(tenant, name);
+            let meta = catalog.load_table(project, name).await?;
+            let relid = table_oid(project, name);
             for (idx, field) in meta.schema.fields().iter().enumerate() {
                 attrelids.push(relid);
                 attnames.push(field.name().clone());
@@ -351,12 +351,12 @@ impl InfoSchemaQuery {
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_attribute build: {e}")))
     }
 
-    /// Build `pg_catalog.pg_namespace` filtered to `tenant`. v0.1 emits
-    /// exactly one row (`"public"`) — single-schema-per-tenant is the
+    /// Build `pg_catalog.pg_namespace` filtered to `project`. v0.1 emits
+    /// exactly one row (`"public"`) — single-schema-per-project is the
     /// invariant the rest of the views (`pg_class.relnamespace`,
     /// `information_schema.tables.table_schema`) already encode.
-    pub async fn pg_namespace(_catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let oid = namespace_oid_for(tenant, DEFAULT_SCHEMA);
+    pub async fn pg_namespace(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let oid = namespace_oid_for(project, DEFAULT_SCHEMA);
         let schema = Self::pg_namespace_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![oid])),
@@ -370,11 +370,11 @@ impl InfoSchemaQuery {
     /// Schema for `pg_catalog.pg_proc` rows.
     ///
     /// One row per user-defined function (`prokind = 'f'`) and procedure
-    /// (`prokind = 'p'`) registered for the tenant.
+    /// (`prokind = 'p'`) registered for the project.
     ///
     /// | column        | type    | notes                                     |
     /// |---------------|---------|-------------------------------------------|
-    /// | oid           | BIGINT  | FNV-1a of `(tenant, name)` (same scheme)  |
+    /// | oid           | BIGINT  | FNV-1a of `(project, name)` (same scheme)  |
     /// | proname       | TEXT    | function/procedure name                    |
     /// | pronamespace  | BIGINT  | `pg_namespace.oid` for `"public"`         |
     /// | prokind       | TEXT    | `'f'` for function, `'p'` for procedure    |
@@ -433,13 +433,13 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_proc` filtered to `tenant`'s functions and
-    /// procedures. Cross-tenant leak is a P0 invariant: only
+    /// Build `pg_catalog.pg_proc` filtered to `project`'s functions and
+    /// procedures. Cross-project leak is a P0 invariant: only
     /// [`Catalog::list_sql_functions`] / [`Catalog::list_procedures`] for
-    /// `tenant` are consulted.
-    pub async fn pg_proc(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let funcs = catalog.list_sql_functions(tenant).await;
-        let procs = catalog.list_procedures(tenant).await;
+    /// `project` are consulted.
+    pub async fn pg_proc(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let funcs = catalog.list_sql_functions(project).await;
+        let procs = catalog.list_procedures(project).await;
         let cap = funcs.len() + procs.len();
 
         let mut oids: Vec<i64> = Vec::with_capacity(cap);
@@ -452,10 +452,10 @@ impl InfoSchemaQuery {
         let mut prosrcs: Vec<String> = Vec::with_capacity(cap);
         let mut prolangs: Vec<i64> = Vec::with_capacity(cap);
 
-        let namespace_oid = namespace_oid_for(tenant, DEFAULT_SCHEMA);
+        let namespace_oid = namespace_oid_for(project, DEFAULT_SCHEMA);
 
         for f in &funcs {
-            oids.push(routine_oid(tenant, &f.name));
+            oids.push(routine_oid(project, &f.name));
             pronames.push(f.name.clone());
             pronamespaces.push(namespace_oid);
             prokinds.push(PROKIND_FUNCTION);
@@ -466,7 +466,7 @@ impl InfoSchemaQuery {
             prolangs.push(PROLANG_SQL);
         }
         for p in &procs {
-            oids.push(routine_oid(tenant, &p.name));
+            oids.push(routine_oid(project, &p.name));
             pronames.push(p.name.clone());
             pronamespaces.push(namespace_oid);
             prokinds.push(PROKIND_PROCEDURE);
@@ -493,13 +493,13 @@ impl InfoSchemaQuery {
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_proc build: {e}")))
     }
 
-    /// Build `information_schema.routines` filtered to `tenant`'s
-    /// functions and procedures. Cross-tenant leak is a P0 invariant:
+    /// Build `information_schema.routines` filtered to `project`'s
+    /// functions and procedures. Cross-project leak is a P0 invariant:
     /// only [`Catalog::list_sql_functions`] / [`Catalog::list_procedures`]
-    /// for `tenant` are consulted.
-    pub async fn routines(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let funcs = catalog.list_sql_functions(tenant).await;
-        let procs = catalog.list_procedures(tenant).await;
+    /// for `project` are consulted.
+    pub async fn routines(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let funcs = catalog.list_sql_functions(project).await;
+        let procs = catalog.list_procedures(project).await;
         let cap = funcs.len() + procs.len();
 
         let mut specific_catalogs: Vec<&str> = Vec::with_capacity(cap);
@@ -600,11 +600,11 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_index` filtered to `tenant`. Always empty in
-    /// v0.1 (no user-defined indexes). The `tenant` argument is held for
+    /// Build `pg_catalog.pg_index` filtered to `project`. Always empty in
+    /// v0.1 (no user-defined indexes). The `project` argument is held for
     /// signature stability against the v0.2 expansion that will read
     /// [`TableMetadata::indexes`].
-    pub async fn pg_index(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+    pub async fn pg_index(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
         let schema = Self::pg_index_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(Vec::<i64>::new())),
@@ -627,7 +627,7 @@ impl InfoSchemaQuery {
     ///
     /// | column        | type   | notes                                     |
     /// |---------------|--------|-------------------------------------------|
-    /// | oid           | BIGINT | FNV-1a of `(tenant, table, conname)`      |
+    /// | oid           | BIGINT | FNV-1a of `(project, table, conname)`      |
     /// | conname       | TEXT   | constraint name                            |
     /// | connamespace  | BIGINT | namespace oid (matches pg_namespace)       |
     /// | contype       | TEXT   | `'p'`/`'f'`/`'c'`/`'u'`/`'n'`              |
@@ -648,8 +648,8 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_constraint` filtered to `tenant`. Emits one
-    /// row per constraint declared on each tenant-owned table:
+    /// Build `pg_catalog.pg_constraint` filtered to `project`. Emits one
+    /// row per constraint declared on each project-owned table:
     ///
     /// - `contype = 'p'` for the PRIMARY KEY (one row per table that
     ///   has a PK), named `<table>_pkey`. `conkey` is the
@@ -664,11 +664,11 @@ impl InfoSchemaQuery {
     ///   but Basin advertises it here so PostgREST / pgAdmin can list
     ///   every constraint surface in one view.
     ///
-    /// Cross-tenant leak is a P0 invariant: only [`Catalog::list_tables`]
-    /// / [`Catalog::load_table`] for `tenant`.
-    pub async fn pg_constraint(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
-        let namespace_oid = namespace_oid_for(tenant, DEFAULT_SCHEMA);
+    /// Cross-project leak is a P0 invariant: only [`Catalog::list_tables`]
+    /// / [`Catalog::load_table`] for `project`.
+    pub async fn pg_constraint(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
+        let namespace_oid = namespace_oid_for(project, DEFAULT_SCHEMA);
 
         let mut oids: Vec<i64> = Vec::new();
         let mut connames: Vec<String> = Vec::new();
@@ -682,11 +682,11 @@ impl InfoSchemaQuery {
         // Pre-load metadata for every table so we can resolve FK target
         // attnums by looking the referenced table back up. The map is
         // keyed on the bare name as written in the FK; the engine has
-        // already validated cross-tenant FKs are rejected.
+        // already validated cross-project FKs are rejected.
         let mut metas: std::collections::HashMap<String, crate::metadata::TableMetadata> =
             std::collections::HashMap::with_capacity(names.len());
         for name in &names {
-            let m = catalog.load_table(tenant, name).await?;
+            let m = catalog.load_table(project, name).await?;
             metas.insert(name.as_str().to_string(), m);
         }
 
@@ -704,7 +704,7 @@ impl InfoSchemaQuery {
                     conkeys: &mut Vec<String>,
                     confrelids: &mut Vec<i64>,
                     confkeys: &mut Vec<String>| {
-            let oid_key = format!("basin.pg_constraint:{tenant}:{}:{}", conrelid, &conname);
+            let oid_key = format!("basin.pg_constraint:{project}:{}:{}", conrelid, &conname);
             oids.push(fnv1a_64_to_positive_i64(oid_key.as_bytes()));
             connames.push(conname);
             connamespaces.push(namespace_oid);
@@ -717,7 +717,7 @@ impl InfoSchemaQuery {
 
         for name in &names {
             let meta = &metas[name.as_str()];
-            let relid = table_oid(tenant, name);
+            let relid = table_oid(project, name);
 
             // PRIMARY KEY (one row per table with a PK).
             if !meta.pk_columns.is_empty() {
@@ -757,7 +757,7 @@ impl InfoSchemaQuery {
                     .join(" ");
                 let ref_table = TableName::new(fk.ref_table.clone())
                     .map_err(|e| BasinError::internal(format!("FK ref_table {e}")))?;
-                let confrelid = table_oid(tenant, &ref_table);
+                let confrelid = table_oid(project, &ref_table);
                 let confkey = if let Some(ref_meta) = metas.get(&fk.ref_table) {
                     fk.ref_columns
                         .iter()
@@ -880,7 +880,7 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `information_schema.views` filtered to `tenant`.
+    /// Build `information_schema.views` filtered to `project`.
     ///
     /// Returns one row per:
     /// - Plain view registered via `CREATE VIEW … AS SELECT …`
@@ -888,10 +888,10 @@ impl InfoSchemaQuery {
     /// - Continuous materialized view (`CREATE MATERIALIZED VIEW … WITH
     ///   (basin.continuous, …)`) — same as before.
     ///
-    /// Cross-tenant leak is a P0 invariant: only APIs scoped to `tenant`
+    /// Cross-project leak is a P0 invariant: only APIs scoped to `project`
     /// are consulted.
-    pub async fn views(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    pub async fn views(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
 
         let mut catalogs: Vec<&str> = Vec::new();
         let mut schemas: Vec<&str> = Vec::new();
@@ -903,7 +903,7 @@ impl InfoSchemaQuery {
 
         // 1. Continuous materialized views (existing path).
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let Some(cv) = meta.continuous_aggregate.as_ref() else {
                 continue;
             };
@@ -917,7 +917,7 @@ impl InfoSchemaQuery {
         }
 
         // 2. Plain views registered via CREATE VIEW.
-        let plain_views = catalog.list_views(tenant).await;
+        let plain_views = catalog.list_views(project).await;
         for v in plain_views {
             catalogs.push(BASIN_CATALOG_NAME);
             schemas.push(DEFAULT_SCHEMA);
@@ -963,11 +963,11 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_views` filtered to `tenant`. One row per plain
+    /// Build `pg_catalog.pg_views` filtered to `project`. One row per plain
     /// view registered via `CREATE VIEW … AS SELECT …` plus one row per
     /// continuous materialized view.
-    pub async fn pg_views(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    pub async fn pg_views(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
 
         let mut schema_names: Vec<&str> = Vec::new();
         let mut view_names: Vec<String> = Vec::new();
@@ -976,7 +976,7 @@ impl InfoSchemaQuery {
 
         // Continuous materialized views.
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let Some(cv) = meta.continuous_aggregate.as_ref() else {
                 continue;
             };
@@ -987,7 +987,7 @@ impl InfoSchemaQuery {
         }
 
         // Plain views.
-        let plain_views = catalog.list_views(tenant).await;
+        let plain_views = catalog.list_views(project).await;
         for v in plain_views {
             schema_names.push(DEFAULT_SCHEMA);
             view_names.push(v.name.clone());
@@ -1008,8 +1008,8 @@ impl InfoSchemaQuery {
 
     /// Schema for `information_schema.schemata` rows.
     ///
-    /// v0.1 emits exactly one row per tenant (`"public"`), matching
-    /// the single-schema-per-tenant invariant the rest of the views
+    /// v0.1 emits exactly one row per project (`"public"`), matching
+    /// the single-schema-per-project invariant the rest of the views
     /// already encode (`pg_namespace`, `pg_class.relnamespace`,
     /// `information_schema.tables.table_schema`).
     ///
@@ -1032,9 +1032,9 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `information_schema.schemata` filtered to `tenant`. v0.1
+    /// Build `information_schema.schemata` filtered to `project`. v0.1
     /// emits exactly one row (`"public"`).
-    pub async fn schemata(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+    pub async fn schemata(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
         let schema = Self::schemata_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec![BASIN_CATALOG_NAME.to_string()])),
@@ -1052,7 +1052,7 @@ impl InfoSchemaQuery {
 
     /// Schema for `information_schema.table_constraints` rows.
     ///
-    /// One row per declared constraint visible to the calling tenant. v0.1
+    /// One row per declared constraint visible to the calling project. v0.1
     /// only persists `NOT NULL` constraints (carried by Arrow field
     /// nullability); `PRIMARY KEY`, `FOREIGN KEY`, `CHECK`, and `UNIQUE`
     /// are rejected at parse time today (see `basin_engine::ddl`) and so
@@ -1066,7 +1066,7 @@ impl InfoSchemaQuery {
     /// | constraint_name   | TEXT | derived (`<table>_<column>_not_null` for NOT NULL) |
     /// | table_catalog     | TEXT | always `"basin"`                                   |
     /// | table_schema      | TEXT | always `"public"`                                  |
-    /// | table_name        | TEXT | tenant-local table name                            |
+    /// | table_name        | TEXT | project-local table name                            |
     /// | constraint_type   | TEXT | `"NOT NULL"` / `"PRIMARY KEY"` / `"FOREIGN KEY"` / `"CHECK"` / `"UNIQUE"` |
     /// | is_deferrable     | TEXT | always `"NO"` in v0.1                              |
     /// | initially_deferred| TEXT | always `"NO"` in v0.1                              |
@@ -1149,23 +1149,23 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `information_schema.table_constraints` filtered to `tenant`.
+    /// Build `information_schema.table_constraints` filtered to `project`.
     ///
     /// v0.1 only emits `NOT NULL` constraint rows: one per non-nullable
-    /// column on each tenant-owned table. PK / FK / CHECK / UNIQUE are
+    /// column on each project-owned table. PK / FK / CHECK / UNIQUE are
     /// queued (the parser rejects them today; see `basin_engine::ddl`)
     /// and so contribute zero rows. The constraint name follows the
     /// `<table>_<column>_not_null` convention — pgwire-introspecting
     /// clients (PostgREST, pgAdmin) only need stable names within a
-    /// tenant, not PG-byte-identical ones.
+    /// project, not PG-byte-identical ones.
     ///
-    /// Cross-tenant leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `tenant`.
+    /// Cross-project leak is a P0 invariant: this only ever calls
+    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `project`.
     pub async fn table_constraints(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
 
         let mut constraint_catalogs: Vec<&str> = Vec::new();
         let mut constraint_schemas: Vec<&str> = Vec::new();
@@ -1178,7 +1178,7 @@ impl InfoSchemaQuery {
         let mut initially_deferreds: Vec<&str> = Vec::new();
 
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let mut push = |conname: String, ctype: &'static str| {
                 constraint_catalogs.push(BASIN_CATALOG_NAME);
                 constraint_schemas.push(DEFAULT_SCHEMA);
@@ -1233,7 +1233,7 @@ impl InfoSchemaQuery {
             .map_err(|e| BasinError::internal(format!("info_schema.table_constraints build: {e}")))
     }
 
-    /// Build `information_schema.key_column_usage` filtered to `tenant`.
+    /// Build `information_schema.key_column_usage` filtered to `project`.
     /// PG semantics: one row per column that participates in a UNIQUE /
     /// PRIMARY KEY / FOREIGN KEY constraint. NOT NULL is intentionally
     /// excluded — that's `table_constraints` territory.
@@ -1246,10 +1246,10 @@ impl InfoSchemaQuery {
     /// `position_in_unique_constraint` is set on FK rows to the matching
     /// position in the referenced table's PK; NULL elsewhere.
     ///
-    /// Cross-tenant leak is a P0 invariant: only [`Catalog::list_tables`]
-    /// / [`Catalog::load_table`] for `tenant`.
-    pub async fn key_column_usage(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    /// Cross-project leak is a P0 invariant: only [`Catalog::list_tables`]
+    /// / [`Catalog::load_table`] for `project`.
+    pub async fn key_column_usage(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
 
         let mut constraint_catalogs: Vec<&str> = Vec::new();
         let mut constraint_schemas: Vec<&str> = Vec::new();
@@ -1262,7 +1262,7 @@ impl InfoSchemaQuery {
         let mut position_in_unique: Vec<Option<i32>> = Vec::new();
 
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
 
             // PK columns.
             if !meta.pk_columns.is_empty() {
@@ -1320,16 +1320,16 @@ impl InfoSchemaQuery {
     ///
     /// Static catalog of the PG built-in types Basin's pgwire layer
     /// advertises. The row set is fixed (no user-defined types in v0.1 —
-    /// enums/domains are tracked separately) and shared across tenants;
-    /// `typnamespace` is the only per-tenant column (FNV-1a hash of
-    /// `(tenant, "pg_catalog")`). pgAdmin's column-detail query joins
+    /// enums/domains are tracked separately) and shared across projects;
+    /// `typnamespace` is the only per-project column (FNV-1a hash of
+    /// `(project, "pg_catalog")`). pgAdmin's column-detail query joins
     /// against this view to render PG type names.
     ///
     /// | column        | type    | notes                                     |
     /// |---------------|---------|-------------------------------------------|
     /// | oid           | BIGINT  | PG type OID (16=bool, 23=int4, 25=text…)  |
     /// | typname       | TEXT    | PG type name (`bool`, `int4`, `text`, …)  |
-    /// | typnamespace  | BIGINT  | hash of `(tenant, "pg_catalog")`          |
+    /// | typnamespace  | BIGINT  | hash of `(project, "pg_catalog")`          |
     /// | typtype       | TEXT    | `'b'` base type (all v0.1 entries)        |
     /// | typcategory   | TEXT    | PG single-letter category (`B`/`N`/`S`/…) |
     /// | typlen        | SMALLINT| length in bytes; `-1` for variable-length |
@@ -1347,13 +1347,13 @@ impl InfoSchemaQuery {
     }
 
     /// Build `pg_catalog.pg_type`. Row set is the static [`BASIN_PG_TYPES`]
-    /// table; `typnamespace` is hashed per-tenant against the
+    /// table; `typnamespace` is hashed per-project against the
     /// `"pg_catalog"` schema so a JOIN against `pg_namespace` works the
     /// same way as `pg_class.relnamespace` / `pg_proc.pronamespace`.
     /// `catalog` is unused for v0.1 (no user-defined types in pg_type yet)
     /// and held for signature stability against the v0.2 expansion that
-    /// will read tenant-defined enum / domain types.
-    pub async fn pg_type(_catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+    /// will read project-defined enum / domain types.
+    pub async fn pg_type(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
         let n = BASIN_PG_TYPES.len();
         let mut oids: Vec<i64> = Vec::with_capacity(n);
         let mut typnames: Vec<&'static str> = Vec::with_capacity(n);
@@ -1363,7 +1363,7 @@ impl InfoSchemaQuery {
         let mut typlens: Vec<i16> = Vec::with_capacity(n);
         let mut typbyvals: Vec<bool> = Vec::with_capacity(n);
 
-        let nsp = namespace_oid_for(tenant, PG_CATALOG_SCHEMA);
+        let nsp = namespace_oid_for(project, PG_CATALOG_SCHEMA);
 
         for (oid, typname, typtype, typcategory, typlen, typbyval) in BASIN_PG_TYPES {
             oids.push(*oid);
@@ -1390,7 +1390,7 @@ impl InfoSchemaQuery {
     }
 
     /// Build `information_schema.referential_constraints` filtered to
-    /// `tenant`. One row per FOREIGN KEY. `update_rule` / `delete_rule`
+    /// `project`. One row per FOREIGN KEY. `update_rule` / `delete_rule`
     /// reflect the FK's [`crate::metadata::RefAction`] mapped to PG's
     /// action strings (`"NO ACTION"` / `"CASCADE"`). `match_option` is
     /// always `"NONE"` — Basin doesn't model `MATCH PARTIAL` / `MATCH
@@ -1398,13 +1398,13 @@ impl InfoSchemaQuery {
     /// PK constraint (`<ref_table>_pkey`) since v0.1 only allows FKs
     /// against PKs.
     ///
-    /// Cross-tenant leak is a P0 invariant: only [`Catalog::list_tables`]
-    /// / [`Catalog::load_table`] for `tenant`.
+    /// Cross-project leak is a P0 invariant: only [`Catalog::list_tables`]
+    /// / [`Catalog::load_table`] for `project`.
     pub async fn referential_constraints(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
 
         let mut constraint_catalogs: Vec<&str> = Vec::new();
         let mut constraint_schemas: Vec<&str> = Vec::new();
@@ -1417,7 +1417,7 @@ impl InfoSchemaQuery {
         let mut delete_rules: Vec<&'static str> = Vec::new();
 
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             for fk in &meta.foreign_keys {
                 let ref_table = TableName::new(fk.ref_table.clone())
                     .map_err(|e| BasinError::internal(format!("FK ref_table {e}")))?;
@@ -1455,7 +1455,7 @@ impl InfoSchemaQuery {
     /// Records dependency edges between catalog objects. v0.1 surfaces:
     ///
     /// - Continuous matview → source-table edges (one row per CV when the
-    ///   source table is owned by the same tenant).
+    ///   source table is owned by the same project).
     /// - Function → return type / argument type edges (one row per arg
     ///   plus one row per non-zero return type, per registered function).
     ///
@@ -1484,11 +1484,11 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_depend` filtered to `tenant`.
+    /// Build `pg_catalog.pg_depend` filtered to `project`.
     ///
-    /// Cross-tenant leak is a P0 invariant: only `list_tables` /
-    /// `load_table` / `list_sql_functions` for `tenant` are consulted.
-    pub async fn pg_depend(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
+    /// Cross-project leak is a P0 invariant: only `list_tables` /
+    /// `load_table` / `list_sql_functions` for `project` are consulted.
+    pub async fn pg_depend(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
         let mut classids: Vec<i64> = Vec::new();
         let mut objids: Vec<i64> = Vec::new();
         let mut objsubids: Vec<i32> = Vec::new();
@@ -1497,20 +1497,20 @@ impl InfoSchemaQuery {
         let mut refobjsubids: Vec<i32> = Vec::new();
         let mut deptypes: Vec<&str> = Vec::new();
 
-        let pg_class_classid = catalog_table_oid(tenant, "pg_class");
-        let pg_proc_classid = catalog_table_oid(tenant, "pg_proc");
-        let pg_type_classid = catalog_table_oid(tenant, "pg_type");
+        let pg_class_classid = catalog_table_oid(project, "pg_class");
+        let pg_proc_classid = catalog_table_oid(project, "pg_proc");
+        let pg_type_classid = catalog_table_oid(project, "pg_type");
 
-        // CV → source-table edges: walk the tenant's tables, surface one
+        // CV → source-table edges: walk the project's tables, surface one
         // row per matview whose `source_table` resolves to a sibling table.
         // Tables in `list_tables` are valid identifiers, so reparsing the
         // CV's `source_table` only fails for malformed metadata (would
         // never have round-tripped through DDL); we silently skip those.
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
         let known: std::collections::HashSet<String> =
             names.iter().map(|n| n.as_str().to_string()).collect();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let Some(cv) = meta.continuous_aggregate.as_ref() else {
                 continue;
             };
@@ -1521,10 +1521,10 @@ impl InfoSchemaQuery {
                 continue;
             };
             classids.push(pg_class_classid);
-            objids.push(table_oid(tenant, name));
+            objids.push(table_oid(project, name));
             objsubids.push(0);
             refclassids.push(pg_class_classid);
-            refobjids.push(table_oid(tenant, &src));
+            refobjids.push(table_oid(project, &src));
             refobjsubids.push(0);
             deptypes.push(DEPTYPE_NORMAL);
         }
@@ -1532,9 +1532,9 @@ impl InfoSchemaQuery {
         // Function → return-type / arg-type edges. Procedures don't have
         // a return type and `Table` returns aren't yet round-tripped to a
         // single OID, so we restrict to `Scalar` returns.
-        let funcs = catalog.list_sql_functions(tenant).await;
+        let funcs = catalog.list_sql_functions(project).await;
         for f in &funcs {
-            let fn_oid = routine_oid(tenant, &f.name);
+            let fn_oid = routine_oid(project, &f.name);
             // Return type: only emit when scalar with a positive OID.
             let ret_oid = return_type_oid(&f.return_type);
             if ret_oid > 0 {
@@ -1574,16 +1574,16 @@ impl InfoSchemaQuery {
 
     /// Schema for `pg_catalog.pg_authid` rows.
     ///
-    /// Basin uses tenants, not PG-style roles. v0.1 surfaces exactly one
-    /// row per tenant — the calling tenant — so admin scripts that JOIN
+    /// Basin uses projects, not PG-style roles. v0.1 surfaces exactly one
+    /// row per project — the calling project — so admin scripts that JOIN
     /// against `pg_authid` to render an "owner" column resolve. Cross-
-    /// tenant role enumeration is not exposed: each tenant only ever
+    /// project role enumeration is not exposed: each project only ever
     /// sees its own row.
     ///
     /// | column          | type    | notes                                  |
     /// |-----------------|---------|----------------------------------------|
-    /// | oid             | BIGINT  | FNV-1a of `(tenant)`                   |
-    /// | rolname         | TEXT    | tenant id rendered as text             |
+    /// | oid             | BIGINT  | FNV-1a of `(project)`                   |
+    /// | rolname         | TEXT    | project id rendered as text             |
     /// | rolsuper        | BOOL    | always false                           |
     /// | rolinherit      | BOOL    | always true                            |
     /// | rolcreaterole   | BOOL    | always false                           |
@@ -1609,12 +1609,12 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_authid` filtered to `tenant`. Always exactly
-    /// one row (the calling tenant); cross-tenant role enumeration is
+    /// Build `pg_catalog.pg_authid` filtered to `project`. Always exactly
+    /// one row (the calling project); cross-project role enumeration is
     /// intentionally absent.
-    pub async fn pg_authid(_catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let oid = role_oid_for(tenant);
-        let rolname = tenant.to_string();
+    pub async fn pg_authid(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let oid = role_oid_for(project);
+        let rolname = project.to_string();
         let schema = Self::pg_authid_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![oid])),
@@ -1634,7 +1634,7 @@ impl InfoSchemaQuery {
     }
 
     // -----------------------------------------------------------------------
-    // pg_catalog.pg_database  (one row — the current tenant's logical db)
+    // pg_catalog.pg_database  (one row — the current project's logical db)
     // -----------------------------------------------------------------------
 
     pub fn pg_database_schema() -> Arc<Schema> {
@@ -1651,9 +1651,9 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn pg_database(_catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{tenant}").as_bytes());
-        let dba_oid = role_oid_for(tenant);
+    pub async fn pg_database(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{project}").as_bytes());
+        let dba_oid = role_oid_for(project);
         let schema = Self::pg_database_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![db_oid])),
@@ -1690,9 +1690,9 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn pg_roles(_catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let oid = role_oid_for(tenant);
-        let rolname = tenant.to_string();
+    pub async fn pg_roles(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let oid = role_oid_for(project);
+        let rolname = project.to_string();
         let schema = Self::pg_roles_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![oid])),
@@ -1725,17 +1725,17 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Returns one row per index in the tenant's tables. v0.1 only carries
+    /// Returns one row per index in the project's tables. v0.1 only carries
     /// PRIMARY KEY constraints; each PK produces one `<table>_pkey` row.
-    pub async fn pg_indexes(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    pub async fn pg_indexes(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
         let mut schemas: Vec<&str> = Vec::new();
         let mut tablenames: Vec<String> = Vec::new();
         let mut indexnames: Vec<String> = Vec::new();
         let mut tablespaces: Vec<Option<String>> = Vec::new();
         let mut indexdefs: Vec<Option<String>> = Vec::new();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             if !meta.pk_columns.is_empty() {
                 schemas.push(DEFAULT_SCHEMA);
                 tablenames.push(name.as_str().to_string());
@@ -1778,8 +1778,8 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn pg_tables(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+    pub async fn pg_tables(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
         let mut schemas: Vec<&str> = Vec::new();
         let mut tablenames: Vec<String> = Vec::new();
         let mut owners: Vec<String> = Vec::new();
@@ -1788,9 +1788,9 @@ impl InfoSchemaQuery {
         let mut hasrules: Vec<bool> = Vec::new();
         let mut hastriggers: Vec<bool> = Vec::new();
         let mut rowsecurity: Vec<bool> = Vec::new();
-        let owner = tenant.to_string();
+        let owner = project.to_string();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             // Only base tables (not matviews) appear in pg_tables
             if meta.continuous_aggregate.is_none() {
                 schemas.push(DEFAULT_SCHEMA);
@@ -1844,7 +1844,7 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn pg_settings(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+    pub async fn pg_settings(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
         // A minimal GUC list that ORMs and admin tools commonly probe.
         // Tuple: (name, setting, unit, category, short_desc, context, vartype, source, min, max, boot, reset)
         let rows: &[(&str, &str, Option<&str>, &str, &str, &str, &str, &str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
@@ -1934,7 +1934,7 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn pg_extension(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+    pub async fn pg_extension(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
         let schema = Self::pg_extension_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(Vec::<i64>::new())),
@@ -1963,7 +1963,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_description(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_description_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2008,9 +2008,9 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_user_tables(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
         let mut relids: Vec<i64> = Vec::new();
         let mut schemas: Vec<&str> = Vec::new();
         let mut relnames: Vec<String> = Vec::new();
@@ -2024,12 +2024,12 @@ impl InfoSchemaQuery {
         let mut n_live: Vec<i64> = Vec::new();
         let mut n_dead: Vec<i64> = Vec::new();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let row_count = meta
                 .current()
                 .map(|s| s.data_files.iter().map(|f| f.row_count).sum::<u64>())
                 .unwrap_or(0) as i64;
-            relids.push(table_oid(tenant, name));
+            relids.push(table_oid(project, name));
             schemas.push(DEFAULT_SCHEMA);
             relnames.push(name.as_str().to_string());
             seq_scans.push(0);
@@ -2092,9 +2092,9 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_user_indexes(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
         let mut relids: Vec<i64> = Vec::new();
         let mut indexrelids: Vec<i64> = Vec::new();
         let mut schemas: Vec<&str> = Vec::new();
@@ -2104,13 +2104,13 @@ impl InfoSchemaQuery {
         let mut idx_tup_reads: Vec<i64> = Vec::new();
         let mut idx_tup_fetchs: Vec<i64> = Vec::new();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             if !meta.pk_columns.is_empty() {
                 let idx_name = format!("{}_pkey", name.as_str());
                 let idx_oid = fnv1a_64_to_positive_i64(
-                    format!("basin.pg_index:{tenant}:{idx_name}").as_bytes(),
+                    format!("basin.pg_index:{project}:{idx_name}").as_bytes(),
                 );
-                relids.push(table_oid(tenant, name));
+                relids.push(table_oid(project, name));
                 indexrelids.push(idx_oid);
                 schemas.push(DEFAULT_SCHEMA);
                 relnames.push(name.as_str().to_string());
@@ -2159,7 +2159,7 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn pg_locks(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+    pub async fn pg_locks(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
         let schema = Self::pg_locks_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
@@ -2217,17 +2217,17 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_activity(
         _catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{tenant}").as_bytes());
-        let role_oid = role_oid_for(tenant);
+        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{project}").as_bytes());
+        let role_oid = role_oid_for(project);
         let schema = Self::pg_stat_activity_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![Some(db_oid)])),
             Arc::new(StringArray::from(vec![Some("basin")])),
             Arc::new(Int32Array::from(vec![0i32])),
             Arc::new(Int64Array::from(vec![Some(role_oid)])),
-            Arc::new(StringArray::from(vec![Some(tenant.to_string())])),
+            Arc::new(StringArray::from(vec![Some(project.to_string())])),
             Arc::new(StringArray::from(vec![Some("basin")])),
             Arc::new(StringArray::from(vec![None::<String>])), // client_addr
             Arc::new(StringArray::from(vec![None::<String>])), // client_hostname
@@ -2249,7 +2249,7 @@ impl InfoSchemaQuery {
     }
 
     // -----------------------------------------------------------------------
-    // pg_catalog.pg_stat_database  (one row for the tenant's logical database)
+    // pg_catalog.pg_stat_database  (one row for the project's logical database)
     // -----------------------------------------------------------------------
 
     pub fn pg_stat_database_schema() -> Arc<Schema> {
@@ -2278,9 +2278,9 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_database(
         _catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{tenant}").as_bytes());
+        let db_oid = fnv1a_64_to_positive_i64(format!("basin.pg_database:{project}").as_bytes());
         let schema = Self::pg_stat_database_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![Some(db_oid)])),
@@ -2329,7 +2329,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_bgwriter(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         // Single all-zero row (bgwriter concept does not exist in basin)
         let schema = Self::pg_stat_bgwriter_schema();
@@ -2377,7 +2377,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_replication(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_replication_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2420,7 +2420,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_archiver(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_archiver_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2460,7 +2460,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_wal_receiver(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_wal_receiver_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2501,7 +2501,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_subscription(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_subscription_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2536,7 +2536,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_user_functions(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_user_functions_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2573,7 +2573,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_progress_vacuum(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_progress_vacuum_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2617,7 +2617,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_progress_create_index(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_progress_create_index_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2661,7 +2661,7 @@ impl InfoSchemaQuery {
 
     pub async fn pg_stat_progress_analyze(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::pg_stat_progress_analyze_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -2696,15 +2696,15 @@ impl InfoSchemaQuery {
 
     pub async fn check_constraints(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
         let mut constraint_catalogs: Vec<&str> = Vec::new();
         let mut constraint_schemas: Vec<&str> = Vec::new();
         let mut constraint_names: Vec<String> = Vec::new();
         let mut check_clauses: Vec<String> = Vec::new();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let arrow_schema = &meta.schema;
             for field in arrow_schema.fields() {
                 // Basin encodes CHECK constraints as field metadata
@@ -2751,7 +2751,7 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn triggers(_catalog: &dyn Catalog, _tenant: &TenantId) -> Result<RecordBatch> {
+    pub async fn triggers(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
         let schema = Self::triggers_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(Vec::<&str>::new())),
@@ -2792,8 +2792,8 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn sequences(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let seqs = catalog.list_sequences(tenant).await;
+    pub async fn sequences(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let seqs = catalog.list_sequences(project).await;
         let mut seq_catalogs: Vec<&str> = Vec::new();
         let mut seq_schemas: Vec<&str> = Vec::new();
         let mut seq_names: Vec<String> = Vec::new();
@@ -2862,8 +2862,8 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn domains(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let doms = catalog.list_domains(tenant).await;
+    pub async fn domains(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let doms = catalog.list_domains(project).await;
         let mut dom_catalogs: Vec<&str> = Vec::new();
         let mut dom_schemas: Vec<&str> = Vec::new();
         let mut dom_names: Vec<String> = Vec::new();
@@ -2943,9 +2943,9 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    pub async fn parameters(catalog: &dyn Catalog, tenant: &TenantId) -> Result<RecordBatch> {
-        let functions = catalog.list_sql_functions(tenant).await;
-        let procedures = catalog.list_procedures(tenant).await;
+    pub async fn parameters(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let functions = catalog.list_sql_functions(project).await;
+        let procedures = catalog.list_procedures(project).await;
         let mut specific_catalogs: Vec<&str> = Vec::new();
         let mut specific_schemas: Vec<&str> = Vec::new();
         let mut specific_names: Vec<String> = Vec::new();
@@ -3037,7 +3037,7 @@ impl InfoSchemaQuery {
     }
 
     // -----------------------------------------------------------------------
-    // information_schema.role_table_grants  (empty/calling-tenant-only)
+    // information_schema.role_table_grants  (empty/calling-project-only)
     // -----------------------------------------------------------------------
 
     pub fn role_table_grants_schema() -> Arc<Schema> {
@@ -3054,7 +3054,7 @@ impl InfoSchemaQuery {
     }
 
     // -----------------------------------------------------------------------
-    // information_schema.usage_privileges  (always-allow for calling tenant)
+    // information_schema.usage_privileges  (always-allow for calling project)
     // -----------------------------------------------------------------------
 
     pub fn usage_privileges_schema() -> Arc<Schema> {
@@ -3072,7 +3072,7 @@ impl InfoSchemaQuery {
 
     pub async fn usage_privileges(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         // Basin does not enforce SQL GRANT; return empty (no explicit grants).
         let schema = Self::usage_privileges_schema();
@@ -3109,7 +3109,7 @@ impl InfoSchemaQuery {
 
     pub async fn role_table_grants(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::role_table_grants_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3128,11 +3128,11 @@ impl InfoSchemaQuery {
 
     pub async fn table_privileges(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        // Return one row per privilege type per table owned by the tenant.
-        let names = catalog.list_tables(tenant).await?;
-        let grantee = tenant.to_string();
+        // Return one row per privilege type per table owned by the project.
+        let names = catalog.list_tables(project).await?;
+        let grantee = project.to_string();
         let privs = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
         let mut grantors: Vec<Option<String>> = Vec::new();
         let mut grantees: Vec<String> = Vec::new();
@@ -3188,7 +3188,7 @@ impl InfoSchemaQuery {
 
     pub async fn column_privileges(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         // Basin does not track per-column grants.
         let schema = Self::column_privileges_schema();
@@ -3223,11 +3223,11 @@ impl InfoSchemaQuery {
 
     pub async fn user_defined_types(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
         // Include enum types and domains as user-defined types
-        let enums = catalog.list_enum_types(tenant).await;
-        let doms = catalog.list_domains(tenant).await;
+        let enums = catalog.list_enum_types(project).await;
+        let doms = catalog.list_domains(project).await;
         let mut udt_catalogs: Vec<&str> = Vec::new();
         let mut udt_schemas: Vec<&str> = Vec::new();
         let mut udt_names: Vec<String> = Vec::new();
@@ -3298,9 +3298,9 @@ impl InfoSchemaQuery {
 
     pub async fn column_domain_usage(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
         let mut domain_catalogs: Vec<&str> = Vec::new();
         let mut domain_schemas: Vec<&str> = Vec::new();
         let mut domain_names: Vec<String> = Vec::new();
@@ -3309,7 +3309,7 @@ impl InfoSchemaQuery {
         let mut table_names: Vec<String> = Vec::new();
         let mut column_names: Vec<String> = Vec::new();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let arrow_schema = &meta.schema;
             for field in arrow_schema.fields() {
                 if let Some(domain_name) = field.metadata().get("BASIN_DOMAIN") {
@@ -3355,10 +3355,10 @@ impl InfoSchemaQuery {
 
     pub async fn column_udt_usage(
         catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
         // Reuse column_domain_usage data — domain columns also count as UDT usage
-        let names = catalog.list_tables(tenant).await?;
+        let names = catalog.list_tables(project).await?;
         let mut udt_catalogs: Vec<&str> = Vec::new();
         let mut udt_schemas: Vec<&str> = Vec::new();
         let mut udt_names: Vec<String> = Vec::new();
@@ -3367,7 +3367,7 @@ impl InfoSchemaQuery {
         let mut table_names: Vec<String> = Vec::new();
         let mut column_names: Vec<String> = Vec::new();
         for name in &names {
-            let meta = catalog.load_table(tenant, name).await?;
+            let meta = catalog.load_table(project, name).await?;
             let arrow_schema = &meta.schema;
             for field in arrow_schema.fields() {
                 if let Some(domain_name) = field.metadata().get("BASIN_DOMAIN") {
@@ -3397,7 +3397,7 @@ impl InfoSchemaQuery {
 
     pub async fn role_column_grants(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::role_column_grants_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3435,7 +3435,7 @@ impl InfoSchemaQuery {
 
     pub async fn role_routine_grants(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::role_routine_grants_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3468,9 +3468,9 @@ impl InfoSchemaQuery {
 
     pub async fn applicable_roles(
         _catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let rolname = tenant.to_string();
+        let rolname = project.to_string();
         let schema = Self::applicable_roles_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec![rolname.as_str()])),
@@ -3493,9 +3493,9 @@ impl InfoSchemaQuery {
 
     pub async fn enabled_roles(
         _catalog: &dyn Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<RecordBatch> {
-        let rolname = tenant.to_string();
+        let rolname = project.to_string();
         let schema = Self::enabled_roles_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec![rolname.as_str()])),
@@ -3520,7 +3520,7 @@ impl InfoSchemaQuery {
 
     pub async fn foreign_data_wrappers(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::foreign_data_wrappers_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3545,7 +3545,7 @@ impl InfoSchemaQuery {
 
     pub async fn foreign_data_wrapper_options(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::foreign_data_wrapper_options_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3572,7 +3572,7 @@ impl InfoSchemaQuery {
 
     pub async fn foreign_servers(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::foreign_servers_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3599,7 +3599,7 @@ impl InfoSchemaQuery {
 
     pub async fn foreign_server_options(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::foreign_server_options_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3624,7 +3624,7 @@ impl InfoSchemaQuery {
 
     pub async fn foreign_tables(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::foreign_tables_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3650,7 +3650,7 @@ impl InfoSchemaQuery {
 
     pub async fn foreign_table_options(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::foreign_table_options_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3674,7 +3674,7 @@ impl InfoSchemaQuery {
 
     pub async fn user_mappings(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::user_mappings_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3698,7 +3698,7 @@ impl InfoSchemaQuery {
 
     pub async fn user_mapping_options(
         _catalog: &dyn Catalog,
-        _tenant: &TenantId,
+        _project: &ProjectId,
     ) -> Result<RecordBatch> {
         let schema = Self::user_mapping_options_schema();
         let columns: Vec<ArrayRef> = vec![
@@ -3718,16 +3718,16 @@ impl InfoSchemaQuery {
 /// the connection is bound to. Basin is a single logical database in v0.1.
 const BASIN_CATALOG_NAME: &str = "basin";
 
-/// Schema name returned for every Basin table. v0.1 maps a tenant to
+/// Schema name returned for every Basin table. v0.1 maps a project to
 /// exactly one schema, named `"public"` to match the PG default and let
 /// PostgREST / pgAdmin discover tables without configuration. Multi-schema
-/// per tenant lands in v0.2; until then `relnamespace` and `table_schema`
+/// per project lands in v0.2; until then `relnamespace` and `table_schema`
 /// always carry this value.
 const DEFAULT_SCHEMA: &str = "public";
 
 /// Synthetic schema name used as the namespace for `pg_catalog.pg_type`
-/// rows. Every tenant's pg_type rows nominally live in the `pg_catalog`
-/// namespace; the value participates only in the per-tenant FNV hash and
+/// rows. Every project's pg_type rows nominally live in the `pg_catalog`
+/// namespace; the value participates only in the per-project FNV hash and
 /// never surfaces directly in any query result.
 const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 
@@ -3882,8 +3882,8 @@ const DEPTYPE_NORMAL: &str = "n";
 /// Synthesise the `constraint_name` for a NOT NULL constraint on
 /// `(table, column)`. PG invents constraint names internally too — the
 /// only durable contract is that the name is stable across queries
-/// against the same `(tenant, table, column)` and unique within the
-/// tenant's `table_constraints` rows. The convention is documented in
+/// against the same `(project, table, column)` and unique within the
+/// project's `table_constraints` rows. The convention is documented in
 /// [`InfoSchemaQuery::table_constraints`] so the engine-side test can
 /// assert against it.
 fn not_null_constraint_name(table: &TableName, column: &str) -> String {
@@ -3936,7 +3936,7 @@ fn pg_type_for_field(field: &Field) -> (&'static str, &'static str) {
 
 /// Map an Arrow [`Field`] to the Postgres type OID `pg_catalog.pg_attribute`
 /// reports in `atttypid`. Mirrors the OIDs `basin-router::types` advertises
-/// in `RowDescription` so a tenant joining `pg_attribute` against the wire
+/// in `RowDescription` so a project joining `pg_attribute` against the wire
 /// layer's `RowDescription.type_id` sees consistent values.
 ///
 /// OID reference: <https://www.postgresql.org/docs/current/catalog-pg-type.html>.
@@ -3969,22 +3969,22 @@ fn pg_type_oid_for_field(field: &Field) -> i64 {
     }
 }
 
-/// Stable 64-bit oid for a `(tenant, table)` pair.
+/// Stable 64-bit oid for a `(project, table)` pair.
 ///
 /// Hashing scheme: FNV-1a 64-bit over the byte sequence
-/// `b"basin.pg_class:" || tenant.to_string() || ":" || table.as_str()`,
+/// `b"basin.pg_class:" || project.to_string() || ":" || table.as_str()`,
 /// then masked to 63 bits to fit a positive `i64` (PG's `oid` is
 /// unsigned 32-bit; we widen to `i64` because Basin's identifier space
-/// is per-tenant and a 32-bit hash collides too cheaply across the full
+/// is per-project and a 32-bit hash collides too cheaply across the full
 /// fleet). Properties:
 ///
-/// - **Stable**: the same `(tenant, table)` always hashes to the same
+/// - **Stable**: the same `(project, table)` always hashes to the same
 ///   oid across process restarts and across in-memory / Postgres backends.
-/// - **Per-tenant disjoint by construction**: the tenant ULID is part of
-///   the input, so two tenants with identically-named tables get
-///   different oids. Cross-tenant oid collisions are a per-table
+/// - **Per-project disjoint by construction**: the project ULID is part of
+///   the input, so two projects with identically-named tables get
+///   different oids. Cross-project oid collisions are a per-table
 ///   birthday problem in 2^63 space (negligible at any plausible scale).
-/// - **Same-tenant collision**: 2^63 hash space; same-tenant collisions
+/// - **Same-project collision**: 2^63 hash space; same-project collisions
 ///   would surface as a `pg_class` row pair sharing an oid. Not a
 ///   correctness concern for the views (PostgREST doesn't dedupe by oid)
 ///   but worth flagging for the v0.2 catalog-side oid registry which
@@ -3993,46 +3993,46 @@ fn pg_type_oid_for_field(field: &Field) -> i64 {
 /// This is intentionally _not_ persistence-versioned: changing the input
 /// format here changes every oid downstream clients have cached, so the
 /// constant prefix (`b"basin.pg_class:"`) is load-bearing for stability.
-fn table_oid(tenant: &TenantId, table: &TableName) -> i64 {
-    let key = format!("basin.pg_class:{tenant}:{}", table.as_str());
+fn table_oid(project: &ProjectId, table: &TableName) -> i64 {
+    let key = format!("basin.pg_class:{project}:{}", table.as_str());
     fnv1a_64_to_positive_i64(key.as_bytes())
 }
 
-/// Stable oid for a tenant-scoped namespace. v0.1 has one namespace per
-/// tenant (`"public"`); the function takes the schema name explicitly so
+/// Stable oid for a project-scoped namespace. v0.1 has one namespace per
+/// project (`"public"`); the function takes the schema name explicitly so
 /// the v0.2 multi-schema upgrade is a non-breaking signature extension.
-fn namespace_oid_for(tenant: &TenantId, schema: &str) -> i64 {
-    let key = format!("basin.pg_namespace:{tenant}:{schema}");
+fn namespace_oid_for(project: &ProjectId, schema: &str) -> i64 {
+    let key = format!("basin.pg_namespace:{project}:{schema}");
     fnv1a_64_to_positive_i64(key.as_bytes())
 }
 
-/// Stable 64-bit oid for a `(tenant, routine_name)` pair. Mirrors
+/// Stable 64-bit oid for a `(project, routine_name)` pair. Mirrors
 /// [`table_oid`] but uses a distinct prefix so a function and a table
-/// with the same name in the same tenant do not collide on oid.
-fn routine_oid(tenant: &TenantId, name: &str) -> i64 {
-    let key = format!("basin.pg_proc:{tenant}:{name}");
+/// with the same name in the same project do not collide on oid.
+fn routine_oid(project: &ProjectId, name: &str) -> i64 {
+    let key = format!("basin.pg_proc:{project}:{name}");
     fnv1a_64_to_positive_i64(key.as_bytes())
 }
 
 /// Stable synthetic OID for one of the system catalog tables themselves
-/// (`pg_class`, `pg_proc`, `pg_type`, …) within a tenant's namespace.
+/// (`pg_class`, `pg_proc`, `pg_type`, …) within a project's namespace.
 /// Used as `classid` / `refclassid` in `pg_catalog.pg_depend` rows.
 ///
 /// Reuses the same FNV-1a-then-positive-i64 hash family as the rest of
 /// the M-starter so the resulting OIDs are stable across process restarts
-/// and disjoint between tenants. The catalog-table label (`"pg_class"`,
+/// and disjoint between projects. The catalog-table label (`"pg_class"`,
 /// `"pg_proc"`, `"pg_type"`) participates in the hash so the three
-/// labels never collide on OID for the same tenant.
-fn catalog_table_oid(tenant: &TenantId, table: &str) -> i64 {
-    let key = format!("basin.pg_catalog_table:{tenant}:{table}");
+/// labels never collide on OID for the same project.
+fn catalog_table_oid(project: &ProjectId, table: &str) -> i64 {
+    let key = format!("basin.pg_catalog_table:{project}:{table}");
     fnv1a_64_to_positive_i64(key.as_bytes())
 }
 
-/// Stable role OID for `pg_authid`. v0.1 maps each tenant to exactly one
-/// "role" row, so the OID is a per-tenant FNV-1a hash with a distinct
+/// Stable role OID for `pg_authid`. v0.1 maps each project to exactly one
+/// "role" row, so the OID is a per-project FNV-1a hash with a distinct
 /// prefix from [`table_oid`] / [`routine_oid`] / [`namespace_oid_for`].
-fn role_oid_for(tenant: &TenantId) -> i64 {
-    let key = format!("basin.pg_authid:{tenant}");
+fn role_oid_for(project: &ProjectId) -> i64 {
+    let key = format!("basin.pg_authid:{project}");
     fnv1a_64_to_positive_i64(key.as_bytes())
 }
 

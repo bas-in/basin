@@ -1,4 +1,4 @@
-# 0013 — Auth per-tenant schema (remove loopback pgwire)
+# 0013 — Auth per-project schema (remove loopback pgwire)
 
 - **Status:** Accepted, 2026-05-11
 - **Tags:** auth, architecture, loopback-removal, storage
@@ -7,49 +7,49 @@
 ## Context
 
 basin-auth v0.1 (ADR 0005) stores identity state in a reserved internal
-tenant (`INTERNAL_AUTH_TENANT_ID`) accessed via a loopback pgwire TCP
+project (`INTERNAL_AUTH_PROJECT_ID`) accessed via a loopback pgwire TCP
 connection back to basin-server's own listener. This creates a circular
 startup dependency: auth needs pgwire running to connect, but pgwire needs
-auth to resolve tenant credentials. The workaround — `DeferredAuthResolver`,
+auth to resolve project credentials. The workaround — `DeferredAuthResolver`,
 `OnceLock`, and a 5-second `wait_for_pgwire_accept` polling loop — is
 fragile and adds ~400 lines of bootstrap ceremony.
 
 Supabase solves an identical problem by giving every project its own `auth`
 schema inside that project's Postgres database. GoTrue connects directly to
 that database with a service role — never through PostgREST or any
-application-level API layer. The tenant is known from the connection target
+application-level API layer. The project is known from the connection target
 (project URL), not discovered via a cross-project lookup.
 
 ## Decision
 
 Auth tables (`basin_auth_users`, `basin_auth_refresh_tokens`,
-`basin_auth_email_tokens`, etc.) live in each tenant's own storage
+`basin_auth_email_tokens`, etc.) live in each project's own storage
 namespace under the `basin_auth` schema prefix, provisioned when the
-tenant is created. The auth service accesses them via
-`Engine::open_session_as(tenant_id, "basin_auth_service")` — in-process,
+project is created. The auth service accesses them via
+`Engine::open_session_as(project_id, "basin_auth_service")` — in-process,
 no TCP connection.
 
 **Self-routing credentials.** `pgwire_user` changes format from
-`tenant_<random_hex>` to `{tenant_id}_{random_hex}` (26-char ULID prefix).
-Parsing the first 26 characters gives the tenant_id directly; the auth
-service opens that tenant's schema without any global lookup table. API
-keys embed the same tenant prefix. JWT validation is unchanged (tenant_id
+`project_<random_hex>` to `{project_id}_{random_hex}` (26-char ULID prefix).
+Parsing the first 26 characters gives the project_id directly; the auth
+service opens that project's schema without any global lookup table. API
+keys embed the same project prefix. JWT validation is unchanged (project_id
 already in claims).
 
 **`AuthStore` trait.** `basin-auth` defines a high-level `AuthStore` trait
 and a `PostgresAuthStore` implementation (for operators who want auth state
 on external Postgres). `EngineAuthStore` is defined in `basin-server`,
-wrapping `TenantSession`, and passed into `AuthService::with_store`. This
+wrapping `ProjectSession`, and passed into `AuthService::with_store`. This
 keeps basin-auth free of a basin-engine dependency.
 
 **Startup order becomes:** engine → auth (with EngineAuthStore) →
-StackedTenantResolver → pgwire. No deferred slots, no polling.
+StackedProjectResolver → pgwire. No deferred slots, no polling.
 
 ## Consequences
 
 **Positive**
 - Eliminates the loopback circular dependency and all its workarounds.
-- Auth state replicates with tenant storage automatically — no separate
+- Auth state replicates with project storage automatically — no separate
   replication path needed.
 - Open source deployments need zero external dependencies for auth.
 - `BASIN_AUTH_CATALOG_DSN` becomes an optional operator escape hatch

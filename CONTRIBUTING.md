@@ -41,11 +41,11 @@ CI runs the same on push and PR — see [`.github/workflows/ci.yml`](./.github/w
 
 ## Code style
 
-- **Per-tenant cost discipline is load-bearing.** Anything that scales
-  with the number of tenants in memory (`HashMap<TenantId, _>` at the
-  top level, per-tenant background tasks, per-tenant connection pools)
+- **Per-project cost discipline is load-bearing.** Anything that scales
+  with the number of projects in memory (`HashMap<ProjectId, _>` at the
+  top level, per-project background tasks, per-project connection pools)
   needs an explicit justification. The standard pattern is a single
-  shared resource keyed on tenant ID, with cheap per-tenant primitives
+  shared resource keyed on project ID, with cheap per-project primitives
   (atomic counters, sequence numbers, semaphores).
 
 - **Scope discipline.** Bug fixes don't need surrounding cleanup; feature

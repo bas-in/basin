@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
 use basin_storage::{PageCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
@@ -91,7 +91,7 @@ fn make_batch(start: i64) -> RecordBatch {
 /// silently inflating its denominator.
 async fn point_query(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     id: i64,
 ) -> Result<(), String> {
@@ -100,7 +100,7 @@ async fn point_query(
         ..Default::default()
     };
     let mut stream = storage
-        .read(tenant, table, opts)
+        .read(project, table, opts)
         .await
         .map_err(|e| format!("read({id}): {e}"))?;
     let mut rows = 0usize;
@@ -121,7 +121,7 @@ async fn viability_page_cache() {
     let object_store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(bucket_dir.path()).unwrap());
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
@@ -138,7 +138,7 @@ async fn viability_page_cache() {
     for b in 0..BATCHES {
         let batch = make_batch((b * ROWS_PER_BATCH) as i64);
         writer_storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .expect("write");
     }
@@ -161,9 +161,9 @@ async fn viability_page_cache() {
     // ---- cold pass: cache fresh, working-set ids are misses ------------
     let cold_dist: LatencyDistribution = run_workload(&cfg, TOTAL_ROWS, |id| {
         let storage = &storage;
-        let tenant = &tenant;
+        let project = &project;
         let table = &table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
 
@@ -181,9 +181,9 @@ async fn viability_page_cache() {
     // from the same pool again so coverage is effectively complete).
     let warm_dist: LatencyDistribution = run_workload(&cfg, TOTAL_ROWS, |id| {
         let storage = &storage;
-        let tenant = &tenant;
+        let project = &project;
         let table = &table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
 

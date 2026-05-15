@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_real_postgres_compare, CompareMetric, WhichWins};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
@@ -147,7 +147,7 @@ async fn s3_compare_postgres() {
         prefix: run_prefix.clone(),
     };
 
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema = format!("basin_compare_s3_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema.clone(),
@@ -260,8 +260,8 @@ async fn s3_compare_postgres() {
         catalog: catalog.clone(),
         shard: Some(shard),
     });
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
     sess.execute(
         "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
     )

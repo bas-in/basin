@@ -15,7 +15,7 @@
 //! What we explicitly do NOT test here:
 //! - Snapshot pinning (`AS OF`) — v0.2.
 //! - S3 path — v0.2.
-//! - Tenant-isolation under load (covered by `viability_isolation_under_load`).
+//! - Project-isolation under load (covered by `viability_isolation_under_load`).
 
 #![allow(clippy::print_stdout)]
 
@@ -26,8 +26,8 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_analytical::{AnalyticalConfig, AnalyticalEngine};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
@@ -42,7 +42,7 @@ const GROUPS: i64 = 16;
 // dominated by ~25 ms of connection + view setup. Five iterations
 // amortise that cost while still being a realistic shape: a dashboard
 // polling every few seconds calls back-to-back. The brief recognises
-// this with the v0.2 "cache sessions per tenant" plan.
+// this with the v0.2 "cache sessions per project" plan.
 const ITERATIONS: u32 = 5;
 // Bar: DuckDB should win by >= 1.5x on this aggregate. See module doc above.
 const SPEEDUP_BAR: f64 = 1.5;
@@ -130,13 +130,13 @@ async fn viability_analytical() {
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
 
     // Catalog-side: create the table so both engines can resolve it.
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
@@ -147,13 +147,13 @@ async fn viability_analytical() {
     for f in 0..FILES {
         let batch = build_batch(f * ROWS_PER_FILE, ROWS_PER_FILE);
         let df = storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
-        let meta = catalog.load_table(&tenant, &table).await.unwrap();
+        let meta = catalog.load_table(&project, &table).await.unwrap();
         catalog
             .append_data_files(
-                &tenant,
+                &project,
                 &table,
                 meta.current_snapshot,
                 vec![DataFileRef {
@@ -171,7 +171,7 @@ async fn viability_analytical() {
     // ever changes its writer to split across multiple files per batch the
     // bar would still be valid but the "10 files" claim in the report
     // wouldn't be, and we'd want to know.
-    let files = storage.list_data_files(&tenant, &table).await.unwrap();
+    let files = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(
         files.len(),
         FILES as usize,
@@ -196,7 +196,7 @@ async fn viability_analytical() {
         catalog: catalog.clone(),
         shard: None,
     });
-    let sess: TenantSession = engine.open_session(tenant).await.unwrap();
+    let sess: ProjectSession = engine.open_session(project).await.unwrap();
     // One warmup to make the comparison fair: both engines pay listing /
     // metadata costs; we don't want the first-call cold cache to dominate.
     let _ = sess.execute(sql).await.unwrap();
@@ -220,11 +220,11 @@ async fn viability_analytical() {
     })
     .unwrap();
     // Same warmup courtesy.
-    let _ = analytical.query(&tenant, sql).await.unwrap();
+    let _ = analytical.query(&project, sql).await.unwrap();
     let mut analytical_batches = Vec::new();
     let t0 = Instant::now();
     for _ in 0..ITERATIONS {
-        analytical_batches = analytical.query(&tenant, sql).await.unwrap();
+        analytical_batches = analytical.query(&project, sql).await.unwrap();
     }
     let analytical_ms = t0.elapsed().as_secs_f64() * 1000.0 / ITERATIONS as f64;
     let analytical_agg = collect_aggregate(&analytical_batches);

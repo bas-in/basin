@@ -25,7 +25,7 @@
 //! Sign-out (`signout()`) revokes a single jti without writing a sentinel
 //! — there's no peer "newer" jti to imply leak.
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -42,7 +42,7 @@ fn blanket_key(user_id: Uuid) -> String {
 /// rotation / signout / blanket-revoke.
 pub(crate) async fn issue_refresh(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     user_id: Uuid,
     email: &str,
     now: DateTime<Utc>,
@@ -50,7 +50,7 @@ pub(crate) async fn issue_refresh(
     let (jwt, _jti, expires_at) =
         inner
             .jwt
-            .issue_refresh(tenant, user_id, email, now, inner.cfg.refresh_ttl)?;
+            .issue_refresh(project, user_id, email, now, inner.cfg.refresh_ttl)?;
     Ok((jwt, expires_at))
 }
 
@@ -127,7 +127,7 @@ pub(crate) async fn refresh(inner: &Inner, raw: &str) -> Result<Tokens> {
         return Err(BasinError::InvalidIdent("refresh token revoked".into()));
     }
 
-    issue_tokens_for(inner, &claims.tenant_id, claims.user_id, &claims.email).await
+    issue_tokens_for(inner, &claims.project_id, claims.user_id, &claims.email).await
 }
 
 pub(crate) async fn signout(inner: &Inner, raw: &str) -> Result<()> {

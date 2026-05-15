@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -68,7 +68,7 @@ fn col_i64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
 async fn create_function_round_trip() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -104,7 +104,7 @@ async fn create_function_round_trip() {
 async fn create_or_replace_function_handled() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -151,7 +151,7 @@ async fn create_or_replace_function_handled() {
 async fn drop_function_works() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -179,7 +179,7 @@ async fn drop_function_works() {
 async fn drop_function_if_exists_idempotent() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // DROP IF EXISTS on a non-existent function returns Ok.
     sess.execute("DROP FUNCTION IF EXISTS not_there(BIGINT)")
@@ -205,7 +205,7 @@ async fn drop_function_if_exists_idempotent() {
 async fn alter_function_rename() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -246,7 +246,7 @@ async fn alter_function_rename() {
 async fn language_other_than_sql_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute(
@@ -275,7 +275,7 @@ async fn language_other_than_sql_rejected() {
 async fn recursive_function_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute(
@@ -301,7 +301,7 @@ async fn mutual_recursion_caught_at_create_function() {
     // first SELECT that exercises the inliner.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE FUNCTION a(x BIGINT) RETURNS BIGINT LANGUAGE sql \
@@ -332,7 +332,7 @@ async fn mutual_recursion_caught_at_create_function() {
 async fn body_must_be_select() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -353,14 +353,14 @@ async fn body_must_be_select() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
-    // Two tenants share the same catalog + storage backend; a function
-    // registered for tenant A must be invisible to tenant B.
+async fn cross_project_isolation() {
+    // Two projects share the same catalog + storage backend; a function
+    // registered for project A must be invisible to project B.
     let dir = TempDir::new().unwrap();
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     let eng = shared_engine(&dir, catalog);
-    let sess_a = eng.open_session(TenantId::new()).await.unwrap();
-    let sess_b = eng.open_session(TenantId::new()).await.unwrap();
+    let sess_a = eng.open_session(ProjectId::new()).await.unwrap();
+    let sess_b = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess_a
         .execute("CREATE TABLE t (x BIGINT NOT NULL)")
@@ -375,7 +375,7 @@ async fn cross_tenant_isolation() {
         .await
         .unwrap();
 
-    // Tenant A sees the inlined call.
+    // Project A sees the inlined call.
     let res = sess_a
         .execute("SELECT add_one(x) AS y FROM t")
         .await
@@ -386,8 +386,8 @@ async fn cross_tenant_isolation() {
     };
     assert_eq!(col_i64(&batches, "y"), vec![8]);
 
-    // Tenant B has its own table and no `add_one` function; the call
-    // must surface as a planner error, not silently inline tenant A's
+    // Project B has its own table and no `add_one` function; the call
+    // must surface as a planner error, not silently inline project A's
     // body.
     sess_b
         .execute("CREATE TABLE t (x BIGINT NOT NULL)")
@@ -401,6 +401,6 @@ async fn cross_tenant_isolation() {
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
         msg.contains("add_one") || msg.contains("not") || msg.contains("invalid"),
-        "tenant B should not resolve add_one, got: {err}"
+        "project B should not resolve add_one, got: {err}"
     );
 }

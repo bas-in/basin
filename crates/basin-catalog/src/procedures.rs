@@ -1,16 +1,16 @@
-//! Per-tenant `CREATE PROCEDURE … LANGUAGE sql` catalog.
+//! Per-project `CREATE PROCEDURE … LANGUAGE sql` catalog.
 //!
 //! Customers will write
 //!
 //! ```sql
-//! CREATE PROCEDURE archive_tenant(tid TEXT) LANGUAGE sql AS $$
-//!     INSERT INTO archive SELECT * FROM events WHERE tenant_id = tid;
-//!     DELETE FROM events WHERE tenant_id = tid;
+//! CREATE PROCEDURE archive_project(tid TEXT) LANGUAGE sql AS $$
+//!     INSERT INTO archive SELECT * FROM events WHERE project_id = tid;
+//!     DELETE FROM events WHERE project_id = tid;
 //! $$;
 //!
-//! CALL archive_tenant('01HABCD…');
+//! CALL archive_project('01HABCD…');
 //!
-//! DROP PROCEDURE archive_tenant(TEXT);
+//! DROP PROCEDURE archive_project(TEXT);
 //! ```
 //!
 //! and the engine looks up the registered body, substitutes call-site
@@ -22,9 +22,9 @@
 //! single-`SELECT`. We reuse [`crate::functions::SqlFunctionArg`] for
 //! the parameter list because the substitution surface is identical.
 //!
-//! The catalog is a single shared `HashMap<(TenantId, String),
+//! The catalog is a single shared `HashMap<(ProjectId, String),
 //! SqlProcedureDef>` — same shape rule as every other typed-DDL row in
-//! this crate — so per-tenant cost stays `O(bytes)` with no per-tenant
+//! this crate — so per-project cost stays `O(bytes)` with no per-project
 //! heavy resource.
 //!
 //! Validation at registration:
@@ -48,17 +48,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 use crate::functions::SqlFunctionArg;
 
 /// Catalog row for a `CREATE PROCEDURE … LANGUAGE sql`. Stored
-/// per-tenant; two tenants registering the same procedure name are
+/// per-project; two projects registering the same procedure name are
 /// independent rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlProcedureDef {
-    pub tenant: TenantId,
-    /// Unqualified procedure name within the tenant. Validated to be a
+    pub project: ProjectId,
+    /// Unqualified procedure name within the project. Validated to be a
     /// SQL identifier at registration.
     pub name: String,
     /// Positional parameter list. We reuse `SqlFunctionArg` because the
@@ -189,7 +189,7 @@ mod tests {
 
     fn def(args: Vec<(&str, SqlArgType)>, body: &str) -> SqlProcedureDef {
         SqlProcedureDef {
-            tenant: TenantId::new(),
+            project: ProjectId::new(),
             name: "p".into(),
             args: args
                 .into_iter()

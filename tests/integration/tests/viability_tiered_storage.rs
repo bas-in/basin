@@ -7,7 +7,7 @@
 //!   - `total_rows_visible == 20`
 //!
 //! What we test:
-//! 1. Two Parquet files land for the same `(tenant, table)`: one with rows
+//! 1. Two Parquet files land for the same `(project, table)`: one with rows
 //!    timestamped 100 days ago, one with rows timestamped 10 days ago. Both
 //!    initially live under `tables/<t>/data/...`.
 //! 2. The catalog gets a tier policy with `cold_after_seconds = 30 days`
@@ -35,7 +35,7 @@ use std::time::Duration;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{ReadOptions, Storage, StorageConfig};
 use chrono::Utc;
@@ -128,13 +128,13 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
         wal.clone(),
     ));
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
-    // The shard's tier sweep needs a resident partition for this tenant so
-    // it knows the tenant exists. We get that for free by opening a handle.
-    let _handle = shard.get(&tenant, &part).await.unwrap();
+    // The shard's tier sweep needs a resident partition for this project so
+    // it knows the project exists. We get that for free by opening a handle.
+    let _handle = shard.get(&project, &part).await.unwrap();
 
     // ----------------------------------------------------------------------
     // Seed the catalog: create the table, then write two distinct Parquet
@@ -144,16 +144,16 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
     let old_batch = build_batch(0, 10, 100);
     let new_batch = build_batch(1000, 10, 10);
     catalog
-        .create_table(&tenant, &table, old_batch.schema().as_ref())
+        .create_table(&project, &table, old_batch.schema().as_ref())
         .await
         .unwrap();
 
     let old_file = storage
-        .write_batch(&tenant, &table, &part, &old_batch)
+        .write_batch(&project, &table, &part, &old_batch)
         .await
         .unwrap();
     let new_file = storage
-        .write_batch(&tenant, &table, &part, &new_batch)
+        .write_batch(&project, &table, &part, &new_batch)
         .await
         .unwrap();
 
@@ -175,7 +175,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
     let mut current_snap = basin_catalog::SnapshotId::GENESIS;
     let after_old = catalog
         .append_data_files(
-            &tenant,
+            &project,
             &table,
             current_snap,
             vec![basin_catalog::DataFileRef {
@@ -190,7 +190,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
     current_snap = after_old.current_snapshot;
     let _after_new = catalog
         .append_data_files(
-            &tenant,
+            &project,
             &table,
             current_snap,
             vec![basin_catalog::DataFileRef {
@@ -211,7 +211,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
     // ----------------------------------------------------------------------
     catalog
         .set_tier_policy(
-            &tenant,
+            &project,
             &table,
             Some(30 * SECS_PER_DAY as u64),
             Some("ts".to_string()),
@@ -220,7 +220,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
         .unwrap();
 
     // Pre-sweep sanity: list_data_files reports both as Hot.
-    let pre = storage.list_data_files(&tenant, &table).await.unwrap();
+    let pre = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(
         pre.len(),
         2,
@@ -245,7 +245,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
     // ----------------------------------------------------------------------
     // Assertions.
     // ----------------------------------------------------------------------
-    let post = storage.list_data_files(&tenant, &table).await.unwrap();
+    let post = storage.list_data_files(&project, &table).await.unwrap();
     let cold_files: Vec<_> = post
         .iter()
         .filter(|f| matches!(f.tier, basin_storage::Tier::Cold))
@@ -303,7 +303,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
 
     // SELECT * across tiers — Storage::read transparently includes both.
     let stream = storage
-        .read(&tenant, &table, ReadOptions::default())
+        .read(&project, &table, ReadOptions::default())
         .await
         .unwrap();
     let batches: Vec<RecordBatch> = stream
@@ -321,7 +321,7 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
     // Idempotency: running the sweep again is a no-op (the cold file gets
     // skipped, the still-hot file is below the threshold).
     shard.run_tiering_sweep().await.unwrap();
-    let post2 = storage.list_data_files(&tenant, &table).await.unwrap();
+    let post2 = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(
         post2.len(),
         2,

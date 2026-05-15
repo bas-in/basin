@@ -17,7 +17,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
@@ -82,25 +82,25 @@ async fn s3_viability_analytical_routing() {
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
 
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
     for f in 0..FILES {
         let batch = build_batch(f * ROWS_PER_FILE, ROWS_PER_FILE);
         let df = storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
-        let meta = catalog.load_table(&tenant, &table).await.unwrap();
+        let meta = catalog.load_table(&project, &table).await.unwrap();
         catalog
             .append_data_files(
-                &tenant,
+                &project,
                 &table,
                 meta.current_snapshot,
                 vec![DataFileRef {
@@ -113,7 +113,7 @@ async fn s3_viability_analytical_routing() {
             .await
             .unwrap();
     }
-    let files = storage.list_data_files(&tenant, &table).await.unwrap();
+    let files = storage.list_data_files(&project, &table).await.unwrap();
     assert_eq!(
         files.len(),
         FILES as usize,
@@ -130,7 +130,7 @@ async fn s3_viability_analytical_routing() {
         catalog: catalog.clone(),
         shard: None,
     });
-    let oltp_sess = oltp_engine.open_session(tenant).await.unwrap();
+    let oltp_sess = oltp_engine.open_session(project).await.unwrap();
     let _ = oltp_sess.execute(sql).await.unwrap();
     let mut total_rows = 0usize;
     let t0 = Instant::now();

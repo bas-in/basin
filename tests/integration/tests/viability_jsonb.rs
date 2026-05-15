@@ -28,7 +28,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Int64Array, LargeBinaryArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
@@ -82,8 +82,8 @@ async fn viability_jsonb() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     // Step 1 — CREATE TABLE with a JSONB column. JSONB has no dedicated
     // Arrow `DataType`, so the engine plants a `BASIN_TYPE=JSONB` marker on
@@ -94,7 +94,7 @@ async fn viability_jsonb() {
 
     // Catalog sanity: the column lands as LargeBinary with the JSONB tag.
     let table = TableName::new("docs").unwrap();
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     let payload_field = meta
         .schema
         .field_with_name("payload")
@@ -284,5 +284,5 @@ async fn viability_jsonb() {
 // Indexing on JSONB paths is the v0.3 step: Parquet doesn't have a native
 // JSONB row group statistic, so the cheap-and-cheerful first cut is to
 // project a few hot path expressions out as separate columns at INSERT
-// time (`payload->>'tenant_id'` mat-view-style) and let the existing
+// time (`payload->>'project_id'` mat-view-style) and let the existing
 // bloom-filter / row-group min-max prune those.

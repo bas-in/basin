@@ -1,75 +1,75 @@
-//! Per-tenant noisy-tenant detector.
+//! Per-project noisy-project detector.
 //!
 //! ## What this is
 //!
-//! A cooperative throttle hint: every time a tenant runs an RPC-ish unit of
-//! work (currently: one [`TenantSession::execute`](crate::TenantSession::execute)),
-//! we bump a tiny per-tenant rate estimator. If the rate stays above a
-//! threshold for "long enough", we tag the tenant *noisy*. The engine reads
+//! A cooperative throttle hint: every time a project runs an RPC-ish unit of
+//! work (currently: one [`ProjectSession::execute`](crate::ProjectSession::execute)),
+//! we bump a tiny per-project rate estimator. If the rate stays above a
+//! threshold for "long enough", we tag the project *noisy*. The engine reads
 //! that bit when constructing the next session and downshifts DataFusion's
-//! `target_partitions` from `num_cpus` to `1` for that tenant — its bulk
+//! `target_partitions` from `num_cpus` to `1` for that project — its bulk
 //! scans stop fanning out parallel range reads at full strength, which is
 //! what was previously saturating the shared object-store concurrency budget.
 //!
 //! This is intentionally a hint, not a hard cap. The fair-share scheduler
 //! over in `basin-storage::scheduler` is the real fairness mechanism; this
-//! module just lets a heavy tenant self-cap so the scheduler has less work
+//! module just lets a heavy project self-cap so the scheduler has less work
 //! to do.
 //!
 //! ## Cost
 //!
 //! [`NoisyState`] is sized to ~32 bytes on a 64-bit target (one `u64`
 //! timestamp, one `u64` last-quiet-since timestamp, one `f32` rate, one
-//! `bool` is_noisy + padding). A `HashMap<TenantId, NoisyState>` entry adds
-//! the usual hashbrown bucket overhead (~16 bytes amortised), so per-tenant
+//! `bool` is_noisy + padding). A `HashMap<ProjectId, NoisyState>` entry adds
+//! the usual hashbrown bucket overhead (~16 bytes amortised), so per-project
 //! footprint is ~48-64 bytes including the map slot. Lazy-allocated on the
-//! first `record_query` call for a given tenant.
+//! first `record_query` call for a given project.
 //!
 //! ## Concurrency
 //!
 //! One `RwLock<HashMap<...>>` for the whole detector. `record_query` and
 //! `is_noisy` both take the read lock for the lookup; only first-time
 //! insertion takes the write lock. Lock is never held across `await` — this
-//! file is sync top-to-bottom. Update of a tenant's `NoisyState` happens
+//! file is sync top-to-bottom. Update of a project's `NoisyState` happens
 //! while holding the read lock plus a per-entry `Mutex`, so two queries from
-//! the same tenant don't lose updates.
+//! the same project don't lose updates.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
-/// Sustained rate (queries / sec) above which a tenant is considered noisy.
+/// Sustained rate (queries / sec) above which a project is considered noisy.
 /// Picked to be well above any plausible OLTP workload (a few QPS) but
 /// reachable by a single bulk-scan worker on this PoC (~10-30 scans/sec on a
 /// quiet local filesystem). The bar in `scaling_noisy_neighbor` runs four
 /// parallel full-scan tasks against a 5M-row table; sustained rate there is
-/// roughly 6-12 scans/sec/tenant on the test machine, which puts the noisy
-/// tenant comfortably above this floor while leaving the quiet tenant (200
+/// roughly 6-12 scans/sec/project on the test machine, which puts the noisy
+/// project comfortably above this floor while leaving the quiet project (200
 /// point queries over ~1s) below it.
 pub(crate) const NOISY_RATE_THRESHOLD_QPS: f32 = 8.0;
 
-/// How long a tenant must sustain the threshold before the noisy bit flips
+/// How long a project must sustain the threshold before the noisy bit flips
 /// on. We require the rate to clear the bar at the moment of `is_noisy`
 /// inspection, AND the rate-EWMA to have been integrating for at least this
 /// many seconds — otherwise a single burst (e.g. a cold-start refresh) would
-/// classify a tenant as noisy.
+/// classify a project as noisy.
 const NOISY_ARM_SECS: f32 = 2.0;
 
 /// Once flipped on, the noisy bit only flips back off after the rate has
 /// stayed below the threshold for at least this many seconds. Picked at 5s
 /// per the design brief — long enough that a bulk job winding down doesn't
-/// re-toggle on each lull, short enough that a tenant that genuinely went
+/// re-toggle on each lull, short enough that a project that genuinely went
 /// quiet recovers its parallel read budget within "feels-instant" time.
 const NOISY_DISARM_SECS: f32 = 5.0;
 
-/// EWMA half-life for the per-tenant rate estimate. With a 1s half-life the
+/// EWMA half-life for the per-project rate estimate. With a 1s half-life the
 /// rate tracks the last ~2 seconds of traffic, which matches the "sustained
 /// over the last 2s" wording of the design.
 const RATE_HALF_LIFE_SECS: f32 = 1.0;
 
-/// Per-tenant state. Sized to ~32 bytes on a 64-bit target.
+/// Per-project state. Sized to ~32 bytes on a 64-bit target.
 ///
 /// Fields are pub(crate) only so the unit tests in this file can poke at
 /// them; nothing outside this module should mutate them directly.
@@ -79,11 +79,11 @@ struct NoisyState {
     /// `rate` between updates.
     last_update_ms: u64,
     /// Engine-clock millis at the most recent transition into the
-    /// "below-threshold" regime. `is_noisy` flips off only after the tenant
+    /// "below-threshold" regime. `is_noisy` flips off only after the project
     /// has been below threshold for `NOISY_DISARM_SECS` since this point.
     last_quiet_since_ms: u64,
     /// Engine-clock millis at the *first* `record_query` we ever saw for
-    /// this tenant. Used to enforce the "must have been integrating for
+    /// this project. Used to enforce the "must have been integrating for
     /// NOISY_ARM_SECS before going noisy" guard.
     first_seen_ms: u64,
     /// EWMA-decayed rate in queries-per-second.
@@ -124,7 +124,7 @@ impl NoisyState {
 
     /// Re-evaluate `is_noisy` against the current `rate_qps`. Idempotent;
     /// safe to call from `is_noisy()` paths that haven't recorded a new
-    /// query but want a fresh decision (e.g. a tenant that went quiet a
+    /// query but want a fresh decision (e.g. a project that went quiet a
     /// while ago should be reported non-noisy without first issuing a
     /// query).
     fn refresh_noisy(&mut self, now_ms: u64) {
@@ -159,15 +159,15 @@ impl NoisyState {
     }
 }
 
-/// Per-tenant noisy-tenant detector. Cheap to construct; lazy-allocates one
-/// `NoisyState` per tenant on first `record_query`.
+/// Per-project noisy-project detector. Cheap to construct; lazy-allocates one
+/// `NoisyState` per project on first `record_query`.
 pub(crate) struct NoisyDetector {
-    /// `RwLock` because the steady-state path (record_query for a tenant
+    /// `RwLock` because the steady-state path (record_query for a project
     /// that's already in the map) only needs the read lock plus per-entry
-    /// `Mutex` to serialise two concurrent queries from the same tenant.
+    /// `Mutex` to serialise two concurrent queries from the same project.
     /// First-time insertion takes the write lock; that's at most O(active
-    /// tenants) across the lifetime of the engine.
-    states: RwLock<HashMap<TenantId, Mutex<NoisyState>>>,
+    /// projects) across the lifetime of the engine.
+    states: RwLock<HashMap<ProjectId, Mutex<NoisyState>>>,
     /// Reference clock. We use `Instant` rather than `SystemTime` so wall
     /// clock skew can't affect detection.
     started: Instant,
@@ -185,10 +185,10 @@ impl NoisyDetector {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// Bump `tenant`'s rate by one event. O(1) on the steady-state path
+    /// Bump `project`'s rate by one event. O(1) on the steady-state path
     /// (HashMap probe + per-entry Mutex). Lazy-allocates a `NoisyState` on
-    /// first call for a tenant.
-    pub(crate) fn record_query(&self, tenant: &TenantId) {
+    /// first call for a project.
+    pub(crate) fn record_query(&self, project: &ProjectId) {
         let now = self.now_ms();
         // Fast path: read lock + per-entry mutex.
         {
@@ -196,8 +196,8 @@ impl NoisyDetector {
                 .states
                 .read()
                 .expect("noisy detector states lock poisoned");
-            if let Some(state) = map.get(tenant) {
-                let mut s = state.lock().expect("noisy detector tenant state poisoned");
+            if let Some(state) = map.get(project) {
+                let mut s = state.lock().expect("noisy detector project state poisoned");
                 s.record(now);
                 return;
             }
@@ -209,33 +209,33 @@ impl NoisyDetector {
             .write()
             .expect("noisy detector states lock poisoned");
         let entry = map
-            .entry(*tenant)
+            .entry(*project)
             .or_insert_with(|| Mutex::new(NoisyState::new(now)));
-        let mut s = entry.lock().expect("noisy detector tenant state poisoned");
+        let mut s = entry.lock().expect("noisy detector project state poisoned");
         s.record(now);
     }
 
-    /// O(1) noisy-bit lookup. Returns `false` for tenants we've never seen
+    /// O(1) noisy-bit lookup. Returns `false` for projects we've never seen
     /// (the lazy-allocate happens on `record_query`, not here).
-    pub(crate) fn is_noisy(&self, tenant: &TenantId) -> bool {
+    pub(crate) fn is_noisy(&self, project: &ProjectId) -> bool {
         let now = self.now_ms();
         let map = self
             .states
             .read()
             .expect("noisy detector states lock poisoned");
-        let Some(state) = map.get(tenant) else {
+        let Some(state) = map.get(project) else {
             return false;
         };
-        let mut s = state.lock().expect("noisy detector tenant state poisoned");
+        let mut s = state.lock().expect("noisy detector project state poisoned");
         // Refresh the noisy bit against `now` even if no query was just
-        // recorded — otherwise a tenant that went quiet a while ago would
+        // recorded — otherwise a project that went quiet a while ago would
         // stay tagged noisy until its next record_query, defeating the
         // 5-second disarm window.
         s.refresh_noisy(now);
         s.is_noisy
     }
 
-    /// Test-only: drop all per-tenant state. Used by the unit tests below
+    /// Test-only: drop all per-project state. Used by the unit tests below
     /// to keep cases independent.
     #[cfg(test)]
     fn clear(&self) {
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_tenant_never_noisy() {
+    fn quiet_project_never_noisy() {
         let mut s = NoisyState::new(0);
         // 1 query/sec for 30s — well below the 8 qps bar.
         for i in 1..=30 {
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn noisy_tenant_disarms_after_quiet_window() {
+    fn noisy_project_disarms_after_quiet_window() {
         let mut s = NoisyState::new(0);
         // Arm: 20 qps for 5 seconds.
         let mut t_ms: u64 = 0;
@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn noisy_tenant_stays_noisy_within_quiet_window() {
+    fn noisy_project_stays_noisy_within_quiet_window() {
         let mut s = NoisyState::new(0);
         let mut t_ms: u64 = 0;
         for _ in 0..(20 * 5) {
@@ -348,19 +348,19 @@ mod tests {
     }
 
     #[test]
-    fn detector_returns_false_for_unseen_tenant() {
+    fn detector_returns_false_for_unseen_project() {
         let det = NoisyDetector::new();
-        let t = TenantId::new();
+        let t = ProjectId::new();
         assert!(!det.is_noisy(&t));
     }
 
     #[test]
-    fn detector_per_tenant_isolation() {
-        // Two tenants: one noisy, one quiet. The quiet one's `is_noisy`
+    fn detector_per_project_isolation() {
+        // Two projects: one noisy, one quiet. The quiet one's `is_noisy`
         // must stay false even when the noisy one trips its bit.
         let det = NoisyDetector::new();
-        let noisy = TenantId::new();
-        let quiet = TenantId::new();
+        let noisy = ProjectId::new();
+        let quiet = ProjectId::new();
 
         // Manually inject a noisy state for `noisy` so we don't depend on
         // wall-clock pacing inside this test.
@@ -381,10 +381,10 @@ mod tests {
         // `record_query` on `noisy` so its `last_quiet_since_ms` updates
         // to a recent point, and by reading immediately.
         det.record_query(&noisy);
-        assert!(det.is_noisy(&noisy), "noisy tenant should report noisy");
+        assert!(det.is_noisy(&noisy), "noisy project should report noisy");
         assert!(
             !det.is_noisy(&quiet),
-            "quiet tenant must not be tagged noisy"
+            "quiet project must not be tagged noisy"
         );
 
         det.clear();

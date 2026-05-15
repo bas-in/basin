@@ -1,10 +1,10 @@
-//! Scaling card: tenant-deletion time vs file count, Basin vs Postgres.
+//! Scaling card: project-deletion time vs file count, Basin vs Postgres.
 //!
 //! At small N, PG wins: a `DROP SCHEMA CASCADE` over a single 100K-row
 //! table is one heap unlink + a few catalog rows, dominated by
 //! transaction commit. As N grows, `DROP SCHEMA CASCADE` walks every
 //! row × every index × every FK and has to vacuum; Basin's
-//! `Storage::delete_tenant` is a bulk DELETE of the catalog file set
+//! `Storage::delete_project` is a bulk DELETE of the catalog file set
 //! plus a single `drop_namespace`. The slope difference shows up as a
 //! crossover somewhere along the file-count axis.
 //!
@@ -27,7 +27,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -104,9 +104,9 @@ impl Drop for SchemaGuard {
 }
 
 async fn measure_basin_ms(files: usize) -> f64 {
-    // Setup: write `files` Parquet files for a fresh tenant, register them
+    // Setup: write `files` Parquet files for a fresh project, register them
     // with an in-memory catalog. Setup time is NOT included in the timed
-    // window; only `Storage::delete_tenant` is.
+    // window; only `Storage::delete_project` is.
     let dir = TempDir::new().unwrap();
     let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
 
@@ -120,12 +120,12 @@ async fn measure_basin_ms(files: usize) -> f64 {
     });
 
     let catalog = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
@@ -134,7 +134,7 @@ async fn measure_basin_ms(files: usize) -> f64 {
         let start = (i * ROWS_PER_FILE) as i64;
         let batch = build_batch(start, ROWS_PER_FILE);
         let f = setup_storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
         written.push(DataFileRef {
@@ -145,13 +145,13 @@ async fn measure_basin_ms(files: usize) -> f64 {
         });
     }
     catalog
-        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .append_data_files(&project, &table, SnapshotId::GENESIS, written)
         .await
         .unwrap();
 
     // Reset caches for measurement clarity: build a fresh `Storage` with
     // no caches against the same backing dir. Same wire path, no warm-cache
-    // cheat. Matches the convention `viability_tenant_deletion.rs` uses.
+    // cheat. Matches the convention `viability_project_deletion.rs` uses.
     drop(setup_storage);
     let storage = Storage::new(StorageConfig {
         object_store: fs.clone(),
@@ -162,9 +162,9 @@ async fn measure_basin_ms(files: usize) -> f64 {
 
     let started = Instant::now();
     let _deleted = storage
-        .delete_tenant(catalog.as_ref(), &tenant)
+        .delete_project(catalog.as_ref(), &project)
         .await
-        .expect("delete_tenant");
+        .expect("delete_project");
     started.elapsed().as_secs_f64() * 1000.0
 }
 
@@ -173,7 +173,7 @@ async fn measure_basin_ms(files: usize) -> f64 {
 /// drop-schema wall clock.
 async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
     let total_rows = files * ROWS_PER_FILE;
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema_name = format!("basin_scaling_del_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema_name.clone(),
@@ -211,11 +211,11 @@ async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scaling_tenant_deletion_at_scale() {
+async fn scaling_project_deletion_at_scale() {
     let pg_conn = try_pg_connect().await;
     let pg_skipped = pg_conn.is_none();
     if pg_skipped {
-        println!("[SCALING tenant_deletion_at_scale] postgres unavailable: basin-only run");
+        println!("[SCALING project_deletion_at_scale] postgres unavailable: basin-only run");
     }
 
     struct Row {
@@ -232,7 +232,7 @@ async fn scaling_tenant_deletion_at_scale() {
             None => 0.0,
         };
         println!(
-            "[SCALING tenant_deletion_at_scale] files={n:>6} basin={basin_ms:>9.2}ms \
+            "[SCALING project_deletion_at_scale] files={n:>6} basin={basin_ms:>9.2}ms \
              postgres={postgres_ms:>9.2}ms"
         );
         rows.push(Row {
@@ -276,7 +276,7 @@ async fn scaling_tenant_deletion_at_scale() {
         (false, None) => "none in sweep".to_string(),
     };
     println!(
-        "[SCALING tenant_deletion_at_scale] crossover={crossover_label} \
+        "[SCALING project_deletion_at_scale] crossover={crossover_label} \
          (bar <= {BAR_CROSSOVER}) {}",
         if pass { "PASS" } else { "FAIL" }
     );
@@ -314,16 +314,16 @@ async fn scaling_tenant_deletion_at_scale() {
     };
 
     report_scaling(
-        "tenant_deletion_at_scale",
-        "Tenant deletion at scale (Basin vs Postgres)",
-        "Basin's tenant teardown is a bulk catalog DELETE plus a single \
+        "project_deletion_at_scale",
+        "Project deletion at scale (Basin vs Postgres)",
+        "Basin's project teardown is a bulk catalog DELETE plus a single \
          drop_namespace; PG's DROP SCHEMA CASCADE walks every row and \
          index. Basin's slope is structurally flatter, so it overtakes \
          PG as the file count grows.",
         pass,
         AxisSpec {
             key: "file_count".into(),
-            label: "files per tenant".into(),
+            label: "files per project".into(),
         },
         vec![
             SeriesSpec {

@@ -2,7 +2,7 @@
 //! follow-up views: `pg_catalog.pg_index`, `pg_catalog.pg_constraint`,
 //! `information_schema.views`, and `information_schema.schemata`.
 //!
-//! Each test opens a `TenantSession` and runs SQL through the same
+//! Each test opens a `ProjectSession` and runs SQL through the same
 //! `execute()` entry point a pgwire connection would hit. The asserts
 //! cover:
 //!
@@ -12,15 +12,15 @@
 //!   materialized views created via `CREATE MATERIALIZED VIEW ... WITH
 //!   (basin.continuous, ...)`.
 //! - SELECTs against information_schema.schemata return exactly one row
-//!   per tenant with `schema_name = 'public'`.
-//! - Cross-tenant isolation: A's matview is invisible to B.
+//!   per project with `schema_name = 'public'`.
+//! - Cross-project isolation: A's matview is invisible to B.
 
 use std::sync::Arc;
 
 use arrow_array::{Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -64,7 +64,7 @@ fn total_rows(batches: &[arrow_array::RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -75,7 +75,7 @@ async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> 
 async fn select_pg_index_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -90,7 +90,7 @@ async fn select_pg_index_routes() {
 async fn select_pg_constraint_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await
@@ -109,7 +109,7 @@ async fn select_pg_constraint_routes() {
 async fn select_information_schema_views_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // Create a source table + a continuous matview over it. The matview
     // must show up in information_schema.views.
@@ -154,7 +154,7 @@ async fn select_information_schema_views_routes() {
 async fn select_information_schema_schemata_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let batches = rows(
         &sess,
@@ -173,15 +173,15 @@ async fn select_information_schema_schemata_routes() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_views_at_select() {
+async fn cross_project_isolation_views_at_select() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
-    // Tenant A creates a continuous matview.
+    // Project A creates a continuous matview.
     sa.execute("CREATE TABLE events (bucket BIGINT NOT NULL, n BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -196,7 +196,7 @@ async fn cross_tenant_isolation_views_at_select() {
     .await
     .unwrap();
 
-    // Tenant B creates a plain table only — no matview.
+    // Project B creates a plain table only — no matview.
     sb.execute("CREATE TABLE plain_b (x BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -220,10 +220,10 @@ async fn cross_tenant_isolation_views_at_select() {
     assert_eq!(names_a, vec!["secret_mv".to_string()]);
     assert!(
         names_b.is_empty(),
-        "tenant B leaked tenant A's matview row: {names_b:?}"
+        "project B leaked project A's matview row: {names_b:?}"
     );
     assert!(
         !names_a.contains(&"plain_b".to_string()),
-        "tenant A leaked tenant B's row (which is a plain table, not a matview anyway): {names_a:?}"
+        "project A leaked project B's row (which is a plain table, not a matview anyway): {names_a:?}"
     );
 }

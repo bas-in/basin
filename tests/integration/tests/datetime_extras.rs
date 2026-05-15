@@ -14,7 +14,7 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -39,7 +39,7 @@ async fn open_engine() -> (TempDir, Engine) {
 }
 
 /// Run a single-row, single-column SELECT and return the first batch's first column.
-async fn one_col(sess: &basin_engine::TenantSession, sql: &str) -> Arc<dyn Array> {
+async fn one_col(sess: &basin_engine::ProjectSession, sql: &str) -> Arc<dyn Array> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches
@@ -60,7 +60,7 @@ async fn one_col(sess: &basin_engine::TenantSession, sql: &str) -> Arc<dyn Array
 #[tokio::test]
 async fn overlaps_true_when_intervals_cross() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Intervals [0h, 2h) and [1h, 3h) overlap.
     let col = one_col(
@@ -81,7 +81,7 @@ async fn overlaps_true_when_intervals_cross() {
 #[tokio::test]
 async fn overlaps_false_when_disjoint() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Intervals [0h, 1h) and [2h, 3h) — no overlap.
     let col = one_col(
@@ -102,7 +102,7 @@ async fn overlaps_false_when_disjoint() {
 #[tokio::test]
 async fn overlaps_false_when_adjacent() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Intervals [0h, 1h) and [1h, 2h) — touching but not overlapping (half-open).
     let col = one_col(
@@ -125,7 +125,7 @@ async fn overlaps_false_when_adjacent() {
 #[tokio::test]
 async fn infinity_timestamp_cast() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // 'infinity'::timestamp must return a Timestamp column (not NULL, not error).
     let col = one_col(&sess, "SELECT 'infinity'::timestamp").await;
@@ -140,7 +140,7 @@ async fn infinity_timestamp_cast() {
 #[tokio::test]
 async fn neg_infinity_timestamp_cast() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let col = one_col(&sess, "SELECT '-infinity'::timestamp").await;
     assert_eq!(
@@ -154,7 +154,7 @@ async fn neg_infinity_timestamp_cast() {
 #[tokio::test]
 async fn infinity_gt_neg_infinity() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // 'infinity' must be strictly greater than '-infinity'.
     let col = one_col(
@@ -176,7 +176,7 @@ async fn infinity_gt_neg_infinity() {
 #[tokio::test]
 async fn date_part_year() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let col = one_col(
         &sess,
@@ -209,7 +209,7 @@ async fn date_part_year() {
 #[tokio::test]
 async fn date_part_month() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let col = one_col(
         &sess,
@@ -243,7 +243,7 @@ async fn date_part_month() {
 #[tokio::test]
 async fn array_dims_2d() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let col = one_col(
         &sess,
@@ -265,7 +265,7 @@ async fn array_dims_2d() {
 #[tokio::test]
 async fn array_dims_1d() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let col = one_col(&sess, "SELECT array_dims(ARRAY[1, 2, 3])").await;
     let arr = col
@@ -285,7 +285,7 @@ async fn array_dims_1d() {
 #[tokio::test]
 async fn multi_dim_array_cast_executes() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Use ARRAY[[...]] constructor — DataFusion produces List(List(Int64)).
     let res = sess

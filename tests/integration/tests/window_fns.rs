@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -95,9 +95,9 @@ fn collect_f64(res: ExecResult, col: &str) -> Vec<Option<f64>> {
 // B     frank   100
 // ---------------------------------------------------------------------------
 
-async fn setup_sales(dir: &TempDir) -> (Engine, TenantId) {
+async fn setup_sales(dir: &TempDir) -> (Engine, ProjectId) {
     let engine = engine_in(dir);
-    let tid = TenantId::new();
+    let tid = ProjectId::new();
     let s = engine.open_session(tid.clone()).await.unwrap();
     s.execute(
         "CREATE TABLE sales (dept TEXT NOT NULL, emp TEXT NOT NULL, amount BIGINT NOT NULL)",

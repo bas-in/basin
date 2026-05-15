@@ -1,4 +1,4 @@
-//! Per-tenant DataFusion session.
+//! Per-project DataFusion session.
 //!
 //! ## URL convention for the object store
 //!
@@ -13,7 +13,7 @@
 //! for production: only the registered store changes; the listing-table URLs
 //! the engine constructs do not. The path component carries the configured
 //! `root_prefix` (if any) followed by the standard
-//! `tenants/{tenant}/tables/{table}/data/` layout.
+//! `projects/{project}/tables/{table}/data/` layout.
 //!
 //! Production note: when this crate moves to native S3 listing, swap the
 //! registered store to one whose semantics match `s3://` and then either keep
@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use crate::AuthContext;
 
 use basin_catalog::{PartitionSpec, SnapshotId};
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
@@ -42,7 +42,7 @@ use tracing::instrument;
 use url::Url;
 
 use crate::convert::schema_ws_to_df;
-use crate::{Engine, TenantSession};
+use crate::{Engine, ProjectSession};
 
 /// Synthetic URL we register the storage `ObjectStore` under. The scheme is
 /// purely an internal protocol between `basin-engine` and DataFusion; it is
@@ -74,9 +74,9 @@ pub(crate) struct SessionState {
     pub(crate) snapshots: Mutex<HashMap<TableName, SnapshotId>>,
     /// Per-session prepared-statement registry. See `prepared.rs`.
     pub(crate) prepared: crate::prepared::PreparedRegistry,
-    /// Tracks whether this tenant has *any* table with a non-trivial
+    /// Tracks whether this project has *any* table with a non-trivial
     /// partition spec. The SELECT path uses this as an O(1) gate to skip
-    /// the partition-pruning AST walk on every query for tenants that
+    /// the partition-pruning AST walk on every query for projects that
     /// never used `PARTITION BY`. Initialised at session-open time and
     /// flipped to `true` by `refresh_table` when it sees a partitioned
     /// table.
@@ -139,28 +139,28 @@ pub(crate) fn take_pending_overriding(state: &SessionState) -> Option<Overriding
         .take()
 }
 
-#[instrument(skip(engine, current_user, auth_context), fields(tenant = %tenant))]
+#[instrument(skip(engine, current_user, auth_context), fields(project = %project))]
 pub(crate) async fn open(
     engine: Engine,
-    tenant: TenantId,
+    project: ProjectId,
     current_user: String,
     auth_context: Arc<AuthContext>,
-) -> Result<TenantSession> {
+) -> Result<ProjectSession> {
     // 1. Idempotent namespace.
-    engine.config().catalog.create_namespace(&tenant).await?;
+    engine.config().catalog.create_namespace(&project).await?;
 
     // 2. SessionContext + register the storage's object store under our
     //    synthetic scheme. Recursively descend into the date-and-partition
     //    subdirectories `basin-storage` writes (otherwise DataFusion's
     //    default `listing_table_ignore_subdirectory = true` would skip them).
     //
-    //    Noisy-tenant downshift: when this tenant's recent query rate is
+    //    Noisy-project downshift: when this project's recent query rate is
     //    over the threshold (see `crate::noisy_detector`), pin
     //    `target_partitions = 1` so its bulk scans stop fanning out
     //    parallel range reads at full strength. This is a cooperative hint
-    //    that lets a heavy tenant self-cap; the storage layer's fair-share
+    //    that lets a heavy project self-cap; the storage layer's fair-share
     //    scheduler is the real fairness mechanism. We only consult the
-    //    detector here (at session-open time): a tenant that becomes noisy
+    //    detector here (at session-open time): a project that becomes noisy
     //    mid-session keeps its current partition count until the next
     //    `open_session`, which is the natural granularity for this kind of
     //    soft throttle.
@@ -168,43 +168,43 @@ pub(crate) async fn open(
     // is bounded. Each query reads its files sequentially via one stream
     // instead of issuing 4–8 concurrent range reads per file. Combined
     // with the storage scheduler's small global budget (default 4),
-    // this lets quiet tenants always find a free permit slot within
-    // ~one in-flight RPC's duration. Noisy tenants pay a per-query
+    // this lets quiet projects always find a free permit slot within
+    // ~one in-flight RPC's duration. Noisy projects pay a per-query
     // throughput cost (single-threaded reads) — that's the right
     // tradeoff for fairness on bounded-concurrency backends. On AWS S3
     // with effectively unbounded server-side concurrency, raising this
     // back to `num_cpus` is fine; surface as a per-deployment knob in
     // a v0.3 catalog field. The noisy detector still applies — it
     // would catch a hypothetical per-deployment override that bumps
-    // partitions back up for a tenant that abuses it.
+    // partitions back up for a project that abuses it.
     let cfg = datafusion::execution::config::SessionConfig::new()
         .set_str(
             "datafusion.execution.listing_table_ignore_subdirectory",
             "false",
         )
         .with_target_partitions(1);
-    if engine.is_noisy(&tenant) {
+    if engine.is_noisy(&project) {
         // Already pinned to 1; keep the log so noisy detection is
         // observable in tracing.
         tracing::info!(
-            tenant = %tenant,
-            "noisy tenant detected (target_partitions already pinned to 1)"
+            project = %project,
+            "noisy project detected (target_partitions already pinned to 1)"
         );
     }
     let ctx = SessionContext::new_with_config(cfg);
     let url = Url::parse(BASIN_URL_BASE)
         .map_err(|e| BasinError::internal(format!("bad basin url: {e}")))?;
-    // Register the *tenant-scoped* store so every range read DataFusion
-    // drives for this session counts against the tenant's per-tenant
+    // Register the *project-scoped* store so every range read DataFusion
+    // drives for this session counts against the project's per-project
     // concurrency budget. This is the load-bearing call for in-process
-    // tenant fairness on shared object-store backends (real S3 in
+    // project fairness on shared object-store backends (real S3 in
     // particular, where the shared reqwest pool would otherwise be
-    // saturated by one heavy tenant).
-    let store = engine.config().storage.tenant_object_store(&tenant);
+    // saturated by one heavy project).
+    let store = engine.config().storage.project_object_store(&project);
     ctx.register_object_store(&url, store);
 
     // Register the vector distance UDFs once per session. They're stateless
-    // and don't depend on per-tenant data; registering on every session is
+    // and don't depend on per-project data; registering on every session is
     // cheap and keeps the UDFs visible to any SQL the session executes.
     crate::udf::register_distance_udfs(&ctx);
     // pgcrypto + uuid-ossp shaped UDFs (gen_random_uuid, digest, encode,
@@ -259,14 +259,14 @@ pub(crate) async fn open(
     crate::datetime_extras::register_datetime_extras(&ctx);
 
     // Phase 5.11.M: route `information_schema.tables` and
-    // `pg_catalog.pg_class` SELECTs to the tenant-scoped catalog
-    // snapshot. The providers hold `Arc<dyn Catalog>` + `TenantId` only;
+    // `pg_catalog.pg_class` SELECTs to the project-scoped catalog
+    // snapshot. The providers hold `Arc<dyn Catalog>` + `ProjectId` only;
     // the heavy resource (the catalog handle) is shared across every
-    // session, so per-tenant cost is O(bytes).
+    // session, so per-project cost is O(bytes).
     crate::info_schema_provider::register_info_schema_providers(
         &ctx,
         engine.config().catalog.clone(),
-        tenant,
+        project,
     )
     .map_err(|e| BasinError::internal(format!("info_schema providers: {e}")))?;
 
@@ -274,14 +274,14 @@ pub(crate) async fn open(
 
     // 3. Pre-register every table the catalog already knows about. This makes
     //    SELECT work immediately without a per-query refresh.
-    let tables = engine.config().catalog.list_tables(&tenant).await?;
+    let tables = engine.config().catalog.list_tables(&project).await?;
     for table in tables {
-        refresh_table(&engine, &tenant, &ctx, &state, &table).await?;
+        refresh_table(&engine, &project, &ctx, &state, &table).await?;
     }
 
-    Ok(TenantSession {
+    Ok(ProjectSession {
         engine,
-        tenant,
+        project,
         current_user,
         auth_context,
         ctx,
@@ -298,12 +298,12 @@ pub(crate) async fn open(
 /// every commit.
 pub(crate) async fn refresh_table(
     engine: &Engine,
-    tenant: &TenantId,
+    project: &ProjectId,
     ctx: &SessionContext,
     state: &Arc<SessionState>,
     table: &TableName,
 ) -> Result<()> {
-    let meta = engine.config().catalog.load_table(tenant, table).await?;
+    let meta = engine.config().catalog.load_table(project, table).await?;
     // The catalog hands us a workspace-version schema; convert into the
     // version DataFusion's `register_listing_table` expects.
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
@@ -315,10 +315,10 @@ pub(crate) async fn refresh_table(
     // an extra empty-directory list per query is wasted work on real
     // object stores.
     let root = engine.config().storage.root_prefix_handle();
-    let hot_url = build_table_tier_url(&root, tenant, table, "data");
+    let hot_url = build_table_tier_url(&root, project, table, "data");
     let has_tier_policy = meta.cold_after_seconds.is_some();
     let cold_url = if has_tier_policy {
-        Some(build_table_tier_url(&root, tenant, table, "cold"))
+        Some(build_table_tier_url(&root, project, table, "cold"))
     } else {
         None
     };
@@ -372,14 +372,14 @@ pub(crate) async fn refresh_table(
     Ok(())
 }
 
-/// Build `basin://engine/<root?>/tenants/<tenant>/tables/<table>/<tier>/`,
+/// Build `basin://engine/<root?>/projects/<project>/tables/<table>/<tier>/`,
 /// where `<tier>` is `data` (hot) or `cold`. The trailing slash is critical
 /// — DataFusion uses it to distinguish a directory listing from a single-file
 /// reference. Tier-aware so `refresh_table` can register both URLs and
 /// have the cold-prefix migration land transparently.
 fn build_table_tier_url(
     root: &Option<ObjectPath>,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     tier_segment: &str,
 ) -> String {
@@ -393,8 +393,8 @@ fn build_table_tier_url(
             }
         }
     }
-    url.push_str("tenants/");
-    url.push_str(&tenant.as_prefix());
+    url.push_str("projects/");
+    url.push_str(&project.as_prefix());
     url.push_str("/tables/");
     url.push_str(table.as_str());
     url.push('/');
@@ -411,7 +411,7 @@ fn build_table_tier_url(
 /// listing — DataFusion's per-file stats pruning still catches what we miss.
 pub(crate) async fn apply_partition_pruning_for_query(
     engine: &Engine,
-    tenant: &TenantId,
+    project: &ProjectId,
     ctx: &SessionContext,
     sql: &str,
 ) -> Result<()> {
@@ -433,7 +433,7 @@ pub(crate) async fn apply_partition_pruning_for_query(
             Ok(t) => t,
             Err(_) => continue,
         };
-        let meta = match engine.config().catalog.load_table(tenant, &table).await {
+        let meta = match engine.config().catalog.load_table(project, &table).await {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -446,7 +446,7 @@ pub(crate) async fn apply_partition_pruning_for_query(
         };
 
         let storage = engine.config().storage.clone();
-        let files = match storage.list_data_files(tenant, &table).await {
+        let files = match storage.list_data_files(project, &table).await {
             Ok(f) => f,
             Err(_) => continue,
         };

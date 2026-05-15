@@ -1,6 +1,6 @@
 //! Unit test: outgoing body cap rejects oversized POST bodies.
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_net::{AllowList, GuardConfig, HttpClient, RateLimit};
 
 #[tokio::test]
@@ -11,13 +11,13 @@ async fn oversized_post_body_rejected() {
         timeout: std::time::Duration::from_secs(5),
     };
     let client = HttpClient::with_config(cfg, AllowList::new(), RateLimit::new());
-    let tenant = TenantId::new();
-    client.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    client.allow_host(&project, "127.0.0.1").await;
 
     let body = vec![b'x'; 4096];
     let err = client
         .http_post(
-            &tenant,
+            &project,
             "http://127.0.0.1:1/",
             body,
             "application/octet-stream",
@@ -38,13 +38,13 @@ async fn at_cap_post_body_passes_the_gate() {
         timeout: std::time::Duration::from_secs(5),
     };
     let client = HttpClient::with_config(cfg, AllowList::new(), RateLimit::new());
-    let tenant = TenantId::new();
-    client.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    client.allow_host(&project, "127.0.0.1").await;
 
     let body = vec![b'y'; 64];
     let err = client
         .http_post(
-            &tenant,
+            &project,
             "http://127.0.0.1:1/",
             body,
             "application/octet-stream",

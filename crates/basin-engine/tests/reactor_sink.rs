@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog, ReactorDef, ReactorOps};
-use basin_common::{BasinError, TableName, TenantId};
+use basin_common::{BasinError, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -71,8 +71,8 @@ fn total_rows(batches: &[arrow_array::RecordBatch]) -> usize {
 async fn reactor_fires_on_matching_op() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL, status TEXT NOT NULL)")
         .await
         .unwrap();
@@ -81,7 +81,7 @@ async fn reactor_fires_on_matching_op() {
         .unwrap();
 
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: TableName::new("orders").unwrap(),
         name: "log_updates".into(),
         ops: ReactorOps::UPDATE,
@@ -129,8 +129,8 @@ async fn reactor_fires_on_matching_op() {
 async fn reactor_predicate_filter() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL, status TEXT NOT NULL)")
         .await
         .unwrap();
@@ -142,7 +142,7 @@ async fn reactor_predicate_filter() {
         .unwrap();
 
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: TableName::new("orders").unwrap(),
         name: "on_paid".into(),
         ops: ReactorOps::UPDATE,
@@ -191,8 +191,8 @@ async fn reactor_predicate_filter() {
 async fn reactor_inserts_to_other_table() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -201,7 +201,7 @@ async fn reactor_inserts_to_other_table() {
         .unwrap();
 
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: TableName::new("orders").unwrap(),
         name: "log".into(),
         ops: ReactorOps::INSERT | ReactorOps::UPDATE,
@@ -240,8 +240,8 @@ async fn reactor_inserts_to_other_table() {
 async fn reactor_failure_rolls_back_source_mutation() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL, status TEXT NOT NULL)")
         .await
         .unwrap();
@@ -250,7 +250,7 @@ async fn reactor_failure_rolls_back_source_mutation() {
         .unwrap();
 
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: TableName::new("orders").unwrap(),
         name: "broken".into(),
         ops: ReactorOps::UPDATE,
@@ -305,8 +305,8 @@ async fn reactor_respects_rls() {
     // principal, which is the load-bearing piece.)
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let admin = eng.open_session_as(tenant, "admin").await.unwrap();
+    let project = ProjectId::new();
+    let admin = eng.open_session_as(project, "admin").await.unwrap();
 
     admin
         .execute("CREATE TABLE secret (id BIGINT NOT NULL, owner TEXT NOT NULL)")
@@ -336,7 +336,7 @@ async fn reactor_respects_rls() {
     // row into `captured`. The NEW payload comes from the source
     // mutation's full unfiltered row regardless of RLS.
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: TableName::new("secret").unwrap(),
         name: "audit_writes".into(),
         ops: ReactorOps::INSERT,
@@ -350,7 +350,7 @@ async fn reactor_respects_rls() {
     // SELECT would never see it, the reactor sees it via NEW.* and
     // captures it. This proves the reactor body's NEW carries the
     // unfiltered row.
-    let sess_alice = eng.open_session_as(tenant, "alice").await.unwrap();
+    let sess_alice = eng.open_session_as(project, "alice").await.unwrap();
     sess_alice
         .execute("INSERT INTO secret VALUES (3, 'bob')")
         .await
@@ -390,8 +390,8 @@ async fn reactor_respects_rls() {
 async fn multi_reactor_ordering() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE src (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -401,7 +401,7 @@ async fn multi_reactor_ordering() {
 
     let table = TableName::new("src").unwrap();
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: table.clone(),
         name: "first".into(),
         ops: ReactorOps::INSERT,
@@ -411,7 +411,7 @@ async fn multi_reactor_ordering() {
     .await
     .unwrap();
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: table.clone(),
         name: "second".into(),
         ops: ReactorOps::INSERT,
@@ -434,13 +434,13 @@ async fn multi_reactor_ordering() {
         panic!();
     }
 
-    // Now register a fresh-tenant table where the FIRST reactor (in
+    // Now register a fresh-project table where the FIRST reactor (in
     // registration order) is broken: second must not run at all and
-    // the source INSERT rolls back. Use a separate tenant so the
+    // the source INSERT rolls back. Use a separate project so the
     // earlier `first/second` reactors above don't pollute the
     // ordering.
-    let tenant_b = TenantId::new();
-    let sess_b = eng.open_session(tenant_b).await.unwrap();
+    let project_b = ProjectId::new();
+    let sess_b = eng.open_session(project_b).await.unwrap();
     sess_b
         .execute("CREATE TABLE src (id BIGINT NOT NULL)")
         .await
@@ -451,7 +451,7 @@ async fn multi_reactor_ordering() {
         .unwrap();
     let table_b = TableName::new("src").unwrap();
     cat.register_reactor(ReactorDef {
-        tenant: tenant_b,
+        project: project_b,
         table: table_b.clone(),
         name: "broken_first".into(),
         ops: ReactorOps::INSERT,
@@ -461,7 +461,7 @@ async fn multi_reactor_ordering() {
     .await
     .unwrap();
     cat.register_reactor(ReactorDef {
-        tenant: tenant_b,
+        project: project_b,
         table: table_b.clone(),
         name: "would_run_second".into(),
         ops: ReactorOps::INSERT,
@@ -501,11 +501,11 @@ async fn multi_reactor_ordering() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
     for s in [&sa, &sb] {
@@ -519,7 +519,7 @@ async fn cross_tenant_isolation() {
 
     // Reactor on A only.
     cat.register_reactor(ReactorDef {
-        tenant: a,
+        project: a,
         table: TableName::new("src").unwrap(),
         name: "log".into(),
         ops: ReactorOps::INSERT,
@@ -531,7 +531,7 @@ async fn cross_tenant_isolation() {
 
     sb.execute("INSERT INTO src VALUES (5)").await.unwrap();
 
-    // Tenant B's log table must be empty — A's reactor cannot fire on B.
+    // Project B's log table must be empty — A's reactor cannot fire on B.
     let res = sb.execute("SELECT id FROM log").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(total_rows(&batches), 0);
@@ -553,8 +553,8 @@ async fn cross_tenant_isolation() {
 async fn bind_var_substitution_correctness() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL, status TEXT NOT NULL)")
         .await
         .unwrap();
@@ -573,7 +573,7 @@ async fn bind_var_substitution_correctness() {
         .unwrap();
 
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: TableName::new("orders").unwrap(),
         name: "binds".into(),
         ops: ReactorOps::UPDATE,
@@ -608,8 +608,8 @@ async fn bind_var_substitution_correctness() {
 async fn drop_reactor_stops_firing() {
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE src (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -619,7 +619,7 @@ async fn drop_reactor_stops_firing() {
 
     let table = TableName::new("src").unwrap();
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: table.clone(),
         name: "r".into(),
         ops: ReactorOps::INSERT,
@@ -640,7 +640,7 @@ async fn drop_reactor_stops_firing() {
         panic!();
     }
 
-    cat.drop_reactor(&tenant, &table, "r").await.unwrap();
+    cat.drop_reactor(&project, &table, "r").await.unwrap();
     sess.execute("INSERT INTO src VALUES (2)").await.unwrap();
     let res = sess
         .execute("SELECT id FROM log ORDER BY id")
@@ -653,7 +653,7 @@ async fn drop_reactor_stops_firing() {
     }
 
     let err = cat
-        .drop_reactor(&tenant, &table, "r")
+        .drop_reactor(&project, &table, "r")
         .await
         .expect_err("re-drop should NotFound");
     assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
@@ -676,8 +676,8 @@ async fn counter_denormalization_pattern() {
     // exercised exactly the same way.
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE parent (id BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -692,7 +692,7 @@ async fn counter_denormalization_pattern() {
         .unwrap();
 
     cat.register_reactor(ReactorDef {
-        tenant,
+        project,
         table: TableName::new("child").unwrap(),
         name: "bump_count".into(),
         ops: ReactorOps::INSERT,

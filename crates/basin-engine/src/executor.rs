@@ -25,10 +25,10 @@ use crate::lifecycle::{
     extract_create_table_lifecycle, extract_select_include_deleted, CreateTableLifecycle,
 };
 use crate::session::refresh_table;
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 use basin_catalog::PartitionSpec;
 
-pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResult> {
+pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResult> {
     // Keep a reference to the SQL the user actually wrote. The rewriter
     // below mangles vector operators into UDF calls; that rewrite is
     // irrelevant to (and would only confuse) the analytical engine, which
@@ -89,9 +89,9 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     if let Some(ext) = crate::alter::match_basin_alter_extension(sql)? {
         let table = ext.table().clone();
         let tag = ext
-            .apply(&sess.engine.config().catalog, &sess.tenant)
+            .apply(&sess.engine.config().catalog, &sess.project)
             .await?;
-        crate::session::refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table)
+        crate::session::refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table)
             .await?;
         return Ok(ExecResult::Empty { tag: tag.into() });
     }
@@ -155,7 +155,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     if let Some(intent) = crate::webhook_ddl::match_alter_table_subscribe_webhook(sql)? {
         crate::webhook_ddl::exec_subscribe_webhook(
             intent,
-            &sess.tenant,
+            &sess.project,
             sess.engine.webhook_registry(),
         )
         .await?;
@@ -169,7 +169,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     if let Some(intent) = crate::webhook_ddl::match_alter_table_unsubscribe_webhook(sql)? {
         crate::webhook_ddl::exec_unsubscribe_webhook(
             intent,
-            &sess.tenant,
+            &sess.project,
             sess.engine.webhook_registry(),
         )
         .await?;
@@ -182,7 +182,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // rejects `REACT` outright. The body matcher returns `None` for the
     // constraint-shaped form (handled by the next arm).
     if let Some(intent) = crate::reactor_ddl::match_alter_table_react_on(sql)? {
-        crate::reactor_ddl::exec_react_on(intent, &sess.tenant, &sess.engine.config().catalog)
+        crate::reactor_ddl::exec_react_on(intent, &sess.project, &sess.engine.config().catalog)
             .await?;
         return Ok(ExecResult::Empty {
             tag: "ALTER TABLE".into(),
@@ -193,7 +193,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     if let Some(intent) = crate::reactor_ddl::match_alter_table_react_constraint(sql)? {
         crate::reactor_ddl::exec_react_constraint(
             intent,
-            &sess.tenant,
+            &sess.project,
             &sess.engine.config().catalog,
         )
         .await?;
@@ -205,7 +205,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // 5.11.C — `DROP REACTOR <name> ON <table>`. libpg_query rejects
     // `REACTOR` outright.
     if let Some(intent) = crate::reactor_ddl::match_drop_reactor(sql)? {
-        crate::reactor_ddl::exec_drop_reactor(intent, &sess.tenant, &sess.engine.config().catalog)
+        crate::reactor_ddl::exec_drop_reactor(intent, &sess.project, &sess.engine.config().catalog)
             .await?;
         return Ok(ExecResult::Empty {
             tag: "DROP REACTOR".into(),
@@ -336,7 +336,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // takes over and correctness is preserved.
     if let Some(plan) = crate::vector_planner::rewrite_vector_order_by(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         sql,
     )
     .await?
@@ -440,13 +440,13 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // `cast_infinity_timestamp(...)` UDF before sqlparser sees the SQL.
     let rewritten = crate::datetime_extras::rewrite_infinity_timestamp(&rewritten);
     // User-defined `LANGUAGE sql` function inlining. The rewriter is a
-    // no-op for tenants with no registered functions and for statements
+    // no-op for projects with no registered functions and for statements
     // that contain no function calls at all (the cheap pre-gate runs
     // before any catalog hop). Anything else gets rewritten so DataFusion
     // sees the body inlined into the call site.
     let inlined = crate::sql_functions::rewrite_sql_inlining_functions(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         &rewritten,
     )
     .await?;
@@ -458,7 +458,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // SQL with no sequence call sites.
     let seq_ctx = crate::seq_udf::SequenceContext {
         catalog: &sess.engine.config().catalog,
-        tenant: sess.tenant,
+        project: sess.project,
         session_cache: &sess.state.sequence_cache,
     };
     let seq_rewritten = crate::seq_udf::rewrite_sequence_calls(&inlined, &seq_ctx).await?;
@@ -472,7 +472,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // skip the rewrite and fall back to label-string compare.
     let enum_rewritten = crate::enum_ordinal::rewrite_enum_ordering(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         &seq_rewritten,
     )
     .await?;
@@ -558,7 +558,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         if matches!(stmt, Statement::Query(_)) {
             let estimate = crate::cost_check::estimate_query_rows(
                 sess.engine.config().catalog.as_ref(),
-                &sess.tenant,
+                &sess.project,
                 &stmt,
             )
             .await?;
@@ -811,7 +811,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             // those the order doesn't matter.
             if let Some(analytical) = sess.engine.analytical() {
                 if is_analytical(&stmt, raw_sql) {
-                    match analytical.query(&sess.tenant, raw_sql).await {
+                    match analytical.query(&sess.project, raw_sql).await {
                         Ok(batches) => {
                             sess.engine.note_analytical_routed();
                             return Ok(rows_from_batches(batches));
@@ -860,7 +860,7 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
                     .engine
                     .config()
                     .catalog
-                    .lookup_view(&sess.tenant, plan.table.as_str())
+                    .lookup_view(&sess.project, plan.table.as_str())
                     .await
                     .is_some();
                 if !is_view
@@ -934,7 +934,7 @@ fn rows_from_batches(batches: Vec<RecordBatch>) -> ExecResult {
 }
 
 /// Execute a `VectorSearchPlan` produced by `vector_planner`. Calls
-/// `Storage::vector_search` (via the existing `TenantSession::vector_search`
+/// `Storage::vector_search` (via the existing `ProjectSession::vector_search`
 /// fast path) with `fetch_k` candidates, applies any column-equality
 /// pushdown filters, truncates to the user's `LIMIT`, and projects to the
 /// user's `SELECT` list.
@@ -944,7 +944,7 @@ fn rows_from_batches(batches: Vec<RecordBatch>) -> ExecResult {
 /// `_distance` column. (Brute-force computes the distance in `ORDER BY` but
 /// only emits whatever the user wrote in `SELECT`.)
 async fn execute_vector_search_plan(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     plan: crate::vector_planner::VectorSearchPlan,
 ) -> Result<ExecResult> {
     let fetch_k = crate::vector_planner::fetch_k(&plan);
@@ -956,7 +956,7 @@ async fn execute_vector_search_plan(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &plan.table)
+        .load_table(&sess.project, &plan.table)
         .await?;
 
     let raw_batches = sess
@@ -983,7 +983,7 @@ async fn execute_vector_search_plan(
     }
 
     // Apply any pushdown filters and truncate to k. The single-batch
-    // contract from `TenantSession::vector_search` keeps the loop trivial:
+    // contract from `ProjectSession::vector_search` keeps the loop trivial:
     // each batch already carries `_distance` ascending, so the global
     // top-k after filter is the prefix of `keep` indices.
     let mut filtered_batches: Vec<RecordBatch> = Vec::with_capacity(raw_batches.len());
@@ -1043,7 +1043,7 @@ async fn execute_vector_search_plan(
 }
 
 async fn exec_create_table(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     mut ct: sqlparser::ast::CreateTable,
     cluster_columns: Option<Vec<String>>,
     lifecycle: CreateTableLifecycle,
@@ -1058,7 +1058,7 @@ async fn exec_create_table(
     // validate values + the catalog can refcount.
     let bindings = crate::type_ddl::resolve_user_type_columns(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         &ct.columns,
     )
     .await?;
@@ -1087,7 +1087,7 @@ async fn exec_create_table(
     }
 
     // Validate FK definitions before creating the table — referenced
-    // table must exist in the same tenant, referenced columns must be
+    // table must exist in the same project, referenced columns must be
     // exactly the PK of the referenced table, and types must match.
     for fk in &constraints.foreign_keys {
         let ref_table_name = TableName::new(fk.ref_table.clone())?;
@@ -1098,12 +1098,12 @@ async fn exec_create_table(
                 .engine
                 .config()
                 .catalog
-                .load_table(&sess.tenant, &ref_table_name)
+                .load_table(&sess.project, &ref_table_name)
                 .await
                 .map_err(|e| match e {
                     BasinError::NotFound(_) => BasinError::InvalidSchema(format!(
-                        "FOREIGN KEY {:?}: referenced table {:?} does not exist in this tenant \
-                         (cross-tenant FKs are not supported in v0.1)",
+                        "FOREIGN KEY {:?}: referenced table {:?} does not exist in this project \
+                         (cross-project FKs are not supported in v0.1)",
                         fk.name, fk.ref_table
                     )),
                     other => other,
@@ -1147,7 +1147,7 @@ async fn exec_create_table(
                     .engine
                     .config()
                     .catalog
-                    .load_table(&sess.tenant, &ref_table_name)
+                    .load_table(&sess.project, &ref_table_name)
                     .await?;
                 let ref_field = ref_meta.schema.field_with_name(rc).map_err(|_| {
                     BasinError::InvalidSchema(format!(
@@ -1171,7 +1171,7 @@ async fn exec_create_table(
     sess.engine
         .config()
         .catalog
-        .create_table(&sess.tenant, &table, &schema)
+        .create_table(&sess.project, &table, &schema)
         .await?;
 
     // Register implicit sequences promised by `SERIAL` / `BIGSERIAL` /
@@ -1181,7 +1181,7 @@ async fn exec_create_table(
     // sequence already exists (re-run after a partial failure) we
     // swallow the duplicate-name error so the table can keep going.
     for seq in &constraints.implicit_sequences {
-        let def = basin_catalog::SequenceDef::with_defaults(sess.tenant, seq.name.clone());
+        let def = basin_catalog::SequenceDef::with_defaults(sess.project, seq.name.clone());
         match sess.engine.config().catalog.create_sequence(def).await {
             Ok(()) => {}
             Err(BasinError::Catalog(_)) => {
@@ -1198,7 +1198,7 @@ async fn exec_create_table(
         sess.engine
             .config()
             .catalog
-            .set_partition_spec(&sess.tenant, &table, spec)
+            .set_partition_spec(&sess.project, &table, spec)
             .await?;
     }
 
@@ -1206,7 +1206,7 @@ async fn exec_create_table(
         sess.engine
             .config()
             .catalog
-            .set_cluster_columns(&sess.tenant, &table, cols)
+            .set_cluster_columns(&sess.project, &table, cols)
             .await?;
     }
 
@@ -1218,7 +1218,7 @@ async fn exec_create_table(
             .config()
             .catalog
             .set_table_constraints(
-                &sess.tenant,
+                &sess.project,
                 &table,
                 constraints.pk_columns,
                 constraints.checks,
@@ -1231,11 +1231,11 @@ async fn exec_create_table(
         sess.engine
             .config()
             .catalog
-            .set_unique_constraints(&sess.tenant, &table, constraints.uniques)
+            .set_unique_constraints(&sess.project, &table, constraints.uniques)
             .await?;
     }
 
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
     Ok(ExecResult::Empty {
         tag: "CREATE TABLE".into(),
@@ -1254,7 +1254,7 @@ async fn exec_create_table(
 // declaration shape here is already plural-column-aware so the storage
 // hop is a swap-in rather than a parser change.
 async fn exec_create_index(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     ci: sqlparser::ast::CreateIndex,
 ) -> Result<ExecResult> {
     use crate::index_extras::{
@@ -1338,11 +1338,11 @@ async fn exec_create_index(
     sess.engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await
         .map_err(|e| match e {
             BasinError::NotFound(_) => BasinError::InvalidSchema(format!(
-                "CREATE INDEX: table {table_name:?} does not exist in this tenant"
+                "CREATE INDEX: table {table_name:?} does not exist in this project"
             )),
             other => other,
         })?;
@@ -1365,7 +1365,7 @@ async fn exec_create_index(
         .config()
         .catalog
         .create_index(
-            &sess.tenant,
+            &sess.project,
             &table,
             &index_name,
             &catalog_columns,
@@ -1382,7 +1382,7 @@ async fn exec_create_index(
 /// there's nothing to physically tear down because v0.1 doesn't
 /// materialise any index file.
 async fn exec_drop_index(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     if_exists: bool,
     names: Vec<sqlparser::ast::ObjectName>,
 ) -> Result<ExecResult> {
@@ -1394,13 +1394,13 @@ async fn exec_drop_index(
     for n in &names {
         let index_name = single_part_name(n)?;
         // The catalog stores indexes per-table; we don't track a
-        // global (tenant, index-name) → table mapping. Scan every
-        // table in the tenant for a matching declaration.
+        // global (project, index-name) → table mapping. Scan every
+        // table in the project for a matching declaration.
         let tables = sess
             .engine
             .config()
             .catalog
-            .list_tables(&sess.tenant)
+            .list_tables(&sess.project)
             .await?;
         let mut found = false;
         for t in &tables {
@@ -1408,13 +1408,13 @@ async fn exec_drop_index(
                 .engine
                 .config()
                 .catalog
-                .load_table(&sess.tenant, t)
+                .load_table(&sess.project, t)
                 .await?;
             if meta.indexes.iter().any(|i| i.name == index_name) {
                 sess.engine
                     .config()
                     .catalog
-                    .drop_index(&sess.tenant, t, index_name)
+                    .drop_index(&sess.project, t, index_name)
                     .await?;
                 found = true;
                 break;
@@ -1429,7 +1429,7 @@ async fn exec_drop_index(
     })
 }
 
-async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Result<ExecResult> {
+async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Result<ExecResult> {
     let name = single_part_name(&ins.table_name)?;
     let table = TableName::new(name)?;
 
@@ -1479,7 +1479,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await?;
     let schema = meta.schema.clone();
     let row_count = rows_raw.len();
@@ -1536,7 +1536,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
 
         // Shard path is intentionally disabled for partitioned tables in
         // v0.1 — the shard owner's WAL pre-supposes one partition key per
-        // tenant slice and the multi-partition fan-out hasn't been wired
+        // project slice and the multi-partition fan-out hasn't been wired
         // through compaction yet. Fall through to the synchronous Parquet
         // write path below.
         let opts = write_options_for(&meta);
@@ -1546,19 +1546,19 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
             let batch = batch_from_rows(schema.clone(), &group_rows)?;
             let batch = crate::generated_cols::materialise_generated_columns(
                 &sess.engine.config().catalog,
-                &sess.tenant,
+                &sess.project,
                 batch,
             )
             .await?;
             crate::type_ddl::enforce_enum_labels(
                 &sess.engine.config().catalog,
-                &sess.tenant,
+                &sess.project,
                 &batch,
             )
             .await?;
             crate::type_ddl::enforce_domain_checks(
                 &sess.engine.config().catalog,
-                &sess.tenant,
+                &sess.project,
                 &batch,
             )
             .await?;
@@ -1572,7 +1572,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
             crate::constraints::enforce_fk_on_insert(
                 &sess.engine.config().catalog,
                 &sess.engine.config().storage,
-                &sess.tenant,
+                &sess.project,
                 table.as_str(),
                 &meta.foreign_keys,
                 &batch,
@@ -1580,7 +1580,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
             .await?;
             crate::constraints::enforce_pk_on_insert(
                 &sess.engine.config().storage,
-                &sess.tenant,
+                &sess.project,
                 &table,
                 table.as_str(),
                 &meta.pk_columns,
@@ -1589,7 +1589,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
             .await?;
             crate::constraints::enforce_unique_on_insert(
                 &sess.engine.config().storage,
-                &sess.tenant,
+                &sess.project,
                 &table,
                 table.as_str(),
                 &meta.unique_constraints,
@@ -1613,7 +1613,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
                 .engine
                 .config()
                 .storage
-                .write_batch_with_options(&sess.tenant, &table, pkey, batch, &opts)
+                .write_batch_with_options(&sess.project, &table, pkey, batch, &opts)
                 .await?;
             file_refs.push(DataFileRef {
                 path: df.path.as_ref().to_string(),
@@ -1625,7 +1625,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
 
         commit_with_retry(sess, &table, meta.current_snapshot, file_refs).await?;
         dispatch_post_commit(&sess.engine, events);
-        refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+        refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
         write_insert_audit_rows(sess, meta.schema.as_ref(), &preview_batches).await?;
         return Ok(ExecResult::Empty {
             tag: format!("INSERT 0 {row_count}"),
@@ -1635,13 +1635,13 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     let batch = batch_from_rows(schema, rows)?;
     let batch = crate::generated_cols::materialise_generated_columns(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         batch,
     )
     .await?;
-    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.tenant, &batch)
+    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
-    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.tenant, &batch)
+    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
     // PK / CHECK / FK enforcement. Order: CHECK (no I/O), then FK
     // (one referenced-table scan), then PK (one full-table scan).
@@ -1657,7 +1657,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     crate::constraints::enforce_fk_on_insert(
         &sess.engine.config().catalog,
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         table.as_str(),
         &meta.foreign_keys,
         &batch,
@@ -1665,7 +1665,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     .await?;
     crate::constraints::enforce_pk_on_insert(
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         &table,
         table.as_str(),
         &meta.pk_columns,
@@ -1674,7 +1674,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     .await?;
     crate::constraints::enforce_unique_on_insert(
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         &table,
         table.as_str(),
         &meta.unique_constraints,
@@ -1689,7 +1689,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     // catalog later. We do *not* call `append_data_files` ourselves here: that
     // would race the compactor's own commit and produce a duplicate snapshot.
     if let Some(shard) = sess.engine.config().shard.as_ref() {
-        let handle = shard.get(&sess.tenant, &part).await?;
+        let handle = shard.get(&sess.project, &part).await?;
         handle.write_batch(&table, batch).await?;
         // SELECT-side handles tail-visibility (Option A: force-compact). Skip
         // the DataFusion ListingTable refresh here; reads will trigger it.
@@ -1713,7 +1713,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
         .engine
         .config()
         .storage
-        .write_batch_with_options(&sess.tenant, &table, &part, &batch, &opts)
+        .write_batch_with_options(&sess.project, &table, &part, &batch, &opts)
         .await?;
 
     let file_ref = DataFileRef {
@@ -1727,22 +1727,22 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
     // new row. Then dispatch pre-commit; on error, roll back by deleting
     // the orphan file (the catalog snapshot is unchanged at this point,
     // so cleanup is just removing the orphan parquet).
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
         let _ = sess
             .engine
             .config()
             .storage
-            .delete_file(&sess.tenant, &df.path)
+            .delete_file(&sess.project, &df.path)
             .await;
-        let _ = refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await;
+        let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await;
         return Err(e);
     }
 
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
 
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 
     // RETURNING: if the caller asked for RETURNING *, return the inserted batch.
@@ -1766,7 +1766,7 @@ async fn exec_insert(sess: &TenantSession, ins: sqlparser::ast::Insert) -> Resul
 /// VALUES form uses. Partitioned tables, generated columns, and the
 /// shard-write path are out of scope for v0.1 INSERT-SELECT.
 async fn exec_insert_select(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     ins: &sqlparser::ast::Insert,
     source: &sqlparser::ast::Query,
@@ -1778,7 +1778,7 @@ async fn exec_insert_select(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, table)
+        .load_table(&sess.project, table)
         .await?;
     let schema = meta.schema.clone();
 
@@ -1907,9 +1907,9 @@ async fn exec_insert_select(
 
     // Enum / domain check enforcement matches the VALUES path so
     // constraint violations surface identically regardless of source.
-    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.tenant, &batch)
+    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
-    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.tenant, &batch)
+    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
     crate::constraints::enforce_check_constraints(
         table.as_str(),
@@ -1921,7 +1921,7 @@ async fn exec_insert_select(
     crate::constraints::enforce_fk_on_insert(
         &sess.engine.config().catalog,
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         table.as_str(),
         &meta.foreign_keys,
         &batch,
@@ -1929,7 +1929,7 @@ async fn exec_insert_select(
     .await?;
     crate::constraints::enforce_pk_on_insert(
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         table,
         table.as_str(),
         &meta.pk_columns,
@@ -1938,7 +1938,7 @@ async fn exec_insert_select(
     .await?;
     crate::constraints::enforce_unique_on_insert(
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         table,
         table.as_str(),
         &meta.unique_constraints,
@@ -1954,7 +1954,7 @@ async fn exec_insert_select(
         .engine
         .config()
         .storage
-        .write_batch_with_options(&sess.tenant, table, &part, &batch, &opts)
+        .write_batch_with_options(&sess.project, table, &part, &batch, &opts)
         .await?;
 
     let file_ref = DataFileRef {
@@ -1964,22 +1964,22 @@ async fn exec_insert_select(
         column_stats: written.column_stats.clone(),
     };
 
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
     if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
         let _ = sess
             .engine
             .config()
             .storage
-            .delete_file(&sess.tenant, &written.path)
+            .delete_file(&sess.project, &written.path)
             .await;
-        let _ = refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await;
+        let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
         return Err(e);
     }
 
     commit_with_retry(sess, table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
 
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 
     Ok(ExecResult::Empty {
@@ -1998,7 +1998,7 @@ async fn exec_insert_select(
 /// NOT NULL enforcement in `batch_from_rows` if the column is NOT NULL, giving
 /// the user a clean error rather than a silent bad insert).
 async fn exec_insert_default_values(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     ins: sqlparser::ast::Insert,
 ) -> Result<ExecResult> {
     use sqlparser::ast::{Expr, Value};
@@ -2010,7 +2010,7 @@ async fn exec_insert_default_values(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await?;
     let schema = meta.schema.clone();
 
@@ -2037,13 +2037,13 @@ async fn exec_insert_default_values(
     let batch = batch_from_rows(schema.clone(), &rows)?;
     let batch = crate::generated_cols::materialise_generated_columns(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         batch,
     )
     .await?;
-    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.tenant, &batch)
+    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
-    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.tenant, &batch)
+    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
     crate::constraints::enforce_check_constraints(
         table.as_str(),
@@ -2055,7 +2055,7 @@ async fn exec_insert_default_values(
     crate::constraints::enforce_fk_on_insert(
         &sess.engine.config().catalog,
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         table.as_str(),
         &meta.foreign_keys,
         &batch,
@@ -2063,7 +2063,7 @@ async fn exec_insert_default_values(
     .await?;
     crate::constraints::enforce_pk_on_insert(
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         &table,
         table.as_str(),
         &meta.pk_columns,
@@ -2072,7 +2072,7 @@ async fn exec_insert_default_values(
     .await?;
     crate::constraints::enforce_unique_on_insert(
         &sess.engine.config().storage,
-        &sess.tenant,
+        &sess.project,
         &table,
         table.as_str(),
         &meta.unique_constraints,
@@ -2089,7 +2089,7 @@ async fn exec_insert_default_values(
         .engine
         .config()
         .storage
-        .write_batch_with_options(&sess.tenant, &table, &part, &batch, &opts)
+        .write_batch_with_options(&sess.project, &table, &part, &batch, &opts)
         .await?;
     let file_ref = DataFileRef {
         path: df.path.as_ref().to_string(),
@@ -2098,11 +2098,11 @@ async fn exec_insert_default_values(
         column_stats: df.column_stats.clone(),
     };
 
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     dispatch_pre_commit(&sess.engine, &events).await?;
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 
     if ins.returning.is_some() {
@@ -2126,7 +2126,7 @@ async fn exec_insert_default_values(
 /// applied. Returns `Ok(None)` when no conflict exists, so the caller falls
 /// through to a plain INSERT.
 async fn try_on_conflict_do_update(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     ins: &sqlparser::ast::Insert,
     on_conflict: &sqlparser::ast::OnConflict,
@@ -2177,7 +2177,7 @@ async fn try_on_conflict_do_update(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, table)
+        .load_table(&sess.project, table)
         .await?;
     let schema = meta.schema.clone();
 
@@ -2377,7 +2377,7 @@ fn expand_insert_rows(
 /// [`crate::seq_ddl::evaluate_default_expression`] for the per-call
 /// rewrite + parse hop.
 async fn apply_column_defaults(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     schema: &Schema,
     insert_columns: &[sqlparser::ast::Ident],
     rows: &mut [Vec<sqlparser::ast::Expr>],
@@ -2481,7 +2481,7 @@ fn enforce_identity_insert_columns(
     Ok(())
 }
 
-/// Fill IDENTITY columns by routing through the per-tenant sequence.
+/// Fill IDENTITY columns by routing through the per-project sequence.
 /// Three cases:
 ///   * Column is omitted from the user's INSERT column list (or the
 ///     user wrote no column list and the table has IDENTITY columns
@@ -2495,7 +2495,7 @@ fn enforce_identity_insert_columns(
 ///     enforced `OVERRIDING SYSTEM VALUE` in
 ///     `enforce_identity_insert_columns`).
 async fn apply_identity_columns(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     schema: &Schema,
     insert_columns: &[sqlparser::ast::Ident],
     overriding: Option<crate::session::OverridingKind>,
@@ -2578,8 +2578,8 @@ async fn apply_identity_columns(
         // serialises concurrent calls across sessions.
         let catalog = &sess.engine.config().catalog;
         for row in rows.iter_mut() {
-            let next = catalog.nextval(&sess.tenant, seq_name).await?;
-            sess.state.sequence_cache.record(sess.tenant, seq_name, next).await;
+            let next = catalog.nextval(&sess.project, seq_name).await?;
+            sess.state.sequence_cache.record(sess.project, seq_name, next).await;
             // BIGINT-shaped literal. The row builder coerces this
             // through the standard Int64 path.
             row[col_idx] = Expr::Value(Value::Number(next.to_string(), false));
@@ -2591,10 +2591,10 @@ async fn apply_identity_columns(
 /// AUDIT TO emission for INSERT. The mutation has already committed by
 /// the time we get here; we materialise the after-row payloads from the
 /// in-memory batches and append them to the configured audit table.
-/// Tenant scoping is enforced by `lifecycle::write_audit_rows` resolving
-/// the audit table within the calling session's tenant prefix.
+/// Project scoping is enforced by `lifecycle::write_audit_rows` resolving
+/// the audit table within the calling session's project prefix.
 async fn write_insert_audit_rows(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     schema: &Schema,
     batches: &[RecordBatch],
 ) -> Result<()> {
@@ -2616,10 +2616,10 @@ async fn write_insert_audit_rows(
 }
 
 /// Build one [`ChangeEvent`] per row across `batches`, allocating a
-/// fresh per-`(tenant, table)` seq for each. Returns an empty vec when
+/// fresh per-`(project, table)` seq for each. Returns an empty vec when
 /// no sinks are attached so callers pay only the registry-empty check.
 fn build_insert_events(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     batches: &[RecordBatch],
 ) -> Result<Vec<ChangeEvent>> {
@@ -2638,9 +2638,9 @@ fn build_insert_events(
     for batch in batches {
         for row in 0..batch.num_rows() {
             let after = build_row_json(batch, row)?;
-            let seq = sess.engine.next_event_seq(&sess.tenant, table);
+            let seq = sess.engine.next_event_seq(&sess.project, table);
             out.push(make_event(
-                &sess.tenant,
+                &sess.project,
                 table,
                 ChangeOp::Insert,
                 None,
@@ -2656,7 +2656,7 @@ fn build_insert_events(
 /// Map session principal to the event's `causation_user`. The
 /// anonymous-session sentinel becomes `None` so sinks needn't special-
 /// case it.
-fn causation_user(sess: &TenantSession) -> Option<String> {
+fn causation_user(sess: &ProjectSession) -> Option<String> {
     if sess.current_user == crate::ANONYMOUS_USER {
         None
     } else {
@@ -2686,7 +2686,7 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
 /// `append_data_files`; the in-memory catalog serializes per table so we
 /// re-read and try once more before bubbling up.
 async fn commit_with_retry(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     expected_initial: basin_catalog::SnapshotId,
     files: Vec<DataFileRef>,
@@ -2696,7 +2696,7 @@ async fn commit_with_retry(
         .engine
         .config()
         .catalog
-        .append_data_files(&sess.tenant, table, expected, files.clone())
+        .append_data_files(&sess.project, table, expected, files.clone())
         .await
     {
         Ok(_) => Ok(()),
@@ -2705,13 +2705,13 @@ async fn commit_with_retry(
                 .engine
                 .config()
                 .catalog
-                .load_table(&sess.tenant, table)
+                .load_table(&sess.project, table)
                 .await?;
             expected = fresh.current_snapshot;
             sess.engine
                 .config()
                 .catalog
-                .append_data_files(&sess.tenant, table, expected, files)
+                .append_data_files(&sess.project, table, expected, files)
                 .await?;
             Ok(())
         }
@@ -2719,7 +2719,7 @@ async fn commit_with_retry(
     }
 }
 
-async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> Result<ExecResult> {
+async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) -> Result<ExecResult> {
     // Option A for tail-visibility: when the shard is wired in, the in-RAM
     // tail produced by INSERTs hasn't yet landed in Parquet. Force a synchronous
     // flush + catalog commit before planning so DataFusion's ListingTable scan
@@ -2734,12 +2734,12 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
             .engine
             .config()
             .catalog
-            .list_tables(&sess.tenant)
+            .list_tables(&sess.project)
             .await?;
         for table in &tables {
             crate::session::refresh_table(
                 &sess.engine,
-                &sess.tenant,
+                &sess.project,
                 &sess.ctx,
                 &sess.state,
                 table,
@@ -2753,7 +2753,7 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
     // restricts the partition column) swap the registered `ListingTable`
     // for one whose paths are pre-filtered to matching partitions. The
     // atomic `has_partitioned_table` gate keeps the hot path fast for
-    // tenants that never use PARTITION BY.
+    // projects that never use PARTITION BY.
     if sess
         .state
         .has_partitioned_table
@@ -2761,7 +2761,7 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
     {
         crate::session::apply_partition_pruning_for_query(
             &sess.engine,
-            &sess.tenant,
+            &sess.project,
             &sess.ctx,
             sql,
         )
@@ -2771,10 +2771,10 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
     // View-reference rewriting: replace any reference to a known plain view
     // in the SQL's FROM / JOIN clauses with an inline subquery so DataFusion
     // sees a derived table rather than an unknown table name. This is a
-    // no-op when the tenant has no registered views.
+    // no-op when the project has no registered views.
     let view_rewritten_owned;
     let sql = if let Some(rewritten) =
-        crate::view_ddl::rewrite_view_refs(sess.engine.config().catalog.as_ref(), &sess.tenant, sql)
+        crate::view_ddl::rewrite_view_refs(sess.engine.config().catalog.as_ref(), &sess.project, sql)
             .await?
     {
         view_rewritten_owned = rewritten;
@@ -2798,7 +2798,7 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
         .await
         .map_err(|e| BasinError::internal(format!("plan: {e}")))?;
 
-    // Phase 5.6: row-level security. The per-tenant policy lookup is gated
+    // Phase 5.6: row-level security. The per-project policy lookup is gated
     // on the catalog's `rls_enabled` per table; tables with RLS off cost
     // exactly one `load_table` call, no plan rewriting. The plan rewrite
     // itself happens via DataFusion's `LogicalPlanBuilder::filter` —
@@ -2812,10 +2812,10 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
     let df_schema = df.schema().inner().clone();
     let ws_schema = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
 
-    // Change C: when the shard is wired in we know there are large per-tenant
+    // Change C: when the shard is wired in we know there are large per-project
     // tails on the same runtime. Move the DataFusion executor onto the
     // blocking thread pool so its parquet-decode loop can't pin the
-    // cooperative tokio workers a quiet tenant's point queries run on. Tests
+    // cooperative tokio workers a quiet project's point queries run on. Tests
     // that run without a shard keep the single-await path and behave as
     // before.
     let df_batches = if sess.engine.config().shard.is_some() {
@@ -2858,7 +2858,7 @@ async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> 
 /// Tables with `rls_enabled = false` short-circuit — they pay one catalog
 /// `load_table` call and nothing else, preserving the no-RLS hot path.
 async fn apply_rls_to_select(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     sql: &str,
     df: datafusion::prelude::DataFrame,
 ) -> Result<datafusion::prelude::DataFrame> {
@@ -2879,7 +2879,7 @@ async fn apply_rls_to_select(
     }
     let policies = crate::rls::build_policies_for_query(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         &referenced,
         &sess.current_user,
         basin_catalog::PolicyCommand::Select,
@@ -2897,12 +2897,12 @@ async fn apply_rls_to_select(
 /// `ALTER TABLE … ENABLE/DISABLE ROW LEVEL SECURITY` writes through to the
 /// catalog), and a per-query catalog hop is an O(microsecond) cost on the
 /// SELECT path that's already doing one anyway.
-async fn table_has_rls(sess: &TenantSession, table: &TableName) -> Result<bool> {
+async fn table_has_rls(sess: &ProjectSession, table: &TableName) -> Result<bool> {
     let meta = sess
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, table)
+        .load_table(&sess.project, table)
         .await?;
     Ok(meta.rls_enabled)
 }
@@ -2910,12 +2910,12 @@ async fn table_has_rls(sess: &TenantSession, table: &TableName) -> Result<bool> 
 /// Companion of [`table_has_rls`] for the soft-delete predicate-injection
 /// gate. Tables without a SOFT DELETE column take the simple-select fast
 /// path unchanged.
-async fn table_has_soft_delete(sess: &TenantSession, table: &TableName) -> Result<bool> {
+async fn table_has_soft_delete(sess: &ProjectSession, table: &TableName) -> Result<bool> {
     let meta = sess
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, table)
+        .load_table(&sess.project, table)
         .await?;
     Ok(crate::types::soft_delete_column(meta.schema.as_ref()).is_some())
 }
@@ -2926,7 +2926,7 @@ async fn table_has_soft_delete(sess: &TenantSession, table: &TableName) -> Resul
 /// predicate source. When `INCLUDE DELETED` was specified the caller skips
 /// this step entirely.
 async fn apply_soft_delete_to_select(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     sql: &str,
     df: datafusion::prelude::DataFrame,
 ) -> Result<datafusion::prelude::DataFrame> {
@@ -2951,7 +2951,7 @@ async fn apply_soft_delete_to_select(
             .engine
             .config()
             .catalog
-            .load_table(&sess.tenant, table)
+            .load_table(&sess.project, table)
             .await
         {
             Ok(m) => m,
@@ -3167,13 +3167,13 @@ fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
 /// here — RLS state is consulted at SELECT time by re-reading the catalog
 /// (per-query) so a freshly created policy takes effect on the very next
 /// query without per-session bookkeeping.
-async fn exec_rls_ddl(sess: &TenantSession, ddl: crate::rls::RlsDdl) -> Result<ExecResult> {
+async fn exec_rls_ddl(sess: &ProjectSession, ddl: crate::rls::RlsDdl) -> Result<ExecResult> {
     let table = ddl.table().clone();
     let meta = sess
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await?;
     let mut rls_enabled = meta.rls_enabled;
     let mut policies = meta.policies.clone();
@@ -3181,7 +3181,7 @@ async fn exec_rls_ddl(sess: &TenantSession, ddl: crate::rls::RlsDdl) -> Result<E
     sess.engine
         .config()
         .catalog
-        .set_rls_state(&sess.tenant, &table, rls_enabled, policies)
+        .set_rls_state(&sess.project, &table, rls_enabled, policies)
         .await?;
     Ok(ExecResult::Empty { tag: tag.into() })
 }
@@ -3193,13 +3193,13 @@ async fn exec_rls_ddl(sess: &TenantSession, ddl: crate::rls::RlsDdl) -> Result<E
 /// `SET BLOOM FILTERS ON`, etc.) are intercepted at the very top of
 /// [`execute`] before sqlparser is even called.
 async fn exec_alter_table(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: sqlparser::ast::ObjectName,
     operations: Vec<sqlparser::ast::AlterTableOperation>,
 ) -> Result<ExecResult> {
     let tag = crate::alter::apply_standard_alter_table(
         &sess.engine.config().catalog,
-        &sess.tenant,
+        &sess.project,
         &name,
         &operations,
     )
@@ -3211,18 +3211,18 @@ async fn exec_alter_table(
     // of the AST.
     if name.0.len() == 1 {
         if let Ok(t) = TableName::new(name.0[0].value.clone()) {
-            refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &t).await?;
+            refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &t).await?;
         }
     }
     Ok(ExecResult::Empty { tag: tag.into() })
 }
 
-async fn exec_show_tables(sess: &TenantSession) -> Result<ExecResult> {
+async fn exec_show_tables(sess: &ProjectSession) -> Result<ExecResult> {
     let tables = sess
         .engine
         .config()
         .catalog
-        .list_tables(&sess.tenant)
+        .list_tables(&sess.project)
         .await?;
     let names: Vec<&str> = tables.iter().map(|t| t.as_str()).collect();
     let arr = StringArray::from(names);
@@ -3242,7 +3242,7 @@ async fn exec_show_tables(sess: &TenantSession) -> Result<ExecResult> {
 /// Pull a bare table name out of a sqlparser `ObjectName`.
 ///
 /// Accepts both bare names (`t`) and schema-qualified names (`myschema.t`).
-/// The schema qualifier is stripped: Basin's flat per-tenant model stores all
+/// The schema qualifier is stripped: Basin's flat per-project model stores all
 /// tables in a single catalog namespace. Callers that need to validate the
 /// schema against the session's schema registry should call
 /// `crate::schema_ddl::table_name_from_object` instead.
@@ -3269,7 +3269,7 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
 /// registry.  WITH HOLD is silently accepted but not implemented (cursors die
 /// with the session regardless).
 async fn exec_declare(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     stmts: Vec<sqlparser::ast::Declare>,
 ) -> Result<ExecResult> {
     use sqlparser::ast::DeclareType;
@@ -3315,7 +3315,7 @@ async fn exec_declare(
 
 /// Execute `FETCH [direction] FROM <cursor>`.
 async fn exec_fetch(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     cursor_name: &str,
     direction: sqlparser::ast::FetchDirection,
 ) -> Result<ExecResult> {
@@ -3330,7 +3330,7 @@ async fn exec_fetch(
 
 /// Execute `CLOSE <cursor>` (or `CLOSE ALL`).
 async fn exec_close(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     cursor: sqlparser::ast::CloseCursor,
 ) -> Result<ExecResult> {
     use sqlparser::ast::CloseCursor;
@@ -3353,7 +3353,7 @@ async fn exec_close(
 
 /// Execute `MOVE <direction> [FROM|IN] <cursor>`.
 async fn exec_cursor_move(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     intent: crate::cursor::MoveIntent,
 ) -> Result<ExecResult> {
     sess.state

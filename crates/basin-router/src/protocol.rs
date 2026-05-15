@@ -3,7 +3,7 @@
 //! The structure is:
 //!
 //! 1. A small internal trait `Session` abstracts whatever runs the SQL. The
-//!    real implementation forwards to `basin_engine::TenantSession`; tests
+//!    real implementation forwards to `basin_engine::ProjectSession`; tests
 //!    inject a fake. We *do not* add a trait to basin-engine — the abstraction
 //!    lives entirely in this crate.
 //! 2. `simple_query_messages` produces the full sequence of backend messages
@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use basin_common::Result;
 use basin_engine::{
     AuthContext, BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema,
-    TenantSession,
+    ProjectSession,
 };
 use futures::sink::{Sink, SinkExt};
 use pgwire::api::auth::{
@@ -70,10 +70,10 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 use tokio::sync::Mutex;
 
 use crate::error::error_response;
-use crate::resolver::TenantResolver;
+use crate::resolver::ProjectResolver;
 use crate::types::{arrow_to_pg_type, encode_batches, row_description};
 
-/// Internal trait abstracting whatever runs SQL. `TenantSession` implements it
+/// Internal trait abstracting whatever runs SQL. `ProjectSession` implements it
 /// transparently; tests substitute a fake.
 ///
 /// The prepared-statement methods mirror the engine API one-for-one. Default
@@ -81,11 +81,11 @@ use crate::types::{arrow_to_pg_type, encode_batches, row_description};
 /// implement what they exercise.
 #[async_trait]
 pub(crate) trait Session: Send + Sync {
-    /// Tenant this session belongs to. Stable for the session's lifetime.
-    /// Used by the per-tenant rate limiter (see [`crate::rate_limit`])
-    /// to key the token bucket without re-resolving the tenant on every
+    /// Project this session belongs to. Stable for the session's lifetime.
+    /// Used by the per-project rate limiter (see [`crate::rate_limit`])
+    /// to key the token bucket without re-resolving the project on every
     /// query.
-    fn tenant(&self) -> basin_common::TenantId;
+    fn project(&self) -> basin_common::ProjectId;
 
     async fn execute(&self, sql: &str) -> Result<ExecResult>;
 
@@ -99,7 +99,7 @@ pub(crate) trait Session: Send + Sync {
 
     async fn execute_bound(&self, bound: BoundStatement) -> Result<ExecResult>;
 
-    /// Mirror of [`basin_engine::TenantSession::describe_statement`]. The
+    /// Mirror of [`basin_engine::ProjectSession::describe_statement`]. The
     /// router caches schemas at parse time so this is unused on the hot path,
     /// but the trait keeps it for parity with the engine API.
     #[allow(dead_code)]
@@ -109,17 +109,17 @@ pub(crate) trait Session: Send + Sync {
 }
 
 #[async_trait]
-impl Session for TenantSession {
-    fn tenant(&self) -> basin_common::TenantId {
-        TenantSession::tenant(self)
+impl Session for ProjectSession {
+    fn project(&self) -> basin_common::ProjectId {
+        ProjectSession::project(self)
     }
 
     async fn execute(&self, sql: &str) -> Result<ExecResult> {
-        TenantSession::execute(self, sql).await
+        ProjectSession::execute(self, sql).await
     }
 
     async fn prepare(&self, sql: &str) -> Result<(StatementHandle, StatementSchema)> {
-        TenantSession::prepare(self, sql).await
+        ProjectSession::prepare(self, sql).await
     }
 
     async fn bind(
@@ -127,19 +127,19 @@ impl Session for TenantSession {
         handle: &StatementHandle,
         params: Vec<ScalarParam>,
     ) -> Result<BoundStatement> {
-        TenantSession::bind(self, handle, params).await
+        ProjectSession::bind(self, handle, params).await
     }
 
     async fn execute_bound(&self, bound: BoundStatement) -> Result<ExecResult> {
-        TenantSession::execute_bound(self, bound).await
+        ProjectSession::execute_bound(self, bound).await
     }
 
     async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema> {
-        TenantSession::describe_statement(self, handle).await
+        ProjectSession::describe_statement(self, handle).await
     }
 
     async fn close_statement(&self, handle: &StatementHandle) {
-        TenantSession::close_statement(self, handle).await
+        ProjectSession::close_statement(self, handle).await
     }
 }
 
@@ -1312,7 +1312,7 @@ pub(crate) struct BasinExtendedQueryHandler<S: Session + 'static> {
     session_slot: Arc<Mutex<Option<Arc<S>>>>,
     state: Arc<Mutex<ExtendedState>>,
     /// See [`BasinSimpleQueryHandlerSlot::rate_limit`]; identical
-    /// semantics — `None` disables, `Some` enforces per-tenant qps.
+    /// semantics — `None` disables, `Some` enforces per-project qps.
     rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
     /// Per-connection in-flight `COPY FROM STDIN` slot. Shared with
     /// `BasinSimpleQueryHandlerSlot` so the framework's `CopyHandler`
@@ -1395,12 +1395,12 @@ impl<S: Session + 'static> ExtendedQueryHandler for BasinExtendedQueryHandler<S>
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
         let session = self.require_session().await?;
-        // Per-tenant rate limit. Same shape as the simple-query path:
+        // Per-project rate limit. Same shape as the simple-query path:
         // emit one ErrorResponse + transition back to Idle when the
         // bucket is dry. We don't emit ReadyForQuery here because the
         // pgwire extended-query state machine will emit one after Sync.
         if let Some(rl) = &self.rate_limit {
-            if rl.check(&session.tenant()).is_err() {
+            if rl.check(&session.project()).is_err() {
                 client
                     .feed(PgWireBackendMessage::ErrorResponse(
                         crate::error::rate_limit_exceeded_response(),
@@ -1543,13 +1543,13 @@ impl<S: Session + 'static> ExtendedQueryHandler for BasinExtendedQueryHandler<S>
 /// Startup handler:
 /// 1. Acks `Startup`, replies with `CleartextPassword`.
 /// 2. Accepts any password (PoC).
-/// 3. Resolves the username -> tenant via the resolver.
+/// 3. Resolves the username -> project via the resolver.
 /// 4. Opens an engine session and stores it in the per-connection slot, so
 ///    the simple-query handler can reach it later. If anything fails an
 ///    `ErrorResponse` is sent and the connection is closed.
 pub(crate) struct BasinStartupHandler<F: SessionFactory + 'static> {
     factory: Arc<F>,
-    resolver: Arc<dyn TenantResolver>,
+    resolver: Arc<dyn ProjectResolver>,
     /// Per-connection session slot. Filled in once the user authenticates.
     slot: Arc<Mutex<Option<Arc<F::Session>>>>,
 }
@@ -1557,7 +1557,7 @@ pub(crate) struct BasinStartupHandler<F: SessionFactory + 'static> {
 impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
     pub(crate) fn new(
         factory: Arc<F>,
-        resolver: Arc<dyn TenantResolver>,
+        resolver: Arc<dyn ProjectResolver>,
         slot: Arc<Mutex<Option<Arc<F::Session>>>>,
     ) -> Self {
         Self {
@@ -1601,9 +1601,9 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
                 // it to the resolver. Resolvers that don't care about
                 // passwords (JWT, API-key, static) ignore it via the
                 // default `resolve_credentials` impl. The
-                // `TenantCredentialsResolver` consults it to bcrypt-verify.
+                // `ProjectCredentialsResolver` consults it to bcrypt-verify.
                 let password = pwd.into_password().map(|p| p.password).unwrap_or_default();
-                let tenant = self
+                let project = self
                     .resolver
                     .resolve_credentials(&user, &password)
                     .await
@@ -1622,7 +1622,7 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
                         )))
                     })?;
 
-                let session = self.factory.open(tenant, &user).await.map_err(|e| {
+                let session = self.factory.open(project, &user).await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "FATAL".to_owned(),
                         "XX000".to_owned(),
@@ -1632,7 +1632,7 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
 
                 *self.slot.lock().await = Some(session);
 
-                tracing::info!(%tenant, %user, "tenant authenticated");
+                tracing::info!(%project, %user, "project authenticated");
 
                 finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
             }
@@ -1643,21 +1643,21 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
 }
 
 /// Engine-shaped trait the startup handler can call to materialize a session
-/// for an authenticated tenant. We define this rather than depend on `Engine`
+/// for an authenticated project. We define this rather than depend on `Engine`
 /// directly so the test path can substitute a fake without touching the real
 /// engine (whose body is still `unimplemented!()`).
 ///
 /// `_username` is the original pgwire `user` parameter (after JWT/static
-/// resolution to the same `TenantId`). The single-process and pool factories
+/// resolution to the same `ProjectId`). The single-process and pool factories
 /// ignore it; the remote-shard factory uses it as the upstream `user`
-/// parameter so the upstream router resolves the same tenant. New
+/// parameter so the upstream router resolves the same project. New
 /// implementations should default-impl-ignore it for backward compatibility.
 #[async_trait]
 pub(crate) trait SessionFactory: Send + Sync {
     type Session: Session + 'static;
     async fn open(
         &self,
-        tenant: basin_common::TenantId,
+        project: basin_common::ProjectId,
         _username: &str,
     ) -> Result<Arc<Self::Session>>;
 }
@@ -1699,7 +1699,7 @@ fn auth_context_from_username(
     let Some(auth_svc) = auth else {
         return AuthContext::anonymous();
     };
-    // Strip optional `Bearer ` prefix — same as `JwtTenantResolver`.
+    // Strip optional `Bearer ` prefix — same as `JwtProjectResolver`.
     let token = username.strip_prefix("Bearer ").unwrap_or(username);
     match auth_svc.verify_jwt(token) {
         Ok(claims) => {
@@ -1729,30 +1729,30 @@ fn auth_context_from_username(
 
 #[async_trait]
 impl SessionFactory for EngineSessionFactory {
-    type Session = TenantSession;
+    type Session = ProjectSession;
     async fn open(
         &self,
-        tenant: basin_common::TenantId,
+        project: basin_common::ProjectId,
         username: &str,
-    ) -> Result<Arc<TenantSession>> {
+    ) -> Result<Arc<ProjectSession>> {
         let auth_ctx = auth_context_from_username(username, self.auth.as_deref());
         let s = self
             .engine
-            .open_session_with_auth(tenant, username, auth_ctx)
+            .open_session_with_auth(project, username, auth_ctx)
             .await?;
         Ok(Arc::new(s))
     }
 }
 
 /// Bridge to `basin_pool::SessionPool`. Acquires a `PooledSession` whose
-/// `Drop` returns the underlying `TenantSession` to the pool when the
+/// `Drop` returns the underlying `ProjectSession` to the pool when the
 /// connection's session slot is cleared (i.e. when the per-connection state
 /// goes away).
 ///
 /// `client_key` is `None` for now; the JWT-aware path that derives a
-/// per-user key from the bearer token is layered on by `JwtTenantResolver`
+/// per-user key from the bearer token is layered on by `JwtProjectResolver`
 /// elsewhere — keeping the pool key here `None` matches today's "username
-/// is the tenant" world.
+/// is the project" world.
 pub(crate) struct PooledSessionFactory {
     pool: Arc<basin_pool::SessionPool>,
 }
@@ -1764,7 +1764,7 @@ impl PooledSessionFactory {
 }
 
 /// Per-connection wrapper that owns the `PooledSession`. We forward the
-/// `Session` trait through to the underlying `TenantSession`. Holding the
+/// `Session` trait through to the underlying `ProjectSession`. Holding the
 /// `PooledSession` for the lifetime of the connection's slot is what keeps
 /// the engine session checked-out; when the slot drops, the wrapper drops,
 /// the `PooledSession` drops, and the engine session goes back to the pool.
@@ -1774,8 +1774,8 @@ pub(crate) struct PooledSessionWrapper {
 
 #[async_trait]
 impl Session for PooledSessionWrapper {
-    fn tenant(&self) -> basin_common::TenantId {
-        self.pooled.tenant()
+    fn project(&self) -> basin_common::ProjectId {
+        self.pooled.project()
     }
 
     async fn execute(&self, sql: &str) -> Result<ExecResult> {
@@ -1812,10 +1812,10 @@ impl SessionFactory for PooledSessionFactory {
     type Session = PooledSessionWrapper;
     async fn open(
         &self,
-        tenant: basin_common::TenantId,
+        project: basin_common::ProjectId,
         _username: &str,
     ) -> Result<Arc<PooledSessionWrapper>> {
-        let pooled = self.pool.acquire(tenant, None).await?;
+        let pooled = self.pool.acquire(project, None).await?;
         Ok(Arc::new(PooledSessionWrapper { pooled }))
     }
 }
@@ -1872,7 +1872,7 @@ impl<F: SessionFactory + 'static> PgWireServerHandlers for BasinHandlers<F> {
 /// hands in `slot` and `rate_limit` only.
 pub(crate) struct BasinSimpleQueryHandlerSlot<S: Session + 'static> {
     pub(crate) slot: Arc<Mutex<Option<Arc<S>>>>,
-    /// Optional per-tenant rate limiter shared across every connection
+    /// Optional per-project rate limiter shared across every connection
     /// for the lifetime of the router. `None` (the default) disables
     /// throttling so existing demos/benches keep their unbounded
     /// throughput; `Some` is set when `BASIN_PGWIRE_RATE_LIMIT_QPS > 0`.
@@ -1915,11 +1915,11 @@ impl<S: Session + 'static> SimpleQueryHandler for BasinSimpleQueryHandlerSlot<S>
                 )
             })?
         };
-        // Per-tenant rate limit (Phase 6): when enabled, drop the query
-        // before it touches the engine if the tenant has burned their
+        // Per-project rate limit (Phase 6): when enabled, drop the query
+        // before it touches the engine if the project has burned their
         // budget. Map to SQLSTATE 53400 (configuration_limit_exceeded).
         if let Some(rl) = &self.rate_limit {
-            if rl.check(&session.tenant()).is_err() {
+            if rl.check(&session.project()).is_err() {
                 if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
                     return Err(PgWireError::NotReadyForQuery);
                 }
@@ -2365,8 +2365,8 @@ mod tests {
 
     #[async_trait]
     impl Session for FakeSession {
-        fn tenant(&self) -> basin_common::TenantId {
-            basin_common::TenantId::new()
+        fn project(&self) -> basin_common::ProjectId {
+            basin_common::ProjectId::new()
         }
 
         async fn execute(&self, _sql: &str) -> Result<ExecResult> {
@@ -2563,8 +2563,8 @@ mod tests {
 
     #[async_trait]
     impl Session for ScriptedSession {
-        fn tenant(&self) -> basin_common::TenantId {
-            basin_common::TenantId::new()
+        fn project(&self) -> basin_common::ProjectId {
+            basin_common::ProjectId::new()
         }
         async fn execute(&self, sql: &str) -> Result<ExecResult> {
             self.executed.lock().await.push(sql.to_string());
@@ -2687,8 +2687,8 @@ mod tests {
 
     #[async_trait]
     impl Session for SubstSession {
-        fn tenant(&self) -> basin_common::TenantId {
-            basin_common::TenantId::new()
+        fn project(&self) -> basin_common::ProjectId {
+            basin_common::ProjectId::new()
         }
 
         async fn execute(&self, _sql: &str) -> Result<ExecResult> {
@@ -2908,7 +2908,7 @@ mod tests {
     }
 
     /// Drive `PooledSessionFactory::open` end-to-end against a real `Engine` +
-    /// `SessionPool`. Two sequential `open`s for the same tenant should hit
+    /// `SessionPool`. Two sequential `open`s for the same project should hit
     /// the pool's cached session on the second call (one miss, one hit) — this
     /// is what `BasinStartupHandler` will exercise once it's running over a
     /// pool.
@@ -2936,13 +2936,13 @@ mod tests {
             basin_pool::PoolConfig::default(),
         ));
         let factory = super::PooledSessionFactory::new(pool.clone());
-        let tenant = basin_common::TenantId::new();
+        let project = basin_common::ProjectId::new();
 
         // First open is a cold miss, releases on Drop, so the second sees the
         // cached session.
-        let s1 = factory.open(tenant, "alice").await.unwrap();
+        let s1 = factory.open(project, "alice").await.unwrap();
         drop(s1);
-        let s2 = factory.open(tenant, "alice").await.unwrap();
+        let s2 = factory.open(project, "alice").await.unwrap();
         drop(s2);
 
         let stats = pool.stats();

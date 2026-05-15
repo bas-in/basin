@@ -6,8 +6,8 @@
 //! see basin-router's module docs), and asserts:
 //!
 //! 1. The query results round-trip correctly.
-//! 2. Two tenants writing to a same-named table see only their own rows.
-//! 3. Parquet files actually land on disk under `tenants/{tenant}/...`.
+//! 2. Two projects writing to a same-named table see only their own rows.
+//! 3. Parquet files actually land on disk under `projects/{project}/...`.
 //!
 //! This is the test that proves the four-layer stack composes.
 
@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use basin_common::TenantId;
-use basin_router::{ServerConfig, StaticTenantResolver};
+use basin_common::ProjectId;
+use basin_router::{ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -27,8 +27,8 @@ struct TestServer {
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _join: tokio::task::JoinHandle<basin_common::Result<()>>,
     data_dir: TempDir,
-    alice: TenantId,
-    bob: TenantId,
+    alice: ProjectId,
+    bob: ProjectId,
 }
 
 async fn start_server() -> TestServer {
@@ -49,17 +49,17 @@ async fn start_server() -> TestServer {
         shard: None,
     });
 
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     let mut map = HashMap::new();
     map.insert("alice".to_owned(), alice);
     map.insert("bob".to_owned(), bob);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -146,8 +146,8 @@ async fn poc_pgwire_end_to_end_create_insert_select() {
     assert_eq!(rows[2], vec![Some("3".into()), Some("third".into())]);
 
     // Parquet must actually be on disk under alice's prefix, and only there.
-    let alice_prefix = format!("tenants/{}", server.alice);
-    let bob_prefix = format!("tenants/{}", server.bob);
+    let alice_prefix = format!("projects/{}", server.alice);
+    let bob_prefix = format!("projects/{}", server.bob);
     let mut alice_files = 0;
     let mut bob_files = 0;
     for entry in WalkDir::new(server.data_dir.path()).into_iter().flatten() {
@@ -166,12 +166,12 @@ async fn poc_pgwire_end_to_end_create_insert_select() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn poc_pgwire_two_tenants_isolated() {
+async fn poc_pgwire_two_projects_isolated() {
     let server = start_server().await;
     let alice = connect(server.addr, "alice").await;
     let bob = connect(server.addr, "bob").await;
 
-    // Both tenants create the *same-named* table with different rows.
+    // Both projects create the *same-named* table with different rows.
     for c in [&alice, &bob] {
         c.simple_query("CREATE TABLE shared (who TEXT NOT NULL, id BIGINT NOT NULL)")
             .await

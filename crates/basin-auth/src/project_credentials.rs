@@ -1,27 +1,27 @@
-//! Per-tenant pgwire credentials.
+//! Per-project pgwire credentials.
 //!
-//! One row per tenant in `auth_tenant_credentials`. Each row maps a public
+//! One row per project in `auth_project_credentials`. Each row maps a public
 //! `pgwire_user` (the literal string a customer pastes into a Postgres URL,
-//! e.g. `01JBAS1NAVTH00000000000000_a1b2c3d4`) to a tenant id, a
+//! e.g. `01JBAS1NAVTH00000000000000_a1b2c3d4`) to a project id, a
 //! bcrypt-hashed password, and a `dbname`. Validation is bcrypt-only — no
 //! second sha256 fast path — because the authentication boundary on a pgwire
 //! connection is per-connection (cheap enough at 12-cost bcrypt for the
 //! wedge).
 //!
 //! Plaintext passwords leave this module exactly twice: from
-//! `provision_tenant_db` and from `rotate_pgwire_password`. After that, the
+//! `provision_project_db` and from `rotate_pgwire_password`. After that, the
 //! plaintext is permanently gone — only the bcrypt hash and the public
 //! descriptor survive.
 //!
 //! ## pgwire_user format
 //!
-//! `{tenant_id}_{8 hex chars}` where tenant_id is the full 26-char ULID.
+//! `{project_id}_{8 hex chars}` where project_id is the full 26-char ULID.
 //! Example: `01JBAS1NAVTH00000000000000_a1b2c3d4`.
-//! The tenant_id is embedded so callers can extract it without a DB round-trip
-//! using [`parse_tenant_from_pgwire_user`].
+//! The project_id is embedded so callers can extract it without a DB round-trip
+//! using [`parse_project_from_pgwire_user`].
 
 use base64::Engine;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 
@@ -33,29 +33,29 @@ use crate::{password, Inner};
 /// the whole point of choosing this alphabet over the standard one.
 const PASSWORD_BYTES: usize = 24;
 
-/// Public-facing descriptor for `list_tenant_credentials`. Carries the
+/// Public-facing descriptor for `list_project_credentials`. Carries the
 /// columns an operator needs to render a credentials page; never the hash,
 /// never the plaintext.
 #[derive(Debug, Clone)]
-pub struct TenantCredentialDescriptor {
+pub struct ProjectCredentialDescriptor {
     pub id: i64,
-    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
     pub pgwire_user: String,
     pub dbname: String,
     pub created_at: DateTime<Utc>,
     pub rotated_at: Option<DateTime<Utc>>,
 }
 
-/// Returned exactly once from `provision_tenant_db` and `rotate_pgwire_password`.
+/// Returned exactly once from `provision_project_db` and `rotate_pgwire_password`.
 /// The `password_secret` field is the only place the plaintext exists outside
 /// the customer's clipboard; after the response goes out, it's gone.
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
-    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
     pub pgwire_user: String,
     pub dbname: String,
     /// Plaintext password — present only on the response from
-    /// `provision_tenant_db` / `rotate_pgwire_password`, never returned again.
+    /// `provision_project_db` / `rotate_pgwire_password`, never returned again.
     pub password_secret: String,
     /// Convenience: a complete `postgres://user:password@host/dbname` URL
     /// the customer can paste into psql / tokio-postgres / asyncpg / JDBC.
@@ -63,14 +63,14 @@ pub struct ConnectionInfo {
 }
 
 /// Generate a pgwire username in the new ADR-0013 format:
-/// `{26-char-tenant-ulid}_{8 hex chars}`. The tenant ULID embedded in the
+/// `{26-char-project-ulid}_{8 hex chars}`. The project ULID embedded in the
 /// username makes it self-routing — the pgwire auth handler can call
-/// [`parse_tenant_from_pgwire_user`] to resolve the tenant without a global
+/// [`parse_project_from_pgwire_user`] to resolve the project without a global
 /// DB lookup, even before the password has been verified.
-fn generate_pgwire_user(tenant: &TenantId) -> String {
+fn generate_pgwire_user(project: &ProjectId) -> String {
     let mut buf = [0u8; 4];
     rand::thread_rng().fill_bytes(&mut buf);
-    format!("{}_{}", tenant.to_string(), hex::encode(buf))
+    format!("{}_{}", project.to_string(), hex::encode(buf))
 }
 
 fn generate_password() -> String {
@@ -79,27 +79,27 @@ fn generate_password() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-/// Returns `true` if `pgwire_user` is in the pre-ADR-0013 `tenant_<hex>`
-/// format, which does not embed the tenant ULID and therefore requires a DB
-/// lookup to resolve the tenant. Credentials in this format must be migrated
+/// Returns `true` if `pgwire_user` is in the pre-ADR-0013 `project_<hex>`
+/// format, which does not embed the project ULID and therefore requires a DB
+/// lookup to resolve the project. Credentials in this format must be migrated
 /// to the new `{26-char-ulid}_{hex}` format via
 /// [`migrate_legacy_credential`] before the self-routing path can be used.
 ///
 /// The check is deliberately conservative: only strings that start with
-/// `"tenant_"` AND are shorter than 20 chars are treated as legacy (the old
-/// format is `tenant_` + 8 hex chars = 15 chars; the new format is at least
+/// `"project_"` AND are shorter than 20 chars are treated as legacy (the old
+/// format is `project_` + 8 hex chars = 15 chars; the new format is at least
 /// 28 chars).
 pub fn is_legacy_pgwire_user(pgwire_user: &str) -> bool {
-    pgwire_user.starts_with("tenant_") && pgwire_user.len() < 20
+    pgwire_user.starts_with("project_") && pgwire_user.len() < 20
 }
 
-/// Extract the 26-character tenant ULID from a new-format pgwire username
+/// Extract the 26-character project ULID from a new-format pgwire username
 /// (`{26-char-ulid}_{suffix}`). This makes credential validation self-routing:
-/// the pgwire handler can identify the tenant from the username alone without a
-/// global DB lookup, enabling efficient per-tenant auth table access. Returns
-/// `None` for usernames that don't match the format (e.g. legacy `tenant_<hex>`
+/// the pgwire handler can identify the project from the username alone without a
+/// global DB lookup, enabling efficient per-project auth table access. Returns
+/// `None` for usernames that don't match the format (e.g. legacy `project_<hex>`
 /// credentials).
-pub fn parse_tenant_from_pgwire_user(pgwire_user: &str) -> Option<&str> {
+pub fn parse_project_from_pgwire_user(pgwire_user: &str) -> Option<&str> {
     // ULID is 26 chars, followed by '_'
     if pgwire_user.len() > 27 && pgwire_user.as_bytes()[26] == b'_' {
         Some(&pgwire_user[..26])
@@ -109,7 +109,7 @@ pub fn parse_tenant_from_pgwire_user(pgwire_user: &str) -> Option<&str> {
 }
 
 /// Validate that a pgwire_user matches the new `{26-char-ulid}_{hex}` format.
-/// Also accepts the legacy `tenant_{hex}` format for backwards-compat reads.
+/// Also accepts the legacy `project_{hex}` format for backwards-compat reads.
 fn validate_pgwire_user_format(s: &str) -> Result<()> {
     // New format: 26-char ULID + '_' + hex suffix
     if s.len() > 27 && s.as_bytes()[26] == b'_' {
@@ -118,8 +118,8 @@ fn validate_pgwire_user_format(s: &str) -> Result<()> {
             return Ok(());
         }
     }
-    // Legacy format: `tenant_<hex>`
-    if s.starts_with("tenant_") {
+    // Legacy format: `project_<hex>`
+    if s.starts_with("project_") {
         let suffix = &s[7..];
         if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(());
@@ -160,7 +160,7 @@ fn build_connection_url(host: &str, user: &str, password: &str, dbname: &str) ->
 
 pub(crate) async fn provision(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     dbname: Option<&str>,
 ) -> Result<ConnectionInfo> {
     let dbname = dbname.unwrap_or("basin");
@@ -170,19 +170,19 @@ pub(crate) async fn provision(
     // for v0.1, but the UNIQUE index can still kick on a duplicate.
     let mut last_err = None;
     for _ in 0..4 {
-        let user = generate_pgwire_user(tenant);
+        let user = generate_pgwire_user(project);
         validate_pgwire_user_format(&user)?;
         let secret = generate_password();
         let hash = password::hash(&secret, inner.cfg.bcrypt_cost)?;
         let inserted = inner
             .store
-            .insert_tenant_credential(tenant, &user, &hash, dbname)
+            .insert_project_credential(project, &user, &hash, dbname)
             .await?;
         if inserted {
             let connection_url =
                 build_connection_url(&inner.cfg.pgwire_public_host, &user, &secret, dbname);
             return Ok(ConnectionInfo {
-                tenant_id: *tenant,
+                project_id: *project,
                 pgwire_user: user,
                 dbname: dbname.to_owned(),
                 password_secret: secret,
@@ -195,10 +195,10 @@ pub(crate) async fn provision(
         }
     }
     Err(last_err
-        .unwrap_or_else(|| BasinError::internal("provision_tenant_db: exhausted user retries")))
+        .unwrap_or_else(|| BasinError::internal("provision_project_db: exhausted user retries")))
 }
 
-pub(crate) async fn validate(inner: &Inner, user: &str, password_plain: &str) -> Result<TenantId> {
+pub(crate) async fn validate(inner: &Inner, user: &str, password_plain: &str) -> Result<ProjectId> {
     // Uniform error for both "no such user" and "user exists but wrong
     // password" — keeps the SQLSTATE 28P01 surface minimal and avoids
     // leaking enumeration information. bcrypt's constant-ish work factor
@@ -207,18 +207,18 @@ pub(crate) async fn validate(inner: &Inner, user: &str, password_plain: &str) ->
     if user.is_empty() {
         return Err(unknown());
     }
-    let row = inner.store.find_tenant_credential(user).await?;
+    let row = inner.store.find_project_credential(user).await?;
     let Some(row) = row else {
         return Err(unknown());
     };
     if !password::verify(password_plain, &row.password_hash)? {
         return Err(unknown());
     }
-    let tenant: TenantId = row
-        .tenant_id
+    let project: ProjectId = row
+        .project_id
         .parse()
-        .map_err(|e| BasinError::internal(format!("tenant_credentials tenant parse: {e}")))?;
-    Ok(tenant)
+        .map_err(|e| BasinError::internal(format!("project_credentials project parse: {e}")))?;
+    Ok(project)
 }
 
 pub(crate) async fn rotate(inner: &Inner, pgwire_user: &str) -> Result<ConnectionInfo> {
@@ -227,17 +227,17 @@ pub(crate) async fn rotate(inner: &Inner, pgwire_user: &str) -> Result<Connectio
     let hash = password::hash(&secret, inner.cfg.bcrypt_cost)?;
     let row = inner
         .store
-        .rotate_tenant_credential(pgwire_user, &hash)
+        .rotate_project_credential(pgwire_user, &hash)
         .await?;
     let Some(row) = row else {
         return Err(BasinError::not_found(format!(
             "pgwire_user {pgwire_user:?}"
         )));
     };
-    let tenant: TenantId = row
-        .tenant_id
+    let project: ProjectId = row
+        .project_id
         .parse()
-        .map_err(|e| BasinError::internal(format!("tenant_credentials tenant parse: {e}")))?;
+        .map_err(|e| BasinError::internal(format!("project_credentials project parse: {e}")))?;
     let connection_url = build_connection_url(
         &inner.cfg.pgwire_public_host,
         pgwire_user,
@@ -245,7 +245,7 @@ pub(crate) async fn rotate(inner: &Inner, pgwire_user: &str) -> Result<Connectio
         &row.dbname,
     );
     Ok(ConnectionInfo {
-        tenant_id: tenant,
+        project_id: project,
         pgwire_user: pgwire_user.to_owned(),
         dbname: row.dbname,
         password_secret: secret,
@@ -255,23 +255,23 @@ pub(crate) async fn rotate(inner: &Inner, pgwire_user: &str) -> Result<Connectio
 
 pub(crate) async fn list(
     inner: &Inner,
-    tenant: &TenantId,
-) -> Result<Vec<TenantCredentialDescriptor>> {
-    inner.store.list_tenant_credentials(tenant).await
+    project: &ProjectId,
+) -> Result<Vec<ProjectCredentialDescriptor>> {
+    inner.store.list_project_credentials(project).await
 }
 
 /// Returns every credential row whose `pgwire_user` is in the old
-/// `tenant_<hex>` format. Used by the upgrade migration to discover rows
-/// that need to be rotated to the new `{tenant_id}_{hex}` format.
+/// `project_<hex>` format. Used by the upgrade migration to discover rows
+/// that need to be rotated to the new `{project_id}_{hex}` format.
 ///
-/// Returns a list of `(tenant_id, old_pgwire_user)` pairs.
-pub(crate) async fn list_legacy(inner: &Inner) -> Result<Vec<(TenantId, String)>> {
-    inner.store.list_legacy_tenant_credentials().await
+/// Returns a list of `(project_id, old_pgwire_user)` pairs.
+pub(crate) async fn list_legacy(inner: &Inner) -> Result<Vec<(ProjectId, String)>> {
+    inner.store.list_legacy_project_credentials().await
 }
 
 /// Rotates a single legacy credential in place:
 ///
-/// 1. Generates a new pgwire_user in the new `{tenant_id}_{hex}` format.
+/// 1. Generates a new pgwire_user in the new `{project_id}_{hex}` format.
 /// 2. Generates a new random password.
 /// 3. Inserts the new credential row.
 /// 4. Deletes the old credential row (only after the insert succeeds).
@@ -285,7 +285,7 @@ pub(crate) async fn list_legacy(inner: &Inner) -> Result<Vec<(TenantId, String)>
 /// `BasinError::NotFound` which the caller should treat as "already done".
 pub(crate) async fn migrate_legacy_credential(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     old_pgwire_user: &str,
 ) -> Result<(String, String)> {
     // Sanity-check: only migrate credentials that actually need it.
@@ -298,21 +298,21 @@ pub(crate) async fn migrate_legacy_credential(
     // Try up to 4 times in case of a username collision (same as provision).
     let mut last_err = None;
     for _ in 0..4 {
-        let new_user = generate_pgwire_user(tenant);
+        let new_user = generate_pgwire_user(project);
         let secret = generate_password();
         let hash = password::hash(&secret, inner.cfg.bcrypt_cost)?;
 
         // INSERT new row first — keep the old row alive until we succeed.
         let inserted = inner
             .store
-            .insert_tenant_credential(tenant, &new_user, &hash, "basin")
+            .insert_project_credential(project, &new_user, &hash, "basin")
             .await?;
 
         if inserted {
             // New row is in place; now remove the old one.
             inner
                 .store
-                .delete_tenant_credential(old_pgwire_user)
+                .delete_project_credential(old_pgwire_user)
                 .await?;
             return Ok((new_user, secret));
         } else {
@@ -329,37 +329,37 @@ pub(crate) async fn migrate_legacy_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use basin_common::TenantId;
+    use basin_common::ProjectId;
 
     #[test]
     fn pgwire_user_format_round_trip() {
-        let tenant = TenantId::new();
-        let u = generate_pgwire_user(&tenant);
+        let project = ProjectId::new();
+        let u = generate_pgwire_user(&project);
         validate_pgwire_user_format(&u).unwrap();
         // 26-char ULID + '_' + 8 hex chars = 35 chars
         assert_eq!(u.len(), 26 + 1 + 8);
-        assert_eq!(&u[..26], tenant.to_string().as_str());
+        assert_eq!(&u[..26], project.to_string().as_str());
     }
 
     #[test]
-    fn parse_tenant_round_trip() {
-        let tenant = TenantId::new();
-        let u = generate_pgwire_user(&tenant);
-        let parsed = parse_tenant_from_pgwire_user(&u).expect("should parse");
-        assert_eq!(parsed, tenant.to_string().as_str());
+    fn parse_project_round_trip() {
+        let project = ProjectId::new();
+        let u = generate_pgwire_user(&project);
+        let parsed = parse_project_from_pgwire_user(&u).expect("should parse");
+        assert_eq!(parsed, project.to_string().as_str());
     }
 
     #[test]
-    fn parse_tenant_rejects_short() {
-        assert!(parse_tenant_from_pgwire_user("tenant_a1b2c3d4").is_none());
-        assert!(parse_tenant_from_pgwire_user("short").is_none());
+    fn parse_project_rejects_short() {
+        assert!(parse_project_from_pgwire_user("project_a1b2c3d4").is_none());
+        assert!(parse_project_from_pgwire_user("short").is_none());
     }
 
     #[test]
     fn pgwire_user_format_rejects_path_injection() {
-        assert!(validate_pgwire_user_format("tenant_../etc").is_err());
+        assert!(validate_pgwire_user_format("project_../etc").is_err());
         assert!(validate_pgwire_user_format("../etc").is_err());
-        assert!(validate_pgwire_user_format("tenant_").is_err());
+        assert!(validate_pgwire_user_format("project_").is_err());
     }
 
     #[test]
@@ -387,70 +387,70 @@ mod tests {
 
     #[test]
     fn connection_url_shape() {
-        let tenant = TenantId::new();
-        let user = generate_pgwire_user(&tenant);
+        let project = ProjectId::new();
+        let user = generate_pgwire_user(&project);
         let u = build_connection_url("db.example.com:5433", &user, "supersecret", "basin");
         assert!(u.starts_with("postgres://"));
         assert!(u.contains("supersecret@db.example.com:5433/basin"));
     }
 
-    // --- parse_tenant_from_pgwire_user: new comprehensive cases ---
+    // --- parse_project_from_pgwire_user: new comprehensive cases ---
 
     #[test]
-    fn parse_tenant_valid_new_format() {
+    fn parse_project_valid_new_format() {
         // Valid new format: exactly 26-char ULID + '_' + any suffix
-        let tenant = TenantId::new();
-        let tenant_str = tenant.to_string();
-        assert_eq!(tenant_str.len(), 26, "TenantId must be 26 chars");
-        let pgwire_user = format!("{tenant_str}_a1b2c3d4");
-        let parsed = parse_tenant_from_pgwire_user(&pgwire_user).expect("must parse new format");
-        assert_eq!(parsed, tenant_str.as_str());
+        let project = ProjectId::new();
+        let project_str = project.to_string();
+        assert_eq!(project_str.len(), 26, "ProjectId must be 26 chars");
+        let pgwire_user = format!("{project_str}_a1b2c3d4");
+        let parsed = parse_project_from_pgwire_user(&pgwire_user).expect("must parse new format");
+        assert_eq!(parsed, project_str.as_str());
     }
 
     #[test]
-    fn parse_tenant_requires_more_than_27_chars() {
+    fn parse_project_requires_more_than_27_chars() {
         // Exactly 27 chars (26 + '_' + nothing) → len == 27, not > 27 → None.
-        let tenant = TenantId::new();
-        let user_no_suffix = format!("{}_", tenant);
+        let project = ProjectId::new();
+        let user_no_suffix = format!("{}_", project);
         assert_eq!(user_no_suffix.len(), 27);
         assert!(
-            parse_tenant_from_pgwire_user(&user_no_suffix).is_none(),
+            parse_project_from_pgwire_user(&user_no_suffix).is_none(),
             "need at least one char after the underscore"
         );
     }
 
     #[test]
-    fn parse_tenant_old_legacy_format_returns_none() {
-        // Old `tenant_<hex>` format does not embed a 26-char ULID → None.
-        assert!(parse_tenant_from_pgwire_user("tenant_a1b2c3d4").is_none());
+    fn parse_project_old_legacy_format_returns_none() {
+        // Old `project_<hex>` format does not embed a 26-char ULID → None.
+        assert!(parse_project_from_pgwire_user("project_a1b2c3d4").is_none());
     }
 
     #[test]
-    fn parse_tenant_no_underscore_at_position_26_returns_none() {
+    fn parse_project_no_underscore_at_position_26_returns_none() {
         // 26 chars with no underscore at all.
-        assert!(parse_tenant_from_pgwire_user("01JBAS1NAVTH00000000000000").is_none());
+        assert!(parse_project_from_pgwire_user("01JBAS1NAVTH00000000000000").is_none());
         // 26 chars + non-underscore separator.
-        assert!(parse_tenant_from_pgwire_user("01JBAS1NAVTH00000000000000-suffix").is_none());
+        assert!(parse_project_from_pgwire_user("01JBAS1NAVTH00000000000000-suffix").is_none());
     }
 
     #[test]
-    fn parse_tenant_too_short_returns_none() {
-        assert!(parse_tenant_from_pgwire_user("abc_def").is_none());
-        assert!(parse_tenant_from_pgwire_user("").is_none());
-        assert!(parse_tenant_from_pgwire_user("_").is_none());
+    fn parse_project_too_short_returns_none() {
+        assert!(parse_project_from_pgwire_user("abc_def").is_none());
+        assert!(parse_project_from_pgwire_user("").is_none());
+        assert!(parse_project_from_pgwire_user("_").is_none());
     }
 
     #[test]
-    fn parse_tenant_self_routing_invariant() {
+    fn parse_project_self_routing_invariant() {
         // Every username generated by `generate_pgwire_user` must parse back
-        // to the exact tenant_id it was generated for.
+        // to the exact project_id it was generated for.
         for _ in 0..20 {
-            let tenant = TenantId::new();
-            let u = generate_pgwire_user(&tenant);
-            let parsed = parse_tenant_from_pgwire_user(&u).expect("generated user must parse");
+            let project = ProjectId::new();
+            let u = generate_pgwire_user(&project);
+            let parsed = parse_project_from_pgwire_user(&u).expect("generated user must parse");
             assert_eq!(
                 parsed,
-                tenant.to_string().as_str(),
+                project.to_string().as_str(),
                 "self-routing invariant broken: generated={u:?} parsed={parsed:?}"
             );
         }
@@ -459,17 +459,17 @@ mod tests {
     // --- is_legacy_pgwire_user ---
 
     #[test]
-    fn is_legacy_true_for_tenant_hex_format() {
-        assert!(is_legacy_pgwire_user("tenant_a1b2c3d4"));
-        assert!(is_legacy_pgwire_user("tenant_deadbeef"));
+    fn is_legacy_true_for_project_hex_format() {
+        assert!(is_legacy_pgwire_user("project_a1b2c3d4"));
+        assert!(is_legacy_pgwire_user("project_deadbeef"));
         // 15 chars total (7 + 8): shorter than 20 → legacy.
-        assert!(is_legacy_pgwire_user("tenant_00000000"));
+        assert!(is_legacy_pgwire_user("project_00000000"));
     }
 
     #[test]
     fn is_legacy_false_for_new_format() {
-        let tenant = TenantId::new();
-        let u = generate_pgwire_user(&tenant);
+        let project = ProjectId::new();
+        let u = generate_pgwire_user(&project);
         assert!(
             !is_legacy_pgwire_user(&u),
             "new-format user must not be flagged legacy: {u:?}"
@@ -482,10 +482,10 @@ mod tests {
     }
 
     #[test]
-    fn is_legacy_false_for_long_tenant_prefix() {
-        // Starts with "tenant_" but is >= 20 chars (new-format collision unlikely
+    fn is_legacy_false_for_long_project_prefix() {
+        // Starts with "project_" but is >= 20 chars (new-format collision unlikely
         // but the boundary is what matters for migration correctness).
-        let long = "tenant_0000000000000"; // 7 + 13 = 20 chars
+        let long = "project_0000000000000"; // 7 + 13 = 20 chars
         assert!(!is_legacy_pgwire_user(long), "length 20 is NOT legacy");
     }
 
@@ -494,6 +494,6 @@ mod tests {
         assert!(!is_legacy_pgwire_user(
             "01JBAS1NAVTH00000000000000_a1b2c3d4"
         ));
-        assert!(!is_legacy_pgwire_user("notatenantatall"));
+        assert!(!is_legacy_pgwire_user("notaprojectatall"));
     }
 }

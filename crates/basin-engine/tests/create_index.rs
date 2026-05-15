@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::{BasinError, TableName, TenantId};
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::{BasinError, TableName, ProjectId};
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -30,8 +30,8 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-async fn open(eng: &Engine) -> TenantSession {
-    eng.open_session(TenantId::new()).await.unwrap()
+async fn open(eng: &Engine) -> ProjectSession {
+    eng.open_session(ProjectId::new()).await.unwrap()
 }
 
 fn assert_empty(res: ExecResult, expected_tag: &str) {
@@ -61,11 +61,11 @@ async fn create_single_column_index_accepted() {
         "CREATE INDEX",
     );
 
-    let tenant = sess.tenant();
+    let project = sess.project();
     let meta = eng
         .config()
         .catalog
-        .load_table(&tenant, &TableName::new("users").unwrap())
+        .load_table(&project, &TableName::new("users").unwrap())
         .await
         .unwrap();
     assert_eq!(meta.indexes.len(), 1);
@@ -75,7 +75,7 @@ async fn create_single_column_index_accepted() {
 
 #[tokio::test]
 async fn create_composite_index_accepted() {
-    // basin-auth's `users_tenant_email ON basin_auth_users (tenant_id, email)`
+    // basin-auth's `users_project_email ON basin_auth_users (project_id, email)`
     // shape — the use case driving this whole feature.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
@@ -84,28 +84,28 @@ async fn create_composite_index_accepted() {
     sess.execute(
         "CREATE TABLE basin_auth_users (\
              id BIGINT PRIMARY KEY, \
-             tenant_id BIGINT NOT NULL, \
+             project_id BIGINT NOT NULL, \
              email TEXT NOT NULL)",
     )
     .await
     .unwrap();
 
-    sess.execute("CREATE INDEX users_tenant_email ON basin_auth_users (tenant_id, email)")
+    sess.execute("CREATE INDEX users_project_email ON basin_auth_users (project_id, email)")
         .await
         .unwrap();
 
-    let tenant = sess.tenant();
+    let project = sess.project();
     let meta = eng
         .config()
         .catalog
-        .load_table(&tenant, &TableName::new("basin_auth_users").unwrap())
+        .load_table(&project, &TableName::new("basin_auth_users").unwrap())
         .await
         .unwrap();
     assert_eq!(meta.indexes.len(), 1);
-    assert_eq!(meta.indexes[0].name, "users_tenant_email");
+    assert_eq!(meta.indexes[0].name, "users_project_email");
     assert_eq!(
         meta.indexes[0].columns,
-        vec!["tenant_id".to_string(), "email".to_string()]
+        vec!["project_id".to_string(), "email".to_string()]
     );
 }
 
@@ -120,11 +120,11 @@ async fn create_index_anonymous_name_synthesized() {
         .unwrap();
     sess.execute("CREATE INDEX ON t (name)").await.unwrap();
 
-    let tenant = sess.tenant();
+    let project = sess.project();
     let meta = eng
         .config()
         .catalog
-        .load_table(&tenant, &TableName::new("t").unwrap())
+        .load_table(&project, &TableName::new("t").unwrap())
         .await
         .unwrap();
     assert_eq!(meta.indexes.len(), 1);
@@ -151,11 +151,11 @@ async fn create_index_if_not_exists_is_noop_on_duplicate() {
         .await
         .unwrap();
 
-    let tenant = sess.tenant();
+    let project = sess.project();
     let meta = eng
         .config()
         .catalog
-        .load_table(&tenant, &TableName::new("t").unwrap())
+        .load_table(&project, &TableName::new("t").unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -236,11 +236,11 @@ async fn drop_index_removes_catalog_row() {
         .unwrap();
     sess.execute("DROP INDEX ix_email").await.unwrap();
 
-    let tenant = sess.tenant();
+    let project = sess.project();
     let meta = eng
         .config()
         .catalog
-        .load_table(&tenant, &TableName::new("t").unwrap())
+        .load_table(&project, &TableName::new("t").unwrap())
         .await
         .unwrap();
     assert!(meta.indexes.is_empty(), "DROP INDEX must clear the row");

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Date32Array, Float64Array, Int64Array, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -47,7 +47,7 @@ fn engine_in(dir: &TempDir) -> Engine {
 }
 
 /// Helper: run a SELECT returning one row / one column of type i64.
-async fn select_i64(s: &basin_engine::TenantSession, sql: &str) -> i64 {
+async fn select_i64(s: &basin_engine::ProjectSession, sql: &str) -> i64 {
     let ExecResult::Rows { batches, .. } = s.execute(sql).await.unwrap_or_else(|e| {
         panic!("query failed: {sql:?} — {e}")
     }) else {
@@ -67,7 +67,7 @@ async fn select_i64(s: &basin_engine::TenantSession, sql: &str) -> i64 {
 }
 
 /// Helper: run a SELECT returning one row / one column of type f64.
-async fn select_f64(s: &basin_engine::TenantSession, sql: &str) -> f64 {
+async fn select_f64(s: &basin_engine::ProjectSession, sql: &str) -> f64 {
     let ExecResult::Rows { batches, .. } = s.execute(sql).await.unwrap_or_else(|e| {
         panic!("query failed: {sql:?} — {e}")
     }) else {
@@ -87,7 +87,7 @@ async fn select_f64(s: &basin_engine::TenantSession, sql: &str) -> f64 {
 }
 
 /// Helper: run a SELECT returning one row / one column of type text.
-async fn select_str(s: &basin_engine::TenantSession, sql: &str) -> String {
+async fn select_str(s: &basin_engine::ProjectSession, sql: &str) -> String {
     let ExecResult::Rows { batches, .. } = s.execute(sql).await.unwrap_or_else(|e| {
         panic!("query failed: {sql:?} — {e}")
     }) else {
@@ -114,7 +114,7 @@ async fn select_str(s: &basin_engine::TenantSession, sql: &str) -> String {
 async fn cast_sql_standard_explicit() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     // integer literal → bigint (identity-ish)
     let v = select_i64(&s, "SELECT CAST(42 AS BIGINT)").await;
@@ -133,7 +133,7 @@ async fn cast_sql_standard_explicit() {
 async fn cast_pg_double_colon_operator() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let v = select_i64(&s, "SELECT 42::BIGINT").await;
     assert_eq!(v, 42, "42::BIGINT");
@@ -150,7 +150,7 @@ async fn cast_pg_double_colon_operator() {
 async fn cast_string_to_integer() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let v = select_i64(&s, "SELECT '42'::BIGINT").await;
     assert_eq!(v, 42, "'42'::BIGINT");
@@ -166,7 +166,7 @@ async fn cast_string_to_integer() {
 async fn cast_string_to_float() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let v = select_f64(&s, "SELECT '1.5'::FLOAT8").await;
     assert!((v - 1.5).abs() < 1e-10, "'1.5'::FLOAT8 == 1.5");
@@ -183,7 +183,7 @@ async fn cast_string_to_float() {
 async fn cast_string_to_numeric_in_table() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE prices (id BIGINT NOT NULL, price NUMERIC(10,2))")
         .await
@@ -211,7 +211,7 @@ async fn cast_string_to_numeric_in_table() {
 async fn cast_integer_to_text() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let v = select_str(&s, "SELECT CAST(42 AS TEXT)").await;
     assert_eq!(v, "42", "CAST(42 AS TEXT)");
@@ -229,7 +229,7 @@ async fn cast_integer_to_text() {
 async fn cast_int4_to_int8_promotion() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE nums (id BIGINT NOT NULL, small INTEGER)")
         .await
@@ -265,7 +265,7 @@ async fn cast_int4_to_int8_promotion() {
 async fn cast_string_to_date() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Verify the cast doesn't error. DataFusion returns Date32 (days since epoch).
     let ExecResult::Rows { batches, .. } =
@@ -298,7 +298,7 @@ async fn cast_string_to_date() {
 async fn cast_float_to_integer_truncates() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE scores (id BIGINT NOT NULL, score DOUBLE PRECISION)")
         .await
@@ -334,7 +334,7 @@ async fn cast_float_to_integer_truncates() {
 async fn to_number_with_format() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let v = select_f64(&s, "SELECT to_number('1234.56', '9999.99')").await;
     assert!((v - 1234.56).abs() < 1e-6, "to_number without separator: {v}");
@@ -355,7 +355,7 @@ async fn to_number_with_format() {
 async fn to_date_with_format() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let ExecResult::Rows { batches, .. } =
         s.execute("SELECT to_date('2024-01-15', 'YYYY-MM-DD')")
@@ -393,7 +393,7 @@ async fn to_date_with_format() {
 async fn to_char_date_format() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     s.execute("CREATE TABLE events (id BIGINT NOT NULL, dt DATE)")
         .await
@@ -414,7 +414,7 @@ async fn to_char_date_format() {
 async fn cast_int_to_double_precision() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let v = select_f64(&s, "SELECT CAST(7 AS DOUBLE PRECISION) / CAST(2 AS DOUBLE PRECISION)").await;
     assert!((v - 3.5).abs() < 1e-10, "CAST int to double: 7/2 = 3.5, got {v}");

@@ -48,13 +48,13 @@ byte-identically with no sinks attached.
 ```rust
 // basin-common::events
 pub struct ChangeEvent {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: TableName,
     pub op: ChangeOp,                    // Insert | Update | Delete
     pub before: Option<Value>,
     pub after: Option<Value>,
     pub committed_at: DateTime<Utc>,
-    pub seq: u64,                        // monotonic per-tenant
+    pub seq: u64,                        // monotonic per-project
     pub causation_user: Option<String>,
 }
 
@@ -104,11 +104,11 @@ Lives in `basin-engine`.
 
 ```sql
 ALTER TABLE items REACT ON INSERT
-  CONSTRAINT (SELECT count(*) FROM items WHERE tenant = NEW.tenant) <= 100;
+  CONSTRAINT (SELECT count(*) FROM items WHERE project = NEW.project) <= 100;
 ```
 
 If the predicate evaluates `false`, the INSERT aborts with `23514
-check_violation`. Tenant-scoped invariant enforcement.
+check_violation`. Project-scoped invariant enforcement.
 
 ### Phase 5.11.I — Webhook fanout (built-in `WebhookSink`, post-commit)
 
@@ -122,14 +122,14 @@ ALTER TABLE orders SUBSCRIBE WEBHOOK
 Implements `ChangeEventSink`, attached as **post-commit**. Owns its
 own disk-backed retry queue (basin-wal sidecar; idempotency-keyed).
 Reuses `basin-net` for the actual HTTP path (URL allowlist + per-
-tenant rate limit + body cap + timeout already in place).
+project rate limit + body cap + timeout already in place).
 
 ### Future basin-realtime crate (deferred — same workspace)
 
 When realtime becomes a real ask, add `crates/basin-realtime/` to the
 workspace — same shape as `crates/basin-cron/`, `crates/basin-net/`,
 `crates/basin-trgm/`. Implements the same `ChangeEventSink` trait as a
-post-commit sink. WebSocket axum handler + per-tenant ring buffer +
+post-commit sink. WebSocket axum handler + per-project ring buffer +
 replay cursors + filter pushdown + disconnect protocol — all the
 genuinely-novel infrastructure — lives in this future crate, not in
 the engine.
@@ -159,9 +159,9 @@ issue tracker, easier refactoring. All matter at Basin's stage.
   reactors are SQL-bodied only
 - **Full PG `LISTEN` / `NOTIFY` wire-protocol compat** — reactors and
   webhooks cover the use cases; future realtime is WebSocket-shaped
-- **Cross-tenant subscribers** — every event is tenant-scoped; an admin
-  tool that wants to fan out across tenants does so by attaching a
-  sink that ignores the `tenant` filter
+- **Cross-project subscribers** — every event is project-scoped; an admin
+  tool that wants to fan out across projects does so by attaching a
+  sink that ignores the `project` filter
 - **Cross-region replication of change events** — Phase 6 multi-region
   work; ADR 0009 covers it
 - **WASM UDFs** — Phase 5.11.J, gated on customer demand
@@ -225,7 +225,7 @@ The trade is:
 
 - **Lose:** the "drop in any PG schema unchanged" claim. Customers with
   deeply legacy enterprise PG schemas are not Basin's wedge anyway.
-- **Win:** wedge clarity ("the multi-tenant DB designed for new SaaS"),
+- **Win:** wedge clarity ("the multi-project DB designed for new SaaS"),
   bounded engineering scope, no permanent PL/pgSQL maintenance load,
   clean trait-shaped extensibility for future sinks, no novel realtime
   infrastructure shipped speculatively.
@@ -258,7 +258,7 @@ Without all three, the answer stays "no" for both.
 
 - [ADR 0002 — No upstream Postgres extensions](./0002-no-postgres-extensions.md) — the original
   "don't rebuild Aurora" call; this ADR is consistent with that.
-- [ADR 0008 — Noisy-neighbor fairness](./0008-noisy-neighbor-fairness.md) — the per-tenant cost
+- [ADR 0008 — Noisy-neighbor fairness](./0008-noisy-neighbor-fairness.md) — the per-project cost
   discipline this ADR preserves.
 - 2026-05-09 conversation log — the "10 drawbacks of full PG compat"
   audit, the new-SaaS-only reframe, the WebSocket-removal decision,

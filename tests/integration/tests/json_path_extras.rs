@@ -18,13 +18,13 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, LargeBinaryArray, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-async fn make_engine() -> (Engine, TenantId) {
+async fn make_engine() -> (Engine, ProjectId) {
     let dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let storage = Storage::new(StorageConfig {
@@ -39,8 +39,8 @@ async fn make_engine() -> (Engine, TenantId) {
         catalog,
         shard: None,
     });
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.expect("open_session");
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.expect("open_session");
     sess.execute("CREATE TABLE t (id BIGINT, data JSONB)")
         .await
         .expect("CREATE TABLE");
@@ -52,12 +52,12 @@ async fn make_engine() -> (Engine, TenantId) {
     )
     .await
     .expect("INSERT");
-    (engine, tenant)
+    (engine, project)
 }
 
 /// Helper: run a SELECT and get first column first row as String.
-async fn first_string(engine: &Engine, tenant: TenantId, sql: &str) -> Option<String> {
-    let sess = engine.open_session(tenant).await.expect("open_session");
+async fn first_string(engine: &Engine, project: ProjectId, sql: &str) -> Option<String> {
+    let sess = engine.open_session(project).await.expect("open_session");
     let result = sess.execute(sql).await.expect(sql);
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
@@ -85,8 +85,8 @@ async fn first_string(engine: &Engine, tenant: TenantId, sql: &str) -> Option<St
 }
 
 /// Helper: run a SELECT and get first boolean column first row.
-async fn first_bool(engine: &Engine, tenant: TenantId, sql: &str) -> Option<bool> {
-    let sess = engine.open_session(tenant).await.expect("open_session");
+async fn first_bool(engine: &Engine, project: ProjectId, sql: &str) -> Option<bool> {
+    let sess = engine.open_session(project).await.expect("open_session");
     let result = sess.execute(sql).await.expect(sql);
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
@@ -110,29 +110,29 @@ async fn first_bool(engine: &Engine, tenant: TenantId, sql: &str) -> Option<bool
 
 #[tokio::test]
 async fn test_jsonb_typeof_object() {
-    let (engine, tenant) = make_engine().await;
-    let s = first_string(&engine, tenant, "SELECT jsonb_typeof('{\"a\":1}')").await;
+    let (engine, project) = make_engine().await;
+    let s = first_string(&engine, project, "SELECT jsonb_typeof('{\"a\":1}')").await;
     assert_eq!(s.as_deref(), Some("object"), "jsonb_typeof object");
 }
 
 #[tokio::test]
 async fn test_json_typeof_array() {
-    let (engine, tenant) = make_engine().await;
-    let s = first_string(&engine, tenant, "SELECT json_typeof('[1,2,3]')").await;
+    let (engine, project) = make_engine().await;
+    let s = first_string(&engine, project, "SELECT json_typeof('[1,2,3]')").await;
     assert_eq!(s.as_deref(), Some("array"), "json_typeof array");
 }
 
 #[tokio::test]
 async fn test_json_typeof_string() {
-    let (engine, tenant) = make_engine().await;
-    let s = first_string(&engine, tenant, "SELECT json_typeof('\"hello\"')").await;
+    let (engine, project) = make_engine().await;
+    let s = first_string(&engine, project, "SELECT json_typeof('\"hello\"')").await;
     assert_eq!(s.as_deref(), Some("string"), "json_typeof string");
 }
 
 #[tokio::test]
 async fn test_json_typeof_number() {
-    let (engine, tenant) = make_engine().await;
-    let s = first_string(&engine, tenant, "SELECT json_typeof('42')").await;
+    let (engine, project) = make_engine().await;
+    let s = first_string(&engine, project, "SELECT json_typeof('42')").await;
     assert_eq!(s.as_deref(), Some("number"), "json_typeof number");
 }
 
@@ -142,10 +142,10 @@ async fn test_json_typeof_number() {
 
 #[tokio::test]
 async fn test_json_strip_nulls() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_strip_nulls('{\"a\":1,\"b\":null,\"c\":3}')",
     )
     .await;
@@ -162,8 +162,8 @@ async fn test_json_strip_nulls() {
 
 #[tokio::test]
 async fn test_to_json_string() {
-    let (engine, tenant) = make_engine().await;
-    let s = first_string(&engine, tenant, "SELECT to_json('hello')").await;
+    let (engine, project) = make_engine().await;
+    let s = first_string(&engine, project, "SELECT to_json('hello')").await;
     let s = s.expect("to_json result");
     assert!(s.contains("hello"), "to_json output: {s}");
 }
@@ -175,10 +175,10 @@ async fn test_to_json_string() {
 #[tokio::test]
 #[ignore = "v0.1 json path UDFs don't yet resolve column-typed jsonb; rewriter target — v0.2"]
 async fn test_jsonb_path_query_first_field() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_path_query_first(data, '$.name') FROM t WHERE id = 1",
     )
     .await;
@@ -191,10 +191,10 @@ async fn test_jsonb_path_query_first_field() {
 #[tokio::test]
 #[ignore = "v0.1 json path UDFs don't yet resolve column-typed jsonb; rewriter target — v0.2"]
 async fn test_jsonb_path_query_first_array_index() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_path_query_first(data, '$.tags[0]') FROM t WHERE id = 1",
     )
     .await;
@@ -211,10 +211,10 @@ async fn test_jsonb_path_query_first_array_index() {
 #[tokio::test]
 #[ignore = "v0.1 json path UDFs don't yet resolve column-typed jsonb; rewriter target — v0.2"]
 async fn test_jsonb_path_query_array() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_path_query_array(data, '$.tags[*]') FROM t WHERE id = 1",
     )
     .await;
@@ -231,10 +231,10 @@ async fn test_jsonb_path_query_array() {
 
 #[tokio::test]
 async fn test_json_object_keys() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_object_keys('{\"a\":1,\"b\":2,\"c\":3}')",
     )
     .await;
@@ -251,18 +251,18 @@ async fn test_json_object_keys() {
 
 #[tokio::test]
 async fn test_json_each() {
-    let (engine, tenant) = make_engine().await;
-    let s = first_string(&engine, tenant, "SELECT json_each('{\"x\":1,\"y\":2}')").await;
+    let (engine, project) = make_engine().await;
+    let s = first_string(&engine, project, "SELECT json_each('{\"x\":1,\"y\":2}')").await;
     let s = s.expect("json_each result");
     assert!(s.contains('x') && s.contains('y'), "json_each output: {s}");
 }
 
 #[tokio::test]
 async fn test_json_each_text() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_each_text('{\"name\":\"alice\",\"age\":30}')",
     )
     .await;
@@ -276,8 +276,8 @@ async fn test_json_each_text() {
 
 #[tokio::test]
 async fn test_json_array_elements() {
-    let (engine, tenant) = make_engine().await;
-    let s = first_string(&engine, tenant, "SELECT json_array_elements('[10,20,30]')").await;
+    let (engine, project) = make_engine().await;
+    let s = first_string(&engine, project, "SELECT json_array_elements('[10,20,30]')").await;
     let s = s.expect("json_array_elements result");
     let v: serde_json::Value = serde_json::from_str(&s).expect("parse");
     assert_eq!(v, serde_json::json!(10), "first element: {v:?}");
@@ -285,10 +285,10 @@ async fn test_json_array_elements() {
 
 #[tokio::test]
 async fn test_json_array_elements_text() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_array_elements_text('[\"alpha\",\"beta\"]')",
     )
     .await;
@@ -302,10 +302,10 @@ async fn test_json_array_elements_text() {
 
 #[tokio::test]
 async fn test_json_get_udf_direct() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_get('{\"name\":\"alice\",\"age\":30}', 'name')",
     )
     .await;
@@ -321,10 +321,10 @@ async fn test_json_get_udf_direct() {
 
 #[tokio::test]
 async fn test_json_get_text_udf_direct() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_get_text('{\"name\":\"bob\",\"age\":25}', 'name')",
     )
     .await;
@@ -338,10 +338,10 @@ async fn test_json_get_text_udf_direct() {
 #[tokio::test]
 #[ignore = "v0.1 json path UDFs don't yet resolve column-typed jsonb; rewriter target — v0.2"]
 async fn test_json_path_extract_udf() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_path_extract(data, '{nested,x}') FROM t WHERE id = 3",
     )
     .await;
@@ -357,10 +357,10 @@ async fn test_json_path_extract_udf() {
 #[tokio::test]
 #[ignore = "v0.1 json path UDFs don't yet resolve column-typed jsonb; rewriter target — v0.2"]
 async fn test_json_path_extract_text_udf() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_path_extract_text(data, '{nested,x}') FROM t WHERE id = 3",
     )
     .await;
@@ -373,10 +373,10 @@ async fn test_json_path_extract_text_udf() {
 
 #[tokio::test]
 async fn test_jsonb_contains_true() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let b = first_bool(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_contains('{\"a\":1,\"b\":2}', '{\"a\":1}')",
     )
     .await;
@@ -385,10 +385,10 @@ async fn test_jsonb_contains_true() {
 
 #[tokio::test]
 async fn test_jsonb_contains_false() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let b = first_bool(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_contains('{\"a\":1}', '{\"b\":2}')",
     )
     .await;
@@ -401,10 +401,10 @@ async fn test_jsonb_contains_false() {
 
 #[tokio::test]
 async fn test_jsonb_contained_by() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let b = first_bool(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_contained_by('{\"a\":1}', '{\"a\":1,\"b\":2}')",
     )
     .await;
@@ -417,10 +417,10 @@ async fn test_jsonb_contained_by() {
 
 #[tokio::test]
 async fn test_jsonb_has_key_true() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let b = first_bool(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_has_key('{\"name\":\"alice\",\"age\":30}', 'name')",
     )
     .await;
@@ -429,10 +429,10 @@ async fn test_jsonb_has_key_true() {
 
 #[tokio::test]
 async fn test_jsonb_has_key_false() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let b = first_bool(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_has_key('{\"name\":\"alice\"}', 'missing')",
     )
     .await;
@@ -445,10 +445,10 @@ async fn test_jsonb_has_key_false() {
 
 #[tokio::test]
 async fn test_jsonb_has_all_keys() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let b = first_bool(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_has_all_keys('{\"a\":1,\"b\":2,\"c\":3}', '{a,b}')",
     )
     .await;
@@ -461,10 +461,10 @@ async fn test_jsonb_has_all_keys() {
 
 #[tokio::test]
 async fn test_jsonb_has_any_key() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let b = first_bool(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_has_any_key('{\"a\":1}', '{a,z}')",
     )
     .await;
@@ -477,10 +477,10 @@ async fn test_jsonb_has_any_key() {
 
 #[tokio::test]
 async fn test_jsonb_concat() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT jsonb_concat('{\"a\":1}', '{\"b\":2}')",
     )
     .await;
@@ -499,10 +499,10 @@ async fn test_jsonb_concat() {
 #[tokio::test]
 #[ignore = "v0.1 json path UDFs don't yet resolve column-typed jsonb; rewriter target — v0.2"]
 async fn test_json_get_on_column() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_get(data, 'name') FROM t WHERE id = 2",
     )
     .await;
@@ -515,10 +515,10 @@ async fn test_json_get_on_column() {
 #[tokio::test]
 #[ignore = "v0.1 json path UDFs don't yet resolve column-typed jsonb; rewriter target — v0.2"]
 async fn test_json_get_text_on_column() {
-    let (engine, tenant) = make_engine().await;
+    let (engine, project) = make_engine().await;
     let s = first_string(
         &engine,
-        tenant,
+        project,
         "SELECT json_get_text(data, 'name') FROM t WHERE id = 1",
     )
     .await;

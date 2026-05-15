@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -60,8 +60,8 @@ fn col_i64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
     out
 }
 
-async fn setup_orders_table(eng: &Engine) -> basin_engine::TenantSession {
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+async fn setup_orders_table(eng: &Engine) -> basin_engine::ProjectSession {
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
     sess.execute(
         "CREATE TABLE orders (id BIGINT NOT NULL, owner BIGINT NOT NULL, amount BIGINT NOT NULL)",
     )
@@ -197,7 +197,7 @@ async fn returns_table_with_join() {
 async fn arity_mismatch_rejected_at_registration() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE orders (id BIGINT NOT NULL, owner BIGINT NOT NULL, amount BIGINT NOT NULL)",
@@ -224,7 +224,7 @@ async fn arity_mismatch_rejected_at_registration() {
 async fn column_name_uniqueness_enforced() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute(
@@ -268,12 +268,12 @@ async fn returns_table_in_scalar_position_rejected() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let dir = TempDir::new().unwrap();
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     let eng = shared_engine(&dir, catalog);
-    let sess_a = eng.open_session(TenantId::new()).await.unwrap();
-    let sess_b = eng.open_session(TenantId::new()).await.unwrap();
+    let sess_a = eng.open_session(ProjectId::new()).await.unwrap();
+    let sess_b = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess_a
         .execute(
@@ -304,7 +304,7 @@ async fn cross_tenant_isolation() {
     };
     assert_eq!(col_i64(&batches, "id"), vec![1]);
 
-    // Tenant B has its own orders table but no function — must error.
+    // Project B has its own orders table but no function — must error.
     sess_b
         .execute(
             "CREATE TABLE orders (id BIGINT NOT NULL, owner BIGINT NOT NULL, \
@@ -319,6 +319,6 @@ async fn cross_tenant_isolation() {
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
         msg.contains("recent_orders") || msg.contains("not") || msg.contains("invalid"),
-        "tenant B should not resolve recent_orders, got: {err}"
+        "project B should not resolve recent_orders, got: {err}"
     );
 }

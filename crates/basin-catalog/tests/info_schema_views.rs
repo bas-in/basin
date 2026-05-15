@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 
 fn name(s: &str) -> TableName {
     TableName::new(s).unwrap()
@@ -79,7 +79,7 @@ fn rich_schema() -> Schema {
 #[tokio::test]
 async fn columns_view_emits_one_row_per_column() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = Arc::new(rich_schema());
     cat.create_table(&t, &name("orders"), s.as_ref())
@@ -106,7 +106,7 @@ async fn columns_view_emits_one_row_per_column() {
 #[tokio::test]
 async fn columns_view_pg_type_names() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = Arc::new(rich_schema());
     cat.create_table(&t, &name("t"), s.as_ref()).await.unwrap();
@@ -151,7 +151,7 @@ async fn columns_view_pg_type_names() {
 #[tokio::test]
 async fn columns_view_is_nullable_pg_style() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![
         Field::new("required", DataType::Int64, false),
@@ -172,10 +172,10 @@ async fn columns_view_is_nullable_pg_style() {
 }
 
 #[tokio::test]
-async fn columns_view_cross_tenant_isolation() {
+async fn columns_view_cross_project_isolation() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
 
@@ -205,7 +205,7 @@ async fn columns_view_cross_tenant_isolation() {
 #[tokio::test]
 async fn pg_attribute_emits_one_row_per_column() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![
         Field::new("first", DataType::Int64, false),
@@ -237,7 +237,7 @@ async fn pg_attribute_emits_one_row_per_column() {
 #[tokio::test]
 async fn pg_attribute_attrelid_matches_pg_class_oid() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![
         Field::new("a", DataType::Int64, false),
@@ -264,7 +264,7 @@ async fn pg_attribute_attrelid_matches_pg_class_oid() {
 #[tokio::test]
 async fn pg_attribute_atttypid_pg_oids() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = Arc::new(rich_schema());
     cat.create_table(&t, &name("t"), s.as_ref()).await.unwrap();
@@ -286,10 +286,10 @@ async fn pg_attribute_atttypid_pg_oids() {
 }
 
 #[tokio::test]
-async fn pg_attribute_cross_tenant_isolation() {
+async fn pg_attribute_cross_project_isolation() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
     let schema_a = Schema::new(vec![Field::new("a_col", DataType::Int64, false)]);
@@ -314,9 +314,9 @@ async fn pg_attribute_cross_tenant_isolation() {
 }
 
 #[tokio::test]
-async fn pg_namespace_one_row_per_tenant() {
+async fn pg_namespace_one_row_per_project() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::pg_namespace(&cat, &t).await.unwrap();
@@ -330,10 +330,10 @@ async fn pg_namespace_one_row_per_tenant() {
 }
 
 #[tokio::test]
-async fn pg_namespace_oid_disjoint_per_tenant() {
+async fn pg_namespace_oid_disjoint_per_project() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
 
@@ -343,16 +343,16 @@ async fn pg_namespace_oid_disjoint_per_tenant() {
     let oid_b = col_i64(&bb, "oid").value(0);
     assert_ne!(
         oid_a, oid_b,
-        "two tenants must have disjoint namespace oids"
+        "two projects must have disjoint namespace oids"
     );
 }
 
 #[tokio::test]
 async fn pg_namespace_oid_matches_pg_class_relnamespace() {
     // A table's pg_class.relnamespace must equal pg_namespace.oid for the
-    // tenant. PostgREST and pgAdmin both join on this.
+    // project. PostgREST and pgAdmin both join on this.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![Field::new("c", DataType::Int64, false)]);
     cat.create_table(&t, &name("t"), &schema).await.unwrap();
@@ -368,9 +368,9 @@ async fn pg_namespace_oid_matches_pg_class_relnamespace() {
 }
 
 #[tokio::test]
-async fn empty_tenant_returns_empty_columns_and_attribute() {
+async fn empty_project_returns_empty_columns_and_attribute() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let cols = InfoSchemaQuery::columns(&cat, &t).await.unwrap();
@@ -378,7 +378,7 @@ async fn empty_tenant_returns_empty_columns_and_attribute() {
     let attrs = InfoSchemaQuery::pg_attribute(&cat, &t).await.unwrap();
     assert_eq!(attrs.num_rows(), 0);
     // pg_namespace still emits the single `public` row even when no tables
-    // exist — the namespace is the tenant boundary, not the table set.
+    // exist — the namespace is the project boundary, not the table set.
     let ns = InfoSchemaQuery::pg_namespace(&cat, &t).await.unwrap();
     assert_eq!(ns.num_rows(), 1);
 }

@@ -25,9 +25,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
-use basin_router::{RunningServer, ServerConfig, StaticTenantResolver};
+use basin_router::{RunningServer, ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -97,7 +97,7 @@ async fn boot_server(
     data_dir: &Path,
     schema_name: &str,
     user: &str,
-    tenant: TenantId,
+    project: ProjectId,
 ) -> RunningServer {
     basin_common::telemetry::try_init_for_tests();
 
@@ -119,13 +119,13 @@ async fn boot_server(
     });
 
     let mut map = HashMap::new();
-    map.insert(user.to_owned(), tenant);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    map.insert(user.to_owned(), project);
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -213,10 +213,10 @@ async fn durable_catalog_survives_restart() {
     };
     let data_dir = TempDir::new().expect("tempdir");
     let user = "alice";
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // === Phase 1: first server lifetime ===
-    let server1 = boot_server(data_dir.path(), &schema_name, user, tenant).await;
+    let server1 = boot_server(data_dir.path(), &schema_name, user, project).await;
     let addr1 = server1.local_addr;
     let client1 = connect(addr1, user).await;
 
@@ -246,7 +246,7 @@ async fn durable_catalog_survives_restart() {
 
     // === Phase 2: bring up a fresh server pointed at the same schema +
     // same data dir, then read the rows back. ===
-    let server2 = boot_server(data_dir.path(), &schema_name, user, tenant).await;
+    let server2 = boot_server(data_dir.path(), &schema_name, user, project).await;
     let addr2 = server2.local_addr;
     let client2 = connect(addr2, user).await;
 

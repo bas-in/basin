@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 
 use crate::{Inner, UserId};
 
@@ -61,7 +61,7 @@ fn validate_value(key: &str, value: &str) -> Result<()> {
 
 pub(crate) async fn set(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     user: UserId,
     key: &str,
     value: &str,
@@ -70,16 +70,16 @@ pub(crate) async fn set(
     validate_value(key, value)?;
     inner
         .store
-        .upsert_session_setting(tenant, user, key, value)
+        .upsert_session_setting(project, user, key, value)
         .await
 }
 
 pub(crate) async fn get_all(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     user: UserId,
 ) -> Result<HashMap<String, String>> {
-    inner.store.list_session_settings(tenant, user).await
+    inner.store.list_session_settings(project, user).await
 }
 
 #[cfg(test)]

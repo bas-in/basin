@@ -10,7 +10,7 @@ use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog, SqlArgType, SqlFunctionArg,
     SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 
 fn tname(s: &str) -> TableName {
     TableName::new(s).unwrap()
@@ -60,14 +60,14 @@ fn col_bool<'a>(b: &'a RecordBatch, n: &str) -> &'a BooleanArray {
 }
 
 fn make_func(
-    tenant: TenantId,
+    project: ProjectId,
     name: &str,
     args: Vec<(&str, SqlArgType)>,
     ret: SqlArgType,
     body: &str,
 ) -> SqlFunctionDef {
     SqlFunctionDef {
-        tenant,
+        project,
         name: name.to_string(),
         args: args
             .into_iter()
@@ -88,7 +88,7 @@ async fn pg_depend_includes_function_type_deps() {
     // least 3 rows: one per arg + one for the return type. All three
     // should reference pg_type as the catalog of the depended-on object.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     cat.register_sql_function(make_func(
         t,
@@ -128,7 +128,7 @@ async fn pg_depend_includes_function_type_deps() {
         "missing TEXT (25): {seen_type_oids:?}"
     );
     // refclassid is the synthetic pg_type catalog OID — it must be a
-    // single stable value within the tenant.
+    // single stable value within the project.
     assert_eq!(
         seen_refclassids.len(),
         1,
@@ -139,9 +139,9 @@ async fn pg_depend_includes_function_type_deps() {
 }
 
 #[tokio::test]
-async fn pg_depend_returns_empty_for_tenant_with_no_objects() {
+async fn pg_depend_returns_empty_for_project_with_no_objects() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::pg_depend(&cat, &t).await.unwrap();
@@ -149,13 +149,13 @@ async fn pg_depend_returns_empty_for_tenant_with_no_objects() {
 }
 
 #[tokio::test]
-async fn pg_authid_one_row_per_tenant() {
+async fn pg_authid_one_row_per_project() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::pg_authid(&cat, &t).await.unwrap();
-    assert_eq!(batch.num_rows(), 1, "exactly one row per tenant");
+    assert_eq!(batch.num_rows(), 1, "exactly one row per project");
     assert_eq!(col_str(&batch, "rolname").value(0), &t.to_string());
     // Defaults: rolinherit + rolcanlogin true; everything else false.
     assert!(!col_bool(&batch, "rolsuper").value(0));
@@ -170,7 +170,7 @@ async fn pg_authid_one_row_per_tenant() {
 #[tokio::test]
 async fn pg_authid_oid_stable() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let b1 = InfoSchemaQuery::pg_authid(&cat, &t).await.unwrap();
@@ -180,10 +180,10 @@ async fn pg_authid_oid_stable() {
 }
 
 #[tokio::test]
-async fn pg_authid_cross_tenant_isolation() {
+async fn pg_authid_cross_project_isolation() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
 
@@ -193,14 +193,14 @@ async fn pg_authid_cross_tenant_isolation() {
     let oid_b = col_i64(&bb, "oid").value(0);
     assert_ne!(
         oid_a, oid_b,
-        "different tenants must hash to different oids"
+        "different projects must hash to different oids"
     );
 
     let name_a = col_str(&ba, "rolname").value(0).to_string();
     let name_b = col_str(&bb, "rolname").value(0).to_string();
     assert_eq!(name_a, a.to_string());
     assert_eq!(name_b, b.to_string());
-    // Each tenant only sees its own row.
+    // Each project only sees its own row.
     assert_eq!(ba.num_rows(), 1);
     assert_eq!(bb.num_rows(), 1);
     assert_ne!(name_a, name_b);
@@ -213,7 +213,7 @@ async fn pg_authid_password_is_null() {
     // passwords at all in v0.1 and surfacing anything here would be a
     // forward-compat foot-gun.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::pg_authid(&cat, &t).await.unwrap();
@@ -231,7 +231,7 @@ async fn pg_depend_cv_source_table_edge() {
     // Both ends use the same FNV-1a hash family pg_class consults, so the
     // oids must match the row pg_class returns for each name.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = cv_schema();
     cat.create_table(&t, &tname("events"), &s).await.unwrap();
@@ -300,7 +300,7 @@ async fn pg_depend_cv_source_table_edge_pgdump_ordering_pattern() {
     // contract is locked: oids in pg_depend must JOIN cleanly against
     // pg_class.oid for both endpoints.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = cv_schema();
     cat.create_table(&t, &tname("orders"), &s).await.unwrap();
@@ -348,11 +348,11 @@ async fn pg_depend_cv_source_table_edge_pgdump_ordering_pattern() {
 
 #[tokio::test]
 async fn pg_depend_no_cv_no_extra_rows() {
-    // Regression test: a tenant with only a function (no CVs) must still
+    // Regression test: a project with only a function (no CVs) must still
     // produce exactly the function-type-dep rows — the CV expansion must
     // not add spurious rows when no continuous_aggregate is registered.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let s = cv_schema();
     cat.create_table(&t, &tname("plain"), &s).await.unwrap();
@@ -388,12 +388,12 @@ async fn pg_depend_no_cv_no_extra_rows() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_cv_deps() {
-    // Tenant A registers a CV; tenant B must see zero pg_depend rows
-    // attributable to A. Cross-tenant leak is a P0 invariant.
+async fn cross_project_isolation_cv_deps() {
+    // Project A registers a CV; project B must see zero pg_depend rows
+    // attributable to A. Cross-project leak is a P0 invariant.
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
     let s = cv_schema();
@@ -408,7 +408,7 @@ async fn cross_tenant_isolation_cv_deps() {
     assert_eq!(
         dep_a.num_rows(),
         1,
-        "tenant A should see exactly its CV→src row"
+        "project A should see exactly its CV→src row"
     );
 
     // B sees nothing — no tables, no functions, no CVs.
@@ -416,6 +416,6 @@ async fn cross_tenant_isolation_cv_deps() {
     assert_eq!(
         dep_b.num_rows(),
         0,
-        "tenant B must not see any rows attributable to A"
+        "project B must not see any rows attributable to A"
     );
 }

@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -23,11 +23,11 @@ const VERIFY_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 pub(crate) async fn signup(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     email: &str,
     password_raw: &str,
 ) -> Result<UserId> {
-    inner.ip_limiter.check(&format!("signup:{tenant}"))?;
+    inner.ip_limiter.check(&format!("signup:{project}"))?;
     inner.email_limiter.check(&format!("signup:{email}"))?;
 
     let email = crate::normalise_email(email)?;
@@ -38,20 +38,20 @@ pub(crate) async fn signup(
 
     inner
         .store
-        .create_user(tenant, &email, &hashed, user_id)
+        .create_user(project, &email, &hashed, user_id)
         .await
 }
 
 pub(crate) async fn request_email_verification(
     inner: &Inner,
-    tenant: &TenantId,
+    project: &ProjectId,
     user: UserId,
 ) -> Result<()> {
     let (raw, hash) = generate();
     let expires_at = Utc::now() + crate::ttl_or_default(VERIFY_TTL);
 
     // Pull email so we know where to send it. Fail closed if user is missing.
-    let user_row = inner.store.find_user_by_id(tenant, user).await?;
+    let user_row = inner.store.find_user_by_id(project, user).await?;
     let Some(user_row) = user_row else {
         return Err(BasinError::not_found(format!("user {user}")));
     };
@@ -59,7 +59,7 @@ pub(crate) async fn request_email_verification(
     inner
         .store
         .insert_email_token(
-            tenant,
+            project,
             user,
             &hash,
             EmailTokenPurpose::Verify.as_str(),
@@ -73,10 +73,10 @@ pub(crate) async fn request_email_verification(
     Ok(())
 }
 
-pub(crate) async fn verify_email(inner: &Inner, tenant: &TenantId, raw_token: &str) -> Result<()> {
+pub(crate) async fn verify_email(inner: &Inner, project: &ProjectId, raw_token: &str) -> Result<()> {
     let h = hash_token(raw_token);
 
-    let row = inner.store.find_email_token(tenant, &h).await?;
+    let row = inner.store.find_email_token(project, &h).await?;
     let Some(row) = row else {
         return Err(BasinError::not_found("invalid verification token"));
     };
@@ -95,13 +95,13 @@ pub(crate) async fn verify_email(inner: &Inner, tenant: &TenantId, raw_token: &s
         ));
     }
 
-    let consumed = inner.store.consume_email_token(tenant, &h).await?;
+    let consumed = inner.store.consume_email_token(project, &h).await?;
     if consumed == 0 {
         return Err(BasinError::InvalidIdent(
             "verification token already consumed".into(),
         ));
     }
 
-    inner.store.mark_email_verified(tenant, row.user_id).await?;
+    inner.store.mark_email_verified(project, row.user_id).await?;
     Ok(())
 }

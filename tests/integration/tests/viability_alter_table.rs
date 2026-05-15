@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{InMemoryCatalog, PolicyCommand};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
@@ -51,8 +51,8 @@ async fn viability_alter_table() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     // Setup: a table with a TIMESTAMPTZ-ish age column (BIGINT-as-epoch
     // because the catalog accepts that for cold_age_column).
@@ -74,7 +74,7 @@ async fn viability_alter_table() {
     sess.execute("ALTER TABLE events ADD COLUMN device_id TEXT")
         .await
         .expect("ADD COLUMN");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert!(
         m.schema.field_with_name("device_id").is_ok(),
         "device_id missing from schema after ADD COLUMN"
@@ -90,7 +90,7 @@ async fn viability_alter_table() {
     sess.execute("ALTER TABLE events SET cold_after = 7776000")
         .await
         .expect("SET cold_after");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(
         m.cold_after_seconds,
         Some(7_776_000),
@@ -102,7 +102,7 @@ async fn viability_alter_table() {
     sess.execute("ALTER TABLE events SET cold_age_column = 'ts'")
         .await
         .expect("SET cold_age_column");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(m.cold_age_column.as_deref(), Some("ts"));
     // And cold_after should still be set — the two SETs compose.
     assert_eq!(m.cold_after_seconds, Some(7_776_000));
@@ -112,7 +112,7 @@ async fn viability_alter_table() {
     sess.execute("ALTER TABLE events SET BLOOM FILTERS ON (id, owner_id)")
         .await
         .expect("SET BLOOM FILTERS ON");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(
         m.bloom_filter_columns,
         vec!["id".to_string(), "owner_id".to_string()]
@@ -123,7 +123,7 @@ async fn viability_alter_table() {
     sess.execute("ALTER TABLE events ENABLE ROW LEVEL SECURITY")
         .await
         .expect("ENABLE ROW LEVEL SECURITY");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert!(m.rls_enabled, "rls_enabled should be true");
     variants_passed.push("ENABLE ROW LEVEL SECURITY");
 
@@ -135,7 +135,7 @@ async fn viability_alter_table() {
     )
     .await
     .expect("CREATE POLICY");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(m.policies.len(), 1);
     assert_eq!(m.policies[0].name, "p_owner");
     assert!(matches!(m.policies[0].command, PolicyCommand::All));
@@ -145,7 +145,7 @@ async fn viability_alter_table() {
     sess.execute("DROP POLICY p_owner ON events")
         .await
         .expect("DROP POLICY");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(
         m.policies.len(),
         0,
@@ -157,7 +157,7 @@ async fn viability_alter_table() {
     sess.execute("ALTER TABLE events DISABLE ROW LEVEL SECURITY")
         .await
         .expect("DISABLE ROW LEVEL SECURITY");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert!(!m.rls_enabled, "rls_enabled should be false after DISABLE");
     variants_passed.push("DISABLE ROW LEVEL SECURITY");
 

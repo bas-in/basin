@@ -2,19 +2,19 @@
 //!
 //! ## Layout
 //!
-//! - **One** append-only `queue.jsonl` file per process. Not per-tenant.
-//!   Per-tenant cost rule: a single tenant burning through millions of
-//!   events does not allocate per-tenant file handles. Records are
-//!   tagged with `tenant` so the worker can route to per-tenant rate
+//! - **One** append-only `queue.jsonl` file per process. Not per-project.
+//!   Per-project cost rule: a single project burning through millions of
+//!   events does not allocate per-project file handles. Records are
+//!   tagged with `project` so the worker can route to per-project rate
 //!   limits inside `basin-net`, but the storage layer itself is shared.
 //! - **One** `dead_letter/<subscription_id>.jsonl` per subscription.
 //!   Dead-letters are per-subscription (a customer-facing entity), not
-//!   per-tenant.
+//!   per-project.
 //!
 //! ## Idempotency keys
 //!
-//! Stable SHA-256 of `subscription_id || tenant || table || seq`. The
-//! `seq` field is a monotonic per-(tenant, table) counter the engine
+//! Stable SHA-256 of `subscription_id || project || table || seq`. The
+//! `seq` field is a monotonic per-(project, table) counter the engine
 //! mints in `next_event_seq`; the same change-event re-played through
 //! the queue produces the same key. Subscribers can dedupe on
 //! `X-Basin-Idempotency-Key`.
@@ -35,7 +35,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -56,10 +56,10 @@ pub struct IdempotencyKey(pub String);
 impl IdempotencyKey {
     /// Stable hash. Rebuilds to the same digest for the same logical
     /// event-to-subscription delivery.
-    pub fn compute(sub: WebhookSubscriptionId, tenant: &TenantId, table: &str, seq: u64) -> Self {
+    pub fn compute(sub: WebhookSubscriptionId, project: &ProjectId, table: &str, seq: u64) -> Self {
         let mut h = Sha256::new();
         h.update(sub.0.as_bytes());
-        h.update(tenant.as_prefix().as_bytes());
+        h.update(project.as_prefix().as_bytes());
         h.update(b"|");
         h.update(table.as_bytes());
         h.update(b"|");
@@ -78,7 +78,7 @@ impl IdempotencyKey {
 pub struct QueueEntry {
     pub subscription_id: WebhookSubscriptionId,
     pub idempotency_key: IdempotencyKey,
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub envelope: WebhookEnvelope,
     /// Number of attempts already made. New entries start at 0.
     pub attempt_count: u32,
@@ -93,7 +93,7 @@ pub struct QueueEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeadLetterEntry {
     pub idempotency_key: IdempotencyKey,
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub envelope: WebhookEnvelope,
     pub attempt_count: u32,
     /// Why this one died: `"4xx 422"`, `"max_retries 16"`, etc.
@@ -168,10 +168,10 @@ impl RetryQueue {
     pub async fn enqueue_new(
         &self,
         subscription_id: WebhookSubscriptionId,
-        tenant: TenantId,
+        project: ProjectId,
         envelope: WebhookEnvelope,
     ) -> Result<IdempotencyKey> {
-        self.enqueue_at(subscription_id, tenant, envelope, Utc::now())
+        self.enqueue_at(subscription_id, project, envelope, Utc::now())
             .await
     }
 
@@ -183,15 +183,15 @@ impl RetryQueue {
     pub async fn enqueue_at(
         &self,
         subscription_id: WebhookSubscriptionId,
-        tenant: TenantId,
+        project: ProjectId,
         envelope: WebhookEnvelope,
         now: DateTime<Utc>,
     ) -> Result<IdempotencyKey> {
-        let key = IdempotencyKey::compute(subscription_id, &tenant, &envelope.table, envelope.seq);
+        let key = IdempotencyKey::compute(subscription_id, &project, &envelope.table, envelope.seq);
         let entry = QueueEntry {
             subscription_id,
             idempotency_key: key.clone(),
-            tenant,
+            project,
             envelope,
             attempt_count: 0,
             first_attempt_at: now,
@@ -260,7 +260,7 @@ impl RetryQueue {
         }
         let dle = DeadLetterEntry {
             idempotency_key: entry.idempotency_key,
-            tenant: entry.tenant,
+            project: entry.project,
             envelope: entry.envelope,
             attempt_count: entry.attempt_count,
             reason,

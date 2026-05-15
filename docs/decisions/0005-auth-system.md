@@ -10,28 +10,28 @@
 ## Amendment — 2026-05-11
 
 The architecture section below describes auth state living in a reserved
-internal tenant accessed via loopback pgwire. That model has been
+internal project accessed via loopback pgwire. That model has been
 superseded. See **ADR 0013** for the full decision.
 
 Summary of what changed:
 
 - Auth tables (`basin_auth_users`, `basin_auth_refresh_tokens`, etc.)
-  live in **each tenant's own storage namespace** under a `basin_auth`
-  schema prefix, provisioned at tenant creation. There is no reserved
-  internal tenant (`INTERNAL_AUTH_TENANT_ID` is removed).
-- The auth service accesses tenant auth data via
-  `Engine::open_session_as(tenant_id, "basin_auth_service")` — in-process,
+  live in **each project's own storage namespace** under a `basin_auth`
+  schema prefix, provisioned at project creation. There is no reserved
+  internal project (`INTERNAL_AUTH_PROJECT_ID` is removed).
+- The auth service accesses project auth data via
+  `Engine::open_session_as(project_id, "basin_auth_service")` — in-process,
   no TCP, no loopback pgwire connection.
-- `pgwire_user` credential format changes from `tenant_<random_hex>` to
-  `{tenant_id}_{random_hex}` so the 26-character ULID prefix
-  self-identifies the owning tenant; no global cross-tenant lookup table
+- `pgwire_user` credential format changes from `project_<random_hex>` to
+  `{project_id}_{random_hex}` so the 26-character ULID prefix
+  self-identifies the owning project; no global cross-project lookup table
   is required.
-- API keys embed the same tenant prefix for self-routing.
+- API keys embed the same project prefix for self-routing.
 - `BASIN_AUTH_CATALOG_DSN` is now an **optional operator override** for
   external Postgres (blast-radius separation), not the default path.
 - `DeferredAuthResolver`, `wait_for_pgwire_accept`, and the loopback
   startup ceremony are removed. Startup order is: engine → auth
-  (with `EngineAuthStore`) → `StackedTenantResolver` → pgwire.
+  (with `EngineAuthStore`) → `StackedProjectResolver` → pgwire.
 
 The scope, features, SMTP requirements, v1 capabilities, and trigger
 conditions documented below are unchanged.
@@ -58,17 +58,17 @@ Basin will ship a small, opinionated auth crate, **`basin-auth`**, with:
 
 ### Core capabilities (v1)
 
-1. **Per-tenant user identity.** Each tenant has its own `auth.users`
-   table (rows scoped by the standard tenant prefix). A user belongs
-   to exactly one tenant; no cross-tenant identity. The `tenant_id`
+1. **Per-project user identity.** Each project has its own `auth.users`
+   table (rows scoped by the standard project prefix). A user belongs
+   to exactly one project; no cross-project identity. The `project_id`
    is a JWT claim.
 2. **Email + password sign-up and sign-in** with bcrypt password
    hashing (cost factor 12 by default).
 3. **Email verification** (one-time token, 24-hour TTL).
 4. **Password reset** (one-time token, 1-hour TTL, sent via SMTP).
 5. **Magic-link sign-in** (one-time token, 15-minute TTL, sent via SMTP).
-6. **JWT issuance** signed HS256 with a tenant-scoped secret. Claims:
-   `tenant_id`, `user_id`, `email`, `roles[]`, `iat`, `exp`.
+6. **JWT issuance** signed HS256 with a project-scoped secret. Claims:
+   `project_id`, `user_id`, `email`, `roles[]`, `iat`, `exp`.
 7. **Refresh tokens** (opaque, stored in `auth.refresh_tokens`,
    30-day TTL by default). Rotation on use.
 8. **Sign-out** (revokes the refresh token).
@@ -83,7 +83,7 @@ Required env vars:
 
 ```text
 BASIN_AUTH_ENABLED=1                          # off by default
-BASIN_AUTH_JWT_SECRET=<32+ bytes, hex>        # platform-level (or per-tenant override)
+BASIN_AUTH_JWT_SECRET=<32+ bytes, hex>        # platform-level (or per-project override)
 BASIN_AUTH_TOKEN_TTL=3600                     # access token, default 1h
 BASIN_AUTH_REFRESH_TTL=2592000                # refresh token, default 30d
 
@@ -115,11 +115,11 @@ ticket in production auth systems.
 - OAuth / social providers (Google, GitHub) — defer to v2; HMAC + email
   is sufficient for the wedge customer's first deploys.
 - SAML / SSO — enterprise-only; defer until paying enterprise customer.
-- Per-tenant SMTP override — defer; one platform-level SMTP first.
+- Per-project SMTP override — defer; one platform-level SMTP first.
 - Org / team / role hierarchies beyond a flat `roles[]` claim.
 - Anonymous / guest users.
 - Phone-number / SMS auth.
-- Federated identity across tenants.
+- Federated identity across projects.
 
 ### Architecture
 
@@ -143,13 +143,13 @@ against the auth namespace) on startup.
 
 Integration with the rest of Basin:
 
-- `basin-router::TenantResolver` gets a JWT-aware implementation
-  (`JwtTenantResolver`) that decodes the bearer token and sets
-  `tenant_id` from its claim. Replaces (or stacks with) the existing
-  `StaticTenantResolver`.
-- `basin-engine::TenantSession` does not change — it still scopes
-  every operation by `tenant_id`. The auth crate's only job is to map
-  external credentials to that tenant id.
+- `basin-router::ProjectResolver` gets a JWT-aware implementation
+  (`JwtProjectResolver`) that decodes the bearer token and sets
+  `project_id` from its claim. Replaces (or stacks with) the existing
+  `StaticProjectResolver`.
+- `basin-engine::ProjectSession` does not change — it still scopes
+  every operation by `project_id`. The auth crate's only job is to map
+  external credentials to that project id.
 - The HTTP REST layer (ADR 0006) depends on this crate.
 
 `basin-auth` does NOT speak pgwire and is NOT consulted on every SQL
@@ -197,11 +197,11 @@ runs at native engine speed.
 ## Architectural compatibility
 
 `basin-auth` plugs into `basin-router` via the existing
-`TenantResolver` trait. There is no change to `basin-engine`,
+`ProjectResolver` trait. There is no change to `basin-engine`,
 `basin-storage`, `basin-catalog`, `basin-wal`, or `basin-shard`.
 
 The auth crate's own state (users, refresh tokens, email tokens) lives
-in tenant-scoped tables in the same Iceberg-style catalog. It is
+in project-scoped tables in the same Iceberg-style catalog. It is
 durable through `PostgresCatalog` (the same backend the production
 deploy already uses for table metadata).
 
@@ -228,7 +228,7 @@ surface to start on speculation.
 | SMTP integration with templated emails (~6 templates) | 0.5 week |
 | JWT + refresh token issue/verify/rotate | 0.5 week |
 | Rate limiting + abuse protection | 0.5 week |
-| `JwtTenantResolver` integration into router | 0.5 week |
+| `JwtProjectResolver` integration into router | 0.5 week |
 | Tests (signup, signin, expired tokens, replay attempts, rate-limit) | 1 week |
 | External security review (CVE review, threat model, penetration) | 1–2 weeks (vendor) |
 | **Total** | **~6–8 weeks calendar** |
@@ -242,7 +242,7 @@ surface to start on speculation.
   data stores; running another stateful service alongside Basin
   doubles the operational surface. Lettre + jsonwebtoken + bcrypt is
   ~400 lines of glue against Basin's catalog.
-- **Per-tenant SMTP from day one.** Rejected for v1 — adds a
+- **Per-project SMTP from day one.** Rejected for v1 — adds a
   configuration surface no one has yet asked for. Easy to add later.
 - **Magic-link only (no passwords).** Considered. Rejected because
   every customer support call about "I can't sign in to my own

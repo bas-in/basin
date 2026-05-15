@@ -19,7 +19,7 @@
 //! type code and the coordinates. EWKB blobs are 25 bytes per point.
 //! v0.1 of basin-geo only emits/parses the 21-byte plain WKB (with an
 //! implicit SRID 4326) because every byte of per-row overhead is
-//! per-tenant cost. EWKB support — needed for non-WGS84 round-trips
+//! per-project cost. EWKB support — needed for non-WGS84 round-trips
 //! against psql clients that emit EWKB — is on the v0.2 list.
 //!
 //! ## Endianness

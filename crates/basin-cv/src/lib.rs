@@ -9,7 +9,7 @@
 //! ## SQL surface (target shape, v0.2)
 //!
 //! ```sql
-//! -- Define a CV: hourly request counts per tenant.
+//! -- Define a CV: hourly request counts per project.
 //! CREATE MATERIALIZED VIEW hourly_requests
 //! WITH (basin.continuous, basin.refresh_interval = '1 hour') AS
 //! SELECT
@@ -43,7 +43,7 @@
 //!
 //! On each [`CvRefresher::tick`] (or [`basin_shard::Shard::run_cv_refresh`]):
 //!
-//! 1. For each registered CV under each resident tenant, check whether
+//! 1. For each registered CV under each resident project, check whether
 //!    `now - last_refreshed_at >= refresh_interval`. Skip if not due.
 //! 2. Decide full vs. incremental:
 //!    - First refresh of a CV (no `last_bucket_max`), or a SELECT body
@@ -75,24 +75,24 @@
 //! may return slightly stale data. v0.2 will merge in the tail at read
 //! time. The integration test documents this gap explicitly.
 //!
-//! ## Per-tenant guardrails
+//! ## Per-project guardrails
 //!
-//! - The CV refresher walks tenants registered with
-//!   [`CvRefresher::register_tenant`] only — a tenant that hasn't been
+//! - The CV refresher walks projects registered with
+//!   [`CvRefresher::register_project`] only — a project that hasn't been
 //!   registered never gets a refresh tick. Mirrors `basin_cron`'s
-//!   `register_tenant` / `tick` surface.
-//! - Each refresh runs through `Engine::open_session(tenant)` so the
-//!   storage layer's per-tenant concurrency permits, RLS predicates,
-//!   and the noisy-tenant detector all apply identically to scheduled
+//!   `register_project` / `tick` surface.
+//! - Each refresh runs through `Engine::open_session(project)` so the
+//!   storage layer's per-project concurrency permits, RLS predicates,
+//!   and the noisy-project detector all apply identically to scheduled
 //!   and ad-hoc queries.
-//! - There is no cross-tenant CV: tenant A cannot define a CV that
+//! - There is no cross-project CV: project A cannot define a CV that
 //!   reads from B's table. The check is structural — the source SQL
 //!   only has access to A's namespace through A's session.
 //!
 //! ## Isolation
 //!
-//! Per-tenant CV state is keyed on [`TenantId`] inside [`CvStore`]'s
-//! catalog. Tenant A's `register_cv` cannot affect B's CVs; A's
+//! Per-project CV state is keyed on [`ProjectId`] inside [`CvStore`]'s
+//! catalog. Project A's `register_cv` cannot affect B's CVs; A's
 //! refresh tick never reads or writes B's data files. Documented and
 //! tested by `tests/unit_test_isolation.rs`.
 

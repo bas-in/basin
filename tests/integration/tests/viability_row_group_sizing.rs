@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
@@ -66,8 +66,8 @@ async fn viability_row_group_sizing() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     // Create both tables with identical schema. `events_small` immediately
     // gets the override; `events_default` keeps the writer global default.
@@ -87,12 +87,12 @@ async fn viability_row_group_sizing() {
     // Sanity: the catalog actually persisted the override and its absence on
     // the default table is recorded as None.
     let m_small = catalog
-        .load_table(&tenant, &TableName::new("events_small").unwrap())
+        .load_table(&project, &TableName::new("events_small").unwrap())
         .await
         .unwrap();
     assert_eq!(m_small.row_group_rows, Some(SMALL_RG_ROWS));
     let m_default = catalog
-        .load_table(&tenant, &TableName::new("events_default").unwrap())
+        .load_table(&project, &TableName::new("events_default").unwrap())
         .await
         .unwrap();
     assert_eq!(m_default.row_group_rows, None);
@@ -224,7 +224,7 @@ async fn viability_row_group_sizing() {
 /// "many row groups in one file" property the test relies on, we issue
 /// ONE giant insert per table — small enough to stay sane, large enough
 /// to land as a single Parquet file with N internal row groups.
-async fn insert_rows(sess: &basin_engine::TenantSession, table: &str, n: i64) {
+async fn insert_rows(sess: &basin_engine::ProjectSession, table: &str, n: i64) {
     // Build one VALUES list with all `n` rows. At ~30 bytes/row this is
     // under 600 KB of SQL for 16k rows — well within sqlparser's comfort.
     let mut sql = String::with_capacity((n as usize) * 32 + 64);

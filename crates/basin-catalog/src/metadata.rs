@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{Snapshot, SnapshotId};
@@ -53,7 +53,7 @@ pub struct Policy {
 }
 
 /// Phase 5.7 B1: secondary index declaration. Records `(name, columns)` for a
-/// per-tenant per-table B-tree-shaped index. The physical map (value-bytes →
+/// per-project per-table B-tree-shaped index. The physical map (value-bytes →
 /// (file, row_group, row)) is materialised lazily on first SELECT after a
 /// write; this struct is purely the catalog declaration.
 ///
@@ -126,7 +126,7 @@ pub enum RefAction {
 /// referential integrity on INSERT / UPDATE of referencing columns
 /// (referenced row must exist) and on DELETE / UPDATE of referenced
 /// columns (NO ACTION rejects, CASCADE propagates). Single-shard,
-/// single-tenant only — cross-tenant FKs are rejected at CREATE.
+/// single-project only — cross-project FKs are rejected at CREATE.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyDef {
     /// Auto-named `<table>_<col>_fkey` unless user wrote
@@ -134,7 +134,7 @@ pub struct ForeignKeyDef {
     pub name: String,
     /// Local columns (in order) that participate in the FK.
     pub columns: Vec<String>,
-    /// Bare table name of the referenced table (same tenant only).
+    /// Bare table name of the referenced table (same project only).
     pub ref_table: String,
     /// Referenced columns on `ref_table`. Must be the PK columns of that
     /// table in v0.1 (UNIQUE-constraint-only references are deferred).
@@ -145,7 +145,7 @@ pub struct ForeignKeyDef {
     pub on_update: RefAction,
 }
 
-/// Within-tenant partitioning declared via `CREATE TABLE … PARTITION BY …`.
+/// Within-project partitioning declared via `CREATE TABLE … PARTITION BY …`.
 ///
 /// Catalog-side this is metadata only; the engine consults it at INSERT to
 /// pick a per-row [`basin_common::PartitionKey`] and at SELECT to prune
@@ -185,7 +185,7 @@ impl PartitionSpec {
 ///
 /// Phase 5.7 A4: file-level coalesced stats only. Row-group-level stats
 /// stay in the Parquet footer for the deeper prune; B1 secondary indexes
-/// will subsume the row-group case via a separate per-tenant index file.
+/// will subsume the row-group case via a separate per-project index file.
 ///
 /// All fields default-deserialise so historic catalog rows that predate
 /// this struct come back as an empty `BTreeMap` on
@@ -269,7 +269,7 @@ pub struct CvDef {
 /// schema to Arrow / Parquet readers without re-cloning column metadata.
 #[derive(Clone, Debug)]
 pub struct TableMetadata {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: TableName,
     pub schema: Arc<Schema>,
     pub current_snapshot: SnapshotId,
@@ -335,7 +335,7 @@ pub struct TableMetadata {
     /// [`crate::Catalog::set_cluster_columns`] or `CLUSTER BY (...)` on
     /// `CREATE TABLE`.
     pub cluster_columns: Vec<String>,
-    /// Phase 6 multi-region scaffolding (ADR 0009). The region a tenant's
+    /// Phase 6 multi-region scaffolding (ADR 0009). The region a project's
     /// writes for this table are *pinned* to — i.e. the home region for
     /// all writes; reads can come from any region (with the freshness
     /// bound from ADR 0004). `None` (the default) means "no pinning";

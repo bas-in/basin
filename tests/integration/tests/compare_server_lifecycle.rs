@@ -24,9 +24,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{report_postgres_compare, CompareMetric, WhichWins};
-use basin_router::{ServerConfig, StaticTenantResolver};
+use basin_router::{ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -216,7 +216,7 @@ async fn spawn_basin_server() -> Option<(ChildGuard, std::net::SocketAddr, TempD
     cmd.env("BASIN_BIND", addr.to_string())
         .env("BASIN_DATA_DIR", data_dir.path())
         .env("BASIN_WAL_DIR", wal_dir.path())
-        .env("BASIN_TENANTS", "alice=*")
+        .env("BASIN_PROJECTS", "alice=*")
         .env("BASIN_CATALOG", "memory")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
@@ -382,12 +382,12 @@ async fn compare_server_lifecycle() {
         shard: None,
     });
     let mut map = HashMap::new();
-    map.insert("alice".to_owned(), TenantId::new());
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    map.insert("alice".to_owned(), ProjectId::new());
+    let resolver = Arc::new(StaticProjectResolver::new(map));
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,

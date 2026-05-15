@@ -12,7 +12,7 @@
 //!   `crate::generated_cols::eval_expression` and
 //!   `crate::type_ddl::enforce_domain_checks`).
 //! - `enforce_fk_on_insert` — for each referencing row, verifies the
-//!   referenced PK tuple exists on the referenced table (same-tenant
+//!   referenced PK tuple exists on the referenced table (same-project
 //!   only). NULL in any FK column makes the row exempt (PG MATCH SIMPLE
 //!   default).
 //! - `enforce_fk_on_delete_or_pk_update` — for DELETE / UPDATE-of-PK
@@ -34,7 +34,7 @@ use arrow_schema::{DataType, Schema};
 use basin_catalog::{
     Catalog, CheckConstraint, ForeignKeyDef, RefAction, TableMetadata, UniqueConstraint,
 };
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -48,13 +48,13 @@ use crate::convert::{batch_df_to_ws, batch_ws_to_df};
 /// Reject the new batch if any row's PK tuple already exists in the
 /// table, OR if two rows in the same batch share a PK tuple.
 ///
-/// Cost note: this scans the entire `(tenant, table)` data file set
+/// Cost note: this scans the entire `(project, table)` data file set
 /// once per call. v0.2 (Phase 5.7 B1) secondary indexes will replace
 /// the scan with a B-tree probe. For v0.1 the per-INSERT cost is
 /// `O(rows_in_table + rows_in_batch)`.
 pub(crate) async fn enforce_pk_on_insert(
     storage: &basin_storage::Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     table_name_str: &str,
     pk_columns: &[String],
@@ -100,13 +100,13 @@ pub(crate) async fn enforce_pk_on_insert(
     }
 
     // 2. Existing-table scan. Read every data file's PK columns.
-    let data_files = storage.list_data_files_with_stats(tenant, table).await?;
+    let data_files = storage.list_data_files_with_stats(project, table).await?;
     if data_files.is_empty() {
         return Ok(());
     }
     let mut existing: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     for f in &data_files {
-        let mut stream = storage.read_file(tenant, &f.path).await?;
+        let mut stream = storage.read_file(project, &f.path).await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
             let rb_pk_idx: Vec<usize> = pk_columns
@@ -159,7 +159,7 @@ pub(crate) async fn enforce_pk_on_insert(
 /// the thousands-to-low-millions range where the scan is fine.
 pub(crate) async fn enforce_unique_on_insert(
     storage: &basin_storage::Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     table_name_str: &str,
     unique_constraints: &[UniqueConstraint],
@@ -171,7 +171,7 @@ pub(crate) async fn enforce_unique_on_insert(
     for u in unique_constraints {
         enforce_one_unique(
             storage,
-            tenant,
+            project,
             table,
             table_name_str,
             &u.name,
@@ -190,7 +190,7 @@ pub(crate) async fn enforce_unique_on_insert(
 /// transaction so the rows they contain aren't really "still present").
 pub(crate) async fn enforce_unique_on_update(
     storage: &basin_storage::Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     table_name_str: &str,
     unique_constraints: &[UniqueConstraint],
@@ -204,7 +204,7 @@ pub(crate) async fn enforce_unique_on_update(
         for b in batches {
             enforce_one_unique(
                 storage,
-                tenant,
+                project,
                 table,
                 table_name_str,
                 &u.name,
@@ -225,7 +225,7 @@ pub(crate) async fn enforce_unique_on_update(
 #[allow(clippy::too_many_arguments)]
 async fn enforce_one_unique(
     storage: &basin_storage::Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     table_name_str: &str,
     constraint_name: &str,
@@ -248,13 +248,13 @@ async fn enforce_one_unique(
     // 1. Existing-table scan (skip replaced files on UPDATE).
     let replaced: std::collections::HashSet<&str> =
         replaced_paths.iter().map(|s| s.as_str()).collect();
-    let data_files = storage.list_data_files_with_stats(tenant, table).await?;
+    let data_files = storage.list_data_files_with_stats(project, table).await?;
     let mut existing: std::collections::HashSet<Vec<String>> = Default::default();
     for f in &data_files {
         if replaced.contains(f.path.as_ref()) {
             continue;
         }
-        let mut stream = storage.read_file(tenant, &f.path).await?;
+        let mut stream = storage.read_file(project, &f.path).await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
             let rb_idx: Vec<usize> = columns
@@ -486,7 +486,7 @@ fn render_row_as_pg_tuple(_schema: &Schema, batch: &RecordBatch, row: usize) -> 
 pub(crate) async fn enforce_fk_on_insert(
     catalog: &Arc<dyn Catalog>,
     storage: &basin_storage::Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table_name_str: &str,
     foreign_keys: &[ForeignKeyDef],
     batch: &RecordBatch,
@@ -519,10 +519,10 @@ pub(crate) async fn enforce_fk_on_insert(
         if needed.is_empty() {
             continue;
         }
-        // Load referenced table (same tenant).
+        // Load referenced table (same project).
         let ref_table_name = TableName::new(fk.ref_table.clone())?;
         let ref_meta = catalog
-            .load_table(tenant, &ref_table_name)
+            .load_table(project, &ref_table_name)
             .await
             .map_err(|e| match e {
                 BasinError::NotFound(_) => BasinError::ForeignKeyViolation(format!(
@@ -532,7 +532,7 @@ pub(crate) async fn enforce_fk_on_insert(
                 )),
                 other => other,
             })?;
-        let ref_pk_set = collect_pk_tuples(&ref_meta, storage, tenant, &fk.ref_columns).await?;
+        let ref_pk_set = collect_pk_tuples(&ref_meta, storage, project, &fk.ref_columns).await?;
         for (row, key) in row_keys.iter().enumerate() {
             let Some(k) = key else { continue };
             if !ref_pk_set.contains(k) {
@@ -557,15 +557,15 @@ pub(crate) async fn enforce_fk_on_insert(
 async fn collect_pk_tuples(
     meta: &TableMetadata,
     storage: &basin_storage::Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     pk_cols: &[String],
 ) -> Result<std::collections::HashSet<Vec<String>>> {
     let mut out: std::collections::HashSet<Vec<String>> = Default::default();
     let data_files = storage
-        .list_data_files_with_stats(tenant, &meta.table)
+        .list_data_files_with_stats(project, &meta.table)
         .await?;
     for f in &data_files {
-        let mut stream = storage.read_file(tenant, &f.path).await?;
+        let mut stream = storage.read_file(project, &f.path).await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
             let idx: Vec<usize> = pk_cols
@@ -592,17 +592,17 @@ async fn collect_pk_tuples(
 // FOREIGN KEY enforcement (parent delete / update side)
 // --------------------------------------------------------------------
 
-/// Walk every table in `tenant` and find FKs that point at
+/// Walk every table in `project` and find FKs that point at
 /// `parent_table`. Returns `(child_table, fk)` pairs.
 pub(crate) async fn fks_referencing(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     parent_table: &str,
 ) -> Result<Vec<(TableName, ForeignKeyDef)>> {
     let mut out = Vec::new();
-    let names = catalog.list_tables(tenant).await?;
+    let names = catalog.list_tables(project).await?;
     for n in &names {
-        let meta = catalog.load_table(tenant, n).await?;
+        let meta = catalog.load_table(project, n).await?;
         for fk in &meta.foreign_keys {
             if fk.ref_table.eq_ignore_ascii_case(parent_table) {
                 out.push((n.clone(), fk.clone()));
@@ -623,7 +623,7 @@ pub(crate) async fn fks_referencing(
 pub(crate) async fn check_parent_delete(
     catalog: &Arc<dyn Catalog>,
     storage: &basin_storage::Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     parent_table_str: &str,
     deleted_pk_tuples: &std::collections::HashSet<Vec<String>>,
     parent_pk_columns: &[String],
@@ -632,13 +632,13 @@ pub(crate) async fn check_parent_delete(
     if deleted_pk_tuples.is_empty() {
         return Ok(out);
     }
-    let referencing = fks_referencing(catalog, tenant, parent_table_str).await?;
+    let referencing = fks_referencing(catalog, project, parent_table_str).await?;
     for (child_table, fk) in &referencing {
         // Map child FK columns → parent PK columns by ref_columns ↔ parent PK position.
         // Build the rows-of-child-with-FK-tuple-in-deleted_pk_tuples.
-        let child_meta = catalog.load_table(tenant, child_table).await?;
+        let child_meta = catalog.load_table(project, child_table).await?;
         let data_files = storage
-            .list_data_files_with_stats(tenant, child_table)
+            .list_data_files_with_stats(project, child_table)
             .await?;
         // Re-order child FK columns to match the parent's PK order
         // so the tuple lookup against `deleted_pk_tuples` is byte-
@@ -662,7 +662,7 @@ pub(crate) async fn check_parent_delete(
 
         let mut matching_rows: Vec<HashMap<String, String>> = Vec::new();
         for f in &data_files {
-            let mut stream = storage.read_file(tenant, &f.path).await?;
+            let mut stream = storage.read_file(project, &f.path).await?;
             while let Some(rb) = stream.next().await {
                 let rb = rb?;
                 let idx: Vec<usize> = local_in_parent_pk_order

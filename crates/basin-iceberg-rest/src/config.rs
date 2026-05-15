@@ -12,7 +12,7 @@ pub struct IcebergRestConfig {
     pub require_bearer: bool,
     /// Base location written into the `metadata.location` field of every
     /// `LoadTableResponse`. Defaults to `s3://basin/`. The translator
-    /// concatenates `<base_location>/<tenant>/<table>/` for each table.
+    /// concatenates `<base_location>/<project>/<table>/` for each table.
     pub base_location: String,
 }
 

@@ -13,7 +13,7 @@
 //! 1. Flush + Parquet-drain on `M_src` (no in-flight tail in RAM only).
 //! 2. Bring up `M_tgt` (cold engine, same bucket + catalog).
 //! 3. Atomic placement flip in the catalog (the linearisation point).
-//! 4. `M_tgt` lazy-loads each `(tenant, partition)` on first access via
+//! 4. `M_tgt` lazy-loads each `(project, partition)` on first access via
 //!    the existing WAL replay path.
 //! 5. `M_src` reports zero resident partitions; Fly machine destroy.
 //!
@@ -31,9 +31,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 
-/// Opaque shard identifier. In v0.2 this is `(TenantId, PartitionKey)`
+/// Opaque shard identifier. In v0.2 this is `(ProjectId, PartitionKey)`
 /// flattened to a single string for placement-table rows; v0.3 promotes
 /// to a typed ULID minted by `basin-placement` at first shard activation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -80,7 +80,7 @@ pub struct LoadMap {
 /// Per-shard load snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct ShardLoad {
-    pub tenant: Option<TenantId>,
+    pub project: Option<ProjectId>,
     pub write_qps: f64,
     pub read_qps: f64,
     pub bytes_resident: u64,
@@ -182,8 +182,8 @@ mod tests {
 
     #[test]
     fn shard_id_displays() {
-        let s = ShardId("tenant-foo/bucket=0007".into());
-        assert_eq!(s.to_string(), "tenant-foo/bucket=0007");
+        let s = ShardId("project-foo/bucket=0007".into());
+        assert_eq!(s.to_string(), "project-foo/bucket=0007");
     }
 
     #[test]

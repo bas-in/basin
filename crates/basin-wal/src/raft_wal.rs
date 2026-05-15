@@ -12,7 +12,7 @@
 //!
 //! ## Storage
 //!
-//! State machine state is an in-memory `HashMap<(TenantId, PartitionKey),
+//! State machine state is an in-memory `HashMap<(ProjectId, PartitionKey),
 //! Vec<EntryRecord>>` keyed by `Lsn`. Per the openraft model, applied entries
 //! are durable when the state machine is durable — which for v0.1 means the
 //! snapshot is durable. Snapshots ride a `Cursor<Vec<u8>>` (the openraft
@@ -27,7 +27,7 @@
 //!   Every call site that holds `Arc<dyn Wal>` works against either backend.
 //! - `append` blocks until the entry is quorum-committed and applied to the
 //!   local state machine; the returned `Lsn` is the LSN assigned by the
-//!   leader's state machine (per `(tenant, partition)` keying preserved).
+//!   leader's state machine (per `(project, partition)` keying preserved).
 //! - `read_from` / `high_water` read the local state machine — followers
 //!   serve reads from their replicated copy, leader serves reads from its
 //!   own.
@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, PartitionKey, Result, TenantCounterRegistry, TenantId};
+use basin_common::{BasinError, PartitionKey, Result, ProjectCounterRegistry, ProjectId};
 use bytes::Bytes;
 use chrono::Utc;
 use openraft::error::{NetworkError, RPCError, RaftError, RemoteError};
@@ -142,14 +142,14 @@ impl RaftWalConfig {
 // Type config
 // ---------------------------------------------------------------------------
 
-/// One raft log payload — an append for `(tenant, partition, payload)`.
+/// One raft log payload — an append for `(project, partition, payload)`.
 ///
 /// Carries no LSN; the state machine assigns it on apply so that LSN
-/// monotonicity per `(tenant, partition)` follows from the raft log order
+/// monotonicity per `(project, partition)` follows from the raft log order
 /// (which is itself globally totally ordered).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BasinRaftRequest {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub partition: PartitionKey,
     pub payload: Vec<u8>,
 }
@@ -180,7 +180,7 @@ type RaftHandle = openraft::Raft<C>;
 // State machine + storage
 // ---------------------------------------------------------------------------
 
-/// Per-`(tenant, partition)` log entries the state machine has applied.
+/// Per-`(project, partition)` log entries the state machine has applied.
 /// One `Vec` per partition, sorted by LSN.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PartitionLog {
@@ -206,18 +206,18 @@ struct StoredEntry {
 ///
 /// `partitions` lives in a `HashMap` for O(1) lookup but is serialised as a
 /// `Vec<PartitionEntry>` because `serde_json` can't encode non-string map
-/// keys (the natural `(TenantId, PartitionKey)` tuple). See the manual
+/// keys (the natural `(ProjectId, PartitionKey)` tuple). See the manual
 /// serde impl below.
 #[derive(Clone, Debug, Default)]
 struct StateMachineData {
     last_applied_log: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
-    partitions: HashMap<(TenantId, PartitionKey), PartitionLog>,
+    partitions: HashMap<(ProjectId, PartitionKey), PartitionLog>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct PartitionEntry {
-    tenant: TenantId,
+    project: ProjectId,
     partition: PartitionKey,
     log: PartitionLog,
 }
@@ -238,7 +238,7 @@ impl Serialize for StateMachineData {
                 .partitions
                 .iter()
                 .map(|((t, p), log)| PartitionEntry {
-                    tenant: *t,
+                    project: *t,
                     partition: p.clone(),
                     log: log.clone(),
                 })
@@ -253,7 +253,7 @@ impl<'de> Deserialize<'de> for StateMachineData {
         let wire = StateMachineDataWire::deserialize(de)?;
         let mut partitions = HashMap::new();
         for e in wire.partitions {
-            partitions.insert((e.tenant, e.partition), e.log);
+            partitions.insert((e.project, e.partition), e.log);
         }
         Ok(Self {
             last_applied_log: wire.last_applied_log,
@@ -455,7 +455,7 @@ impl RaftStorage<C> for Arc<BasinRaftStorage> {
                     out.push(BasinRaftResponse { lsn: Lsn::ZERO });
                 }
                 EntryPayload::Normal(req) => {
-                    let key = (req.tenant, req.partition.clone());
+                    let key = (req.project, req.partition.clone());
                     let part = sm.partitions.entry(key).or_default();
                     if part.next_lsn == 0 {
                         part.next_lsn = 1;
@@ -836,12 +836,12 @@ impl RaftWal {
 
     async fn read_state_machine_partition(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
     ) -> PartitionLog {
         let sm = self.storage.sm.read().await;
         sm.partitions
-            .get(&(*tenant, partition.clone()))
+            .get(&(*project, partition.clone()))
             .cloned()
             .unwrap_or_default()
     }
@@ -851,12 +851,12 @@ impl RaftWal {
 impl Wal for RaftWal {
     async fn append(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn> {
         let req = BasinRaftRequest {
-            tenant: *tenant,
+            project: *project,
             partition: partition.clone(),
             payload: payload.to_vec(),
         };
@@ -875,17 +875,17 @@ impl Wal for RaftWal {
 
     async fn read_from(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>> {
-        let part = self.read_state_machine_partition(tenant, partition).await;
+        let part = self.read_state_machine_partition(project, partition).await;
         let out = part
             .entries
             .iter()
             .filter(|e| e.lsn > since_lsn.0 && e.lsn > part.truncated_up_to)
             .map(|e| WalEntry {
-                tenant: *tenant,
+                project: *project,
                 partition: partition.clone(),
                 lsn: Lsn(e.lsn),
                 payload: Bytes::from(e.payload.clone()),
@@ -895,8 +895,8 @@ impl Wal for RaftWal {
         Ok(out)
     }
 
-    async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn> {
-        let part = self.read_state_machine_partition(tenant, partition).await;
+    async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn> {
+        let part = self.read_state_machine_partition(project, partition).await;
         let hw = part
             .entries
             .iter()
@@ -908,7 +908,7 @@ impl Wal for RaftWal {
 
     async fn truncate(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         up_to: Lsn,
     ) -> Result<()> {
@@ -930,7 +930,7 @@ impl Wal for RaftWal {
         // remains the source of truth for replication; this only affects
         // what `read_from` / `high_water` return on this node.
         let mut sm = self.storage.sm.write().await;
-        let key = (*tenant, partition.clone());
+        let key = (*project, partition.clone());
         if let Some(part) = sm.partitions.get_mut(&key) {
             part.entries.retain(|e| e.lsn > up_to.0);
             if up_to.0 > part.truncated_up_to {
@@ -945,9 +945,9 @@ impl Wal for RaftWal {
         Ok(())
     }
 
-    fn attach_tenant_counters(&self, _registry: Arc<TenantCounterRegistry>) {
+    fn attach_project_counters(&self, _registry: Arc<ProjectCounterRegistry>) {
         // Counter wiring is a v0.2 follow-up — `client_write` is the natural
-        // place to bump per-tenant ops; deferring keeps the v0.1 surface
+        // place to bump per-project ops; deferring keeps the v0.1 surface
         // small and the integration small enough to land in one PR.
     }
 }

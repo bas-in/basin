@@ -10,7 +10,7 @@ auto-generated benchmark dashboard see [`RESULTS_localfs.md`](./RESULTS_localfs.
 | Feature | Number | Workload |
 |---|---|---|
 | `RaftWal` 3-node append (in-process simulation) | ~120 µs/op | 10 entries via `client_write`, no fsync, no network — sets a floor for the cross-process gRPC follow-up |
-| EDF scheduler — noisy-neighbor p50 | 5.83 ms | Tenant B's 100 sequential HEADs vs tenant A's 1000-bulk-op concurrent load |
+| EDF scheduler — noisy-neighbor p50 | 5.83 ms | Project B's 100 sequential HEADs vs project A's 1000-bulk-op concurrent load |
 | EDF scheduler — noisy-neighbor p99 | 13.97 ms | Same workload (per-op cost = 2 ms; ratio ≈ 7×; cf. ADR 0008's 32–44× p99 inflation pre-EDF) |
 | `LocalWal` (single-node fsync, baseline) | byte-identical to pre-trait extraction | preserved across `Wal` trait extraction — verified by 9 unchanged unit tests |
 

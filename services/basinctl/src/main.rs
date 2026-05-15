@@ -1,6 +1,6 @@
 //! `basinctl` — a small administrative CLI for a running Basin pgwire endpoint.
 //!
-//! Six subcommands: `ping`, `tenants`, `tables`, `query`, `version`,
+//! Six subcommands: `ping`, `projects`, `tables`, `query`, `version`,
 //! `reset-auth`. Connection string is taken from `--url`, else `BASIN_URL`,
 //! else (for `ping`) the positional argument. See
 //! `services/basinctl/README.md` for examples.
@@ -31,7 +31,7 @@ enum Cmd {
         url: Option<String>,
     },
     /// Print `current_user` from the connected session.
-    Tenants,
+    Projects,
     /// List tables (`SHOW TABLES`).
     Tables,
     /// Run an arbitrary SQL statement and print rows.
@@ -64,12 +64,12 @@ enum Cmd {
             default_value = "postgres://basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable"
         )]
         engine_url: String,
-        /// Also drop `basin_auth_auth_tenant_credentials` (the per-tenant
+        /// Also drop `basin_auth_auth_project_credentials` (the per-project
         /// pgwire login table). Off by default — most resets keep the
         /// customer-facing wire credentials intact and only clear the
         /// user / session / api-key state.
         #[arg(long)]
-        include_tenant_creds: bool,
+        include_project_creds: bool,
     },
 }
 
@@ -90,10 +90,10 @@ const AUTH_TABLES_CORE: &[&str] = &[
     "basin_auth_users",
 ];
 
-/// Extra table dropped only when `--include-tenant-creds` is passed. Kept
-/// separate because clearing this row set logs every pgwire-using tenant
+/// Extra table dropped only when `--include-project-creds` is passed. Kept
+/// separate because clearing this row set logs every pgwire-using project
 /// out — most reset scenarios want to keep wire creds intact.
-const AUTH_TABLE_TENANT_CREDS: &str = "basin_auth_auth_tenant_credentials";
+const AUTH_TABLE_PROJECT_CREDS: &str = "basin_auth_auth_project_credentials";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -123,7 +123,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("OK in {} ms", t0.elapsed().as_millis());
             Ok(())
         }
-        Cmd::Tenants => {
+        Cmd::Projects => {
             let client = connect(&resolve_url(cli.url.as_deref(), None)?).await?;
             let row = client
                 .query_one("SELECT current_user", &[])
@@ -135,7 +135,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Tables => {
             let client = connect(&resolve_url(cli.url.as_deref(), None)?).await?;
-            // SHOW TABLES is Basin's per-tenant table listing; see CAPABILITIES.md.
+            // SHOW TABLES is Basin's per-project table listing; see CAPABILITIES.md.
             let rows = client
                 .simple_query("SHOW TABLES")
                 .await
@@ -161,13 +161,13 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::ResetAuth {
             yes,
             engine_url,
-            include_tenant_creds,
-        } => reset_auth(yes, &engine_url, include_tenant_creds).await,
+            include_project_creds,
+        } => reset_auth(yes, &engine_url, include_project_creds).await,
     }
 }
 
 /// Drop every basin-auth catalog table. See `Cmd::ResetAuth` for rationale.
-async fn reset_auth(yes: bool, engine_url: &str, include_tenant_creds: bool) -> Result<()> {
+async fn reset_auth(yes: bool, engine_url: &str, include_project_creds: bool) -> Result<()> {
     if !yes {
         return Err(anyhow!(
             "reset-auth refuses to run without --yes (this drops all basin-auth tables)"
@@ -176,11 +176,11 @@ async fn reset_auth(yes: bool, engine_url: &str, include_tenant_creds: bool) -> 
 
     // Compose the full drop list once so the preview and the execution agree.
     let mut targets: Vec<&str> = AUTH_TABLES_CORE.to_vec();
-    if include_tenant_creds {
+    if include_project_creds {
         // Insert just before `basin_auth_users` (the FK parent) so we still
         // drop child rows first.
         let insert_at = targets.len().saturating_sub(1);
-        targets.insert(insert_at, AUTH_TABLE_TENANT_CREDS);
+        targets.insert(insert_at, AUTH_TABLE_PROJECT_CREDS);
     }
 
     println!(
@@ -305,9 +305,9 @@ mod tests {
     }
 
     #[test]
-    fn tenants_subcommand() {
-        let cli = parse(&["basinctl", "tenants"]);
-        assert_eq!(cli.cmd, Cmd::Tenants);
+    fn projects_subcommand() {
+        let cli = parse(&["basinctl", "projects"]);
+        assert_eq!(cli.cmd, Cmd::Projects);
     }
 
     #[test]
@@ -347,10 +347,10 @@ mod tests {
             Cmd::ResetAuth {
                 yes,
                 engine_url,
-                include_tenant_creds,
+                include_project_creds,
             } => {
                 assert!(yes);
-                assert!(!include_tenant_creds);
+                assert!(!include_project_creds);
                 assert!(
                     engine_url.starts_with("postgres://basin_auth:basin_auth@127.0.0.1:5433/"),
                     "unexpected default engine_url: {engine_url}"
@@ -368,16 +368,16 @@ mod tests {
             "--yes",
             "--engine-url",
             "postgres://basin_auth:pw@10.0.0.1:5433/basin?sslmode=disable",
-            "--include-tenant-creds",
+            "--include-project-creds",
         ]);
         match cli.cmd {
             Cmd::ResetAuth {
                 yes,
                 engine_url,
-                include_tenant_creds,
+                include_project_creds,
             } => {
                 assert!(yes);
-                assert!(include_tenant_creds);
+                assert!(include_project_creds);
                 assert_eq!(
                     engine_url,
                     "postgres://basin_auth:pw@10.0.0.1:5433/basin?sslmode=disable"
@@ -402,11 +402,11 @@ mod tests {
     fn auth_tables_core_is_seven() {
         // Cross-check against `basin_auth::schema::run_migrations` —
         // 8 tables total, 7 in the default reset set, 1 gated behind
-        // `--include-tenant-creds`.
+        // `--include-project-creds`.
         assert_eq!(AUTH_TABLES_CORE.len(), 7);
         assert!(AUTH_TABLES_CORE
             .iter()
             .all(|t| t.starts_with("basin_auth_")));
-        assert!(AUTH_TABLE_TENANT_CREDS.starts_with("basin_auth_"));
+        assert!(AUTH_TABLE_PROJECT_CREDS.starts_with("basin_auth_"));
     }
 }

@@ -5,10 +5,10 @@
 //! using that JWT as the `user` parameter. Asserts:
 //!
 //! 1. A pgwire connection authenticated as `user=<jwt>` can `CREATE TABLE`,
-//!    `INSERT`, and `SELECT` against the JWT's tenant — proving the binary
-//!    auto-mounts `JwtTenantResolver` when auth is enabled.
+//!    `INSERT`, and `SELECT` against the JWT's project — proving the binary
+//!    auto-mounts `JwtProjectResolver` when auth is enabled.
 //! 2. A second pgwire connection as `user=alice` (the static fallback from
-//!    `BASIN_TENANTS=alice=*`) also succeeds — proving the stacked resolver
+//!    `BASIN_PROJECTS=alice=*`) also succeeds — proving the stacked resolver
 //!    keeps the static map as a real fallback rather than dropping it.
 //! 3. A third pgwire connection as `user=garbage_unknown` is rejected — neither
 //!    JWT verification nor the static map should accept random strings.
@@ -139,7 +139,7 @@ async fn spawn_with_auth() -> Option<(
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.env("BASIN_BIND", pg_addr.to_string())
         .env("BASIN_DATA_DIR", data_dir.path())
-        .env("BASIN_TENANTS", "alice=*")
+        .env("BASIN_PROJECTS", "alice=*")
         .env("BASIN_CATALOG", "memory")
         .env("BASIN_AUTH_ENABLED", "1")
         .env("BASIN_REST_ENABLED", "1")
@@ -327,11 +327,11 @@ async fn poc_pgwire_jwt_resolver_round_trip() {
         return;
     };
 
-    let tenant = basin_common::TenantId::new().to_string();
+    let project = basin_common::ProjectId::new().to_string();
 
     // 1. signup via REST
     let body = serde_json::json!({
-        "tenant_id": tenant,
+        "project_id": project,
         "email": "alice@example.com",
         "password": "longenoughpassword",
     })
@@ -357,7 +357,7 @@ async fn poc_pgwire_jwt_resolver_round_trip() {
 
     // 3. signin to mint a JWT
     let body = serde_json::json!({
-        "tenant_id": tenant,
+        "project_id": project,
         "email": "alice@example.com",
         "password": "longenoughpassword",
     })
@@ -382,7 +382,7 @@ async fn poc_pgwire_jwt_resolver_round_trip() {
 
     // 4. pgwire connection with `user=<jwt>` — primary path through the
     //    stacked resolver. CREATE / INSERT / SELECT must all succeed against
-    //    the JWT's tenant.
+    //    the JWT's project.
     let conn_str = format!(
         "host={} port={} user={} password=ignored",
         pg_addr.ip(),
@@ -418,7 +418,7 @@ async fn poc_pgwire_jwt_resolver_round_trip() {
     let _ = driver.await;
 
     // 5. pgwire connection with `user=alice` — static fallback. Must also
-    //    succeed, proving the stacked resolver keeps `BASIN_TENANTS` as a
+    //    succeed, proving the stacked resolver keeps `BASIN_PROJECTS` as a
     //    real fallback rather than discarding it when JWT is enabled.
     let conn_str_static = format!(
         "host={} port={} user=alice password=ignored",

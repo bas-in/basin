@@ -10,7 +10,7 @@
 //!
 //! Format is internal to this crate. Callers see [`crate::WalEntry`] only.
 
-use basin_common::{BasinError, PartitionKey, Result, TenantId};
+use basin_common::{BasinError, PartitionKey, Result, ProjectId};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use crate::Lsn;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SegmentHeader {
     pub format_version: u16,
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub partition: PartitionKey,
     pub first_lsn: Lsn,
     pub segment_id: Ulid,
@@ -33,7 +33,7 @@ pub(crate) struct SegmentHeader {
 /// for ser/de.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EntryRecord {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub partition: PartitionKey,
     pub lsn: Lsn,
     pub payload: Vec<u8>,
@@ -101,14 +101,14 @@ pub(crate) fn decode_segment(buf: &[u8]) -> Result<(SegmentHeader, Vec<EntryReco
 
 /// Convenience for constructing the wire entry from the public type's pieces.
 pub(crate) fn entry_record(
-    tenant: &TenantId,
+    project: &ProjectId,
     partition: &PartitionKey,
     lsn: Lsn,
     payload: &Bytes,
     appended_at: DateTime<Utc>,
 ) -> EntryRecord {
     EntryRecord {
-        tenant: *tenant,
+        project: *project,
         partition: partition.clone(),
         lsn,
         payload: payload.to_vec(),

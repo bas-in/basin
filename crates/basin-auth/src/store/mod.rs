@@ -17,7 +17,7 @@ pub mod postgres;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use basin_common::{Result, TenantId};
+use basin_common::{Result, ProjectId};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -43,16 +43,16 @@ pub struct AuthUser {
 #[derive(Debug, Clone)]
 pub struct ApiKeyRow {
     pub id: i64,
-    pub tenant_id: String,
+    pub project_id: String,
     pub user_id: Uuid,
     pub key_bcrypt: String,
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-/// A tenant-credential row for the validate / rotate paths.
+/// A project-credential row for the validate / rotate paths.
 #[derive(Debug, Clone)]
-pub struct TenantCredentialRow {
-    pub tenant_id: String,
+pub struct ProjectCredentialRow {
+    pub project_id: String,
     pub dbname: String,
     pub password_hash: String,
 }
@@ -83,43 +83,43 @@ pub trait AuthStore: Send + Sync {
     // --- Users --------------------------------------------------------------
 
     /// Insert a new user row. Returns the new `UserId` on success.
-    /// Returns `CommitConflict` if `(tenant, email)` already exists.
+    /// Returns `CommitConflict` if `(project, email)` already exists.
     async fn create_user(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         email: &str,
         password_hash: &str,
         user_id: UserId,
     ) -> Result<UserId>;
 
-    /// Look up a user by `(tenant, email)`. Returns `None` if not found.
-    async fn find_user_by_email(&self, tenant: &TenantId, email: &str) -> Result<Option<AuthUser>>;
+    /// Look up a user by `(project, email)`. Returns `None` if not found.
+    async fn find_user_by_email(&self, project: &ProjectId, email: &str) -> Result<Option<AuthUser>>;
 
-    /// Look up a user by `(tenant, user_id)`. Returns `None` if not found.
-    async fn find_user_by_id(&self, tenant: &TenantId, user_id: UserId)
+    /// Look up a user by `(project, user_id)`. Returns `None` if not found.
+    async fn find_user_by_id(&self, project: &ProjectId, user_id: UserId)
         -> Result<Option<AuthUser>>;
 
-    /// Return any user (from any tenant) matching `email`. Used by the
-    /// tenant-agnostic email-link flow to check existence before issuing a
-    /// link. Returns `None` if no user has this email in any tenant.
+    /// Return any user (from any project) matching `email`. Used by the
+    /// project-agnostic email-link flow to check existence before issuing a
+    /// link. Returns `None` if no user has this email in any project.
     async fn any_user_by_email(&self, email: &str) -> Result<Option<()>>;
 
     /// Return the most-recently-created user matching `email` across all
-    /// tenants. Used by `email_link::consume`.
-    async fn latest_user_by_email(&self, email: &str) -> Result<Option<(UserId, TenantId)>>;
+    /// projects. Used by `email_link::consume`.
+    async fn latest_user_by_email(&self, email: &str) -> Result<Option<(UserId, ProjectId)>>;
 
-    /// Mark `email_verified_at = now()` for `(tenant, user_id)`.
-    async fn mark_email_verified(&self, tenant: &TenantId, user_id: UserId) -> Result<()>;
+    /// Mark `email_verified_at = now()` for `(project, user_id)`.
+    async fn mark_email_verified(&self, project: &ProjectId, user_id: UserId) -> Result<()>;
 
     /// Mark `email_verified_at = COALESCE(email_verified_at, now())` — sets
     /// the timestamp only if it hasn't been set yet. Used by magic-link
     /// flows where a user may already be verified.
-    async fn mark_email_verified_if_null(&self, tenant: &TenantId, user_id: UserId) -> Result<()>;
+    async fn mark_email_verified_if_null(&self, project: &ProjectId, user_id: UserId) -> Result<()>;
 
     /// Update the password hash for a user.
     async fn update_password(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: UserId,
         password_hash: &str,
     ) -> Result<()>;
@@ -129,26 +129,26 @@ pub trait AuthStore: Send + Sync {
     /// Insert an email token row (verify, reset, magic-link purpose).
     async fn insert_email_token(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: UserId,
         token_hash: &str,
         purpose: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<()>;
 
-    /// Look up an email token by hash + tenant. Returns the full row
+    /// Look up an email token by hash + project. Returns the full row
     /// columns needed for validation.
     async fn find_email_token(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         token_hash: &str,
     ) -> Result<Option<EmailTokenRow>>;
 
-    /// Look up a magic-link email token by hash + tenant, joining the user
+    /// Look up a magic-link email token by hash + project, joining the user
     /// table to return the user's email in one round trip.
     async fn find_magic_link_email_token(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         token_hash: &str,
     ) -> Result<Option<MagicLinkEmailTokenRow>>;
 
@@ -156,7 +156,7 @@ pub trait AuthStore: Send + Sync {
     /// currently `NULL`. Returns the number of rows updated; `0` means the
     /// token was already consumed or never existed — both cases map to an
     /// error in the flow layer.
-    async fn consume_email_token(&self, tenant: &TenantId, token_hash: &str) -> Result<u64>;
+    async fn consume_email_token(&self, project: &ProjectId, token_hash: &str) -> Result<u64>;
 
     // --- Revoked refresh tokens ---------------------------------------------
 
@@ -199,10 +199,10 @@ pub trait AuthStore: Send + Sync {
     // --- API keys -----------------------------------------------------------
 
     /// Insert a new API key row. Returns `(id, created_at)` on success, or
-    /// `CommitConflict` if `(tenant, user, name)` is already taken.
+    /// `CommitConflict` if `(project, user, name)` is already taken.
     async fn insert_api_key(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: UserId,
         name: &str,
         key_hash: &str,
@@ -216,14 +216,14 @@ pub trait AuthStore: Send + Sync {
     /// Best-effort `last_used_at = now()` bump.
     async fn touch_api_key(&self, id: i64) -> Result<()>;
 
-    /// Soft-delete: set `revoked_at = now()` where id + tenant match.
-    /// Returns `NotFound` if the key doesn't belong to the tenant.
-    async fn revoke_api_key(&self, tenant: &TenantId, key_id: i64) -> Result<()>;
+    /// Soft-delete: set `revoked_at = now()` where id + project match.
+    /// Returns `NotFound` if the key doesn't belong to the project.
+    async fn revoke_api_key(&self, project: &ProjectId, key_id: i64) -> Result<()>;
 
-    /// List a user's API keys within a tenant. Ordered by id ascending.
+    /// List a user's API keys within a project. Ordered by id ascending.
     async fn list_api_keys(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: UserId,
     ) -> Result<Vec<crate::api_keys::ApiKeyDescriptor>>;
 
@@ -232,68 +232,68 @@ pub trait AuthStore: Send + Sync {
     /// Upsert a single session-setting row.
     async fn upsert_session_setting(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: UserId,
         key: &str,
         value: &str,
     ) -> Result<()>;
 
-    /// Return all session-setting rows for `(tenant, user)`.
+    /// Return all session-setting rows for `(project, user)`.
     async fn list_session_settings(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user_id: UserId,
     ) -> Result<HashMap<String, String>>;
 
-    // --- Tenant credentials (pgwire) ----------------------------------------
+    // --- Project credentials (pgwire) ----------------------------------------
 
     /// Insert a new credential row. Returns `true` if the row was inserted
     /// (i.e. `pgwire_user` was unique), `false` on conflict (so the caller
     /// can retry with a fresh username).
-    async fn insert_tenant_credential(
+    async fn insert_project_credential(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         pgwire_user: &str,
         password_hash: &str,
         dbname: &str,
     ) -> Result<bool>;
 
     /// Look up a credential row by `pgwire_user`.
-    async fn find_tenant_credential(
+    async fn find_project_credential(
         &self,
         pgwire_user: &str,
-    ) -> Result<Option<TenantCredentialRow>>;
+    ) -> Result<Option<ProjectCredentialRow>>;
 
     /// Rotate the password for an existing credential row. Returns the
-    /// updated `(tenant_id, dbname)` or `None` if not found.
-    async fn rotate_tenant_credential(
+    /// updated `(project_id, dbname)` or `None` if not found.
+    async fn rotate_project_credential(
         &self,
         pgwire_user: &str,
         password_hash: &str,
-    ) -> Result<Option<TenantCredentialRow>>;
+    ) -> Result<Option<ProjectCredentialRow>>;
 
-    /// List every credential row belonging to `tenant`.
-    async fn list_tenant_credentials(
+    /// List every credential row belonging to `project`.
+    async fn list_project_credentials(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Vec<crate::tenant_credentials::TenantCredentialDescriptor>>;
+        project: &ProjectId,
+    ) -> Result<Vec<crate::project_credentials::ProjectCredentialDescriptor>>;
 
-    /// Return all credential rows across all tenants whose `pgwire_user`
-    /// is in the old `tenant_<hex>` format (i.e. starts with `"tenant_"`).
+    /// Return all credential rows across all projects whose `pgwire_user`
+    /// is in the old `project_<hex>` format (i.e. starts with `"project_"`).
     /// Used by the upgrade migration to find credentials that need rotation.
     ///
-    /// Returns `(tenant_id, pgwire_user)` pairs.
-    async fn list_legacy_tenant_credentials(&self) -> Result<Vec<(TenantId, String)>>;
+    /// Returns `(project_id, pgwire_user)` pairs.
+    async fn list_legacy_project_credentials(&self) -> Result<Vec<(ProjectId, String)>>;
 
     /// Delete a single credential row by `pgwire_user`. Called after a
     /// successful migration INSERT to clean up the old-format row.
     /// Returns `NotFound` when the row is already gone (idempotent).
-    async fn delete_tenant_credential(&self, pgwire_user: &str) -> Result<()>;
+    async fn delete_project_credential(&self, pgwire_user: &str) -> Result<()>;
 
-    // --- Auth magic-links (tenant-agnostic email-link flow) -----------------
+    // --- Auth magic-links (project-agnostic email-link flow) -----------------
 
-    /// Insert a new auth_magic_links row (the tenant-agnostic email-link
-    /// flow, not the per-tenant `email_tokens` magic-link).
+    /// Insert a new auth_magic_links row (the project-agnostic email-link
+    /// flow, not the per-project `email_tokens` magic-link).
     async fn insert_auth_magic_link(
         &self,
         email: &str,
@@ -305,13 +305,13 @@ pub trait AuthStore: Send + Sync {
     /// them for bcrypt verification in the flow layer.
     async fn list_active_auth_magic_links(&self) -> Result<Vec<AuthMagicLinkRow>>;
 
-    /// Single-use atomic consume for the tenant-agnostic magic-link row.
+    /// Single-use atomic consume for the project-agnostic magic-link row.
     /// Sets `consumed_at = now()` where `id = $1 AND consumed_at IS NULL`.
     /// Returns the row count; `0` means already consumed (duplicate token use).
     async fn consume_auth_magic_link(&self, id: i64) -> Result<u64>;
 
     /// Mark `email_verified_at = COALESCE(email_verified_at, now())` for
-    /// a user by id (no tenant filter — used in the tenant-agnostic path).
+    /// a user by id (no project filter — used in the project-agnostic path).
     async fn mark_email_verified_by_user_id(&self, user_id: UserId) -> Result<()>;
 }
 
@@ -346,7 +346,7 @@ pub struct RefreshRevocationRow {
     pub revoked_at: DateTime<Utc>,
 }
 
-/// A row from `auth_magic_links` (the tenant-agnostic flow table).
+/// A row from `auth_magic_links` (the project-agnostic flow table).
 #[derive(Debug, Clone)]
 pub struct AuthMagicLinkRow {
     pub id: i64,

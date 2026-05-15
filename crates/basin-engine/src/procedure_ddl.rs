@@ -18,7 +18,7 @@
 //!    — sqlparser parses this natively as
 //!    `Statement::DropProcedure { proc_desc, … }`. The argument list
 //!    from the AST is accepted but not used to disambiguate; v0.1
-//!    forbids per-tenant overloading so `(tenant, name)` is the unique
+//!    forbids per-project overloading so `(project, name)` is the unique
 //!    key.
 //!
 //! Transactional semantics (v0.1): **best-effort sequential**. Each
@@ -48,26 +48,26 @@ use sqlparser::ast::{
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Execute a parsed `CREATE PROCEDURE` from the textual pre-screen
 /// [`match_create_procedure`]. The catalog stores the body verbatim
 /// after [`SqlProcedureDef`] validation; the engine reparses on every
 /// `CALL`.
 pub(crate) async fn exec_create_procedure(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     args: Vec<SqlFunctionArg>,
     body: &str,
 ) -> Result<ExecResult> {
     let def = SqlProcedureDef {
-        tenant: sess.tenant,
+        project: sess.project,
         name: name.to_string(),
         args,
         body: body.to_string(),
     };
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
-    if catalog.lookup_procedure(&sess.tenant, name).await.is_some() {
+    if catalog.lookup_procedure(&sess.project, name).await.is_some() {
         return Err(BasinError::InvalidSchema(format!(
             "CREATE PROCEDURE: procedure {name:?} already exists; \
              drop it first (v0.1 has no CREATE OR REPLACE PROCEDURE)"
@@ -81,10 +81,10 @@ pub(crate) async fn exec_create_procedure(
 
 /// Execute `DROP PROCEDURE [IF EXISTS] <name>(<args>)`. The argument
 /// list from the AST is accepted (and parsed) but not used to
-/// disambiguate; v0.1 forbids overloading per tenant so
-/// `(tenant, name)` is the unique key.
+/// disambiguate; v0.1 forbids overloading per project so
+/// `(project, name)` is the unique key.
 pub(crate) async fn exec_drop_procedure(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     if_exists: bool,
     proc_desc: Vec<FunctionDesc>,
 ) -> Result<ExecResult> {
@@ -96,7 +96,7 @@ pub(crate) async fn exec_drop_procedure(
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     for desc in proc_desc {
         let name = single_part_object_name(&desc.name)?;
-        match catalog.drop_procedure(&sess.tenant, &name).await {
+        match catalog.drop_procedure(&sess.project, &name).await {
             Ok(()) => {}
             Err(BasinError::NotFound(_)) if if_exists => {}
             Err(BasinError::NotFound(_)) => {
@@ -113,7 +113,7 @@ pub(crate) async fn exec_drop_procedure(
 }
 
 /// Execute `CALL <name>(<args>)`. Resolves the procedure from the
-/// per-tenant catalog, substitutes the call-site arguments into each
+/// per-project catalog, substitutes the call-site arguments into each
 /// body statement (via `Expr::Identifier(arg_name) → call-site Expr`,
 /// the same mechanism `sql_functions.rs` uses for scalar UDFs), and
 /// runs the substituted statements in order through the standard
@@ -124,7 +124,7 @@ pub(crate) async fn exec_drop_procedure(
 /// per Phase 5). The return tag carries the count of statements that
 /// ran successfully so callers can distinguish full from partial
 /// completion.
-pub(crate) async fn exec_call(sess: &TenantSession, call: Function) -> Result<ExecResult> {
+pub(crate) async fn exec_call(sess: &ProjectSession, call: Function) -> Result<ExecResult> {
     let proc_name = single_part_object_name(&call.name)?;
 
     // Reject the same shape modifiers the function inliner rejects
@@ -137,7 +137,7 @@ pub(crate) async fn exec_call(sess: &TenantSession, call: Function) -> Result<Ex
 
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     let def = catalog
-        .lookup_procedure(&sess.tenant, &proc_name)
+        .lookup_procedure(&sess.project, &proc_name)
         .await
         .ok_or_else(|| BasinError::not_found(format!("procedure {proc_name:?} does not exist")))?;
 

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use futures::StreamExt;
@@ -181,7 +181,7 @@ async fn viability_3_predicate_pushdown() {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("rg").unwrap();
     let part = PartitionKey::default_key();
 
@@ -202,7 +202,7 @@ async fn viability_3_predicate_pushdown() {
         let start = (b * ROWS_PER_BATCH) as i64;
         let batch = build_batch(start, ROWS_PER_BATCH);
         storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
     }
@@ -214,7 +214,7 @@ async fn viability_3_predicate_pushdown() {
     counting.range_bytes.store(0, Ordering::Relaxed);
     counting.full_bytes.store(0, Ordering::Relaxed);
     let mut full_stream = storage
-        .read(&tenant, &table, ReadOptions::default())
+        .read(&project, &table, ReadOptions::default())
         .await
         .unwrap();
     let mut full_rows = 0usize;
@@ -232,7 +232,7 @@ async fn viability_3_predicate_pushdown() {
         filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(TARGET_ID))],
         ..Default::default()
     };
-    let mut stream = storage.read(&tenant, &table, opts).await.unwrap();
+    let mut stream = storage.read(&project, &table, opts).await.unwrap();
     let mut hit_rows = 0usize;
     while let Some(b) = stream.next().await {
         let b = b.unwrap();

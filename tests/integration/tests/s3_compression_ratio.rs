@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{Storage, StorageConfig};
@@ -125,13 +125,13 @@ async fn s3_compression_ratio() {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
     let batch = build_batch();
     let df = storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .unwrap();
     let parquet_bytes = df.size_bytes;

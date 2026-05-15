@@ -41,8 +41,8 @@ and operator set, not as `pg_vector` compatibility:
 3. An `ORDER BY embedding <-> $1 LIMIT k` pattern that the engine
    recognises and routes through an HNSW index when one exists.
 4. HNSW index support in `basin-storage` (write side) and a
-   per-`(tenant, table)` HNSW segment file format under
-   `/tenants/{id}/tables/{name}/index/{column}.hnsw`. Read side: the
+   per-`(project, table)` HNSW segment file format under
+   `/projects/{id}/tables/{name}/index/{column}.hnsw`. Read side: the
    engine consults the index when the planner picks the
    nearest-neighbor path.
 5. Brute-force fallback when no HNSW index exists, so correctness is
@@ -58,10 +58,10 @@ needs IVF.
 **Positive**
 
 - An agent-platform customer can build a working RAG pipeline on
-  Basin alone, with the per-tenant economics intact.
+  Basin alone, with the per-project economics intact.
 - The dashboard gets a new comparison axis: "vector queries per dollar"
   vs Pinecone, Weaviate, pg_vector-on-Neon, pg_vector-on-RDS.
-- Extends the wedge naturally: per-tenant vector indexes, cheap
+- Extends the wedge naturally: per-project vector indexes, cheap
   retention of historical embeddings on object storage.
 
 **Negative**
@@ -91,7 +91,7 @@ extension's behavior to be wedge-aligned and algorithm-shaped (rare).
 
 We add IVF-flat indexes when a wedge customer specifically needs them
 (typically for billion-scale corpora) AND signs a contract. HNSW is
-fine for the first 1B vectors per tenant.
+fine for the first 1B vectors per project.
 
 ## Alternatives considered
 

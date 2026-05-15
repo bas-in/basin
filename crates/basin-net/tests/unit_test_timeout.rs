@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_net::{AllowList, GuardConfig, HttpClient, RateLimit};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -45,11 +45,11 @@ async fn timeout_fires_on_slow_server() {
         timeout: Duration::from_millis(150),
     };
     let client = HttpClient::with_config(cfg, AllowList::new(), RateLimit::new());
-    let tenant = TenantId::new();
-    client.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    client.allow_host(&project, "127.0.0.1").await;
     let url = format!("http://{addr}/slow");
     let started = std::time::Instant::now();
-    let err = client.http_get(&tenant, &url).await.unwrap_err();
+    let err = client.http_get(&project, &url).await.unwrap_err();
     let elapsed = started.elapsed();
     let msg = format!("{err}");
     assert!(msg.contains("timed out"), "got {msg}");

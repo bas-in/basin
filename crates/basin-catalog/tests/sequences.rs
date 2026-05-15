@@ -8,12 +8,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog, SequenceDef};
-use basin_common::{BasinError, TenantId};
+use basin_common::{BasinError, ProjectId};
 use futures::future::join_all;
 
-fn def(tenant: TenantId, name: &str, start: i64, increment: i64) -> SequenceDef {
+fn def(project: ProjectId, name: &str, start: i64, increment: i64) -> SequenceDef {
     SequenceDef {
-        tenant,
+        project,
         name: name.into(),
         start,
         increment,
@@ -27,7 +27,7 @@ fn def(tenant: TenantId, name: &str, start: i64, increment: i64) -> SequenceDef 
 #[tokio::test]
 async fn create_and_nextval_basic() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
 
     assert_eq!(cat.nextval(&t, "s").await.unwrap(), 1);
@@ -36,13 +36,13 @@ async fn create_and_nextval_basic() {
 }
 
 /// Concurrency invariant: no two `nextval` calls on the same sequence
-/// hand out the same value. The per-`(tenant, sequence)` Mutex
+/// hand out the same value. The per-`(project, sequence)` Mutex
 /// serialises the increment; this test asserts the resulting set of
 /// 10 values has 10 distinct elements.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nextval_concurrent_no_duplicates() {
     let cat = Arc::new(InMemoryCatalog::new());
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
 
     let mut handles = Vec::with_capacity(10);
@@ -75,7 +75,7 @@ async fn nextval_concurrent_no_duplicates() {
 #[tokio::test]
 async fn cache_block_refill() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let mut d = def(t, "s", 1, 1);
     d.cache_size = 10;
     cat.create_sequence(d).await.unwrap();
@@ -98,7 +98,7 @@ async fn cache_block_refill() {
 /// the latter is what we model.
 #[tokio::test]
 async fn cache_gap_on_restart_acceptable() {
-    let t = TenantId::new();
+    let t = ProjectId::new();
     // First incarnation: hand out 5 values from a cache_size=10 sequence.
     let pre_drop_values: Vec<i64>;
     {
@@ -136,7 +136,7 @@ async fn cache_gap_on_restart_acceptable() {
 #[tokio::test]
 async fn currval_without_nextval_errors() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
 
     let err = cat.currval(&t, "s").await.unwrap_err();
@@ -149,7 +149,7 @@ async fn currval_without_nextval_errors() {
 #[tokio::test]
 async fn currval_after_nextval_returns_last() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
     let n = cat.nextval(&t, "s").await.unwrap();
     let c = cat.currval(&t, "s").await.unwrap();
@@ -159,7 +159,7 @@ async fn currval_after_nextval_returns_last() {
 #[tokio::test]
 async fn setval_advance_true() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
     let r = cat.setval(&t, "s", 100, true).await.unwrap();
     assert_eq!(r, 100);
@@ -170,7 +170,7 @@ async fn setval_advance_true() {
 #[tokio::test]
 async fn setval_advance_false() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
     let r = cat.setval(&t, "s", 100, false).await.unwrap();
     assert_eq!(r, 100);
@@ -179,35 +179,35 @@ async fn setval_advance_false() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_sequence(def(a, "shared", 1, 1)).await.unwrap();
 
-    // Tenant A's sequence is invisible to tenant B.
+    // Project A's sequence is invisible to project B.
     let err = cat.nextval(&b, "shared").await.unwrap_err();
     assert!(
         matches!(err, BasinError::NotFound(_)),
-        "tenant B must not see tenant A's sequence, got {err:?}"
+        "project B must not see project A's sequence, got {err:?}"
     );
 
-    // Tenant A advances independently of tenant B's empty namespace.
+    // Project A advances independently of project B's empty namespace.
     assert_eq!(cat.nextval(&a, "shared").await.unwrap(), 1);
     assert_eq!(cat.nextval(&a, "shared").await.unwrap(), 2);
 
-    // Tenant B can register its *own* "shared" sequence with no
-    // collision against tenant A.
+    // Project B can register its *own* "shared" sequence with no
+    // collision against project A.
     cat.create_sequence(def(b, "shared", 100, 1)).await.unwrap();
     assert_eq!(cat.nextval(&b, "shared").await.unwrap(), 100);
-    // Tenant A is unchanged.
+    // Project A is unchanged.
     assert_eq!(cat.nextval(&a, "shared").await.unwrap(), 3);
 }
 
 #[tokio::test]
 async fn drop_sequence_works() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
     cat.nextval(&t, "s").await.unwrap();
 
@@ -227,7 +227,7 @@ async fn drop_sequence_works() {
 #[tokio::test]
 async fn create_duplicate_errors() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
     let err = cat.create_sequence(def(t, "s", 100, 2)).await.unwrap_err();
     assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
@@ -236,7 +236,7 @@ async fn create_duplicate_errors() {
 #[tokio::test]
 async fn lookup_returns_definition() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let original = def(t, "s", 5, 7);
     cat.create_sequence(original.clone()).await.unwrap();
     let looked_up = cat.lookup_sequence(&t, "s").await.unwrap();
@@ -247,7 +247,7 @@ async fn lookup_returns_definition() {
 #[tokio::test]
 async fn drop_namespace_clears_sequences() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
     cat.drop_namespace(&t).await.unwrap();
     let err = cat.nextval(&t, "s").await.unwrap_err();

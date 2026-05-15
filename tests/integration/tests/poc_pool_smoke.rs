@@ -1,7 +1,7 @@
 //! End-to-end smoke test for `BASIN_POOL_ENABLED=1`.
 //!
 //! Spawns the basin-server binary with `BASIN_POOL_ENABLED=1`, opens 100
-//! short-lived pgwire connections in sequence as the same tenant, then asserts
+//! short-lived pgwire connections in sequence as the same project, then asserts
 //! the pool actually reused sessions instead of opening one per connection.
 //!
 //! "Reuse actually happened" is observed indirectly via behaviour: every
@@ -72,7 +72,7 @@ async fn spawn_with_pool() -> Option<(ChildGuard, std::net::SocketAddr, TempDir)
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.env("BASIN_BIND", addr.to_string())
         .env("BASIN_DATA_DIR", data_dir.path())
-        .env("BASIN_TENANTS", "alice=*")
+        .env("BASIN_PROJECTS", "alice=*")
         .env("BASIN_CATALOG", "memory")
         .env("BASIN_POOL_ENABLED", "1")
         .env("RUST_LOG", "warn")

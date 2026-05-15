@@ -45,7 +45,7 @@ use std::time::Duration;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
 use basin_storage::{DiskCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
@@ -171,7 +171,7 @@ impl ObjectStore for LatencyStore {
 /// One point query. Returns `Ok(())` on the expected single-row result.
 async fn point_query(
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     id: i64,
 ) -> Result<(), String> {
@@ -180,7 +180,7 @@ async fn point_query(
         ..Default::default()
     };
     let mut stream = storage
-        .read(tenant, table, opts)
+        .read(project, table, opts)
         .await
         .map_err(|e| format!("read({id}): {e}"))?;
     let mut rows = 0usize;
@@ -210,7 +210,7 @@ async fn viability_disk_cache() {
 
     let dc_cfg = DiskCacheConfig::new(cache_dir.path().to_path_buf(), CACHE_BUDGET_BYTES);
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
@@ -227,7 +227,7 @@ async fn viability_disk_cache() {
     for b in 0..BATCHES {
         let batch = make_batch((b * ROWS_PER_BATCH) as i64);
         writer_storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .expect("write");
     }
@@ -252,9 +252,9 @@ async fn viability_disk_cache() {
     let inner_gets_at_cold_start = latency.inner_gets.load(Ordering::Relaxed);
     let cold_dist: LatencyDistribution = run_workload(&cfg, TOTAL_ROWS, |id| {
         let storage = &storage;
-        let tenant = &tenant;
+        let project = &project;
         let table = &table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
     let cold_inner_gets = latency.inner_gets.load(Ordering::Relaxed) - inner_gets_at_cold_start;
@@ -267,9 +267,9 @@ async fn viability_disk_cache() {
     let inner_gets_at_warm_start = latency.inner_gets.load(Ordering::Relaxed);
     let warm_dist: LatencyDistribution = run_workload(&cfg, TOTAL_ROWS, |id| {
         let storage = &storage;
-        let tenant = &tenant;
+        let project = &project;
         let table = &table;
-        async move { point_query(storage, tenant, table, id as i64).await }
+        async move { point_query(storage, project, table, id as i64).await }
     })
     .await;
     let warm_inner_gets = latency.inner_gets.load(Ordering::Relaxed) - inner_gets_at_warm_start;

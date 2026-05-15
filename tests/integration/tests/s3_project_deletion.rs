@@ -1,11 +1,11 @@
-//! S3 port of `viability_tenant_deletion.rs`.
+//! S3 port of `viability_project_deletion.rs`.
 //!
-//! Same shape: 100 small Parquet files for one tenant, then time the
-//! catalog-aware deletion pass via `Storage::delete_tenant`. The new
+//! Same shape: 100 small Parquet files for one project, then time the
+//! catalog-aware deletion pass via `Storage::delete_project`. The new
 //! shape pulls file paths from the catalog (no LIST RTT on the hot
 //! path), fires the AWS-native bulk `DeleteObjects` against them, runs
 //! a LIST mop-up in parallel for any orphans, and finally drops every
-//! catalog row owned by the tenant.
+//! catalog row owned by the project.
 //!
 //! Important: the dashboard primary metric is `deletion_ms` only —
 //! setup PUTs are reported under `setup_ms` but are NOT the primary.
@@ -13,7 +13,7 @@
 //! of setup, which is irrelevant to the deletion-latency claim.
 //!
 //! Cache reset: caches are default-on for the integration suite, but
-//! tenant deletion should be measured cold so we don't accidentally
+//! project deletion should be measured cold so we don't accidentally
 //! benchmark a warm-cache short-circuit. Since `Storage` doesn't (yet)
 //! expose `clear_disk_cache()` / `clear_page_cache()`, we build a
 //! fresh `Storage` (caches=None) against the same bucket prefix for
@@ -35,7 +35,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{Storage, StorageConfig};
@@ -44,7 +44,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use serde_json::json;
 
-const TEST_NAME: &str = "s3_tenant_deletion";
+const TEST_NAME: &str = "s3_project_deletion";
 const FILES: usize = 100;
 const ROWS_PER_FILE: usize = 1_000;
 // 3 s bar: catalog-first deletion eliminates one RTT vs the legacy
@@ -74,7 +74,7 @@ fn build_batch(start: i64, len: usize) -> RecordBatch {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
-async fn s3_tenant_deletion() {
+async fn s3_project_deletion() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,
         Err(e) => panic!("parse .basin-test.toml: {e}"),
@@ -103,7 +103,7 @@ async fn s3_tenant_deletion() {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
@@ -112,7 +112,7 @@ async fn s3_tenant_deletion() {
     // knowledge of every file path without paying a LIST RTT.
     let catalog = Arc::new(InMemoryCatalog::new());
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
@@ -126,7 +126,7 @@ async fn s3_tenant_deletion() {
             let start = (i * ROWS_PER_FILE) as i64;
             let batch = build_batch(start, ROWS_PER_FILE);
             storage
-                .write_batch(&tenant, &table, &part, &batch)
+                .write_batch(&project, &table, &part, &batch)
                 .await
                 .unwrap()
         });
@@ -144,15 +144,15 @@ async fn s3_tenant_deletion() {
     // Single catalog append registers every file in one snapshot —
     // outside the timed window, same scope as `setup_ms`.
     catalog
-        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .append_data_files(&project, &table, SnapshotId::GENESIS, written)
         .await
         .unwrap();
     let setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
 
     // Sanity check the writes landed (outside any timed window).
-    let tenant_prefix = ObjectPath::from(format!("{run_prefix}/tenants/{tenant}"));
+    let project_prefix = ObjectPath::from(format!("{run_prefix}/projects/{project}"));
     let listed_before: Vec<_> = object_store
-        .list(Some(&tenant_prefix))
+        .list(Some(&project_prefix))
         .try_collect()
         .await
         .unwrap();
@@ -185,13 +185,13 @@ async fn s3_tenant_deletion() {
     // LIST → DELETE serial.
     let started = Instant::now();
     let deleted = storage
-        .delete_tenant(catalog.as_ref(), &tenant)
+        .delete_project(catalog.as_ref(), &project)
         .await
-        .expect("delete_tenant");
+        .expect("delete_project");
     let deletion_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let listed_after: Vec<_> = object_store
-        .list(Some(&tenant_prefix))
+        .list(Some(&project_prefix))
         .try_collect()
         .await
         .unwrap();
@@ -203,13 +203,13 @@ async fn s3_tenant_deletion() {
     assert!(deleted >= FILES, "deleted only {deleted} of >= {FILES}");
 
     // Catalog must be empty after deletion: drop_namespace is the
-    // last step in `delete_tenant` and cascades through every table.
-    let tables_after = catalog.list_tables(&tenant).await.unwrap();
+    // last step in `delete_project` and cascades through every table.
+    let tables_after = catalog.list_tables(&project).await.unwrap();
     assert!(
         tables_after.is_empty(),
         "expected zero residual catalog tables, got {tables_after:?}"
     );
-    let load_err = catalog.load_table(&tenant, &table).await.unwrap_err();
+    let load_err = catalog.load_table(&project, &table).await.unwrap_err();
     assert!(
         matches!(load_err, basin_common::BasinError::NotFound(_)),
         "expected NotFound on dropped table, got {load_err:?}"
@@ -217,15 +217,15 @@ async fn s3_tenant_deletion() {
 
     let pass = deletion_ms < BAR_MS;
     println!(
-        "[S3 tenant_deletion] files={deleted}, setup={setup_ms:.1} ms, \
+        "[S3 project_deletion] files={deleted}, setup={setup_ms:.1} ms, \
          deletion={deletion_ms:.1} ms (bar <{BAR_MS} ms) {}",
         if pass { "PASS" } else { "FAIL" }
     );
 
     report_real_viability(
-        "tenant_deletion",
-        "Tenant deletion latency (real S3)",
-        "Deleting a tenant of 100 small files via Storage::delete_tenant \
+        "project_deletion",
+        "Project deletion latency (real S3)",
+        "Deleting a project of 100 small files via Storage::delete_project \
          (catalog-first; LIST mop-up in parallel; drop_namespace) \
          completes in under 3 seconds on real S3 (caches reset; cold path).",
         pass,

@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use basin_common::{PartitionKey, Result, TableName, TenantId};
+use basin_common::{PartitionKey, Result, TableName, ProjectId};
 use basin_wal::{Lsn, WalEntry};
 
 /// Per-shard role. Set when [`crate::Shard::new`] (leader) or
@@ -165,7 +165,7 @@ impl Default for FollowerStats {
 pub trait ShardFollower: Send + Sync {
     /// Apply one WAL record to the follower's state. Returns the new
     /// `current_lsn` after apply (always strictly greater than the
-    /// previous one, monotonic per `(tenant, partition)`).
+    /// previous one, monotonic per `(project, partition)`).
     ///
     /// Idempotent on already-applied records (returns the current LSN
     /// unchanged) — this keeps tail-restart cheap.
@@ -173,13 +173,13 @@ pub trait ShardFollower: Send + Sync {
 
     /// Highest LSN this follower has applied. Stable across calls from
     /// the same task once they observe a given record.
-    async fn current_lsn(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn>;
+    async fn current_lsn(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn>;
 
     /// Predicate the router consults on each read. True iff
     /// `(leader_high_water - current_lsn) <= threshold`.
     async fn is_caught_up(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         threshold: Duration,
     ) -> Result<bool>;
@@ -189,18 +189,18 @@ pub trait ShardFollower: Send + Sync {
     /// arithmetic is involved.
     async fn has_applied(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         target_lsn: Lsn,
     ) -> Result<bool>;
 
-    /// Read-only data path. Same surface as [`crate::TenantHandle::read`]
+    /// Read-only data path. Same surface as [`crate::ProjectHandle::read`]
     /// — the storage view is identical (Parquet base + in-memory tail);
     /// the only difference is that the tail is reconstructed from the
     /// WAL stream rather than maintained by direct writes.
     async fn read(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         table: &TableName,
         opts: basin_storage::ReadOptions,
@@ -208,7 +208,7 @@ pub trait ShardFollower: Send + Sync {
 
     /// Snapshot of this follower's stats. Same intent as
     /// [`crate::Shard::stats`].
-    async fn stats(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<FollowerStats>;
+    async fn stats(&self, project: &ProjectId, partition: &PartitionKey) -> Result<FollowerStats>;
 }
 
 /// Handle to a follower replica's shard map. Cheap to clone (`Arc`
@@ -261,46 +261,46 @@ impl FollowerShard {
     /// Pass-through to [`ShardFollower::is_caught_up`].
     pub async fn is_caught_up(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         threshold: Duration,
     ) -> Result<bool> {
-        self.inner.is_caught_up(tenant, partition, threshold).await
+        self.inner.is_caught_up(project, partition, threshold).await
     }
 
     /// Pass-through to [`ShardFollower::has_applied`].
     pub async fn has_applied(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         target_lsn: Lsn,
     ) -> Result<bool> {
-        self.inner.has_applied(tenant, partition, target_lsn).await
+        self.inner.has_applied(project, partition, target_lsn).await
     }
 
     /// Pass-through to [`ShardFollower::current_lsn`].
-    pub async fn current_lsn(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn> {
-        self.inner.current_lsn(tenant, partition).await
+    pub async fn current_lsn(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn> {
+        self.inner.current_lsn(project, partition).await
     }
 
     /// Pass-through to [`ShardFollower::read`].
     pub async fn read(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         table: &TableName,
         opts: basin_storage::ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        self.inner.read(tenant, partition, table, opts).await
+        self.inner.read(project, partition, table, opts).await
     }
 
     /// Pass-through to [`ShardFollower::stats`].
     pub async fn stats(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
     ) -> Result<FollowerStats> {
-        self.inner.stats(tenant, partition).await
+        self.inner.stats(project, partition).await
     }
 }
 

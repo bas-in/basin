@@ -81,7 +81,7 @@ async fn measure_cold_start_local(
     cmd.env("BASIN_BIND", addr.to_string())
         .env("BASIN_DATA_DIR", data_dir)
         .env("BASIN_WAL_DIR", wal_dir)
-        .env("BASIN_TENANTS", "alice=*")
+        .env("BASIN_PROJECTS", "alice=*")
         .env("BASIN_CATALOG", "memory")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
@@ -125,7 +125,7 @@ async fn measure_cold_start_local(
                 driver.abort();
             }
             // Connect succeeded but pgwire didn't — keep polling. The
-            // server may still be wiring up its tenant resolver.
+            // server may still be wiring up its project resolver.
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

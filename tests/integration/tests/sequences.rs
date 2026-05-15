@@ -1,14 +1,14 @@
 //! SQL-level coverage for the sequence UDFs (`nextval` / `currval` /
 //! `setval`). The Rust-API surface is covered by
 //! `crates/basin-catalog/tests/sequences.rs`; this file exercises the
-//! same machinery through `TenantSession::execute`.
+//! same machinery through `ProjectSession::execute`.
 
 use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{InMemoryCatalog, SequenceDef};
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -31,13 +31,13 @@ async fn open_engine() -> (TempDir, Engine) {
     (dir, engine)
 }
 
-async fn open_session(engine: &Engine) -> TenantSession {
-    engine.open_session(TenantId::new()).await.unwrap()
+async fn open_session(engine: &Engine) -> ProjectSession {
+    engine.open_session(ProjectId::new()).await.unwrap()
 }
 
 /// Pull the single i64 result from a SELECT that returns exactly one
 /// row × one column.
-async fn one_i64(sess: &TenantSession, sql: &str) -> i64 {
+async fn one_i64(sess: &ProjectSession, sql: &str) -> i64 {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().expect("no batches");
@@ -54,9 +54,9 @@ async fn one_i64(sess: &TenantSession, sql: &str) -> i64 {
     }
 }
 
-fn def(tenant: TenantId, name: &str, start: i64, increment: i64) -> SequenceDef {
+fn def(project: ProjectId, name: &str, start: i64, increment: i64) -> SequenceDef {
     SequenceDef {
-        tenant,
+        project,
         name: name.into(),
         start,
         increment,
@@ -73,7 +73,7 @@ async fn select_nextval_round_trip() {
     let sess = open_session(&engine).await;
 
     let cat = engine.config().catalog.clone();
-    cat.create_sequence(def(sess.tenant(), "order_id_seq", 1, 1))
+    cat.create_sequence(def(sess.project(), "order_id_seq", 1, 1))
         .await
         .unwrap();
 
@@ -88,7 +88,7 @@ async fn select_currval_after_nextval() {
     let sess = open_session(&engine).await;
 
     let cat = engine.config().catalog.clone();
-    cat.create_sequence(def(sess.tenant(), "s", 1, 1))
+    cat.create_sequence(def(sess.project(), "s", 1, 1))
         .await
         .unwrap();
 
@@ -103,7 +103,7 @@ async fn select_currval_without_nextval_errors() {
     let sess = open_session(&engine).await;
 
     let cat = engine.config().catalog.clone();
-    cat.create_sequence(def(sess.tenant(), "s", 1, 1))
+    cat.create_sequence(def(sess.project(), "s", 1, 1))
         .await
         .unwrap();
 
@@ -124,7 +124,7 @@ async fn select_setval_advances_state() {
     let sess = open_session(&engine).await;
 
     let cat = engine.config().catalog.clone();
-    cat.create_sequence(def(sess.tenant(), "s", 1, 1))
+    cat.create_sequence(def(sess.project(), "s", 1, 1))
         .await
         .unwrap();
 
@@ -138,15 +138,15 @@ async fn select_setval_advances_state() {
 }
 
 #[tokio::test]
-async fn nextval_cross_tenant_isolation() {
-    // The same sequence name in two tenants must resolve through the
-    // calling session's tenant — A's `nextval` only ever sees A's
+async fn nextval_cross_project_isolation() {
+    // The same sequence name in two projects must resolve through the
+    // calling session's project — A's `nextval` only ever sees A's
     // sequence, never B's.
     let (_dir, engine) = open_engine().await;
     let cat = engine.config().catalog.clone();
 
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_sequence(def(a, "ids", 1, 1)).await.unwrap();
     cat.create_sequence(def(b, "ids", 1000, 1)).await.unwrap();
 

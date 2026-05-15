@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use basin_common::{PartitionKey, TenantId};
+use basin_common::{PartitionKey, ProjectId};
 use basin_wal::{LocalWal, Lsn, RaftWal, RaftWalConfig, Wal, WalConfig};
 use bytes::Bytes;
 use object_store::local::LocalFileSystem;
@@ -39,13 +39,13 @@ async fn local_wal_implements_trait() {
     let dir = TempDir::new().unwrap();
     let local = LocalWal::open(local_cfg(&dir)).await.unwrap();
     let wal: Arc<dyn Wal> = Arc::new(local);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let partition = PartitionKey::default_key();
 
     // Append some entries through the trait object.
     for i in 1..=5u64 {
         let lsn = wal
-            .append(&tenant, &partition, Bytes::from(format!("payload-{i}")))
+            .append(&project, &partition, Bytes::from(format!("payload-{i}")))
             .await
             .unwrap();
         assert_eq!(lsn, Lsn(i));
@@ -53,12 +53,12 @@ async fn local_wal_implements_trait() {
 
     wal.flush().await.unwrap();
 
-    let entries = wal.read_from(&tenant, &partition, Lsn::ZERO).await.unwrap();
+    let entries = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
     assert_eq!(entries.len(), 5);
-    assert_eq!(wal.high_water(&tenant, &partition).await.unwrap(), Lsn(5));
+    assert_eq!(wal.high_water(&project, &partition).await.unwrap(), Lsn(5));
 
-    wal.truncate(&tenant, &partition, Lsn(3)).await.unwrap();
-    let remaining = wal.read_from(&tenant, &partition, Lsn::ZERO).await.unwrap();
+    wal.truncate(&project, &partition, Lsn(3)).await.unwrap();
+    let remaining = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
     // After truncate(<=3) only entries with lsn > 3 remain on durable storage.
     // Entries that were still in the in-RAM buffer are also returned.
     assert!(remaining.iter().all(|e| e.lsn > Lsn(0)));
@@ -80,18 +80,18 @@ async fn raft_wal_single_node_implements_trait() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let wal: Arc<dyn Wal> = Arc::new(raft);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let partition = PartitionKey::default_key();
 
     let lsn = wal
-        .append(&tenant, &partition, Bytes::from("hello"))
+        .append(&project, &partition, Bytes::from("hello"))
         .await
         .unwrap();
     assert_eq!(lsn, Lsn(1));
 
-    let entries = wal.read_from(&tenant, &partition, Lsn::ZERO).await.unwrap();
+    let entries = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(wal.high_water(&tenant, &partition).await.unwrap(), Lsn(1));
+    assert_eq!(wal.high_water(&project, &partition).await.unwrap(), Lsn(1));
 
     wal.flush().await.unwrap();
     wal.close().await.unwrap();
@@ -126,13 +126,13 @@ async fn arc_dyn_wal_is_cheap_to_clone() {
     let dir = TempDir::new().unwrap();
     let wal: Arc<dyn Wal> = Arc::new(LocalWal::open(local_cfg(&dir)).await.unwrap());
     let cloned = wal.clone();
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let partition = PartitionKey::default_key();
     cloned
-        .append(&tenant, &partition, Bytes::from("hello"))
+        .append(&project, &partition, Bytes::from("hello"))
         .await
         .unwrap();
-    let entries = wal.read_from(&tenant, &partition, Lsn::ZERO).await.unwrap();
+    let entries = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
     assert_eq!(entries.len(), 1);
     wal.close().await.unwrap();
 }

@@ -1,23 +1,23 @@
-//! Per-tenant observability for the webhook fanout machinery.
+//! Per-project observability for the webhook fanout machinery.
 //!
 //! ## Counter shape
 //!
-//! Each tenant that emits at least one webhook event lazily acquires a
+//! Each project that emits at least one webhook event lazily acquires a
 //! [`WebhookCounters`] handle: a small bag of `AtomicU64` (deliveries
 //! succeeded / failed / retries / dead-letters), a signed `AtomicI64` for
-//! the currently-pending queue depth attributable to that tenant, and a
+//! the currently-pending queue depth attributable to that project, and a
 //! fixed-size ring buffer of recent delivery latency samples used to
 //! approximate p99. The shape mirrors `basin_common::telemetry`'s
-//! [`TenantCounters`](basin_common::telemetry::TenantCounters); we do not
+//! [`ProjectCounters`](basin_common::telemetry::ProjectCounters); we do not
 //! fork the underlying primitive — just add webhook-specific fields.
 //!
-//! ## Per-tenant cost discipline
+//! ## Per-project cost discipline
 //!
 //! One process-wide [`WebhookCountersRegistry`] holding a single
-//! `RwLock<HashMap<TenantId, Arc<WebhookCounters>>>`. Per-tenant cost is
+//! `RwLock<HashMap<ProjectId, Arc<WebhookCounters>>>`. Per-project cost is
 //! O(bytes): a `WebhookCounters` is roughly 32 bytes of atomics plus a
 //! 128-sample ring (~520 bytes). Entries are created lazily on the first
-//! webhook event for a tenant. No per-tenant pooled resources (worker,
+//! webhook event for a project. No per-project pooled resources (worker,
 //! file handle, semaphore) are allocated here — the same rule the rest
 //! of `basin-webhooks` honours.
 //!
@@ -26,14 +26,14 @@
 //! Production wiring holds an `Arc<WebhookSink>`. Call
 //! [`WebhookSink::counters`](crate::WebhookSink::counters) to get an
 //! `Arc<WebhookCountersRegistry>`, then
-//! [`WebhookCountersRegistry::snapshot`] for one tenant or
+//! [`WebhookCountersRegistry::snapshot`] for one project or
 //! [`WebhookCountersRegistry::snapshot_all`] for the whole table. The
 //! plain-data [`WebhookCountersSnapshot`] is cheap to copy and serialize.
 //!
 //! ## OTLP propagation
 //!
 //! The worker delivery loop is wrapped in `#[tracing::instrument]` spans
-//! whose attributes (`tenant`, `subscription_id`, `table`, `op`, `seq`,
+//! whose attributes (`project`, `subscription_id`, `table`, `op`, `seq`,
 //! `attempt_count`) propagate through `tracing-subscriber` to the OTLP
 //! exporter wired by `basin-common::telemetry::init`. Span attributes
 //! show up unchanged on the OTLP collector; counters are surfaced via
@@ -43,14 +43,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
-/// Number of recent latency samples retained per tenant for the p99
+/// Number of recent latency samples retained per project for the p99
 /// estimate. Same constant the engine telemetry uses; bytes-cheap and
 /// stable enough that p99 over the last ~128 deliveries is informative.
 const LATENCY_RING_SIZE: usize = 128;
 
-/// Per-tenant webhook counters.
+/// Per-project webhook counters.
 ///
 /// Atomic bump points + a fixed-size ring of recent latency samples.
 /// Public API is the `record_*` family (bumps) and [`Self::snapshot`]
@@ -168,12 +168,12 @@ pub struct WebhookCountersSnapshot {
     pub p99_latency_ms: f64,
 }
 
-/// Process-wide registry of per-tenant webhook counters. Lazy-allocates
-/// on first access so per-tenant cost is O(bytes), not O(active_tenants
+/// Process-wide registry of per-project webhook counters. Lazy-allocates
+/// on first access so per-project cost is O(bytes), not O(active_projects
 /// × buffer).
 #[derive(Debug, Default)]
 pub struct WebhookCountersRegistry {
-    per_tenant: RwLock<HashMap<TenantId, Arc<WebhookCounters>>>,
+    per_project: RwLock<HashMap<ProjectId, Arc<WebhookCounters>>>,
 }
 
 impl WebhookCountersRegistry {
@@ -181,42 +181,42 @@ impl WebhookCountersRegistry {
         Self::default()
     }
 
-    /// Get-or-insert the per-tenant counters. Returns an `Arc` so callers
+    /// Get-or-insert the per-project counters. Returns an `Arc` so callers
     /// can hold their own handle without re-locking on every bump.
-    pub fn for_tenant(&self, tenant: &TenantId) -> Arc<WebhookCounters> {
+    pub fn for_project(&self, project: &ProjectId) -> Arc<WebhookCounters> {
         {
             let map = self
-                .per_tenant
+                .per_project
                 .read()
                 .expect("webhook counter registry poisoned");
-            if let Some(c) = map.get(tenant) {
+            if let Some(c) = map.get(project) {
                 return c.clone();
             }
         }
         let mut map = self
-            .per_tenant
+            .per_project
             .write()
             .expect("webhook counter registry poisoned");
-        map.entry(*tenant)
+        map.entry(*project)
             .or_insert_with(|| Arc::new(WebhookCounters::default()))
             .clone()
     }
 
-    /// Snapshot for one tenant. Returns the zero-value snapshot if the
-    /// tenant has not yet recorded a webhook event — saves the caller
+    /// Snapshot for one project. Returns the zero-value snapshot if the
+    /// project has not yet recorded a webhook event — saves the caller
     /// having to `Option::unwrap_or_default`.
-    pub fn snapshot(&self, tenant: &TenantId) -> WebhookCountersSnapshot {
+    pub fn snapshot(&self, project: &ProjectId) -> WebhookCountersSnapshot {
         let map = self
-            .per_tenant
+            .per_project
             .read()
             .expect("webhook counter registry poisoned");
-        map.get(tenant).map(|c| c.snapshot()).unwrap_or_default()
+        map.get(project).map(|c| c.snapshot()).unwrap_or_default()
     }
 
-    /// Snapshot every tenant that has ever recorded a webhook event.
-    pub fn snapshot_all(&self) -> Vec<(TenantId, WebhookCountersSnapshot)> {
+    /// Snapshot every project that has ever recorded a webhook event.
+    pub fn snapshot_all(&self) -> Vec<(ProjectId, WebhookCountersSnapshot)> {
         let map = self
-            .per_tenant
+            .per_project
             .read()
             .expect("webhook counter registry poisoned");
         map.iter().map(|(t, c)| (*t, c.snapshot())).collect()
@@ -228,20 +228,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_is_per_tenant_isolated() {
+    fn registry_is_per_project_isolated() {
         let r = WebhookCountersRegistry::new();
-        let a = TenantId::new();
-        let b = TenantId::new();
-        r.for_tenant(&a).record_success();
-        r.for_tenant(&a).record_success();
-        r.for_tenant(&b).record_failure();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+        r.for_project(&a).record_success();
+        r.for_project(&a).record_success();
+        r.for_project(&b).record_failure();
         assert_eq!(r.snapshot(&a).deliveries_succeeded, 2);
         assert_eq!(r.snapshot(&a).deliveries_failed, 0);
         assert_eq!(r.snapshot(&b).deliveries_succeeded, 0);
         assert_eq!(r.snapshot(&b).deliveries_failed, 1);
-        // Unseen tenant returns zero-value snapshot, not None.
+        // Unseen project returns zero-value snapshot, not None.
         let unseen = WebhookCountersSnapshot::default();
-        assert_eq!(r.snapshot(&TenantId::new()), unseen);
+        assert_eq!(r.snapshot(&ProjectId::new()), unseen);
     }
 
     #[test]

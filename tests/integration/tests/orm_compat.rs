@@ -1,7 +1,7 @@
 //! ORM startup-query compatibility harness — Phase 5.11.M tail.
 //!
 //! Mirrors the design of `postgrest_pgadmin_compat.rs`: spin a fresh
-//! in-process Basin pgwire server, open a tenant connection, seed a
+//! in-process Basin pgwire server, open a project connection, seed a
 //! shared fixture, then issue the *exact* SQL each ORM runs on
 //! `connect()` / `sync()`. We do not bundle Node.js or Python runtimes;
 //! every assertion runs through `tokio-postgres` against the real
@@ -24,8 +24,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use basin_common::TenantId;
-use basin_router::{ServerConfig, StaticTenantResolver};
+use basin_common::ProjectId;
+use basin_router::{ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls};
@@ -60,15 +60,15 @@ async fn start_server() -> TestServer {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let mut map = HashMap::new();
-    map.insert("alice".to_owned(), tenant);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    map.insert("alice".to_owned(), project);
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -106,7 +106,7 @@ async fn connect(addr: SocketAddr) -> Client {
 /// Three tables:
 /// - `users` — single-PK shape (id BIGINT, email TEXT, created_at TIMESTAMPTZ)
 /// - `orders` — FK-shape (id BIGINT, user_id BIGINT → users, total NUMERIC(10,2))
-/// - `events` — composite-PK shape (tenant_id BIGINT, event_id BIGINT, payload TEXT)
+/// - `events` — composite-PK shape (project_id BIGINT, event_id BIGINT, payload TEXT)
 ///
 /// Plus one function and one procedure (matching the PostgREST harness).
 ///
@@ -128,7 +128,7 @@ async fn setup_orm_fixture(client: &Client) {
              total NUMERIC(10, 2) NOT NULL\
          )",
         "CREATE TABLE events (\
-             tenant_id BIGINT NOT NULL, \
+             project_id BIGINT NOT NULL, \
              event_id BIGINT NOT NULL, \
              payload TEXT NOT NULL\
          )",
@@ -546,9 +546,9 @@ async fn sqlalchemy_pk_column_ordering() {
         .expect("SQLAlchemy composite-PK ordering query");
 
     // Flip-marker: when a659ad3 ships, events' composite PK
-    // (tenant_id, event_id) must surface in this order.
+    // (project_id, event_id) must surface in this order.
     let names: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    assert_eq!(names, vec!["tenant_id", "event_id"]);
+    assert_eq!(names, vec!["project_id", "event_id"]);
 }
 
 /// SQLAlchemy query 3 — sequence-backed (SERIAL) column detection.

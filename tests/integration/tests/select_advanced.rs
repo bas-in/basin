@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -51,7 +51,7 @@ fn engine_in(dir: &TempDir) -> Engine {
 
 /// Execute SQL and return the first batch's i64 column as a vec.
 async fn i64_column(engine: &Engine, sql: &str, col: &str) -> Vec<i64> {
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
     // seed table
     s.execute("CREATE TABLE t (id BIGINT NOT NULL, cat TEXT NOT NULL, val BIGINT NOT NULL)")
         .await
@@ -112,7 +112,7 @@ fn collect_str(res: &ExecResult, col: &str) -> Vec<String> {
 async fn distinct_on_returns_one_row_per_key() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE events (id BIGINT NOT NULL, cat TEXT NOT NULL, val BIGINT NOT NULL)")
         .await
         .unwrap();
@@ -358,7 +358,7 @@ async fn order_by_nulls_last_accepted() {
 async fn table_shorthand_selects_all_rows() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let s = engine.open_session(TenantId::new()).await.unwrap();
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
     s.execute("CREATE TABLE items (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
         .unwrap();

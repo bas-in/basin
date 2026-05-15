@@ -1,7 +1,7 @@
-//! Compare 3: lifecycle ops — tenant deletion and ADD COLUMN.
+//! Compare 3: lifecycle ops — project deletion and ADD COLUMN.
 //!
 //! Two metrics:
-//!   A. Tenant deletion. Basin = `Storage::delete_tenant` (catalog-first +
+//!   A. Project deletion. Basin = `Storage::delete_project` (catalog-first +
 //!      parallel orphan LIST + drop_namespace); PG = DROP SCHEMA ... CASCADE
 //!      on a 100K-row table.
 //!   B. ADD COLUMN on a 100K-row table. Both Basin and PG run
@@ -21,7 +21,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_postgres_compare, CompareMetric, WhichWins};
 use basin_storage::{Storage, StorageConfig};
@@ -112,8 +112,8 @@ async fn compare_lifecycle_ops() {
             println!("[COMPARE lifecycle_ops] postgres unavailable: skipping");
             report_postgres_compare(
                 "lifecycle_ops",
-                "Lifecycle ops: tenant deletion + ADD COLUMN",
-                "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+                "Lifecycle ops: project deletion + ADD COLUMN",
+                "Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
                 false,
                 vec![],
                 Some("postgres unavailable"),
@@ -123,7 +123,7 @@ async fn compare_lifecycle_ops() {
     };
 
     // Unique schema per run; Drop guard cleans up even on panic.
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema = format!("basin_lifecycle_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema.clone(),
@@ -150,10 +150,10 @@ async fn compare_lifecycle_ops() {
     .await
     .expect("pg populate");
 
-    // ---- Metric A: tenant deletion --------------------------------------
-    // Basin: write 100 small Parquet files for one tenant (= 100K rows
+    // ---- Metric A: project deletion --------------------------------------
+    // Basin: write 100 small Parquet files for one project (= 100K rows
     // across files) and register them in an `InMemoryCatalog`, then time
-    // `Storage::delete_tenant` end-to-end. This is the same code path the
+    // `Storage::delete_project` end-to-end. This is the same code path the
     // engine wires up — catalog-first DELETE + parallel orphan LIST +
     // drop_namespace — so the dashboard plots the production teardown
     // latency, not a bypass through the raw object store.
@@ -166,11 +166,11 @@ async fn compare_lifecycle_ops() {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
     catalog
-        .create_table(&tenant, &table, basin_schema_v1().as_ref())
+        .create_table(&project, &table, basin_schema_v1().as_ref())
         .await
         .unwrap();
     let mut written: Vec<DataFileRef> = Vec::with_capacity(BASIN_FILES);
@@ -178,7 +178,7 @@ async fn compare_lifecycle_ops() {
         let start = (i * BASIN_ROWS_PER_FILE) as i64;
         let batch = build_basin_batch(start, BASIN_ROWS_PER_FILE);
         let f = storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
         written.push(DataFileRef {
@@ -191,15 +191,15 @@ async fn compare_lifecycle_ops() {
     // One catalog append registers every file in a single snapshot — the
     // deletion path then sees the full set without a LIST RTT.
     catalog
-        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .append_data_files(&project, &table, SnapshotId::GENESIS, written)
         .await
         .unwrap();
 
     let basin_del_started = Instant::now();
     let _deleted = storage
-        .delete_tenant(catalog.as_ref(), &tenant)
+        .delete_project(catalog.as_ref(), &project)
         .await
-        .expect("delete_tenant");
+        .expect("delete_project");
     let basin_del_ms = basin_del_started.elapsed().as_secs_f64() * 1000.0;
 
     let pg_del_started = Instant::now();
@@ -213,7 +213,7 @@ async fn compare_lifecycle_ops() {
     // ---- Metric B: ADD COLUMN -------------------------------------------
     // Set up a fresh PG schema for the column-add, since the previous one
     // was just dropped.
-    let suffix2 = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix2 = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema2 = format!("basin_lifecycle_{}", suffix2);
     let _guard2 = SchemaGuard {
         schema: schema2.clone(),
@@ -244,7 +244,7 @@ async fn compare_lifecycle_ops() {
 
     // Basin: real ALTER TABLE through the engine's SQL surface. The
     // ADD COLUMN path is implemented in `crates/basin-engine/src/alter.rs`
-    // and dispatches via `TenantSession::execute`. We populate 100 small
+    // and dispatches via `ProjectSession::execute`. We populate 100 small
     // Parquet files first so the timed ALTER runs against a table with
     // 100K rows — the catalog-only fast path doesn't touch them, but the
     // mental model matches PG's "100K-row metadata-only ALTER".
@@ -263,8 +263,8 @@ async fn compare_lifecycle_ops() {
         catalog: catalog2.clone(),
         shard: None,
     });
-    let tenant2 = TenantId::new();
-    let session = engine.open_session(tenant2).await.unwrap();
+    let project2 = ProjectId::new();
+    let session = engine.open_session(project2).await.unwrap();
     session
         .execute("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
@@ -279,7 +279,7 @@ async fn compare_lifecycle_ops() {
         let start = (i * BASIN_ROWS_PER_FILE) as i64;
         let batch = build_basin_batch(start, BASIN_ROWS_PER_FILE);
         storage2
-            .write_batch(&tenant2, &table_v1, &part2, &batch)
+            .write_batch(&project2, &table_v1, &part2, &batch)
             .await
             .unwrap();
     }
@@ -300,7 +300,7 @@ async fn compare_lifecycle_ops() {
     );
     println!(
         "{:>52} {:>12.2}ms {:>12.2}ms {:>22}",
-        "tenant_deletion (1 tenant, 100K rows)",
+        "project_deletion (1 project, 100K rows)",
         basin_del_ms,
         pg_del_ms,
         format!("pg/basin = {:.2}x", del_ratio)
@@ -314,13 +314,13 @@ async fn compare_lifecycle_ops() {
     );
 
     println!(
-        "[COMPARE lifecycle_ops] tenant-delete ratio={:.2}x, add-column ratio={:.2}x",
+        "[COMPARE lifecycle_ops] project-delete ratio={:.2}x, add-column ratio={:.2}x",
         del_ratio, alter_ratio
     );
 
     let metrics = vec![
         CompareMetric {
-            label: "Tenant deletion (1 tenant, 100K rows)".into(),
+            label: "Project deletion (1 project, 100K rows)".into(),
             basin: basin_del_ms,
             postgres: pg_del_ms,
             unit: "ms".into(),
@@ -339,8 +339,8 @@ async fn compare_lifecycle_ops() {
 
     report_postgres_compare(
         "lifecycle_ops",
-        "Lifecycle ops: tenant deletion + ADD COLUMN",
-        "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+        "Lifecycle ops: project deletion + ADD COLUMN",
+        "Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
         true,
         metrics,
         None,

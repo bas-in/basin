@@ -11,7 +11,7 @@
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 
 fn name(s: &str) -> TableName {
     TableName::new(s).unwrap()
@@ -31,7 +31,7 @@ async fn pg_index_returns_empty_for_v01() {
     // queued). The view exists for compatibility but always reports
     // zero rows.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -70,7 +70,7 @@ async fn pg_constraint_lists_not_null_rows() {
     // row. Full PK / FK / CHECK coverage lives in the engine-side
     // `constraints` test.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -107,7 +107,7 @@ async fn views_lists_materialized_views() {
     // routing test exercises the full `CREATE MATERIALIZED VIEW ... WITH
     // (basin.continuous, ...)` path.
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![
         Field::new("bucket", DataType::Int64, false),
@@ -153,7 +153,7 @@ async fn views_lists_materialized_views() {
 #[tokio::test]
 async fn views_excludes_plain_tables() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let schema = Schema::new(vec![Field::new("c", DataType::Int64, false)]);
     cat.create_table(&t, &name("only_table"), &schema)
@@ -165,9 +165,9 @@ async fn views_excludes_plain_tables() {
 }
 
 #[tokio::test]
-async fn schemata_one_row_per_tenant() {
+async fn schemata_one_row_per_project() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::schemata(&cat, &t).await.unwrap();
@@ -212,13 +212,13 @@ async fn schemata_one_row_per_tenant() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation_views() {
-    // Tenant A registers a continuous matview; tenant B must not see
+async fn cross_project_isolation_views() {
+    // Project A registers a continuous matview; project B must not see
     // it via `information_schema.views`. Same P0 invariant the rest of
     // the catalog views enforce.
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.create_namespace(&a).await.unwrap();
     cat.create_namespace(&b).await.unwrap();
 
@@ -241,7 +241,7 @@ async fn cross_tenant_isolation_views() {
     .await
     .unwrap();
 
-    // Tenant B has nothing.
+    // Project B has nothing.
     let ba = InfoSchemaQuery::views(&cat, &a).await.unwrap();
     let bb = InfoSchemaQuery::views(&cat, &b).await.unwrap();
     let names_a: Vec<&str> = (0..ba.num_rows())
@@ -253,6 +253,6 @@ async fn cross_tenant_isolation_views() {
     assert_eq!(names_a, vec!["a_mv"]);
     assert!(
         names_b.is_empty(),
-        "tenant B must not see tenant A's matview, got: {names_b:?}"
+        "project B must not see project A's matview, got: {names_b:?}"
     );
 }

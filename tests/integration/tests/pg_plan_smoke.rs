@@ -13,7 +13,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -79,21 +79,21 @@ async fn pg_plan_smoke_select_with_where() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
 
-    // Provision the tenant namespace and create the table.
+    // Provision the project namespace and create the table.
     engine
         .config()
         .catalog
-        .create_namespace(&tenant)
+        .create_namespace(&project)
         .await
         .unwrap();
     engine
         .config()
         .catalog
-        .create_table(&tenant, &table, t_schema().as_ref())
+        .create_table(&project, &table, t_schema().as_ref())
         .await
         .unwrap();
 
@@ -102,20 +102,20 @@ async fn pg_plan_smoke_select_with_where() {
     let df = engine
         .config()
         .storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .unwrap();
     let meta = engine
         .config()
         .catalog
-        .load_table(&tenant, &table)
+        .load_table(&project, &table)
         .await
         .unwrap();
     engine
         .config()
         .catalog
         .append_data_files(
-            &tenant,
+            &project,
             &table,
             meta.current_snapshot,
             vec![DataFileRef {
@@ -128,7 +128,7 @@ async fn pg_plan_smoke_select_with_where() {
         .await
         .unwrap();
 
-    let sess = engine.open_session(tenant).await.unwrap();
+    let sess = engine.open_session(project).await.unwrap();
 
     let count_before = engine.pg_plan_routing_count();
 

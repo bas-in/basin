@@ -1,12 +1,12 @@
 //! JWT issue + verify (HS256).
 //!
-//! Claims layout matches ADR 0005: `tenant_id`, `user_id`, `email`, `roles`,
+//! Claims layout matches ADR 0005: `project_id`, `user_id`, `email`, `roles`,
 //! `iat`, `exp`. Signing is HS256 with the platform-level secret loaded by
 //! `AuthConfig::from_env`.
 
 use std::time::Duration;
 
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use uuid::Uuid;
 /// token survives any JSON tooling on the way to a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claims {
-    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
     pub user_id: Uuid,
     pub email: String,
     pub roles: Vec<String>,
@@ -26,13 +26,13 @@ pub struct Claims {
     /// Defaults to `false` (i.e. the wire claim is omitted by `issue` and
     /// `WireClaims` decodes a missing field as `false`). The wedge customer's
     /// control plane mints one admin-true token at deploy time and uses it to
-    /// provision tenants.
+    /// provision projects.
     pub is_admin: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WireClaims {
-    tenant_id: String,
+    project_id: String,
     user_id: String,
     email: String,
     roles: Vec<String>,
@@ -46,7 +46,7 @@ struct WireClaims {
 /// being passed to `/refresh`; `jti` keys the per-token revocation row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshClaims {
-    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
     pub user_id: Uuid,
     pub email: String,
     pub jti: String,
@@ -56,7 +56,7 @@ pub struct RefreshClaims {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RefreshWireClaims {
-    tenant_id: String,
+    project_id: String,
     user_id: String,
     email: String,
     jti: String,
@@ -98,14 +98,14 @@ impl JwtKeys {
     /// Issue a fresh access token. `now` lets tests be deterministic.
     pub fn issue(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user: Uuid,
         email: &str,
         roles: &[String],
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<(String, DateTime<Utc>)> {
-        self.issue_with_admin(tenant, user, email, roles, false, now, ttl)
+        self.issue_with_admin(project, user, email, roles, false, now, ttl)
     }
 
     /// Issue an access token with the `is_admin` claim set explicitly. Tokens
@@ -114,7 +114,7 @@ impl JwtKeys {
     /// admin-grade entry point.
     pub fn issue_with_admin(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user: Uuid,
         email: &str,
         roles: &[String],
@@ -127,7 +127,7 @@ impl JwtKeys {
                 BasinError::internal(format!("token_ttl out of range for chrono: {e}"))
             })?;
         let wire = WireClaims {
-            tenant_id: tenant.to_string(),
+            project_id: project.to_string(),
             user_id: user.to_string(),
             email: email.to_owned(),
             roles: roles.to_vec(),
@@ -145,16 +145,16 @@ impl JwtKeys {
         let data = decode::<WireClaims>(token, &self.decoding, &self.validation)
             .map_err(|e| BasinError::internal(format!("jwt verify: {e}")))?;
         let w = data.claims;
-        let tenant: TenantId = w
-            .tenant_id
+        let project: ProjectId = w
+            .project_id
             .parse()
-            .map_err(|e| BasinError::internal(format!("jwt tenant_id parse: {e}")))?;
+            .map_err(|e| BasinError::internal(format!("jwt project_id parse: {e}")))?;
         let user: Uuid = w
             .user_id
             .parse()
             .map_err(|e| BasinError::internal(format!("jwt user_id parse: {e}")))?;
         Ok(Claims {
-            tenant_id: tenant,
+            project_id: project,
             user_id: user,
             email: w.email,
             roles: w.roles,
@@ -169,7 +169,7 @@ impl JwtKeys {
     /// to `/refresh` and vice versa.
     pub fn issue_refresh(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         user: Uuid,
         email: &str,
         now: DateTime<Utc>,
@@ -181,7 +181,7 @@ impl JwtKeys {
             })?;
         let jti = Uuid::new_v4().to_string();
         let wire = RefreshWireClaims {
-            tenant_id: tenant.to_string(),
+            project_id: project.to_string(),
             user_id: user.to_string(),
             email: email.to_owned(),
             jti: jti.clone(),
@@ -199,16 +199,16 @@ impl JwtKeys {
         let data = decode::<RefreshWireClaims>(token, &self.decoding, &self.refresh_validation)
             .map_err(|e| BasinError::internal(format!("refresh jwt verify: {e}")))?;
         let w = data.claims;
-        let tenant: TenantId = w
-            .tenant_id
+        let project: ProjectId = w
+            .project_id
             .parse()
-            .map_err(|e| BasinError::internal(format!("refresh jwt tenant_id parse: {e}")))?;
+            .map_err(|e| BasinError::internal(format!("refresh jwt project_id parse: {e}")))?;
         let user: Uuid = w
             .user_id
             .parse()
             .map_err(|e| BasinError::internal(format!("refresh jwt user_id parse: {e}")))?;
         Ok(RefreshClaims {
-            tenant_id: tenant,
+            project_id: project,
             user_id: user,
             email: w.email,
             jti: w.jti,
@@ -225,12 +225,12 @@ mod tests {
     #[test]
     fn issue_then_verify_round_trips() {
         let keys = JwtKeys::new(&[7u8; 32]);
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let user = Uuid::new_v4();
         let now = Utc::now();
         let (jwt, exp) = keys
             .issue(
-                &tenant,
+                &project,
                 user,
                 "alice@example.com",
                 &["admin".to_string()],
@@ -239,7 +239,7 @@ mod tests {
             )
             .unwrap();
         let claims = keys.verify(&jwt).unwrap();
-        assert_eq!(claims.tenant_id, tenant);
+        assert_eq!(claims.project_id, project);
         assert_eq!(claims.user_id, user);
         assert_eq!(claims.email, "alice@example.com");
         assert_eq!(claims.roles, vec!["admin".to_string()]);
@@ -252,7 +252,7 @@ mod tests {
         let keys = JwtKeys::new(&[7u8; 32]);
         let (jwt, _) = keys
             .issue(
-                &TenantId::new(),
+                &ProjectId::new(),
                 Uuid::new_v4(),
                 "x@y.z",
                 &[],
@@ -271,12 +271,12 @@ mod tests {
     #[test]
     fn refresh_token_round_trips() {
         let keys = JwtKeys::new(&[7u8; 32]);
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let user = Uuid::new_v4();
         let now = Utc::now();
         let (jwt, jti, exp) = keys
             .issue_refresh(
-                &tenant,
+                &project,
                 user,
                 "alice@example.com",
                 now,
@@ -284,7 +284,7 @@ mod tests {
             )
             .unwrap();
         let claims = keys.verify_refresh(&jwt).unwrap();
-        assert_eq!(claims.tenant_id, tenant);
+        assert_eq!(claims.project_id, project);
         assert_eq!(claims.user_id, user);
         assert_eq!(claims.jti, jti);
         assert_eq!(claims.exp, exp.timestamp());
@@ -293,14 +293,14 @@ mod tests {
     #[test]
     fn refresh_jwt_unique_jti_per_issue() {
         let keys = JwtKeys::new(&[7u8; 32]);
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let user = Uuid::new_v4();
         let now = Utc::now();
         let (_, jti_a, _) = keys
-            .issue_refresh(&tenant, user, "x@y.z", now, Duration::from_secs(60))
+            .issue_refresh(&project, user, "x@y.z", now, Duration::from_secs(60))
             .unwrap();
         let (_, jti_b, _) = keys
-            .issue_refresh(&tenant, user, "x@y.z", now, Duration::from_secs(60))
+            .issue_refresh(&project, user, "x@y.z", now, Duration::from_secs(60))
             .unwrap();
         assert_ne!(jti_a, jti_b, "jti must be unique per refresh issuance");
     }
@@ -312,7 +312,7 @@ mod tests {
         let keys = JwtKeys::new(&[7u8; 32]);
         let (access, _) = keys
             .issue(
-                &TenantId::new(),
+                &ProjectId::new(),
                 Uuid::new_v4(),
                 "x@y.z",
                 &[],
@@ -328,7 +328,7 @@ mod tests {
         let keys = JwtKeys::new(&[7u8; 32]);
         let (refresh, _, _) = keys
             .issue_refresh(
-                &TenantId::new(),
+                &ProjectId::new(),
                 Uuid::new_v4(),
                 "x@y.z",
                 Utc::now(),
@@ -349,7 +349,7 @@ mod tests {
         let past = Utc::now() - chrono::Duration::seconds(600);
         let (jwt, _) = keys
             .issue(
-                &TenantId::new(),
+                &ProjectId::new(),
                 Uuid::new_v4(),
                 "x@y.z",
                 &[],

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::DataType;
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 
@@ -34,7 +34,7 @@ use crate::types::field_is_generated;
 /// generated column is allowed to reference an earlier one (PG semantics).
 pub(crate) async fn materialise_generated_columns(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     batch: RecordBatch,
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
@@ -57,7 +57,7 @@ pub(crate) async fn materialise_generated_columns(
         .collect();
 
     for (col_idx, expr_text, col_dt) in gen_cols {
-        let computed = eval_expression(catalog, tenant, &current, &expr_text, &col_dt).await?;
+        let computed = eval_expression(catalog, project, &current, &expr_text, &col_dt).await?;
         current = swap_column(&current, col_idx, computed)?;
     }
 
@@ -72,7 +72,7 @@ pub(crate) async fn materialise_generated_columns(
 /// or narrower).
 pub(crate) async fn eval_expression(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     batch: &RecordBatch,
     expr_text: &str,
     expected_dt: &DataType,
@@ -82,7 +82,7 @@ pub(crate) async fn eval_expression(
     // pass through unchanged.
     let projection_sql = format!("SELECT {expr_text} AS __basin_gen FROM __basin_gen_src");
     let rewritten =
-        crate::sql_functions::rewrite_sql_inlining_functions(catalog, tenant, &projection_sql)
+        crate::sql_functions::rewrite_sql_inlining_functions(catalog, project, &projection_sql)
             .await?;
 
     let ctx = SessionContext::new();
@@ -165,7 +165,7 @@ fn swap_column(batch: &RecordBatch, col_idx: usize, new_col: ArrayRef) -> Result
 /// convention as `apply_assignments`).
 pub(crate) async fn materialise_generated_columns_masked(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     batch: RecordBatch,
     mask: &BooleanArray,
 ) -> Result<RecordBatch> {
@@ -190,7 +190,7 @@ pub(crate) async fn materialise_generated_columns_masked(
         .collect();
 
     for (col_idx, expr_text, col_dt) in gen_cols {
-        let computed = eval_expression(catalog, tenant, &current, &expr_text, &col_dt).await?;
+        let computed = eval_expression(catalog, project, &current, &expr_text, &col_dt).await?;
         let original = current.column(col_idx).clone();
         let merged = merge_by_mask(&original, &computed, mask)?;
         current = swap_column(&current, col_idx, merged)?;

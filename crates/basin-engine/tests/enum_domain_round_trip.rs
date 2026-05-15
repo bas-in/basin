@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -36,7 +36,7 @@ fn engine_in(dir: &TempDir) -> Engine {
 async fn create_type_enum_then_use_in_table() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let res = sess
         .execute("CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped')")
@@ -69,7 +69,7 @@ async fn create_type_enum_then_use_in_table() {
 async fn insert_unknown_enum_label_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE color AS ENUM ('red', 'green', 'blue')")
         .await
@@ -100,7 +100,7 @@ async fn insert_unknown_enum_label_rejected() {
 async fn alter_type_add_value() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE status AS ENUM ('a', 'b')")
         .await
@@ -133,7 +133,7 @@ async fn alter_type_add_value() {
 async fn add_existing_enum_value_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE k AS ENUM ('a', 'b')")
         .await
@@ -153,7 +153,7 @@ async fn add_existing_enum_value_rejected() {
 async fn drop_type_with_dependent_column_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TYPE used AS ENUM ('a', 'b')")
         .await
@@ -174,7 +174,7 @@ async fn drop_type_with_dependent_column_rejected() {
 async fn drop_type_if_exists_idempotent() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // Idempotent: dropping a non-existent type with IF EXISTS is Ok.
     sess.execute("DROP TYPE IF EXISTS missing").await.unwrap();
@@ -190,7 +190,7 @@ async fn drop_type_if_exists_idempotent() {
 async fn create_domain_then_use_in_table() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let res = sess
         .execute("CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)")
@@ -213,7 +213,7 @@ async fn create_domain_then_use_in_table() {
 async fn domain_check_enforced_on_insert() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)")
         .await
@@ -241,7 +241,7 @@ async fn domain_check_enforced_on_insert() {
 async fn drop_domain_with_dependent_column_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE DOMAIN d AS INT CHECK (VALUE > 0)")
         .await
@@ -259,7 +259,7 @@ async fn drop_domain_with_dependent_column_rejected() {
 async fn drop_domain_if_exists_idempotent() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("DROP DOMAIN IF EXISTS missing").await.unwrap();
     let err = sess.execute("DROP DOMAIN missing").await.unwrap_err();
@@ -270,7 +270,7 @@ async fn drop_domain_if_exists_idempotent() {
 }
 
 #[tokio::test]
-async fn cross_tenant_type_isolation() {
+async fn cross_project_type_isolation() {
     let dir = TempDir::new().unwrap();
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
@@ -286,21 +286,21 @@ async fn cross_tenant_type_isolation() {
         shard: None,
     });
 
-    let sess_a = eng.open_session(TenantId::new()).await.unwrap();
-    let sess_b = eng.open_session(TenantId::new()).await.unwrap();
+    let sess_a = eng.open_session(ProjectId::new()).await.unwrap();
+    let sess_b = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess_a
         .execute("CREATE TYPE k AS ENUM ('a', 'b')")
         .await
         .unwrap();
 
-    // Tenant B cannot see tenant A's type — using `k` in a column type
+    // Project B cannot see project A's type — using `k` in a column type
     // should surface as an "unsupported custom type" error from the
     // standard arrow_data_type fallback.
     let err = sess_b.execute("CREATE TABLE t (c k)").await.unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
         msg.contains("unsupported") || msg.contains("custom type") || msg.contains("invalid"),
-        "tenant B should not see tenant A's enum type, got: {err}"
+        "project B should not see project A's enum type, got: {err}"
     );
 }

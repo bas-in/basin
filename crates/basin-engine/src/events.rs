@@ -22,7 +22,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use basin_common::{
     BasinError, ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry, Result, TableName,
-    TenantId,
+    ProjectId,
 };
 use chrono::Utc;
 use serde_json::{Map, Value};
@@ -78,7 +78,7 @@ pub(crate) fn dispatch_post_commit(engine: &Engine, events: Vec<ChangeEvent>) {
             tokio::spawn(async move {
                 if let Err(e) = sink.publish(&ev).await {
                     tracing::warn!(
-                        tenant = %ev.tenant,
+                        project = %ev.project,
                         table = %ev.table,
                         seq = ev.seq,
                         error = %e,
@@ -99,7 +99,7 @@ pub(crate) fn registry_has_any(reg: &EventSinkRegistry) -> bool {
 /// Materialize the events for a freshly-allocated `(seq, op, before, after)`
 /// shape. Caller has already taken `next_event_seq` for each row.
 pub(crate) fn make_event(
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     op: ChangeOp,
     before: Option<Value>,
@@ -108,7 +108,7 @@ pub(crate) fn make_event(
     causation_user: Option<String>,
 ) -> ChangeEvent {
     ChangeEvent {
-        tenant: *tenant,
+        project: *project,
         table: table.clone(),
         op,
         before,
@@ -190,7 +190,7 @@ pub struct TracingSink;
 impl ChangeEventSink for TracingSink {
     async fn publish(&self, event: &ChangeEvent) -> Result<()> {
         tracing::info!(
-            tenant = %event.tenant,
+            project = %event.project,
             table = %event.table,
             op = ?event.op,
             seq = event.seq,
@@ -211,7 +211,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{Engine, EngineConfig, ExecResult, TenantSession};
+    use crate::{Engine, EngineConfig, ExecResult, ProjectSession};
 
     fn engine_in(dir: &TempDir) -> Engine {
         let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
@@ -253,7 +253,7 @@ mod tests {
         }
     }
 
-    async fn seed_table(sess: &TenantSession) {
+    async fn seed_table(sess: &ProjectSession) {
         sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
             .await
             .unwrap();
@@ -268,7 +268,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         eng.attach_pre_commit_sink(Arc::new(FailingSink));
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_table(&sess).await;
 
         let err = sess
@@ -291,7 +291,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         eng.attach_post_commit_sink(Arc::new(FailingSink));
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_table(&sess).await;
 
         sess.execute("INSERT INTO t VALUES (1, 'a')")
@@ -318,8 +318,8 @@ mod tests {
         eng.attach_pre_commit_sink(Arc::new(CapturingSink {
             events: captured.clone(),
         }));
-        let tenant = TenantId::new();
-        let sess = eng.open_session(tenant).await.unwrap();
+        let project = ProjectId::new();
+        let sess = eng.open_session(project).await.unwrap();
         seed_table(&sess).await;
 
         sess.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
@@ -356,18 +356,18 @@ mod tests {
         assert_eq!(events[3].before.as_ref().unwrap()["id"].as_i64(), Some(1),);
         assert!(events[3].after.is_none());
 
-        // Seq monotonic per-tenant.
+        // Seq monotonic per-project.
         for w in events.windows(2) {
             assert!(w[0].seq < w[1].seq, "seq should increase: {events:?}");
         }
-        // All carry the right tenant.
+        // All carry the right project.
         for ev in &events {
-            assert_eq!(ev.tenant, tenant);
+            assert_eq!(ev.project, project);
         }
     }
 
     #[tokio::test]
-    async fn multi_tenant_seq_counters_independent() {
+    async fn multi_project_seq_counters_independent() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let captured = Arc::new(Mutex::new(Vec::<ChangeEvent>::new()));
@@ -375,8 +375,8 @@ mod tests {
             events: captured.clone(),
         }));
 
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let sa = eng.open_session(a).await.unwrap();
         let sb = eng.open_session(b).await.unwrap();
         for s in [&sa, &sb] {
@@ -396,12 +396,12 @@ mod tests {
         let events = captured.lock().unwrap().clone();
         let a_seqs: Vec<u64> = events
             .iter()
-            .filter(|e| e.tenant == a)
+            .filter(|e| e.project == a)
             .map(|e| e.seq)
             .collect();
         let b_seqs: Vec<u64> = events
             .iter()
-            .filter(|e| e.tenant == b)
+            .filter(|e| e.project == b)
             .map(|e| e.seq)
             .collect();
         assert_eq!(a_seqs, vec![1, 2, 3, 4, 5]);
@@ -417,7 +417,7 @@ mod tests {
         // here proves the no-op path doesn't accidentally regress.
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
-        let sess = eng.open_session(TenantId::new()).await.unwrap();
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
         seed_table(&sess).await;
         sess.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
             .await

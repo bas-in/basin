@@ -6,8 +6,8 @@
 //! to the underlying KMS — basin-storage only orchestrates.
 
 use async_trait::async_trait;
-use basin_catalog::TenantStorageConfig;
-use basin_common::{BasinError, Result, TenantId};
+use basin_catalog::ProjectStorageConfig;
+use basin_common::{BasinError, Result, ProjectId};
 use bytes::Bytes;
 use futures::future::FutureExt;
 
@@ -18,43 +18,43 @@ use futures::future::FutureExt;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WrappedKey(pub Vec<u8>);
 
-/// Tenant-scoped envelope-encryption provider. Implementations must be
+/// Project-scoped envelope-encryption provider. Implementations must be
 /// `Send + Sync` and cheap to clone (`Arc` inside) — one provider per
-/// process, looked up per tenant.
+/// process, looked up per project.
 #[async_trait]
 pub trait EncryptionProvider: Send + Sync {
-    /// Generate a fresh data key for `tenant`, wrap it via the tenant's
+    /// Generate a fresh data key for `project`, wrap it via the project's
     /// CMK, and return both the plaintext key (the caller uses it to
     /// AES-GCM the file body) and the wrapped form (basin-storage
     /// persists it as a sidecar).
-    async fn wrap_key(&self, tenant: &TenantId) -> Result<(Vec<u8>, WrappedKey)>;
+    async fn wrap_key(&self, project: &ProjectId) -> Result<(Vec<u8>, WrappedKey)>;
 
     /// Inverse of `wrap_key`. Given the wrapped sidecar, return the
     /// plaintext data key. Used at GET time.
-    async fn unwrap_key(&self, tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>>;
+    async fn unwrap_key(&self, project: &ProjectId, wrapped: &WrappedKey) -> Result<Vec<u8>>;
 
-    /// Optional: when the engine has a [`TenantStorageConfig`] for this
-    /// tenant, it threads it through here so the impl can route to the
-    /// per-tenant CMK instead of its default. Default impl ignores the
+    /// Optional: when the engine has a [`ProjectStorageConfig`] for this
+    /// project, it threads it through here so the impl can route to the
+    /// per-project CMK instead of its default. Default impl ignores the
     /// config and falls back to plain `wrap_key`, preserving backwards
     /// compatibility for impls written against the original two-method
     /// trait.
     async fn wrap_key_with_config(
         &self,
-        tenant: &TenantId,
-        _config: &TenantStorageConfig,
+        project: &ProjectId,
+        _config: &ProjectStorageConfig,
     ) -> Result<(Vec<u8>, WrappedKey)> {
-        self.wrap_key(tenant).await
+        self.wrap_key(project).await
     }
 
     /// Symmetric for unwrap. Default impl forwards to plain `unwrap_key`.
     async fn unwrap_key_with_config(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         wrapped: &WrappedKey,
-        _config: &TenantStorageConfig,
+        _config: &ProjectStorageConfig,
     ) -> Result<Vec<u8>> {
-        self.unwrap_key(tenant, wrapped).await
+        self.unwrap_key(project, wrapped).await
     }
 }
 
@@ -144,7 +144,7 @@ mod tests {
 
     #[async_trait]
     impl EncryptionProvider for MockProvider {
-        async fn wrap_key(&self, _tenant: &TenantId) -> Result<(Vec<u8>, WrappedKey)> {
+        async fn wrap_key(&self, _project: &ProjectId) -> Result<(Vec<u8>, WrappedKey)> {
             // Fixed 32-byte key for reproducibility; real adapters draw
             // from a CSPRNG / KMS GenerateDataKey.
             let plaintext: Vec<u8> = (0u8..32).collect();
@@ -156,7 +156,7 @@ mod tests {
             Ok((plaintext, WrappedKey(sidecar)))
         }
 
-        async fn unwrap_key(&self, _tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
+        async fn unwrap_key(&self, _project: &ProjectId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
             let bytes = &wrapped.0;
             if bytes.first().copied() != Some(0x01) {
                 return Err(BasinError::storage("mock unwrap: bad version byte"));
@@ -168,20 +168,20 @@ mod tests {
     #[tokio::test]
     async fn round_trip_wrap_unwrap() {
         let p = MockProvider { mask: 0xA5 };
-        let tenant = TenantId::new();
-        let (plain, wrapped) = p.wrap_key(&tenant).await.unwrap();
-        let unwrapped = p.unwrap_key(&tenant, &wrapped).await.unwrap();
+        let project = ProjectId::new();
+        let (plain, wrapped) = p.wrap_key(&project).await.unwrap();
+        let unwrapped = p.unwrap_key(&project, &wrapped).await.unwrap();
         assert_eq!(plain, unwrapped);
     }
 
     #[tokio::test]
     async fn tampered_wrapped_key_errors() {
         let p = MockProvider { mask: 0xA5 };
-        let tenant = TenantId::new();
-        let (_plain, wrapped) = p.wrap_key(&tenant).await.unwrap();
+        let project = ProjectId::new();
+        let (_plain, wrapped) = p.wrap_key(&project).await.unwrap();
         let mut bad = wrapped.0.clone();
         bad[0] = 0xFF; // corrupt the version byte
-        let res = p.unwrap_key(&tenant, &WrappedKey(bad)).await;
+        let res = p.unwrap_key(&project, &WrappedKey(bad)).await;
         assert!(res.is_err());
     }
 
@@ -190,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn provider_is_object_safe() {
         let p: Arc<dyn EncryptionProvider> = Arc::new(MockProvider { mask: 0x7E });
-        let tenant = TenantId::new();
-        let _ = p.wrap_key(&tenant).await.unwrap();
+        let project = ProjectId::new();
+        let _ = p.wrap_key(&project).await.unwrap();
     }
 }

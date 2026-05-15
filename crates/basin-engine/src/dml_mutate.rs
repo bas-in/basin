@@ -3,7 +3,7 @@
 //! Iceberg v2 lets a snapshot record either copy-on-write (CoW) or
 //! merge-on-read (MoR) row-level changes. v0.1 ships CoW only:
 //!
-//! 1. List every Parquet file in `(tenant, table)` *with stats*.
+//! 1. List every Parquet file in `(project, table)` *with stats*.
 //! 2. For each file, ask the predicate pruner: can we prove this file
 //!    has no matching rows? Can we prove every row matches?
 //!      - NoMatch: pass through to the new snapshot's `data_files`
@@ -54,7 +54,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::DataFileRef;
-use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName, TenantId};
+use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName, ProjectId};
 use basin_storage::{
     evaluate_compound, evaluate_compound_for_pruning, vector_index_segment_key_for_data_file,
     CompoundPredicate, DataFile, Predicate, PruneOutcome, ScalarValue, Storage,
@@ -81,7 +81,7 @@ use sqlparser::ast::{
 /// The function is recursive so nested AND/OR containing IN-subqueries work
 /// too.
 pub(crate) async fn resolve_subqueries_in_expr(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     expr: Expr,
 ) -> Result<Expr> {
     match expr {
@@ -210,9 +210,9 @@ use crate::events::{
 };
 use crate::lifecycle::AuditRecord;
 use crate::session::refresh_table;
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
-pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<ExecResult> {
+pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result<ExecResult> {
     let table = single_table_from_delete(&delete)?;
     // Resolve any IN (SELECT …) subqueries in the WHERE clause to literal
     // lists before parsing. This must happen before `pre_mutation_flush` so
@@ -250,7 +250,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await?;
     let schema = meta.schema.clone();
 
@@ -267,7 +267,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
     let storage = sess.engine.config().storage.clone();
 
     let data_files = storage
-        .list_data_files_with_stats(&sess.tenant, &table)
+        .list_data_files_with_stats(&sess.project, &table)
         .await?;
     if data_files.is_empty() {
         return Ok(ExecResult::Empty {
@@ -310,7 +310,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
                 if capture_events {
                     capture_dropped_file(
                         &storage,
-                        &sess.tenant,
+                        &sess.project,
                         &f.path,
                         &mut event_payloads,
                         want_returning_rows.then_some(&mut returning_input),
@@ -325,7 +325,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
                 let (kept, deleted_rows, deleted_batch) = if capture_events {
                     evaluate_and_partition_delete_capturing(
                         &storage,
-                        &sess.tenant,
+                        &sess.project,
                         &f.path,
                         p,
                         want_returning_rows,
@@ -333,7 +333,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
                     .await?
                 } else {
                     let kept =
-                        evaluate_and_partition_delete(&storage, &sess.tenant, &f.path, p).await?;
+                        evaluate_and_partition_delete(&storage, &sess.project, &f.path, p).await?;
                     (kept, Vec::new(), None)
                 };
                 let kept_rows: usize = kept.iter().map(|b| b.num_rows()).sum();
@@ -383,7 +383,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
                 .engine
                 .config()
                 .storage
-                .read_file(&sess.tenant, &object_store::path::Path::from(p.as_str()))
+                .read_file(&sess.project, &object_store::path::Path::from(p.as_str()))
                 .await?;
             while let Some(rb) = stream.next().await {
                 let rb = rb?;
@@ -409,7 +409,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
                 .engine
                 .config()
                 .storage
-                .read_file(&sess.tenant, &object_store::path::Path::from(p.as_str()))
+                .read_file(&sess.project, &object_store::path::Path::from(p.as_str()))
                 .await?;
             while let Some(rb) = stream.next().await {
                 let rb = rb?;
@@ -439,7 +439,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
         cascades = crate::constraints::check_parent_delete(
             &sess.engine.config().catalog,
             &sess.engine.config().storage,
-            &sess.tenant,
+            &sess.project,
             table.as_str(),
             &deleted_pks,
             &meta.pk_columns,
@@ -469,7 +469,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
     .await?;
     dispatch_post_commit(&sess.engine, events);
     delete_objects(sess, &table, schema.as_ref(), &removed_paths).await?;
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
     if let Some(audit) = audit_table.as_ref() {
         write_audit_rows(sess, audit, ChangeOp::Delete, audit_rows).await?;
@@ -483,7 +483,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
             .engine
             .config()
             .catalog
-            .load_table(&sess.tenant, &cd.child_table)
+            .load_table(&sess.project, &cd.child_table)
             .await?;
         let where_sql = crate::constraints::build_in_predicate_sql(
             &cd.rows,
@@ -498,7 +498,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
     if let Some(items) = returning.as_deref() {
         return project_returning(
             &sess.engine.config().catalog,
-            &sess.tenant,
+            &sess.project,
             schema.clone(),
             returning_input,
             items,
@@ -512,7 +512,7 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
 }
 
 pub(crate) async fn exec_update(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table_with_joins: TableWithJoins,
     assignments: Vec<Assignment>,
     from: Option<TableWithJoins>,
@@ -565,7 +565,7 @@ pub(crate) async fn exec_update(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await?;
     let schema = meta.schema.clone();
     let storage = sess.engine.config().storage.clone();
@@ -585,7 +585,7 @@ pub(crate) async fn exec_update(
         .any(|(_, rhs)| matches!(rhs, AssignmentRhs::Expr(_)));
 
     let data_files = storage
-        .list_data_files_with_stats(&sess.tenant, &table)
+        .list_data_files_with_stats(&sess.project, &table)
         .await?;
     if data_files.is_empty() {
         return Ok(ExecResult::Empty {
@@ -638,14 +638,14 @@ pub(crate) async fn exec_update(
             (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
                 let catalog = &sess.engine.config().catalog;
                 let (mut new_batches, before_batches, all_true_masks) = if capture_events {
-                    let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                    let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
                     let mut all_masks = Vec::with_capacity(befores.len());
                     for b in &befores {
                         all_masks.push(BooleanArray::from(vec![true; b.num_rows()]));
                     }
                     let news = apply_assignments_all(
                         &sess.engine.config().catalog,
-                        &sess.tenant,
+                        &sess.project,
                         &befores,
                         &assignments,
                     )
@@ -655,7 +655,7 @@ pub(crate) async fn exec_update(
                     let news = read_and_apply_assignments(
                         &sess.engine.config().catalog,
                         &storage,
-                        &sess.tenant,
+                        &sess.project,
                         &f.path,
                         None,
                         &assignments,
@@ -669,7 +669,7 @@ pub(crate) async fn exec_update(
                         rebuilt.push(
                             crate::generated_cols::materialise_generated_columns(
                                 catalog,
-                                &sess.tenant,
+                                &sess.project,
                                 b,
                             )
                             .await?,
@@ -701,7 +701,7 @@ pub(crate) async fn exec_update(
                 let catalog = &sess.engine.config().catalog;
                 let (rows_matched, mut new_batches, before_batches, mask_per_batch) =
                     if capture_events {
-                        let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                        let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
                         let mut masks = Vec::with_capacity(befores.len());
                         let mut news = Vec::with_capacity(befores.len());
                         let mut matched = 0usize;
@@ -711,7 +711,7 @@ pub(crate) async fn exec_update(
                             })?;
                             matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
                             news.push(
-                                apply_assignments(catalog, &sess.tenant, b, &mask, &assignments)
+                                apply_assignments(catalog, &sess.project, b, &mask, &assignments)
                                     .await?,
                             );
                             masks.push(mask);
@@ -721,7 +721,7 @@ pub(crate) async fn exec_update(
                         let (matched, news) = read_and_apply_assignments_mixed(
                             catalog,
                             &storage,
-                            &sess.tenant,
+                            &sess.project,
                             &f.path,
                             p,
                             &assignments,
@@ -742,7 +742,7 @@ pub(crate) async fn exec_update(
                         rebuilt.push(
                             crate::generated_cols::materialise_generated_columns_masked(
                                 &sess.engine.config().catalog,
-                                &sess.tenant,
+                                &sess.project,
                                 b,
                                 m,
                             )
@@ -819,7 +819,7 @@ pub(crate) async fn exec_update(
     if assignments_touch_pk && !meta.pk_columns.is_empty() {
         check_update_pk(
             &sess.engine.config().storage,
-            &sess.tenant,
+            &sess.project,
             &table,
             table.as_str(),
             &meta.pk_columns,
@@ -833,7 +833,7 @@ pub(crate) async fn exec_update(
             crate::constraints::enforce_fk_on_insert(
                 &sess.engine.config().catalog,
                 &sess.engine.config().storage,
-                &sess.tenant,
+                &sess.project,
                 table.as_str(),
                 &meta.foreign_keys,
                 batch,
@@ -856,7 +856,7 @@ pub(crate) async fn exec_update(
     if assignments_touch_unique && !meta.unique_constraints.is_empty() {
         crate::constraints::enforce_unique_on_update(
             &sess.engine.config().storage,
-            &sess.tenant,
+            &sess.project,
             &table,
             table.as_str(),
             &meta.unique_constraints,
@@ -888,7 +888,7 @@ pub(crate) async fn exec_update(
     .await?;
     dispatch_post_commit(&sess.engine, events);
     delete_objects(sess, &table, schema.as_ref(), &replaced_paths).await?;
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
     if let Some(audit) = audit_table.as_ref() {
         write_audit_rows(sess, audit, ChangeOp::Update, audit_rows).await?;
@@ -897,7 +897,7 @@ pub(crate) async fn exec_update(
     if let Some(items) = returning.as_deref() {
         return project_returning(
             &sess.engine.config().catalog,
-            &sess.tenant,
+            &sess.project,
             schema.clone(),
             returning_input,
             items,
@@ -931,7 +931,7 @@ pub(crate) async fn exec_update(
 /// Multi-column PKs require a composite IN or repeated OR clauses; we
 /// emit the latter.
 async fn exec_delete_using(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     selection: Option<Expr>,
     target: &TableName,
     using_tables: Vec<TableWithJoins>,
@@ -940,7 +940,7 @@ async fn exec_delete_using(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, target)
+        .load_table(&sess.project, target)
         .await?;
     if meta.pk_columns.is_empty() {
         return Err(BasinError::InvalidSchema(format!(
@@ -1010,7 +1010,7 @@ async fn exec_delete_using(
 /// 3. Run `SELECT t.pk, rhs_col1, rhs_col2, … FROM t JOIN u ON <cond>`
 /// 4. For each result row emit `UPDATE t SET col1=v1, col2=v2, … WHERE pk=pk`.
 async fn exec_update_from(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     target_twj: TableWithJoins,
     assignments: Vec<Assignment>,
     from_table: TableWithJoins,
@@ -1039,7 +1039,7 @@ async fn exec_update_from(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &target)
+        .load_table(&sess.project, &target)
         .await?;
     if meta.pk_columns.is_empty() {
         return Err(BasinError::InvalidSchema(format!(
@@ -1264,7 +1264,7 @@ struct RowChange {
 /// Hot-path probe: are any sinks attached on either side? When false,
 /// the rest of the mutation path is byte-identical to the no-event
 /// baseline.
-fn sinks_attached(sess: &TenantSession) -> bool {
+fn sinks_attached(sess: &ProjectSession) -> bool {
     let guard = sess
         .engine
         .event_sinks()
@@ -1274,7 +1274,7 @@ fn sinks_attached(sess: &TenantSession) -> bool {
 }
 
 fn build_events(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     op: ChangeOp,
     rows: Vec<RowChange>,
@@ -1289,9 +1289,9 @@ fn build_events(
     };
     let mut out = Vec::with_capacity(rows.len());
     for RowChange { before, after } in rows {
-        let seq = sess.engine.next_event_seq(&sess.tenant, table);
+        let seq = sess.engine.next_event_seq(&sess.project, table);
         out.push(make_event(
-            &sess.tenant,
+            &sess.project,
             table,
             op,
             before,
@@ -1309,12 +1309,12 @@ fn build_events(
 /// also captured for the RETURNING projection.
 async fn capture_dropped_file(
     storage: &Storage,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     path: &object_store::path::Path,
     out: &mut Vec<RowChange>,
     mut returning_out: Option<&mut Vec<RecordBatch>>,
 ) -> Result<()> {
-    let mut stream = storage.read_file(tenant, path).await?;
+    let mut stream = storage.read_file(project, path).await?;
     while let Some(batch) = stream.next().await {
         let batch = batch?;
         for row in 0..batch.num_rows() {
@@ -1336,7 +1336,7 @@ async fn capture_dropped_file(
 /// the matched-rows batch for RETURNING (only built when requested).
 async fn evaluate_and_partition_delete_capturing(
     storage: &Storage,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
     want_returning: bool,
@@ -1345,7 +1345,7 @@ async fn evaluate_and_partition_delete_capturing(
     Vec<(RecordBatch, usize)>,
     Option<RecordBatch>,
 )> {
-    let mut stream = storage.read_file(tenant, path).await?;
+    let mut stream = storage.read_file(project, path).await?;
     let mut kept = Vec::new();
     let mut deleted = Vec::new();
     let mut deleted_batches: Vec<RecordBatch> = Vec::new();
@@ -1408,10 +1408,10 @@ fn sanitize_mask_local(mask: &BooleanArray) -> BooleanArray {
 /// UPDATE path so we can pair before/after row-by-row without re-reading.
 async fn read_file_to_batches(
     storage: &Storage,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     path: &object_store::path::Path,
 ) -> Result<Vec<RecordBatch>> {
-    let mut stream = storage.read_file(tenant, path).await?;
+    let mut stream = storage.read_file(project, path).await?;
     let mut out = Vec::new();
     while let Some(batch) = stream.next().await {
         out.push(batch?);
@@ -1423,14 +1423,14 @@ async fn read_file_to_batches(
 /// post-SET batches.
 async fn apply_assignments_all(
     catalog: &Arc<dyn basin_catalog::Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     befores: &[RecordBatch],
     assignments: &[(usize, AssignmentRhs)],
 ) -> Result<Vec<RecordBatch>> {
     let mut out = Vec::with_capacity(befores.len());
     for b in befores {
         let mask = BooleanArray::from(vec![true; b.num_rows()]);
-        out.push(apply_assignments(catalog, tenant, b, &mask, assignments).await?);
+        out.push(apply_assignments(catalog, project, b, &mask, assignments).await?);
     }
     Ok(out)
 }
@@ -1478,11 +1478,11 @@ fn file_outcome(
 /// `pred`. Used by DELETE.
 async fn evaluate_and_partition_delete(
     storage: &Storage,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
 ) -> Result<Vec<RecordBatch>> {
-    let mut stream = storage.read_file(tenant, path).await?;
+    let mut stream = storage.read_file(project, path).await?;
     let mut kept = Vec::new();
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -1505,12 +1505,12 @@ async fn evaluate_and_partition_delete(
 async fn read_and_apply_assignments(
     catalog: &Arc<dyn basin_catalog::Catalog>,
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     path: &object_store::path::Path,
     pred: Option<&CompoundPredicate>,
     assignments: &[(usize, AssignmentRhs)],
 ) -> Result<Vec<RecordBatch>> {
-    let mut stream = storage.read_file(tenant, path).await?;
+    let mut stream = storage.read_file(project, path).await?;
     let mut out = Vec::new();
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -1519,7 +1519,7 @@ async fn read_and_apply_assignments(
                 .map_err(|e| BasinError::internal(format!("update predicate eval: {e}")))?,
             None => BooleanArray::from(vec![true; batch.num_rows()]),
         };
-        out.push(apply_assignments(catalog, tenant, &batch, &mask, assignments).await?);
+        out.push(apply_assignments(catalog, project, &batch, &mask, assignments).await?);
     }
     Ok(out)
 }
@@ -1531,12 +1531,12 @@ async fn read_and_apply_assignments(
 async fn read_and_apply_assignments_mixed(
     catalog: &Arc<dyn basin_catalog::Catalog>,
     storage: &Storage,
-    tenant: &TenantId,
+    project: &ProjectId,
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
     assignments: &[(usize, AssignmentRhs)],
 ) -> Result<(usize, Vec<RecordBatch>)> {
-    let mut stream = storage.read_file(tenant, path).await?;
+    let mut stream = storage.read_file(project, path).await?;
     let mut matched = 0usize;
     let mut out = Vec::new();
     while let Some(batch) = stream.next().await {
@@ -1544,7 +1544,7 @@ async fn read_and_apply_assignments_mixed(
         let mask = evaluate_compound(&batch, pred)
             .map_err(|e| BasinError::internal(format!("update predicate eval: {e}")))?;
         matched += mask.iter().filter(|b| matches!(b, Some(true))).count();
-        out.push(apply_assignments(catalog, tenant, &batch, &mask, assignments).await?);
+        out.push(apply_assignments(catalog, project, &batch, &mask, assignments).await?);
     }
     Ok((matched, out))
 }
@@ -1557,7 +1557,7 @@ async fn read_and_apply_assignments_mixed(
 /// against that plus their own intra-batch duplicates.
 async fn check_update_pk(
     storage: &Storage,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table: &TableName,
     table_name_str: &str,
     pk_columns: &[String],
@@ -1569,13 +1569,13 @@ async fn check_update_pk(
     }
     use std::collections::HashSet;
     let replaced: HashSet<&str> = replaced_paths.iter().map(|s| s.as_str()).collect();
-    let data_files = storage.list_data_files_with_stats(tenant, table).await?;
+    let data_files = storage.list_data_files_with_stats(project, table).await?;
     let mut existing: HashSet<Vec<String>> = HashSet::new();
     for f in &data_files {
         if replaced.contains(f.path.as_ref()) {
             continue;
         }
-        let mut stream = storage.read_file(tenant, &f.path).await?;
+        let mut stream = storage.read_file(project, &f.path).await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
             let idx: Vec<usize> = pk_columns
@@ -1623,7 +1623,7 @@ async fn check_update_pk(
     Ok(())
 }
 
-async fn pre_mutation_flush(sess: &TenantSession) -> Result<()> {
+async fn pre_mutation_flush(sess: &ProjectSession) -> Result<()> {
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
     }
@@ -1635,7 +1635,7 @@ async fn pre_mutation_flush(sess: &TenantSession) -> Result<()> {
 /// per-call; a multi-batch table would otherwise produce N replacement files
 /// per UPDATE which fragments the Parquet base needlessly.
 async fn write_replacement(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
@@ -1662,7 +1662,7 @@ async fn write_replacement(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, table)
+        .load_table(&sess.project, table)
         .await?;
     let opts = basin_storage::WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
@@ -1673,7 +1673,7 @@ async fn write_replacement(
         .engine
         .config()
         .storage
-        .write_batch_with_options(&sess.tenant, table, &part, &merged, &opts)
+        .write_batch_with_options(&sess.project, table, &part, &merged, &opts)
         .await?;
     Ok(vec![DataFileRef {
         path: df.path.as_ref().to_string(),
@@ -1692,7 +1692,7 @@ async fn write_replacement(
 /// in between our list and our commit it would still appear in the next
 /// SELECT (the new INSERT lands as a separate Parquet file).
 async fn commit_replace(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     expected: basin_catalog::SnapshotId,
     removed: Vec<String>,
@@ -1703,7 +1703,7 @@ async fn commit_replace(
         .config()
         .catalog
         .replace_data_files(
-            &sess.tenant,
+            &sess.project,
             table,
             expected,
             removed.clone(),
@@ -1717,12 +1717,12 @@ async fn commit_replace(
                 .engine
                 .config()
                 .catalog
-                .load_table(&sess.tenant, table)
+                .load_table(&sess.project, table)
                 .await?;
             sess.engine
                 .config()
                 .catalog
-                .replace_data_files(&sess.tenant, table, fresh.current_snapshot, removed, added)
+                .replace_data_files(&sess.project, table, fresh.current_snapshot, removed, added)
                 .await?;
             Ok(())
         }
@@ -1743,13 +1743,13 @@ async fn commit_replace(
 /// segments and re-checks each, so a leftover segment pointing at a
 /// deleted Parquet ULID just contributes hits we discard.
 async fn delete_objects(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: &TableName,
     schema: &Schema,
     paths: &[String],
 ) -> Result<()> {
     let storage = &sess.engine.config().storage;
-    let store = storage.tenant_object_store(&sess.tenant);
+    let store = storage.project_object_store(&sess.project);
     let root = storage.root_prefix_handle();
     let vector_columns: Vec<String> = schema
         .fields()
@@ -1773,7 +1773,7 @@ async fn delete_objects(
         for column in &vector_columns {
             if let Some(sidecar) = vector_index_segment_key_for_data_file(
                 root.as_ref(),
-                &sess.tenant,
+                &sess.project,
                 table,
                 column,
                 p,
@@ -1822,7 +1822,7 @@ fn invert_mask(mask: &BooleanArray) -> BooleanArray {
 /// values (PG semantics), then merged into matched rows via the mask.
 async fn apply_assignments(
     catalog: &Arc<dyn basin_catalog::Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     batch: &RecordBatch,
     mask: &BooleanArray,
     assignments: &[(usize, AssignmentRhs)],
@@ -1842,7 +1842,7 @@ async fn apply_assignments(
                 let field = schema.field(col_idx);
                 let computed = crate::generated_cols::eval_expression(
                     catalog,
-                    tenant,
+                    project,
                     batch,
                     text,
                     field.data_type(),
@@ -1969,7 +1969,7 @@ fn projected_returning_schema(schema: &Schema, items: &[SelectItem]) -> Schema {
 /// function calls) works without a bespoke evaluator here.
 async fn project_returning(
     catalog: &Arc<dyn basin_catalog::Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table_schema: Arc<Schema>,
     inputs: Vec<RecordBatch>,
     items: &[SelectItem],
@@ -1999,7 +1999,7 @@ async fn project_returning(
     let projection_sql =
         format!("SELECT {projection} FROM __basin_returning_src");
     let rewritten =
-        crate::sql_functions::rewrite_sql_inlining_functions(catalog, tenant, &projection_sql)
+        crate::sql_functions::rewrite_sql_inlining_functions(catalog, project, &projection_sql)
             .await?;
 
     let ctx = SessionContext::new();
@@ -2631,7 +2631,7 @@ fn inject_auto_update_assignments(
 /// crate's [`AuditRecord`] so `lifecycle::write_audit_rows` is the
 /// single place that knows the audit-table physical schema.
 async fn write_audit_rows(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     audit_table: &str,
     op: ChangeOp,
     rows: Vec<RowChange>,
@@ -2651,7 +2651,7 @@ async fn write_audit_rows(
 /// configured) is `'delete'` because that's what the user asked for —
 /// the underlying write being an UPDATE is an implementation detail.
 async fn exec_soft_delete(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     table: TableName,
     schema: Arc<Schema>,
     predicate_expr: Option<&Expr>,
@@ -2663,7 +2663,7 @@ async fn exec_soft_delete(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &table)
+        .load_table(&sess.project, &table)
         .await?;
 
     // Build the assignments: just `<sd_col> = now()`. AUTO_UPDATE stamps
@@ -2692,7 +2692,7 @@ async fn exec_soft_delete(
     }
 
     let data_files = storage
-        .list_data_files_with_stats(&sess.tenant, &table)
+        .list_data_files_with_stats(&sess.project, &table)
         .await?;
     if data_files.is_empty() {
         return Ok(empty_or_returning(
@@ -2721,9 +2721,9 @@ async fn exec_soft_delete(
             PruneOutcome::NoMatch => {}
             PruneOutcome::AllMatch => {
                 let catalog = &sess.engine.config().catalog;
-                let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
                 let news =
-                    apply_assignments_all(catalog, &sess.tenant, &befores, &assignments).await?;
+                    apply_assignments_all(catalog, &sess.project, &befores, &assignments).await?;
                 updated_total += f.row_count as usize;
                 replaced_paths.push(f.path.as_ref().to_string());
                 if capture_events {
@@ -2738,7 +2738,7 @@ async fn exec_soft_delete(
             }
             PruneOutcome::Mixed => {
                 let catalog = &sess.engine.config().catalog;
-                let befores = read_file_to_batches(&storage, &sess.tenant, &f.path).await?;
+                let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
                 let mut masks = Vec::with_capacity(befores.len());
                 let mut news = Vec::with_capacity(befores.len());
                 let mut matched = 0usize;
@@ -2748,7 +2748,7 @@ async fn exec_soft_delete(
                     })?;
                     matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
                     news.push(
-                        apply_assignments(catalog, &sess.tenant, b, &mask, &assignments).await?,
+                        apply_assignments(catalog, &sess.project, b, &mask, &assignments).await?,
                     );
                     masks.push(mask);
                 }
@@ -2814,7 +2814,7 @@ async fn exec_soft_delete(
     .await?;
     dispatch_post_commit(&sess.engine, events);
     delete_objects(sess, &table, schema.as_ref(), &replaced_paths).await?;
-    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
     if let Some(audit) = audit_table.as_ref() {
         write_audit_rows(sess, audit, ChangeOp::Delete, audit_rows).await?;
@@ -2823,7 +2823,7 @@ async fn exec_soft_delete(
     if let Some(items) = returning.as_deref() {
         return project_returning(
             &sess.engine.config().catalog,
-            &sess.tenant,
+            &sess.project,
             schema.clone(),
             returning_input,
             items,

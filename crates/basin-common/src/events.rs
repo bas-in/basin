@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::error::Result;
-use crate::ids::{TableName, TenantId};
+use crate::ids::{TableName, ProjectId};
 
 /// What kind of mutation produced this event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,13 +30,13 @@ pub enum ChangeOp {
 /// One committed-row change. `before` is `None` for INSERT; `after` is
 /// `None` for DELETE; UPDATE carries both.
 ///
-/// `seq` is a monotonic counter scoped per-tenant. It increments by 1
+/// `seq` is a monotonic counter scoped per-project. It increments by 1
 /// for each emitted event and is the caller's ordering signal — sinks
 /// that fan out concurrently can use it to reconstruct the commit order
-/// for a tenant.
+/// for a project.
 #[derive(Clone, Debug)]
 pub struct ChangeEvent {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: TableName,
     pub op: ChangeOp,
     pub before: Option<Value>,

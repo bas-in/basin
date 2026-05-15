@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::{BasinError, TenantId};
+use basin_common::{BasinError, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -86,7 +86,7 @@ fn col_str(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<String> {
 async fn create_call_procedure_round_trip() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
         .await
@@ -123,7 +123,7 @@ async fn create_call_procedure_round_trip() {
 async fn multi_statement_body_executes_in_order() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE seen (msg TEXT NOT NULL, ord BIGINT NOT NULL)")
         .await
@@ -164,7 +164,7 @@ async fn multi_statement_body_executes_in_order() {
 async fn call_with_arguments_substitutes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE notes (greeting TEXT NOT NULL, n BIGINT NOT NULL)")
         .await
@@ -203,7 +203,7 @@ async fn call_failure_mid_procedure_persists_prior_statements() {
     // transactions land per Phase 5). This test pins that contract.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
         .await
@@ -240,7 +240,7 @@ async fn call_failure_mid_procedure_persists_prior_statements() {
 async fn drop_procedure_works() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT)").await.unwrap();
     sess.execute("CREATE PROCEDURE noop() LANGUAGE sql AS $$ INSERT INTO t VALUES (1) $$")
@@ -266,16 +266,16 @@ async fn drop_procedure_works() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let dir = TempDir::new().unwrap();
     let cat: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     let eng_a = shared_engine(&dir, cat.clone());
     let eng_b = shared_engine(&dir, cat.clone());
 
-    let tenant_a = TenantId::new();
-    let tenant_b = TenantId::new();
-    let sess_a = eng_a.open_session(tenant_a).await.unwrap();
-    let sess_b = eng_b.open_session(tenant_b).await.unwrap();
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
+    let sess_a = eng_a.open_session(project_a).await.unwrap();
+    let sess_b = eng_b.open_session(project_b).await.unwrap();
 
     sess_a
         .execute("CREATE TABLE log (msg TEXT NOT NULL)")
@@ -286,14 +286,14 @@ async fn cross_tenant_isolation() {
         .await
         .unwrap();
 
-    // Tenant A's procedure must not be visible to tenant B.
+    // Project A's procedure must not be visible to project B.
     let err = sess_b.execute("CALL note()").await.unwrap_err();
     assert!(
         matches!(err, BasinError::NotFound(_)),
-        "expected NotFound for tenant B, got {err:?}"
+        "expected NotFound for project B, got {err:?}"
     );
 
-    // Tenant A still sees its procedure.
+    // Project A still sees its procedure.
     sess_a.execute("CALL note()").await.unwrap();
     let res = sess_a.execute("SELECT msg FROM log").await.unwrap();
     let batches = match res {
@@ -309,7 +309,7 @@ async fn nested_call_rejected() {
     // registration. v0.1 has no nested calls.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT)").await.unwrap();
     let err = sess
@@ -333,7 +333,7 @@ async fn language_other_than_sql_rejected() {
     // SQLSTATE 0A000 per ADR 0012 — `LANGUAGE plpgsql` is out of scope.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let err = sess
         .execute("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$")
@@ -353,7 +353,7 @@ async fn procedure_with_user_function_call_works() {
     // body's statement at planning time when the procedure runs.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (x BIGINT NOT NULL)")
         .await

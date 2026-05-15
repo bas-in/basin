@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
 use basin_net::{HttpClient, HttpRequest, RequestQueue, ResponseStore};
 use object_store::local::LocalFileSystem;
@@ -57,25 +57,25 @@ async fn spawn_ok_server() -> std::net::SocketAddr {
 async fn async_post_roundtrip_records_response_row() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     let addr = spawn_ok_server().await;
     let url = format!("http://{addr}/echo");
 
     let client = HttpClient::new();
-    client.allow_host(&tenant, "127.0.0.1").await;
+    client.allow_host(&project, "127.0.0.1").await;
     let store = ResponseStore::new(engine.clone());
     let queue = RequestQueue::new(client, store.clone());
 
     let req = HttpRequest::post(&url, b"{\"x\":1}".to_vec(), "application/json");
-    let id = queue.submit(&tenant, req);
+    let id = queue.submit(&project, req);
 
     // Step the runner exactly once for determinism.
     let processed = queue.run_one().await.expect("queue had a request");
     assert_eq!(processed, id);
 
     let row = store
-        .get(&tenant, id)
+        .get(&project, id)
         .await
         .unwrap()
         .expect("response row missing");
@@ -92,7 +92,7 @@ async fn allowlist_failure_is_recorded_as_terminal_error_row() {
     // table with an `error` column populated. Mirror that.
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     let client = HttpClient::new();
     // Note: deliberately not opting in to "127.0.0.1" so the allowlist fires.
@@ -100,11 +100,11 @@ async fn allowlist_failure_is_recorded_as_terminal_error_row() {
     let queue = RequestQueue::new(client, store.clone());
 
     let req = HttpRequest::get("http://127.0.0.1/blocked");
-    let id = queue.submit(&tenant, req);
+    let id = queue.submit(&project, req);
     let processed = queue.run_one().await.expect("queue had a request");
     assert_eq!(processed, id);
 
-    let row = store.get(&tenant, id).await.unwrap().expect("row missing");
+    let row = store.get(&project, id).await.unwrap().expect("row missing");
     assert_eq!(row.status, 0);
     assert!(row
         .error

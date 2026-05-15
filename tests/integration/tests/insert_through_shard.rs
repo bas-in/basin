@@ -27,9 +27,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
-use basin_router::{ServerConfig, StaticTenantResolver};
+use basin_router::{ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
@@ -88,13 +88,13 @@ async fn start_server_with_shard() -> TestServer {
     });
 
     let mut map = HashMap::new();
-    map.insert("alice".to_owned(), TenantId::new());
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    map.insert("alice".to_owned(), ProjectId::new());
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,

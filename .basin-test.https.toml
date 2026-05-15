@@ -7,7 +7,7 @@
 #
 # `http2_only = true` forces reqwest to negotiate h2 over TLS via ALPN.
 # h2 multiplexes many concurrent streams over one TCP socket, eliminating
-# HTTP/1.1 head-of-line blocking when one tenant's bulk transfer would
+# HTTP/1.1 head-of-line blocking when one project's bulk transfer would
 # otherwise tie up the connection pool.
 
 [s3]

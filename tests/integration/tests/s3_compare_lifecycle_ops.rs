@@ -1,6 +1,6 @@
 //! S3 port of `compare_lifecycle_ops.rs`.
 //!
-//! Tenant deletion + ADD COLUMN. Tenant deletion on S3 is dramatically
+//! Project deletion + ADD COLUMN. Project deletion on S3 is dramatically
 //! different from LocalFS (per-object DELETE round-trip vs an unlinked inode),
 //! so the absolute numbers will diverge. We surface honestly: PG vs Basin-S3
 //! with no fudging, and let the dashboard reader judge.
@@ -20,7 +20,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_real_postgres_compare, CompareMetric, WhichWins};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
@@ -120,8 +120,8 @@ async fn s3_compare_lifecycle_ops() {
         None => {
             report_real_postgres_compare(
                 "lifecycle_ops",
-                "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-                "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
+                "Lifecycle ops on real S3: project deletion + ADD COLUMN",
+                "Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
                 false,
                 vec![],
                 Some("postgres unavailable"),
@@ -136,8 +136,8 @@ async fn s3_compare_lifecycle_ops() {
             println!("[S3 compare_lifecycle_ops] postgres unreachable: skipping");
             report_real_postgres_compare(
                 "lifecycle_ops",
-                "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-                "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
+                "Lifecycle ops on real S3: project deletion + ADD COLUMN",
+                "Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE.",
                 false,
                 vec![],
                 Some("postgres unreachable"),
@@ -155,7 +155,7 @@ async fn s3_compare_lifecycle_ops() {
         prefix: run_prefix.clone(),
     };
 
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema = format!("basin_lifecycle_s3_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema.clone(),
@@ -179,10 +179,10 @@ async fn s3_compare_lifecycle_ops() {
     .await
     .expect("pg populate");
 
-    // ---- Metric A: tenant deletion --------------------------------------
-    // Basin on S3: write 100 small Parquet files for one tenant under a
+    // ---- Metric A: project deletion --------------------------------------
+    // Basin on S3: write 100 small Parquet files for one project under a
     // sub-prefix, register them in an `InMemoryCatalog`, then time
-    // `Storage::delete_tenant` end-to-end. This is the same code path the
+    // `Storage::delete_project` end-to-end. This is the same code path the
     // engine wires up — catalog-first DELETE + parallel orphan LIST +
     // drop_namespace — so the dashboard plots the production teardown
     // latency, not a bypass through the raw object store.
@@ -194,11 +194,11 @@ async fn s3_compare_lifecycle_ops() {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
     catalog
-        .create_table(&tenant, &table, basin_schema_v1().as_ref())
+        .create_table(&project, &table, basin_schema_v1().as_ref())
         .await
         .unwrap();
     // Fan-out the writes — sequential PUTs on S3 would dominate the test.
@@ -211,7 +211,7 @@ async fn s3_compare_lifecycle_ops() {
             let start = (i * BASIN_ROWS_PER_FILE) as i64;
             let batch = build_basin_batch(start, BASIN_ROWS_PER_FILE);
             storage
-                .write_batch(&tenant, &table, &part, &batch)
+                .write_batch(&project, &table, &part, &batch)
                 .await
                 .unwrap()
         });
@@ -229,15 +229,15 @@ async fn s3_compare_lifecycle_ops() {
     // One catalog append registers every file in a single snapshot — the
     // deletion path then sees the full set without paying a LIST RTT.
     catalog
-        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .append_data_files(&project, &table, SnapshotId::GENESIS, written)
         .await
         .unwrap();
 
     let basin_del_started = Instant::now();
     let _deleted = storage
-        .delete_tenant(catalog.as_ref(), &tenant)
+        .delete_project(catalog.as_ref(), &project)
         .await
-        .expect("delete_tenant");
+        .expect("delete_project");
     let basin_del_ms = basin_del_started.elapsed().as_secs_f64() * 1000.0;
 
     let pg_del_started = Instant::now();
@@ -249,7 +249,7 @@ async fn s3_compare_lifecycle_ops() {
     let del_ratio = pg_del_ms / basin_del_ms.max(1e-9);
 
     // ---- Metric B: ADD COLUMN -------------------------------------------
-    let suffix2 = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix2 = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema2 = format!("basin_lifecycle_s3_{}", suffix2);
     let _guard2 = SchemaGuard {
         schema: schema2.clone(),
@@ -292,8 +292,8 @@ async fn s3_compare_lifecycle_ops() {
         catalog: catalog2.clone(),
         shard: None,
     });
-    let tenant2 = TenantId::new();
-    let session = engine.open_session(tenant2).await.unwrap();
+    let project2 = ProjectId::new();
+    let session = engine.open_session(project2).await.unwrap();
     session
         .execute("CREATE TABLE events (id BIGINT NOT NULL, body TEXT NOT NULL)")
         .await
@@ -310,7 +310,7 @@ async fn s3_compare_lifecycle_ops() {
             let start = (i * BASIN_ROWS_PER_FILE) as i64;
             let batch = build_basin_batch(start, BASIN_ROWS_PER_FILE);
             storage
-                .write_batch(&tenant2, &table, &part, &batch)
+                .write_batch(&project2, &table, &part, &batch)
                 .await
                 .unwrap();
         });
@@ -334,7 +334,7 @@ async fn s3_compare_lifecycle_ops() {
     );
     println!(
         "{:>52} {:>12.2}ms {:>12.2}ms {:>22}",
-        "tenant_deletion (1 tenant, 100K rows in 100 files)",
+        "project_deletion (1 project, 100K rows in 100 files)",
         basin_del_ms,
         pg_del_ms,
         format!("pg/basin = {:.2}x", del_ratio)
@@ -348,13 +348,13 @@ async fn s3_compare_lifecycle_ops() {
     );
 
     println!(
-        "[S3 compare_lifecycle_ops] tenant-delete ratio={:.2}x, add-column ratio={:.2}x",
+        "[S3 compare_lifecycle_ops] project-delete ratio={:.2}x, add-column ratio={:.2}x",
         del_ratio, alter_ratio
     );
 
     let metrics = vec![
         CompareMetric {
-            label: "Tenant deletion (1 tenant, 100K rows in 100 files; basin on S3)".into(),
+            label: "Project deletion (1 project, 100K rows in 100 files; basin on S3)".into(),
             basin: basin_del_ms,
             postgres: pg_del_ms,
             unit: "ms".into(),
@@ -373,11 +373,11 @@ async fn s3_compare_lifecycle_ops() {
 
     report_real_postgres_compare(
         "lifecycle_ops",
-        "Lifecycle ops on real S3: tenant deletion + ADD COLUMN",
-        "Basin makes tenant teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
+        "Lifecycle ops on real S3: project deletion + ADD COLUMN",
+        "Basin makes project teardown a catalog-first DELETE with a parallel orphan LIST and a single drop_namespace, and treats schema evolution as a catalog operation; PG must DROP SCHEMA CASCADE and (in the general case) rewrite the heap.",
         true,
         metrics,
-        Some("Basin storage on real S3 — tenant deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."),
+        Some("Basin storage on real S3 — project deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."),
     );
 
     drop(_guard2);

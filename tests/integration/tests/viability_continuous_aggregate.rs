@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use arrow_array::{Int64Array, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{PartitionKey, TenantId};
+use basin_common::{PartitionKey, ProjectId};
 use basin_cv::{CvRefresher, CvSpec, TestClock};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
@@ -77,16 +77,16 @@ async fn viability_continuous_aggregate() {
         shard: None,
     });
 
-    // ---------- Tenant + base table seeded with 100 rows over 5 days -----
-    let tenant = TenantId::new();
-    // The shard's `run_cv_refresh` walks resident tenants; touching the
-    // partition through `Shard::get` makes the tenant resident.
+    // ---------- Project + base table seeded with 100 rows over 5 days -----
+    let project = ProjectId::new();
+    // The shard's `run_cv_refresh` walks resident projects; touching the
+    // partition through `Shard::get` makes the project resident.
     let _h = shard
-        .get(&tenant, &PartitionKey::default_key())
+        .get(&project, &PartitionKey::default_key())
         .await
         .unwrap();
 
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute(
             "CREATE TABLE events (\
@@ -117,12 +117,12 @@ async fn viability_continuous_aggregate() {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
     let clock = TestClock::new(t0);
     let refresher = CvRefresher::new(engine.clone(), Arc::new(clock.clone()));
-    refresher.register_tenant(tenant).await;
+    refresher.register_project(project).await;
 
     refresher
         .store()
         .register_cv_at(
-            &tenant,
+            &project,
             CvSpec {
                 name: "events_per_day".into(),
                 source_table: "events".into(),
@@ -155,12 +155,12 @@ async fn viability_continuous_aggregate() {
         matches!(outcomes[0].outcome, basin_cv::CvRefreshOutcome::NotDue);
 
     // ---------- Read CV: must be 5 day-buckets ---------------------------
-    let cv_rows_initial = read_cv_rows(&engine, tenant).await;
+    let cv_rows_initial = read_cv_rows(&engine, project).await;
     let cv_rows_correct = cv_rows_initial.len() == 5;
     println!("[VIABILITY continuous_aggregate] initial cv rows: {cv_rows_initial:?}");
 
     // ---------- Insert 10 more rows in the latest day --------------------
-    let writer = engine.open_session(tenant).await.unwrap();
+    let writer = engine.open_session(project).await.unwrap();
     let mut sql = String::from("INSERT INTO events VALUES ");
     for i in 0..10u32 {
         if i > 0 {
@@ -190,7 +190,7 @@ async fn viability_continuous_aggregate() {
     );
 
     // ---------- Read CV: still 5 day-buckets, latest day count is 30 -----
-    let cv_rows_after = read_cv_rows(&engine, tenant).await;
+    let cv_rows_after = read_cv_rows(&engine, project).await;
     println!("[VIABILITY continuous_aggregate] post-refresh cv rows: {cv_rows_after:?}");
     let still_five = cv_rows_after.len() == 5;
     // The 4 earlier days have 20 rows each; the latest day was 20+10=30.
@@ -237,8 +237,8 @@ async fn viability_continuous_aggregate() {
 }
 
 /// Read every row of the `events_per_day` CV and return `(day, n)` pairs.
-async fn read_cv_rows(engine: &Engine, tenant: TenantId) -> Vec<(String, i64)> {
-    let sess = engine.open_session(tenant).await.unwrap();
+async fn read_cv_rows(engine: &Engine, project: ProjectId) -> Vec<(String, i64)> {
+    let sess = engine.open_session(project).await.unwrap();
     let res = sess
         .execute("SELECT day, n FROM events_per_day")
         .await

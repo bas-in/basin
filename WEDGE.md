@@ -1,8 +1,8 @@
 # Basin — wedge-deepening roadmap
 
 The five things that turn Basin from "interesting PoC" into "developers can
-ship a multi-tenant SaaS on it." All directly serve the wedge customer
-(multi-tenant SaaS with audit-log workloads).
+ship a multi-project SaaS on it." All directly serve the wedge customer
+(multi-project SaaS with audit-log workloads).
 
 This is **not** a plan to beat Neon at Postgres-app workloads or Turso at
 the edge. The brief is explicit: stay in the wedge until paying customers
@@ -27,7 +27,7 @@ window frames, `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`. See
 Three additional crates landed alongside the wedge by founder direction
 and now ship as part of the open-source bundle (Phase 5.10 in
 [`TASK.md`](./TASK.md)): `basin-auth` (identity, ADR 0005), `basin-rest`
-(PostgREST equivalent, ADR 0006), `basin-pool` (per-tenant connection
+(PostgREST equivalent, ADR 0006), `basin-pool` (per-project connection
 pool, ADR 0007). All three are wired into `basin-server` behind opt-in
 env vars; defaults preserve the original PoC behaviour.
 
@@ -40,7 +40,7 @@ hosted-cloud product lives in a separate repo):**
 4. **pg_query migration (ADR 0014)** — adopt libpg_query as the canonical SQL parser, demoting sqlparser-rs to a transitional fallback and DataFusion-sql to executor-only. Phase 1 (in flight): pg_query parses every statement, drives dispatch for the 14 textual pre-screens in `executor.rs`, and rejects unsupported statement kinds with SQLSTATE 0A000. Phase 2: own `PgNode → DataFusion LogicalPlan` translator for SELECT. Phase 3: long-tail SQL (window funcs, GROUPING SETS, recursive CTEs, MERGE, LATERAL). Precedent: DuckDB, CockroachDB, Spanner-PG, YugabyteDB. Phase 1 is ~1 week of focused work; the full migration is a 1-quarter project that lands incrementally.
 5. **Phase 5.11.A — expanded built-in function catalogue** — date/time, string, math, coalesce, aggregate. Gates triggers + PL/pgSQL. ~3 weeks. The smaller "drop in your existing PG schema" win and a hard prerequisite for everything else in 5.11.
 6. **Phase 5.11.D — `CREATE MATERIALIZED VIEW` SQL surface** — drop the `cv_glue` stub. ~1 week, lands once 5.11.A is in.
-7. **B1 per-tenant secondary indexes** — biggest remaining point-query win. ~8 weeks.
+7. **B1 per-project secondary indexes** — biggest remaining point-query win. ~8 weeks.
 8. **Phase 5.12 — SmithDB-inspired storage optimizations (SQL compat at 97.2% / 423 ✅ — gate cleared).** LangChain's [SmithDB](https://www.langchain.com/blog/introducing-smithdb) is a Rust + DataFusion + Vortex + object-store database that ships LangSmith's agent-trace workload in production. The architecture is a cousin of Basin's; the four patterns below are battle-tested under the same constraints we operate within. Land them in this order:
    - **5.12.A — time-tiered compaction.** Replace the compactor's uniform schedule with SmithDB-style time-tiered policy: recent partitions compact often, older partitions settle into larger files. Matches Basin's audit-log target workload exactly. ~1 week. Single file: `crates/basin-shard/src/compactor.rs`.
    - **5.12.B — late materialization for big payloads.** Split JSONB and large-text columns from "core" columns at row-group write time so point queries that don't project the payload skip the body entirely. SmithDB does this for trace bodies; Basin's audit-log workload has the same shape (small core + big JSON). ~2 weeks. Touches the Parquet writer in `basin-storage` and the planner's projection pushdown. Compounds with A4 catalog stats + cluster-by for ~10× point-query latency improvement on payload-heavy tables.
@@ -73,7 +73,7 @@ Postgres driver fails on `Parse` with `0A000`. Now resolved.
       (`encode_batches_with_formats`)
 - [x] Smoke test: `tokio_postgres`'s default extended-query API
       (`client.query`, `client.prepare`+`query`, `client.execute`)
-      runs end-to-end against two concurrent tenants — 10/10 pass
+      runs end-to-end against two concurrent projects — 10/10 pass
 - [ ] Smoke test: `asyncpg.fetch` works (Python) — deferred, low risk
       given tokio-postgres works
 - [x] PoC dashboard updated: `extended_protocol` viability card
@@ -108,7 +108,7 @@ flush moves to background compaction. Closes the only wedge-relevant
 metric where Basin loses to PG.
 
 - [x] `basin-wal`: file-backed single-node v0.1 (Raft is v0.2). Append
-      keyed by `(tenant_id, partition)`, monotonic LSN per partition
+      keyed by `(project_id, partition)`, monotonic LSN per partition
 - [x] Batched flush to object storage every 200 ms or 1 MB
 - [x] Recovery: list segments and replay on `Wal::open`
 - [x] Bench: **57k writes/sec debug, 954k writes/sec release** —
@@ -122,17 +122,17 @@ metric where Basin loses to PG.
 ## 4 — Shard owners + eviction (Phase 3, ~3 months) — **v0.1 shipped 2026-05-01**
 
 Fixes the noisy-neighbor 42× p99 degradation surfaced on the dashboard.
-Enables genuinely many-tenant scale (every tenant has their own in-mem
-state; idle tenants evict). First time we can measure cold-start
+Enables genuinely many-project scale (every project has their own in-mem
+state; idle projects evict). First time we can measure cold-start
 latency.
 
-- [x] `basin-shard`: in-process map of `(tenant_id, partition) → in-mem state`
-- [x] Lazy load tenant state from WAL + Parquet on first request
+- [x] `basin-shard`: in-process map of `(project_id, partition) → in-mem state`
+- [x] Lazy load project state from WAL + Parquet on first request
 - [x] Idle eviction (default 5 min) with metrics on evictions
 - [x] Read path: in-RAM tail merged with Parquet base; predicate eval on tail
 - [x] Background compactor: WAL → Parquet → catalog commit → WAL truncate
 - [x] Per-partition `RwLock`; outer map lock held only for lookup/insert
-- [ ] `basin-placement`: `(tenant, partition) → owner` map, etcd/FDB backed
+- [ ] `basin-placement`: `(project, partition) → owner` map, etcd/FDB backed
 - [ ] Consistent hashing with virtual nodes
 - [ ] Fast failover: reassign shards within seconds on owner unreachable
 - [ ] On-disk `last_compacted_lsn` marker so cold load doesn't re-replay
@@ -146,8 +146,8 @@ latency.
 
 ## 5c — Connection pooler (`basin-pool`) (~1 week) — scoped 2026-05-01
 
-A thin native pooler that caches `TenantSession` objects by
-`(tenant_id, client_id)` and reuses them across short-lived client
+A thin native pooler that caches `ProjectSession` objects by
+`(project_id, client_id)` and reuses them across short-lived client
 connections (Lambda, Cloud Run, the per-request lifecycle).
 
 Pgbouncer specifically does **not** work for Basin (its transaction-
@@ -156,11 +156,11 @@ pooler is both smaller and better-fitted. See
 [ADR 0007](./docs/decisions/0007-connection-pooling.md).
 
 - [ ] `basin-pool` crate scaffold; `PoolConfig` (max sessions, idle TTL,
-      per-tenant cap)
-- [ ] LRU cache keyed on `(TenantId, client_id)` with idle eviction
+      per-project cap)
+- [ ] LRU cache keyed on `(ProjectId, client_id)` with idle eviction
 - [ ] `pgwire` accept loop checks the pool first, opens a fresh
       session only on miss
-- [ ] Per-tenant cap so one tenant's burst can't starve others
+- [ ] Per-project cap so one project's burst can't starve others
 - [ ] Metrics: hit rate, miss rate, evictions, sessions resident
 - [ ] Smoke test: 1000 short-lived connections cycle through 10
       pool slots without `Engine::open_session` being called more
@@ -175,7 +175,7 @@ consistent cross-region read replicas, region-local writes, no cross-region
 
 - [ ] `basin-region` crate scaffold; `Region` type + routing decision
 - [ ] `BASIN_REGION` env var on `basin-server`
-- [ ] Region column on tenant catalog rows
+- [ ] Region column on project catalog rows
 - [ ] pgwire-to-pgwire forwarder from replica regions to primary
 - [ ] `PostgresCatalog::connect` accepts `read_only` for replica regions
 - [ ] Postgres logical-replication setup docs
@@ -206,11 +206,11 @@ run green against Basin, the door opens for adoption conversations.
 ## Definition of done for the roadmap
 
 A small SaaS team picks Basin, points their existing Prisma + Postgres
-app at it, signs up 100 tenants in trial, and reports back that:
+app at it, signs up 100 projects in trial, and reports back that:
 
 1. Their existing app works without changes (compat).
 2. Storage cost dropped by ≥10× vs the Postgres or Neon they came from.
-3. Tenant onboarding/deletion is fast and per-tenant isolated.
+3. Project onboarding/deletion is fast and per-project isolated.
 4. Their team didn't have to learn a new database to use it.
 
 When that conversation happens with a real customer, Basin is "real."

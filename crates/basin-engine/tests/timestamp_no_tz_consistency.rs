@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -34,7 +34,7 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -77,7 +77,7 @@ fn col_i64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
 async fn create_domain_with_timestamp_succeeds() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     let res = sess
         .execute("CREATE DOMAIN naive_ts AS TIMESTAMP")
@@ -104,7 +104,7 @@ async fn create_domain_with_timestamp_succeeds() {
 async fn create_function_with_timestamp_arg() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE FUNCTION when_was(ts TIMESTAMP) RETURNS TEXT \
@@ -125,7 +125,7 @@ async fn create_function_with_timestamp_arg() {
 async fn create_function_returns_table_with_timestamp() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE FUNCTION recent() RETURNS TABLE(id BIGINT, ts TIMESTAMP) \
@@ -144,7 +144,7 @@ async fn create_function_returns_table_with_timestamp() {
 async fn create_procedure_with_timestamp_arg() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE logs (ts TIMESTAMP NOT NULL)")
         .await
@@ -178,7 +178,7 @@ async fn timestamptz_still_works() {
     // refactor didn't accidentally break the WithTimeZone arm.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE FUNCTION zoned_when(ts TIMESTAMPTZ) RETURNS TEXT \
@@ -204,7 +204,7 @@ async fn timestamp_and_timestamptz_distinct_in_function_arg() {
     // OIDs differ (1114 vs 1184) at the table level.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE FUNCTION both(a TIMESTAMP, b TIMESTAMPTZ) RETURNS BIGINT \

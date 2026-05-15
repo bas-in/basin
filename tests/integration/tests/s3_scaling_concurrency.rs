@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -84,13 +84,13 @@ async fn s3_scaling_concurrency() {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
     let batch = build_batch(0, ROWS);
     storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .unwrap();
 
@@ -126,7 +126,7 @@ async fn s3_scaling_concurrency() {
                         ..Default::default()
                     };
                     let q_start = Instant::now();
-                    let mut stream = storage.read(&tenant, &table, opts).await.unwrap();
+                    let mut stream = storage.read(&project, &table, opts).await.unwrap();
                     while let Some(b) = stream.next().await {
                         let _ = b.unwrap();
                     }

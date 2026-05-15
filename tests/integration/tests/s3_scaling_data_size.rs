@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -104,7 +104,7 @@ async fn s3_scaling_data_size() {
             page_cache: None,
         });
 
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("events").unwrap();
         let part = PartitionKey::default_key();
 
@@ -114,7 +114,7 @@ async fn s3_scaling_data_size() {
             let start = (b * BATCH_SIZE) as i64;
             let batch = build_batch(start, BATCH_SIZE);
             let df = storage
-                .write_batch(&tenant, &table, &part, &batch)
+                .write_batch(&project, &table, &part, &batch)
                 .await
                 .unwrap();
             total_disk += df.size_bytes;
@@ -130,7 +130,7 @@ async fn s3_scaling_data_size() {
                 ..Default::default()
             };
             let started = Instant::now();
-            let mut stream = storage.read(&tenant, &table, opts).await.unwrap();
+            let mut stream = storage.read(&project, &table, opts).await.unwrap();
             let mut hits = 0usize;
             while let Some(b) = stream.next().await {
                 hits += b.unwrap().num_rows();
@@ -148,7 +148,7 @@ async fn s3_scaling_data_size() {
         for _ in 0..3 {
             let started = Instant::now();
             let mut stream = storage
-                .read(&tenant, &table, ReadOptions::default())
+                .read(&project, &table, ReadOptions::default())
                 .await
                 .unwrap();
             let mut total = 0usize;
@@ -228,7 +228,7 @@ async fn s3_scaling_data_size() {
 
     report_real_scaling(
         "data_size",
-        "Single-tenant data size scale-up (real S3)",
+        "Single-project data size scale-up (real S3)",
         "On real S3, storage is linear in row count and point-query latency stays bounded.",
         pass,
         AxisSpec {

@@ -3,7 +3,7 @@
 //! When the SQL is a "simple SELECT" — a flat projection from a single table
 //! with at most one equality predicate against a column literal and an
 //! optional LIMIT — we bypass DataFusion entirely and read directly through
-//! `basin_storage::Storage` (or the shard's [`TenantHandle`] when one is
+//! `basin_storage::Storage` (or the shard's [`ProjectHandle`] when one is
 //! configured). Skipping the DataFusion plan saves the per-query planning +
 //! arrow-version conversion cost that dominates point-query latency on this
 //! PoC.
@@ -16,7 +16,7 @@
 //! caller fall through. The cost of a missed fast path is the planner work
 //! we already pay today; the cost of an over-eager match is a wrong answer.
 //!
-//! [`TenantHandle`]: basin_shard::TenantHandle
+//! [`ProjectHandle`]: basin_shard::ProjectHandle
 
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ use sqlparser::ast::{
     TableFactor, UnaryOperator, Value,
 };
 
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Recognised "simple SELECT" plan. When `predicate` is `None` the read is
 /// an unfiltered scan; when `limit` is `Some(n)` we truncate the merged
@@ -265,7 +265,7 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
 /// pool (Change C). The numbers are deliberately conservative: a SELECT that
 /// has to read more than 100 K rows OR 50 MiB of Parquet is heavy enough
 /// that pinning a cooperative tokio worker for the duration of the decode
-/// loop materially hurts other tenants on the same runtime. Point queries
+/// loop materially hurts other projects on the same runtime. Point queries
 /// (which carry a predicate) always stay on the cooperative pool — they
 /// only touch one row group thanks to predicate pushdown, and the
 /// `spawn_blocking` round-trip would dwarf the actual work.
@@ -273,12 +273,12 @@ const HEAVY_ROW_THRESHOLD: u64 = 100_000;
 const HEAVY_BYTE_THRESHOLD: u64 = 50 * 1024 * 1024;
 
 /// Run a recognised plan against the engine's storage layer (or, when wired
-/// up, the shard's [`TenantHandle`]). Returns the merged result set ready to
+/// up, the shard's [`ProjectHandle`]). Returns the merged result set ready to
 /// hand back to the caller.
 ///
-/// [`TenantHandle`]: basin_shard::TenantHandle
+/// [`ProjectHandle`]: basin_shard::ProjectHandle
 pub(crate) async fn execute_simple_select(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     plan: SimpleSelectPlan,
 ) -> Result<ExecResult> {
     // Flush the in-RAM tail before we look up the table's metadata so the
@@ -292,7 +292,7 @@ pub(crate) async fn execute_simple_select(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &plan.table)
+        .load_table(&sess.project, &plan.table)
         .await?;
 
     // Validate the projection against the cached schema. Doing it here means
@@ -342,7 +342,7 @@ pub(crate) async fn execute_simple_select(
         // read is bounded, then `handle.read` only has to scan whatever new
         // tail rows have arrived since.
         let handle = shard
-            .get(&sess.tenant, &PartitionKey::default_key())
+            .get(&sess.project, &PartitionKey::default_key())
             .await?;
         if heavy {
             let table = plan.table.clone();
@@ -353,11 +353,11 @@ pub(crate) async fn execute_simple_select(
     } else {
         if heavy {
             let storage = sess.engine.config().storage.clone();
-            let tenant = sess.tenant;
+            let project = sess.project;
             let table = plan.table.clone();
             run_blocking(move || async move {
                 use futures::StreamExt;
-                let stream = storage.read(&tenant, &table, opts).await?;
+                let stream = storage.read(&project, &table, opts).await?;
                 let collected: Vec<Result<RecordBatch>> = stream.collect().await;
                 collected.into_iter().collect::<Result<Vec<_>>>()
             })
@@ -368,7 +368,7 @@ pub(crate) async fn execute_simple_select(
                 .engine
                 .config()
                 .storage
-                .read(&sess.tenant, &plan.table, opts)
+                .read(&sess.project, &plan.table, opts)
                 .await?;
             let collected: Vec<Result<RecordBatch>> = stream.collect().await;
             collected.into_iter().collect::<Result<Vec<_>>>()?

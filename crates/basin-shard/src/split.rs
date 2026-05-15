@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use basin_catalog::PartitionSpec;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 use basin_wal::Lsn;
 
 /// Catalog epoch for a table's partition spec. Bumped on every successful
@@ -67,7 +67,7 @@ pub struct CatchupReport {
 /// call so the implementation never has to look up the same row twice.
 #[derive(Clone, Debug)]
 pub struct SplitPlan {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: TableName,
     pub old_spec: PartitionSpec,
     pub new_spec: PartitionSpec,
@@ -81,7 +81,7 @@ pub struct SplitPlan {
     pub dual_write_open_lsn: Option<Lsn>,
 }
 
-/// Drive a hash-bucket split for a single `(tenant, table)`.
+/// Drive a hash-bucket split for a single `(project, table)`.
 ///
 /// Implementations are responsible for:
 ///   - catalog round-trips (proposed spec rows, dual-write flag, atomic
@@ -99,7 +99,7 @@ pub trait ShardSplitter: Send + Sync {
     /// Returns a [`SplitPlan`] that all subsequent phases use.
     async fn prepare_split(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         new_spec: PartitionSpec,
     ) -> Result<SplitPlan>;
@@ -158,7 +158,7 @@ impl LocalShardSplitter {
 impl ShardSplitter for LocalShardSplitter {
     async fn prepare_split(
         &self,
-        _tenant: &TenantId,
+        _project: &ProjectId,
         _table: &TableName,
         _new_spec: PartitionSpec,
     ) -> Result<SplitPlan> {

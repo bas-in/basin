@@ -23,9 +23,9 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::TenantSession;
+use crate::ProjectSession;
 
-impl TenantSession {
+impl ProjectSession {
     /// Approximate nearest-neighbour search using the HNSW sidecar indexes.
     ///
     /// Returns the matched rows as workspace-Arrow `RecordBatch`es, with a
@@ -42,7 +42,7 @@ impl TenantSession {
     ) -> Result<Vec<RecordBatch>> {
         let storage = &self.engine.config().storage;
         let hits: Vec<VectorHit> = storage
-            .vector_search(&self.tenant, table, column, &query, k, distance)
+            .vector_search(&self.project, table, column, &query, k, distance)
             .await?;
         if hits.is_empty() {
             return Ok(Vec::new());
@@ -55,7 +55,7 @@ impl TenantSession {
             by_file.entry(h.file_path.clone()).or_default().push(h);
         }
 
-        let store = storage.tenant_object_store(&self.tenant);
+        let store = storage.project_object_store(&self.project);
         let mut output_rows: Vec<(f32, RecordBatch)> = Vec::with_capacity(hits.len());
 
         for (path, group) in by_file {

@@ -14,7 +14,7 @@ mod common;
 
 use std::sync::Arc;
 
-use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, TenantId};
+use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, ProjectId};
 use basin_net::HttpClient;
 use basin_webhooks::{
     AttemptOutcome, RetryQueue, TestClock, WebhookConfig, WebhookOps, WebhookRegistry, WebhookSink,
@@ -73,9 +73,9 @@ async fn build_stack(net: HttpClient) -> Stack {
     }
 }
 
-fn evt(tenant: TenantId, table: &str, op: ChangeOp, seq: u64) -> ChangeEvent {
+fn evt(project: ProjectId, table: &str, op: ChangeOp, seq: u64) -> ChangeEvent {
     ChangeEvent {
-        tenant,
+        project,
         table: TableName::new(table).unwrap(),
         op,
         before: None,
@@ -87,7 +87,7 @@ fn evt(tenant: TenantId, table: &str, op: ChangeOp, seq: u64) -> ChangeEvent {
 }
 
 fn sub(
-    tenant: TenantId,
+    project: ProjectId,
     table: &str,
     url: String,
     ops: WebhookOps,
@@ -95,7 +95,7 @@ fn sub(
 ) -> WebhookSubscription {
     WebhookSubscription {
         id: WebhookSubscriptionId::new(),
-        tenant,
+        project,
         table: TableName::new(table).unwrap(),
         url,
         ops,
@@ -115,14 +115,14 @@ fn make_client() -> HttpClient {
 async fn webhook_subscription_routes_event() {
     let server = spawn_server(200).await;
     let net = make_client();
-    let tenant = TenantId::new();
-    net.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(tenant, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
     let id = stack.registry.add(s).await.unwrap();
 
-    let ev = evt(tenant, "orders", ChangeOp::Insert, 1);
+    let ev = evt(project, "orders", ChangeOp::Insert, 1);
     stack.sink.publish(&ev).await.unwrap();
     assert_eq!(stack.queue.depth().await, 1);
 
@@ -158,14 +158,14 @@ async fn webhook_idempotency_key_dedupes_after_retry() {
     let server = spawn_server(200).await;
     server.push_response(500);
     let net = make_client();
-    let tenant = TenantId::new();
-    net.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(tenant, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
     stack.registry.add(s).await.unwrap();
 
-    let ev = evt(tenant, "orders", ChangeOp::Insert, 7);
+    let ev = evt(project, "orders", ChangeOp::Insert, 7);
     stack.sink.publish(&ev).await.unwrap();
 
     // Tick 1: 500. Worker requeues.
@@ -194,14 +194,14 @@ async fn webhook_idempotency_key_dedupes_after_retry() {
 async fn webhook_dead_letter_after_max_retries() {
     let server = spawn_server(500).await;
     let net = make_client();
-    let tenant = TenantId::new();
-    net.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(tenant, "orders", server.url("/hook"), WebhookOps::INSERT, 2);
+    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 2);
     let id = stack.registry.add(s).await.unwrap();
 
-    let ev = evt(tenant, "orders", ChangeOp::Insert, 11);
+    let ev = evt(project, "orders", ChangeOp::Insert, 11);
     stack.sink.publish(&ev).await.unwrap();
 
     // Attempt 1: 500 → requeued.
@@ -232,12 +232,12 @@ async fn webhook_dead_letter_after_max_retries() {
 async fn webhook_4xx_kills_immediately() {
     let server = spawn_server(422).await;
     let net = make_client();
-    let tenant = TenantId::new();
-    net.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
     let s = sub(
-        tenant,
+        project,
         "orders",
         server.url("/hook"),
         WebhookOps::INSERT,
@@ -245,7 +245,7 @@ async fn webhook_4xx_kills_immediately() {
     );
     let id = stack.registry.add(s).await.unwrap();
 
-    let ev = evt(tenant, "orders", ChangeOp::Insert, 1);
+    let ev = evt(project, "orders", ChangeOp::Insert, 1);
     stack.sink.publish(&ev).await.unwrap();
 
     let o = stack.worker.tick().await;
@@ -274,15 +274,15 @@ async fn webhook_4xx_kills_immediately() {
 async fn webhook_pause_skip_delivery() {
     let server = spawn_server(200).await;
     let net = make_client();
-    let tenant = TenantId::new();
-    net.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let mut s = sub(tenant, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let mut s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
     s.paused = true;
     let _id = stack.registry.add(s).await.unwrap();
 
-    let ev = evt(tenant, "orders", ChangeOp::Insert, 1);
+    let ev = evt(project, "orders", ChangeOp::Insert, 1);
     stack.sink.publish(&ev).await.unwrap();
     // Sink does not check `paused` for enqueue — the worker enforces it.
     // (Actually it does, see sink.rs match block.) Either way: no POST.
@@ -299,8 +299,8 @@ async fn webhook_pause_skip_delivery() {
 async fn webhook_auto_pause_after_24h() {
     let server = spawn_server(500).await;
     let net = make_client();
-    let tenant = TenantId::new();
-    net.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    net.allow_host(&project, "127.0.0.1").await;
 
     // Custom config so `auto_pause_after` is 1 hour for test brevity;
     // the production value is 24h. The mechanism is the same.
@@ -329,7 +329,7 @@ async fn webhook_auto_pause_after_24h() {
     );
 
     let s = sub(
-        tenant,
+        project,
         "orders",
         server.url("/hook"),
         WebhookOps::INSERT,
@@ -337,7 +337,7 @@ async fn webhook_auto_pause_after_24h() {
     );
     let id = registry.add(s).await.unwrap();
 
-    let ev = evt(tenant, "orders", ChangeOp::Insert, 1);
+    let ev = evt(project, "orders", ChangeOp::Insert, 1);
     sink.publish(&ev).await.unwrap();
 
     // First attempt to fail: gives `attempt_count = 1`.
@@ -353,22 +353,22 @@ async fn webhook_auto_pause_after_24h() {
     assert!(after.paused, "subscription should be auto-paused");
 }
 
-/// 7. Tenant A's subscription does NOT receive tenant B's events.
+/// 7. Project A's subscription does NOT receive project B's events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let server = spawn_server(200).await;
     let net = make_client();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     net.allow_host(&a, "127.0.0.1").await;
     net.allow_host(&b, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    // Only tenant A subscribes.
+    // Only project A subscribes.
     let sa = sub(a, "orders", server.url("/hook"), WebhookOps::all_ops(), 4);
     stack.registry.add(sa).await.unwrap();
 
-    // Tenant B fires an event. No subscription matches → no enqueue,
+    // Project B fires an event. No subscription matches → no enqueue,
     // no POST.
     let evb = evt(b, "orders", ChangeOp::Insert, 1);
     stack.sink.publish(&evb).await.unwrap();
@@ -378,13 +378,13 @@ async fn cross_tenant_isolation() {
         "B's event must not reach A's hook"
     );
 
-    // Tenant A's event lands.
+    // Project A's event lands.
     let eva = evt(a, "orders", ChangeOp::Insert, 1);
     stack.sink.publish(&eva).await.unwrap();
     let _ = stack.worker.tick().await;
     assert_eq!(server.requests().len(), 1);
     let body = body_as_json(&server.requests()[0]);
-    assert_eq!(body["tenant"], a.to_string());
+    assert_eq!(body["project"], a.to_string());
 }
 
 /// 8. Plug `WebhookSink` into a real Engine via
@@ -415,15 +415,15 @@ async fn post_commit_failure_does_not_rollback() {
     });
 
     let net = make_client();
-    let tenant = TenantId::new();
-    net.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
     // Subscription pointing at an unallocated TCP port — every POST
     // will fail at the network layer (connection refused). The crucial
     // part of this test is that the engine's INSERT still commits.
     let s = sub(
-        tenant,
+        project,
         "t",
         "http://127.0.0.1:1/black-hole".into(),
         WebhookOps::all_ops(),
@@ -432,7 +432,7 @@ async fn post_commit_failure_does_not_rollback() {
     stack.registry.add(s).await.unwrap();
     engine.attach_post_commit_sink(stack.sink.clone());
 
-    let sess = engine.open_session(tenant).await.unwrap();
+    let sess = engine.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
         .unwrap();

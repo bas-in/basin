@@ -21,13 +21,13 @@
 //!
 //! ## Concurrency model
 //!
-//! - One outer `Mutex<HashMap<(TenantId, PartitionKey), Arc<RwLock<PartitionState>>>>`.
+//! - One outer `Mutex<HashMap<(ProjectId, PartitionKey), Arc<RwLock<PartitionState>>>>`.
 //!   Held only long enough to look up or insert the per-partition entry; never
 //!   held across I/O or across awaits on the inner lock.
 //! - Each `PartitionState` lives behind its own `tokio::sync::RwLock`. Writes
 //!   acquire the write side briefly to push onto the tail; reads acquire the
 //!   read side to clone the tail.
-//! - Background loops snapshot the tenant map under the outer lock, drop it,
+//! - Background loops snapshot the project map under the outer lock, drop it,
 //!   then process each partition independently. Compaction acquires the
 //!   per-partition write lock only at the start (to snapshot what to drain)
 //!   and at the end (to remove drained entries from the tail). Object-store
@@ -44,7 +44,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use basin_catalog::DataFileRef;
-use basin_common::{BasinError, PartitionKey, Result, TableName, TenantId};
+use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
 use basin_storage::ReadOptions;
 use basin_wal::Lsn;
 use bytes::Bytes;
@@ -53,14 +53,14 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-    ShardBackgroundHandle, ShardConfig, ShardImpl, ShardStats, TenantHandle, TenantHandleImpl,
+    ShardBackgroundHandle, ShardConfig, ShardImpl, ShardStats, ProjectHandle, ProjectHandleImpl,
 };
 
-/// Per-(tenant, partition) in-memory state. Lives behind an `RwLock` inside
+/// Per-(project, partition) in-memory state. Lives behind an `RwLock` inside
 /// the shard's outer map.
 pub(crate) struct PartitionState {
     #[allow(dead_code)]
-    tenant: TenantId,
+    project: ProjectId,
     #[allow(dead_code)]
     partition: PartitionKey,
     last_active: Instant,
@@ -77,9 +77,9 @@ pub(crate) struct PartitionState {
 }
 
 impl PartitionState {
-    fn new(tenant: TenantId, partition: PartitionKey) -> Self {
+    fn new(project: ProjectId, partition: PartitionKey) -> Self {
         Self {
-            tenant,
+            project,
             partition,
             last_active: Instant::now(),
             last_compacted_lsn: Lsn::ZERO,
@@ -97,8 +97,8 @@ impl PartitionState {
     }
 }
 
-type PartitionMap = HashMap<(TenantId, PartitionKey), Arc<RwLock<PartitionState>>>;
-type PartitionSnapshot = Vec<((TenantId, PartitionKey), Arc<RwLock<PartitionState>>)>;
+type PartitionMap = HashMap<(ProjectId, PartitionKey), Arc<RwLock<PartitionState>>>;
+type PartitionSnapshot = Vec<((ProjectId, PartitionKey), Arc<RwLock<PartitionState>>)>;
 
 pub(crate) struct InProcessShard {
     pub(crate) cfg: ShardConfig,
@@ -127,13 +127,13 @@ impl InProcessShard {
     /// first access.
     async fn load_or_create(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
     ) -> Result<Arc<RwLock<PartitionState>>> {
         // Fast path: already resident.
         {
             let map = self.partitions.lock().await;
-            if let Some(existing) = map.get(&(*tenant, partition.clone())) {
+            if let Some(existing) = map.get(&(*project, partition.clone())) {
                 let arc = existing.clone();
                 // Touch outside the outer lock; still fine because the inner
                 // lock is independent of the outer one.
@@ -146,15 +146,15 @@ impl InProcessShard {
         // Cold-load path. Replay the WAL into a fresh state object before
         // exposing it to the map; that way concurrent callers either see the
         // empty slot (and replay themselves) or see a fully replayed state.
-        let mut state = PartitionState::new(*tenant, partition.clone());
-        replay_wal_into(&self.cfg.wal, tenant, partition, &mut state).await?;
+        let mut state = PartitionState::new(*project, partition.clone());
+        replay_wal_into(&self.cfg.wal, project, partition, &mut state).await?;
 
         let arc = Arc::new(RwLock::new(state));
         let mut map = self.partitions.lock().await;
         // Another task may have raced us to populate; prefer the existing
         // entry so we don't expose two divergent copies.
         let entry = map
-            .entry((*tenant, partition.clone()))
+            .entry((*project, partition.clone()))
             .or_insert_with(|| arc.clone())
             .clone();
         drop(map);
@@ -174,7 +174,7 @@ impl InProcessShard {
         self.compact_all().await
     }
 
-    /// Walk every resident tenant's tables and migrate any data file whose
+    /// Walk every resident project's tables and migrate any data file whose
     /// `cold_age_column` max is older than `cold_after_seconds` into the
     /// cold tier. The flow per file is:
     ///
@@ -188,33 +188,33 @@ impl InProcessShard {
     /// logged but never propagated — one bad table mustn't stall the rest
     /// of the sweep, same convention as `compact_all`.
     pub(crate) async fn tiering_sweep(&self) -> Result<()> {
-        // Collect the set of tenants we know about. Resident partitions are
-        // the ground truth here — we only sweep tenants whose data we've
-        // touched. Cold-loading every tenant from a global registry would
+        // Collect the set of projects we know about. Resident partitions are
+        // the ground truth here — we only sweep projects whose data we've
+        // touched. Cold-loading every project from a global registry would
         // require an admin API the catalog doesn't expose by design.
-        let tenants: Vec<TenantId> = {
+        let projects: Vec<ProjectId> = {
             let map = self.partitions.lock().await;
-            let mut seen: HashSet<TenantId> = HashSet::new();
+            let mut seen: HashSet<ProjectId> = HashSet::new();
             for (t, _) in map.keys() {
                 seen.insert(*t);
             }
             seen.into_iter().collect()
         };
 
-        for tenant in tenants {
-            if let Err(e) = self.sweep_tenant(&tenant).await {
-                warn!(%tenant, error = %e, "tiering sweep failed for tenant; will retry next tick");
+        for project in projects {
+            if let Err(e) = self.sweep_project(&project).await {
+                warn!(%project, error = %e, "tiering sweep failed for project; will retry next tick");
             }
         }
         Ok(())
     }
 
-    async fn sweep_tenant(&self, tenant: &TenantId) -> Result<()> {
-        let tables = self.cfg.catalog.list_tables(tenant).await?;
+    async fn sweep_project(&self, project: &ProjectId) -> Result<()> {
+        let tables = self.cfg.catalog.list_tables(project).await?;
         for table in tables {
-            if let Err(e) = self.sweep_table(tenant, &table).await {
+            if let Err(e) = self.sweep_table(project, &table).await {
                 warn!(
-                    %tenant,
+                    %project,
                     %table,
                     error = %e,
                     "tiering sweep failed for table; skipping",
@@ -224,8 +224,8 @@ impl InProcessShard {
         Ok(())
     }
 
-    async fn sweep_table(&self, tenant: &TenantId, table: &TableName) -> Result<()> {
-        let meta = self.cfg.catalog.load_table(tenant, table).await?;
+    async fn sweep_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
+        let meta = self.cfg.catalog.load_table(project, table).await?;
         let Some(threshold_secs) = meta.cold_after_seconds else {
             return Ok(()); // Policy disabled.
         };
@@ -255,7 +255,7 @@ impl InProcessShard {
         let cutoff_seconds = cutoff_dt.timestamp();
 
         let storage = &self.cfg.storage;
-        let files = storage.list_data_files_with_stats(tenant, table).await?;
+        let files = storage.list_data_files_with_stats(project, table).await?;
 
         let mut migrated = 0usize;
         for f in files {
@@ -302,7 +302,7 @@ impl InProcessShard {
             //   1. Copy hot -> cold
             //   2. Catalog: replace the hot file with the cold one
             //   3. Delete the hot object
-            let cold_file = match storage.migrate_to_cold(tenant, &f.path).await {
+            let cold_file = match storage.migrate_to_cold(project, &f.path).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(path = %f.path, error = %e, "tier migrate copy failed; skipping file");
@@ -313,7 +313,7 @@ impl InProcessShard {
             let parent_snapshot = self
                 .cfg
                 .catalog
-                .load_table(tenant, table)
+                .load_table(project, table)
                 .await?
                 .current_snapshot;
             let added = DataFileRef {
@@ -332,7 +332,7 @@ impl InProcessShard {
             match self
                 .cfg
                 .catalog
-                .replace_data_files(tenant, table, parent_snapshot, removed, vec![added])
+                .replace_data_files(project, table, parent_snapshot, removed, vec![added])
                 .await
             {
                 Ok(_) => {}
@@ -344,20 +344,20 @@ impl InProcessShard {
                     );
                     // Try to clean up the orphan cold copy. Failure here is
                     // pure waste, not a correctness issue.
-                    let _ = storage.delete_file(tenant, &cold_file.path).await;
+                    let _ = storage.delete_file(project, &cold_file.path).await;
                     continue;
                 }
             }
 
             // Catalog now points at the cold path; the hot file is safe to
             // delete. Best-effort: a leftover hot object is wasted bytes.
-            if let Err(e) = storage.delete_file(tenant, &f.path).await {
+            if let Err(e) = storage.delete_file(project, &f.path).await {
                 warn!(path = %f.path, error = %e, "post-migrate hot delete failed");
             }
             migrated += 1;
         }
         if migrated > 0 {
-            tracing::info!(%tenant, %table, migrated, "tier migration complete");
+            tracing::info!(%project, %table, migrated, "tier migration complete");
         }
         Ok(())
     }
@@ -375,7 +375,7 @@ impl InProcessShard {
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
 
-        let mut to_evict: Vec<(TenantId, PartitionKey)> = Vec::new();
+        let mut to_evict: Vec<(ProjectId, PartitionKey)> = Vec::new();
         for (key, state) in snapshot {
             let guard = state.read().await;
             let stale = now.duration_since(guard.last_active) >= idle;
@@ -406,7 +406,7 @@ impl InProcessShard {
             }
         }
         stats.resident_partitions = map.len();
-        stats.resident_tenants = unique_tenants(&map);
+        stats.resident_projects = unique_projects(&map);
         Ok(())
     }
 
@@ -418,12 +418,12 @@ impl InProcessShard {
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
 
-        for ((tenant, partition), state) in snapshot {
-            if let Err(e) = self.compact_one(&tenant, &partition, state).await {
+        for ((project, partition), state) in snapshot {
+            if let Err(e) = self.compact_one(&project, &partition, state).await {
                 // A failure to compact one partition must not stall others.
                 // Surface via tracing; the next tick will retry.
                 warn!(
-                    %tenant,
+                    %project,
                     %partition,
                     error = %e,
                     "compaction failed for partition; will retry next tick",
@@ -435,7 +435,7 @@ impl InProcessShard {
 
     async fn compact_one(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         state: Arc<RwLock<PartitionState>>,
     ) -> Result<()> {
@@ -474,7 +474,7 @@ impl InProcessShard {
             let data_file = self
                 .cfg
                 .storage
-                .write_batch(tenant, &table, partition, &merged)
+                .write_batch(project, &table, partition, &merged)
                 .await?;
 
             let file_ref = DataFileRef {
@@ -484,7 +484,7 @@ impl InProcessShard {
                 column_stats: data_file.column_stats.clone(),
             };
 
-            self.commit_with_retry(tenant, &table, &merged, file_ref)
+            self.commit_with_retry(project, &table, &merged, file_ref)
                 .await?;
 
             drained_per_table.insert(table, max_lsn);
@@ -514,7 +514,7 @@ impl InProcessShard {
         // would be lost; this way the worst case is a duplicate Parquet file
         // with a small replayed batch, which is reconciled on next compaction.
         if let Some(max_lsn) = max_lsn_overall {
-            self.cfg.wal.truncate(tenant, partition, max_lsn).await?;
+            self.cfg.wal.truncate(project, partition, max_lsn).await?;
         }
 
         let mut stats = self.stats.lock().await;
@@ -527,19 +527,19 @@ impl InProcessShard {
     /// batch's schema.
     async fn commit_with_retry(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         batch: &RecordBatch,
         file: DataFileRef,
     ) -> Result<()> {
         // Make sure the table exists; if not, create it from the batch schema.
-        let mut snapshot = match self.cfg.catalog.load_table(tenant, table).await {
+        let mut snapshot = match self.cfg.catalog.load_table(project, table).await {
             Ok(meta) => meta.current_snapshot,
             Err(BasinError::NotFound(_)) => {
                 let meta = self
                     .cfg
                     .catalog
-                    .create_table(tenant, table, batch.schema().as_ref())
+                    .create_table(project, table, batch.schema().as_ref())
                     .await?;
                 meta.current_snapshot
             }
@@ -550,12 +550,12 @@ impl InProcessShard {
             match self
                 .cfg
                 .catalog
-                .append_data_files(tenant, table, snapshot, vec![file.clone()])
+                .append_data_files(project, table, snapshot, vec![file.clone()])
                 .await
             {
                 Ok(_) => return Ok(()),
                 Err(BasinError::CommitConflict(_)) if attempt == 0 => {
-                    let meta = self.cfg.catalog.load_table(tenant, table).await?;
+                    let meta = self.cfg.catalog.load_table(project, table).await?;
                     snapshot = meta.current_snapshot;
                     continue;
                 }
@@ -563,7 +563,7 @@ impl InProcessShard {
             }
         }
         Err(BasinError::CommitConflict(format!(
-            "{tenant}/{table}: lost commit race twice"
+            "{project}/{table}: lost commit race twice"
         )))
     }
 
@@ -571,12 +571,12 @@ impl InProcessShard {
         let map = self.partitions.lock().await;
         let mut stats = self.stats.lock().await;
         stats.resident_partitions = map.len();
-        stats.resident_tenants = unique_tenants(&map);
+        stats.resident_projects = unique_projects(&map);
     }
 }
 
-fn unique_tenants(map: &PartitionMap) -> usize {
-    let mut seen: HashSet<TenantId> = HashSet::new();
+fn unique_projects(map: &PartitionMap) -> usize {
+    let mut seen: HashSet<ProjectId> = HashSet::new();
     for (t, _) in map.keys() {
         seen.insert(*t);
     }
@@ -585,17 +585,17 @@ fn unique_tenants(map: &PartitionMap) -> usize {
 
 #[async_trait]
 impl ShardImpl for InProcessShard {
-    #[instrument(skip(self), fields(tenant = %tenant, partition = %partition))]
-    async fn get(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<TenantHandle> {
-        let state = self.load_or_create(tenant, partition).await?;
+    #[instrument(skip(self), fields(project = %project, partition = %partition))]
+    async fn get(&self, project: &ProjectId, partition: &PartitionKey) -> Result<ProjectHandle> {
+        let state = self.load_or_create(project, partition).await?;
         self.refresh_resident_stats().await;
-        let inner: Arc<dyn TenantHandleImpl> = Arc::new(InProcessTenantHandle {
-            tenant: *tenant,
+        let inner: Arc<dyn ProjectHandleImpl> = Arc::new(InProcessProjectHandle {
+            project: *project,
             partition: partition.clone(),
             state,
             cfg: self.cfg.clone(),
         });
-        Ok(TenantHandle { inner })
+        Ok(ProjectHandle { inner })
     }
 
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle {
@@ -658,9 +658,9 @@ impl ShardImpl for InProcessShard {
         self.tiering_sweep().await
     }
 
-    async fn resident_tenants(&self) -> Vec<TenantId> {
+    async fn resident_projects(&self) -> Vec<ProjectId> {
         let map = self.partitions.lock().await;
-        let mut seen: HashSet<TenantId> = HashSet::new();
+        let mut seen: HashSet<ProjectId> = HashSet::new();
         for (t, _) in map.keys() {
             seen.insert(*t);
         }
@@ -682,22 +682,22 @@ fn decode_le_i64(bytes: &[u8]) -> Option<i64> {
     Some(i64::from_le_bytes(a))
 }
 
-struct InProcessTenantHandle {
-    tenant: TenantId,
+struct InProcessProjectHandle {
+    project: ProjectId,
     partition: PartitionKey,
     state: Arc<RwLock<PartitionState>>,
     cfg: ShardConfig,
 }
 
 #[async_trait]
-impl TenantHandleImpl for InProcessTenantHandle {
-    #[instrument(skip(self, batch), fields(tenant = %self.tenant, partition = %self.partition, table = %table, rows = batch.num_rows()))]
+impl ProjectHandleImpl for InProcessProjectHandle {
+    #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
     async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
         let payload = encode_payload(table, &batch)?;
         let lsn = self
             .cfg
             .wal
-            .append(&self.tenant, &self.partition, payload)
+            .append(&self.project, &self.partition, payload)
             .await?;
 
         let mut guard = self.state.write().await;
@@ -714,7 +714,7 @@ impl TenantHandleImpl for InProcessTenantHandle {
         Ok(())
     }
 
-    #[instrument(skip(self, opts), fields(tenant = %self.tenant, partition = %self.partition, table = %table))]
+    #[instrument(skip(self, opts), fields(project = %self.project, partition = %self.partition, table = %table))]
     async fn read(&self, table: &TableName, opts: ReadOptions) -> Result<Vec<RecordBatch>> {
         // Stream the Parquet base.
         let parquet_opts = ReadOptions {
@@ -725,7 +725,7 @@ impl TenantHandleImpl for InProcessTenantHandle {
         let stream = self
             .cfg
             .storage
-            .read(&self.tenant, table, parquet_opts)
+            .read(&self.project, table, parquet_opts)
             .await?;
         let mut out: Vec<RecordBatch> = stream
             .collect::<Vec<Result<RecordBatch>>>()
@@ -769,8 +769,8 @@ impl TenantHandleImpl for InProcessTenantHandle {
         }
     }
 
-    fn tenant(&self) -> TenantId {
-        self.tenant
+    fn project(&self) -> ProjectId {
+        self.project
     }
 }
 
@@ -830,13 +830,13 @@ fn decode_payload(bytes: &[u8]) -> Result<(TableName, Vec<RecordBatch>)> {
 
 async fn replay_wal_into(
     wal: &Arc<dyn basin_wal::Wal>,
-    tenant: &TenantId,
+    project: &ProjectId,
     partition: &PartitionKey,
     state: &mut PartitionState,
 ) -> Result<()> {
     // v0.1: always replay from `Lsn::ZERO`. Once we persist a compaction
     // marker we'll skip already-flushed entries.
-    let entries = wal.read_from(tenant, partition, Lsn::ZERO).await?;
+    let entries = wal.read_from(project, partition, Lsn::ZERO).await?;
     for entry in entries {
         let (table, batches) = decode_payload(&entry.payload)?;
         let table_tail = state.tail.entry(table.clone()).or_default();
@@ -853,7 +853,7 @@ async fn replay_wal_into(
         }
     }
     debug!(
-        %tenant,
+        %project,
         %partition,
         tables = state.tail.len(),
         "replayed WAL into partition state",
@@ -991,7 +991,7 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use basin_catalog::InMemoryCatalog;
-    use basin_common::{PartitionKey, TableName, TenantId};
+    use basin_common::{PartitionKey, TableName, ProjectId};
     use basin_storage::{Storage, StorageConfig};
     use basin_wal::{LocalWal, Wal, WalConfig};
     use object_store::local::LocalFileSystem;
@@ -1070,11 +1070,11 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_returns_tail() {
         let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let partition = PartitionKey::default_key();
         let table = TableName::new("events").unwrap();
 
-        let handle = shard.get(&tenant, &partition).await.unwrap();
+        let handle = shard.get(&project, &partition).await.unwrap();
         for i in 0..3 {
             handle
                 .write_batch(&table, batch(i * 10, 10, "v-"))
@@ -1089,11 +1089,11 @@ mod tests {
     #[tokio::test]
     async fn compaction_drains_tail_to_parquet() {
         let (shard, _sd, _wd, storage, _cat, wal) = fresh_shard().await;
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let partition = PartitionKey::default_key();
         let table = TableName::new("events").unwrap();
 
-        let handle = shard.get(&tenant, &partition).await.unwrap();
+        let handle = shard.get(&project, &partition).await.unwrap();
         for i in 0..3 {
             handle
                 .write_batch(&table, batch(i * 10, 10, "v-"))
@@ -1105,7 +1105,7 @@ mod tests {
         inner.run_compaction_once().await.unwrap();
 
         // Parquet file exists in storage.
-        let files = storage.list_data_files(&tenant, &table).await.unwrap();
+        let files = storage.list_data_files(&project, &table).await.unwrap();
         assert!(
             !files.is_empty(),
             "expected at least one data file after compaction",
@@ -1125,7 +1125,7 @@ mod tests {
         // Tail empty after compaction.
         let state = {
             let map = inner.partitions.lock().await;
-            map.get(&(tenant, partition.clone())).unwrap().clone()
+            map.get(&(project, partition.clone())).unwrap().clone()
         };
         let guard = state.read().await;
         assert!(
@@ -1136,7 +1136,7 @@ mod tests {
         // Sanity: WAL high_water reflects truncation by returning the pre-trunc
         // value or higher, never resetting to ZERO. Just call it to ensure
         // truncate didn't error out.
-        let _ = wal.high_water(&tenant, &partition).await.unwrap();
+        let _ = wal.high_water(&project, &partition).await.unwrap();
     }
 
     #[tokio::test]
@@ -1160,7 +1160,7 @@ mod tests {
             flush_max_bytes: 1024 * 1024,
         };
 
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let partition = PartitionKey::default_key();
         let table = TableName::new("events").unwrap();
 
@@ -1169,7 +1169,7 @@ mod tests {
             let wal: Arc<dyn Wal> = Arc::new(LocalWal::open(wal_cfg()).await.unwrap());
             let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal.clone());
             let shard = crate::Shard::new(cfg);
-            let handle = shard.get(&tenant, &partition).await.unwrap();
+            let handle = shard.get(&project, &partition).await.unwrap();
             for i in 0..5 {
                 handle
                     .write_batch(&table, batch(i * 10, 10, "v-"))
@@ -1185,7 +1185,7 @@ mod tests {
             let wal: Arc<dyn Wal> = Arc::new(LocalWal::open(wal_cfg()).await.unwrap());
             let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal);
             let shard = crate::Shard::new(cfg);
-            let handle = shard.get(&tenant, &partition).await.unwrap();
+            let handle = shard.get(&project, &partition).await.unwrap();
             let read = handle.read(&table, ReadOptions::default()).await.unwrap();
             assert_eq!(
                 rows_in(&read),
@@ -1199,10 +1199,10 @@ mod tests {
     async fn eviction_drops_idle() {
         let (mut shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
         // Rewire eviction_idle to zero by recreating the shard.
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let partition = PartitionKey::default_key();
 
-        let handle = shard.get(&tenant, &partition).await.unwrap();
+        let handle = shard.get(&project, &partition).await.unwrap();
         drop(handle);
 
         // Reach into the impl, override eviction_idle, run one tick.
@@ -1216,7 +1216,7 @@ mod tests {
             ..inner.cfg.clone()
         };
         let shard2 = crate::Shard::new(cfg2);
-        let h2 = shard2.get(&tenant, &partition).await.unwrap();
+        let h2 = shard2.get(&project, &partition).await.unwrap();
         drop(h2);
         // Sleep 1ms so last_active is strictly in the past.
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1228,7 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn eviction_skips_dirty_tail() {
         let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let partition = PartitionKey::default_key();
         let table = TableName::new("events").unwrap();
 
@@ -1238,7 +1238,7 @@ mod tests {
             ..inner.cfg.clone()
         };
         let shard2 = crate::Shard::new(cfg2);
-        let handle = shard2.get(&tenant, &partition).await.unwrap();
+        let handle = shard2.get(&project, &partition).await.unwrap();
         handle
             .write_batch(&table, batch(0, 10, "v-"))
             .await
@@ -1256,10 +1256,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_isolation() {
+    async fn project_isolation() {
         let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let partition = PartitionKey::default_key();
         let table = TableName::new("shared").unwrap();
 
@@ -1285,7 +1285,7 @@ mod tests {
         for i in 0..names.len() {
             assert!(
                 names.value(i).starts_with("a-"),
-                "tenant a saw {} which is not a's data",
+                "project a saw {} which is not a's data",
                 names.value(i)
             );
         }

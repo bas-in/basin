@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, StringArray, UInt64Array};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -76,7 +76,7 @@ async fn open_engine() -> (TempDir, Engine) {
 /// Execute `sql`, expect exactly one row × one column. Return the single
 /// `ArrayRef` from that batch.
 async fn single_col(
-    sess: &basin_engine::TenantSession,
+    sess: &basin_engine::ProjectSession,
     sql: &str,
 ) -> arrow_array::ArrayRef {
     match sess.execute(sql).await {
@@ -95,14 +95,14 @@ async fn single_col(
 
 /// Extract i32 from single-cell result (array_ndims etc may return Int32 or Int64).
 #[allow(dead_code)]
-async fn one_i32(sess: &basin_engine::TenantSession, sql: &str) -> i64 {
+async fn one_i32(sess: &basin_engine::ProjectSession, sql: &str) -> i64 {
     one_int(sess, sql).await
 }
 
 /// Extract i64 / i32 / u64 (flexibly) from single-cell result. DataFusion
 /// returns `cardinality`, `array_length`, `array_ndims`, `array_position(s)`,
 /// etc. as UInt64; Postgres returns those as int4/int8. Accept all three.
-async fn one_int(sess: &basin_engine::TenantSession, sql: &str) -> i64 {
+async fn one_int(sess: &basin_engine::ProjectSession, sql: &str) -> i64 {
     let col = single_col(sess, sql).await;
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
         return a.value(0);
@@ -117,7 +117,7 @@ async fn one_int(sess: &basin_engine::TenantSession, sql: &str) -> i64 {
 }
 
 /// Extract string from single-cell result.
-async fn one_str(sess: &basin_engine::TenantSession, sql: &str) -> String {
+async fn one_str(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     let col = single_col(sess, sql).await;
     col.as_any()
         .downcast_ref::<StringArray>()
@@ -127,7 +127,7 @@ async fn one_str(sess: &basin_engine::TenantSession, sql: &str) -> String {
 }
 
 /// Extract bool from single-cell result.
-async fn one_bool(sess: &basin_engine::TenantSession, sql: &str) -> bool {
+async fn one_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
     let col = single_col(sess, sql).await;
     col.as_any()
         .downcast_ref::<BooleanArray>()
@@ -137,7 +137,7 @@ async fn one_bool(sess: &basin_engine::TenantSession, sql: &str) -> bool {
 
 /// Execute SQL expecting multiple rows × 1 column; return all values as
 /// Strings (type-independent, for SRF / unnest results).
-async fn multi_str(sess: &basin_engine::TenantSession, sql: &str) -> Vec<String> {
+async fn multi_str(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<String> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let mut out = Vec::new();
@@ -175,7 +175,7 @@ async fn multi_str(sess: &basin_engine::TenantSession, sql: &str) -> Vec<String>
 #[tokio::test]
 async fn array_literal_1d_constructor() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // cardinality of the literal array
     let n = one_int(&sess, "SELECT cardinality(ARRAY[10, 20, 30])").await;
     assert_eq!(n, 3, "ARRAY[10,20,30] should have cardinality 3");
@@ -189,7 +189,7 @@ async fn array_literal_1d_constructor() {
 #[tokio::test]
 async fn array_literal_multidim_constructor() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // DataFusion 44 supports nested make_array giving a List<List<Int64>>.
     // array_ndims of a 2-level list should be 2.
     let n = one_int(
@@ -207,7 +207,7 @@ async fn array_literal_multidim_constructor() {
 #[tokio::test]
 async fn array_fill_basic() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // DataFusion 44 does not expose array_fill natively.  We verify that
     // array_repeat (DF's equivalent) works, which covers the same use case.
     // array_repeat(scalar, n) → List<scalar> of length n.
@@ -223,7 +223,7 @@ async fn array_fill_basic() {
 #[tokio::test]
 async fn array_length_1d() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let n = one_int(&sess, "SELECT array_length(ARRAY[10, 20, 30], 1)").await;
     assert_eq!(n, 3);
 }
@@ -232,7 +232,7 @@ async fn array_length_1d() {
 #[tokio::test]
 async fn cardinality_1d() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let n = one_int(&sess, "SELECT cardinality(ARRAY[1, 2, 3, 4])").await;
     assert_eq!(n, 4);
 }
@@ -241,7 +241,7 @@ async fn cardinality_1d() {
 #[tokio::test]
 async fn array_ndims_1d() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let n = one_int(&sess, "SELECT array_ndims(ARRAY[1, 2])").await;
     assert_eq!(n, 1);
 }
@@ -255,7 +255,7 @@ async fn array_ndims_1d() {
 #[tokio::test]
 async fn array_lower_known_gap_workaround() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // PG lower bound is always 1 for normal arrays — verify array_length works
     // as the upper bound equivalent.
     let upper = one_int(&sess, "SELECT array_length(ARRAY[10, 20, 30], 1)").await;
@@ -270,7 +270,7 @@ async fn array_lower_known_gap_workaround() {
 #[tokio::test]
 async fn array_upper_via_array_length() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // array_upper(arr, 1) == array_length(arr, 1) for standard 1-based arrays.
     let n = one_int(&sess, "SELECT array_length(ARRAY[10, 20, 30], 1)").await;
     assert_eq!(n, 3, "array_length(arr, 1) is the upper bound for 1-based arrays");
@@ -280,7 +280,7 @@ async fn array_upper_via_array_length() {
 #[tokio::test]
 async fn array_dims_text() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let s = one_str(&sess, "SELECT array_dims(ARRAY[10, 20, 30])").await;
     // DataFusion returns "[1:3]" matching PG
     assert!(
@@ -293,7 +293,7 @@ async fn array_dims_text() {
 #[tokio::test]
 async fn array_subscript_1based() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // DataFusion uses array_element(arr, idx) internally
     let n = one_int(&sess, "SELECT array_element(ARRAY[10, 20, 30], 1)").await;
     assert_eq!(n, 10, "array_element(arr, 1) should return first element");
@@ -303,7 +303,7 @@ async fn array_subscript_1based() {
 #[tokio::test]
 async fn array_slice_range() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // array_slice returns a sub-array; verify cardinality
     let n = one_int(
         &sess,
@@ -321,7 +321,7 @@ async fn array_slice_range() {
 #[tokio::test]
 async fn array_append_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let n = one_int(
         &sess,
         "SELECT cardinality(array_append(ARRAY[1, 2, 3], 4))",
@@ -334,7 +334,7 @@ async fn array_append_test() {
 #[tokio::test]
 async fn array_prepend_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let n = one_int(
         &sess,
         "SELECT cardinality(array_prepend(0, ARRAY[1, 2, 3]))",
@@ -354,7 +354,7 @@ async fn array_prepend_test() {
 #[tokio::test]
 async fn array_cat_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let n = one_int(
         &sess,
         "SELECT cardinality(array_cat(ARRAY[1, 2], ARRAY[3, 4, 5]))",
@@ -367,7 +367,7 @@ async fn array_cat_test() {
 #[tokio::test]
 async fn array_remove_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // DataFusion's `array_remove` only removes the FIRST occurrence; PG's
     // removes all. Pin the DF behaviour for now — v0.2 will rewrite to an
     // array_filter equivalent so this asserts `1` (PG semantics).
@@ -386,7 +386,7 @@ async fn array_remove_test() {
 #[tokio::test]
 async fn array_replace_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // Replace 2 → 99 in [1,2,2,3] → should have element 99 at position 2
     let v = one_int(
         &sess,
@@ -400,7 +400,7 @@ async fn array_replace_test() {
 #[tokio::test]
 async fn array_positions_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // array_positions returns a List<Int64>; verify cardinality of result
     let n = one_int(
         &sess,
@@ -414,7 +414,7 @@ async fn array_positions_test() {
 #[tokio::test]
 async fn array_position_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let pos = one_int(
         &sess,
         "SELECT array_position(ARRAY[10, 20, 30], 20)",
@@ -435,7 +435,7 @@ async fn array_position_test() {
 #[tokio::test]
 async fn any_operator_in_array() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // Primary: array_has is the canonical DataFusion spelling
     let b = one_bool(&sess, "SELECT array_has(ARRAY[1, 2, 3], 2)").await;
     assert!(b, "array_has([1,2,3], 2) should be true (ANY semantics)");
@@ -452,7 +452,7 @@ async fn any_operator_in_array() {
 #[ignore = "Depends on PG-semantics array_remove (removes all matches); DataFusion removes only the first — v0.2 alignment"]
 async fn all_operator_semantics() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // All elements are 2 in [2,2,2]: removing 2 leaves cardinality 0
     let n = one_int(
         &sess,
@@ -473,7 +473,7 @@ async fn all_operator_semantics() {
 #[tokio::test]
 async fn array_contains_operator() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // DataFusion planner routes @> for List types to array_has_all
     let b = one_bool(&sess, "SELECT array_has_all(ARRAY[1, 2, 3], ARRAY[1, 2])").await;
     assert!(b, "[1,2,3] @> [1,2] should be true");
@@ -485,7 +485,7 @@ async fn array_contains_operator() {
 #[tokio::test]
 async fn array_contained_by_operator() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // <@ = arr2 @> arr1, i.e. array_has_all(arr2, arr1)
     let b = one_bool(&sess, "SELECT array_has_all(ARRAY[1, 2, 3], ARRAY[2, 3])").await;
     assert!(b, "[2,3] <@ [1,2,3] should be true");
@@ -496,7 +496,7 @@ async fn array_contained_by_operator() {
 #[tokio::test]
 async fn array_overlap_operator() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // array_has_any(arr1, arr2) = true if they share any element
     let b = one_bool(
         &sess,
@@ -520,7 +520,7 @@ async fn array_overlap_operator() {
 #[tokio::test]
 async fn unnest_srf() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let rows = multi_str(&sess, "SELECT unnest(ARRAY[10, 20, 30])").await;
     assert_eq!(rows, vec!["10", "20", "30"], "unnest should expand array to rows");
 }
@@ -529,7 +529,7 @@ async fn unnest_srf() {
 #[tokio::test]
 async fn array_to_string_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let s = one_str(
         &sess,
         "SELECT array_to_string(ARRAY['a', 'b', 'c'], ',')",
@@ -542,7 +542,7 @@ async fn array_to_string_test() {
 #[tokio::test]
 async fn string_to_array_test() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let n = one_int(
         &sess,
         "SELECT cardinality(string_to_array('a,b,c,d', ','))",
@@ -555,7 +555,7 @@ async fn string_to_array_test() {
 #[tokio::test]
 async fn array_to_string_with_null_str() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let s = one_str(
         &sess,
         "SELECT array_to_string(ARRAY['x', 'y', 'z'], '-', '*')",
@@ -568,7 +568,7 @@ async fn array_to_string_with_null_str() {
 #[tokio::test]
 async fn array_concat_pipe_operator() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // DataFusion rewrites List || List → array_concat
     let n = one_int(
         &sess,
@@ -582,7 +582,7 @@ async fn array_concat_pipe_operator() {
 #[tokio::test]
 async fn array_has_element() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let b = one_bool(&sess, "SELECT array_has(ARRAY[1, 2, 3], 2)").await;
     assert!(b, "array_has([1,2,3], 2) should be true");
     let b2 = one_bool(&sess, "SELECT array_has(ARRAY[1, 2, 3], 9)").await;
@@ -594,7 +594,7 @@ async fn array_has_element() {
 #[tokio::test]
 async fn array_chained_operations() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // Split "a,b,c" → array, append "d", join back → "a,b,c,d"
     let s = one_str(
         &sess,

@@ -5,12 +5,12 @@
 //!
 //! ## Basin's flat model
 //!
-//! Basin uses a flat per-tenant prefix in object storage. Schemas are
+//! Basin uses a flat per-project prefix in object storage. Schemas are
 //! *namespace metadata* tracked in session state; they do not produce
 //! separate storage prefixes or catalog namespaces. A `CREATE SCHEMA`
 //! records the schema name; `DROP SCHEMA` removes it. All qualified
 //! references (`myschema.t`) are resolved to the bare table name (`t`)
-//! since all tables share the tenant's single catalog namespace.
+//! since all tables share the project's single catalog namespace.
 //!
 //! ## `public` is always present
 //!
@@ -38,10 +38,10 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_common::{BasinError, Result};
 use sqlparser::ast::{ObjectName, SchemaName};
 
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Per-session schema state. Held behind `Arc<RwLock<...>>` inside
-/// `SessionState` so all methods on `TenantSession` can reach it without
+/// `SessionState` so all methods on `ProjectSession` can reach it without
 /// borrowing `SessionState` directly.
 #[derive(Debug)]
 pub(crate) struct SchemaState {
@@ -117,7 +117,7 @@ pub(crate) fn resolve_object_name(name: &ObjectName) -> Result<ResolvedName> {
 /// Extract the bare table name from an `ObjectName`, accepting both
 /// bare (`t`) and schema-qualified (`myschema.t`) forms. The schema
 /// qualifier is validated (must be a known schema on this session) but
-/// stripped for catalog lookup — all tables live in the flat tenant
+/// stripped for catalog lookup — all tables live in the flat project
 /// namespace.
 pub(crate) fn table_name_from_object(
     name: &ObjectName,
@@ -140,7 +140,7 @@ pub(crate) fn table_name_from_object(
 // ─── CREATE SCHEMA ──────────────────────────────────────────────────────────
 
 pub(crate) async fn exec_create_schema(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     schema_name: SchemaName,
     if_not_exists: bool,
 ) -> Result<ExecResult> {
@@ -180,7 +180,7 @@ pub(crate) async fn exec_create_schema(
 // ─── DROP SCHEMA ────────────────────────────────────────────────────────────
 
 pub(crate) async fn exec_drop_schema(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     names: &[ObjectName],
     if_exists: bool,
     // CASCADE / RESTRICT — Basin's flat model has no owned objects per schema,
@@ -258,7 +258,7 @@ pub(crate) fn match_alter_schema_rename(sql: &str) -> Option<(String, String)> {
 /// Validates that `old` exists, `new` does not, and neither is `"public"`.
 /// Updates the session-local schema state and the search_path in-place.
 pub(crate) async fn exec_alter_schema_rename(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     old: &str,
     new: &str,
 ) -> Result<ExecResult> {
@@ -314,7 +314,7 @@ pub(crate) async fn exec_alter_schema_rename(
 /// Returns a single-column, single-row result set with the current
 /// `search_path` value formatted as a comma-separated string, matching
 /// Postgres's `SHOW search_path` response shape.
-pub(crate) fn exec_show_search_path(sess: &TenantSession) -> Result<ExecResult> {
+pub(crate) fn exec_show_search_path(sess: &ProjectSession) -> Result<ExecResult> {
     let st = sess
         .state
         .schema_state
@@ -345,7 +345,7 @@ pub(crate) fn exec_show_search_path(sess: &TenantSession) -> Result<ExecResult> 
 /// `Expr::Value(Value::SingleQuotedString(...))`. We accept both forms
 /// and store the lowercase list on the session's `SchemaState`.
 pub(crate) fn exec_set_search_path(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     values: &[sqlparser::ast::Expr],
 ) -> Result<ExecResult> {
     use sqlparser::ast::{Expr, Value};
@@ -387,7 +387,7 @@ pub(crate) fn exec_set_search_path(
 /// Rewrite `schema.table` two-part names in a SQL string to bare `table`
 /// names before handing the SQL to DataFusion. DataFusion uses its own
 /// catalog/schema namespace (`datafusion.<schema>.<table>`) which is
-/// distinct from Basin's per-tenant flat namespace. This rewrite lets
+/// distinct from Basin's per-project flat namespace. This rewrite lets
 /// clients write `SELECT ... FROM myschema.items` and have DataFusion see
 /// `SELECT ... FROM items`, which *is* registered in the session context.
 ///

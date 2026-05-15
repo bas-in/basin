@@ -1,8 +1,8 @@
-//! Viability test 2: idle-tenant RAM cost.
+//! Viability test 2: idle-project RAM cost.
 //!
-//! Claim: Basin holds many idle tenants in one process for cheap. We
-//! provision N=1000 tenants (namespace + table only — no data, no engine
-//! sessions) and measure the RSS delta. Bar: <500 KiB / tenant.
+//! Claim: Basin holds many idle projects in one process for cheap. We
+//! provision N=1000 projects (namespace + table only — no data, no engine
+//! sessions) and measure the RSS delta. Bar: <500 KiB / project.
 //!
 //! The bar is more honest than the original 100 KB pitch: tokio runtime,
 //! allocator slack, and arrow_schema overhead are all real, and pretending
@@ -16,15 +16,15 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
 
-const TENANTS: usize = 1000;
-const BAR_KIB_PER_TENANT: u64 = 500;
+const PROJECTS: usize = 1000;
+const BAR_KIB_PER_PROJECT: u64 = 500;
 
 /// Read the current process's resident set size in KiB via `ps -o rss=`.
 /// macOS and Linux both ship this. Returns KiB.
@@ -49,8 +49,8 @@ fn schema() -> Schema {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn viability_2_idle_tenant_ram() {
-    // Storage is a shared resource; provisioning a tenant is purely a catalog
+async fn viability_2_idle_project_ram() {
+    // Storage is a shared resource; provisioning a project is purely a catalog
     // operation in this test (no Parquet is written).
     let dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
@@ -68,66 +68,66 @@ async fn viability_2_idle_tenant_ram() {
     // low. A single dummy provision exercises the same code paths the loop
     // does and stabilizes lazy initialization in tokio + tracing.
     {
-        let warm = TenantId::new();
+        let warm = ProjectId::new();
         catalog.create_namespace(&warm).await.unwrap();
         catalog.create_table(&warm, &table, &sch).await.unwrap();
     }
 
     let rss_before = rss_kib();
 
-    // Hold the tenant ids so the compiler doesn't drop them and so we model
-    // a realistic "control plane has a list of all tenants in memory" world.
-    let mut tenants: Vec<TenantId> = Vec::with_capacity(TENANTS);
-    for _ in 0..TENANTS {
-        let t = TenantId::new();
+    // Hold the project ids so the compiler doesn't drop them and so we model
+    // a realistic "control plane has a list of all projects in memory" world.
+    let mut projects: Vec<ProjectId> = Vec::with_capacity(PROJECTS);
+    for _ in 0..PROJECTS {
+        let t = ProjectId::new();
         catalog.create_namespace(&t).await.unwrap();
         catalog.create_table(&t, &table, &sch).await.unwrap();
-        tenants.push(t);
+        projects.push(t);
     }
 
     let rss_after = rss_kib();
 
     let delta_kib = rss_after.saturating_sub(rss_before);
-    let per_tenant_kib = delta_kib as f64 / TENANTS as f64;
-    let bar_kib = BAR_KIB_PER_TENANT as f64;
-    let pass = per_tenant_kib < bar_kib;
+    let per_project_kib = delta_kib as f64 / PROJECTS as f64;
+    let bar_kib = BAR_KIB_PER_PROJECT as f64;
+    let pass = per_project_kib < bar_kib;
 
-    // Keep `tenants` live across the measurement.
-    assert_eq!(tenants.len(), TENANTS);
+    // Keep `projects` live across the measurement.
+    assert_eq!(projects.len(), PROJECTS);
 
     println!(
-        "[VIABILITY 2] idle tenants: tenants={}, rss_before={} KiB, rss_after={} KiB, per_tenant={:.1} KiB (bar <{} KiB/tenant) {}",
-        TENANTS,
+        "[VIABILITY 2] idle projects: projects={}, rss_before={} KiB, rss_after={} KiB, per_project={:.1} KiB (bar <{} KiB/project) {}",
+        PROJECTS,
         rss_before,
         rss_after,
-        per_tenant_kib,
-        BAR_KIB_PER_TENANT,
+        per_project_kib,
+        BAR_KIB_PER_PROJECT,
         if pass { "PASS" } else { "FAIL" }
     );
 
-    let per_tenant_bytes = (delta_kib as f64 * 1024.0) / TENANTS as f64;
-    let bar_bytes = (BAR_KIB_PER_TENANT * 1024) as f64;
+    let per_project_bytes = (delta_kib as f64 * 1024.0) / PROJECTS as f64;
+    let bar_bytes = (BAR_KIB_PER_PROJECT * 1024) as f64;
 
     report_viability(
-        "idle_tenant_ram",
-        "Idle-tenant RAM cost",
-        "Basin holds many idle tenants in one process for under 500 KiB each.",
+        "idle_project_ram",
+        "Idle-project RAM cost",
+        "Basin holds many idle projects in one process for under 500 KiB each.",
         pass,
         PrimaryMetric {
-            label: "per_tenant_kib".into(),
-            value: per_tenant_kib,
+            label: "per_project_kib".into(),
+            value: per_project_kib,
             unit: "KiB".into(),
-            bar: BarOp::lt(BAR_KIB_PER_TENANT as f64),
+            bar: BarOp::lt(BAR_KIB_PER_PROJECT as f64),
         },
         json!({
-            "tenants": TENANTS,
+            "projects": PROJECTS,
             "rss_before_kib": rss_before,
             "rss_after_kib": rss_after,
         }),
     );
 
     assert!(
-        per_tenant_bytes < bar_bytes,
-        "{per_tenant_bytes:.0} bytes/tenant >= {bar_bytes:.0} bytes/tenant bar"
+        per_project_bytes < bar_bytes,
+        "{per_project_bytes:.0} bytes/project >= {bar_bytes:.0} bytes/project bar"
     );
 }

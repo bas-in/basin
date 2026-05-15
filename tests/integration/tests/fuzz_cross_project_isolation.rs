@@ -1,9 +1,9 @@
-//! Cross-tenant isolation fuzz test.
+//! Cross-project isolation fuzz test.
 //!
 //! TASK.md "Cross-cutting": find an isolation bug -> file a P0. The single
-//! load-bearing rule of the project is that no tenant ever observes another
-//! tenant's bytes. This test bombards a fresh in-process Engine with random
-//! query traffic from N tenants and asserts every row a session reads carries
+//! load-bearing rule of the project is that no project ever observes another
+//! project's bytes. This test bombards a fresh in-process Engine with random
+//! query traffic from N projects and asserts every row a session reads carries
 //! that session's marker. A leak surfaces as `BasinError::IsolationViolation`
 //! plus a `panic!` so CI flags it as a P0.
 //!
@@ -18,37 +18,37 @@ use std::time::Instant;
 
 use arrow_array::{Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::{BasinError, TableName, TenantId};
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::{BasinError, TableName, ProjectId};
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
-const TENANTS: usize = 8;
-const ROWS_PER_TENANT: usize = 300;
+const PROJECTS: usize = 8;
+const ROWS_PER_PROJECT: usize = 300;
 const ITERATIONS: usize = 1_000;
 const DEFAULT_SEED: u64 = 0xB451_FACE_DEAD_BEEF;
 
-fn payload_for(tenant: &TenantId, row: usize) -> String {
-    format!("t-{tenant}-{row}")
+fn payload_for(project: &ProjectId, row: usize) -> String {
+    format!("t-{project}-{row}")
 }
 
-fn payload_prefix_for(tenant: &TenantId) -> String {
-    format!("t-{tenant}-")
+fn payload_prefix_for(project: &ProjectId) -> String {
+    format!("t-{project}-")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fuzz_cross_tenant_isolation() {
+async fn fuzz_cross_project_isolation() {
     // Path-injection vector: TableName must reject anything that could escape
-    // the per-tenant prefix. Run this first so a regression here trips before
+    // the per-project prefix. Run this first so a regression here trips before
     // the engine even spins up.
     for bad in [
-        "../tenant-other/data",
+        "../project-other/data",
         "./../foo",
         "../../etc/passwd",
         "data/../other",
-        "tenant/data",
+        "project/data",
         "a.b",
         "",
         "1leading",
@@ -66,7 +66,7 @@ async fn fuzz_cross_tenant_isolation() {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_SEED);
-    println!("[fuzz_cross_tenant_isolation] seed={seed}");
+    println!("[fuzz_cross_project_isolation] seed={seed}");
     let mut rng = StdRng::seed_from_u64(seed);
 
     let dir = TempDir::new().unwrap();
@@ -84,29 +84,29 @@ async fn fuzz_cross_tenant_isolation() {
         shard: None,
     });
 
-    // Provision N tenants. Each gets the same `data(id BIGINT, payload TEXT)`
+    // Provision N projects. Each gets the same `data(id BIGINT, payload TEXT)`
     // schema and a few hundred rows whose payload is recognisably its own.
-    let mut sessions: Vec<TenantSession> = Vec::with_capacity(TENANTS);
-    let mut tenant_ids: Vec<TenantId> = Vec::with_capacity(TENANTS);
-    let mut known_ids: Vec<Vec<i64>> = Vec::with_capacity(TENANTS);
-    for _ in 0..TENANTS {
-        let t = TenantId::new();
+    let mut sessions: Vec<ProjectSession> = Vec::with_capacity(PROJECTS);
+    let mut project_ids: Vec<ProjectId> = Vec::with_capacity(PROJECTS);
+    let mut known_ids: Vec<Vec<i64>> = Vec::with_capacity(PROJECTS);
+    for _ in 0..PROJECTS {
+        let t = ProjectId::new();
         let sess = engine.open_session(t).await.unwrap();
         sess.execute("CREATE TABLE data (id BIGINT NOT NULL, payload TEXT NOT NULL)")
             .await
             .unwrap();
 
         // INSERT in a single multi-row VALUES so we don't pay one Parquet
-        // file per row. The id space is offset per tenant so the predicate
+        // file per row. The id space is offset per project so the predicate
         // shapes can pick a valid id-in-T even when running against S.
-        let mut sql = String::with_capacity(ROWS_PER_TENANT * 48);
+        let mut sql = String::with_capacity(ROWS_PER_PROJECT * 48);
         sql.push_str("INSERT INTO data VALUES ");
-        let mut ids = Vec::with_capacity(ROWS_PER_TENANT);
-        for r in 0..ROWS_PER_TENANT {
+        let mut ids = Vec::with_capacity(ROWS_PER_PROJECT);
+        for r in 0..ROWS_PER_PROJECT {
             if r > 0 {
                 sql.push(',');
             }
-            let id = (tenant_ids.len() as i64) * 1_000_000 + r as i64;
+            let id = (project_ids.len() as i64) * 1_000_000 + r as i64;
             ids.push(id);
             // payload literal is single-quoted; the ULID and `r` are both
             // ASCII alphanumeric so SQL escaping is unnecessary.
@@ -114,7 +114,7 @@ async fn fuzz_cross_tenant_isolation() {
         }
         sess.execute(&sql).await.unwrap();
 
-        tenant_ids.push(t);
+        project_ids.push(t);
         known_ids.push(ids);
         sessions.push(sess);
     }
@@ -125,13 +125,13 @@ async fn fuzz_cross_tenant_isolation() {
 
     for _ in 0..ITERATIONS {
         // Pick S, then T != S.
-        let s_idx = rng.gen_range(0..TENANTS);
-        let mut t_idx = rng.gen_range(0..TENANTS);
+        let s_idx = rng.gen_range(0..PROJECTS);
+        let mut t_idx = rng.gen_range(0..PROJECTS);
         while t_idx == s_idx {
-            t_idx = rng.gen_range(0..TENANTS);
+            t_idx = rng.gen_range(0..PROJECTS);
         }
-        let s_tenant = &tenant_ids[s_idx];
-        let t_tenant = &tenant_ids[t_idx];
+        let s_project = &project_ids[s_idx];
+        let t_project = &project_ids[t_idx];
         let sess = &sessions[s_idx];
 
         let shape = rng.gen_range(0..4u8);
@@ -147,13 +147,13 @@ async fn fuzz_cross_tenant_isolation() {
                 format!("SELECT * FROM data WHERE id = {id}")
             }
             2 => "SELECT count(*) AS n FROM data".to_string(),
-            _ => format!("SELECT * FROM data WHERE payload LIKE '%t-{t_tenant}%'"),
+            _ => format!("SELECT * FROM data WHERE payload LIKE '%t-{t_project}%'"),
         };
 
         let res = match sess.execute(&sql).await {
             Ok(r) => r,
             Err(e) => panic!(
-                "fuzz query failed (seed={seed}, S={s_tenant}, T={t_tenant}, sql={sql:?}): {e:?}"
+                "fuzz query failed (seed={seed}, S={s_project}, T={t_project}, sql={sql:?}): {e:?}"
             ),
         };
 
@@ -177,10 +177,10 @@ async fn fuzz_cross_tenant_isolation() {
                         .expect("count is bigint");
                     for i in 0..arr.len() {
                         let n = arr.value(i);
-                        if n as usize > ROWS_PER_TENANT {
+                        if n as usize > ROWS_PER_PROJECT {
                             let msg = format!(
-                                "count(*)={n} exceeds ROWS_PER_TENANT={ROWS_PER_TENANT} \
-                                 for S={s_tenant} (seed={seed}, sql={sql:?}) — \
+                                "count(*)={n} exceeds ROWS_PER_PROJECT={ROWS_PER_PROJECT} \
+                                 for S={s_project} (seed={seed}, sql={sql:?}) — \
                                  isolation breach",
                             );
                             let _err = BasinError::isolation(msg.clone());
@@ -192,7 +192,7 @@ async fn fuzz_cross_tenant_isolation() {
             continue;
         }
 
-        let expected_prefix = payload_prefix_for(s_tenant);
+        let expected_prefix = payload_prefix_for(s_project);
         match res {
             ExecResult::Rows { batches, .. } => {
                 for b in &batches {
@@ -213,8 +213,8 @@ async fn fuzz_cross_tenant_isolation() {
                             // path is exercised, then panic so the test
                             // framework reports a hard failure (P0).
                             let msg = format!(
-                                "tenant {s_tenant} observed payload {v:?} that does not \
-                                 start with {expected_prefix:?} (seed={seed}, T={t_tenant}, \
+                                "project {s_project} observed payload {v:?} that does not \
+                                 start with {expected_prefix:?} (seed={seed}, T={t_project}, \
                                  sql={sql:?})"
                             );
                             let _err = BasinError::isolation(msg.clone());
@@ -231,8 +231,8 @@ async fn fuzz_cross_tenant_isolation() {
 
     let elapsed = started.elapsed();
     println!(
-        "[fuzz_cross_tenant_isolation] iters={ITERATIONS}, tenants={TENANTS}, \
-         rows_per_tenant={ROWS_PER_TENANT}, total_rows_scanned={total_rows_scanned}, \
+        "[fuzz_cross_project_isolation] iters={ITERATIONS}, projects={PROJECTS}, \
+         rows_per_project={ROWS_PER_PROJECT}, total_rows_scanned={total_rows_scanned}, \
          elapsed={:.2}s, shapes(scan/by_id/count/like)={:?}, seed={seed}",
         elapsed.as_secs_f64(),
         shape_counts

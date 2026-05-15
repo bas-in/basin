@@ -23,7 +23,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Decimal128Array, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -50,14 +50,14 @@ async fn open_engine() -> (TempDir, Engine) {
 }
 
 /// Execute SQL and panic on error.
-async fn exec_ok(sess: &basin_engine::TenantSession, sql: &str) -> ExecResult {
+async fn exec_ok(sess: &basin_engine::ProjectSession, sql: &str) -> ExecResult {
     sess.execute(sql)
         .await
         .unwrap_or_else(|e| panic!("SQL failed [{sql}]: {e}"))
 }
 
 /// Execute SQL, collect all batches.
-async fn rows(sess: &basin_engine::TenantSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+async fn rows(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match exec_ok(sess, sql).await {
         ExecResult::Rows { batches, .. } => batches,
         ExecResult::Empty { tag } => panic!("expected rows for [{sql}], got Empty tag={tag:?}"),
@@ -70,7 +70,7 @@ async fn rows(sess: &basin_engine::TenantSession, sql: &str) -> Vec<arrow_array:
 #[tokio::test]
 async fn numeric_decimal128_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -119,7 +119,7 @@ async fn numeric_decimal128_round_trip() {
 #[tokio::test]
 async fn decimal_synonym_accepted() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -140,7 +140,7 @@ async fn decimal_synonym_accepted() {
 #[tokio::test]
 async fn money_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -188,7 +188,7 @@ async fn money_round_trip() {
 #[tokio::test]
 async fn inet_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -251,7 +251,7 @@ async fn inet_round_trip() {
 #[tokio::test]
 async fn cidr_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -296,7 +296,7 @@ async fn cidr_round_trip() {
 #[tokio::test]
 async fn macaddr_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -342,7 +342,7 @@ async fn macaddr_round_trip() {
 #[tokio::test]
 async fn macaddr8_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -389,7 +389,7 @@ async fn macaddr8_round_trip() {
 #[tokio::test]
 async fn bit_fixed_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,
@@ -443,7 +443,7 @@ async fn bit_fixed_round_trip() {
 #[tokio::test]
 async fn varbit_round_trip() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec_ok(
         &sess,

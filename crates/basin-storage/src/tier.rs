@@ -24,7 +24,7 @@ pub enum Tier {
     #[default]
     Hot,
     /// Cold tier. Recovered from any Parquet file that happens to live under
-    /// the `cold/` segment of a tenant's table.
+    /// the `cold/` segment of a project's table.
     Cold,
 }
 
@@ -41,7 +41,7 @@ impl Tier {
 
     /// Best-effort derivation from an object key. Returns [`Tier::Cold`] iff
     /// the key contains a `/cold/` (or leading `cold/`) segment under the
-    /// tenant table prefix; otherwise [`Tier::Hot`]. The catalog never has to
+    /// project table prefix; otherwise [`Tier::Hot`]. The catalog never has to
     /// remember the tier explicitly because the path is self-describing —
     /// callers serialise the path round-trip and recover the tier on load.
     pub fn from_path(path: &str) -> Self {
@@ -113,10 +113,10 @@ mod tests {
 
     #[test]
     fn from_path_recognises_cold() {
-        let hot = "tenants/01HABC/tables/events/data/2026/04/30/X.parquet";
-        let cold = "tenants/01HABC/tables/events/cold/2026/04/30/X.parquet";
-        let cold_part = "tenants/01HABC/tables/events/cold/year=2026/month=04/X.parquet";
-        let with_root = "warehouse/tenants/01HABC/tables/events/cold/X.parquet";
+        let hot = "projects/01HABC/tables/events/data/2026/04/30/X.parquet";
+        let cold = "projects/01HABC/tables/events/cold/2026/04/30/X.parquet";
+        let cold_part = "projects/01HABC/tables/events/cold/year=2026/month=04/X.parquet";
+        let with_root = "warehouse/projects/01HABC/tables/events/cold/X.parquet";
         assert_eq!(Tier::from_path(hot), Tier::Hot);
         assert_eq!(Tier::from_path(cold), Tier::Cold);
         assert_eq!(Tier::from_path(cold_part), Tier::Cold);
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn from_path_does_not_misclassify_columns_named_cold() {
         // A partition value or sub-segment shouldn't trigger.
-        let p = "tenants/01HABC/tables/events/data/cold=true/X.parquet";
+        let p = "projects/01HABC/tables/events/data/cold=true/X.parquet";
         assert_eq!(Tier::from_path(p), Tier::Hot);
     }
 

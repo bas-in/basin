@@ -1,12 +1,12 @@
-//! Unit test: per-tenant URL allowlist gates outbound requests.
+//! Unit test: per-project URL allowlist gates outbound requests.
 //!
 //! The allowlist is the single most-load-bearing safety check in
 //! `basin-net`. Default DENY-ALL prevents SSRF to AWS metadata
 //! (`169.254.169.254`) or any other internal endpoint. We assert here that
-//! a fresh tenant cannot reach a host until the host is explicitly opted
-//! in, and that the opt-in is per-tenant (A's allowlist does not unlock B).
+//! a fresh project cannot reach a host until the host is explicitly opted
+//! in, and that the opt-in is per-project (A's allowlist does not unlock B).
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_net::{AllowList, GuardConfig, HttpClient, RateLimit};
 
 fn fresh_client() -> HttpClient {
@@ -16,9 +16,9 @@ fn fresh_client() -> HttpClient {
 #[tokio::test]
 async fn unknown_host_is_denied() {
     let client = fresh_client();
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let err = client
-        .http_get(&tenant, "http://203.0.113.5/admin")
+        .http_get(&project, "http://203.0.113.5/admin")
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -33,10 +33,10 @@ async fn allowlisted_host_passes_the_gate() {
     // expected next step. We assert the failure surface is *not* the
     // allowlist one.
     let client = fresh_client();
-    let tenant = TenantId::new();
-    client.allow_host(&tenant, "127.0.0.1").await;
+    let project = ProjectId::new();
+    client.allow_host(&project, "127.0.0.1").await;
     let err = client
-        .http_get(&tenant, "http://127.0.0.1:1/never-listens")
+        .http_get(&project, "http://127.0.0.1:1/never-listens")
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -47,10 +47,10 @@ async fn allowlisted_host_passes_the_gate() {
 }
 
 #[tokio::test]
-async fn allowlist_is_per_tenant() {
+async fn allowlist_is_per_project() {
     let client = fresh_client();
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     client.allow_host(&alice, "example.com").await;
 
     // Alice's host is unknown to Bob.
@@ -70,14 +70,14 @@ async fn host_check_lowercases() {
     // RFC 3986 says host comparison is case-insensitive. The client's
     // lookup must lowercase before comparing.
     let allow = AllowList::new();
-    let tenant = TenantId::new();
-    allow.allow(&tenant, "EXAMPLE.com").await;
+    let project = ProjectId::new();
+    allow.allow(&project, "EXAMPLE.com").await;
     allow
-        .check(&tenant, "http://example.COM/path")
+        .check(&project, "http://example.COM/path")
         .await
         .unwrap();
     allow
-        .check(&tenant, "http://EXAMPLE.com/path")
+        .check(&project, "http://EXAMPLE.com/path")
         .await
         .unwrap();
 }
@@ -85,8 +85,8 @@ async fn host_check_lowercases() {
 #[tokio::test]
 async fn invalid_url_surfaces_invalid_url() {
     let client = fresh_client();
-    let tenant = TenantId::new();
-    let err = client.http_get(&tenant, "not-a-url").await.unwrap_err();
+    let project = ProjectId::new();
+    let err = client.http_get(&project, "not-a-url").await.unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("invalid url"), "got {msg}");
 }

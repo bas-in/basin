@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_iceberg_rest::{
     router_with_config, IcebergRestConfig, ListNamespacesResponse, ListTablesResponse,
     LoadTableResponse,
@@ -29,12 +29,12 @@ fn make_schema() -> Schema {
     ])
 }
 
-async fn seed_catalog(catalog: &Arc<dyn Catalog>, tenant: &TenantId, tables: &[&str]) {
-    catalog.create_namespace(tenant).await.unwrap();
+async fn seed_catalog(catalog: &Arc<dyn Catalog>, project: &ProjectId, tables: &[&str]) {
+    catalog.create_namespace(project).await.unwrap();
     for t in tables {
         let table = TableName::new(*t).unwrap();
         catalog
-            .create_table(tenant, &table, &make_schema())
+            .create_table(project, &table, &make_schema())
             .await
             .unwrap();
     }
@@ -55,10 +55,10 @@ async fn body_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
 }
 
 #[tokio::test]
-async fn list_namespaces_returns_caller_tenant() {
+async fn list_namespaces_returns_caller_project() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     seed_catalog(&catalog, &alice, &["users"]).await;
     seed_catalog(&catalog, &bob, &["events"]).await;
 
@@ -91,14 +91,14 @@ async fn list_namespaces_returns_caller_tenant() {
 #[tokio::test]
 async fn list_tables_in_namespace() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users", "orders"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users", "orders"]).await;
 
     let app = auth_router(catalog);
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
@@ -108,21 +108,21 @@ async fn list_tables_in_namespace() {
     assert!(names.contains(&"users".to_string()));
     assert!(names.contains(&"orders".to_string()));
     for ident in &body.identifiers {
-        assert_eq!(ident.namespace, vec![tenant.to_string()]);
+        assert_eq!(ident.namespace, vec![project.to_string()]);
     }
 }
 
 #[tokio::test]
 async fn load_table_returns_iceberg_metadata() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = auth_router(catalog);
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
@@ -130,7 +130,7 @@ async fn load_table_returns_iceberg_metadata() {
     let body: LoadTableResponse = body_json(res.into_body()).await;
 
     assert_eq!(body.metadata.format_version, 2);
-    assert!(body.metadata.location.contains(&tenant.to_string()));
+    assert!(body.metadata.location.contains(&project.to_string()));
     assert!(body.metadata.location.ends_with("/users/"));
     assert_eq!(body.metadata.schemas.len(), 1);
     assert_eq!(body.metadata.schemas[0].fields.len(), 3);
@@ -150,15 +150,15 @@ async fn load_table_returns_iceberg_metadata() {
 #[tokio::test]
 async fn unauthorized_returns_401() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = auth_router(catalog);
 
     // No bearer.
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
         .body(Body::empty())
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
@@ -167,7 +167,7 @@ async fn unauthorized_returns_401() {
     // Wrong scheme.
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
         .header(header::AUTHORIZATION, "Basic abc")
         .body(Body::empty())
         .unwrap();
@@ -177,7 +177,7 @@ async fn unauthorized_returns_401() {
     // Empty bearer.
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
         .header(header::AUTHORIZATION, "Bearer ")
         .body(Body::empty())
         .unwrap();
@@ -187,7 +187,7 @@ async fn unauthorized_returns_401() {
     // Non-ULID bearer.
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
         .header(header::AUTHORIZATION, "Bearer not-a-ulid")
         .body(Body::empty())
         .unwrap();
@@ -198,14 +198,14 @@ async fn unauthorized_returns_401() {
 #[tokio::test]
 async fn load_nonexistent_table_returns_404() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &[]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &[]).await;
 
     let app = auth_router(catalog);
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/missing"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/missing"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
@@ -217,16 +217,16 @@ async fn load_nonexistent_table_returns_404() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     seed_catalog(&catalog, &alice, &["users"]).await;
     seed_catalog(&catalog, &bob, &["events"]).await;
 
     let app = auth_router(catalog);
     // Bob tries to list Alice's tables — must be rejected even though
-    // both tenants exist.
+    // both projects exist.
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("/v1/main/namespaces/{alice}/tables"))
@@ -250,20 +250,20 @@ async fn cross_tenant_isolation() {
 #[tokio::test]
 async fn drop_table_round_trip() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = auth_router(catalog.clone());
     let req = Request::builder()
         .method(Method::DELETE)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     // Table is gone from the underlying catalog.
-    let names = catalog.list_tables(&tenant).await.unwrap();
+    let names = catalog.list_tables(&project).await.unwrap();
     assert!(names.is_empty());
 }
 
@@ -273,8 +273,8 @@ async fn create_table_round_trip() {
     // nullable, one Decimal128). A subsequent GET load-table returns
     // metadata with the same column shape and the same `table-uuid`.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &[]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &[]).await;
 
     let app = auth_router(catalog);
     let body = serde_json::json!({
@@ -291,8 +291,8 @@ async fn create_table_round_trip() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -309,8 +309,8 @@ async fn create_table_round_trip() {
     // Same uuid via GET load-table.
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/events"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/events"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
@@ -327,8 +327,8 @@ async fn create_table_with_decimal_type() {
     // mapping; if the workspace doesn't yet support it, the
     // load-table response will round-trip as `decimal(P,S)`.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &[]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &[]).await;
 
     let app = auth_router(catalog);
     let body = serde_json::json!({
@@ -344,8 +344,8 @@ async fn create_table_with_decimal_type() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -363,8 +363,8 @@ async fn create_table_unsupported_type_returns_501() {
     // `fixed` and `list` aren't supported by Basin v0.1; the handler
     // returns a structured 501 with `NotImplementedException`.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &[]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &[]).await;
 
     let app = auth_router(catalog);
     let body = serde_json::json!({
@@ -379,8 +379,8 @@ async fn create_table_unsupported_type_returns_501() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -398,15 +398,15 @@ async fn commit_table_assert_uuid_passes() {
     // commit-table with `assert-table-uuid` referencing it. Adds one
     // file via `summary.added-files-paths`. Post-commit head advances.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = auth_router(catalog);
     // Read the synthesised UUID off the GET endpoint.
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .body(Body::empty())
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
@@ -443,8 +443,8 @@ async fn commit_table_assert_uuid_passes() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -470,8 +470,8 @@ async fn commit_table_assert_uuid_passes() {
 async fn commit_table_assert_uuid_fails_returns_409() {
     // Wrong uuid → CommitFailedException-shaped 409 envelope.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = auth_router(catalog);
     let body = serde_json::json!({
@@ -483,8 +483,8 @@ async fn commit_table_assert_uuid_fails_returns_409() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -501,8 +501,8 @@ async fn commit_table_set_current_snapshot() {
     // via commit-table with `add-snapshot` + `set-current-snapshot`,
     // then load-table sees the new head.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = auth_router(catalog);
     let body = serde_json::json!({
@@ -531,8 +531,8 @@ async fn commit_table_set_current_snapshot() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -542,8 +542,8 @@ async fn commit_table_set_current_snapshot() {
     // load-table sees current = 1, refs.main = 1, with both files.
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
@@ -564,8 +564,8 @@ async fn commit_table_set_current_snapshot() {
 async fn commit_table_unsupported_action_returns_501() {
     // `add-sort-order` isn't modelled in v0.1; reject as 501.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = auth_router(catalog);
     let body = serde_json::json!({
@@ -577,8 +577,8 @@ async fn commit_table_unsupported_action_returns_501() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables/users"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/tables/users"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -593,8 +593,8 @@ async fn commit_table_unsupported_action_returns_501() {
 async fn register_table_returns_501() {
     // POST /register isn't supported by Basin v0.1.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &[]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &[]).await;
 
     let app = auth_router(catalog);
     let body = serde_json::json!({
@@ -604,8 +604,8 @@ async fn register_table_returns_501() {
     .to_string();
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/main/namespaces/{tenant}/register"))
-        .header(header::AUTHORIZATION, format!("Bearer {tenant}"))
+        .uri(format!("/v1/main/namespaces/{project}/register"))
+        .header(header::AUTHORIZATION, format!("Bearer {project}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -624,13 +624,13 @@ async fn open_router_skips_auth() {
     // future pyiceberg test crate that wants to drive the surface
     // without crafting bearer tokens.
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
-    seed_catalog(&catalog, &tenant, &["users"]).await;
+    let project = ProjectId::new();
+    seed_catalog(&catalog, &project, &["users"]).await;
 
     let app = open_router(catalog);
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/v1/main/namespaces/{tenant}/tables"))
+        .uri(format!("/v1/main/namespaces/{project}/tables"))
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();

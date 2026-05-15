@@ -13,8 +13,8 @@ use std::sync::Arc;
 use arrow_array::{Array, Int64Array, StringArray};
 use arrow_array::RecordBatch;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -39,8 +39,8 @@ async fn open_engine() -> (TempDir, Engine) {
     (dir, engine)
 }
 
-async fn session(engine: &Engine) -> TenantSession {
-    engine.open_session(TenantId::new()).await.unwrap()
+async fn session(engine: &Engine) -> ProjectSession {
+    engine.open_session(ProjectId::new()).await.unwrap()
 }
 
 #[allow(dead_code)]

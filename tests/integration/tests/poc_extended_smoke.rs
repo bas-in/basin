@@ -4,7 +4,7 @@
 //! `client.prepare`, `client.query`) end-to-end. Asserts:
 //!
 //! 1. CREATE / INSERT / prepared SELECT round-trip via `Parse`/`Bind`/`Execute`.
-//! 2. Two tenants in parallel see only their own rows.
+//! 2. Two projects in parallel see only their own rows.
 //! 3. The result-set of a parameterised SELECT matches what was inserted.
 //!
 //! This is the test that proves the wedge-1 work — the moment this is green,
@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
-use basin_router::{ServerConfig, StaticTenantResolver};
+use basin_router::{ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
@@ -48,17 +48,17 @@ async fn start_server() -> TestServer {
         shard: None,
     });
 
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     let mut map = HashMap::new();
     map.insert("alice".to_owned(), alice);
     map.insert("bob".to_owned(), bob);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -152,7 +152,7 @@ async fn poc_extended_protocol_end_to_end() {
         passed += 1;
     }
 
-    // 7..8) Tenant isolation through the extended protocol.
+    // 7..8) Project isolation through the extended protocol.
     let bob = connect(server.addr, "bob").await;
     total += 1;
     if bob

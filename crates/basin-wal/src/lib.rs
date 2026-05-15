@@ -2,7 +2,7 @@
 //!
 //! ## Status
 //!
-//! v0.1: **single-node, file-backed** ([`LocalWal`]). Per-tenant +
+//! v0.1: **single-node, file-backed** ([`LocalWal`]). Per-project +
 //! per-partition append-only log. Background batched flush to object storage
 //! every 200 ms or 1 MB, whichever first. Recovery on startup replays from
 //! object storage.
@@ -41,14 +41,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basin_common::{PartitionKey, Result, TenantCounterRegistry, TenantId};
+use basin_common::{PartitionKey, Result, ProjectCounterRegistry, ProjectId};
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 
 /// Monotonically-increasing log sequence number, scoped to a single
-/// `(tenant_id, partition)`. Stable across process restarts (recovered from
+/// `(project_id, partition)`. Stable across process restarts (recovered from
 /// object storage). Used by callers to track replication progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -73,7 +73,7 @@ impl std::fmt::Display for Lsn {
 /// `RecordBatch` from the shard owner. The WAL never inspects it.
 #[derive(Clone, Debug)]
 pub struct WalEntry {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub partition: PartitionKey,
     pub lsn: Lsn,
     pub payload: Bytes,
@@ -85,7 +85,7 @@ pub struct WalEntry {
 pub struct WalConfig {
     pub object_store: Arc<dyn ObjectStore>,
     /// Optional bucket sub-prefix. WAL segments live under
-    /// `{root}/wal/{tenant}/{partition}/{ulid}.seg`.
+    /// `{root}/wal/{project}/{partition}/{ulid}.seg`.
     pub root_prefix: Option<ObjectPath>,
     /// Flush after this many milliseconds of accumulated writes.
     pub flush_interval: Duration,
@@ -119,10 +119,10 @@ fn panic_no_default_object_store() -> Arc<dyn ObjectStore> {
 /// by the compactor after Parquet commit.
 #[async_trait]
 pub trait Wal: Send + Sync + std::fmt::Debug {
-    /// Append `payload` for `(tenant, partition)`. Durable when this returns.
+    /// Append `payload` for `(project, partition)`. Durable when this returns.
     async fn append(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn>;
@@ -132,33 +132,33 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
     /// the local WAL it forces an upload of buffered entries.
     async fn flush(&self) -> Result<()>;
 
-    /// Return all entries for `(tenant, partition)` with LSN strictly greater
+    /// Return all entries for `(project, partition)` with LSN strictly greater
     /// than `since_lsn`, in append order. Used by the compactor and by shard
     /// owner cold-start replay.
     async fn read_from(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>>;
 
-    /// Latest LSN for `(tenant, partition)`. `Lsn::ZERO` means no entries.
-    async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn>;
+    /// Latest LSN for `(project, partition)`. `Lsn::ZERO` means no entries.
+    async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn>;
 
-    /// Drop all entries for `(tenant, partition)` whose LSN is strictly
+    /// Drop all entries for `(project, partition)` whose LSN is strictly
     /// less than or equal to `up_to`. Called by the compactor after the
     /// segment has been merged into Parquet and committed to the catalog.
-    async fn truncate(&self, tenant: &TenantId, partition: &PartitionKey, up_to: Lsn)
+    async fn truncate(&self, project: &ProjectId, partition: &PartitionKey, up_to: Lsn)
         -> Result<()>;
 
     /// Stop background tasks and drain. Idempotent.
     async fn close(&self) -> Result<()>;
 
-    /// Attach a per-tenant counter registry so the WAL append path bumps the
-    /// same per-tenant rollup as engine-side ops and storage-side bytes.
+    /// Attach a per-project counter registry so the WAL append path bumps the
+    /// same per-project rollup as engine-side ops and storage-side bytes.
     /// Default impl is a no-op for backends that don't track byte counters
     /// (e.g. the [`RaftWal`] stub).
-    fn attach_tenant_counters(&self, _registry: Arc<TenantCounterRegistry>) {}
+    fn attach_project_counters(&self, _registry: Arc<ProjectCounterRegistry>) {}
 }
 
 /// Single-node, file-backed WAL. Cheap to clone (`Arc` inside); share across
@@ -170,20 +170,20 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
 #[derive(Clone)]
 pub struct LocalWal {
     inner: Arc<dyn WalImpl>,
-    /// Optional per-tenant counter registry (Phase 6 telemetry). Attached by
-    /// the engine so the WAL append path bumps the same per-tenant rollup as
+    /// Optional per-project counter registry (Phase 6 telemetry). Attached by
+    /// the engine so the WAL append path bumps the same per-project rollup as
     /// engine-side ops and storage-side bytes.
-    tenant_counters: Arc<OnceLock<Arc<TenantCounterRegistry>>>,
+    project_counters: Arc<OnceLock<Arc<ProjectCounterRegistry>>>,
 }
 
 impl LocalWal {
     /// Open a WAL against the configured object store. Replays any persisted
-    /// segments to recover in-memory state (per-(tenant, partition) LSN).
+    /// segments to recover in-memory state (per-(project, partition) LSN).
     pub async fn open(cfg: WalConfig) -> Result<Self> {
         let inner = file_wal::FileWal::open(cfg).await?;
         Ok(Self {
             inner: Arc::new(inner),
-            tenant_counters: Arc::new(OnceLock::new()),
+            project_counters: Arc::new(OnceLock::new()),
         })
     }
 }
@@ -192,16 +192,16 @@ impl LocalWal {
 impl Wal for LocalWal {
     async fn append(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn> {
         let bytes = payload.len() as u64;
-        let lsn = self.inner.append(tenant, partition, payload).await?;
-        // Per-tenant WAL append counters (Phase 6 telemetry). One op per
+        let lsn = self.inner.append(project, partition, payload).await?;
+        // Per-project WAL append counters (Phase 6 telemetry). One op per
         // append; bytes_written grows by payload size. No-op without registry.
-        if let Some(reg) = self.tenant_counters.get() {
-            let tc = reg.for_tenant(tenant);
+        if let Some(reg) = self.project_counters.get() {
+            let tc = reg.for_project(project);
             tc.record_op();
             tc.record_bytes_written(bytes);
         }
@@ -214,33 +214,33 @@ impl Wal for LocalWal {
 
     async fn read_from(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>> {
-        self.inner.read_from(tenant, partition, since_lsn).await
+        self.inner.read_from(project, partition, since_lsn).await
     }
 
-    async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn> {
-        self.inner.high_water(tenant, partition).await
+    async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn> {
+        self.inner.high_water(project, partition).await
     }
 
     async fn truncate(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         up_to: Lsn,
     ) -> Result<()> {
-        self.inner.truncate(tenant, partition, up_to).await
+        self.inner.truncate(project, partition, up_to).await
     }
 
     async fn close(&self) -> Result<()> {
         self.inner.close().await
     }
 
-    fn attach_tenant_counters(&self, registry: Arc<TenantCounterRegistry>) {
+    fn attach_project_counters(&self, registry: Arc<ProjectCounterRegistry>) {
         // Idempotent (first attach wins).
-        let _ = self.tenant_counters.set(registry);
+        let _ = self.project_counters.set(registry);
     }
 }
 
@@ -256,19 +256,19 @@ impl std::fmt::Debug for LocalWal {
 pub(crate) trait WalImpl: Send + Sync {
     async fn append(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn>;
     async fn flush(&self) -> Result<()>;
     async fn read_from(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>>;
-    async fn high_water(&self, tenant: &TenantId, partition: &PartitionKey) -> Result<Lsn>;
-    async fn truncate(&self, tenant: &TenantId, partition: &PartitionKey, up_to: Lsn)
+    async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn>;
+    async fn truncate(&self, project: &ProjectId, partition: &PartitionKey, up_to: Lsn)
         -> Result<()>;
     async fn close(&self) -> Result<()>;
 }

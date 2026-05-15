@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -57,7 +57,7 @@ fn make_engine(dir: &TempDir) -> Engine {
 
 /// Execute a SQL statement and return the result.
 async fn exec(
-    sess: &basin_engine::TenantSession,
+    sess: &basin_engine::ProjectSession,
     sql: &str,
 ) -> ExecResult {
     sess.execute(sql).await.unwrap_or_else(|e| panic!("SQL failed: {sql:?}\nError: {e}"))
@@ -65,7 +65,7 @@ async fn exec(
 
 /// Execute a SQL statement, expect it to return rows, and return the first
 /// column of each row as an `i64`.
-async fn scalar_i64s(sess: &basin_engine::TenantSession, sql: &str) -> Vec<i64> {
+async fn scalar_i64s(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<i64> {
     let result = exec(sess, sql).await;
     match result {
         ExecResult::Rows { batches, .. } => {
@@ -88,7 +88,7 @@ async fn scalar_i64s(sess: &basin_engine::TenantSession, sql: &str) -> Vec<i64> 
 
 /// Execute a SQL statement, expect it to return rows, and return the first
 /// column of each row as a bool.
-async fn scalar_bools(sess: &basin_engine::TenantSession, sql: &str) -> Vec<bool> {
+async fn scalar_bools(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<bool> {
     let result = exec(sess, sql).await;
     match result {
         ExecResult::Rows { batches, .. } => {
@@ -110,7 +110,7 @@ async fn scalar_bools(sess: &basin_engine::TenantSession, sql: &str) -> Vec<bool
 }
 
 /// Count rows returned.
-async fn row_count(sess: &basin_engine::TenantSession, sql: &str) -> usize {
+async fn row_count(sess: &basin_engine::ProjectSession, sql: &str) -> usize {
     let result = exec(sess, sql).await;
     match result {
         ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum(),
@@ -126,7 +126,7 @@ async fn row_count(sess: &basin_engine::TenantSession, sql: &str) -> usize {
 async fn is_distinct_from_basic() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // NULL IS DISTINCT FROM NULL → false (both null, so not distinct)
     let vals = scalar_bools(&sess, "SELECT NULL IS DISTINCT FROM NULL").await;
@@ -145,7 +145,7 @@ async fn is_distinct_from_basic() {
 async fn is_not_distinct_from_basic() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // NULL IS NOT DISTINCT FROM NULL → true
     let vals = scalar_bools(&sess, "SELECT NULL IS NOT DISTINCT FROM NULL").await;
@@ -164,7 +164,7 @@ async fn is_not_distinct_from_basic() {
 async fn is_null_filter() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE t (id INT, val INT)").await;
     exec(&sess, "INSERT INTO t VALUES (1, NULL), (2, 42)").await;
@@ -184,7 +184,7 @@ async fn is_null_filter() {
 async fn between_and_not_between() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE nums (n INT NOT NULL)").await;
     exec(&sess, "INSERT INTO nums VALUES (1), (5), (10), (15), (20)").await;
@@ -204,7 +204,7 @@ async fn between_and_not_between() {
 async fn between_symmetric_high_low() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE nums (n INT NOT NULL)").await;
     exec(&sess, "INSERT INTO nums VALUES (1), (5), (10), (15), (20)").await;
@@ -218,7 +218,7 @@ async fn between_symmetric_high_low() {
 async fn not_between_symmetric() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE nums (n INT NOT NULL)").await;
     exec(&sess, "INSERT INTO nums VALUES (1), (5), (10), (15), (20)").await;
@@ -235,7 +235,7 @@ async fn not_between_symmetric() {
 async fn posix_tilde_match() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
     exec(&sess, "INSERT INTO words VALUES ('apple'), ('banana'), ('cherry')").await;
@@ -249,7 +249,7 @@ async fn posix_tilde_match() {
 async fn posix_bang_tilde_no_match() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
     exec(&sess, "INSERT INTO words VALUES ('apple'), ('banana'), ('cherry')").await;
@@ -263,7 +263,7 @@ async fn posix_bang_tilde_no_match() {
 async fn posix_tilde_star_case_insensitive() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
     exec(&sess, "INSERT INTO words VALUES ('Apple'), ('banana'), ('cherry')").await;
@@ -277,7 +277,7 @@ async fn posix_tilde_star_case_insensitive() {
 async fn posix_bang_tilde_star_case_insensitive_no_match() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
     exec(&sess, "INSERT INTO words VALUES ('Apple'), ('Banana'), ('Cherry')").await;
@@ -295,7 +295,7 @@ async fn posix_bang_tilde_star_case_insensitive_no_match() {
 async fn array_concat_operator() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // || for arrays — DataFusion native (no rewriter needed).
     // Verify it doesn't raise a parse error.
@@ -308,7 +308,7 @@ async fn array_concat_operator() {
 async fn array_contains_at_gt() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // @> rewritten to array_contains(lhs, rhs)
     let result = sess.execute("SELECT ARRAY[1,2,3] @> ARRAY[1,2]").await;
@@ -319,7 +319,7 @@ async fn array_contains_at_gt() {
 async fn array_contained_by_lt_at() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // <@ rewritten to array_contains(rhs, lhs)
     let result = sess.execute("SELECT ARRAY[1,2] <@ ARRAY[1,2,3]").await;
@@ -330,7 +330,7 @@ async fn array_contained_by_lt_at() {
 async fn array_overlap_amp_amp() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // && rewritten to arrays_overlap(lhs, rhs)
     let result = sess.execute("SELECT ARRAY[1,2] && ARRAY[2,3]").await;
@@ -346,7 +346,7 @@ async fn array_overlap_amp_amp() {
 async fn any_subquery() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE t (id BIGINT NOT NULL)").await;
     exec(&sess, "CREATE TABLE u (id BIGINT NOT NULL)").await;
@@ -362,7 +362,7 @@ async fn any_subquery() {
 async fn all_subquery() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE t (id BIGINT NOT NULL)").await;
     exec(&sess, "CREATE TABLE u (id BIGINT NOT NULL)").await;
@@ -378,7 +378,7 @@ async fn all_subquery() {
 async fn some_subquery_alias_for_any() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE t (id BIGINT NOT NULL)").await;
     exec(&sess, "CREATE TABLE u (id BIGINT NOT NULL)").await;
@@ -397,7 +397,7 @@ async fn some_subquery_alias_for_any() {
 async fn bitwise_and() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // 5 & 3 = 1
     let vals = scalar_i64s(&sess, "SELECT 5 & 3").await;
@@ -408,7 +408,7 @@ async fn bitwise_and() {
 async fn bitwise_or() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // 5 | 3 = 7
     let vals = scalar_i64s(&sess, "SELECT 5 | 3").await;
@@ -420,7 +420,7 @@ async fn bitwise_or() {
 async fn bitwise_xor() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // 5 # 3 = 6 (XOR in PG)
     let vals = scalar_i64s(&sess, "SELECT 5 # 3").await;
@@ -432,7 +432,7 @@ async fn bitwise_xor() {
 async fn bitwise_shift_left() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // 1 << 3 = 8
     let vals = scalar_i64s(&sess, "SELECT 1 << 3").await;
@@ -444,7 +444,7 @@ async fn bitwise_shift_left() {
 async fn bitwise_shift_right() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // 8 >> 2 = 2
     let vals = scalar_i64s(&sess, "SELECT 8 >> 2").await;
@@ -456,7 +456,7 @@ async fn bitwise_shift_right() {
 async fn bitwise_not_unary() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     // ~0 = -1 in two's complement
     let vals = scalar_i64s(&sess, "SELECT ~0").await;

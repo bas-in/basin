@@ -48,7 +48,7 @@ basin-catalog.workspace = true
 # hyphenated text (Postgres OID 2950) on both the simple-query and
 # extended-query response paths. See `types::render_uuid`.
 uuid.workspace = true
-# Per-tenant pgwire rate limiter (`rate_limit.rs`) — same crate basin-net
+# Per-project pgwire rate limiter (`rate_limit.rs`) — same crate basin-net
 # uses for outbound HTTP throttling, keeping the limiter implementation
 # uniform across both protocols.
 governor.workspace = true

@@ -2,8 +2,8 @@
 
 ## Repo description (visible under the repo name; max 350 chars)
 
-> Multi-tenant Postgres-compatible database on object storage. Per-tenant
-> prefix isolation, ~$0.10/tenant/month at scale, drop-in pgwire works with
+> Multi-project Postgres-compatible database on object storage. Per-project
+> prefix isolation, ~$0.10/project/month at scale, drop-in pgwire works with
 > psql / tokio-postgres / asyncpg / JDBC / any ORM. Native vector search,
 > ZSTD Parquet, Iceberg catalog. Auth + REST included. Apache-2.0, Rust.
 
@@ -17,7 +17,7 @@ Recommended order — leading with high-traffic tags, then niche-specific:
 postgres
 database
 rust
-multi-tenant
+multi-project
 s3
 object-storage
 vector-database
@@ -38,7 +38,7 @@ apache-2-0
 Top 7 (the ones GitHub renders inline above the description) should be:
 
 ```
-postgres database rust multi-tenant s3 vector-database iceberg
+postgres database rust multi-project s3 vector-database iceberg
 ```
 
 ## Website (Settings → General → Website)

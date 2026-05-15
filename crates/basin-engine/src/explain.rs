@@ -21,14 +21,14 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_common::{BasinError, Result};
 use sqlparser::ast::{AnalyzeFormat, Statement};
 
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Dispatched from `executor::execute` when the parsed statement is
 /// `Statement::Explain { … }`. Re-runs the inner SQL through DataFusion's
 /// planner, wraps it in an `Explain` logical plan, collects the result, and
 /// reformats to a PG-shaped `QUERY PLAN` column.
 pub(crate) async fn exec_explain(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     analyze: bool,
     verbose: bool,
     format: Option<AnalyzeFormat>,

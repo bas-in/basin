@@ -1,39 +1,18 @@
-//! Scaling card: tenant-deletion time vs file count, **realistic SaaS
-//! schema profile**, Basin vs Postgres.
+//! S3 port of `scaling_project_deletion_realistic.rs`.
 //!
-//! The companion `scaling_tenant_deletion.rs` card uses a single 1-index
-//! `events(id, body)` table on the PG side. PG wins handily there because
-//! `DROP SCHEMA CASCADE` over an unindexed heap is one heap unlink + a
-//! few catalog rows. Real production schemas don't look like that —
-//! a typical events table has 5-20 indexes plus 1-3 FK constraints. PG
-//! has to drop every index and validate every FK on `DROP CASCADE`,
-//! and that work scales with row count.
+//! Card: `project_deletion_realistic` (real-cloud dashboard).
+//! Bar: at the largest scale point in the sweep, `basin_ms <= postgres_ms`
+//! when PG is available. PG-skipped runs pass trivially (basin-only).
 //!
-//! This card sweeps `files in [100, 1000, 5000]` (LocalFS only) with the
-//! following PG-side schema profile:
+//! Same shape as the LocalFS card with a realistic SaaS-shaped PG
+//! schema (5 indexes + FK CASCADE). Basin's side is unchanged from the
+//! simple-schema variant — storage doesn't care about indexes.
 //!
-//! ```sql
-//! CREATE TABLE users (id BIGINT PRIMARY KEY);
-//! CREATE TABLE events (
-//!   id BIGINT, ts BIGINT, owner_id BIGINT, region TEXT, payload TEXT
-//! );
-//! CREATE INDEX ON events (id);
-//! CREATE INDEX ON events (ts);
-//! CREATE INDEX ON events (owner_id, ts DESC);
-//! CREATE INDEX ON events (region, ts DESC);
-//! CREATE INDEX ON events (payload) WHERE payload != '';
-//! ALTER TABLE events ADD FOREIGN KEY (owner_id)
-//!   REFERENCES users(id) ON DELETE CASCADE;
-//! ```
+//! Scale gating for cloud cost (see s3_scaling_project_deletion_at_scale):
+//!   * R2 / generic S3: SCALES = [10, 100, 1000].
+//!   * SeaweedFS loopback: SCALES = [100, 1000, 5000].
 //!
-//! Basin's side is **the same Parquet writes** as the simple card —
-//! storage doesn't care about indexes or FKs. The point of this card is
-//! that PG's `DROP SCHEMA CASCADE` is now O(rows × indexes + FK_validate)
-//! while Basin's `Storage::delete_tenant` stays O(file_count).
-//!
-//! Bar: `basin_at_5000_files <= postgres_at_5000_files`. Basin should
-//! win at 5000 files with this schema profile. If PG still wins, the
-//! test's `passed: false` is honest data — we record it and move on.
+//! Skips cleanly when `[s3]` is missing.
 
 #![allow(clippy::print_stdout)]
 
@@ -43,21 +22,21 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
-    report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
+    report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
+use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop, PostgresConfig};
 use basin_storage::{Storage, StorageConfig};
-use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use serde_json::json;
-use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls};
 
-const SCALES: [usize; 3] = [100, 1_000, 5_000];
+const TEST_NAME: &str = "s3_scaling_project_deletion_realistic";
 const ROWS_PER_FILE: usize = 100;
-/// Bar scale: Basin must win (or tie) at this many files.
-const BAR_SCALE_FILES: usize = 5_000;
+const SCALES_CLOUD: [usize; 3] = [10, 100, 1_000];
+const SCALES_LOCAL: [usize; 3] = [100, 1_000, 5_000];
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -75,24 +54,29 @@ fn build_batch(start: i64, len: usize) -> RecordBatch {
     RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(body_arr)]).unwrap()
 }
 
-async fn try_pg_connect() -> Option<(Client, String)> {
-    for user in ["pc", "postgres"] {
-        let conn_str = format!("host=127.0.0.1 port=5432 user={user} dbname=postgres");
-        match tokio_postgres::connect(&conn_str, NoTls).await {
-            Ok((client, conn)) => {
-                tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                return Some((client, conn_str));
-            }
-            Err(_) => continue,
-        }
-    }
-    None
+fn is_seaweedfs_target() -> bool {
+    std::env::var("BASIN_BENCHMARK_DIR")
+        .ok()
+        .map(|s| s.contains("data_seaweedfs"))
+        .unwrap_or(false)
 }
 
-/// RAII guard that drops one schema on Drop. Same shape as the simple
-/// scaling card so a panicking test still cleans up its PG namespace.
+async fn pg_connect(pg_cfg: &PostgresConfig) -> Option<(Client, String)> {
+    let conn_str = format!(
+        "host={} port={} user={} password={} dbname={}",
+        pg_cfg.host, pg_cfg.port, pg_cfg.user, pg_cfg.password, pg_cfg.dbname
+    );
+    match tokio_postgres::connect(&conn_str, NoTls).await {
+        Ok((client, conn)) => {
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            Some((client, conn_str))
+        }
+        Err(_) => None,
+    }
+}
+
 struct SchemaGuard {
     schema: String,
     conn_str: String,
@@ -120,26 +104,25 @@ impl Drop for SchemaGuard {
     }
 }
 
-/// Basin side: identical to the simple card. The whole point is that
-/// Basin's tenant-deletion cost is independent of the schema profile.
-async fn measure_basin_ms(files: usize) -> f64 {
-    let dir = TempDir::new().unwrap();
-    let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-
+async fn measure_basin_ms(
+    object_store: Arc<dyn ObjectStore>,
+    base_prefix: ObjectPath,
+    files: usize,
+) -> f64 {
     let setup_storage = Storage::new(StorageConfig {
-        object_store: fs.clone(),
-        root_prefix: None,
+        object_store: object_store.clone(),
+        root_prefix: Some(base_prefix.clone()),
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
     let catalog = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
@@ -148,7 +131,7 @@ async fn measure_basin_ms(files: usize) -> f64 {
         let start = (i * ROWS_PER_FILE) as i64;
         let batch = build_batch(start, ROWS_PER_FILE);
         let f = setup_storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
         written.push(DataFileRef {
@@ -159,33 +142,30 @@ async fn measure_basin_ms(files: usize) -> f64 {
         });
     }
     catalog
-        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .append_data_files(&project, &table, SnapshotId::GENESIS, written)
         .await
         .unwrap();
 
     drop(setup_storage);
     let storage = Storage::new(StorageConfig {
-        object_store: fs.clone(),
-        root_prefix: None,
+        object_store: object_store.clone(),
+        root_prefix: Some(base_prefix.clone()),
         disk_cache: None,
         page_cache: None,
     });
 
     let started = Instant::now();
     let _deleted = storage
-        .delete_tenant(catalog.as_ref(), &tenant)
+        .delete_project(catalog.as_ref(), &project)
         .await
-        .expect("delete_tenant");
+        .expect("delete_project");
     started.elapsed().as_secs_f64() * 1000.0
 }
 
-/// PG side: realistic SaaS schema. Creates `users(id PK)` + `events`
-/// with 5 indexes and a FK `events.owner_id -> users(id) ON DELETE
-/// CASCADE`, populates both, then times `DROP SCHEMA <s> CASCADE`.
 async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
     let total_rows = files * ROWS_PER_FILE;
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
-    let schema_name = format!("basin_scaling_real_{}", suffix);
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
+    let schema_name = format!("basin_s3_real_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema_name.clone(),
         conn_str: conn_str.to_string(),
@@ -209,7 +189,6 @@ async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
     .await
     .expect("create events");
 
-    // Five indexes mirroring the SaaS shape spelled out in the card brief.
     pg.simple_query(&format!(
         "CREATE INDEX ON {schema_name}.events (id);\
          CREATE INDEX ON {schema_name}.events (ts);\
@@ -229,8 +208,6 @@ async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
     .await
     .expect("add fk");
 
-    // Owners pool kept modest (1024) so each owner_id has many child
-    // events — gives the FK index real work on cascade walks.
     let owner_modulus: i64 = 1024;
     pg.simple_query(&format!(
         "INSERT INTO {schema_name}.users (id) \
@@ -240,9 +217,6 @@ async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
     .await
     .expect("populate users");
 
-    // Events insert: integer mod for owner_id, string region from a
-    // small enum, payload non-empty for ~50% of rows so the partial
-    // index has a job to do.
     pg.simple_query(&format!(
         "INSERT INTO {schema_name}.events (id, ts, owner_id, region, payload) \
          SELECT i, \
@@ -262,39 +236,71 @@ async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
         .await
         .expect("drop schema");
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-
-    // Guard's Drop is a no-op once we've already dropped the schema.
     drop(_guard);
     ms
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scaling_tenant_deletion_realistic() {
-    let pg_conn = try_pg_connect().await;
-    let pg_skipped = pg_conn.is_none();
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn s3_scaling_project_deletion_realistic() {
+    basin_common::telemetry::try_init_for_tests();
+
+    let cfg = match BasinTestConfig::load() {
+        Ok(c) => c,
+        Err(e) => panic!("parse .basin-test.toml: {e}"),
+    };
+    let s3_cfg = match cfg.s3_or_skip(TEST_NAME) {
+        Some(c) => c.clone(),
+        None => return,
+    };
+
+    let object_store = s3_cfg
+        .build_object_store()
+        .unwrap_or_else(|e| panic!("build object store: {e}"));
+    let run_prefix = s3_cfg.run_prefix(TEST_NAME);
+    let _cleanup = CleanupOnDrop {
+        store: object_store.clone(),
+        prefix: run_prefix.clone(),
+    };
+    let prefix_path = ObjectPath::from(run_prefix.as_str());
+
+    let pg_pair = match cfg.pg_or_skip(TEST_NAME) {
+        Some(c) => pg_connect(c).await,
+        None => None,
+    };
+    let pg_skipped = pg_pair.is_none();
     if pg_skipped {
-        println!(
-            "[SCALING tenant_deletion_realistic] postgres unavailable: \
-             basin-only run"
-        );
+        println!("[S3 project_deletion_realistic] postgres unavailable: basin-only run");
     }
+
+    let scales: &[usize] = if is_seaweedfs_target() {
+        &SCALES_LOCAL
+    } else {
+        &SCALES_CLOUD
+    };
+    let bar_scale_files: usize = *scales.last().unwrap();
+    println!(
+        "[S3 project_deletion_realistic] scales = {:?} (seaweedfs target = {})",
+        scales,
+        is_seaweedfs_target()
+    );
 
     struct Row {
         files: usize,
         basin_ms: f64,
         postgres_ms: f64,
     }
-    let mut rows: Vec<Row> = Vec::with_capacity(SCALES.len());
+    let mut rows: Vec<Row> = Vec::with_capacity(scales.len());
 
     let total_started = Instant::now();
-    for &n in SCALES.iter() {
-        let basin_ms = measure_basin_ms(n).await;
-        let postgres_ms = match pg_conn.as_ref() {
+    for &n in scales.iter() {
+        let basin_ms = measure_basin_ms(object_store.clone(), prefix_path.clone(), n).await;
+        let postgres_ms = match pg_pair.as_ref() {
             Some((pg, conn_str)) => measure_pg_ms(pg, conn_str, n).await,
             None => 0.0,
         };
         println!(
-            "[SCALING tenant_deletion_realistic] files={n:>6} \
+            "[S3 project_deletion_realistic] files={n:>6} \
              basin={basin_ms:>9.2}ms postgres={postgres_ms:>9.2}ms"
         );
         rows.push(Row {
@@ -305,7 +311,6 @@ async fn scaling_tenant_deletion_realistic() {
     }
     let total_wall_ms = total_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Crossover: smallest N at which basin_ms <= postgres_ms.
     let crossover: Option<usize> = if pg_skipped {
         None
     } else {
@@ -314,16 +319,12 @@ async fn scaling_tenant_deletion_realistic() {
             .map(|r| r.files)
     };
 
-    // Bar: at the largest scale (BAR_SCALE_FILES), Basin must be <= PG.
-    // - PG skipped: pass trivially (basin-only run; no comparison).
-    // - PG present: look at the row at BAR_SCALE_FILES and check.
-    let bar_row = rows.iter().find(|r| r.files == BAR_SCALE_FILES);
+    let bar_row = rows.iter().find(|r| r.files == bar_scale_files);
     let pass = if pg_skipped {
         true
     } else if let Some(r) = bar_row {
         r.basin_ms <= r.postgres_ms
     } else {
-        // Shouldn't happen — SCALES contains BAR_SCALE_FILES — but be lenient.
         true
     };
 
@@ -333,8 +334,8 @@ async fn scaling_tenant_deletion_realistic() {
         (false, None) => "none in sweep".to_string(),
     };
     println!(
-        "[SCALING tenant_deletion_realistic] crossover={crossover_label} \
-         bar_basin@{BAR_SCALE_FILES}={:.2}ms bar_pg@{BAR_SCALE_FILES}={:.2}ms \
+        "[S3 project_deletion_realistic] crossover={crossover_label} \
+         bar_basin@{bar_scale_files}={:.2}ms bar_pg@{bar_scale_files}={:.2}ms \
          total_wall={total_wall_ms:.0}ms {}",
         bar_row.map(|r| r.basin_ms).unwrap_or(0.0),
         bar_row.map(|r| r.postgres_ms).unwrap_or(0.0),
@@ -353,19 +354,13 @@ async fn scaling_tenant_deletion_realistic() {
         })
         .collect();
 
-    // Primary metric: when PG is available, report the ratio of
-    // basin/pg at the bar scale (lower is better, 1.0 = parity).
-    // Bar is < 1.0 (Basin must be strictly faster, or at parity).
-    // When PG is absent, fall back to basin's own ms at the largest scale.
     let primary = match (pg_skipped, bar_row) {
         (false, Some(r)) if r.postgres_ms > 0.0 => PrimaryMetric {
             label: format!(
-                "Basin/Postgres ratio at {BAR_SCALE_FILES} files \
-                 (realistic schema)"
+                "Basin/Postgres ratio at {bar_scale_files} files (realistic schema, real S3)"
             ),
             value: r.basin_ms / r.postgres_ms,
             unit: "ratio".into(),
-            // Bar: ratio <= 1.0 means Basin wins or ties.
             bar: BarOp::lt(1.0_f64 + f64::EPSILON),
         },
         _ => PrimaryMetric {
@@ -376,18 +371,18 @@ async fn scaling_tenant_deletion_realistic() {
         },
     };
 
-    report_scaling(
-        "tenant_deletion_realistic",
-        "Tenant deletion at scale, realistic SaaS schema (Basin vs Postgres)",
+    report_real_scaling(
+        "project_deletion_realistic",
+        "Project deletion at scale, realistic SaaS schema, real S3 (Basin vs Postgres)",
         "Real production tables have 5-20 indexes and 1-3 FK \
          constraints. PG's DROP SCHEMA CASCADE walks every row × \
          every index + validates every FK on the cascade; Basin's \
-         tenant teardown stays O(file_count). The crossover from the \
+         project teardown stays O(file_count). The crossover from the \
          simple card moves dramatically left under this schema profile.",
         pass,
         AxisSpec {
             key: "file_count".into(),
-            label: "files per tenant".into(),
+            label: "files per project".into(),
         },
         vec![
             SeriesSpec {
@@ -405,11 +400,6 @@ async fn scaling_tenant_deletion_realistic() {
         Some(primary),
     );
 
-    // The brief explicitly accepts `passed: false` as honest data when PG
-    // wins anyway: real PG `DROP SCHEMA CASCADE` over an indexed events
-    // table is bottlenecked by relfilenode unlink (one syscall per
-    // index + heap), not per-row index work, so PG can stay sub-15 ms
-    // even at 500K rows. We record the honest curve and let the
-    // dashboard tell the story; we don't panic so the test suite still
-    // exits clean and bundle.py can pick up the JSON.
+    // Same lenient policy as LocalFS sibling: passed:false is honest
+    // data when PG wins anyway. We emit and don't panic.
 }

@@ -43,10 +43,10 @@ use sqlparser::parser::Parser;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Opaque identifier for one prepared statement, scoped to one
-/// [`TenantSession`]. Closing the session implicitly closes the statement.
+/// [`ProjectSession`]. Closing the session implicitly closes the statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StatementHandle(pub Uuid);
 
@@ -114,7 +114,7 @@ pub enum ScalarParam {
     Bytea(Vec<u8>),
 }
 
-/// Output of [`TenantSession::bind`]. Holds the substituted SQL and the
+/// Output of [`ProjectSession::bind`]. Holds the substituted SQL and the
 /// originating handle (for traceability). Opaque on purpose — the router
 /// should never read its fields directly. `Clone` so the router can hold a
 /// portal across separate `Execute` rounds without re-binding.
@@ -148,7 +148,7 @@ impl BoundStatement {
     }
 }
 
-/// Per-session prepared-statement registry. Held inside `TenantSession::state`
+/// Per-session prepared-statement registry. Held inside `ProjectSession::state`
 /// so each session gets its own map; closing the session drops everything.
 pub(crate) struct PreparedRegistry {
     inner: RwLock<HashMap<StatementHandle, PreparedEntry>>,
@@ -168,10 +168,10 @@ impl PreparedRegistry {
     }
 }
 
-/// Implementation of [`TenantSession::prepare`]. See module docs for the
+/// Implementation of [`ProjectSession::prepare`]. See module docs for the
 /// substitution strategy.
 pub(crate) async fn prepare(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     sql: &str,
 ) -> Result<(StatementHandle, StatementSchema)> {
     let placeholder_count = scan_placeholders(sql)?;
@@ -238,7 +238,7 @@ pub(crate) async fn prepare(
 ///
 /// Any pattern we don't recognise leaves the slot at TEXT.
 async fn infer_param_types(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     sql: &str,
     out: &mut [DataType],
     is_jsonb_out: &mut [bool],
@@ -258,7 +258,7 @@ async fn infer_param_types(
                 .engine
                 .config()
                 .catalog
-                .load_table(&sess.tenant, &table_name)
+                .load_table(&sess.project, &table_name)
                 .await?;
             // Column ordering for the insert: the user's listed columns if
             // present, otherwise table-declaration order.
@@ -319,7 +319,7 @@ async fn infer_param_types(
                         .engine
                         .config()
                         .catalog
-                        .load_table(&sess.tenant, &tn)
+                        .load_table(&sess.project, &tn)
                         .await
                     {
                         let schema = (*meta.schema).clone();
@@ -350,7 +350,7 @@ async fn infer_param_types(
                             .engine
                             .config()
                             .catalog
-                            .load_table(&sess.tenant, &tn)
+                            .load_table(&sess.project, &tn)
                             .await
                         {
                             let schema = (*meta.schema).clone();
@@ -442,7 +442,7 @@ fn column_field<'a>(schema: &'a arrow_schema::Schema, col: &str) -> Option<&'a F
 /// for the SELECT WHERE side so prepared `WHERE id = $1` over a UUID column
 /// surfaces OID 2950 / 3802 instead of the BYTEA / TEXT default.
 async fn walk_select_for_predicates(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     q: &Query,
     out: &mut [DataType],
     is_jsonb_out: &mut [bool],
@@ -461,7 +461,7 @@ async fn walk_select_for_predicates(
                     .engine
                     .config()
                     .catalog
-                    .load_table(&sess.tenant, &tn)
+                    .load_table(&sess.project, &tn)
                     .await
                 {
                     let label = alias
@@ -592,7 +592,7 @@ fn resolve_column_meta(
 }
 
 pub(crate) async fn describe_statement(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     handle: &StatementHandle,
 ) -> Result<StatementSchema> {
     let guard = sess.state.prepared.inner.read().await;
@@ -602,12 +602,12 @@ pub(crate) async fn describe_statement(
     Ok(entry.schema.clone())
 }
 
-pub(crate) async fn close_statement(sess: &TenantSession, handle: &StatementHandle) {
+pub(crate) async fn close_statement(sess: &ProjectSession, handle: &StatementHandle) {
     sess.state.prepared.inner.write().await.remove(handle);
 }
 
 pub(crate) async fn bind(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     handle: &StatementHandle,
     params: Vec<ScalarParam>,
 ) -> Result<BoundStatement> {
@@ -630,7 +630,7 @@ pub(crate) async fn bind(
 }
 
 pub(crate) async fn execute_bound(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     bound: BoundStatement,
 ) -> Result<ExecResult> {
     crate::executor::execute(sess, &bound.sql).await
@@ -899,7 +899,7 @@ fn substitute_for_probe(sql: &str, param_types: &[DataType]) -> String {
     substitute(sql, &params).unwrap_or_else(|_| sql.to_owned())
 }
 
-async fn probe_schema(sess: &TenantSession, sql: &str) -> Result<Vec<Field>> {
+async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
     // Only SELECT can yield a row description ahead of execute; for anything
     // else we return no columns and the caller falls back.
     let trimmed = sql.trim_start().to_ascii_uppercase();

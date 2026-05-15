@@ -8,19 +8,19 @@ based on load metrics in v0.3.
 Today (`v0.1`):
 
 - **One shard per process.** `basin_shard::Shard` wraps a single
-  `InProcessShard` — an in-process `HashMap<(TenantId, PartitionKey),
+  `InProcessShard` — an in-process `HashMap<(ProjectId, PartitionKey),
   PartitionState>` (see `crates/basin-shard/src/in_process.rs`). The whole
   map lives behind one outer `Mutex`; each `PartitionState` lives behind
   its own `tokio::sync::RwLock`.
-- **Single-writer-per-(tenant, partition).** A write acquires the partition
+- **Single-writer-per-(project, partition).** A write acquires the partition
   write lock, appends to the WAL (`Wal::append` — fsync on `LocalWal`, future
   Raft quorum on `RaftWal`), then pushes the `(Lsn, RecordBatch)` onto the
   in-RAM tail. Throughput per partition is bounded by WAL fsync latency +
   Arrow IPC serialisation cost.
-- **Router-side tenant → shard mapping is process-level.**
-  `basin_router::sharding::ShardMap` picks `endpoints[hash(tenant_ulid) %
+- **Router-side project → shard mapping is process-level.**
+  `basin_router::sharding::ShardMap` picks `endpoints[hash(project_ulid) %
   N]`, where `N` is the static endpoint count read from
-  `BASIN_SHARD_ENDPOINTS` at startup. Whale pins via `BASIN_TENANT_PINS`.
+  `BASIN_SHARD_ENDPOINTS` at startup. Whale pins via `BASIN_PROJECT_PINS`.
   **Resharding live is explicitly out of scope of v0.1** (see comment block
   at the top of `sharding.rs`).
 - **Partition key is opaque.** `basin_common::PartitionKey` is a validated
@@ -28,7 +28,7 @@ Today (`v0.1`):
   `_default`, ...). The engine derives it per row from the table's
   `PartitionSpec` (today: `Unpartitioned` → `_default`, or `RangeMonthly`
   on a `TIMESTAMPTZ` column → `year=YYYY/month=MM`). There is no
-  hash-bucketed sub-sharding inside a tenant; one `(tenant, partition)` =
+  hash-bucketed sub-sharding inside a project; one `(project, partition)` =
   one writer.
 - **`basin-placement` is a stub.** Module-level docs declare it Phase 3
   work, intended to host a stateless service backed by a strongly-
@@ -38,7 +38,7 @@ Today (`v0.1`):
 
 ### Per-shard write throughput ceiling
 
-The per-`(tenant, partition)` ceiling is set by:
+The per-`(project, partition)` ceiling is set by:
 
 1. **WAL append latency** — `LocalWal` batches with 200 ms / 1 MB cap; in
    practice a few thousand small batches/sec per partition.
@@ -51,7 +51,7 @@ The per-`(tenant, partition)` ceiling is set by:
 
 The classic write-scale answer is: **make more partitions so more writers
 run in parallel**. The unit of horizontal write scale is the
-`(tenant, partition)` pair — the shard owner already executes them
+`(project, partition)` pair — the shard owner already executes them
 independently.
 
 ## 2. Shard key model — hash vs range
@@ -62,13 +62,13 @@ Three keys are in play:
 
 | Layer | Key used | Type |
 |------|---------|------|
-| Router → shard endpoint | `hash(tenant_ulid) % N` | hash |
-| `(tenant, partition)` → in-memory state | `(TenantId, PartitionKey)` exact | range-ish (the key is opaque, but tables pick range partition specs) |
-| Storage layout (object keys) | `…/{tenant}/{table}/data/{partition}/{ulid}.parquet` | range (partition is the dir) |
+| Router → shard endpoint | `hash(project_ulid) % N` | hash |
+| `(project, partition)` → in-memory state | `(ProjectId, PartitionKey)` exact | range-ish (the key is opaque, but tables pick range partition specs) |
+| Storage layout (object keys) | `…/{project}/{table}/data/{partition}/{ulid}.parquet` | range (partition is the dir) |
 
-So the router uses **hash** (over tenant) while the partition layer uses
+So the router uses **hash** (over project) while the partition layer uses
 **range** (the user's `PARTITION BY` clause). For the write-scale story
-we want to split *within a tenant* (sub-tenant sharding), which means we
+we want to split *within a project* (sub-project sharding), which means we
 extend the partition layer, not the router.
 
 ### Recommendation — hash-bucketed sub-partitions on top of the existing range partition spec
@@ -130,16 +130,16 @@ _default                               // Unpartitioned (no change)
 Storage layout follows:
 
 ```
-tenants/{ulid}/{table}/data/year=2026/month=05/bucket=0007/{ulid}.parquet
+projects/{ulid}/{table}/data/year=2026/month=05/bucket=0007/{ulid}.parquet
 ```
 
-Each new `bucket=` segment is one more `(tenant, partition)` pair → one
-more independent writer. A tenant going from 1 → 16 buckets gets 16×
+Each new `bucket=` segment is one more `(project, partition)` pair → one
+more independent writer. A project going from 1 → 16 buckets gets 16×
 write parallelism without any router change.
 
 ## 3. Shard split protocol
 
-The goal: take one `(tenant, partition)` writer at write capacity, split
+The goal: take one `(project, partition)` writer at write capacity, split
 it into two, with zero lost writes and a bounded read-staleness window.
 
 ### Pre-condition
@@ -161,7 +161,7 @@ phase 4  drop old       reclaim old bucket's storage
 
 #### Phase 0 — pre-split
 
-1. Catalog op: `Catalog::propose_partition_split(tenant, table, new_spec)`
+1. Catalog op: `Catalog::propose_partition_split(project, table, new_spec)`
    writes a *proposed* spec row alongside the live one (does **not**
    replace it). Both have an `epoch` integer; the proposed row's epoch
    is `live + 1`.
@@ -172,7 +172,7 @@ phase 4  drop old       reclaim old bucket's storage
 
 #### Phase 1 — dual-write window
 
-1. Catalog op: `Catalog::open_dual_write(tenant, table)` flips a flag
+1. Catalog op: `Catalog::open_dual_write(project, table)` flips a flag
    that says "writers SHOULD append to both old AND new buckets". The
    engine's INSERT path checks this on every batch.
 2. Per-batch, the engine:
@@ -180,8 +180,8 @@ phase 4  drop old       reclaim old bucket's storage
    - Computes the **new** partition key (`bucket_count = 2N`).
    - If they differ (in general they do — every other row), it splits
      the `RecordBatch` row-wise into two batches and calls
-     `Shard::get(tenant, old_key).write_batch` AND
-     `Shard::get(tenant, new_key).write_batch`. WAL appends both.
+     `Shard::get(project, old_key).write_batch` AND
+     `Shard::get(project, new_key).write_batch`. WAL appends both.
 3. **Cost during this window**: 1× WAL bandwidth (one fsync per row
    either way), but 2× catalog row counts and 2× active partitions in
    memory. Bounded by definition since the window is short.
@@ -206,7 +206,7 @@ phase 4  drop old       reclaim old bucket's storage
 
 #### Phase 3 — cutover
 
-1. Catalog op: `Catalog::commit_partition_split(tenant, table,
+1. Catalog op: `Catalog::commit_partition_split(project, table,
    expected_proposed_epoch)`. Atomically:
    - Promotes the proposed spec to live.
    - Bumps `table.partition_epoch` from `N` to `2N`.
@@ -225,7 +225,7 @@ phase 4  drop old       reclaim old bucket's storage
 
 #### Phase 4 — drop old
 
-1. The old `(tenant, old_bucket)` partition state has nothing left in
+1. The old `(project, old_bucket)` partition state has nothing left in
    it; the eviction loop drops it on its next tick.
 2. The old Parquet files have been replaced (`replace_data_files`
    call during phase 2 swapped them out), so they're not catalogued
@@ -250,7 +250,7 @@ What happens?
   transaction. Either the write landed under the old policy (both
   buckets get it) or the new policy (only the new bucket gets it).
 
-**Epoch bumping**: every shard write call carries `(tenant, partition,
+**Epoch bumping**: every shard write call carries `(project, partition,
 partition_epoch)`. The catalog's `append_data_files` will reject commits
 with stale epochs (already does, via `expected_snapshot`). On stale
 epoch the engine reloads the spec and retries — same retry loop the
@@ -288,15 +288,15 @@ machine `M_src`, moving to `M_tgt`. The bucket is shared.
    `basin-engine` binary, configured with the same bucket and the
    shared placement-service endpoint. The embedded catalog is local to
    the engine — `M_tgt` does not need a separate Postgres connection.
-   It comes up cold (no resident tenants).
+   It comes up cold (no resident projects).
 4. **Drain → quiesce `M_src`** — placement service flips the
-   `(tenant, partition) → machine` mapping from `M_src` to `M_tgt`. New
+   `(project, partition) → machine` mapping from `M_src` to `M_tgt`. New
    client connections route to `M_tgt`. In-flight connections on `M_src`
    stay attached but their writes start failing fast with
    `BasinError::shard_moved` (a new variant the router catches and
    reconnects the client transparently).
 5. **Replay WAL tail on `M_tgt`** — `M_tgt` lazy-loads each
-   `(tenant, partition)` on first access (today's cold-start path via
+   `(project, partition)` on first access (today's cold-start path via
    `replay_wal_into`). The WAL is in the bucket; replay is a few-megabyte
    read + IPC decode.
 6. **Drop `M_src`** — once `M_src` reports zero resident partitions for
@@ -330,13 +330,13 @@ unaffected.
 ### `basin-shard/src/split.rs` (new)
 
 ```rust
-/// Drive a hash-bucket split for a single (tenant, table).
+/// Drive a hash-bucket split for a single (project, table).
 #[async_trait]
 pub trait ShardSplitter: Send + Sync {
     /// Phase 0: register the new spec. Returns the proposed epoch.
     async fn prepare_split(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         new_spec: PartitionSpec,
     ) -> Result<SplitPlan>;
@@ -356,7 +356,7 @@ pub trait ShardSplitter: Send + Sync {
 }
 
 pub struct SplitPlan {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub table: TableName,
     pub old_spec: PartitionSpec,
     pub new_spec: PartitionSpec,
@@ -415,7 +415,7 @@ pub struct MoveReport {
 
 ## 6. Operational triggers
 
-A shard split is appropriate when **one `(tenant, table)` partition is
+A shard split is appropriate when **one `(project, table)` partition is
 the bottleneck**. Signals:
 
 | Signal | Threshold (v0.2 default) | Source |

@@ -22,12 +22,12 @@
 //! data files as immutable, so this is mostly the "compactor deleted a
 //! merged file" case.
 //!
-//! Wrapping order: the cache wrapper sits **inside** the per-tenant
-//! `TenantScopedStore`. So a typical RPC stack is
+//! Wrapping order: the cache wrapper sits **inside** the per-project
+//! `ProjectScopedStore`. So a typical RPC stack is
 //!
 //! ```text
 //!   reader/writer
-//!     -> TenantScopedStore (per-tenant semaphore)
+//!     -> ProjectScopedStore (per-project semaphore)
 //!     -> DiskCachedStore   (this module)
 //!     -> real ObjectStore  (LocalFS / S3 / Tigris / R2 / GCS / ...)
 //! ```
@@ -65,12 +65,12 @@
 //! `Notify`, the second one sees it and `notified().await`s on the
 //! first's completion before re-checking the cache.
 //!
-//! # Tenant isolation
+//! # Project isolation
 //!
 //! The cache key is derived from the full object_store `Path`, which
-//! always includes the tenant prefix (`tenants/{ulid}/...`). Two
-//! tenants with otherwise-identical reads produce different keys
-//! mechanically; there is no cross-tenant key collision possible.
+//! always includes the project prefix (`projects/{ulid}/...`). Two
+//! projects with otherwise-identical reads produce different keys
+//! mechanically; there is no cross-project key collision possible.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;

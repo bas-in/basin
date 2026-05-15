@@ -13,19 +13,19 @@ use basin_catalog::{
     Catalog, DomainDef, EnumTypeDef, InMemoryCatalog, SqlArgType, BASIN_DOMAIN_KEY,
     BASIN_ENUM_TYPE_KEY,
 };
-use basin_common::{BasinError, TableName, TenantId};
+use basin_common::{BasinError, TableName, ProjectId};
 
-fn enum_def(t: TenantId, name: &str, labels: &[&str]) -> EnumTypeDef {
+fn enum_def(t: ProjectId, name: &str, labels: &[&str]) -> EnumTypeDef {
     EnumTypeDef {
-        tenant: t,
+        project: t,
         name: name.into(),
         labels: labels.iter().map(|s| s.to_string()).collect(),
     }
 }
 
-fn domain_def(t: TenantId, name: &str, base: SqlArgType, check: Option<&str>) -> DomainDef {
+fn domain_def(t: ProjectId, name: &str, base: SqlArgType, check: Option<&str>) -> DomainDef {
     DomainDef {
-        tenant: t,
+        project: t,
         name: name.into(),
         base_type: base,
         check_predicate: check.map(|s| s.to_string()),
@@ -35,7 +35,7 @@ fn domain_def(t: TenantId, name: &str, base: SqlArgType, check: Option<&str>) ->
 #[tokio::test]
 async fn enum_round_trip() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.register_enum_type(enum_def(t, "color", &["red", "green", "blue"]))
         .await
         .unwrap();
@@ -57,7 +57,7 @@ async fn enum_round_trip() {
 #[tokio::test]
 async fn enum_value_uniqueness_enforced() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let err = cat
         .register_enum_type(enum_def(t, "x", &["a", "b", "a"]))
         .await
@@ -75,7 +75,7 @@ async fn enum_value_uniqueness_enforced() {
 #[tokio::test]
 async fn enum_empty_label_list_rejected() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let err = cat
         .register_enum_type(enum_def(t, "empty", &[]))
         .await
@@ -86,7 +86,7 @@ async fn enum_empty_label_list_rejected() {
 #[tokio::test]
 async fn enum_duplicate_registration_rejected() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.register_enum_type(enum_def(t, "z", &["a"]))
         .await
         .unwrap();
@@ -100,7 +100,7 @@ async fn enum_duplicate_registration_rejected() {
 #[tokio::test]
 async fn add_enum_value_on_unknown_errors() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let err = cat.add_enum_value(&t, "missing", "x").await.unwrap_err();
     assert!(matches!(err, BasinError::NotFound(_)));
 }
@@ -108,7 +108,7 @@ async fn add_enum_value_on_unknown_errors() {
 #[tokio::test]
 async fn drop_enum_unknown_errors() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let err = cat.drop_enum_type(&t, "ghost").await.unwrap_err();
     assert!(matches!(err, BasinError::NotFound(_)));
 }
@@ -116,7 +116,7 @@ async fn drop_enum_unknown_errors() {
 #[tokio::test]
 async fn domain_round_trip() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.register_domain(domain_def(
         t,
         "positive_int",
@@ -139,7 +139,7 @@ async fn domain_round_trip() {
 #[tokio::test]
 async fn domain_predicate_must_parse() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let err = cat
         .register_domain(domain_def(t, "bad", SqlArgType::Int, Some("@@@")))
         .await
@@ -148,10 +148,10 @@ async fn domain_predicate_must_parse() {
 }
 
 #[tokio::test]
-async fn cross_tenant_isolation() {
+async fn cross_project_isolation() {
     let cat = InMemoryCatalog::new();
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     cat.register_enum_type(enum_def(a, "shared", &["x", "y"]))
         .await
         .unwrap();
@@ -159,14 +159,14 @@ async fn cross_tenant_isolation() {
         .await
         .unwrap();
 
-    // Tenant B sees neither the enum nor the domain.
+    // Project B sees neither the enum nor the domain.
     assert!(cat.lookup_enum_type(&b, "shared").await.is_none());
     assert!(cat.lookup_domain(&b, "d").await.is_none());
     assert!(cat.list_enum_types(&b).await.is_empty());
     assert!(cat.list_domains(&b).await.is_empty());
 
-    // Tenant B can register its own type with the same name without
-    // colliding against tenant A's row.
+    // Project B can register its own type with the same name without
+    // colliding against project A's row.
     cat.register_enum_type(enum_def(b, "shared", &["one"]))
         .await
         .unwrap();
@@ -179,7 +179,7 @@ async fn cross_tenant_isolation() {
 #[tokio::test]
 async fn enum_and_domain_namespace_collision_rejected() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.register_enum_type(enum_def(t, "name", &["a"]))
         .await
         .unwrap();
@@ -193,7 +193,7 @@ async fn enum_and_domain_namespace_collision_rejected() {
 #[tokio::test]
 async fn drop_enum_blocked_when_referenced() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.register_enum_type(enum_def(t, "status", &["a", "b"]))
         .await
         .unwrap();
@@ -228,7 +228,7 @@ async fn drop_enum_blocked_when_referenced() {
 #[tokio::test]
 async fn drop_domain_blocked_when_referenced() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.register_domain(domain_def(
         t,
         "positive_int",
@@ -259,7 +259,7 @@ async fn drop_domain_blocked_when_referenced() {
 #[tokio::test]
 async fn drop_namespace_clears_enums_and_domains() {
     let cat = Arc::new(InMemoryCatalog::new());
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.register_enum_type(enum_def(t, "e", &["a"]))
         .await
         .unwrap();

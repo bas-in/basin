@@ -6,7 +6,7 @@
 //! always returns `true`; real FTS selectivity is deferred to `basin-fts`.
 //!
 //! These tests exercise the full pipeline (rewriter → planner → executor)
-//! through `TenantSession::execute`.  Coverage:
+//! through `ProjectSession::execute`.  Coverage:
 //!
 //!   * Basic `tsvector @@ tsquery` between two function calls.
 //!   * Parenthesised operands.
@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -53,7 +53,7 @@ async fn open_engine() -> (TempDir, Engine) {
     (dir, engine)
 }
 
-async fn single_bool(sess: &basin_engine::TenantSession, sql: &str) -> bool {
+async fn single_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches
@@ -73,7 +73,7 @@ async fn single_bool(sess: &basin_engine::TenantSession, sql: &str) -> bool {
     }
 }
 
-async fn row_count(sess: &basin_engine::TenantSession, sql: &str) -> usize {
+async fn row_count(sess: &basin_engine::ProjectSession, sql: &str) -> usize {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches.iter().map(|b| b.num_rows()).sum(),
         Ok(other) => panic!("non-rows result for {sql}: {other:?}"),
@@ -90,7 +90,7 @@ async fn row_count(sess: &basin_engine::TenantSession, sql: &str) -> usize {
 #[tokio::test]
 async fn basic_at_at_between_function_calls() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let got = single_bool(
         &sess,
         "SELECT to_tsvector('a quick brown fox') @@ to_tsquery('english', 'fox')",
@@ -104,7 +104,7 @@ async fn basic_at_at_between_function_calls() {
 #[tokio::test]
 async fn at_at_with_parenthesised_operands() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let got = single_bool(
         &sess,
         "SELECT (to_tsvector('a b c')) @@ (to_tsquery('b'))",
@@ -117,7 +117,7 @@ async fn at_at_with_parenthesised_operands() {
 #[tokio::test]
 async fn at_at_with_cast_lhs() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let got = single_bool(
         &sess,
         "SELECT 'a quick fox'::tsvector @@ to_tsquery('english', 'fox')",
@@ -130,7 +130,7 @@ async fn at_at_with_cast_lhs() {
 #[tokio::test]
 async fn at_at_with_cast_rhs() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let got = single_bool(
         &sess,
         "SELECT to_tsvector('a quick fox') @@ 'fox'::tsquery",
@@ -145,7 +145,7 @@ async fn at_at_with_cast_rhs() {
 #[tokio::test]
 async fn multiple_at_at_in_one_statement() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let got = single_bool(
         &sess,
         "SELECT (to_tsvector('a') @@ to_tsquery('a')) OR (to_tsvector('b') @@ to_tsquery('b'))",
@@ -160,7 +160,7 @@ async fn multiple_at_at_in_one_statement() {
 #[tokio::test]
 async fn triple_at_is_not_rewritten() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let result = sess.execute("SELECT 1 @@@ 2").await;
     assert!(
         result.is_err(),
@@ -173,7 +173,7 @@ async fn triple_at_is_not_rewritten() {
 #[tokio::test]
 async fn at_at_inside_string_literal_is_data() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     match sess.execute("SELECT 'a @@ b' AS lit").await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let col = batches[0].column(0);
@@ -191,7 +191,7 @@ async fn at_at_inside_string_literal_is_data() {
 #[tokio::test]
 async fn at_at_inside_line_comment_is_ignored() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // The body is plain `SELECT 1`; the comment must not be lowered.
     let n = row_count(&sess, "SELECT 1 -- a @@ b\n").await;
     assert_eq!(n, 1);
@@ -208,7 +208,7 @@ async fn at_at_inside_line_comment_is_ignored() {
 #[tokio::test]
 async fn end_to_end_tsvector_column_with_at_at() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE doc (id INT, ts TSVECTOR)")
         .await
@@ -235,7 +235,7 @@ async fn end_to_end_tsvector_column_with_at_at() {
 #[tokio::test]
 async fn qualified_column_lhs() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE doc (id INT, ts TSVECTOR)")
         .await

@@ -6,7 +6,7 @@
 
 use arrow_array::{Array, BooleanArray, Int16Array, Int64Array, RecordBatch, StringArray};
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 
 fn col_str<'a>(b: &'a RecordBatch, n: &str) -> &'a StringArray {
     let idx = b.schema().index_of(n).unwrap();
@@ -48,7 +48,7 @@ fn typname_to_oid(b: &RecordBatch, want: &str) -> Option<i64> {
 #[tokio::test]
 async fn pg_type_lists_basin_supported_types() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::pg_type(&cat, &t).await.unwrap();
@@ -78,7 +78,7 @@ async fn pg_type_lists_basin_supported_types() {
         ]
     );
 
-    // Core types every Basin tenant needs.
+    // Core types every Basin project needs.
     for required in [
         "bool",
         "int4",
@@ -125,7 +125,7 @@ async fn pg_type_lists_basin_supported_types() {
 #[tokio::test]
 async fn pg_type_oids_match_router() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
     let batch = InfoSchemaQuery::pg_type(&cat, &t).await.unwrap();
 
@@ -149,9 +149,9 @@ async fn pg_type_oids_match_router() {
 }
 
 #[tokio::test]
-async fn pg_type_per_tenant_typnamespace_consistent() {
+async fn pg_type_per_project_typnamespace_consistent() {
     let cat = InMemoryCatalog::new();
-    let t = TenantId::new();
+    let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let b1 = InfoSchemaQuery::pg_type(&cat, &t).await.unwrap();
@@ -163,19 +163,19 @@ async fn pg_type_per_tenant_typnamespace_consistent() {
         assert_eq!(nsp1.value(i), nsp2.value(i), "typnamespace must be stable");
     }
     // Every row in a single batch must share the same namespace value
-    // (single `pg_catalog` namespace per tenant).
+    // (single `pg_catalog` namespace per project).
     let first = nsp1.value(0);
     for i in 1..b1.num_rows() {
         assert_eq!(nsp1.value(i), first, "all rows share one typnamespace");
     }
 
-    // A different tenant must hash to a different namespace value.
-    let t2 = TenantId::new();
+    // A different project must hash to a different namespace value.
+    let t2 = ProjectId::new();
     let b3 = InfoSchemaQuery::pg_type(&cat, &t2).await.unwrap();
     let nsp3 = col_i64(&b3, "typnamespace");
     assert_ne!(
         nsp1.value(0),
         nsp3.value(0),
-        "distinct tenants must produce distinct typnamespace hashes"
+        "distinct projects must produce distinct typnamespace hashes"
     );
 }

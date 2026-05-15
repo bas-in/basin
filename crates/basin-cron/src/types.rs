@@ -7,14 +7,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// One row in `cron.job`. The `(tenant, jobname)` pair is the natural key
-/// (jobnames must be unique per tenant); `jobid` is a synthetic monotonically
+/// One row in `cron.job`. The `(project, jobname)` pair is the natural key
+/// (jobnames must be unique per project); `jobid` is a synthetic monotonically
 /// increasing surrogate so result sets sort stably.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronJob {
-    /// Surrogate id, unique per tenant. Allocated at schedule time.
+    /// Surrogate id, unique per project. Allocated at schedule time.
     pub jobid: i64,
-    /// Human-readable name. Unique within a tenant. The pg_cron equivalent.
+    /// Human-readable name. Unique within a project. The pg_cron equivalent.
     pub jobname: String,
     /// Cron expression: `min hour dom mon dow` (5 fields).
     /// Note: the `cron` crate accepts a 6- or 7-field form too; we normalise
@@ -42,7 +42,7 @@ pub enum JobStatus {
     /// Job ran and the engine returned an error. `return_message` will be
     /// the error string.
     Failed,
-    /// Per-tenant rate limit was exhausted before this run could be issued.
+    /// Per-project rate limit was exhausted before this run could be issued.
     /// `return_message` is the rate-limit policy.
     RateLimited,
     /// Job was skipped because `active = false` at the time of the tick.
@@ -64,7 +64,7 @@ impl JobStatus {
 /// to execute.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronRunDetail {
-    /// Auto-incrementing per-tenant id.
+    /// Auto-incrementing per-project id.
     pub id: i64,
     /// `CronJob::jobid` this run is for.
     pub jobid: i64,
@@ -72,7 +72,7 @@ pub struct CronRunDetail {
     pub runid: i64,
     /// Always `None` in v0.1 — Basin does not expose engine-side OS pids.
     pub job_pid: Option<u32>,
-    /// Logical database name. We use the tenant's prefix string.
+    /// Logical database name. We use the project's prefix string.
     pub database: String,
     /// Principal `current_user` was stamped at schedule time.
     pub username: String,

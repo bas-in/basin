@@ -6,14 +6,14 @@
 //!
 //! ```text
 //! BASIN_DATA_DIR=/tmp/basin BASIN_BIND=127.0.0.1:5433 \
-//! BASIN_TENANTS=alice=01HABCD..,bob=01HEFGH.. \
+//! BASIN_PROJECTS=alice=01HABCD..,bob=01HEFGH.. \
 //! cargo run -p basin-server
 //! ```
 //!
-//! `BASIN_TENANTS` is a comma-separated list of `user=tenant_id_ulid` pairs.
-//! For convenience, an entry of the form `user=*` allocates a fresh tenant id
+//! `BASIN_PROJECTS` is a comma-separated list of `user=project_id_ulid` pairs.
+//! For convenience, an entry of the form `user=*` allocates a fresh project id
 //! at startup and prints it to stderr. This is PoC-grade only — production
-//! tenant provisioning lives in the (not-yet-built) control plane.
+//! project provisioning lives in the (not-yet-built) control plane.
 //!
 //! Catalog backend is selected via `BASIN_CATALOG`:
 //!
@@ -69,7 +69,7 @@
 //! When `BASIN_AUTH_ENABLED=1`, auth tables are stored in-process by default:
 //! the server builds an `EngineAuthStore` that runs SQL directly against the
 //! in-process `basin_engine::Engine` under the reserved
-//! `INTERNAL_AUTH_TENANT_ID`. This eliminates the loopback TCP round-trip and
+//! `INTERNAL_AUTH_PROJECT_ID`. This eliminates the loopback TCP round-trip and
 //! the chicken-and-egg startup ordering problem it caused.
 //!
 //! Operators who need auth stored in an external Postgres (Neon, RDS, etc.)
@@ -101,15 +101,15 @@
 //! ship, so the binary refuses to start in that combination.
 //!
 //! Default behaviour with none of these set is unchanged: a single pgwire
-//! listener with `StaticTenantResolver`, no pool, no REST, and no auth side
+//! listener with `StaticProjectResolver`, no pool, no REST, and no auth side
 //! channel.
 //!
 //! ## Pgwire username convention with auth
 //!
 //! When `BASIN_AUTH_ENABLED=1`, the pgwire `user` parameter doubles as a
 //! bearer-token slot: clients can connect with `user=<jwt>` (optionally
-//! `user=Bearer <jwt>`) and the server resolves the embedded `tenant_id`
-//! claim through `JwtTenantResolver`. Static `BASIN_TENANTS` mappings such
+//! `user=Bearer <jwt>`) and the server resolves the embedded `project_id`
+//! claim through `JwtProjectResolver`. Static `BASIN_PROJECTS` mappings such
 //! as `alice=*` keep working as a fallback: the binary stacks the JWT
 //! resolver in front of the static one, so dev clients and JWT clients
 //! coexist on the same listener.
@@ -131,11 +131,11 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use basin_common::{
     telemetry::{init, LogFormat},
-    TenantId,
+    ProjectId,
 };
 use basin_router::{
-    ApiKeyTenantResolver, JwtTenantResolver, ServerConfig, StackedTenantResolver,
-    StaticTenantResolver, TenantCredentialsResolver, TenantResolver, TlsConfig,
+    ApiKeyProjectResolver, JwtProjectResolver, ServerConfig, StackedProjectResolver,
+    StaticProjectResolver, ProjectCredentialsResolver, ProjectResolver, TlsConfig,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         bind = %cfg.bind,
         data_dir = %cfg.data_dir.display(),
-        tenants = cfg.tenants.len(),
+        projects = cfg.projects.len(),
         shard_enabled = cfg.shard_enabled,
         pool_enabled = cfg.pool_enabled,
         auth_enabled = cfg.auth_enabled,
@@ -313,11 +313,11 @@ async fn main() -> Result<()> {
         engine
     };
 
-    // Build the static resolver from `BASIN_TENANTS`.
-    let mut static_resolver = StaticTenantResolver::default();
-    for (user, tenant) in cfg.tenants {
-        tracing::info!(%user, %tenant, "tenant registered");
-        static_resolver = static_resolver.with_entry(user, tenant);
+    // Build the static resolver from `BASIN_PROJECTS`.
+    let mut static_resolver = StaticProjectResolver::default();
+    for (user, project) in cfg.projects {
+        tracing::info!(%user, %project, "project registered");
+        static_resolver = static_resolver.with_entry(user, project);
     }
 
     // --- optional auth service (built before the router) --------------------
@@ -325,7 +325,7 @@ async fn main() -> Result<()> {
     // With `EngineAuthStore`, basin-auth no longer needs an outbound TCP
     // connection back to our own pgwire listener. We can build the full
     // AuthService in-process and hand the live resolvers directly to
-    // `StackedTenantResolver` before the pgwire router even binds.
+    // `StackedProjectResolver` before the pgwire router even binds.
     //
     // Fallback: when `BASIN_AUTH_CATALOG_DSN` is explicitly set, operators
     // want auth stored in an external Postgres. In that case we fall back to
@@ -349,13 +349,13 @@ async fn main() -> Result<()> {
             // In-process path: build EngineAuthStore backed by the engine we
             // just constructed — no loopback TCP, no OnceLock, no race.
             tracing::info!("basin-auth: using in-process EngineAuthStore (no loopback TCP)");
-            let internal_auth_tenant: TenantId = basin_auth::INTERNAL_AUTH_TENANT_ID
+            let internal_auth_project: ProjectId = basin_auth::INTERNAL_AUTH_PROJECT_ID
                 .parse()
-                .map_err(|e| anyhow!("INTERNAL_AUTH_TENANT_ID is not a valid tenant id: {e}"))?;
+                .map_err(|e| anyhow!("INTERNAL_AUTH_PROJECT_ID is not a valid project id: {e}"))?;
             let auth_store = Arc::new(engine_auth_store::EngineAuthStore::new(
                 Arc::new(engine.clone()),
                 auth_cfg.catalog_schema.clone(),
-                internal_auth_tenant,
+                internal_auth_project,
             ));
             let mailer: Arc<dyn basin_auth::Mailer> =
                 Arc::new(basin_auth::SmtpMailer::from_config(&auth_cfg.smtp)?);
@@ -392,12 +392,12 @@ async fn main() -> Result<()> {
     // Build the resolver stack. When auth is enabled we have a live
     // AuthService right now (no deferred slot needed), so we wire up the
     // full JWT + API-key + credentials + static stack immediately.
-    let tenant_resolver: Arc<dyn TenantResolver> = if let Some(ref auth) = auth_service {
+    let project_resolver: Arc<dyn ProjectResolver> = if let Some(ref auth) = auth_service {
         tracing::info!("pgwire resolver: credentials + JWT + API-key + static");
-        Arc::new(StackedTenantResolver::new(vec![
-            Arc::new(TenantCredentialsResolver::new(auth.clone())),
-            Arc::new(JwtTenantResolver::new(auth.clone())),
-            Arc::new(ApiKeyTenantResolver::new(auth.clone())),
+        Arc::new(StackedProjectResolver::new(vec![
+            Arc::new(ProjectCredentialsResolver::new(auth.clone())),
+            Arc::new(JwtProjectResolver::new(auth.clone())),
+            Arc::new(ApiKeyProjectResolver::new(auth.clone())),
             Arc::new(static_resolver),
         ]))
     } else {
@@ -436,7 +436,7 @@ async fn main() -> Result<()> {
     let server_cfg = ServerConfig {
         bind_addr: cfg.bind,
         engine: engine.clone(),
-        tenant_resolver,
+        project_resolver,
         pool,
         shard_endpoints: None,
         tls,
@@ -514,7 +514,7 @@ struct Cfg {
     rest_enabled: bool,
     analytical_enabled: bool,
     rest_bind: SocketAddr,
-    tenants: Vec<(String, TenantId)>,
+    projects: Vec<(String, ProjectId)>,
     catalog: CatalogBackend,
     storage_root_prefix: Option<ObjectPath>,
     wal_root_prefix: Option<ObjectPath>,
@@ -551,24 +551,24 @@ impl Cfg {
             .unwrap_or_else(|_| "127.0.0.1:5434".to_string())
             .parse()
             .context("BASIN_REST_BIND must be host:port")?;
-        let raw = std::env::var("BASIN_TENANTS").unwrap_or_else(|_| "alice=*".to_string());
-        let mut tenants = Vec::new();
+        let raw = std::env::var("BASIN_PROJECTS").unwrap_or_else(|_| "alice=*".to_string());
+        let mut projects = Vec::new();
         for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (user, tid) = entry
                 .split_once('=')
-                .ok_or_else(|| anyhow!("bad BASIN_TENANTS entry: {entry:?} (want user=tid)"))?;
-            let tenant = if tid == "*" {
-                let t = TenantId::new();
-                eprintln!("provisioned tenant {user} -> {t}");
+                .ok_or_else(|| anyhow!("bad BASIN_PROJECTS entry: {entry:?} (want user=tid)"))?;
+            let project = if tid == "*" {
+                let t = ProjectId::new();
+                eprintln!("provisioned project {user} -> {t}");
                 t
             } else {
                 tid.parse()
-                    .map_err(|e| anyhow!("bad tenant id {tid:?} for user {user:?}: {e}"))?
+                    .map_err(|e| anyhow!("bad project id {tid:?} for user {user:?}: {e}"))?
             };
-            tenants.push((user.to_owned(), tenant));
+            projects.push((user.to_owned(), project));
         }
-        if tenants.is_empty() {
-            return Err(anyhow!("BASIN_TENANTS produced no entries"));
+        if projects.is_empty() {
+            return Err(anyhow!("BASIN_PROJECTS produced no entries"));
         }
         let catalog = parse_catalog_env()?;
         let storage_root_prefix = parse_object_prefix_env("BASIN_STORAGE_ROOT_PREFIX")?;
@@ -584,7 +584,7 @@ impl Cfg {
             rest_enabled,
             analytical_enabled,
             rest_bind,
-            tenants,
+            projects,
             catalog,
             storage_root_prefix,
             wal_root_prefix,

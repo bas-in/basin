@@ -1,8 +1,8 @@
-//! End-to-end coverage for the per-tenant storage-config routing in the
+//! End-to-end coverage for the per-project storage-config routing in the
 //! storage encryption call path: writer should call
 //! `wrap_key_with_config` when a config is present, plain `wrap_key`
 //! otherwise; the reader's unwrap path mirrors. Cache invalidation on
-//! `set_tenant_storage_config` is also asserted.
+//! `set_project_storage_config` is also asserted.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use basin_catalog::{Catalog, InMemoryCatalog, TenantStorageConfig};
-use basin_common::{PartitionKey, Result, TableName, TenantId};
+use basin_catalog::{Catalog, InMemoryCatalog, ProjectStorageConfig};
+use basin_common::{PartitionKey, Result, TableName, ProjectId};
 use basin_storage::{EncryptionProvider, Storage, StorageConfig, WrappedKey};
 use object_store::memory::InMemory;
 
@@ -26,7 +26,7 @@ struct CallCounters {
 }
 
 /// Test provider that records which method was called and (optionally)
-/// derives the data key from the per-tenant config so we can prove the
+/// derives the data key from the per-project config so we can prove the
 /// config-aware path is the one decrypting.
 struct RecordingProvider {
     counters: Arc<CallCounters>,
@@ -46,7 +46,7 @@ impl RecordingProvider {
     /// Derive a deterministic 32-byte data key from the optional config
     /// so wrap and unwrap line up regardless of whether the no-config or
     /// with-config path was taken on each leg.
-    fn data_key(cfg: Option<&TenantStorageConfig>) -> Vec<u8> {
+    fn data_key(cfg: Option<&ProjectStorageConfig>) -> Vec<u8> {
         let mut k = vec![0u8; 32];
         if let Some(cfg) = cfg {
             if let Some(r) = &cfg.kms_key_ref {
@@ -62,7 +62,7 @@ impl RecordingProvider {
 
 #[async_trait]
 impl EncryptionProvider for RecordingProvider {
-    async fn wrap_key(&self, _tenant: &TenantId) -> Result<(Vec<u8>, WrappedKey)> {
+    async fn wrap_key(&self, _project: &ProjectId) -> Result<(Vec<u8>, WrappedKey)> {
         self.counters.wrap_plain.fetch_add(1, Ordering::Relaxed);
         let key = Self::data_key(None);
         // Sidecar carries a tag identifying the path so unwrap can
@@ -72,15 +72,15 @@ impl EncryptionProvider for RecordingProvider {
         Ok((key, WrappedKey(sidecar)))
     }
 
-    async fn unwrap_key(&self, _tenant: &TenantId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
+    async fn unwrap_key(&self, _project: &ProjectId, wrapped: &WrappedKey) -> Result<Vec<u8>> {
         self.counters.unwrap_plain.fetch_add(1, Ordering::Relaxed);
         Ok(wrapped.0[1..].to_vec())
     }
 
     async fn wrap_key_with_config(
         &self,
-        _tenant: &TenantId,
-        config: &TenantStorageConfig,
+        _project: &ProjectId,
+        config: &ProjectStorageConfig,
     ) -> Result<(Vec<u8>, WrappedKey)> {
         self.counters.wrap_with_cfg.fetch_add(1, Ordering::Relaxed);
         *self.counters.last_kms_key_ref.lock().unwrap() = config.kms_key_ref.clone();
@@ -92,9 +92,9 @@ impl EncryptionProvider for RecordingProvider {
 
     async fn unwrap_key_with_config(
         &self,
-        _tenant: &TenantId,
+        _project: &ProjectId,
         wrapped: &WrappedKey,
-        _config: &TenantStorageConfig,
+        _config: &ProjectStorageConfig,
     ) -> Result<Vec<u8>> {
         self.counters
             .unwrap_with_cfg
@@ -121,10 +121,10 @@ fn small_batch() -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(ids)]).unwrap()
 }
 
-fn cfg_with(key: &str) -> TenantStorageConfig {
+fn cfg_with(key: &str) -> ProjectStorageConfig {
     let mut extras = BTreeMap::new();
     extras.insert("region".into(), "us-east-1".into());
-    TenantStorageConfig {
+    ProjectStorageConfig {
         kms_key_ref: Some(key.into()),
         provider_extras: extras,
     }
@@ -136,16 +136,16 @@ async fn wrap_key_with_config_routes_when_config_present() {
     let (provider, counters) = RecordingProvider::new();
     storage.attach_encryption_provider(Arc::new(provider));
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     storage
-        .set_tenant_storage_config(&tenant, cfg_with("arn:aws:kms:us-east-1:1:key/abc"))
+        .set_project_storage_config(&project, cfg_with("arn:aws:kms:us-east-1:1:key/abc"))
         .await
         .unwrap();
 
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
     storage
-        .write_batch(&tenant, &table, &part, &small_batch())
+        .write_batch(&project, &table, &part, &small_batch())
         .await
         .unwrap();
 
@@ -163,13 +163,13 @@ async fn wrap_key_falls_back_when_no_config() {
     let (provider, counters) = RecordingProvider::new();
     storage.attach_encryption_provider(Arc::new(provider));
 
-    // No `set_tenant_storage_config` call — the cached lookup returns
+    // No `set_project_storage_config` call — the cached lookup returns
     // None and the writer falls back to plain `wrap_key`.
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
     storage
-        .write_batch(&tenant, &table, &part, &small_batch())
+        .write_batch(&project, &table, &part, &small_batch())
         .await
         .unwrap();
 
@@ -183,16 +183,16 @@ async fn cache_invalidated_on_config_update() {
     let (provider, counters) = RecordingProvider::new();
     storage.attach_encryption_provider(Arc::new(provider));
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     storage
-        .set_tenant_storage_config(&tenant, cfg_with("first-cmk"))
+        .set_project_storage_config(&project, cfg_with("first-cmk"))
         .await
         .unwrap();
 
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
     storage
-        .write_batch(&tenant, &table, &part, &small_batch())
+        .write_batch(&project, &table, &part, &small_batch())
         .await
         .unwrap();
     assert_eq!(
@@ -201,11 +201,11 @@ async fn cache_invalidated_on_config_update() {
     );
 
     storage
-        .set_tenant_storage_config(&tenant, cfg_with("second-cmk"))
+        .set_project_storage_config(&project, cfg_with("second-cmk"))
         .await
         .unwrap();
     storage
-        .write_batch(&tenant, &table, &part, &small_batch())
+        .write_batch(&project, &table, &part, &small_batch())
         .await
         .unwrap();
     assert_eq!(
@@ -222,21 +222,21 @@ async fn unwrap_path_threads_config() {
     let (provider, counters) = RecordingProvider::new();
     storage.attach_encryption_provider(Arc::new(provider));
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     storage
-        .set_tenant_storage_config(&tenant, cfg_with("round-trip-cmk"))
+        .set_project_storage_config(&project, cfg_with("round-trip-cmk"))
         .await
         .unwrap();
 
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
     storage
-        .write_batch(&tenant, &table, &part, &small_batch())
+        .write_batch(&project, &table, &part, &small_batch())
         .await
         .unwrap();
 
     let stream = storage
-        .read(&tenant, &table, basin_storage::ReadOptions::default())
+        .read(&project, &table, basin_storage::ReadOptions::default())
         .await
         .unwrap();
     let batches: Vec<_> = stream.collect().await;
@@ -256,10 +256,10 @@ struct LegacyProvider;
 
 #[async_trait]
 impl EncryptionProvider for LegacyProvider {
-    async fn wrap_key(&self, _tenant: &TenantId) -> Result<(Vec<u8>, WrappedKey)> {
+    async fn wrap_key(&self, _project: &ProjectId) -> Result<(Vec<u8>, WrappedKey)> {
         Ok((vec![7u8; 32], WrappedKey(vec![0xAA; 8])))
     }
-    async fn unwrap_key(&self, _tenant: &TenantId, _wrapped: &WrappedKey) -> Result<Vec<u8>> {
+    async fn unwrap_key(&self, _project: &ProjectId, _wrapped: &WrappedKey) -> Result<Vec<u8>> {
         Ok(vec![7u8; 32])
     }
 }
@@ -268,20 +268,20 @@ impl EncryptionProvider for LegacyProvider {
 async fn legacy_provider_default_impl_forwards_to_wrap_key() {
     // A provider without `wrap_key_with_config` overridden still works:
     // the default-impl forwards to `wrap_key` so the encryption call
-    // path remains valid even when a per-tenant config is present.
+    // path remains valid even when a per-project config is present.
     let (storage, _cat) = build_storage();
     storage.attach_encryption_provider(Arc::new(LegacyProvider));
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     storage
-        .set_tenant_storage_config(&tenant, cfg_with("ignored"))
+        .set_project_storage_config(&project, cfg_with("ignored"))
         .await
         .unwrap();
 
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
     storage
-        .write_batch(&tenant, &table, &part, &small_batch())
+        .write_batch(&project, &table, &part, &small_batch())
         .await
         .unwrap();
     // No assertion needed beyond not panicking — we just verified that

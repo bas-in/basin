@@ -1,6 +1,6 @@
 //! CV refresh tick loop. Once every refresh-interval-floor seconds (in
 //! production) or once per [`CvRefresher::tick`] (in tests), walk every
-//! resident tenant's CV set, run each due CV's source SQL, and atomically
+//! resident project's CV set, run each due CV's source SQL, and atomically
 //! swap the materialised file in via [`basin_catalog::Catalog::replace_data_files`].
 //!
 //! ## Clock injection
@@ -8,11 +8,11 @@
 //! [`CvRefresher`] takes a [`Clock`] so tests can drive ticks at deterministic
 //! times. Production code uses [`SystemClock`] which delegates to `Utc::now`.
 //!
-//! ## Per-tenant queue
+//! ## Per-project queue
 //!
-//! Tenants are processed sequentially within a single tick to keep the
-//! per-tenant resource footprint bounded. The "queue" shape lets a future
-//! production driver split the per-tenant work onto a thread pool without
+//! Projects are processed sequentially within a single tick to keep the
+//! per-project resource footprint bounded. The "queue" shape lets a future
+//! production driver split the per-project work onto a thread pool without
 //! changing the API; v0.1's implementation is a sequential walk.
 //!
 //! ## Incremental refresh
@@ -42,8 +42,8 @@ use arrow_array::{
 use arrow_schema::{DataType, TimeUnit};
 use async_trait::async_trait;
 use basin_catalog::{Catalog, DataFileRef};
-use basin_common::{BasinError, PartitionKey, Result, TableName, TenantId};
-use basin_engine::{Engine, ExecResult, TenantSession};
+use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
+use basin_engine::{Engine, ExecResult, ProjectSession};
 use basin_shard::CvRefreshDriver;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Mutex;
@@ -122,7 +122,7 @@ pub enum RefreshMode {
 /// One refresh attempt's outcome, paired with the CV name it concerns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshOutcome {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub cv_name: String,
     pub outcome: CvRefreshOutcome,
 }
@@ -138,15 +138,15 @@ pub struct CvRefresher {
 struct RefresherInner {
     store: CvStore,
     clock: Arc<dyn Clock>,
-    /// Tenants the refresher is responsible for. CV is opt-in per tenant —
-    /// the router (or test) registers each tenant once via
-    /// [`CvRefresher::register_tenant`]. Mirrors `basin-cron`'s shape.
-    tenants: Mutex<Vec<TenantId>>,
-    /// Per-tenant timestamp of the most recent tick. Used only as a hook
+    /// Projects the refresher is responsible for. CV is opt-in per project —
+    /// the router (or test) registers each project once via
+    /// [`CvRefresher::register_project`]. Mirrors `basin-cron`'s shape.
+    projects: Mutex<Vec<ProjectId>>,
+    /// Per-project timestamp of the most recent tick. Used only as a hook
     /// for future "skip the CV refresh entirely if no work has accumulated"
-    /// logic; v0.1 always does a per-CV due-check inside `tick_tenant`.
+    /// logic; v0.1 always does a per-CV due-check inside `tick_project`.
     #[allow(dead_code)]
-    last_tick: Mutex<HashMap<TenantId, DateTime<Utc>>>,
+    last_tick: Mutex<HashMap<ProjectId, DateTime<Utc>>>,
     /// Optional test spy. None in production.
     spy: Mutex<Option<Arc<dyn RefreshSpy>>>,
 }
@@ -158,7 +158,7 @@ impl CvRefresher {
             inner: Arc::new(RefresherInner {
                 store: CvStore::new(engine),
                 clock,
-                tenants: Mutex::new(Vec::new()),
+                projects: Mutex::new(Vec::new()),
                 last_tick: Mutex::new(HashMap::new()),
                 spy: Mutex::new(None),
             }),
@@ -181,50 +181,50 @@ impl CvRefresher {
         *self.inner.spy.lock().await = Some(spy);
     }
 
-    /// Mark `tenant` as resident. Idempotent.
-    pub async fn register_tenant(&self, tenant: TenantId) {
-        let mut tenants = self.inner.tenants.lock().await;
-        if !tenants.contains(&tenant) {
-            tenants.push(tenant);
+    /// Mark `project` as resident. Idempotent.
+    pub async fn register_project(&self, project: ProjectId) {
+        let mut projects = self.inner.projects.lock().await;
+        if !projects.contains(&project) {
+            projects.push(project);
         }
     }
 
-    /// Run one tick. Walks every registered tenant, refreshes every CV
+    /// Run one tick. Walks every registered project, refreshes every CV
     /// whose interval has elapsed, and returns one [`RefreshOutcome`] per
     /// CV.
     pub async fn tick(&self) -> Result<Vec<RefreshOutcome>> {
         let now = self.inner.clock.now();
-        let tenants = self.inner.tenants.lock().await.clone();
+        let projects = self.inner.projects.lock().await.clone();
         let mut outcomes = Vec::new();
-        for tenant in tenants {
-            let per_tenant = self.tick_tenant(&tenant, now).await?;
-            outcomes.extend(per_tenant);
+        for project in projects {
+            let per_project = self.tick_project(&project, now).await?;
+            outcomes.extend(per_project);
         }
         Ok(outcomes)
     }
 
     /// Convenience for one-shot tests: take an explicit `now`.
     pub async fn tick_at(&self, now: DateTime<Utc>) -> Result<Vec<RefreshOutcome>> {
-        let tenants = self.inner.tenants.lock().await.clone();
+        let projects = self.inner.projects.lock().await.clone();
         let mut outcomes = Vec::new();
-        for tenant in tenants {
-            let per_tenant = self.tick_tenant(&tenant, now).await?;
-            outcomes.extend(per_tenant);
+        for project in projects {
+            let per_project = self.tick_project(&project, now).await?;
+            outcomes.extend(per_project);
         }
         Ok(outcomes)
     }
 
-    async fn tick_tenant(
+    async fn tick_project(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         now: DateTime<Utc>,
     ) -> Result<Vec<RefreshOutcome>> {
-        let cvs = self.inner.store.list_cvs(tenant).await?;
+        let cvs = self.inner.store.list_cvs(project).await?;
         let mut outcomes = Vec::with_capacity(cvs.len());
         for spec in cvs {
-            let outcome = self.refresh_one(tenant, &spec, now).await;
+            let outcome = self.refresh_one(project, &spec, now).await;
             outcomes.push(RefreshOutcome {
-                tenant: *tenant,
+                project: *project,
                 cv_name: spec.name.clone(),
                 outcome,
             });
@@ -232,12 +232,12 @@ impl CvRefresher {
         Ok(outcomes)
     }
 
-    /// Walk every CV under `tenant` once, refreshing those whose interval
+    /// Walk every CV under `project` once, refreshing those whose interval
     /// has elapsed. Returns the count of CVs that were re-materialised
     /// (`NotDue` / `Failed` outcomes don't count).
-    pub async fn refresh_tenant_now(&self, tenant: &TenantId) -> Result<usize> {
+    pub async fn refresh_project_now(&self, project: &ProjectId) -> Result<usize> {
         let now = self.inner.clock.now();
-        let outcomes = self.tick_tenant(tenant, now).await?;
+        let outcomes = self.tick_project(project, now).await?;
         let refreshed = outcomes
             .iter()
             .filter(|o| matches!(o.outcome, CvRefreshOutcome::Refreshed { .. }))
@@ -245,25 +245,25 @@ impl CvRefresher {
         Ok(refreshed)
     }
 
-    /// One-shot: refresh `name` under `tenant` immediately, ignoring the
+    /// One-shot: refresh `name` under `project` immediately, ignoring the
     /// due-check. `force_full = true` forces a full re-execution (the
     /// `WITH (full=true)` opt-out for `REFRESH MATERIALIZED VIEW`); the
     /// default is to use the same incremental-vs-full logic the periodic
     /// tick uses.
     pub async fn refresh_named_now(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         name: &str,
         force_full: bool,
     ) -> Result<u64> {
         let spec = self
             .inner
             .store
-            .get_cv(tenant, name)
+            .get_cv(project, name)
             .await?
-            .ok_or_else(|| BasinError::not_found(format!("CV {name} on {tenant}")))?;
+            .ok_or_else(|| BasinError::not_found(format!("CV {name} on {project}")))?;
         let now = self.inner.clock.now();
-        self.do_refresh(tenant, &spec, now, force_full).await
+        self.do_refresh(project, &spec, now, force_full).await
     }
 
     /// Refresh a single CV. Errors are caught and surfaced as
@@ -271,7 +271,7 @@ impl CvRefresher {
     /// of the tick.
     async fn refresh_one(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         spec: &CvSpec,
         now: DateTime<Utc>,
     ) -> CvRefreshOutcome {
@@ -283,7 +283,7 @@ impl CvRefresher {
             }
         }
 
-        match self.do_refresh(tenant, spec, now, false).await {
+        match self.do_refresh(project, spec, now, false).await {
             Ok(rows) => CvRefreshOutcome::Refreshed { rows_written: rows },
             Err(e) => CvRefreshOutcome::Failed(format!("{e}")),
         }
@@ -294,7 +294,7 @@ impl CvRefresher {
     /// matches a recognised time-bucket shape.
     async fn do_refresh(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         spec: &CvSpec,
         now: DateTime<Utc>,
         force_full: bool,
@@ -305,14 +305,14 @@ impl CvRefresher {
             .flatten();
         match (bucket, spec.last_bucket_max) {
             (Some(info), Some(watermark)) => {
-                self.refresh_incremental(tenant, spec, &info, watermark, now)
+                self.refresh_incremental(project, spec, &info, watermark, now)
                     .await
             }
             (info, _) => {
                 // Either no bucket detected, force_full set, or first
                 // refresh: do a full rebuild and (if a bucket *is*
                 // detectable) compute the watermark for the next tick.
-                self.refresh_full(tenant, spec, info, now).await
+                self.refresh_full(project, spec, info, now).await
             }
         }
     }
@@ -322,7 +322,7 @@ impl CvRefresher {
     /// watermark by scanning the source table's max bucket-column value.
     async fn refresh_full(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         spec: &CvSpec,
         bucket: Option<BucketInfo>,
         now: DateTime<Utc>,
@@ -333,7 +333,7 @@ impl CvRefresher {
         let table = TableName::new(spec.name.clone())
             .map_err(|e| BasinError::internal(format!("CV name {} invalid: {e}", spec.name)))?;
 
-        let sess = engine.open_session(*tenant).await?;
+        let sess = engine.open_session(*project).await?;
         self.notify_spy(&spec.name, RefreshMode::Full, &spec.query_sql)
             .await;
         let res = sess.execute(&spec.query_sql).await?;
@@ -368,15 +368,15 @@ impl CvRefresher {
             };
             self.inner
                 .store
-                .update_refresh_state(tenant, &spec.name, state)
+                .update_refresh_state(project, &spec.name, state)
                 .await?;
             return Ok(0);
         }
 
         let merged = concat_batches(&schema, &batches)?;
         let part = PartitionKey::default_key();
-        let written = storage.write_batch(tenant, &table, &part, &merged).await?;
-        let meta = catalog.load_table(tenant, &table).await?;
+        let written = storage.write_batch(project, &table, &part, &merged).await?;
+        let meta = catalog.load_table(project, &table).await?;
         let removed_paths: Vec<String> = meta
             .snapshots
             .iter()
@@ -390,7 +390,7 @@ impl CvRefresher {
         }];
         catalog
             .replace_data_files(
-                tenant,
+                project,
                 &table,
                 meta.current_snapshot,
                 removed_paths.clone(),
@@ -402,7 +402,7 @@ impl CvRefresher {
                 continue;
             }
             let p = object_store::path::Path::from(path.as_str());
-            let _ = storage.delete_file(tenant, &p).await;
+            let _ = storage.delete_file(project, &p).await;
         }
 
         let state = CvRefreshState {
@@ -412,7 +412,7 @@ impl CvRefresher {
         };
         self.inner
             .store
-            .update_refresh_state(tenant, &spec.name, state)
+            .update_refresh_state(project, &spec.name, state)
             .await?;
         Ok(written.row_count)
     }
@@ -425,7 +425,7 @@ impl CvRefresher {
     /// already-finalised buckets are missed (documented v0.1 limitation).
     async fn refresh_incremental(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         spec: &CvSpec,
         bucket: &BucketInfo,
         watermark: DateTime<Utc>,
@@ -444,12 +444,12 @@ impl CvRefresher {
                 Ok(s) => s,
                 Err(_) => {
                     return self
-                        .refresh_full(tenant, spec, Some(bucket.clone()), now)
+                        .refresh_full(project, spec, Some(bucket.clone()), now)
                         .await;
                 }
             };
 
-        let sess = engine.open_session(*tenant).await?;
+        let sess = engine.open_session(*project).await?;
         self.notify_spy(&spec.name, RefreshMode::Incremental, &rewritten)
             .await;
 
@@ -513,7 +513,7 @@ impl CvRefresher {
             };
             self.inner
                 .store
-                .update_refresh_state(tenant, &spec.name, state)
+                .update_refresh_state(project, &spec.name, state)
                 .await?;
             return Ok(0);
         } else if all_batches.len() == 1 {
@@ -526,8 +526,8 @@ impl CvRefresher {
 
         // 4. Write the combined result and swap.
         let part = PartitionKey::default_key();
-        let written = storage.write_batch(tenant, &table, &part, &merged).await?;
-        let meta = catalog.load_table(tenant, &table).await?;
+        let written = storage.write_batch(project, &table, &part, &merged).await?;
+        let meta = catalog.load_table(project, &table).await?;
         let removed_paths: Vec<String> = meta
             .snapshots
             .iter()
@@ -541,7 +541,7 @@ impl CvRefresher {
         }];
         catalog
             .replace_data_files(
-                tenant,
+                project,
                 &table,
                 meta.current_snapshot,
                 removed_paths.clone(),
@@ -553,7 +553,7 @@ impl CvRefresher {
                 continue;
             }
             let p = object_store::path::Path::from(path.as_str());
-            let _ = storage.delete_file(tenant, &p).await;
+            let _ = storage.delete_file(project, &p).await;
         }
 
         // 5. Compute the next watermark from the source's current max ts.
@@ -568,7 +568,7 @@ impl CvRefresher {
         };
         self.inner
             .store
-            .update_refresh_state(tenant, &spec.name, state)
+            .update_refresh_state(project, &spec.name, state)
             .await?;
         Ok(written.row_count)
     }
@@ -578,7 +578,7 @@ impl CvRefresher {
     /// empty (no rows).
     async fn compute_watermark(
         &self,
-        sess: &TenantSession,
+        sess: &ProjectSession,
         source_table: &str,
         bucket: &BucketInfo,
     ) -> Result<Option<DateTime<Utc>>> {
@@ -805,7 +805,7 @@ fn build_lt_watermark_mask(
 /// The trait lives in `basin-shard`; the implementation lives here.
 #[async_trait]
 impl CvRefreshDriver for CvRefresher {
-    async fn refresh_tenant(&self, tenant: &TenantId) -> Result<usize> {
-        self.refresh_tenant_now(tenant).await
+    async fn refresh_project(&self, project: &ProjectId) -> Result<usize> {
+        self.refresh_project_now(project).await
     }
 }

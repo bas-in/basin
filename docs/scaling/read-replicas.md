@@ -8,10 +8,10 @@ lives in `crates/basin-shard/src/follower.rs`.
 ## 1. Current state (v0.1)
 
 The shard owner is a single-writer-per-shard process. Every
-`(tenant, partition)` writes through one `Arc<RwLock<PartitionState>>` on
+`(project, partition)` writes through one `Arc<RwLock<PartitionState>>` on
 exactly one machine. The write path is:
 
-1. `TenantHandle::write_batch` encodes `(table, batch)` into the WAL payload
+1. `ProjectHandle::write_batch` encodes `(table, batch)` into the WAL payload
    format documented in `basin-shard/src/in_process.rs`.
 2. `Wal::append` returns once the entry is durable (LocalWal: file fsync +
    queued upload; RaftWal v0.2: quorum ack).
@@ -19,10 +19,10 @@ exactly one machine. The write path is:
 4. The background compactor drains the tail into Parquet via
    `basin-storage`, commits through `basin-catalog`, and truncates the WAL.
 
-Reads land on the same process. `TenantHandle::read` streams the Parquet
+Reads land on the same process. `ProjectHandle::read` streams the Parquet
 base from storage, then appends the in-memory tail. There is no follower
 today — read traffic competes with write traffic for the single per-shard
-runtime, and the only horizontal axis is sharding (one tenant on one node).
+runtime, and the only horizontal axis is sharding (one project on one node).
 
 Why this is the bottleneck the doc fixes: single-writer is the right
 serialization model for correctness (LSN ordering, commit-conflict
@@ -34,7 +34,7 @@ consume the WAL and serve identical reads.
 
 ### 2.1 Roles
 
-Each `(tenant, partition)` ("shard") has exactly one **leader** and zero
+Each `(project, partition)` ("shard") has exactly one **leader** and zero
 or more **followers**:
 
 - **Leader**: today's `InProcessShard`. Owns writes, owns the catalog
@@ -53,7 +53,7 @@ greater than the leader's `last_compacted_lsn` at any given moment.
 ### 2.2 WAL streaming
 
 The leader-side WAL (`crates/basin-wal`) already exposes
-`read_from(tenant, partition, since_lsn)` — this is the catchup primitive
+`read_from(project, partition, since_lsn)` — this is the catchup primitive
 for cold-load today. Followers reuse it; the addition is a streaming
 variant:
 
@@ -61,13 +61,13 @@ variant:
 // New on the Wal trait (default impl in terms of read_from + poll).
 async fn tail(
     &self,
-    tenant: &TenantId,
+    project: &ProjectId,
     partition: &PartitionKey,
     since_lsn: Lsn,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<WalEntry>> + Send>>>;
 ```
 
-Followers open one `tail` stream per resident `(tenant, partition)` and
+Followers open one `tail` stream per resident `(project, partition)` and
 apply entries in LSN order. The streaming impl can be:
 
 - **v0.2 local FS / single region**: a poll loop on top of `read_from`,
@@ -118,9 +118,9 @@ the follower fleet without an explicit user knob.
 ## 3. Routing
 
 `basin-router` today picks a shard endpoint with stable hashing of
-`TenantId`. With followers in the picture, the unit of routing
-changes from "one endpoint per tenant" to "one **set** of endpoints
-per tenant, tagged leader/follower".
+`ProjectId`. With followers in the picture, the unit of routing
+changes from "one endpoint per project" to "one **set** of endpoints
+per project, tagged leader/follower".
 
 ### 3.1 New shape
 
@@ -136,7 +136,7 @@ pub struct Follower { pub endpoint: String, pub lag_ms: u64 }
 
 Selection per connection:
 
-1. Resolve `TenantId → ShardSlot`.
+1. Resolve `ProjectId → ShardSlot`.
 2. Parse intent from the SQL (or from a sidechannel — see below).
    - INSERT / UPDATE / DELETE / DDL / `BEGIN`-in-flight → `leader`.
    - SELECT with no open txn → eligible for `followers`.
@@ -158,9 +158,9 @@ Two channels, used in this order:
    everything else → write. The `x-basin-rylw-lsn` header overrides
    the default if present.
 
-For the pgwire path we keep the existing tenant→shard hash for the
+For the pgwire path we keep the existing project→shard hash for the
 *leader* (so leader pinning is consistent with v0.1 cluster) and
-deterministically derive the follower set for that tenant from
+deterministically derive the follower set for that project from
 `basin-placement`.
 
 ### 3.3 Failover at the router edge
@@ -173,7 +173,7 @@ When a follower returns a connection error mid-query the router:
 3. Falls back to the leader as last resort.
 
 This is identical to the existing pgwire client-reconnect pattern, just
-at a finer granularity than tenant.
+at a finer granularity than project.
 
 ## 4. Placement
 
@@ -185,7 +185,7 @@ empty (Phase 3); this is where it gets shape.
 
 ```rust
 pub struct ShardLayout {
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub partition: PartitionKey,
     pub leader: MachineId,
     pub followers: Vec<MachineId>,
@@ -237,7 +237,7 @@ Two design points beyond single-region:
   need read-your-writes either route to leader region or run a basin-cli
   command that waits for the regional follower to catch up.
 - **Region failover**: full region loss promotes a remote follower.
-  Cross-region promotion is opt-in per tenant (some users prefer to
+  Cross-region promotion is opt-in per project (some users prefer to
   stay write-unavailable rather than risk a longer lag window before
   serving writes from a region that may be behind).
 
@@ -261,10 +261,10 @@ pub trait ShardFollower: Send + Sync {
     /// `(leader_high_water - current_lsn) <= threshold`.
     async fn is_caught_up(&self, threshold: Duration) -> bool;
 
-    /// Read-only path. Identical surface to `TenantHandle::read`.
+    /// Read-only path. Identical surface to `ProjectHandle::read`.
     async fn read(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         partition: &PartitionKey,
         table: &TableName,
         opts: basin_storage::ReadOptions,
@@ -304,7 +304,7 @@ verbatim.
 - Region-aware router (prefer local region's followers; fall back to
   remote followers; fall back to leader region).
 - Opt-in cross-region promotion.
-- Per-tenant overrides for "always read from leader region" (low-lag
+- Per-project overrides for "always read from leader region" (low-lag
   freshness customers) and "RF=5 across three regions" (read-heavy
   globally distributed workloads).
 
@@ -324,7 +324,7 @@ verbatim.
   machine→machine TCP, or NATS) gets us to ≤ 50 ms. Decision deferred
   until we measure polling in dev.
 - **Snapshot install for new followers**: a fresh follower replaying
-  from `Lsn::ZERO` against a tenant with months of WAL is wasteful.
+  from `Lsn::ZERO` against a project with months of WAL is wasteful.
   v0.2.1 should add a "follower joins from latest Parquet snapshot +
   WAL since that snapshot's LSN" path. The catalog already records
   snapshot LSN per commit.

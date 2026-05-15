@@ -27,16 +27,16 @@
 //!         translation path; v0.1 ships the SELECT/UPDATE/DELETE filter
 //!         and leaves WITH CHECK as a TODO (see end of file).
 //!
-//! 4. `current_user` is resolved from the calling [`crate::TenantSession`].
+//! 4. `current_user` is resolved from the calling [`crate::ProjectSession`].
 //!    With auth disabled the engine stamps `'anonymous'`. Substitution into
 //!    the policy expression is by SQL-text replacement of the
 //!    `current_user` identifier with a single-quoted string literal — this
 //!    is principal-text substitution (not user-SQL rewriting) and runs
 //!    only on the policy's own definition.
 //!
-//! 5. RLS is a *layer above* tenant prefix isolation. The catalog calls
-//!    that materialise table state are tenant-scoped; a policy registered
-//!    on tenant A's `orders` is invisible to tenant B's session. The
+//! 5. RLS is a *layer above* project prefix isolation. The catalog calls
+//!    that materialise table state are project-scoped; a policy registered
+//!    on project A's `orders` is invisible to project B's session. The
 //!    integration test `viability_rls_isolation` is the back-stop.
 
 use std::collections::HashMap;
@@ -535,14 +535,14 @@ fn is_ident_part(c: char) -> bool {
 /// signal to the caller (the SELECT executor) to take the no-RLS fast path.
 pub(crate) async fn build_policies_for_query(
     catalog: &Arc<dyn basin_catalog::Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     tables: &[TableName],
     current_user: &str,
     kind: PolicyCommand,
 ) -> Result<HashMap<String, Vec<Policy>>> {
     let mut out = HashMap::new();
     for table in tables {
-        let meta = match catalog.load_table(tenant, table).await {
+        let meta = match catalog.load_table(project, table).await {
             Ok(m) => m,
             Err(_) => continue, // user query refers to unknown table; let DF
                                 // surface the error.

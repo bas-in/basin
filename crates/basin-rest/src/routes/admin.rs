@@ -1,11 +1,11 @@
-//! `/admin/v1/*` — operator-grade endpoints for per-tenant pgwire credentials.
+//! `/admin/v1/*` — operator-grade endpoints for per-project pgwire credentials.
 //!
 //! Auth: every route requires a JWT with `is_admin: true`. The check is
 //! deliberately blunt for v0.1 — the wedge customer's control-plane mints
-//! one such token at deploy time and uses it to provision new tenants.
+//! one such token at deploy time and uses it to provision new projects.
 //! Everything else (rotate, list) takes the same gate.
 //!
-//! Wire shape mirrors the marketing copy: `POST /admin/v1/tenants` returns a
+//! Wire shape mirrors the marketing copy: `POST /admin/v1/projects` returns a
 //! drop-in `connection_url` the customer pastes into their Postgres driver.
 
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -25,9 +25,9 @@ use crate::server::{authorize, Inner};
 pub(crate) struct ProvisionRequest {
     /// Optional override; defaults to `"basin"` server-side.
     pub dbname: Option<String>,
-    /// Optional preset tenant id. When absent, a fresh one is allocated.
-    /// Useful for the "I already have a tenant id from elsewhere" case.
-    pub tenant_id: Option<String>,
+    /// Optional preset project id. When absent, a fresh one is allocated.
+    /// Useful for the "I already have a project id from elsewhere" case.
+    pub project_id: Option<String>,
 }
 
 fn require_admin(claims: &basin_auth::Claims) -> Result<(), ApiError> {
@@ -41,7 +41,7 @@ fn require_admin(claims: &basin_auth::Claims) -> Result<(), ApiError> {
 
 fn connection_info_to_json(info: &basin_auth::ConnectionInfo) -> Value {
     json!({
-        "tenant_id": info.tenant_id.to_string(),
+        "project_id": info.project_id.to_string(),
         "pgwire_user": info.pgwire_user,
         "dbname": info.dbname,
         "password": info.password_secret,
@@ -49,11 +49,11 @@ fn connection_info_to_json(info: &basin_auth::ConnectionInfo) -> Value {
     })
 }
 
-/// `POST /admin/v1/tenants` — issue a fresh tenant id (or use the supplied
-/// one) and return the per-tenant pgwire URL. The plaintext `password` field
+/// `POST /admin/v1/projects` — issue a fresh project id (or use the supplied
+/// one) and return the per-project pgwire URL. The plaintext `password` field
 /// in the response is the only place the secret ever leaves the server.
 #[axum::debug_handler]
-pub(crate) async fn provision_tenant(
+pub(crate) async fn provision_project(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
     Json(req): Json<ProvisionRequest>,
@@ -61,29 +61,29 @@ pub(crate) async fn provision_tenant(
     let claims = authorize(&state, &headers).await?;
     require_admin(&claims)?;
 
-    let tenant = match req.tenant_id.as_deref() {
+    let project = match req.project_id.as_deref() {
         Some(s) => s
-            .parse::<TenantId>()
-            .map_err(|e| ApiError::invalid(format!("invalid tenant_id: {e}")))?,
-        None => TenantId::new(),
+            .parse::<ProjectId>()
+            .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?,
+        None => ProjectId::new(),
     };
 
     let info = state
         .cfg
         .auth
-        .provision_tenant_db(&tenant, req.dbname.as_deref())
+        .provision_project_db(&project, req.dbname.as_deref())
         .await
         .map_err(ApiError::from)?;
 
     Ok((StatusCode::CREATED, Json(connection_info_to_json(&info))).into_response())
 }
 
-/// `POST /admin/v1/tenants/{id}/rotate` — rotate a credential's password.
-/// `id` is the `pgwire_user` (`tenant_<8 hex>`), not the tenant ULID. The
+/// `POST /admin/v1/projects/{id}/rotate` — rotate a credential's password.
+/// `id` is the `pgwire_user` (`project_<8 hex>`), not the project ULID. The
 /// older password stops validating immediately; the response carries the new
 /// `connection_url`.
 #[axum::debug_handler]
-pub(crate) async fn rotate_tenant(
+pub(crate) async fn rotate_project(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
     Path(pgwire_user): Path<String>,
@@ -101,26 +101,26 @@ pub(crate) async fn rotate_tenant(
     Ok(Json(connection_info_to_json(&info)).into_response())
 }
 
-/// `GET /admin/v1/tenants/{id}/credentials` — list credential descriptors
-/// for a tenant. `id` is the tenant ULID. Never returns the plaintext or
+/// `GET /admin/v1/projects/{id}/credentials` — list credential descriptors
+/// for a project. `id` is the project ULID. Never returns the plaintext or
 /// the hash.
 #[axum::debug_handler]
-pub(crate) async fn list_tenant_credentials(
+pub(crate) async fn list_project_credentials(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
-    Path(tenant_id): Path<String>,
+    Path(project_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let claims = authorize(&state, &headers).await?;
     require_admin(&claims)?;
 
-    let tenant: TenantId = tenant_id
+    let project: ProjectId = project_id
         .parse()
-        .map_err(|e| ApiError::invalid(format!("invalid tenant_id: {e}")))?;
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
 
     let descriptors = state
         .cfg
         .auth
-        .list_tenant_credentials(&tenant)
+        .list_project_credentials(&project)
         .await
         .map_err(ApiError::from)?;
 
@@ -129,7 +129,7 @@ pub(crate) async fn list_tenant_credentials(
         .map(|d| {
             json!({
                 "id": d.id,
-                "tenant_id": d.tenant_id.to_string(),
+                "project_id": d.project_id.to_string(),
                 "pgwire_user": d.pgwire_user,
                 "dbname": d.dbname,
                 "created_at": d.created_at.to_rfc3339(),

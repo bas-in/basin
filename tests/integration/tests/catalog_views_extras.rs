@@ -2,14 +2,14 @@
 //!
 //! Each test does a bare `SELECT * FROM <view>` and asserts it returns without
 //! error. Row counts are not asserted — some views return 0 rows on an empty
-//! tenant (locks, triggers, …) and some return ≥1 (settings, stat_activity).
+//! project (locks, triggers, …) and some return ≥1 (settings, stat_activity).
 
 #![allow(clippy::print_stdout)]
 
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -38,7 +38,7 @@ async fn open_engine() -> (TempDir, Engine) {
 }
 
 /// Execute `sql` and assert it completes without error. Rows are discarded.
-async fn assert_no_error(sess: &basin_engine::TenantSession, sql: &str) {
+async fn assert_no_error(sess: &basin_engine::ProjectSession, sql: &str) {
     match sess.execute(sql).await {
         Ok(_) => {}
         Err(e) => panic!("unexpected error for query [{sql}]: {e}"),
@@ -52,84 +52,84 @@ async fn assert_no_error(sess: &basin_engine::TenantSession, sql: &str) {
 #[tokio::test]
 async fn pg_database_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_database").await;
 }
 
 #[tokio::test]
 async fn pg_roles_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_roles").await;
 }
 
 #[tokio::test]
 async fn pg_views_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_views").await;
 }
 
 #[tokio::test]
 async fn pg_indexes_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_indexes").await;
 }
 
 #[tokio::test]
 async fn pg_tables_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_tables").await;
 }
 
 #[tokio::test]
 async fn pg_settings_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_settings").await;
 }
 
 #[tokio::test]
 async fn pg_extension_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_extension").await;
 }
 
 #[tokio::test]
 async fn pg_description_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_description").await;
 }
 
 #[tokio::test]
 async fn pg_stat_user_tables_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_user_tables").await;
 }
 
 #[tokio::test]
 async fn pg_stat_user_indexes_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_user_indexes").await;
 }
 
 #[tokio::test]
 async fn pg_locks_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_locks").await;
 }
 
 #[tokio::test]
 async fn pg_stat_activity_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_activity").await;
 }
 
@@ -140,7 +140,7 @@ async fn pg_stat_activity_selectable() {
 #[tokio::test]
 async fn information_schema_check_constraints_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(
         &sess,
         "SELECT * FROM information_schema.check_constraints",
@@ -151,35 +151,35 @@ async fn information_schema_check_constraints_selectable() {
 #[tokio::test]
 async fn information_schema_triggers_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM information_schema.triggers").await;
 }
 
 #[tokio::test]
 async fn information_schema_sequences_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM information_schema.sequences").await;
 }
 
 #[tokio::test]
 async fn information_schema_domains_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM information_schema.domains").await;
 }
 
 #[tokio::test]
 async fn information_schema_parameters_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM information_schema.parameters").await;
 }
 
 #[tokio::test]
 async fn information_schema_role_table_grants_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(
         &sess,
         "SELECT * FROM information_schema.role_table_grants",
@@ -190,7 +190,7 @@ async fn information_schema_role_table_grants_selectable() {
 #[tokio::test]
 async fn information_schema_user_defined_types_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(
         &sess,
         "SELECT * FROM information_schema.user_defined_types",
@@ -201,7 +201,7 @@ async fn information_schema_user_defined_types_selectable() {
 #[tokio::test]
 async fn information_schema_column_domain_usage_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(
         &sess,
         "SELECT * FROM information_schema.column_domain_usage",
@@ -212,7 +212,7 @@ async fn information_schema_column_domain_usage_selectable() {
 #[tokio::test]
 async fn information_schema_column_udt_usage_selectable() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_no_error(&sess, "SELECT * FROM information_schema.column_udt_usage").await;
 }
 
@@ -223,7 +223,7 @@ async fn information_schema_column_udt_usage_selectable() {
 #[tokio::test]
 async fn pg_settings_has_rows() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     match sess
         .execute("SELECT count(*) FROM pg_catalog.pg_settings")
         .await
@@ -245,7 +245,7 @@ async fn pg_settings_has_rows() {
 #[tokio::test]
 async fn pg_database_has_one_row() {
     let (_dir, engine) = open_engine().await;
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     match sess
         .execute("SELECT count(*) FROM pg_catalog.pg_database")
         .await

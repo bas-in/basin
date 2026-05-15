@@ -1,12 +1,12 @@
 //! S3 port of `viability_isolation_under_load.rs`.
 //!
-//! 50 tenants × 100 tasks × 20 ops (= 2000 ops total — same as LocalFS).
+//! 50 projects × 100 tasks × 20 ops (= 2000 ops total — same as LocalFS).
 //! The brief mentioned scaling down to 1000 ops, but the tasks * ops product
 //! controls the workload; here it's already TASKS * OPS_PER_TASK = 2000.
 //! We keep the same shape and let the wall-clock breathe.
 //!
 //! Storage layer is on S3, so each INSERT triggers a real PUT. Bar is still
-//! `leaks == 0` — a cross-tenant leak is fatal regardless of backend.
+//! `leaks == 0` — a cross-project leak is fatal regardless of backend.
 
 #![allow(clippy::print_stdout)]
 
@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use arrow_array::{Array, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use object_store::path::Path as ObjectPath;
@@ -26,10 +26,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 const TEST_NAME: &str = "s3_isolation_under_load";
-const TENANTS: usize = 50;
+const PROJECTS: usize = 50;
 const TASKS: usize = 50;
 // Down from 20 ops/task (= 2000 total) to 20 ops/task with 50 tasks (= 1000
-// total), per the brief. Cross-tenant leaks are still detectable at this
+// total), per the brief. Cross-project leaks are still detectable at this
 // scale; the savings is on S3 PUT volume.
 const OPS_PER_TASK: usize = 20;
 
@@ -75,10 +75,10 @@ async fn s3_isolation_under_load() {
         shard: None,
     });
 
-    let mut sessions: Vec<Arc<Mutex<TenantSession>>> = Vec::with_capacity(TENANTS);
-    let mut markers: Vec<String> = Vec::with_capacity(TENANTS);
-    for _ in 0..TENANTS {
-        let t = TenantId::new();
+    let mut sessions: Vec<Arc<Mutex<ProjectSession>>> = Vec::with_capacity(PROJECTS);
+    let mut markers: Vec<String> = Vec::with_capacity(PROJECTS);
+    for _ in 0..PROJECTS {
+        let t = ProjectId::new();
         let sess = engine.open_session(t).await.unwrap();
         sess.execute("CREATE TABLE events (id BIGINT NOT NULL, marker TEXT NOT NULL)")
             .await
@@ -104,9 +104,9 @@ async fn s3_isolation_under_load() {
             let mut rng_state: u64 = (task_id as u64).wrapping_mul(0xA5A5A5A5).wrapping_add(1);
 
             for op_idx in 0..OPS_PER_TASK {
-                let tenant_idx = (next_u64(&mut rng_state) as usize) % TENANTS;
-                let expected_marker = markers[tenant_idx].as_str();
-                let sess = sessions[tenant_idx].clone();
+                let project_idx = (next_u64(&mut rng_state) as usize) % PROJECTS;
+                let expected_marker = markers[project_idx].as_str();
+                let sess = sessions[project_idx].clone();
                 let is_read = (next_u64(&mut rng_state) % 10) < 7;
 
                 if is_read {
@@ -155,8 +155,8 @@ async fn s3_isolation_under_load() {
     let pass = leaks_val == 0;
 
     println!(
-        "[S3 isolation_under_load] tenants={}, ops={}, leaks={}, elapsed={:.2}s (bar leaks=0) {}",
-        TENANTS,
+        "[S3 isolation_under_load] projects={}, ops={}, leaks={}, elapsed={:.2}s (bar leaks=0) {}",
+        PROJECTS,
         ops_val,
         leaks_val,
         elapsed.as_secs_f64(),
@@ -165,8 +165,8 @@ async fn s3_isolation_under_load() {
 
     report_real_viability(
         "isolation_under_load",
-        "Tenant isolation under concurrent load (real S3)",
-        "Concurrent multi-tenant traffic on S3 produces zero cross-tenant row leakage.",
+        "Project isolation under concurrent load (real S3)",
+        "Concurrent multi-project traffic on S3 produces zero cross-project row leakage.",
         pass,
         PrimaryMetric {
             label: "leaks".into(),
@@ -175,7 +175,7 @@ async fn s3_isolation_under_load() {
             bar: BarOp::eq(0.0),
         },
         json!({
-            "tenants": TENANTS,
+            "projects": PROJECTS,
             "ops": ops_val,
             "elapsed_s": elapsed.as_secs_f64(),
             "endpoint": s3_cfg.endpoint.clone(),
@@ -183,5 +183,5 @@ async fn s3_isolation_under_load() {
         }),
     );
 
-    assert_eq!(leaks_val, 0, "{leaks_val} cross-tenant row leaks observed");
+    assert_eq!(leaks_val, 0, "{leaks_val} cross-project row leaks observed");
 }

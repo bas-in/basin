@@ -22,7 +22,7 @@ use datafusion::logical_expr::{Filter, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::{DataFrame, SessionContext};
 use serde_json::Value as JsonValue;
 
-use crate::TenantSession;
+use crate::ProjectSession;
 
 /// Pre-screened lifecycle config extracted from a raw `CREATE TABLE`
 /// statement. `auto_update_columns` and `soft_delete_columns` are the bare
@@ -658,19 +658,19 @@ pub(crate) fn audit_schema() -> Schema {
     ])
 }
 
-/// Ensure `audit_table` exists in the tenant's catalog, creating it on
+/// Ensure `audit_table` exists in the project's catalog, creating it on
 /// first reference with the canonical [`audit_schema`]. No-op if it
 /// already exists.
-async fn ensure_audit_table_exists(sess: &TenantSession, audit_table: &TableName) -> Result<()> {
+async fn ensure_audit_table_exists(sess: &ProjectSession, audit_table: &TableName) -> Result<()> {
     let cat = sess.engine.config().catalog.clone();
-    match cat.load_table(&sess.tenant, audit_table).await {
+    match cat.load_table(&sess.project, audit_table).await {
         Ok(_) => Ok(()),
         Err(BasinError::NotFound(_)) => {
             let schema = audit_schema();
-            cat.create_table(&sess.tenant, audit_table, &schema).await?;
+            cat.create_table(&sess.project, audit_table, &schema).await?;
             crate::session::refresh_table(
                 &sess.engine,
-                &sess.tenant,
+                &sess.project,
                 &sess.ctx,
                 &sess.state,
                 audit_table,
@@ -692,7 +692,7 @@ async fn ensure_audit_table_exists(sess: &TenantSession, audit_table: &TableName
 /// transactions don't yet exist in this engine (see Phase 5 task),
 /// which is the natural fix.
 pub(crate) async fn write_audit_rows(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     audit_table_name: &str,
     op: ChangeOp,
     records: Vec<AuditRecord>,
@@ -706,7 +706,7 @@ pub(crate) async fn write_audit_rows(
         .engine
         .config()
         .catalog
-        .load_table(&sess.tenant, &audit_table)
+        .load_table(&sess.project, &audit_table)
         .await?;
     let schema = meta.schema.clone();
     let n = records.len();
@@ -731,12 +731,12 @@ pub(crate) async fn write_audit_rows(
         .with_data_type(schema.field(4).data_type().clone());
     let mut user_b = StringBuilder::with_capacity(n, n * 8);
 
-    // Audit-id is a per-(tenant, audit_table) sequence; the engine's
+    // Audit-id is a per-(project, audit_table) sequence; the engine's
     // existing `next_event_seq` table keeps a monotonic counter under
     // exactly that key shape so we lean on it instead of carrying our
     // own.
     for rec in records {
-        let id = sess.engine.next_event_seq(&sess.tenant, &audit_table) as i64;
+        let id = sess.engine.next_event_seq(&sess.project, &audit_table) as i64;
         id_b.append_value(id);
         op_b.append_value(op_text);
         match rec.before.as_ref() {
@@ -777,7 +777,7 @@ pub(crate) async fn write_audit_rows(
     let storage = &sess.engine.config().storage;
     let part = PartitionKey::default_key();
     let df = storage
-        .write_batch(&sess.tenant, &audit_table, &part, &batch)
+        .write_batch(&sess.project, &audit_table, &part, &batch)
         .await?;
     let file_ref = DataFileRef {
         path: df.path.as_ref().to_string(),
@@ -790,14 +790,14 @@ pub(crate) async fn write_audit_rows(
     let cat = sess.engine.config().catalog.clone();
     let expected = meta.current_snapshot;
     match cat
-        .append_data_files(&sess.tenant, &audit_table, expected, vec![file_ref.clone()])
+        .append_data_files(&sess.project, &audit_table, expected, vec![file_ref.clone()])
         .await
     {
         Ok(_) => {}
         Err(BasinError::CommitConflict(_)) => {
-            let fresh = cat.load_table(&sess.tenant, &audit_table).await?;
+            let fresh = cat.load_table(&sess.project, &audit_table).await?;
             cat.append_data_files(
-                &sess.tenant,
+                &sess.project,
                 &audit_table,
                 fresh.current_snapshot,
                 vec![file_ref],
@@ -808,7 +808,7 @@ pub(crate) async fn write_audit_rows(
     }
     crate::session::refresh_table(
         &sess.engine,
-        &sess.tenant,
+        &sess.project,
         &sess.ctx,
         &sess.state,
         &audit_table,

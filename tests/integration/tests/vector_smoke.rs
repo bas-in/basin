@@ -25,7 +25,7 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_vector::Distance;
@@ -95,8 +95,8 @@ async fn vector_search_smoke() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let session = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let session = engine.open_session(project).await.unwrap();
     let table = TableName::new("docs").unwrap();
 
     // 1. CREATE TABLE ... vector(N).
@@ -140,15 +140,15 @@ async fn vector_search_smoke() {
     .unwrap();
     let part = PartitionKey::default_key();
     let df = storage
-        .write_batch(&tenant, &table, &part, &batch)
+        .write_batch(&project, &table, &part, &batch)
         .await
         .unwrap();
 
     // Commit the bulk file in the catalog so SQL queries can see it.
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     catalog
         .append_data_files(
-            &tenant,
+            &project,
             &table,
             meta.current_snapshot,
             vec![DataFileRef {
@@ -164,7 +164,7 @@ async fn vector_search_smoke() {
     // The SessionContext caches a `ListingTable` snapshot of the data files;
     // re-open the session so subsequent SQL sees the bulk file.
     drop(session);
-    let session = engine.open_session(tenant).await.unwrap();
+    let session = engine.open_session(project).await.unwrap();
 
     // 4. Pick a query vector. Using a fixed seed so the test is fully
     //    reproducible. The point of the test is consistency between brute

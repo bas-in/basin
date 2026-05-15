@@ -15,9 +15,9 @@ every architectural decision starts to bend around future cross-region
 2PC, and the team ends up shipping nothing usable for two years while
 trying to make eventual consistency feel like strong consistency.
 
-The wedge customer (multi-tenant SaaS with audit-log workloads) is
+The wedge customer (multi-project SaaS with audit-log workloads) is
 typically *single-region for compliance reasons* — GDPR, US data
-residency, BYO-bucket tenants. A multi-region story is not on their
+residency, BYO-bucket projects. A multi-region story is not on their
 critical path until they cross the threshold of "enterprise customers
 in Asia-Pacific are demanding sub-100ms reads from Sydney." That is a
 real threshold, but it is far past the threshold of "any wedge customer
@@ -67,20 +67,20 @@ Customers who need multi-region today should not pick Basin.
 Single-region is a current scope choice, not a design assumption baked
 into the types. The following pieces preserve future option value:
 
-- The storage layout `/tenants/{tenant_id}/...` is region-agnostic.
+- The storage layout `/projects/{project_id}/...` is region-agnostic.
   S3 cross-region replication "just works" against it.
-- The WAL is keyed by `(tenant_id, partition_key)`; partition keys
+- The WAL is keyed by `(project_id, partition_key)`; partition keys
   can carry a region tag in the future without rewriting the WAL.
 - The catalog client trait (`basin-catalog::Catalog`) does not assume
   a single instance — a future regional catalog implementation slots
   into the same trait.
-- Tenant IDs are ULIDs, not region-namespaced. We can prepend a region
+- Project IDs are ULIDs, not region-namespaced. We can prepend a region
   in the prefix later without an ID migration.
 
 The single concrete thing we should *not* do meanwhile: bake
 single-region assumptions into bucket policies that key off the bucket
 itself rather than the prefix. Already enforced by the existing
-per-tenant prefix layout.
+per-project prefix layout.
 
 ## Trigger to reconsider
 

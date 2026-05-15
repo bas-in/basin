@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use basin_common::TenantId;
-use basin_router::{run_until_bound, ServerConfig, StaticTenantResolver, TlsConfig};
+use basin_common::ProjectId;
+use basin_router::{run_until_bound, ServerConfig, StaticProjectResolver, TlsConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,13 +47,13 @@ async fn spawn_router(
     });
 
     let mut map = HashMap::new();
-    map.insert("alice".to_owned(), TenantId::new());
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    map.insert("alice".to_owned(), ProjectId::new());
+    let resolver = Arc::new(StaticProjectResolver::new(map));
 
     let running = run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls,

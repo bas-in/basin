@@ -1,9 +1,9 @@
-//! Per-tenant fair-share I/O scheduler over a shared global RPC budget.
+//! Per-project fair-share I/O scheduler over a shared global RPC budget.
 //!
-//! Earliest-deadline-first (EDF) with a per-tenant fairness cap.
+//! Earliest-deadline-first (EDF) with a per-project fairness cap.
 //! Activates the v0.3 fix described in ADR 0008. Point reads (5 ms
 //! deadline) consistently beat bulk scans (1 s deadline); the
-//! consecutive-dispatch cap prevents one tenant from monopolising via
+//! consecutive-dispatch cap prevents one project from monopolising via
 //! deadline=now flooding.
 //!
 //! ## Deadline-budget formula
@@ -17,7 +17,7 @@
 //! }
 //! ```
 //!
-//! Priority is derived at the `TenantScopedStore` boundary:
+//! Priority is derived at the `ProjectScopedStore` boundary:
 //!
 //! - `head` / small `get_range` (< [`PRIORITY_RANGE_BYTES_THRESHOLD`])
 //!   / `list` / `delete` / `copy` / full `get_opts` → **High** (point-shaped).
@@ -27,22 +27,22 @@
 //! ADR 0008 doesn't fully specify the deadline-budget formula. We use a
 //! priority-class formula (rather than a recent-throughput one) because
 //! the workload signal we have is *operation shape*, not historical
-//! tenant volume: a quiet tenant issuing a 1 GB scan should still
-//! receive the bulk deadline, and a noisy tenant issuing a point lookup
+//! project volume: a quiet project issuing a 1 GB scan should still
+//! receive the bulk deadline, and a noisy project issuing a point lookup
 //! should still receive the point deadline. Recent-throughput
 //! prioritisation collapses to the same outcome in steady state (a
-//! tenant doing many bulk ops naturally accumulates bulk-class
-//! deadlines) without the bookkeeping. Per-tenant rate counters are
-//! still maintained on `TenantStatsAtomics` so `Storage::tenant_stats`
-//! exposes them for the noisy-tenant detector at the engine layer.
+//! project doing many bulk ops naturally accumulates bulk-class
+//! deadlines) without the bookkeeping. Per-project rate counters are
+//! still maintained on `ProjectStatsAtomics` so `Storage::project_stats`
+//! exposes them for the noisy-project detector at the engine layer.
 //!
-//! Per-tenant cost is O(bytes): two VecDeques + counters. Heap entries
-//! are 24 bytes. No per-tenant tasks. Idle tenants are evicted.
+//! Per-project cost is O(bytes): two VecDeques + counters. Heap entries
+//! are 24 bytes. No per-project tasks. Idle projects are evicted.
 //!
 //! Liveness: each request awaits a `oneshot::Receiver`. The dispatcher
 //! is driven inline from `acquire` and `Permit::Drop` — no background
-//! task. The per-tenant semaphore in `TenantScopedStore` is acquired
-//! BEFORE we enqueue, so its liveness floor still bounds each tenant.
+//! task. The per-project semaphore in `ProjectScopedStore` is acquired
+//! BEFORE we enqueue, so its liveness floor still bounds each project.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -50,10 +50,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use tokio::sync::oneshot;
 
-/// Total in-flight RPC budget across all tenants. ADR 0008 explains
+/// Total in-flight RPC budget across all projects. ADR 0008 explains
 /// why <4 deadlocks the Parquet reader's range fan-out.
 pub const DEFAULT_GLOBAL_BUDGET: usize = 4;
 
@@ -61,13 +61,13 @@ pub const DEFAULT_GLOBAL_BUDGET: usize = 4;
 const HIGH_PRIORITY_DEADLINE: Duration = Duration::from_millis(5);
 const LOW_PRIORITY_DEADLINE: Duration = Duration::from_millis(1000);
 
-/// Yielding tenant's new deadline = max(other_head, self) + epsilon.
+/// Yielding project's new deadline = max(other_head, self) + epsilon.
 const FAIRNESS_YIELD_EPSILON: Duration = Duration::from_micros(1);
 
-/// Max consecutive dispatches by the same tenant before yielding to
-/// another tenant with queued work. Load-bearing fairness invariant:
-/// without this, a tenant flooding the heap with deadline=now starves
-/// other tenants.
+/// Max consecutive dispatches by the same project before yielding to
+/// another project with queued work. Load-bearing fairness invariant:
+/// without this, a project flooding the heap with deadline=now starves
+/// other projects.
 const CONSECUTIVE_DISPATCH_CAP: u8 = 2;
 
 /// Priority class. High = point reads / HEADs / footer fetches (5ms
@@ -90,21 +90,21 @@ impl Priority {
 /// Range size at which `concurrency.rs` heuristics flip High→Low.
 pub(crate) const PRIORITY_RANGE_BYTES_THRESHOLD: usize = 256 * 1024;
 
-/// Public lock-free view of one tenant's live I/O accounting. Used by
-/// the engine layer for noisy-tenant detection.
+/// Public lock-free view of one project's live I/O accounting. Used by
+/// the engine layer for noisy-project detection.
 #[derive(Debug, Clone, Default)]
-pub struct TenantIoStats {
+pub struct ProjectIoStats {
     pub in_flight: u64,
     pub queue_depth_high: u64,
     pub queue_depth_low: u64,
     /// Arrivals in the most recent ~1s window (resets when stale).
     pub recent_rpcs: u64,
-    /// Total RPCs ever issued by this tenant (monotonic).
+    /// Total RPCs ever issued by this project (monotonic).
     pub total_rpcs: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct TenantStatsAtomics {
+pub(crate) struct ProjectStatsAtomics {
     in_flight: AtomicU64,
     queue_depth_high: AtomicU64,
     queue_depth_low: AtomicU64,
@@ -112,7 +112,7 @@ pub(crate) struct TenantStatsAtomics {
     total_rpcs: AtomicU64,
 }
 
-impl TenantStatsAtomics {
+impl ProjectStatsAtomics {
     fn new() -> Self {
         Self {
             in_flight: AtomicU64::new(0),
@@ -123,8 +123,8 @@ impl TenantStatsAtomics {
         }
     }
 
-    fn snapshot(&self) -> TenantIoStats {
-        TenantIoStats {
+    fn snapshot(&self) -> ProjectIoStats {
+        ProjectIoStats {
             in_flight: self.in_flight.load(Ordering::Relaxed),
             queue_depth_high: self.queue_depth_high.load(Ordering::Relaxed),
             queue_depth_low: self.queue_depth_low.load(Ordering::Relaxed),
@@ -138,16 +138,16 @@ struct Waiter {
     tx: oneshot::Sender<Permit>,
 }
 
-/// Per-tenant queue. Waiter deadline = enqueue time + priority budget.
-struct TenantQueue {
+/// Per-project queue. Waiter deadline = enqueue time + priority budget.
+struct ProjectQueue {
     high: VecDeque<DeadlinedWaiter>,
     low: VecDeque<DeadlinedWaiter>,
     in_flight: u64,
-    /// Consecutive dispatches without yielding. Reset on tenant switch.
+    /// Consecutive dispatches without yielding. Reset on project switch.
     consecutive_dispatches: u8,
-    /// Set when this tenant has a (possibly stale) entry in the heap.
+    /// Set when this project has a (possibly stale) entry in the heap.
     in_heap: bool,
-    stats: Arc<TenantStatsAtomics>,
+    stats: Arc<ProjectStatsAtomics>,
 }
 
 struct DeadlinedWaiter {
@@ -155,8 +155,8 @@ struct DeadlinedWaiter {
     deadline: Instant,
 }
 
-impl TenantQueue {
-    fn new(stats: Arc<TenantStatsAtomics>) -> Self {
+impl ProjectQueue {
+    fn new(stats: Arc<ProjectStatsAtomics>) -> Self {
         Self {
             high: VecDeque::new(),
             low: VecDeque::new(),
@@ -167,7 +167,7 @@ impl TenantQueue {
         }
     }
 
-    /// Pop next waiter — high lane wins intra-tenant.
+    /// Pop next waiter — high lane wins intra-project.
     fn pop_next(&mut self) -> Option<DeadlinedWaiter> {
         if let Some(w) = self.high.pop_front() {
             self.stats.queue_depth_high.fetch_sub(1, Ordering::Relaxed);
@@ -199,14 +199,14 @@ impl TenantQueue {
     }
 }
 
-/// One heap entry per active tenant. Stale entries (deadline differs
-/// from tenant's current `head_deadline()`) are skipped on pop.
+/// One heap entry per active project. Stale entries (deadline differs
+/// from project's current `head_deadline()`) are skipped on pop.
 /// Wrapped in `Reverse` to make `BinaryHeap` a min-heap on deadline.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct DeadlineEntry {
     deadline: Instant,
     seq: u64,
-    tenant: TenantId,
+    project: ProjectId,
 }
 
 impl Ord for DeadlineEntry {
@@ -214,7 +214,7 @@ impl Ord for DeadlineEntry {
         self.deadline
             .cmp(&other.deadline)
             .then_with(|| self.seq.cmp(&other.seq))
-            .then_with(|| self.tenant.cmp(&other.tenant))
+            .then_with(|| self.project.cmp(&other.project))
     }
 }
 
@@ -233,24 +233,24 @@ pub struct Scheduler {
 struct SchedulerInner {
     global_budget: usize,
     state: Mutex<State>,
-    /// Per-tenant atomic stats. Read lock-free by `Storage::tenant_stats`.
-    stats: Mutex<HashMap<TenantId, Arc<TenantStatsAtomics>>>,
+    /// Per-project atomic stats. Read lock-free by `Storage::project_stats`.
+    stats: Mutex<HashMap<ProjectId, Arc<ProjectStatsAtomics>>>,
 }
 
 struct State {
     available: usize,
-    queues: HashMap<TenantId, TenantQueue>,
+    queues: HashMap<ProjectId, ProjectQueue>,
     heap: BinaryHeap<Reverse<DeadlineEntry>>,
-    /// Per-tenant rate window start (recent_rpcs reset boundary).
-    rate_window_start: HashMap<TenantId, Instant>,
+    /// Per-project rate window start (recent_rpcs reset boundary).
+    rate_window_start: HashMap<ProjectId, Instant>,
     next_seq: u64,
-    last_dispatched_tenant: Option<TenantId>,
+    last_dispatched_project: Option<ProjectId>,
 }
 
 /// RAII permit. Drop releases the global slot.
 pub(crate) struct Permit {
     sched: Arc<SchedulerInner>,
-    tenant: TenantId,
+    project: ProjectId,
     /// false if the receiver was dropped before the permit landed.
     held: bool,
 }
@@ -262,16 +262,16 @@ impl Drop for Permit {
         }
         let mut state = self.sched.state.lock().expect("scheduler state poisoned");
         state.available += 1;
-        if let Some(q) = state.queues.get_mut(&self.tenant) {
+        if let Some(q) = state.queues.get_mut(&self.project) {
             if q.in_flight > 0 {
                 q.in_flight -= 1;
-                self.sched.stats_for(&self.tenant, |s| {
+                self.sched.stats_for(&self.project, |s| {
                     s.in_flight.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             if q.is_idle() {
-                state.queues.remove(&self.tenant);
-                state.rate_window_start.remove(&self.tenant);
+                state.queues.remove(&self.project);
+                state.rate_window_start.remove(&self.project);
             }
         }
         drop(state);
@@ -295,7 +295,7 @@ impl Scheduler {
                     heap: BinaryHeap::new(),
                     rate_window_start: HashMap::new(),
                     next_seq: 0,
-                    last_dispatched_tenant: None,
+                    last_dispatched_project: None,
                 }),
                 stats: Mutex::new(HashMap::new()),
             }),
@@ -304,7 +304,7 @@ impl Scheduler {
 
     /// Enqueue and await dispatch. Returns a `Permit` that must be held
     /// for the underlying RPC's lifetime. Cancellation-safe.
-    pub(crate) async fn acquire(&self, tenant: TenantId, priority: Priority) -> Permit {
+    pub(crate) async fn acquire(&self, project: ProjectId, priority: Priority) -> Permit {
         let (tx, rx) = oneshot::channel();
         let deadline = Instant::now() + priority.deadline_budget();
         let dw = DeadlinedWaiter {
@@ -313,12 +313,12 @@ impl Scheduler {
         };
 
         {
-            let stats = self.inner.ensure_stats(&tenant);
+            let stats = self.inner.ensure_stats(&project);
             let mut state = self.inner.state.lock().expect("scheduler state poisoned");
 
             // Recent-rpcs single-second rate window.
             let now = Instant::now();
-            let win_start = state.rate_window_start.entry(tenant).or_insert(now);
+            let win_start = state.rate_window_start.entry(project).or_insert(now);
             if now.duration_since(*win_start).as_secs_f64() >= 1.0 {
                 *win_start = now;
                 stats.recent_rpcs.store(0, Ordering::Relaxed);
@@ -329,8 +329,8 @@ impl Scheduler {
             let head_deadline = {
                 let q = state
                     .queues
-                    .entry(tenant)
-                    .or_insert_with(|| TenantQueue::new(stats.clone()));
+                    .entry(project)
+                    .or_insert_with(|| ProjectQueue::new(stats.clone()));
                 match priority {
                     Priority::High => {
                         q.high.push_back(dw);
@@ -352,7 +352,7 @@ impl Scheduler {
             state.heap.push(Reverse(DeadlineEntry {
                 deadline: head_deadline,
                 seq,
-                tenant,
+                project,
             }));
         }
 
@@ -360,13 +360,13 @@ impl Scheduler {
         rx.await.expect("dispatcher dropped waiter")
     }
 
-    /// Lock-free read of one tenant's live stats. Returns zeros if the
-    /// tenant has never used the scheduler.
-    pub fn tenant_stats(&self, tenant: &TenantId) -> TenantIoStats {
+    /// Lock-free read of one project's live stats. Returns zeros if the
+    /// project has never used the scheduler.
+    pub fn project_stats(&self, project: &ProjectId) -> ProjectIoStats {
         let stats = self.inner.stats.lock().expect("stats map poisoned");
-        match stats.get(tenant) {
+        match stats.get(project) {
             Some(s) => s.snapshot(),
-            None => TenantIoStats::default(),
+            None => ProjectIoStats::default(),
         }
     }
 
@@ -375,7 +375,7 @@ impl Scheduler {
     /// await — so this is safe to call from the request hot path.
     fn try_dispatch(&self) {
         loop {
-            let (waiter, tenant) = {
+            let (waiter, project) = {
                 let mut state = self.inner.state.lock().expect("scheduler state poisoned");
                 if state.available == 0 {
                     return;
@@ -391,7 +391,7 @@ impl Scheduler {
             // Permit::Drop.
             let permit = Permit {
                 sched: self.inner.clone(),
-                tenant,
+                project,
                 held: true,
             };
             if let Err(returned) = waiter.tx.send(permit) {
@@ -400,11 +400,11 @@ impl Scheduler {
         }
     }
 
-    /// Pop the earliest-deadline tenant honoring the fairness cap.
+    /// Pop the earliest-deadline project honoring the fairness cap.
     /// On success: state.available decremented, in_flight incremented,
     /// consecutive_dispatches updated. Returns None if nothing is
     /// dispatchable.
-    fn pick_next(&self, state: &mut State) -> Option<(Waiter, TenantId)> {
+    fn pick_next(&self, state: &mut State) -> Option<(Waiter, ProjectId)> {
         // Defensive bound: stale entries are dropped without re-push;
         // fairness yields re-push at most once per encounter.
         let mut sweep_budget = state.heap.len().saturating_mul(2) + 8;
@@ -413,10 +413,10 @@ impl Scheduler {
 
             let Reverse(top) = state.heap.pop()?;
 
-            // Stale check: the heap entry must match the tenant's
-            // current head_deadline. If it doesn't, the tenant has
+            // Stale check: the heap entry must match the project's
+            // current head_deadline. If it doesn't, the project has
             // either drained or has a newer (earlier) entry pushed.
-            let (matches, head_dl) = match state.queues.get(&top.tenant) {
+            let (matches, head_dl) = match state.queues.get(&top.project) {
                 Some(q) => match q.head_deadline() {
                     Some(hd) => (hd == top.deadline, Some(hd)),
                     None => (false, None),
@@ -425,32 +425,32 @@ impl Scheduler {
             };
             if !matches {
                 if head_dl.is_none() {
-                    if let Some(q) = state.queues.get_mut(&top.tenant) {
+                    if let Some(q) = state.queues.get_mut(&top.project) {
                         q.in_heap = false;
                     }
                 }
                 continue;
             }
 
-            // Fairness yield: if this tenant hit the consecutive cap
-            // and any other tenant has queued work, bump our deadlines
+            // Fairness yield: if this project hit the consecutive cap
+            // and any other project has queued work, bump our deadlines
             // past theirs and re-push.
             let consecutive = state
                 .queues
-                .get(&top.tenant)
+                .get(&top.project)
                 .map(|q| q.consecutive_dispatches)
                 .unwrap_or(0);
             if consecutive >= CONSECUTIVE_DISPATCH_CAP {
                 let next_other = state
                     .queues
                     .iter()
-                    .filter(|(t, q)| **t != top.tenant && !q.is_queue_empty())
+                    .filter(|(t, q)| **t != top.project && !q.is_queue_empty())
                     .filter_map(|(_, q)| q.head_deadline())
                     .min();
                 if let Some(other_dl) = next_other {
                     let target = (other_dl + FAIRNESS_YIELD_EPSILON)
                         .max(top.deadline + FAIRNESS_YIELD_EPSILON);
-                    if let Some(q) = state.queues.get_mut(&top.tenant) {
+                    if let Some(q) = state.queues.get_mut(&top.project) {
                         let shift = target.saturating_duration_since(top.deadline);
                         for w in q.high.iter_mut() {
                             w.deadline += shift;
@@ -466,19 +466,19 @@ impl Scheduler {
                     state.heap.push(Reverse(DeadlineEntry {
                         deadline: target,
                         seq,
-                        tenant: top.tenant,
+                        project: top.project,
                     }));
                     continue;
                 }
-                // Sole tenant — clear streak, dispatch.
-                if let Some(q) = state.queues.get_mut(&top.tenant) {
+                // Sole project — clear streak, dispatch.
+                if let Some(q) = state.queues.get_mut(&top.project) {
                     q.consecutive_dispatches = 0;
                 }
             }
 
             // Pop the waiter and dispatch.
             let (waiter, queue_drained) = {
-                let Some(q) = state.queues.get_mut(&top.tenant) else {
+                let Some(q) = state.queues.get_mut(&top.project) else {
                     continue;
                 };
                 let Some(w) = q.pop_next() else { continue };
@@ -495,7 +495,7 @@ impl Scheduler {
             if !queue_drained {
                 if let Some(d) = state
                     .queues
-                    .get(&top.tenant)
+                    .get(&top.project)
                     .and_then(|q| q.head_deadline())
                 {
                     let seq = state.next_seq;
@@ -503,17 +503,17 @@ impl Scheduler {
                     state.heap.push(Reverse(DeadlineEntry {
                         deadline: d,
                         seq,
-                        tenant: top.tenant,
+                        project: top.project,
                     }));
-                    if let Some(q) = state.queues.get_mut(&top.tenant) {
+                    if let Some(q) = state.queues.get_mut(&top.project) {
                         q.in_heap = true;
                     }
                 }
             }
 
             // Streak bookkeeping.
-            let same = state.last_dispatched_tenant == Some(top.tenant);
-            if let Some(q) = state.queues.get_mut(&top.tenant) {
+            let same = state.last_dispatched_project == Some(top.project);
+            if let Some(q) = state.queues.get_mut(&top.project) {
                 q.consecutive_dispatches = if same {
                     q.consecutive_dispatches.saturating_add(1)
                 } else {
@@ -521,31 +521,31 @@ impl Scheduler {
                 };
             }
             if !same {
-                if let Some(prev) = state.last_dispatched_tenant {
+                if let Some(prev) = state.last_dispatched_project {
                     if let Some(prev_q) = state.queues.get_mut(&prev) {
                         prev_q.consecutive_dispatches = 0;
                     }
                 }
             }
-            state.last_dispatched_tenant = Some(top.tenant);
+            state.last_dispatched_project = Some(top.project);
             state.available -= 1;
-            return Some((waiter.waiter, top.tenant));
+            return Some((waiter.waiter, top.project));
         }
         None
     }
 }
 
 impl SchedulerInner {
-    fn ensure_stats(&self, tenant: &TenantId) -> Arc<TenantStatsAtomics> {
+    fn ensure_stats(&self, project: &ProjectId) -> Arc<ProjectStatsAtomics> {
         let mut map = self.stats.lock().expect("stats map poisoned");
-        map.entry(*tenant)
-            .or_insert_with(|| Arc::new(TenantStatsAtomics::new()))
+        map.entry(*project)
+            .or_insert_with(|| Arc::new(ProjectStatsAtomics::new()))
             .clone()
     }
 
-    fn stats_for<F: FnOnce(&TenantStatsAtomics)>(&self, tenant: &TenantId, f: F) {
+    fn stats_for<F: FnOnce(&ProjectStatsAtomics)>(&self, project: &ProjectId, f: F) {
         let map = self.stats.lock().expect("stats map poisoned");
-        if let Some(s) = map.get(tenant) {
+        if let Some(s) = map.get(project) {
             f(s);
         }
     }
@@ -568,14 +568,14 @@ mod tests {
     #[tokio::test]
     async fn budget_caps_concurrency() {
         let s = Scheduler::new(2);
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let max = Arc::new(AtomicUsize::new(0));
         let cur = Arc::new(AtomicUsize::new(0));
 
         let mut handles = vec![];
         for _ in 0..10 {
             let s = s.clone();
-            let t = tenant;
+            let t = project;
             let max = max.clone();
             let cur = cur.clone();
             handles.push(tokio::spawn(async move {
@@ -603,8 +603,8 @@ mod tests {
     #[tokio::test]
     async fn fair_share_does_not_starve() {
         let s = Scheduler::new(1);
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
 
         let mut handles = vec![];
@@ -641,11 +641,11 @@ mod tests {
         );
     }
 
-    /// Within a single tenant, High waiters jump ahead of queued Lows.
+    /// Within a single project, High waiters jump ahead of queued Lows.
     #[tokio::test]
-    async fn high_priority_jumps_within_tenant() {
+    async fn high_priority_jumps_within_project() {
         let s = Scheduler::new(1);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let blocker = s.acquire(t, Priority::Low).await;
         let mut handles = vec![];
@@ -675,9 +675,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_tenant_evicted() {
+    async fn idle_project_evicted() {
         let s = Scheduler::new(4);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         drop(s.acquire(t, Priority::Low).await);
         assert!(!s.inner.state.lock().unwrap().queues.contains_key(&t));
     }
@@ -685,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_releases_slot() {
         let s = Scheduler::new(1);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let _hold = s.acquire(t, Priority::Low).await;
         let s2 = s.clone();
         let waiter = tokio::spawn(async move {
@@ -702,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn stats_reflect_live_state() {
         let s = Scheduler::new(1);
-        let t = TenantId::new();
+        let t = ProjectId::new();
         let h = s.acquire(t, Priority::Low).await;
         let s2 = s.clone();
         let bg = tokio::spawn(async move {
@@ -710,20 +710,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         });
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let stats = s.tenant_stats(&t);
+        let stats = s.project_stats(&t);
         assert_eq!(stats.in_flight, 1, "{:?}", stats);
         assert_eq!(stats.queue_depth_low, 1, "{:?}", stats);
         drop(h);
         bg.await.unwrap();
     }
 
-    /// EDF across tenants: noisy queues 100 Low (1s deadlines), quiet
+    /// EDF across projects: noisy queues 100 Low (1s deadlines), quiet
     /// arrives with one High (5ms). Quiet must dispatch first.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn earliest_deadline_first_across_tenants() {
+    async fn earliest_deadline_first_across_projects() {
         let s = Scheduler::new(1);
-        let noisy = TenantId::new();
-        let quiet = TenantId::new();
+        let noisy = ProjectId::new();
+        let quiet = ProjectId::new();
         let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let q_started = Arc::new(tokio::sync::Notify::new());
 
@@ -767,24 +767,24 @@ mod tests {
     /// Each "RPC" = 2ms sleep holding the permit. Quiet's p99 must not
     /// blow up under noise — EDF puts High at the head of the heap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn quiet_tenant_p99_under_noise() {
+    async fn quiet_project_p99_under_noise() {
         let s = Scheduler::new(4);
-        let noisy_tenants = [
-            TenantId::new(),
-            TenantId::new(),
-            TenantId::new(),
-            TenantId::new(),
+        let noisy_projects = [
+            ProjectId::new(),
+            ProjectId::new(),
+            ProjectId::new(),
+            ProjectId::new(),
         ];
-        let quiet = TenantId::new();
+        let quiet = ProjectId::new();
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut noisy_handles = vec![];
-        for tenant in noisy_tenants {
+        for project in noisy_projects {
             let s = s.clone();
             let stop = stop.clone();
             noisy_handles.push(tokio::spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
-                    let p = s.acquire(tenant, Priority::Low).await;
+                    let p = s.acquire(project, Priority::Low).await;
                     tokio::time::sleep(Duration::from_millis(2)).await;
                     drop(p);
                 }

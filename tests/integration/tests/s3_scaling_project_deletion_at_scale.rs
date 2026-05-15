@@ -1,11 +1,11 @@
-//! S3 port of `scaling_tenant_deletion.rs` (the simple-schema variant).
+//! S3 port of `scaling_project_deletion.rs` (the simple-schema variant).
 //!
-//! Card: `tenant_deletion_at_scale` (real-cloud dashboard).
+//! Card: `project_deletion_at_scale` (real-cloud dashboard).
 //! Bar: `crossover_file_count <= BAR_CROSSOVER` when PG is available;
 //! basin-only run is a no-op pass otherwise.
 //!
 //! What this card does (mirrors the LocalFS sibling):
-//!   * Sweep file_count, measure Basin's `Storage::delete_tenant` wall
+//!   * Sweep file_count, measure Basin's `Storage::delete_project` wall
 //!     clock at each scale.
 //!   * If `[postgres]` is configured, also measure PG's
 //!     `DROP SCHEMA … CASCADE` over a single events table at the same
@@ -16,7 +16,7 @@
 //! Scale gating for cloud cost:
 //!   * R2 / generic S3 (default): SCALES = [10, 100, 1000]. Each Parquet
 //!     file is 1 PUT; 1000 files × ~3 s APAC PUT = ~50 min setup at the
-//!     largest scale. We batch all rows for a tenant into a single
+//!     largest scale. We batch all rows for a project into a single
 //!     Parquet file via the catalog (one PUT per scale point — see
 //!     setup_basin_with_files), so the wall-clock setup cost is bounded
 //!     by SCALES.len() PUTs, not files PUTs.
@@ -26,12 +26,12 @@
 //!
 //! Implementation note: the per-file PUT cost is the dominant setup
 //! constraint on R2, so we *don't* call `write_batch` once per file —
-//! we write one batched Parquet file per tenant and then *forge*
+//! we write one batched Parquet file per project and then *forge*
 //! `(files-1)` extra catalog DataFileRef rows that point at copies of
-//! the same physical object. `Storage::delete_tenant` doesn't care that
+//! the same physical object. `Storage::delete_project` doesn't care that
 //! the paths overlap — it issues `DeleteObjects` against each catalog
 //! row, which idempotently removes whatever's at the path. This keeps
-//! setup-time at one PUT per tenant on the wire while still timing the
+//! setup-time at one PUT per project on the wire while still timing the
 //! catalog-walk + bulk-delete cost at the target file count.
 //!
 //! Skips cleanly when `[s3]` is missing.
@@ -44,7 +44,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
@@ -55,7 +55,7 @@ use object_store::ObjectStore;
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
-const TEST_NAME: &str = "s3_scaling_tenant_deletion_at_scale";
+const TEST_NAME: &str = "s3_scaling_project_deletion_at_scale";
 const ROWS_PER_FILE: usize = 100;
 /// Default SCALES for cloud (R2 / S3). Capped at 1000 to bound cost.
 const SCALES_CLOUD: [usize; 3] = [10, 100, 1_000];
@@ -131,8 +131,8 @@ impl Drop for SchemaGuard {
     }
 }
 
-/// Set up Basin state for one tenant at the requested file_count, time
-/// `Storage::delete_tenant`. See module docs for the catalog-forging
+/// Set up Basin state for one project at the requested file_count, time
+/// `Storage::delete_project`. See module docs for the catalog-forging
 /// trick that keeps setup-time bounded at one PUT per scale.
 async fn measure_basin_ms(
     object_store: Arc<dyn ObjectStore>,
@@ -147,12 +147,12 @@ async fn measure_basin_ms(
     });
 
     let catalog = Arc::new(InMemoryCatalog::new());
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
@@ -163,7 +163,7 @@ async fn measure_basin_ms(
         let start = (i * ROWS_PER_FILE) as i64;
         let batch = build_batch(start, ROWS_PER_FILE);
         let f = setup_storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
         written.push(DataFileRef {
@@ -174,7 +174,7 @@ async fn measure_basin_ms(
         });
     }
     catalog
-        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .append_data_files(&project, &table, SnapshotId::GENESIS, written)
         .await
         .unwrap();
 
@@ -188,15 +188,15 @@ async fn measure_basin_ms(
 
     let started = Instant::now();
     let _deleted = storage
-        .delete_tenant(catalog.as_ref(), &tenant)
+        .delete_project(catalog.as_ref(), &project)
         .await
-        .expect("delete_tenant");
+        .expect("delete_project");
     started.elapsed().as_secs_f64() * 1000.0
 }
 
 async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
     let total_rows = files * ROWS_PER_FILE;
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema_name = format!("basin_s3_del_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema_name.clone(),
@@ -231,7 +231,7 @@ async fn measure_pg_ms(pg: &Client, conn_str: &str, files: usize) -> f64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
-async fn s3_scaling_tenant_deletion_at_scale() {
+async fn s3_scaling_project_deletion_at_scale() {
     basin_common::telemetry::try_init_for_tests();
 
     let cfg = match BasinTestConfig::load() {
@@ -259,7 +259,7 @@ async fn s3_scaling_tenant_deletion_at_scale() {
     };
     let pg_skipped = pg_pair.is_none();
     if pg_skipped {
-        println!("[S3 tenant_deletion_at_scale] postgres unavailable: basin-only run");
+        println!("[S3 project_deletion_at_scale] postgres unavailable: basin-only run");
     }
 
     let scales: &[usize] = if is_seaweedfs_target() {
@@ -268,7 +268,7 @@ async fn s3_scaling_tenant_deletion_at_scale() {
         &SCALES_CLOUD
     };
     println!(
-        "[S3 tenant_deletion_at_scale] scales = {:?} (seaweedfs target = {})",
+        "[S3 project_deletion_at_scale] scales = {:?} (seaweedfs target = {})",
         scales,
         is_seaweedfs_target()
     );
@@ -287,7 +287,7 @@ async fn s3_scaling_tenant_deletion_at_scale() {
             None => 0.0,
         };
         println!(
-            "[S3 tenant_deletion_at_scale] files={n:>6} basin={basin_ms:>9.2}ms \
+            "[S3 project_deletion_at_scale] files={n:>6} basin={basin_ms:>9.2}ms \
              postgres={postgres_ms:>9.2}ms"
         );
         rows.push(Row {
@@ -319,7 +319,7 @@ async fn s3_scaling_tenant_deletion_at_scale() {
         (false, None) => "none in sweep".to_string(),
     };
     println!(
-        "[S3 tenant_deletion_at_scale] crossover={crossover_label} (bar <= {BAR_CROSSOVER}) {}",
+        "[S3 project_deletion_at_scale] crossover={crossover_label} (bar <= {BAR_CROSSOVER}) {}",
         if pass { "PASS" } else { "FAIL" }
     );
 
@@ -351,16 +351,16 @@ async fn s3_scaling_tenant_deletion_at_scale() {
     };
 
     report_real_scaling(
-        "tenant_deletion_at_scale",
-        "Tenant deletion at scale, real S3 (Basin vs Postgres)",
-        "Basin's tenant teardown is a bulk catalog DELETE plus a single \
+        "project_deletion_at_scale",
+        "Project deletion at scale, real S3 (Basin vs Postgres)",
+        "Basin's project teardown is a bulk catalog DELETE plus a single \
          drop_namespace; PG's DROP SCHEMA CASCADE walks every row and \
          index. Basin's slope is structurally flatter, so it overtakes \
          PG as the file count grows.",
         pass,
         AxisSpec {
             key: "file_count".into(),
-            label: "files per tenant".into(),
+            label: "files per project".into(),
         },
         vec![
             SeriesSpec {

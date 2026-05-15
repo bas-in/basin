@@ -1,16 +1,16 @@
-//! Viability test 4: tenant deletion.
+//! Viability test 4: project deletion.
 //!
-//! Claim: Deleting a tenant is O(file_count) with a small constant. Object
-//! storage gives us a flat keyspace under the tenant prefix; deleting a
-//! tenant is "drop catalog rows + parallel DeleteObjects". On LocalFS
+//! Claim: Deleting a project is O(file_count) with a small constant. Object
+//! storage gives us a flat keyspace under the project prefix; deleting a
+//! project is "drop catalog rows + parallel DeleteObjects". On LocalFS
 //! this is unlinked-inode fast; on S3 it's a single bulk DeleteObjects
-//! RPC fired in parallel with a LIST mop-up (see `s3_tenant_deletion.rs`).
+//! RPC fired in parallel with a LIST mop-up (see `s3_project_deletion.rs`).
 //!
-//! Setup: write 100 small Parquet files for one tenant *and* register
+//! Setup: write 100 small Parquet files for one project *and* register
 //! them in an `InMemoryCatalog` — NOT timed (reported as `setup_ms`
 //! only). Then **reset caches** (build a fresh `Storage` with
 //! caches=None against the same backing dir) and time
-//! `Storage::delete_tenant` end-to-end. The catalog-aware path fires
+//! `Storage::delete_project` end-to-end. The catalog-aware path fires
 //! `DeleteObjects` against the catalog file set in parallel with a
 //! LIST RPC, hiding one network round-trip on high-RTT object stores.
 //!
@@ -25,7 +25,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId};
-use basin_common::{PartitionKey, TableName, TenantId};
+use basin_common::{PartitionKey, TableName, ProjectId};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
 use futures::TryStreamExt;
@@ -61,7 +61,7 @@ fn build_batch(start: i64, len: usize) -> RecordBatch {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn viability_4_tenant_deletion() {
+async fn viability_4_project_deletion() {
     let dir = TempDir::new().unwrap();
     let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
 
@@ -73,7 +73,7 @@ async fn viability_4_tenant_deletion() {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let table = TableName::new("events").unwrap();
     let part = PartitionKey::default_key();
 
@@ -83,7 +83,7 @@ async fn viability_4_tenant_deletion() {
     // (drop_namespace must clear every row).
     let catalog = Arc::new(InMemoryCatalog::new());
     catalog
-        .create_table(&tenant, &table, schema().as_ref())
+        .create_table(&project, &table, schema().as_ref())
         .await
         .unwrap();
 
@@ -93,7 +93,7 @@ async fn viability_4_tenant_deletion() {
         let start = (i * ROWS_PER_FILE) as i64;
         let batch = build_batch(start, ROWS_PER_FILE);
         let f = setup_storage
-            .write_batch(&tenant, &table, &part, &batch)
+            .write_batch(&project, &table, &part, &batch)
             .await
             .unwrap();
         written.push(DataFileRef {
@@ -107,14 +107,14 @@ async fn viability_4_tenant_deletion() {
     // deletion path's catalog query returns the full set. (Outside the
     // timed window — same scope as `setup_ms`.)
     catalog
-        .append_data_files(&tenant, &table, SnapshotId::GENESIS, written)
+        .append_data_files(&project, &table, SnapshotId::GENESIS, written)
         .await
         .unwrap();
     let setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
 
     // Sanity check (outside any timed window).
-    let tenant_prefix = ObjectPath::from(format!("tenants/{tenant}"));
-    let listed_before: Vec<_> = fs.list(Some(&tenant_prefix)).try_collect().await.unwrap();
+    let project_prefix = ObjectPath::from(format!("projects/{project}"));
+    let listed_before: Vec<_> = fs.list(Some(&project_prefix)).try_collect().await.unwrap();
     let parquet_count = listed_before
         .iter()
         .filter(|m| m.location.as_ref().ends_with(".parquet"))
@@ -141,12 +141,12 @@ async fn viability_4_tenant_deletion() {
     // set and a LIST mop-up in parallel, then drops every catalog row.
     let started = Instant::now();
     let deleted = storage
-        .delete_tenant(catalog.as_ref(), &tenant)
+        .delete_project(catalog.as_ref(), &project)
         .await
-        .expect("delete_tenant");
+        .expect("delete_project");
     let deletion_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-    let listed_after: Vec<_> = fs.list(Some(&tenant_prefix)).try_collect().await.unwrap();
+    let listed_after: Vec<_> = fs.list(Some(&project_prefix)).try_collect().await.unwrap();
     assert!(
         listed_after.is_empty(),
         "expected zero residual objects, got {}",
@@ -155,14 +155,14 @@ async fn viability_4_tenant_deletion() {
     assert!(deleted >= FILES, "deleted only {deleted} of >= {FILES}");
 
     // Catalog must be empty after deletion: drop_table for every table
-    // and drop_namespace for the tenant must have fired inside
-    // `delete_tenant`.
-    let tables_after = catalog.list_tables(&tenant).await.unwrap();
+    // and drop_namespace for the project must have fired inside
+    // `delete_project`.
+    let tables_after = catalog.list_tables(&project).await.unwrap();
     assert!(
         tables_after.is_empty(),
         "expected zero residual catalog tables, got {tables_after:?}"
     );
-    let load_err = catalog.load_table(&tenant, &table).await.unwrap_err();
+    let load_err = catalog.load_table(&project, &table).await.unwrap_err();
     assert!(
         matches!(load_err, basin_common::BasinError::NotFound(_)),
         "expected NotFound on dropped table, got {load_err:?}"
@@ -170,15 +170,15 @@ async fn viability_4_tenant_deletion() {
 
     let pass = deletion_ms < BAR_MS;
     println!(
-        "[VIABILITY 4] tenant deletion: files={deleted}, setup={setup_ms:.1} ms, \
+        "[VIABILITY 4] project deletion: files={deleted}, setup={setup_ms:.1} ms, \
          deletion={deletion_ms:.1} ms (bar <{BAR_MS} ms) {}",
         if pass { "PASS" } else { "FAIL" }
     );
 
     report_viability(
-        "tenant_deletion",
-        "Tenant deletion latency",
-        "Deleting a tenant of 100 small files via Storage::delete_tenant \
+        "project_deletion",
+        "Project deletion latency",
+        "Deleting a project of 100 small files via Storage::delete_project \
          (catalog-first; LIST mop-up in parallel) completes in under 3 \
          seconds (caches reset; cold path).",
         pass,

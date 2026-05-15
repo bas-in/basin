@@ -70,10 +70,10 @@ table.
 | 0004 | Multi-region read replicas | Accepted | Eventual-consistent read replicas scoped for Phase 6 |
 | 0005 | Auth system | Accepted | basin-auth scope: signup, JWT, refresh, API keys, magic-link |
 | 0006 | REST API layer | Accepted | basin-rest: PostgREST-shaped, requires auth enabled |
-| 0007 | Connection pooling | Accepted | Native TenantSession cache; per-tenant cap; LRU eviction |
+| 0007 | Connection pooling | Accepted | Native ProjectSession cache; per-project cap; LRU eviction |
 | 0008 | Noisy-neighbor fairness | Accepted | EDF scheduler; priority by op-shape; p99 13.97 ms under load |
 | 0009 | Multi-region architecture | Accepted | One cluster per region; data-plane topology locked |
 | 0010 | Catalog replication | Accepted | Single-writer global Postgres + regional read replicas via logical replication |
 | 0011 | Cross-shard 2PC | Accepted | Deferred; locked architecturally; gated on customer demand |
 | 0012 | Change event primitive | Accepted | ChangeEventSink trait; declarative lifecycle + reactors replace PL/pgSQL triggers |
-| 0013 | Auth per-tenant schema | Accepted | Removes loopback pgwire; auth data in per-tenant storage; auth.uid/role/jwt |
+| 0013 | Auth per-project schema | Accepted | Removes loopback pgwire; auth data in per-project storage; auth.uid/role/jwt |

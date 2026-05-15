@@ -34,7 +34,7 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeBinaryArray, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Storage, StorageConfig};
@@ -59,8 +59,8 @@ async fn viability_uuid() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     // ---- 1. CREATE TABLE with a UUID column ---------------------------------
     sess.execute("CREATE TABLE users (id UUID, email TEXT)")
@@ -68,7 +68,7 @@ async fn viability_uuid() {
         .expect("CREATE TABLE users");
 
     let table = TableName::new("users").unwrap();
-    let meta = catalog.load_table(&tenant, &table).await.unwrap();
+    let meta = catalog.load_table(&project, &table).await.unwrap();
     let id_field = meta
         .schema
         .field_with_name("id")

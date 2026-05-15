@@ -15,20 +15,20 @@
 //! comfortably beats DataFusion-on-the-OLTP-path on wide group-bys and full
 //! scans without us writing a single line of execution code.
 //!
-//! ## Tenant isolation
+//! ## Project isolation
 //!
-//! DuckDB has no model of tenants. Isolation is enforced *before* SQL ever
+//! DuckDB has no model of projects. Isolation is enforced *before* SQL ever
 //! reaches DuckDB, by Basin:
 //!
-//! 1. `query` requires a [`TenantId`]. Every code path uses it.
+//! 1. `query` requires a [`ProjectId`]. Every code path uses it.
 //! 2. The file list registered as a DuckDB view comes from
-//!    `basin_storage::Storage::list_data_files(tenant, table)`, which
-//!    physically prefixes every key with `tenants/{tenant}/`.
+//!    `basin_storage::Storage::list_data_files(project, table)`, which
+//!    physically prefixes every key with `projects/{project}/`.
 //! 3. The submitted SQL is rejected if it contains the strings `read_parquet`,
 //!    `read_csv`, `read_json`, or `attach`. Those are the only documented
 //!    DuckDB constructs that can name a path the engine didn't choose. A
 //!    string match is crude but it's defence-in-depth: even if a future
-//!    extension adds another way in, the existing tenant-prefix invariant on
+//!    extension adds another way in, the existing project-prefix invariant on
 //!    the registered file paths still holds for the views we expose. See
 //!    [`validate_sql`].
 //!
@@ -39,7 +39,7 @@
 //!   publicly, so we accept the root as an explicit `PathBuf` in
 //!   [`AnalyticalConfig`]. v0.2 will wire DuckDB's `httpfs` extension and
 //!   accept `s3://` URLs from a real `object_store::aws::AmazonS3` backend.
-//! - One fresh DuckDB connection per query. v0.2 will cache per-tenant
+//! - One fresh DuckDB connection per query. v0.2 will cache per-project
 //!   sessions to amortise startup. v0.1 measures correctly even without that.
 //! - All current data files are registered. We do not yet honour Iceberg
 //!   snapshot pinning (`AS OF SNAPSHOT n`); that's also v0.2.
@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use basin_common::{BasinError, Result, TableName, TenantId};
+use basin_common::{BasinError, Result, TableName, ProjectId};
 
 pub use validate::validate_sql;
 
@@ -96,17 +96,17 @@ impl AnalyticalEngine {
         })
     }
 
-    /// Tables visible to `tenant`. Delegates to the catalog so the analytical
+    /// Tables visible to `project`. Delegates to the catalog so the analytical
     /// path agrees with the OLTP path on table existence.
-    #[tracing::instrument(skip(self), fields(tenant = %tenant))]
-    pub async fn list_tables(&self, tenant: &TenantId) -> Result<Vec<TableName>> {
-        self.inner.cfg.catalog.list_tables(tenant).await
+    #[tracing::instrument(skip(self), fields(project = %project))]
+    pub async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>> {
+        self.inner.cfg.catalog.list_tables(project).await
     }
 
-    /// Run an analytical SQL query for `tenant`. The flow is:
+    /// Run an analytical SQL query for `project`. The flow is:
     ///
     /// 1. Reject obvious file-system escape patterns in the submitted SQL.
-    /// 2. Resolve the tenant's tables via the catalog.
+    /// 2. Resolve the project's tables via the catalog.
     /// 3. For each table, list its current Parquet files via
     ///    [`basin_storage::Storage::list_data_files`].
     /// 4. Open a fresh DuckDB connection. Register one VIEW per table backed
@@ -117,9 +117,9 @@ impl AnalyticalEngine {
     /// `duckdb` crate is synchronous.
     #[tracing::instrument(
         skip(self, sql),
-        fields(tenant = %tenant, sql = %sql.lines().next().unwrap_or("")),
+        fields(project = %project, sql = %sql.lines().next().unwrap_or("")),
     )]
-    pub async fn query(&self, tenant: &TenantId, sql: &str) -> Result<Vec<RecordBatch>> {
+    pub async fn query(&self, project: &ProjectId, sql: &str) -> Result<Vec<RecordBatch>> {
         validate::validate_sql(sql)?;
 
         let root = self.inner.cfg.local_fs_root.clone().ok_or_else(|| {
@@ -129,19 +129,19 @@ impl AnalyticalEngine {
             )
         })?;
 
-        // Resolve tables visible to this tenant. We register every table the
-        // tenant owns, not just the ones the SQL parser thinks are referenced
+        // Resolve tables visible to this project. We register every table the
+        // project owns, not just the ones the SQL parser thinks are referenced
         // — that keeps us out of the SQL-parsing business entirely and makes
-        // the isolation argument (above) crisper. If the tenant has many
+        // the isolation argument (above) crisper. If the project has many
         // tables, v0.2 can switch to lazy registration.
-        let tables = self.inner.cfg.catalog.list_tables(tenant).await?;
+        let tables = self.inner.cfg.catalog.list_tables(project).await?;
 
         // Snapshot the file set for each table. DuckDB will see exactly these
         // files; concurrent writes on another shard owner won't be visible
         // until the next query (snapshot isolation, v0.1 flavour).
         let mut registered: Vec<(TableName, Vec<String>)> = Vec::with_capacity(tables.len());
         for t in tables {
-            let files = self.inner.cfg.storage.list_data_files(tenant, &t).await?;
+            let files = self.inner.cfg.storage.list_data_files(project, &t).await?;
             let mut paths = Vec::with_capacity(files.len());
             for f in files {
                 let abs = root.join(f.path.as_ref());
@@ -156,10 +156,10 @@ impl AnalyticalEngine {
                     .to_string();
                 paths.push(s);
             }
-            // Tenant-prefix safety net: the storage layer guarantees this, but
+            // Project-prefix safety net: the storage layer guarantees this, but
             // we re-assert here. A leak would be P0; cheap to check, infinite
             // upside if it ever catches anything.
-            let prefix = format!("tenants/{tenant}/");
+            let prefix = format!("projects/{project}/");
             for p in &paths {
                 if !p.contains(&prefix) {
                     return Err(BasinError::isolation(format!(
@@ -259,7 +259,7 @@ mod tests {
     use arrow_array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use basin_catalog::{DataFileRef, InMemoryCatalog};
-    use basin_common::{PartitionKey, TableName, TenantId};
+    use basin_common::{PartitionKey, TableName, ProjectId};
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
@@ -319,23 +319,23 @@ mod tests {
     async fn seed_one_batch(
         storage: &basin_storage::Storage,
         catalog: &Arc<dyn basin_catalog::Catalog>,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         batch: RecordBatch,
     ) {
         let part = PartitionKey::default_key();
         catalog
-            .create_table(tenant, table, batch.schema().as_ref())
+            .create_table(project, table, batch.schema().as_ref())
             .await
             .ok();
         let df = storage
-            .write_batch(tenant, table, &part, &batch)
+            .write_batch(project, table, &part, &batch)
             .await
             .unwrap();
-        let meta = catalog.load_table(tenant, table).await.unwrap();
+        let meta = catalog.load_table(project, table).await.unwrap();
         catalog
             .append_data_files(
-                tenant,
+                project,
                 table,
                 meta.current_snapshot,
                 vec![DataFileRef {
@@ -356,18 +356,18 @@ mod tests {
     #[tokio::test]
     async fn query_simple_select() {
         let (_dir, engine, storage, catalog) = fixture();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("t").unwrap();
         seed_one_batch(
             &storage,
             &catalog,
-            &tenant,
+            &project,
             &table,
             batch_with_category(0, 100),
         )
         .await;
 
-        let batches = engine.query(&tenant, "SELECT * FROM t").await.unwrap();
+        let batches = engine.query(&project, "SELECT * FROM t").await.unwrap();
         assert_eq!(total_rows(&batches), 100);
         assert!(!batches.is_empty());
         let cols: Vec<_> = batches[0]
@@ -383,12 +383,12 @@ mod tests {
     #[tokio::test]
     async fn query_aggregate() {
         let (_dir, engine, storage, catalog) = fixture();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("t").unwrap();
         seed_one_batch(
             &storage,
             &catalog,
-            &tenant,
+            &project,
             &table,
             batch_with_category(0, 100),
         )
@@ -399,7 +399,7 @@ mod tests {
         // `Int64Array`, regardless of DuckDB's promotion rules.
         let batches = engine
             .query(
-                &tenant,
+                &project,
                 "SELECT count(*) AS n, CAST(sum(id) AS BIGINT) AS s FROM t",
             )
             .await
@@ -427,12 +427,12 @@ mod tests {
     #[tokio::test]
     async fn query_group_by() {
         let (_dir, engine, storage, catalog) = fixture();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("t").unwrap();
         seed_one_batch(
             &storage,
             &catalog,
-            &tenant,
+            &project,
             &table,
             batch_with_category(0, 100),
         )
@@ -440,7 +440,7 @@ mod tests {
 
         let batches = engine
             .query(
-                &tenant,
+                &project,
                 "SELECT category, count(*) AS n FROM t GROUP BY category ORDER BY category",
             )
             .await
@@ -498,9 +498,9 @@ mod tests {
     #[tokio::test]
     async fn query_rejects_read_parquet_escape() {
         let (_dir, engine, _, _) = fixture();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let err = engine
-            .query(&tenant, "SELECT * FROM read_parquet('/etc/passwd')")
+            .query(&project, "SELECT * FROM read_parquet('/etc/passwd')")
             .await
             .unwrap_err();
         assert!(
@@ -514,7 +514,7 @@ mod tests {
             "SELECT * FROM read_json('/etc/passwd')",
             "ATTACH '/some/path' AS evil",
         ] {
-            let err = engine.query(&tenant, sql).await.unwrap_err();
+            let err = engine.query(&project, sql).await.unwrap_err();
             assert!(
                 matches!(err, BasinError::InvalidIdent(_)),
                 "expected InvalidIdent for {sql:?}, got {err:?}"
@@ -523,14 +523,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_isolation() {
+    async fn project_isolation() {
         let (_dir, engine, storage, catalog) = fixture();
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let table = TableName::new("t").unwrap();
-        // Same table name, distinct row sets per tenant. A returns ids 0..50;
+        // Same table name, distinct row sets per project. A returns ids 0..50;
         // B returns ids 1000..1100. If isolation breaks, the assertions below
-        // would see ids from the other tenant's prefix.
+        // would see ids from the other project's prefix.
         seed_one_batch(&storage, &catalog, &a, &table, batch_with_category(0, 50)).await;
         seed_one_batch(
             &storage,
@@ -600,7 +600,7 @@ mod tests {
         })
         .unwrap();
         let err = engine
-            .query(&TenantId::new(), "SELECT 1")
+            .query(&ProjectId::new(), "SELECT 1")
             .await
             .unwrap_err();
         assert!(matches!(err, BasinError::Internal(_)), "got {err:?}");
@@ -609,12 +609,12 @@ mod tests {
     #[tokio::test]
     async fn list_tables_delegates_to_catalog() {
         let (_dir, engine, storage, catalog) = fixture();
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let t1 = TableName::new("alpha").unwrap();
         let t2 = TableName::new("beta").unwrap();
-        seed_one_batch(&storage, &catalog, &tenant, &t1, batch_with_category(0, 1)).await;
-        seed_one_batch(&storage, &catalog, &tenant, &t2, batch_with_category(0, 1)).await;
-        let mut listed = engine.list_tables(&tenant).await.unwrap();
+        seed_one_batch(&storage, &catalog, &project, &t1, batch_with_category(0, 1)).await;
+        seed_one_batch(&storage, &catalog, &project, &t2, batch_with_category(0, 1)).await;
+        let mut listed = engine.list_tables(&project).await.unwrap();
         listed.sort();
         assert_eq!(listed, vec![t1, t2]);
     }

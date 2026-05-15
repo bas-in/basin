@@ -37,13 +37,13 @@ impl AtomicStats {
 /// Public snapshot of pool counters.
 ///
 /// `resident_sessions` is the total number of sessions held by the pool
-/// (in-use plus idle). `resident_per_tenant` is the maximum number of
-/// resident sessions for any single tenant — the pressure-tracking number
-/// for the per-tenant cap.
+/// (in-use plus idle). `resident_per_project` is the maximum number of
+/// resident sessions for any single project — the pressure-tracking number
+/// for the per-project cap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolStats {
     pub resident_sessions: usize,
-    pub resident_per_tenant: usize,
+    pub resident_per_project: usize,
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,

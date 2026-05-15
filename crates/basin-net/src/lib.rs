@@ -8,7 +8,7 @@
 //!    inline. Mirrors the [`http`](https://github.com/pramsey/pgsql-http)
 //!    extension's `http_get(url)` / `http_post(url, body, ct)` calls.
 //! 2. An asynchronous [`RequestQueue`] that enqueues a request and writes the
-//!    response into a per-tenant `_net_http_response` table. Mirrors
+//!    response into a per-project `_net_http_response` table. Mirrors
 //!    Supabase's [`pg_net`](https://github.com/supabase/pg_net)
 //!    `net.http_post` / `net._http_response` shape.
 //! 3. A [`ResponseStore`] that exposes the persisted response rows.
@@ -44,9 +44,9 @@
 //! there and `Engine::new` will pick it up automatically. The same staging
 //! pattern is used by `basin-cron` for `cron.schedule(...)`.
 //!
-//! ## Per-tenant guardrails (non-negotiable)
+//! ## Per-project guardrails (non-negotiable)
 //!
-//! - **URL allowlist**: per-tenant catalog config. Default DENY-ALL. Hosts
+//! - **URL allowlist**: per-project catalog config. Default DENY-ALL. Hosts
 //!   are opted in via [`HttpClient::allow_host`] (or `INSERT INTO
 //!   _net_allowed_hosts ...` once the SQL surface lands). URLs whose host
 //!   isn't in the allowlist surface `BasinError::Internal("host not on
@@ -57,8 +57,8 @@
 //!   time. Applies to request bodies and response bodies.
 //! - **Timeout**: 30s default per request. Configurable via
 //!   `BASIN_NET_TIMEOUT_SECS`.
-//! - **Rate limit**: 10 req/s sustained, burst 30, per tenant. Token bucket
-//!   via the `governor` crate. A tenant that bursts over its quota gets a
+//! - **Rate limit**: 10 req/s sustained, burst 30, per project. Token bucket
+//!   via the `governor` crate. A project that bursts over its quota gets a
 //!   `BasinError::Internal("rate limited (basin_net)")` instead of an
 //!   outbound request.
 //! - **TLS verify on by default**. There is no way to disable from
@@ -67,8 +67,8 @@
 //!
 //! ## Isolation
 //!
-//! All per-tenant state — allowlist, rate-limit bucket, response table — is
-//! keyed on [`TenantId`]. Tenant A's allowlist edit cannot affect B's
+//! All per-project state — allowlist, rate-limit bucket, response table — is
+//! keyed on [`ProjectId`]. Project A's allowlist edit cannot affect B's
 //! requests; A's response rows are only visible inside A's session (the same
 //! catalog-level namespace boundary the rest of the engine relies on).
 

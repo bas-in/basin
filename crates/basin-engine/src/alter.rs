@@ -28,8 +28,8 @@
 //!    {SET <keyword> | RESET <keyword> | CLUSTER BY (...)}` and otherwise
 //!    returns `None`, falling through to the standard path.
 //!
-//! Tenant scoping: every catalog mutator is tenant-scoped already; the
-//! engine never sees a non-tenant-qualified `Catalog::set_*` call.
+//! Project scoping: every catalog mutator is project-scoped already; the
+//! engine never sees a non-project-qualified `Catalog::set_*` call.
 
 use arrow_schema::{Field, Schema};
 use basin_catalog::{Catalog, CheckConstraint};
@@ -272,26 +272,26 @@ impl BasinAlterExtension {
     pub(crate) async fn apply(
         self,
         catalog: &Arc<dyn Catalog>,
-        tenant: &basin_common::TenantId,
+        project: &basin_common::ProjectId,
     ) -> Result<&'static str> {
         match self {
             BasinAlterExtension::SetColdAfter { table, seconds } => {
-                let meta = catalog.load_table(tenant, &table).await?;
+                let meta = catalog.load_table(project, &table).await?;
                 catalog
-                    .set_tier_policy(tenant, &table, Some(seconds), meta.cold_age_column.clone())
+                    .set_tier_policy(project, &table, Some(seconds), meta.cold_age_column.clone())
                     .await?;
                 Ok("ALTER TABLE")
             }
             BasinAlterExtension::SetColdAgeColumn { table, column } => {
                 // Validate the column exists in the schema.
-                let meta = catalog.load_table(tenant, &table).await?;
+                let meta = catalog.load_table(project, &table).await?;
                 if meta.schema.field_with_name(&column).is_err() {
                     return Err(BasinError::InvalidSchema(format!(
                         "ALTER TABLE {table}: column {column:?} not in table schema"
                     )));
                 }
                 catalog
-                    .set_tier_policy(tenant, &table, meta.cold_after_seconds, Some(column))
+                    .set_tier_policy(project, &table, meta.cold_after_seconds, Some(column))
                     .await?;
                 Ok("ALTER TABLE")
             }
@@ -299,7 +299,7 @@ impl BasinAlterExtension {
                 // Validate every column exists in the schema before we
                 // persist; an unknown column would silently disable
                 // the bloom filter on any future write.
-                let meta = catalog.load_table(tenant, &table).await?;
+                let meta = catalog.load_table(project, &table).await?;
                 for c in &columns {
                     if meta.schema.field_with_name(c).is_err() {
                         return Err(BasinError::InvalidSchema(format!(
@@ -308,7 +308,7 @@ impl BasinAlterExtension {
                     }
                 }
                 catalog
-                    .set_bloom_filter_columns(tenant, &table, columns)
+                    .set_bloom_filter_columns(project, &table, columns)
                     .await?;
                 Ok("ALTER TABLE")
             }
@@ -316,22 +316,22 @@ impl BasinAlterExtension {
                 // Validate the table exists; the catalog setter would
                 // bubble NotFound up too, but we want a consistent error
                 // shape with the other extensions.
-                let _ = catalog.load_table(tenant, &table).await?;
+                let _ = catalog.load_table(project, &table).await?;
                 catalog
-                    .set_row_group_rows(tenant, &table, Some(rows))
+                    .set_row_group_rows(project, &table, Some(rows))
                     .await?;
                 Ok("ALTER TABLE")
             }
             BasinAlterExtension::ResetRowGroupRows { table } => {
-                let _ = catalog.load_table(tenant, &table).await?;
-                catalog.set_row_group_rows(tenant, &table, None).await?;
+                let _ = catalog.load_table(project, &table).await?;
+                catalog.set_row_group_rows(project, &table, None).await?;
                 Ok("ALTER TABLE")
             }
             BasinAlterExtension::SetClusterColumns { table, columns } => {
                 // Validate every cluster column exists in the schema; an
                 // unknown column would silently disable the lexsort on
                 // every future write.
-                let meta = catalog.load_table(tenant, &table).await?;
+                let meta = catalog.load_table(project, &table).await?;
                 for c in &columns {
                     if meta.schema.field_with_name(c).is_err() {
                         return Err(BasinError::InvalidSchema(format!(
@@ -339,13 +339,13 @@ impl BasinAlterExtension {
                         )));
                     }
                 }
-                catalog.set_cluster_columns(tenant, &table, columns).await?;
+                catalog.set_cluster_columns(project, &table, columns).await?;
                 Ok("ALTER TABLE")
             }
             BasinAlterExtension::ResetClusterColumns { table } => {
-                let _ = catalog.load_table(tenant, &table).await?;
+                let _ = catalog.load_table(project, &table).await?;
                 catalog
-                    .set_cluster_columns(tenant, &table, Vec::new())
+                    .set_cluster_columns(project, &table, Vec::new())
                     .await?;
                 Ok("ALTER TABLE")
             }
@@ -354,7 +354,7 @@ impl BasinAlterExtension {
                 // deferred / NOT VALID constraints — every constraint
                 // is enforced on every write — so a known constraint
                 // is a no-op accept and an unknown one is an error.
-                let meta = catalog.load_table(tenant, &table).await?;
+                let meta = catalog.load_table(project, &table).await?;
                 let exists = meta
                     .check_constraints
                     .iter()
@@ -381,7 +381,7 @@ impl BasinAlterExtension {
                 // partition routing is computed from the PARTITION BY
                 // column at write time, so the attach / detach is a
                 // no-op accept beyond the existence check.
-                let _ = catalog.load_table(tenant, &table).await?;
+                let _ = catalog.load_table(project, &table).await?;
                 Ok("ALTER TABLE")
             }
         }
@@ -410,7 +410,7 @@ impl BasinAlterExtension {
 /// and never reaches this dispatch.
 pub(crate) async fn apply_standard_alter_table(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     name: &ObjectName,
     operations: &[AlterTableOperation],
 ) -> Result<&'static str> {
@@ -423,14 +423,14 @@ pub(crate) async fn apply_standard_alter_table(
     for op in operations {
         match op {
             AlterTableOperation::AddColumn { column_def, .. } => {
-                add_column(catalog, tenant, &table, column_def).await?;
+                add_column(catalog, project, &table, column_def).await?;
             }
             AlterTableOperation::DropColumn {
                 column_name,
                 if_exists,
                 ..
             } => {
-                drop_column(catalog, tenant, &table, &column_name.value, *if_exists).await?;
+                drop_column(catalog, project, &table, &column_name.value, *if_exists).await?;
             }
             AlterTableOperation::RenameColumn {
                 old_column_name,
@@ -438,7 +438,7 @@ pub(crate) async fn apply_standard_alter_table(
             } => {
                 rename_column(
                     catalog,
-                    tenant,
+                    project,
                     &table,
                     &old_column_name.value,
                     &new_column_name.value,
@@ -447,11 +447,11 @@ pub(crate) async fn apply_standard_alter_table(
             }
             AlterTableOperation::RenameTable { table_name } => {
                 let new_table = single_part_object_name(table_name)?;
-                catalog.rename_table(tenant, &table, &new_table).await?;
+                catalog.rename_table(project, &table, &new_table).await?;
             }
             AlterTableOperation::AlterColumn { column_name, op } => match op {
                 AlterColumnOperation::SetDataType { data_type, .. } => {
-                    alter_column_type(catalog, tenant, &table, &column_name.value, data_type)
+                    alter_column_type(catalog, project, &table, &column_name.value, data_type)
                         .await?;
                 }
                 AlterColumnOperation::DropDefault
@@ -472,12 +472,12 @@ pub(crate) async fn apply_standard_alter_table(
                 }
             },
             AlterTableOperation::AddConstraint(tc) => {
-                add_constraint(catalog, tenant, &table, tc).await?;
+                add_constraint(catalog, project, &table, tc).await?;
             }
             AlterTableOperation::DropConstraint {
                 name, if_exists, ..
             } => {
-                drop_constraint(catalog, tenant, &table, &name.value, *if_exists).await?;
+                drop_constraint(catalog, project, &table, &name.value, *if_exists).await?;
             }
             AlterTableOperation::AttachPartition { .. }
             | AlterTableOperation::DetachPartition { .. } => {
@@ -486,7 +486,7 @@ pub(crate) async fn apply_standard_alter_table(
                 // accepted syntactically so DDL emitted by PG-shaped
                 // migration tools doesn't blow up. The partition table
                 // already exists as a regular table in the catalog.
-                let _ = catalog.load_table(tenant, &table).await?;
+                let _ = catalog.load_table(project, &table).await?;
             }
             // RLS forms are absorbed upstream and never reach here.
             AlterTableOperation::EnableRowLevelSecurity
@@ -515,12 +515,12 @@ pub(crate) async fn apply_standard_alter_table(
 /// implement CASCADE).
 async fn drop_column(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table: &TableName,
     name: &str,
     if_exists: bool,
 ) -> Result<()> {
-    let meta = catalog.load_table(tenant, table).await?;
+    let meta = catalog.load_table(project, table).await?;
     let pos = meta
         .schema
         .fields()
@@ -582,11 +582,11 @@ async fn drop_column(
         .filter_map(|(i, f)| if i == pos { None } else { Some((**f).clone()) })
         .collect();
     let new_schema = Schema::new_with_metadata(fields, meta.schema.metadata().clone());
-    catalog.set_schema(tenant, table, new_schema).await?;
+    catalog.set_schema(project, table, new_schema).await?;
     if new_checks.len() != meta.check_constraints.len() {
         catalog
             .set_table_constraints(
-                tenant,
+                project,
                 table,
                 meta.pk_columns.clone(),
                 new_checks,
@@ -633,12 +633,12 @@ fn is_ident_char(b: u8) -> bool {
 /// scan time.
 async fn rename_column(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table: &TableName,
     old: &str,
     new: &str,
 ) -> Result<()> {
-    let meta = catalog.load_table(tenant, table).await?;
+    let meta = catalog.load_table(project, table).await?;
     if meta.schema.field_with_name(new).is_ok() {
         return Err(BasinError::InvalidSchema(format!(
             "ALTER TABLE {table}: column {new:?} already exists"
@@ -660,7 +660,7 @@ async fn rename_column(
         .with_metadata(old_field.metadata().clone());
     fields[pos] = renamed;
     let new_schema = Schema::new_with_metadata(fields, meta.schema.metadata().clone());
-    catalog.set_schema(tenant, table, new_schema).await?;
+    catalog.set_schema(project, table, new_schema).await?;
     Ok(())
 }
 
@@ -672,12 +672,12 @@ async fn rename_column(
 /// type-mismatch error.
 async fn alter_column_type(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table: &TableName,
     column: &str,
     new_dt: &sqlparser::ast::DataType,
 ) -> Result<()> {
-    let meta = catalog.load_table(tenant, table).await?;
+    let meta = catalog.load_table(project, table).await?;
     let pos = meta
         .schema
         .fields()
@@ -694,7 +694,7 @@ async fn alter_column_type(
     fields[pos] =
         Field::new(old.name().clone(), dt, old.is_nullable()).with_metadata(old.metadata().clone());
     let new_schema = Schema::new_with_metadata(fields, meta.schema.metadata().clone());
-    catalog.set_schema(tenant, table, new_schema).await?;
+    catalog.set_schema(project, table, new_schema).await?;
     Ok(())
 }
 
@@ -706,11 +706,11 @@ async fn alter_column_type(
 /// without the explicit syntax for that flavour).
 async fn add_constraint(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table: &TableName,
     tc: &TableConstraint,
 ) -> Result<()> {
-    let meta = catalog.load_table(tenant, table).await?;
+    let meta = catalog.load_table(project, table).await?;
     match tc {
         TableConstraint::Check { name, expr } => {
             let cname = match name {
@@ -734,7 +734,7 @@ async fn add_constraint(
             });
             catalog
                 .set_table_constraints(
-                    tenant,
+                    project,
                     table,
                     meta.pk_columns.clone(),
                     checks,
@@ -766,12 +766,12 @@ async fn add_constraint(
 /// support drop for all of them.
 async fn drop_constraint(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table: &TableName,
     name: &str,
     if_exists: bool,
 ) -> Result<()> {
-    let meta = catalog.load_table(tenant, table).await?;
+    let meta = catalog.load_table(project, table).await?;
     let mut checks = meta.check_constraints.clone();
     let mut foreign_keys = meta.foreign_keys.clone();
     let mut uniques = meta.unique_constraints.clone();
@@ -805,11 +805,11 @@ async fn drop_constraint(
         )));
     }
     catalog
-        .set_table_constraints(tenant, table, pk_columns, checks, foreign_keys)
+        .set_table_constraints(project, table, pk_columns, checks, foreign_keys)
         .await?;
     if uniques.len() != meta.unique_constraints.len() {
         catalog
-            .set_unique_constraints(tenant, table, uniques)
+            .set_unique_constraints(project, table, uniques)
             .await?;
     }
     Ok(())
@@ -821,11 +821,11 @@ async fn drop_constraint(
 /// scan time, which is exactly Arrow's projection behaviour.
 async fn add_column(
     catalog: &Arc<dyn Catalog>,
-    tenant: &basin_common::TenantId,
+    project: &basin_common::ProjectId,
     table: &TableName,
     column_def: &ColumnDef,
 ) -> Result<()> {
-    let meta = catalog.load_table(tenant, table).await?;
+    let meta = catalog.load_table(project, table).await?;
     let name = column_def.name.value.clone();
     if meta.schema.field_with_name(&name).is_ok() {
         return Err(BasinError::InvalidSchema(format!(
@@ -857,7 +857,7 @@ async fn add_column(
     let mut fields: Vec<Field> = meta.schema.fields().iter().map(|f| (**f).clone()).collect();
     fields.push(Field::new(name, dt, nullable));
     let new_schema = Schema::new(fields);
-    catalog.set_schema(tenant, table, new_schema).await?;
+    catalog.set_schema(project, table, new_schema).await?;
     Ok(())
 }
 

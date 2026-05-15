@@ -11,7 +11,7 @@
 //!    UDFs (`l2_distance`, `cosine_distance`, `dot_product`).
 //! 2. `basin-storage` writes / reads HNSW segment files via [`HnswIndex`].
 //!    Each Parquet data file may have a sibling `.hnsw` file under
-//!    `tenants/{tenant}/tables/{table}/index/{column}.hnsw`.
+//!    `projects/{project}/tables/{table}/index/{column}.hnsw`.
 //!
 //! The crate stays small on purpose. New ANN algorithms (IVF-flat, ScaNN)
 //! land here only when a wedge customer pays for them.

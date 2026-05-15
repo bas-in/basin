@@ -62,8 +62,8 @@ pub struct AuthConfig {
     /// Defaults to `true`. Operators with no SMTP relay set this to false
     /// and the magic-link endpoint returns 503 instead of crashing on send.
     pub email_enabled: bool,
-    /// Host:port that goes into the per-tenant `postgres://...` connection
-    /// URL handed back from `AuthService::provision_tenant_db`. Set to the
+    /// Host:port that goes into the per-project `postgres://...` connection
+    /// URL handed back from `AuthService::provision_project_db`. Set to the
     /// public-facing pgwire endpoint (e.g. `db.basin.cloud:5432`). For
     /// local development the default is `127.0.0.1:5433`.
     pub pgwire_public_host: String,
@@ -84,8 +84,8 @@ impl AuthConfig {
     /// `postgres://basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable`.
     ///
     /// The loopback username [`INTERNAL_AUTH_USERNAME`] maps through the
-    /// auto-injected static-tenant entry to the reserved
-    /// [`INTERNAL_AUTH_TENANT_ID`]. Engine accepts plaintext socket on
+    /// auto-injected static-project entry to the reserved
+    /// [`INTERNAL_AUTH_PROJECT_ID`]. Engine accepts plaintext socket on
     /// loopback, so `sslmode=disable` is correct and a TLS handshake is
     /// unnecessary.
     pub fn effective_dsn(&self) -> String {
@@ -95,14 +95,14 @@ impl AuthConfig {
     }
 }
 
-/// Reserved system tenant for basin-auth's own catalog. Used by basin-server
-/// to auto-inject the [`INTERNAL_AUTH_USERNAME`] → tenant mapping into the
+/// Reserved system project for basin-auth's own catalog. Used by basin-server
+/// to auto-inject the [`INTERNAL_AUTH_USERNAME`] → project mapping into the
 /// static resolver so basin-auth can authenticate as itself over the loopback
 /// pgwire path.
 ///
 /// 26-char Crockford base-32 ULID (no I, L, O, U). Deterministic — the
 /// constant is the contract.
-pub const INTERNAL_AUTH_TENANT_ID: &str = "01JBAS1NAVTH00000000000000";
+pub const INTERNAL_AUTH_PROJECT_ID: &str = "01JBAS1NAVTH00000000000000";
 
 /// Reserved pgwire username basin-auth uses when connecting back to basin
 /// engine over the loopback catalog path.
@@ -110,8 +110,8 @@ pub const INTERNAL_AUTH_USERNAME: &str = "basin_auth";
 
 /// Default loopback catalog DSN. Used when `BASIN_AUTH_CATALOG_DSN` is unset
 /// and no explicit DSN was passed in code. The username matches
-/// [`INTERNAL_AUTH_USERNAME`] so basin-server's auto-injected static-tenant
-/// entry resolves it to [`INTERNAL_AUTH_TENANT_ID`].
+/// [`INTERNAL_AUTH_USERNAME`] so basin-server's auto-injected static-project
+/// entry resolves it to [`INTERNAL_AUTH_PROJECT_ID`].
 pub const DEFAULT_LOOPBACK_CATALOG_DSN: &str =
     "postgres://basin_auth:basin_auth@127.0.0.1:5433/basin?sslmode=disable";
 
@@ -200,7 +200,7 @@ impl AuthConfig {
 
         // Catalog DSN is now optional. Unset or empty means "use the loopback
         // default" (basin engine's own pgwire on 127.0.0.1:5433 via the
-        // reserved system tenant). Set this to keep using an external Postgres
+        // reserved system project). Set this to keep using an external Postgres
         // — e.g. a managed PG instance during migration off it.
         let catalog_dsn = match std::env::var("BASIN_AUTH_CATALOG_DSN") {
             Ok(s) if !s.trim().is_empty() => Some(s),

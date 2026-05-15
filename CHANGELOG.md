@@ -30,11 +30,11 @@ graduate to 1.0 and the standard SemVer guarantees.
 - `auth.uid()`, `auth.role()`, `auth.jwt()` SQL session functions — Supabase-compatible;
   usable in RLS policies (`CREATE POLICY … USING (owner_id = auth.uid())`). Both
   `auth.uid()` and `auth_uid()` spellings work.
-- Per-tenant auth schema — auth data now lives in each tenant's own Basin storage
-  (like Supabase's `auth` schema per project). No reserved internal tenant, no loopback
+- Per-project auth schema — auth data now lives in each project's own Basin storage
+  (like Supabase's `auth` schema per project). No reserved internal project, no loopback
   pgwire connection. See ADR 0013.
-- Self-routing pgwire credentials — `pgwire_user` format now encodes `tenant_id` as a
-  26-char ULID prefix, enabling credential validation without a global cross-tenant lookup.
+- Self-routing pgwire credentials — `pgwire_user` format now encodes `project_id` as a
+  26-char ULID prefix, enabling credential validation without a global cross-project lookup.
 - `AuthStore` trait — pluggable auth storage; `PostgresAuthStore` for external Postgres,
   `EngineAuthStore` (default) for in-process Basin storage. Zero external dependencies
   for open source deployments.
@@ -46,8 +46,8 @@ graduate to 1.0 and the standard SemVer guarantees.
   default loopback path.
 
 ### Migration
-- Existing `pgwire_user` credentials in the old `tenant_<hex>` format are automatically
-  rotated to the new `{tenant_id}_{hex}` format on first startup after upgrade.
+- Existing `pgwire_user` credentials in the old `project_<hex>` format are automatically
+  rotated to the new `{project_id}_{hex}` format on first startup after upgrade.
 
 ## [0.1.3] - 2026-05-11
 
@@ -155,7 +155,7 @@ Phase 6 production-hardening entry batch.
   - 5.11.C / C2: SQL-bodied reactors (`ALTER TABLE … REACT ON … EXECUTE`) + constraint reactors via `__basin_assert(predicate, error_text)` UDF
   - 5.11.D / E / F: `LANGUAGE sql` scalar functions, `RETURNS TABLE` functions, multi-statement `CALL` procedures (planning-time inlined)
   - 5.11.D2: `CREATE MATERIALIZED VIEW … WITH (basin.continuous, …)` SQL surface
-  - 5.11.I: webhook fanout (`ALTER TABLE … SUBSCRIBE WEBHOOK …`) with retry queue, dead-letter, idempotency keys, per-tenant counters
+  - 5.11.I: webhook fanout (`ALTER TABLE … SUBSCRIBE WEBHOOK …`) with retry queue, dead-letter, idempotency keys, per-project counters
   - 5.11.K: generated columns (`GENERATED ALWAYS AS (expr) STORED`)
   - 5.11.K2: `CREATE TYPE … AS ENUM` + `CREATE DOMAIN`; enum ordinal comparison via `ORDER BY` planner rewrite
   - 5.11.K3: sequences (`CREATE SEQUENCE` + `nextval` / `currval` / `setval` UDFs); multi-option grammar via textual pre-screen
@@ -163,16 +163,16 @@ Phase 6 production-hardening entry batch.
   - Mutual recursion detection in `LANGUAGE sql` inliner — catches `f → g → f` at registration
 
 - **Phase 6 — production hardening (entry batch):**
-  - Constraint enforcement: PRIMARY KEY (composite + single), CHECK (column + table-level), FOREIGN KEY (single-tenant single-shard, `NO ACTION` + `CASCADE`)
+  - Constraint enforcement: PRIMARY KEY (composite + single), CHECK (column + table-level), FOREIGN KEY (single-project single-shard, `NO ACTION` + `CASCADE`)
   - WAL Phase 2 — `Wal` trait extracted; `LocalWal` (single-node fsync, byte-identical to prior concrete) + `RaftWal` (multi-node openraft consensus, single-process simulation, 3-node + 5-node + leader-failure tests)
-  - EDF (Earliest Deadline First) per-tenant scheduler — priority by op-shape, p99 13.97ms under noisy-neighbor load
+  - EDF (Earliest Deadline First) per-project scheduler — priority by op-shape, p99 13.97ms under noisy-neighbor load
   - Vector planner auto-routing for `ORDER BY x <-> $1 LIMIT k` — 5.62× speedup on 1K-row debug-build corpus
   - Decimal128 / `NUMERIC(p, s)` type bridge — DDL + arrow-bridge + pgwire OID 1700 (text wire); `NUMERIC` / `DECIMAL` / `DEC` synonyms accepted
   - basin-trgm GIN trigram index — 9.4× speedup on 1K-row debug-build corpus
   - basin-cv incremental refresh — watermark-based, `date_trunc` / `time_bucket` GROUP BY shapes; falls back to full re-execution on unsupported shapes; `WITH (full = true)` opt-out
   - basin-geo: `LineString` / `Polygon` types + `ST_MakeLine` / `ST_NumPoints` / `ST_PointN` / `ST_Length` / `ST_MakePolygon` / `ST_Area` / `ST_Contains` / `ST_Within`
   - basin-iceberg-rest — Lakekeeper-compat REST catalog (GET namespaces / list-tables / load-table; POST create-table; POST commit-table with `assert-table-uuid` / `assert-current-schema-id` / `assert-ref-snapshot-id` requirements)
-  - BYO-key (KMS) engine seam — `EncryptionProvider` trait + per-tenant `TenantStorageConfig` registry with cache invalidation; `wrap_key_with_config` / `unwrap_key_with_config` extension methods (default-impl forwards for backward compat)
+  - BYO-key (KMS) engine seam — `EncryptionProvider` trait + per-project `ProjectStorageConfig` registry with cache invalidation; `wrap_key_with_config` / `unwrap_key_with_config` extension methods (default-impl forwards for backward compat)
   - CSV `COPY` extensions: column-list (`COPY t (col1, col2) FROM STDIN`) + file paths (`COPY t TO '/var/lib/basin/exports/users.csv'`, gated by `BASIN_COPY_PATH_ALLOWLIST`)
   - pgwire simple-query multi-statement support (`tokio_postgres::batch_execute` of `;`-separated statements)
   - `TIMESTAMP` (without time zone) accepted in CREATE TABLE / TYPE / DOMAIN / FUNCTION arg / RETURNS TABLE / PROCEDURE arg surfaces
@@ -188,7 +188,7 @@ Phase 6 production-hardening entry batch.
 
 - **Trigger story reframed** — `CREATE TRIGGER` with PL/pgSQL body is now an explicit non-goal per [ADR 0012](docs/decisions/0012-change-event-primitive.md). The replacement primitives (declarative lifecycle + reactors) cover ~95% of real-world trigger use cases.
 - **basin-cloud / basin-billing moved out of OSS workspace** — hosted-product crates now live in the separate (closed-source) `basin-cloud` repo. The OSS engine ships `EncryptionProvider` and `BillingProvider`-shaped traits; external callers wire their own adapters.
-- `Engine::new` now `attach_catalog`s on storage so the encryption call path can look up per-tenant `TenantStorageConfig`.
+- `Engine::new` now `attach_catalog`s on storage so the encryption call path can look up per-project `ProjectStorageConfig`.
 - `pg_constraint` / `information_schema.table_constraints` / `key_column_usage` / `referential_constraints` views now populate with real PK / CHECK / FK rows (previously schema-only).
 
 ### Fixed

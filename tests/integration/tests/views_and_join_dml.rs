@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -92,7 +92,7 @@ fn row_count(result: &ExecResult) -> usize {
 async fn view_create_and_select() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE employees (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, dept TEXT NOT NULL)")
         .await
@@ -123,7 +123,7 @@ async fn view_create_and_select() {
 async fn view_create_or_replace() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE nums (n BIGINT NOT NULL PRIMARY KEY)")
         .await
@@ -153,7 +153,7 @@ async fn view_create_or_replace() {
 async fn view_create_duplicate_rejected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
         .await
@@ -171,7 +171,7 @@ async fn view_create_duplicate_rejected() {
 async fn view_drop_if_exists() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
         .await
@@ -197,7 +197,7 @@ async fn view_drop_if_exists() {
 async fn view_temp_accepted() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
         .await
@@ -220,7 +220,7 @@ async fn view_temp_accepted() {
 async fn view_join_in_query() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE orders (oid BIGINT NOT NULL PRIMARY KEY, uid BIGINT NOT NULL, amount BIGINT NOT NULL)")
         .await
@@ -258,7 +258,7 @@ async fn view_cascade_drop_ignored_v0() {
     // CASCADE and RESTRICT are accepted syntactically in v0.1 (no dependents tracked).
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
         .await
@@ -283,7 +283,7 @@ async fn view_cascade_drop_ignored_v0() {
 async fn delete_using_basic() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, status TEXT NOT NULL)")
         .await
@@ -323,7 +323,7 @@ async fn delete_using_basic() {
 async fn delete_using_no_match() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
         .await
@@ -361,7 +361,7 @@ async fn delete_using_no_match() {
 async fn update_from_basic() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE TABLE products (id BIGINT NOT NULL PRIMARY KEY, price BIGINT NOT NULL)",
@@ -413,7 +413,7 @@ async fn insert_select_join_works() {
     // existing exec_insert_select path (DataFusion handles the join).
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
         .await

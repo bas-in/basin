@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
@@ -66,16 +66,16 @@ async fn s3_viability_rls_basic() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL, payload TEXT NOT NULL)")
         .await
         .unwrap();
 
-    let alice = engine.open_session_as(tenant, "alice").await.unwrap();
-    let bob = engine.open_session_as(tenant, "bob").await.unwrap();
+    let alice = engine.open_session_as(project, "alice").await.unwrap();
+    let bob = engine.open_session_as(project, "bob").await.unwrap();
 
     for i in 1..=5_i64 {
         alice
@@ -117,7 +117,7 @@ async fn s3_viability_rls_basic() {
     );
     assert_eq!(bob_rows, 5, "bob sees his 5 rows under RLS, got {bob_rows}");
 
-    let anon = engine.open_session(tenant).await.unwrap();
+    let anon = engine.open_session(project).await.unwrap();
     let anon_rows = rows_seen(anon.execute("SELECT * FROM orders").await.unwrap());
     assert_eq!(
         anon_rows, 0,

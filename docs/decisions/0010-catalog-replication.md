@@ -53,8 +53,8 @@ is the entire point of this document.
 **Pick A: single-writer global Postgres catalog, with per-region read
 replicas via Postgres logical replication.**
 
-One Postgres instance — physically located in the tenant's primary region —
-is the *single writer* for every catalog row that tenant owns. Other regions
+One Postgres instance — physically located in the project's primary region —
+is the *single writer* for every catalog row that project owns. Other regions
 run logical-replication subscribers that ship the `basin_catalog.*` schema
 into a region-local Postgres replica. `basin-server` processes in a replica
 region read from the local replica; writes (DDL, `append_data_files`,
@@ -92,10 +92,10 @@ on it. See "Trigger to revisit" below.
 
 ### Why not Option C (hybrid / batched metadata changes)
 
-Hybrid is the wrong shape for our wedge. The wedge customer is multi-tenant
+Hybrid is the wrong shape for our wedge. The wedge customer is multi-project
 SaaS with audit-log workloads. Their write rate to the catalog is bounded
-by `append_data_files` per tenant per WAL flush — call it tens of commits
-per tenant per second at the high end, and far less for typical tenants.
+by `append_data_files` per project per WAL flush — call it tens of commits
+per project per second at the high end, and far less for typical projects.
 The catalog write rate is not the bottleneck; the catalog *consistency*
 is. Batching metadata changes adds latency to commits in exchange for
 throughput we don't need. Reject.
@@ -144,7 +144,7 @@ Concrete deliverables:
    `fork_table`, `rollback_to_snapshot`) returns
    `BasinError::Catalog("catalog is read-only on this region")`. Read
    methods (`load_table`, `list_tables`, `list_snapshots`,
-   `list_tenant_data_files`) work normally.
+   `list_project_data_files`) work normally.
 3. **One unit test** asserting a read-only `PostgresCatalog` returns the
    right error on every mutating method, and a read works.
 4. **One integration test** (`tests/integration/tests/`, in another agent's
@@ -158,7 +158,7 @@ read replicas (ADR 0004 item 4) is unblocked.
 Out of scope for v0.1: write forwarding (router-layer, ADR 0004 item 3),
 primary-failover automation, replication-lag SLO enforcement.
 
-### v0.2 — Replication-lag observability + per-tenant primary region
+### v0.2 — Replication-lag observability + per-project primary region
 
 Goal: an operator can see lag and a customer can be assigned a non-default
 primary region.
@@ -169,18 +169,18 @@ Concrete deliverables:
    -> Result<Option<Duration>>` (default impl returns `Ok(None)`;
    `PostgresCatalog::connect_read_only` overrides to query
    `pg_stat_subscription` and return the lag).
-2. **`tenants.primary_region` column** on the catalog's namespaces row
+2. **`projects.primary_region` column** on the catalog's namespaces row
    (additive migration in `PostgresCatalog::migrate`), populated at
    `create_namespace` from a new optional argument or the
    `BASIN_DEFAULT_PRIMARY_REGION` env var.
 3. **Lag-based alerting**: a `basin-server` healthcheck that surfaces
    `replication_lag > 5min` as a degraded state. Wires into the existing
-   metrics layer via `TenantCounterRegistry` or a new top-level metric;
+   metrics layer via `ProjectCounterRegistry` or a new top-level metric;
    choose one when this milestone starts.
 
 ### v0.3 — Catalog-side support for primary failover
 
-Goal: an operator can fail a tenant's primary region over to a former
+Goal: an operator can fail a project's primary region over to a former
 replica with a documented data-loss window.
 
 Concrete deliverables:
@@ -197,7 +197,7 @@ Concrete deliverables:
    window math.
 
 v0.3 is *not* automatic failover. Per ADR 0004: "No automatic failover of
-a tenant's primary region. Primary failover is a manual operator action
+a project's primary region. Primary failover is a manual operator action
 with explicit data-loss-window guarantees." This milestone preserves that
 posture.
 
@@ -224,9 +224,9 @@ v0.3):
   there is enough until customer revenue exposes a number.
 - **Active-active catalog writes.** Multi-master Postgres logical
   replication is operationally a nightmare and the wedge does not need
-  it. Future direction stays single-writer-per-tenant.
+  it. Future direction stays single-writer-per-project.
 - **Catalog sharding.** Today: one Postgres instance holds *every*
-  tenant's catalog. At ~10⁶ tenants × ~50 tables × ~10 snapshots, the
+  project's catalog. At ~10⁶ projects × ~50 tables × ~10 snapshots, the
   catalog table size is ~500M rows — within Postgres's comfortable
   range with the right indexes. Sharding becomes a discussion at the
   ~10⁸-row threshold; that is well into Phase 7+.
@@ -256,9 +256,9 @@ We write a successor ADR (0011 or later) when **any** of:
    `RestCatalog` stub graduates to a real implementation, and the
    replication question gets re-examined alongside it.
 4. **Postgres itself becomes the limit.** If the single-writer Postgres
-   becomes a write-throughput bottleneck for any single tenant (the
-   "noisy catalog tenant" problem, analogous to ADR 0008's noisy storage
-   tenant), the answer is per-tenant Postgres sharding, *not* a different
+   becomes a write-throughput bottleneck for any single project (the
+   "noisy catalog project" problem, analogous to ADR 0008's noisy storage
+   project), the answer is per-project Postgres sharding, *not* a different
    replication architecture. That sharding work gets its own ADR.
 
 A single squeaky prospect at smaller value, or a vague "we'd love
@@ -278,13 +278,13 @@ lost-deal tracker and watch the aggregate.
   costs commit latency and operational complexity for throughput we
   don't need. Hybrid is a solution looking for a problem.
 - **Per-region independent catalogs (no replication).** Equivalent to
-  pre-0004 single-region deployments stacked N times. Tenants must
+  pre-0004 single-region deployments stacked N times. Projects must
   choose one region, no read locality benefit, no cross-region read
   story. Rejected: this is what 0004 explicitly steered away from.
 - **Replicate via the WAL.** Tempting (the WAL is already designed to
   ship metadata changes durably), but the WAL is keyed by
-  `(tenant_id, partition_key)` and the catalog is keyed by
-  `(tenant_id, table_name)`. Forcing the catalog through the WAL
+  `(project_id, partition_key)` and the catalog is keyed by
+  `(project_id, table_name)`. Forcing the catalog through the WAL
   conflates two replication regimes with different consistency needs and
   fan-out shapes. Rejected: stays as a "WAL is for data, catalog is for
   metadata" boundary.

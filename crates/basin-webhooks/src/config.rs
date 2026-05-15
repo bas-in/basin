@@ -4,8 +4,8 @@
 //! wiring layer) and threaded through [`WebhookSink`](crate::WebhookSink),
 //! [`RetryQueue`](crate::RetryQueue), and [`WebhookWorker`](crate::WebhookWorker).
 //!
-//! Per-tenant cost discipline is preserved here: every value is process-
-//! global, never per-tenant.
+//! Per-project cost discipline is preserved here: every value is process-
+//! global, never per-project.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -50,7 +50,7 @@ impl WebhookConfig {
     }
 
     /// Filesystem path of the (single, shared) retry queue file. Per-
-    /// tenant cost rule: this is one file process-wide, not per-tenant.
+    /// project cost rule: this is one file process-wide, not per-project.
     pub fn queue_path(&self) -> PathBuf {
         self.data_dir
             .join("webhooks")
@@ -60,7 +60,7 @@ impl WebhookConfig {
 
     /// Filesystem path of the dead-letter file for `subscription_id`.
     /// Dead-letter storage is per-subscription (a customer-facing entity)
-    /// not per-tenant.
+    /// not per-project.
     pub fn dead_letter_path(&self, subscription_id: &crate::WebhookSubscriptionId) -> PathBuf {
         self.data_dir
             .join("webhooks")

@@ -28,7 +28,7 @@
 //!
 //! Engine reentry would let us reuse the full SQL evaluator at the
 //! cost of a `basin-engine` dep here. That dependency cycle is
-//! exactly what the crate-doc's per-tenant cost discipline calls out
+//! exactly what the crate-doc's per-project cost discipline calls out
 //! — the engine attaches the sink, so the sink cannot own a back-ref
 //! to the engine crate. The mini-evaluator is contained to this file
 //! and covers the predicate shapes the SQL surface accepts in v0.1
@@ -232,13 +232,13 @@ fn op_text(op: basin_common::ChangeOp) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use basin_common::{ChangeOp, TableName, TenantId};
+    use basin_common::{ChangeOp, TableName, ProjectId};
     use chrono::Utc;
     use serde_json::json;
 
     fn ev(after: serde_json::Value) -> ChangeEvent {
         ChangeEvent {
-            tenant: TenantId::new(),
+            project: ProjectId::new(),
             table: TableName::new("t").unwrap(),
             op: ChangeOp::Update,
             before: Some(json!({})),

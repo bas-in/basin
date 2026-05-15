@@ -2,7 +2,7 @@
 //!
 //! See [ADR 0006](../../../docs/decisions/0006-rest-api-layer.md) for
 //! the full design. Depends on `basin-auth` for JWT verification —
-//! REST without auth is a public dump of every tenant's data, not a
+//! REST without auth is a public dump of every project's data, not a
 //! feature.
 //!
 //! ## v1 endpoints
@@ -33,7 +33,7 @@
 //!
 //! Every `/rest/v1/*` request carries `Authorization: Bearer <jwt>`. The JWT
 //! is verified via [`basin_auth::AuthService::verify_jwt`]; the resulting
-//! [`basin_auth::Claims::tenant_id`] feeds [`basin_engine::Engine::open_session`]
+//! [`basin_auth::Claims::project_id`] feeds [`basin_engine::Engine::open_session`]
 //! for the request's lifetime. RLS policies (when implemented) consume the
 //! `roles[]` claim.
 //!
@@ -58,7 +58,7 @@
 //!
 //! - Embedded resources, stored functions, realtime, GraphQL, and
 //!   aggregates are out of v1 (see ADR 0006).
-//! - OpenAPI: `GET /rest/v1/_openapi.json` ships a per-tenant 3.0.3
+//! - OpenAPI: `GET /rest/v1/_openapi.json` ships a per-project 3.0.3
 //!   spec generated from the live catalog. Deferred for follow-up:
 //!   security schemes (the bearer-JWT requirement), per-operation
 //!   query / filter parameter docs, request examples, and a multi-
@@ -74,7 +74,7 @@
 //!
 //! - `#![forbid(unsafe_code)]`.
 //! - Every endpoint goes through JWT auth before reaching the engine.
-//! - Per-tenant rate limit via `governor`.
+//! - Per-project rate limit via `governor`.
 //! - Body size capped via `axum::extract::DefaultBodyLimit`.
 //! - CORS allowlist is explicit; the bare `*` origin is never emitted.
 //! - All errors come back as `{ "code": "...", "message": "..." }` JSON.
@@ -120,7 +120,7 @@ pub struct RestConfig {
     pub max_page_size: usize,
     /// Allowed CORS origins. **Never `*`.**
     pub cors_origins: Vec<String>,
-    /// Per-tenant rate limit, requests per second. Defaults to 100.
+    /// Per-project rate limit, requests per second. Defaults to 100.
     pub rate_limit_per_sec: u32,
 }
 

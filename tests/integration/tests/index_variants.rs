@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -50,9 +50,9 @@ fn assert_empty(res: ExecResult, tag: &str) {
     }
 }
 
-async fn setup(dir: &TempDir, ddl: &str) -> basin_engine::TenantSession {
+async fn setup(dir: &TempDir, ddl: &str) -> basin_engine::ProjectSession {
     let engine = make_engine(dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_empty(
         sess.execute(ddl).await.unwrap_or_else(|e| panic!("setup failed: {e}")),
         "CREATE TABLE",

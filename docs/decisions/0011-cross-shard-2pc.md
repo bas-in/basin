@@ -6,12 +6,12 @@
 
 ## Context
 
-Basin shards by tenant. The router (`crates/basin-router/src/sharding.rs`)
-hashes `TenantId` to one shard endpoint and proxies the entire connection
-to that owner via `remote_shard.rs`. There is no "tenant lives on two
-shards" case in the substrate — a tenant is one shard's tenant, full
+Basin shards by project. The router (`crates/basin-router/src/sharding.rs`)
+hashes `ProjectId` to one shard endpoint and proxies the entire connection
+to that owner via `remote_shard.rs`. There is no "project lives on two
+shards" case in the substrate — a project is one shard's project, full
 stop. Whale pinning (Phase 5.5) overrides the hash for individual
-tenants, but each pinned tenant still resolves to exactly one endpoint.
+projects, but each pinned project still resolves to exactly one endpoint.
 
 Two layers above are missing today:
 
@@ -32,13 +32,13 @@ transaction resolution) is a multi-month project for a team that has
 done it before — and it permanently raises the operational complexity
 floor of the cluster.
 
-The wedge customer (multi-tenant SaaS / audit-heavy fintech / agent
-platforms) writes only within a single tenant 99.9%+ of the time.
-Per-tenant prefix isolation makes cross-shard writes structurally rare:
+The wedge customer (multi-project SaaS / audit-heavy fintech / agent
+platforms) writes only within a single project 99.9%+ of the time.
+Per-project prefix isolation makes cross-shard writes structurally rare:
 a SQL statement that mutates rows on two shards is, by Basin's
-construction, a SQL statement that names two tenants. The pgwire
-session is bound to one tenant via `TenantSession`; the SQL surface has
-no qualifier syntax that names another tenant; the engine's
+construction, a SQL statement that names two projects. The pgwire
+session is bound to one project via `ProjectSession`; the SQL surface has
+no qualifier syntax that names another project; the engine's
 `single_part_name` helper rejects schema-qualified identifiers as
 `InvalidIdent` already.
 
@@ -66,7 +66,7 @@ We considered:
   failure domain, and you pay the prepare round-trip on *every* write
   whose plan touches more than one shard (which the planner often
   cannot tell ahead of time without per-row routing). For a wedge
-  customer who writes within one tenant 99.9% of the time, this is
+  customer who writes within one project 99.9% of the time, this is
   paying a tax on every write to insure against an event that doesn't
   happen.
 - **Option B — Saga / TCC.** No global lock; each step is a local
@@ -86,8 +86,8 @@ We considered:
   full optionality on which of A or B we ship later.
 
 The recommendation argues from the wedge's actual shape, not from
-textbook 2PC abstractness. **For Basin's wedge customer — multi-tenant
-SaaS where each tenant's data is fully self-contained — C is the right
+textbook 2PC abstractness. **For Basin's wedge customer — multi-project
+SaaS where each project's data is fully self-contained — C is the right
 answer today.** The ADR locks C and documents what would flip it.
 
 ## What gets rejected today, and what to do instead
@@ -95,14 +95,14 @@ answer today.** The ADR locks C and documents what would flip it.
 The engine rejects the following shapes with SQLSTATE `0A000`,
 message `cross-shard mutations are not supported in v0.1; see ADR 0011`:
 
-- **Multi-table DML referencing more than one tenant's table by name.**
+- **Multi-table DML referencing more than one project's table by name.**
   Today this is structurally impossible to express because the SQL
-  surface has no `tenant.table` qualifier and `TenantSession` is
-  per-tenant. The rejection is defense-in-depth for the day a future
-  feature (cross-tenant materialized views, an admin SQL surface) adds
+  surface has no `project.table` qualifier and `ProjectSession` is
+  per-project. The rejection is defense-in-depth for the day a future
+  feature (cross-project materialized views, an admin SQL surface) adds
   qualified naming.
 - **`INSERT INTO a SELECT … FROM b` where `a` and `b` resolve to
-  different shards.** Within one tenant (the only case the engine can
+  different shards.** Within one project (the only case the engine can
   currently express) this is a single-shard write — the engine
   already accepts it on the `single_part_name` path. The rejection
   fires only if a future planner extension routes the SELECT to a
@@ -111,27 +111,27 @@ message `cross-shard mutations are not supported in v0.1; see ADR 0011`:
   resolve to different shards** (e.g. `WITH x AS (UPDATE t1 …),
   y AS (UPDATE t2 …) SELECT …` where `t1` and `t2` live on different
   endpoints).
-- **Future cross-tenant `JOIN` with `INSERT INTO … SELECT`.** Same
+- **Future cross-project `JOIN` with `INSERT INTO … SELECT`.** Same
   rule: any plan that fans a write to more than one shard is rejected.
 
 The rejection lives at planning time inside the engine, not at the
 router, because the router cannot tell mutation shape from connection
 metadata alone — it forwards bytes to the shard owner that owns the
-session's tenant, and the shard owner is the one with the parsed AST.
+session's project, and the shard owner is the one with the parsed AST.
 
 **What to do instead, today:**
 
-- Run multi-tenant reporting against the analytical engine
+- Run multi-project reporting against the analytical engine
   (`basin-analytical` / DuckDB on Iceberg) which reads the shared
   storage substrate. Reads do *not* span shards in the writer sense —
   the analytical pool reads Parquet directly.
-- For cross-tenant aggregation that updates a derived table, write a
-  job (using `basin-cron`, ADR 0002 substitute) that runs per-tenant,
-  writes per-tenant, and produces per-tenant materializations.
+- For cross-project aggregation that updates a derived table, write a
+  job (using `basin-cron`, ADR 0002 substitute) that runs per-project,
+  writes per-project, and produces per-project materializations.
   `basin-cv` (continuous-aggregate equivalent) already does this.
-- For a true cross-tenant rollup table, model it as its own tenant
+- For a true cross-project rollup table, model it as its own project
   whose owner is the platform: a single-shard write target the platform
-  populates from per-tenant feeds. Crosses no shards on the write path.
+  populates from per-project feeds. Crosses no shards on the write path.
 
 ## Recovery semantics
 
@@ -201,7 +201,7 @@ them.
   that pulls rows from another shard). Read-side cross-shard fan-out
   is a separate feature (CAPABILITIES.md "Cross-shard query merging");
   write-side cross-shard fan-out is exactly what this ADR rejects.
-- **Catalog-level 2PC for DDL across shards.** DDL is per-tenant
+- **Catalog-level 2PC for DDL across shards.** DDL is per-project
   per-shard already; there is no DDL operation today that names two
   shards.
 
@@ -242,24 +242,24 @@ hook point.
 We write a successor ADR (likely 0012) and start the implementation
 when **one** of:
 
-1. A wedge customer signs ≥ $50k ARR contingent on cross-tenant
+1. A wedge customer signs ≥ $50k ARR contingent on cross-project
    reporting that *requires strong consistency at write time* (not
    eventual; not bounded-staleness — actual serializability across
-   tenants in a single transaction). The contract terms must include
+   projects in a single transaction). The contract terms must include
    a delivery window of ≥ 4 months after signing.
 2. A regulator or compliance regime mandates cross-shard atomicity
    for an audit-log requirement that genuinely cannot be served by
-   per-tenant audit logs (rare; most regulators care about per-entity
-   integrity, which is per-tenant by construction).
-3. We onboard a customer whose tenant-level partitioning genuinely
-   does not work — their data model is irreducibly cross-tenant in
-   shape (e.g. a shared marketplace ledger), and the platform-tenant
+   per-project audit logs (rare; most regulators care about per-entity
+   integrity, which is per-project by construction).
+3. We onboard a customer whose project-level partitioning genuinely
+   does not work — their data model is irreducibly cross-project in
+   shape (e.g. a shared marketplace ledger), and the platform-project
    workaround in "What to do instead" above is unacceptable for
    their auditors.
 
 A single prospect at smaller value, or "we'd love it someday," or "our
 ORM emits cross-table updates we want to land atomically *within* a
-tenant" (that's single-shard), is **not** the trigger. Log them in the
+project" (that's single-shard), is **not** the trigger. Log them in the
 lost-deal tracker but do not start the work.
 
 When the trigger fires, the successor ADR picks A or B explicitly. Our

@@ -10,7 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// One continuous-aggregate definition. The natural key is `(tenant, name)`;
+/// One continuous-aggregate definition. The natural key is `(project, name)`;
 /// `name` is the same identifier used to read the CV via SQL
 /// (`SELECT * FROM <name>`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

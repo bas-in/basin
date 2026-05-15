@@ -24,10 +24,10 @@ This ADR locks the design. The build is deferred along with 0005.
 ## Decision
 
 Basin will ship **`basin-rest`**, a thin HTTP service exposing each
-tenant's tables as REST endpoints with PostgREST-compatible URL and
+project's tables as REST endpoints with PostgREST-compatible URL and
 JSON conventions for the subset that matters. **basin-rest depends on
 basin-auth.** A REST API without authentication is not a product; it
-is a public dump of every tenant's data.
+is a public dump of every project's data.
 
 ### Endpoint shape
 
@@ -70,8 +70,8 @@ DELETE /rest/v1/<table>?<filter>
 2. Client calls `GET /rest/v1/events`, sends `Authorization: Bearer
    <access_token>`.
 3. `basin-rest` verifies the JWT via `basin-auth::verify_token`,
-   extracts `tenant_id` and `roles[]`.
-4. The request runs against `basin-engine` scoped to that `tenant_id`.
+   extracts `project_id` and `roles[]`.
+4. The request runs against `basin-engine` scoped to that `project_id`.
 5. RLS policies (when implemented) consult `roles[]` from the claims.
 
 ### What's *out* of v1
@@ -136,7 +136,7 @@ without the other is a fatal startup error.
 
 - Frontend-only customers can ship without an application server.
   fetch() against `/rest/v1/...` with the JWT in headers — done.
-- Same wedge math (per-tenant cheap multi-tenant) applies to REST
+- Same wedge math (per-project cheap multi-project) applies to REST
   customers as to pgwire customers.
 - Demo gain: `curl https://demo.basin.io/rest/v1/events -H "Authorization: ..."`
   is much easier sales theatre than spinning up `psql`.
@@ -155,7 +155,7 @@ without the other is a fatal startup error.
 
 **Mitigations**
 
-- All endpoints rate-limited per-tenant via the same `governor` setup
+- All endpoints rate-limited per-project via the same `governor` setup
   basin-auth uses.
 - Body-size caps and result-row caps default to conservative values.
 - The `OPTIONS` preflight is a fast path; CORS origin allowlist is
@@ -211,8 +211,8 @@ the BaaS strategy. That sequencing is intentional.
   customer specifically asks. No conflict — could be added as a
   parallel crate `basin-graphql` later.
 - **Build the REST layer without auth in v1.** Hard rejected. A
-  public REST endpoint over a multi-tenant database is a P0 incident
+  public REST endpoint over a multi-project database is a P0 incident
   waiting to happen. basin-auth gates this build.
 - **Re-use basin-router's pgwire startup auth for REST.** Rejected —
-  pgwire's auth is connection-scoped (one tenant per TCP connection);
+  pgwire's auth is connection-scoped (one project per TCP connection);
   REST is per-request. Different shape, different code path.

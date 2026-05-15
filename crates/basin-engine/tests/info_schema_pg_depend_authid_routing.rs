@@ -6,7 +6,7 @@
 //!
 //! - SELECTs against pg_depend route end-to-end and surface function-type
 //!   dep rows the catalog API produced.
-//! - SELECTs against pg_authid surface the calling tenant's role row.
+//! - SELECTs against pg_authid surface the calling project's role row.
 //! - pgAdmin-style "list relations + their owner" CROSS JOIN against
 //!   `pg_class` works (Basin doesn't track per-object owner yet, so the
 //!   pattern degrades to one role row × N relations).
@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
-use basin_engine::{Engine, EngineConfig, ExecResult, TenantSession};
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
@@ -72,7 +72,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-async fn rows(sess: &TenantSession, sql: &str) -> Vec<RecordBatch> {
+async fn rows(sess: &ProjectSession, sql: &str) -> Vec<RecordBatch> {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -85,7 +85,7 @@ async fn select_pg_depend_routes() {
     // 3 normal-deptype rows in pg_depend.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute(
         "CREATE FUNCTION fmt_id(label TEXT, n BIGINT) RETURNS BIGINT \
@@ -120,13 +120,13 @@ async fn select_pg_depend_routes() {
 async fn select_pg_authid_routes() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
 
     let batches = rows(&sess, "SELECT rolname FROM pg_catalog.pg_authid").await;
     assert_eq!(total_rows(&batches), 1, "exactly one role per session");
     let names = col_string(&batches, "rolname");
-    assert_eq!(names, vec![tenant.to_string()]);
+    assert_eq!(names, vec![project.to_string()]);
 }
 
 #[tokio::test]
@@ -134,14 +134,14 @@ async fn pg_authid_join_pg_class_owner_pattern() {
     // pgAdmin-style "list every relation alongside the owner role" pattern.
     // Basin v0.1 doesn't yet track owner per object, so the realistic
     // best-effort approximation is a CROSS JOIN: every relation gets
-    // paired with the single tenant-as-role row. Tooling that displays
+    // paired with the single project-as-role row. Tooling that displays
     // "owner" can still render a non-NULL value; the trade-off is that
     // every relation reports the same owner. This is documented in the
     // CAPABILITIES.md row for 5.11.M.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let tenant = TenantId::new();
-    let sess = eng.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
 
     sess.execute("CREATE TABLE accounts (id BIGINT NOT NULL, email TEXT NOT NULL)")
         .await
@@ -166,11 +166,11 @@ async fn pg_authid_join_pg_class_owner_pattern() {
     let relnames = col_string(&batches, "relname");
     let rolnames = col_string(&batches, "rolname");
     assert_eq!(relnames, vec!["accounts".to_string(), "orders".to_string()]);
-    let expected = tenant.to_string();
+    let expected = project.to_string();
     for r in &rolnames {
         assert_eq!(
             r, &expected,
-            "every relation maps to the calling tenant role"
+            "every relation maps to the calling project role"
         );
     }
 }
@@ -185,7 +185,7 @@ async fn pg_depend_cv_source_table_pgdump_join() {
     // resolves the matview name back to its source table.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
-    let sess = eng.open_session(TenantId::new()).await.unwrap();
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("CREATE TABLE events (bucket BIGINT NOT NULL, n BIGINT NOT NULL)")
         .await

@@ -1,5 +1,5 @@
-//! End-to-end coverage for the EDF (Earliest Deadline First) per-tenant
-//! scheduler activation. The tests drive `Storage::tenant_object_store`
+//! End-to-end coverage for the EDF (Earliest Deadline First) per-project
+//! scheduler activation. The tests drive `Storage::project_object_store`
 //! through a deliberately-slow inner [`ObjectStore`] so the scheduler's
 //! dispatch-order behaviour is observable in real wall-clock time.
 //!
@@ -22,7 +22,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult,
 };
 
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_storage::{Storage, StorageConfig};
 
 /// Inner store with synthetic latency. Each RPC sleeps for the
@@ -31,7 +31,7 @@ use basin_storage::{Storage, StorageConfig};
 ///
 /// `concurrent_max` is the high-water mark of in-flight ops observed
 /// through this wrapper; tests assert it never exceeds `cap=16` (the
-/// per-tenant Semaphore floor) under any workload.
+/// per-project Semaphore floor) under any workload.
 #[derive(Debug)]
 struct SlowStore {
     inner: Arc<dyn ObjectStore>,
@@ -186,12 +186,12 @@ fn storage_with_slow(slow: Arc<SlowStore>) -> Storage {
     })
 }
 
-/// Pre-populate the inner store with a key shaped under `tenant`'s
+/// Pre-populate the inner store with a key shaped under `project`'s
 /// prefix and return the path. Bytes are tunable so a test can request
 /// a small (point-shaped) or large (bulk-shaped) value.
-async fn seed_object(storage: &Storage, tenant: &TenantId, name: &str, bytes: usize) -> ObjectPath {
-    let path = ObjectPath::from(format!("tenants/{}/data/{}", tenant.as_prefix(), name));
-    let store = storage.tenant_object_store(tenant);
+async fn seed_object(storage: &Storage, project: &ProjectId, name: &str, bytes: usize) -> ObjectPath {
+    let path = ObjectPath::from(format!("projects/{}/data/{}", project.as_prefix(), name));
+    let store = storage.project_object_store(project);
     let payload = PutPayload::from(Bytes::from(vec![0u8; bytes]));
     store.put(&path, payload).await.expect("seed put");
     path
@@ -201,18 +201,18 @@ async fn seed_object(storage: &Storage, tenant: &TenantId, name: &str, bytes: us
 // Tests
 // ---------------------------------------------------------------------
 
-/// One tenant submits 100 ops sequentially; the scheduler must not
+/// One project submits 100 ops sequentially; the scheduler must not
 /// inflate completion time beyond ~2× the bare per-op cost. Validates
 /// the EDF wiring is overhead-free in the steady state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn single_tenant_no_starvation() {
+async fn single_project_no_starvation() {
     let per_op = Duration::from_millis(2);
     let slow = Arc::new(SlowStore::new(per_op));
     let storage = storage_with_slow(slow.clone());
-    let tenant = TenantId::new();
-    let path = seed_object(&storage, &tenant, "f", 64).await;
+    let project = ProjectId::new();
+    let path = seed_object(&storage, &project, "f", 64).await;
 
-    let store = storage.tenant_object_store(&tenant);
+    let store = storage.project_object_store(&project);
     let started = Instant::now();
     for _ in 0..100 {
         let _ = store.head(&path).await.expect("head");
@@ -222,31 +222,31 @@ async fn single_tenant_no_starvation() {
     // scheduler can add bookkeeping overhead but not double the cost.
     assert!(
         elapsed < per_op * 100 * 2,
-        "single-tenant overhead: {:?} > 2× ({:?})",
+        "single-project overhead: {:?} > 2× ({:?})",
         elapsed,
         per_op * 100 * 2
     );
 }
 
-/// Tenant A submits 100 bulk Low ops; tenant B submits one point High
+/// Project A submits 100 bulk Low ops; project B submits one point High
 /// op concurrently. B's op must dispatch before more than a small
 /// number of A's bulks complete — bounded by the EDF deadline gap
 /// + consecutive-dispatch cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn noisy_tenant_no_starvation_for_quiet_tenant() {
+async fn noisy_project_no_starvation_for_quiet_project() {
     let per_op = Duration::from_millis(5);
     let slow = Arc::new(SlowStore::new(per_op));
     let storage = storage_with_slow(slow.clone());
 
-    let tenant_a = TenantId::new();
-    let tenant_b = TenantId::new();
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
     // Seed a >256KB object for A (so A's get_range maps to Low) and a
     // small object for B (so B's HEAD maps to High).
-    let a_path = seed_object(&storage, &tenant_a, "bulk", 1024 * 1024).await; // 1 MiB
-    let b_path = seed_object(&storage, &tenant_b, "point", 64).await;
+    let a_path = seed_object(&storage, &project_a, "bulk", 1024 * 1024).await; // 1 MiB
+    let b_path = seed_object(&storage, &project_b, "point", 64).await;
 
-    let store_a = storage.tenant_object_store(&tenant_a);
-    let store_b = storage.tenant_object_store(&tenant_b);
+    let store_a = storage.project_object_store(&project_a);
+    let store_b = storage.project_object_store(&project_b);
 
     let mut handles = vec![];
     for _ in 0..100 {
@@ -269,7 +269,7 @@ async fn noisy_tenant_no_starvation_for_quiet_tenant() {
     let bound = per_op * 16;
     assert!(
         b_latency < bound,
-        "B's point HEAD latency {:?} ≥ bound {:?} — quiet tenant starved",
+        "B's point HEAD latency {:?} ≥ bound {:?} — quiet project starved",
         b_latency,
         bound
     );
@@ -279,8 +279,8 @@ async fn noisy_tenant_no_starvation_for_quiet_tenant() {
     }
 }
 
-/// One tenant performs a sustained scan workload (Low, large range);
-/// another tenant fires point lookups (High) concurrently. Every
+/// One project performs a sustained scan workload (Low, large range);
+/// another project fires point lookups (High) concurrently. Every
 /// point lookup should complete with low per-op latency — bounded by
 /// the EDF deadline, not by the scanner's bulk throughput.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -293,13 +293,13 @@ async fn large_op_doesnt_starve_point_lookups() {
     let slow = Arc::new(SlowStore::new(per_op));
     let storage = storage_with_slow(slow.clone());
 
-    let scanner = TenantId::new();
-    let pointer = TenantId::new();
+    let scanner = ProjectId::new();
+    let pointer = ProjectId::new();
     let bulk_path = seed_object(&storage, &scanner, "scan", 2 * 1024 * 1024).await;
     let point_path = seed_object(&storage, &pointer, "p", 64).await;
 
-    let scan_store = storage.tenant_object_store(&scanner);
-    let point_store = storage.tenant_object_store(&pointer);
+    let scan_store = storage.project_object_store(&scanner);
+    let point_store = storage.project_object_store(&pointer);
 
     // Bulk scanner: a sustained sequence of large range reads (each
     // classed Low by the scheduler).
@@ -316,7 +316,7 @@ async fn large_op_doesnt_starve_point_lookups() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Pointer: 100 sequential point lookups (the realistic shape — a
-    // quiet tenant pipelines, doesn't burst). Measure per-op latency.
+    // quiet project pipelines, doesn't burst). Measure per-op latency.
     let mut latencies: Vec<Duration> = Vec::with_capacity(100);
     for _ in 0..100 {
         let started = Instant::now();
@@ -345,10 +345,10 @@ async fn large_op_doesnt_starve_point_lookups() {
     );
 }
 
-/// One tenant submits 100 point ops; a second tenant submits 100 point
+/// One project submits 100 point ops; a second project submits 100 point
 /// ops concurrently. Without the consecutive-dispatch cap the first
-/// tenant's deadlines would all win the heap and serialise. With the
-/// cap, the dispatch order interleaves — neither tenant runs more than
+/// project's deadlines would all win the heap and serialise. With the
+/// cap, the dispatch order interleaves — neither project runs more than
 /// `CONSECUTIVE_DISPATCH_CAP` consecutive dispatches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consecutive_dispatch_cap_enforced() {
@@ -356,13 +356,13 @@ async fn consecutive_dispatch_cap_enforced() {
     let slow = Arc::new(SlowStore::new(per_op));
     let storage = storage_with_slow(slow.clone());
 
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     let pa = seed_object(&storage, &a, "p", 64).await;
     let pb = seed_object(&storage, &b, "p", 64).await;
 
-    let store_a = storage.tenant_object_store(&a);
-    let store_b = storage.tenant_object_store(&b);
+    let store_a = storage.project_object_store(&a);
+    let store_b = storage.project_object_store(&b);
 
     let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -404,19 +404,19 @@ async fn consecutive_dispatch_cap_enforced() {
     );
 }
 
-/// Regression: even with the EDF scheduler in front, a single tenant
-/// can never exceed the per-tenant Semaphore floor (cap=16) of
+/// Regression: even with the EDF scheduler in front, a single project
+/// can never exceed the per-project Semaphore floor (cap=16) of
 /// concurrent in-flight ops. Submits 200 concurrent point ops from one
-/// tenant; the SlowStore's high-water mark must stay ≤ 16.
+/// project; the SlowStore's high-water mark must stay ≤ 16.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cap_16_concurrent_unchanged() {
     let per_op = Duration::from_millis(20);
     let slow = Arc::new(SlowStore::new(per_op));
     let storage = storage_with_slow(slow.clone());
 
-    let tenant = TenantId::new();
-    let p = seed_object(&storage, &tenant, "p", 64).await;
-    let store = storage.tenant_object_store(&tenant);
+    let project = ProjectId::new();
+    let p = seed_object(&storage, &project, "p", 64).await;
+    let store = storage.project_object_store(&project);
 
     let mut handles = vec![];
     for _ in 0..200 {
@@ -432,7 +432,7 @@ async fn cap_16_concurrent_unchanged() {
     let max_in_flight = slow.concurrent_max();
     assert!(
         max_in_flight <= 16,
-        "max in-flight {} exceeded cap=16 per-tenant Semaphore floor",
+        "max in-flight {} exceeded cap=16 per-project Semaphore floor",
         max_in_flight
     );
 }
@@ -447,13 +447,13 @@ async fn fairness_observability() {
     let slow = Arc::new(SlowStore::new(per_op));
     let storage = storage_with_slow(slow.clone());
 
-    let bulk = TenantId::new();
-    let point = TenantId::new();
+    let bulk = ProjectId::new();
+    let point = ProjectId::new();
     let bulk_path = seed_object(&storage, &bulk, "b", 1024 * 1024).await;
     let point_path = seed_object(&storage, &point, "p", 64).await;
 
-    let store_bulk = storage.tenant_object_store(&bulk);
-    let store_point = storage.tenant_object_store(&point);
+    let store_bulk = storage.project_object_store(&bulk);
+    let store_point = storage.project_object_store(&point);
 
     // Spawn the noisy bulk workload. Finite count so the test always
     // terminates regardless of scheduler decisions.
@@ -466,8 +466,8 @@ async fn fairness_observability() {
         }));
     }
 
-    // Tiny pause so the bulk tenant's queue is hot before the point
-    // tenant arrives.
+    // Tiny pause so the bulk project's queue is hot before the point
+    // project arrives.
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Time 100 sequential point lookups.

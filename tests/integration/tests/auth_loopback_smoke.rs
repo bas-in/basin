@@ -20,7 +20,7 @@
 //!    loopback pgwire connection (the SMTP relay is a stub on
 //!    `localhost:2525`).
 //! 6. `POST /auth/v1/signin` → 200 + `access_token` JWT.
-//! 7. Connect to pgwire as the static `test` user (from `BASIN_TENANTS=
+//! 7. Connect to pgwire as the static `test` user (from `BASIN_PROJECTS=
 //!    test=...`), run `SELECT 1`, assert one row with the int value `1`.
 //! 8. Connect via `basin_auth` again and read `SELECT email FROM
 //!    basin_auth_users` to verify the signup row landed in the auth catalog.
@@ -48,8 +48,8 @@ use tokio_postgres::NoTls;
 
 /// Crockford-base32 ULID, valid characters only (no I/L/O/U). Stable across
 /// runs so a debugging operator can grep logs deterministically.
-const STATIC_TENANT_ULID: &str = "01JABBASEZTESTTENANT0000ZZ";
-const STATIC_TENANT_USER: &str = "test";
+const STATIC_PROJECT_ULID: &str = "01JABBASEZTESTPROJECT0000ZZ";
+const STATIC_PROJECT_USER: &str = "test";
 
 /// Hex-encoded 32-byte JWT secret (≥32 bytes after `hex::decode`).
 const JWT_SECRET_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -132,8 +132,8 @@ async fn boot() -> Option<(ChildGuard, SocketAddr, SocketAddr, TempDir, TempDir)
             .env("BASIN_DATA_DIR", data_dir.path())
             .env("BASIN_WAL_DIR", wal_dir.path())
             .env(
-                "BASIN_TENANTS",
-                format!("{STATIC_TENANT_USER}={STATIC_TENANT_ULID}"),
+                "BASIN_PROJECTS",
+                format!("{STATIC_PROJECT_USER}={STATIC_PROJECT_ULID}"),
             )
             .env("BASIN_CATALOG", "memory")
             .env("BASIN_AUTH_ENABLED", "1")
@@ -318,8 +318,8 @@ fn decode_chunked(mut buf: &[u8]) -> Vec<u8> {
 
 /// Open a pgwire connection as the reserved `basin_auth` user. This goes
 /// through the auto-injected static-resolver entry (basin-server registers
-/// `basin_auth -> INTERNAL_AUTH_TENANT_ID` at startup) and lands in the
-/// system tenant's namespace — exactly where basin-auth's `users` /
+/// `basin_auth -> INTERNAL_AUTH_PROJECT_ID` at startup) and lands in the
+/// system project's namespace — exactly where basin-auth's `users` /
 /// `refresh_tokens` / etc. tables live.
 async fn connect_as_basin_auth(
     pg_addr: SocketAddr,
@@ -349,14 +349,14 @@ async fn auth_loopback_signup_signin_pgwire_smoke() {
     };
 
     // 1. SIGNUP --------------------------------------------------------------
-    // The basin-rest signup endpoint requires `tenant_id` in the body —
-    // basin-auth's user table is per-tenant. We use the same ULID we baked
-    // into BASIN_TENANTS so the static-resolver path can find it later from
+    // The basin-rest signup endpoint requires `project_id` in the body —
+    // basin-auth's user table is per-project. We use the same ULID we baked
+    // into BASIN_PROJECTS so the static-resolver path can find it later from
     // the pgwire side.
     let email = "alice@example.com";
     let password = "hunter2!hunter2!";
     let signup_body = serde_json::json!({
-        "tenant_id": STATIC_TENANT_ULID,
+        "project_id": STATIC_PROJECT_ULID,
         "email": email,
         "password": password,
     })
@@ -417,7 +417,7 @@ async fn auth_loopback_signup_signin_pgwire_smoke() {
 
     // 3. SIGNIN -------------------------------------------------------------
     let signin_body = serde_json::json!({
-        "tenant_id": STATIC_TENANT_ULID,
+        "project_id": STATIC_PROJECT_ULID,
         "email": email,
         "password": password,
     })
@@ -456,48 +456,48 @@ async fn auth_loopback_signup_signin_pgwire_smoke() {
     );
 
     // 4. STATIC PASSWORDLESS PGWIRE IS BLOCKED ------------------------------
-    // Once auth is enabled, BASIN_TENANTS is only a bootstrap/internal
-    // resolver. Customer pgwire connections must use provisioned per-tenant
+    // Once auth is enabled, BASIN_PROJECTS is only a bootstrap/internal
+    // resolver. Customer pgwire connections must use provisioned per-project
     // credentials; accepting any password here would be the old bug.
     let static_conn = format!(
         "host=127.0.0.1 port={} user={} password=ignored dbname=basin",
         pg_addr.port(),
-        STATIC_TENANT_USER
+        STATIC_PROJECT_USER
     );
     assert!(
         tokio_postgres::connect(&static_conn, NoTls).await.is_err(),
-        "static BASIN_TENANTS user must not accept an arbitrary password when auth is enabled"
+        "static BASIN_PROJECTS user must not accept an arbitrary password when auth is enabled"
     );
 
-    // 5. PGWIRE SELECT 1 AS PROVISIONED TENANT ------------------------------
-    // Provision a tenant credential row directly through the auth catalog,
+    // 5. PGWIRE SELECT 1 AS PROVISIONED PROJECT ------------------------------
+    // Provision a project credential row directly through the auth catalog,
     // then prove pgwire startup bcrypt-validates that password.
-    let pgwire_user = "tenant_deadbeef";
-    let pgwire_password = "tenant-password-12345";
-    let pgwire_hash = bcrypt::hash(pgwire_password, 4).expect("bcrypt tenant pgwire password");
+    let pgwire_user = "project_deadbeef";
+    let pgwire_password = "project-password-12345";
+    let pgwire_hash = bcrypt::hash(pgwire_password, 4).expect("bcrypt project pgwire password");
     let (client, driver) = connect_as_basin_auth(pg_addr).await;
     let n = client
         .execute(
-            "INSERT INTO basin_auth_auth_tenant_credentials \
-               (tenant_id, pgwire_user, password_hash, dbname) \
+            "INSERT INTO basin_auth_auth_project_credentials \
+               (project_id, pgwire_user, password_hash, dbname) \
              VALUES ($1, $2, $3, 'basin')",
-            &[&STATIC_TENANT_ULID, &pgwire_user, &pgwire_hash],
+            &[&STATIC_PROJECT_ULID, &pgwire_user, &pgwire_hash],
         )
         .await
         .expect("insert provisioned pgwire credential");
-    assert_eq!(n, 1, "expected one tenant credential row");
+    assert_eq!(n, 1, "expected one project credential row");
     drop(client);
     let _ = driver.await;
 
-    let tenant_conn = format!(
+    let project_conn = format!(
         "host=127.0.0.1 port={} user={} password={} dbname=basin",
         pg_addr.port(),
         pgwire_user,
         pgwire_password
     );
-    let (client, driver) = tokio_postgres::connect(&tenant_conn, NoTls)
+    let (client, driver) = tokio_postgres::connect(&project_conn, NoTls)
         .await
-        .expect("pgwire connect with provisioned tenant credentials");
+        .expect("pgwire connect with provisioned project credentials");
     let driver = tokio::spawn(async move {
         let _ = driver.await;
     });
@@ -525,7 +525,7 @@ async fn auth_loopback_signup_signin_pgwire_smoke() {
     // 6. AUTH CATALOG INTROSPECTION ----------------------------------------
     // Read the signup row back through loopback pgwire as `basin_auth`.
     // Catches "schema bootstrap broken" / "auth catalog landed in the wrong
-    // tenant namespace" regressions that would otherwise only surface
+    // project namespace" regressions that would otherwise only surface
     // mid-dashboard.
     let (client, driver) = connect_as_basin_auth(pg_addr).await;
     let rows = client

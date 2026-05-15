@@ -39,11 +39,11 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::Field;
 use basin_catalog::{Catalog, DomainDef, EnumTypeDef, SqlArgType};
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use sqlparser::ast::{ColumnDef, DataType as SqlDataType, Ident, ObjectName};
 
 use crate::types::{BASIN_DOMAIN_KEY, BASIN_ENUM_TYPE_KEY};
-use crate::{ExecResult, TenantSession};
+use crate::{ExecResult, ProjectSession};
 
 /// Recognised intent for one column whose declared type is a name
 /// (`status order_status`). Either the name matched an enum catalog
@@ -98,7 +98,7 @@ fn sql_data_type_to_arg(dt: &SqlDataType) -> Result<SqlArgType> {
 /// the existing "unsupported custom type" error from there.
 pub(crate) async fn resolve_user_type_columns(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     columns: &[ColumnDef],
 ) -> Result<HashMap<String, UserTypeBinding>> {
     let mut out: HashMap<String, UserTypeBinding> = HashMap::new();
@@ -130,11 +130,11 @@ pub(crate) async fn resolve_user_type_columns(
         ) {
             continue;
         }
-        if let Some(def) = catalog.lookup_enum_type(tenant, name).await {
+        if let Some(def) = catalog.lookup_enum_type(project, name).await {
             out.insert(col.name.value.clone(), UserTypeBinding::Enum(def));
             continue;
         }
-        if let Some(def) = catalog.lookup_domain(tenant, name).await {
+        if let Some(def) = catalog.lookup_domain(project, name).await {
             out.insert(col.name.value.clone(), UserTypeBinding::Domain(def));
             continue;
         }
@@ -234,7 +234,7 @@ pub(crate) fn apply_user_type_metadata(
 
 /// Execute `CREATE TYPE <name> AS ENUM ('label1', 'label2', …)`.
 pub(crate) async fn exec_create_type_enum(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: ObjectName,
     labels: Vec<Ident>,
 ) -> Result<ExecResult> {
@@ -246,7 +246,7 @@ pub(crate) async fn exec_create_type_enum(
     }
     let label_strings: Vec<String> = labels.into_iter().map(|i| i.value).collect();
     let def = EnumTypeDef {
-        tenant: sess.tenant,
+        project: sess.project,
         name: type_name,
         labels: label_strings,
     };
@@ -259,12 +259,12 @@ pub(crate) async fn exec_create_type_enum(
 
 /// Execute `ALTER TYPE <name> ADD VALUE 'label'`.
 pub(crate) async fn exec_alter_type_add_value(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     value: &str,
 ) -> Result<ExecResult> {
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
-    catalog.add_enum_value(&sess.tenant, name, value).await?;
+    catalog.add_enum_value(&sess.project, name, value).await?;
     Ok(ExecResult::Empty {
         tag: "ALTER TYPE".into(),
     })
@@ -274,7 +274,7 @@ pub(crate) async fn exec_alter_type_add_value(
 /// NotFound; everything else (including refcount-blocked drops)
 /// surfaces.
 pub(crate) async fn exec_drop_type(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     if_exists: bool,
     names: &[ObjectName],
 ) -> Result<ExecResult> {
@@ -286,7 +286,7 @@ pub(crate) async fn exec_drop_type(
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     for name in names {
         let type_name = single_part_object_name(name)?;
-        match catalog.drop_enum_type(&sess.tenant, &type_name).await {
+        match catalog.drop_enum_type(&sess.project, &type_name).await {
             Ok(()) => {}
             Err(BasinError::NotFound(_)) if if_exists => {}
             Err(BasinError::NotFound(_)) => {
@@ -307,13 +307,13 @@ pub(crate) async fn exec_drop_type(
 /// Execute `CREATE DOMAIN <name> AS <base_type> [CHECK (<predicate>)]`.
 /// The shape comes from [`match_create_domain`].
 pub(crate) async fn exec_create_domain(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     base_type: SqlArgType,
     check_predicate: Option<String>,
 ) -> Result<ExecResult> {
     let def = DomainDef {
-        tenant: sess.tenant,
+        project: sess.project,
         name: name.to_string(),
         base_type,
         check_predicate,
@@ -327,12 +327,12 @@ pub(crate) async fn exec_create_domain(
 
 /// Execute `DROP DOMAIN [IF EXISTS] <name>`.
 pub(crate) async fn exec_drop_domain(
-    sess: &TenantSession,
+    sess: &ProjectSession,
     name: &str,
     if_exists: bool,
 ) -> Result<ExecResult> {
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
-    match catalog.drop_domain(&sess.tenant, name).await {
+    match catalog.drop_domain(&sess.project, name).await {
         Ok(()) => {}
         Err(BasinError::NotFound(_)) if if_exists => {}
         Err(BasinError::NotFound(_)) => {
@@ -482,7 +482,7 @@ pub(crate) fn match_drop_domain(sql: &str) -> Result<Option<(String, bool)>> {
 /// domain-typed columns).
 pub(crate) async fn enforce_domain_checks(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     batch: &RecordBatch,
 ) -> Result<()> {
     // Walk fields once; for each domain column with a CHECK predicate,
@@ -496,7 +496,7 @@ pub(crate) async fn enforce_domain_checks(
         let Some(domain_name) = f.metadata().get(BASIN_DOMAIN_KEY) else {
             continue;
         };
-        let Some(def) = catalog.lookup_domain(tenant, domain_name).await else {
+        let Some(def) = catalog.lookup_domain(project, domain_name).await else {
             continue;
         };
         let Some(predicate) = def.check_predicate.clone() else {
@@ -575,7 +575,7 @@ pub(crate) async fn enforce_domain_checks(
 /// Unknown labels surface SQLSTATE `22P02 invalid_text_representation`.
 pub(crate) async fn enforce_enum_labels(
     catalog: &Arc<dyn Catalog>,
-    tenant: &TenantId,
+    project: &ProjectId,
     batch: &RecordBatch,
 ) -> Result<()> {
     use arrow_array::StringArray;
@@ -583,7 +583,7 @@ pub(crate) async fn enforce_enum_labels(
         let Some(enum_name) = f.metadata().get(BASIN_ENUM_TYPE_KEY) else {
             continue;
         };
-        let Some(def) = catalog.lookup_enum_type(tenant, enum_name).await else {
+        let Some(def) = catalog.lookup_enum_type(project, enum_name).await else {
             continue;
         };
         let arr = batch

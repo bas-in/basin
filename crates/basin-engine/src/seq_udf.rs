@@ -8,7 +8,7 @@
 //! requires either:
 //!
 //! * a separate runtime via `spawn_blocking + Runtime::block_on`, which
-//!   is heavyweight per call and breaks the per-tenant blocking-pool
+//!   is heavyweight per call and breaks the per-project blocking-pool
 //!   budget the executor already maintains, or
 //! * `tokio::task::block_in_place + Handle::block_on`, which panics on
 //!   the single-thread runtime that powers `#[tokio::test]`.
@@ -32,7 +32,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, TenantId};
+use basin_common::{BasinError, Result, ProjectId};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
@@ -55,11 +55,11 @@ use tokio::sync::Mutex;
 /// rewrite time.
 #[derive(Default, Debug)]
 pub(crate) struct SessionSequenceCache {
-    /// `(tenant, sequence_name) -> last nextval`. Per-session, so two
+    /// `(project, sequence_name) -> last nextval`. Per-session, so two
     /// sessions on the same sequence never confuse each other's
-    /// `currval`. Tenant is included in the key so a future
-    /// cross-tenant session (admin tools, etc.) is sound; in the v0.1
-    /// per-tenant `TenantSession` shape there's only ever one tenant
+    /// `currval`. Project is included in the key so a future
+    /// cross-project session (admin tools, etc.) is sound; in the v0.1
+    /// per-project `ProjectSession` shape there's only ever one project
     /// per cache instance.
     inner: Mutex<SessionSequenceCacheInner>,
 }
@@ -67,30 +67,30 @@ pub(crate) struct SessionSequenceCache {
 #[derive(Default, Debug)]
 struct SessionSequenceCacheInner {
     /// Per-sequence last-value map.
-    values: std::collections::HashMap<(TenantId, String), i64>,
-    /// Most recent `(tenant, seq_name, value)` for `lastval()`.
-    last: Option<(TenantId, String, i64)>,
+    values: std::collections::HashMap<(ProjectId, String), i64>,
+    /// Most recent `(project, seq_name, value)` for `lastval()`.
+    last: Option<(ProjectId, String, i64)>,
 }
 
 impl SessionSequenceCache {
-    pub(crate) async fn record(&self, tenant: TenantId, name: &str, value: i64) {
+    pub(crate) async fn record(&self, project: ProjectId, name: &str, value: i64) {
         let mut g = self.inner.lock().await;
-        g.values.insert((tenant, name.to_string()), value);
-        g.last = Some((tenant, name.to_string(), value));
+        g.values.insert((project, name.to_string()), value);
+        g.last = Some((project, name.to_string(), value));
     }
 
-    pub(crate) async fn get(&self, tenant: TenantId, name: &str) -> Option<i64> {
+    pub(crate) async fn get(&self, project: ProjectId, name: &str) -> Option<i64> {
         let g = self.inner.lock().await;
-        g.values.get(&(tenant, name.to_string())).copied()
+        g.values.get(&(project, name.to_string())).copied()
     }
 
     /// Return the value from the most recent `nextval` call in this session,
     /// across all sequences. PG SQLSTATE 55000 when no `nextval` has been
     /// called yet.
-    pub(crate) async fn lastval(&self, tenant: TenantId) -> Result<i64> {
+    pub(crate) async fn lastval(&self, project: ProjectId) -> Result<i64> {
         let g = self.inner.lock().await;
         match &g.last {
-            Some((t, _, v)) if *t == tenant => Ok(*v),
+            Some((t, _, v)) if *t == project => Ok(*v),
             _ => Err(BasinError::Catalog(
                 "55000: lastval is not yet defined in this session".into(),
             )),
@@ -103,7 +103,7 @@ impl SessionSequenceCache {
 /// (one `Arc::clone` per field).
 pub(crate) struct SequenceContext<'a> {
     pub catalog: &'a Arc<dyn Catalog>,
-    pub tenant: TenantId,
+    pub project: ProjectId,
     pub session_cache: &'a Arc<SessionSequenceCache>,
 }
 
@@ -446,8 +446,8 @@ async fn dispatch_sequence_call(
 ) -> Result<i64> {
     match kind {
         SeqCall::Nextval => {
-            let v = ctx.catalog.nextval(&ctx.tenant, &parsed.name).await?;
-            ctx.session_cache.record(ctx.tenant, &parsed.name, v).await;
+            let v = ctx.catalog.nextval(&ctx.project, &parsed.name).await?;
+            ctx.session_cache.record(ctx.project, &parsed.name, v).await;
             Ok(v)
         }
         SeqCall::Currval => {
@@ -456,7 +456,7 @@ async fn dispatch_sequence_call(
             // surface the PG-style "object_not_in_prerequisite_state"
             // error mapped through `BasinError::Catalog` (the router's
             // SQLSTATE table maps Catalog -> 55000-class behaviour).
-            match ctx.session_cache.get(ctx.tenant, &parsed.name).await {
+            match ctx.session_cache.get(ctx.project, &parsed.name).await {
                 Some(v) => Ok(v),
                 None => Err(BasinError::Catalog(format!(
                     "55000: currval of sequence {:?} is not yet defined in this session",
@@ -469,17 +469,17 @@ async fn dispatch_sequence_call(
             let advance = parsed.advance.expect("setval has advance flag");
             let v = ctx
                 .catalog
-                .setval(&ctx.tenant, &parsed.name, value, advance)
+                .setval(&ctx.project, &parsed.name, value, advance)
                 .await?;
             // Per PG: setval(seq, n, true) updates the session's
             // "last value" (advance=true); setval(seq, n, false) does
             // *not* arm currval. Mirror that.
             if advance {
-                ctx.session_cache.record(ctx.tenant, &parsed.name, v).await;
+                ctx.session_cache.record(ctx.project, &parsed.name, v).await;
             }
             Ok(v)
         }
-        SeqCall::Lastval => ctx.session_cache.lastval(ctx.tenant).await,
+        SeqCall::Lastval => ctx.session_cache.lastval(ctx.project).await,
     }
 }
 

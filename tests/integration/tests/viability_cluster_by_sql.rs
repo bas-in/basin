@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;
@@ -50,8 +50,8 @@ async fn viability_cluster_by_sql() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
 
     let mut variants_passed: Vec<&'static str> = Vec::new();
 
@@ -62,7 +62,7 @@ async fn viability_cluster_by_sql() {
         .await
         .expect("CREATE TABLE … CLUSTER BY (...)");
     let table = TableName::new("foo").unwrap();
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(m.cluster_columns, vec!["id".to_string(), "ts".to_string()]);
     variants_passed.push("CREATE TABLE … CLUSTER BY (...)");
 
@@ -70,7 +70,7 @@ async fn viability_cluster_by_sql() {
     sess.execute("ALTER TABLE foo CLUSTER BY (ts)")
         .await
         .expect("ALTER TABLE … CLUSTER BY (...)");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert_eq!(m.cluster_columns, vec!["ts".to_string()]);
     variants_passed.push("ALTER TABLE … CLUSTER BY (...)");
 
@@ -78,7 +78,7 @@ async fn viability_cluster_by_sql() {
     sess.execute("ALTER TABLE foo RESET CLUSTER BY")
         .await
         .expect("ALTER TABLE … RESET CLUSTER BY");
-    let m = catalog.load_table(&tenant, &table).await.unwrap();
+    let m = catalog.load_table(&project, &table).await.unwrap();
     assert!(
         m.cluster_columns.is_empty(),
         "cluster_columns should be empty after RESET, got {:?}",
@@ -106,7 +106,7 @@ async fn viability_cluster_by_sql() {
         .await
         .expect("CREATE TABLE bench CLUSTER BY (id)");
     let bench_table = TableName::new("bench").unwrap();
-    let m = catalog.load_table(&tenant, &bench_table).await.unwrap();
+    let m = catalog.load_table(&project, &bench_table).await.unwrap();
     assert_eq!(m.cluster_columns, vec!["id".to_string()]);
 
     // Insert 8 rows in deliberately shuffled order. The catalog reads

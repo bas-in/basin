@@ -7,7 +7,7 @@
 //! 1. `pgwire_sql_injection_via_simple_query` — OWASP-style payloads sent
 //!    through the simple-query path. Engine must reject (parse error /
 //!    InvalidIdent) or treat them as opaque text — never mutate state across
-//!    tenants. After the loop, tenant A's table is intact and tenant B can
+//!    projects. After the loop, project A's table is intact and project B can
 //!    still see only its own rows.
 //! 2. `pgwire_sql_injection_via_extended_bind` — same payloads but pushed
 //!    through `tokio_postgres::query` so they bind as `$1` parameters.
@@ -16,11 +16,11 @@
 //! 3. `path_injection_table_name` — `TableName::new` rejects `../`, `./`,
 //!    backslashes, NUL bytes, control characters, mixed Unicode tricks, and
 //!    Postgres-reserved punctuation.
-//! 4. `path_injection_tenant_id` — `TenantId::from_str` rejects everything
+//! 4. `path_injection_project_id` — `ProjectId::from_str` rejects everything
 //!    that isn't a valid 26-char Crockford-base32 ULID; path-traversal,
 //!    spaces, NULs, mixed Unicode, and SQL fragments all fail.
 //! 5. `partition_key_rejects_path_traversal` — `PartitionKey::new` blocks
-//!    escapees that would let storage paths break out of `tenants/<id>/`.
+//!    escapees that would let storage paths break out of `projects/<id>/`.
 //! 6. `rls_select_excluded_rows` — RLS `USING` predicate must hide rows
 //!    whose owner doesn't match the principal; trying to retrieve them
 //!    via projection + ORDER BY returns zero rows.
@@ -28,15 +28,15 @@
 //!    same RLS-protected table must not surface rows the policy excludes.
 //! 8. `rls_cte_cannot_bypass` — a `WITH` CTE referencing the same RLS table
 //!    inherits the same predicate; rows not matching policy stay hidden.
-//! 9. `cross_tenant_fork_structurally_impossible` — `Catalog::fork_table`
-//!    takes a single `TenantId`; the type system rules out cross-tenant
+//! 9. `cross_project_fork_structurally_impossible` — `Catalog::fork_table`
+//!    takes a single `ProjectId`; the type system rules out cross-project
 //!    forking. The test asserts a fork into a destination owned by another
-//!    tenant either creates the table on the *caller's* side (no row in B)
-//!    or errors. Either way, tenant B never gains a clone of A's data.
+//!    project either creates the table on the *caller's* side (no row in B)
+//!    or errors. Either way, project B never gains a clone of A's data.
 //! 10. `pgwire_rate_limit_throttles_burst` — drives `PgRateLimit` past its
 //!     burst and asserts at least one request rejects with the SQLSTATE
 //!     53400 mapping the protocol layer applies.
-//! 11. `tenant_id_round_trip_is_strict` — `TenantId::from_str` accepts only
+//! 11. `project_id_round_trip_is_strict` — `ProjectId::from_str` accepts only
 //!     the canonical ULID form; lowercase + extra digits + parsed-from-int
 //!     attacks fail.
 //!
@@ -54,7 +54,7 @@
 //! - **Refresh-token reuse blanket-revoke** — covered by
 //!   `crates/basin-auth/src/lib.rs::refresh_reuse_after_double_rotation_revokes_all`
 //!   and `crates/basin-rest/src/tests.rs::refresh_token_reuse_detected_revokes_all`.
-//! - **Cross-tenant SQL injection via REST** — covered by
+//! - **Cross-project SQL injection via REST** — covered by
 //!   `crates/basin-rest/src/parser.rs::injection_attempt_in_value_is_quoted`
 //!   plus the `?id=eq.X` end-to-end tests in
 //!   `crates/basin-rest/src/tests.rs`. The attack-shape lives at the parser,
@@ -68,9 +68,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{BasinError, PartitionKey, TableName, TenantId};
+use basin_common::{BasinError, PartitionKey, TableName, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
-use basin_router::{PgRateLimit, ServerConfig, StaticTenantResolver};
+use basin_router::{PgRateLimit, ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -84,7 +84,7 @@ const PAYLOADS: &[&str] = &[
     "'; SELECT pg_sleep(10); --",
     "1\"; DROP TABLE foo; --",
     "admin'--",
-    "1 UNION SELECT * FROM other_tenant",
+    "1 UNION SELECT * FROM other_project",
     "0x44524F50205441424C45",
     "\\'; SHUTDOWN; --",
     "%27%20OR%201%3D1",
@@ -116,16 +116,16 @@ async fn start_server() -> TestServer {
         shard: None,
     });
 
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     let mut map = HashMap::new();
     map.insert("alice".to_owned(), alice);
     map.insert("bob".to_owned(), bob);
-    let resolver = Arc::new(StaticTenantResolver::new(map));
+    let resolver = Arc::new(StaticProjectResolver::new(map));
     let running = basin_router::run_until_bound(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         engine,
-        tenant_resolver: resolver,
+        project_resolver: resolver,
         pool: None,
         shard_endpoints: None,
         tls: None,
@@ -153,7 +153,7 @@ async fn connect(addr: SocketAddr, user: &str) -> tokio_postgres::Client {
     client
 }
 
-fn engine_with_two_tenants() -> (Engine, TenantId, TenantId, TempDir) {
+fn engine_with_two_projects() -> (Engine, ProjectId, ProjectId, TempDir) {
     let dir = TempDir::new().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
@@ -168,8 +168,8 @@ fn engine_with_two_tenants() -> (Engine, TenantId, TenantId, TempDir) {
         catalog,
         shard: None,
     });
-    let a = TenantId::new();
-    let b = TenantId::new();
+    let a = ProjectId::new();
+    let b = ProjectId::new();
     (engine, a, b, dir)
 }
 
@@ -200,12 +200,12 @@ async fn pgwire_sql_injection_via_simple_query() {
         let sql = format!("SELECT * FROM foo WHERE name = '{p}'");
         // The driver returns Err for parse failures, Ok with zero matched
         // rows for a syntactically-valid-but-no-match. Both are fine; what
-        // we forbid is "tenant A's `foo` got dropped" or "tenant B's row
+        // we forbid is "project A's `foo` got dropped" or "project B's row
         // appeared in alice's results".
         let _ = alice.simple_query(&sql).await;
     }
 
-    // Tenant A's table is intact + still reachable.
+    // Project A's table is intact + still reachable.
     let res = alice
         .simple_query("SELECT id FROM foo ORDER BY id")
         .await
@@ -217,20 +217,20 @@ async fn pgwire_sql_injection_via_simple_query() {
             _ => None,
         })
         .collect();
-    assert_eq!(rows.len(), 1, "tenant A lost rows: {rows:?}");
+    assert_eq!(rows.len(), 1, "project A lost rows: {rows:?}");
 
-    // Tenant B's row is intact + alice still cannot reach `only_b`.
+    // Project B's row is intact + alice still cannot reach `only_b`.
     let leak = alice.simple_query("SELECT * FROM only_b").await;
     assert!(
         leak.is_err(),
-        "alice reached tenant B's table — SECURITY breach"
+        "alice reached project B's table — SECURITY breach"
     );
     let res = bob.simple_query("SELECT id FROM only_b").await.unwrap();
     let rows = res
         .iter()
         .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
         .count();
-    assert_eq!(rows, 1, "tenant B lost its row");
+    assert_eq!(rows, 1, "project B lost its row");
 }
 
 // --- 2. SQL injection via extended (parameter bind) --------------------------
@@ -279,8 +279,8 @@ async fn path_injection_table_name() {
         "../etc/passwd",
         "./",
         "..\\windows\\system32",
-        "tenant\\data",
-        "tenants/other/data",
+        "project\\data",
+        "projects/other/data",
         "with space",
         "a.b",
         "1leading",
@@ -303,15 +303,15 @@ async fn path_injection_table_name() {
     }
 }
 
-// --- 4. Path injection on TenantId ------------------------------------------
+// --- 4. Path injection on ProjectId ------------------------------------------
 
 #[tokio::test]
-async fn path_injection_tenant_id() {
+async fn path_injection_project_id() {
     let evil = [
         "../foo",
         "./bar",
         "..\\baz",
-        "tenants/other",
+        "projects/other",
         "01ARZ3NDEKTSV4RRFFQ69G5FAVx", // 27 chars, ULID is 26
         "01ARZ3NDEKTSV4RRFFQ69G5FA",   // 25 chars
         "",
@@ -321,16 +321,16 @@ async fn path_injection_tenant_id() {
         "01ARZ3NDEKTSV4RRFFQ\u{200E}9G5FAV", // LRM mark mid-id
     ];
     for bad in evil {
-        let res = TenantId::from_str(bad);
+        let res = ProjectId::from_str(bad);
         assert!(
             res.is_err(),
-            "SECURITY: TenantId::from_str accepted {bad:?} — tenant-confusion vector",
+            "SECURITY: ProjectId::from_str accepted {bad:?} — project-confusion vector",
         );
     }
     // Round-trip a real ULID still works.
-    let real = TenantId::new();
+    let real = ProjectId::new();
     let s = real.to_string();
-    let parsed = TenantId::from_str(&s).expect("real ULID must round-trip");
+    let parsed = ProjectId::from_str(&s).expect("real ULID must round-trip");
     assert_eq!(parsed, real);
 }
 
@@ -342,7 +342,7 @@ async fn partition_key_rejects_path_traversal() {
     for bad in evil {
         assert!(
             PartitionKey::new(bad).is_err(),
-            "SECURITY: PartitionKey accepted {bad:?} — storage path could escape tenant prefix",
+            "SECURITY: PartitionKey accepted {bad:?} — storage path could escape project prefix",
         );
     }
     // Hive-style structured keys must still pass.
@@ -353,7 +353,7 @@ async fn partition_key_rejects_path_traversal() {
 
 #[tokio::test]
 async fn rls_select_excluded_rows() {
-    let (engine, t, _, _dir) = engine_with_two_tenants();
+    let (engine, t, _, _dir) = engine_with_two_projects();
     let admin = engine.open_session(t).await.unwrap();
     admin
         .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)")
@@ -396,7 +396,7 @@ async fn rls_select_excluded_rows() {
 // rewritable TableScan nodes.
 #[tokio::test]
 async fn rls_union_subquery_cannot_bypass() {
-    let (engine, t, _, _dir) = engine_with_two_tenants();
+    let (engine, t, _, _dir) = engine_with_two_projects();
     let admin = engine.open_session(t).await.unwrap();
     admin
         .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)")
@@ -446,7 +446,7 @@ async fn rls_union_subquery_cannot_bypass() {
 // rewriter itself already handles the LogicalPlan correctly.
 #[tokio::test]
 async fn rls_cte_cannot_bypass() {
-    let (engine, t, _, _dir) = engine_with_two_tenants();
+    let (engine, t, _, _dir) = engine_with_two_projects();
     let admin = engine.open_session(t).await.unwrap();
     admin
         .execute("CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL)")
@@ -479,13 +479,13 @@ async fn rls_cte_cannot_bypass() {
     }
 }
 
-// --- 9. Cross-tenant fork is structurally impossible -------------------------
+// --- 9. Cross-project fork is structurally impossible -------------------------
 
 #[tokio::test]
-async fn cross_tenant_fork_structurally_impossible() {
+async fn cross_project_fork_structurally_impossible() {
     let cat = Arc::new(InMemoryCatalog::new());
-    let alice = TenantId::new();
-    let bob = TenantId::new();
+    let alice = ProjectId::new();
+    let bob = ProjectId::new();
     cat.create_namespace(&alice).await.unwrap();
     cat.create_namespace(&bob).await.unwrap();
     let src = TableName::new("payments").unwrap();
@@ -496,8 +496,8 @@ async fn cross_tenant_fork_structurally_impossible() {
     )]);
     cat.create_table(&alice, &src, &schema).await.unwrap();
 
-    // The Catalog::fork_table signature takes a *single* TenantId; the API
-    // makes cross-tenant fork unrepresentable. The tightest assertion we can
+    // The Catalog::fork_table signature takes a *single* ProjectId; the API
+    // makes cross-project fork unrepresentable. The tightest assertion we can
     // make from a test is that bob's namespace stays empty no matter what
     // we fork on alice's side.
     let dst = TableName::new("clone").unwrap();
@@ -505,7 +505,7 @@ async fn cross_tenant_fork_structurally_impossible() {
 
     let bobs = cat.list_tables(&bob).await.unwrap();
     if !bobs.is_empty() {
-        panic!("SECURITY: bob acquired {bobs:?} via alice's fork — cross-tenant breach");
+        panic!("SECURITY: bob acquired {bobs:?} via alice's fork — cross-project breach");
     }
     let alices = cat.list_tables(&alice).await.unwrap();
     assert!(alices.contains(&src) && alices.contains(&dst));
@@ -517,7 +517,7 @@ async fn cross_tenant_fork_structurally_impossible() {
 async fn pgwire_rate_limit_throttles_burst() {
     // Drive the limiter directly at 1 qps; 100 hits must produce >=1 reject.
     let rl = PgRateLimit::with_qps(1);
-    let t = TenantId::new();
+    let t = ProjectId::new();
     let mut throttled_count = 0u32;
     for _ in 0..100 {
         if rl.check(&t).is_err() {
@@ -531,20 +531,20 @@ async fn pgwire_rate_limit_throttles_burst() {
     println!("[security::pgwire_rate_limit] threw {throttled_count}/100");
 }
 
-// --- 11. TenantId round-trip is strict --------------------------------------
+// --- 11. ProjectId round-trip is strict --------------------------------------
 
 #[tokio::test]
-async fn tenant_id_round_trip_is_strict() {
-    let real = TenantId::new();
+async fn project_id_round_trip_is_strict() {
+    let real = ProjectId::new();
     let canonical = real.to_string();
     assert_eq!(canonical.len(), 26);
     // Even a single trailing space must reject.
-    assert!(TenantId::from_str(&format!("{canonical} ")).is_err());
-    assert!(TenantId::from_str(&format!(" {canonical}")).is_err());
+    assert!(ProjectId::from_str(&format!("{canonical} ")).is_err());
+    assert!(ProjectId::from_str(&format!(" {canonical}")).is_err());
     // A NUL anywhere is fatal.
     let mut nul = canonical.clone();
     nul.push('\0');
-    assert!(TenantId::from_str(&nul).is_err());
+    assert!(ProjectId::from_str(&nul).is_err());
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -569,7 +569,7 @@ fn collect_int64(res: ExecResult, col: &str) -> Vec<i64> {
 }
 
 // Sanity: BasinError::isolation must be constructible — production code
-// uses it to panic on a real cross-tenant breach. If this fails to compile
+// uses it to panic on a real cross-project breach. If this fails to compile
 // the panic-loud-on-leak contract is broken.
 #[test]
 fn basin_error_isolation_constructor_exists() {

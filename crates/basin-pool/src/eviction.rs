@@ -81,7 +81,7 @@ pub(crate) async fn run_once(pool: &Arc<Inner>) {
     let idle_ttl = pool.cfg.idle_ttl;
 
     let mut state = pool.state.lock().await;
-    let mut to_drop_per_tenant: Vec<basin_common::TenantId> = Vec::new();
+    let mut to_drop_per_project: Vec<basin_common::ProjectId> = Vec::new();
     let mut evicted_total: u64 = 0;
 
     for (key, queue) in state.available.iter_mut() {
@@ -89,7 +89,7 @@ pub(crate) async fn run_once(pool: &Arc<Inner>) {
             if now.duration_since(front.last_used) >= idle_ttl {
                 queue.pop_front();
                 evicted_total += 1;
-                to_drop_per_tenant.push(key.tenant);
+                to_drop_per_project.push(key.project);
             } else {
                 // Queues are MRU-at-back / LRU-at-front; once we hit a
                 // non-stale entry the rest are even fresher.
@@ -99,11 +99,11 @@ pub(crate) async fn run_once(pool: &Arc<Inner>) {
     }
     state.available.retain(|_, q| !q.is_empty());
 
-    for tenant in to_drop_per_tenant {
-        if let Some(count) = state.per_tenant.get_mut(&tenant) {
+    for project in to_drop_per_project {
+        if let Some(count) = state.per_project.get_mut(&project) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                state.per_tenant.remove(&tenant);
+                state.per_project.remove(&project);
             }
         }
         state.total = state.total.saturating_sub(1);

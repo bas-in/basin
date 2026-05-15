@@ -23,12 +23,12 @@ use axum::extract::{Path, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use basin_catalog::{DataFileRef, TableMetadata as BasinTableMetadata};
-use basin_common::{TableName, TenantId};
+use basin_common::{TableName, ProjectId};
 
 use crate::auth;
 use crate::error::IcebergRestError;
 use crate::models::{
-    arrow_to_iceberg_type, iceberg_schema_to_arrow, synthesise_table_uuid, tenant_to_namespace,
+    arrow_to_iceberg_type, iceberg_schema_to_arrow, synthesise_table_uuid, project_to_namespace,
     CommitRequirement, CommitTableRequest, CommitUpdate, CreateTableRequest, IcebergPartitionSpec,
     IcebergSchema, IcebergSchemaField, IcebergSnapshot, IcebergSnapshotRef, IcebergSortOrder,
     IcebergTableMetadata, ListTablesResponse, LoadTableResponse, RegisterTableRequest,
@@ -36,16 +36,16 @@ use crate::models::{
 };
 use crate::State;
 
-/// Decode the `:namespace` URL segment into a `TenantId`.
-fn parse_namespace(raw: &str) -> Result<TenantId, IcebergRestError> {
+/// Decode the `:namespace` URL segment into a `ProjectId`.
+fn parse_namespace(raw: &str) -> Result<ProjectId, IcebergRestError> {
     // Iceberg URL-encodes multi-element namespaces with the unit-separator
     // (0x1F) between segments. v0.1 only accepts a single segment.
     if raw.contains('\u{1F}') {
         return Err(IcebergRestError::BadRequest(
-            "multi-segment namespaces unsupported; expected single tenant id".into(),
+            "multi-segment namespaces unsupported; expected single project id".into(),
         ));
     }
-    TenantId::from_str(raw)
+    ProjectId::from_str(raw)
         .map_err(|e| IcebergRestError::BadRequest(format!("invalid namespace: {e}")))
 }
 
@@ -59,13 +59,13 @@ pub(crate) async fn list_tables(
     Path((_prefix, namespace)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<ListTablesResponse>, IcebergRestError> {
-    let url_tenant = parse_namespace(&namespace)?;
-    let tenant = auth::authorize_namespace(&state.cfg, &headers, &url_tenant)?;
-    let tables = state.catalog.list_tables(&tenant).await?;
+    let url_project = parse_namespace(&namespace)?;
+    let project = auth::authorize_namespace(&state.cfg, &headers, &url_project)?;
+    let tables = state.catalog.list_tables(&project).await?;
     let identifiers = tables
         .into_iter()
         .map(|t| TableIdentifier {
-            namespace: tenant_to_namespace(&tenant),
+            namespace: project_to_namespace(&project),
             name: t.to_string(),
         })
         .collect();
@@ -77,10 +77,10 @@ pub(crate) async fn load_table(
     Path((_prefix, namespace, table)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<LoadTableResponse>, IcebergRestError> {
-    let url_tenant = parse_namespace(&namespace)?;
-    let tenant = auth::authorize_namespace(&state.cfg, &headers, &url_tenant)?;
+    let url_project = parse_namespace(&namespace)?;
+    let project = auth::authorize_namespace(&state.cfg, &headers, &url_project)?;
     let table_name = parse_table(&table)?;
-    let meta = state.catalog.load_table(&tenant, &table_name).await?;
+    let meta = state.catalog.load_table(&project, &table_name).await?;
     Ok(Json(translate_table_metadata(&state, &meta)))
 }
 
@@ -89,10 +89,10 @@ pub(crate) async fn drop_table(
     Path((_prefix, namespace, table)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, IcebergRestError> {
-    let url_tenant = parse_namespace(&namespace)?;
-    let tenant = auth::authorize_namespace(&state.cfg, &headers, &url_tenant)?;
+    let url_project = parse_namespace(&namespace)?;
+    let project = auth::authorize_namespace(&state.cfg, &headers, &url_project)?;
     let table_name = parse_table(&table)?;
-    state.catalog.drop_table(&tenant, &table_name).await?;
+    state.catalog.drop_table(&project, &table_name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -117,8 +117,8 @@ pub(crate) async fn create_table(
     headers: HeaderMap,
     Json(body): Json<CreateTableRequest>,
 ) -> Result<(StatusCode, Json<LoadTableResponse>), IcebergRestError> {
-    let url_tenant = parse_namespace(&namespace)?;
-    let tenant = auth::authorize_namespace(&state.cfg, &headers, &url_tenant)?;
+    let url_project = parse_namespace(&namespace)?;
+    let project = auth::authorize_namespace(&state.cfg, &headers, &url_project)?;
     if body.stage_create {
         return Err(IcebergRestError::NotImplemented(
             "stage-create=true is not supported by Basin v0.1; commits are atomic at create time"
@@ -145,7 +145,7 @@ pub(crate) async fn create_table(
     let arrow_schema = iceberg_schema_to_arrow(&body.schema)?;
     let meta = state
         .catalog
-        .create_table(&tenant, &table_name, &arrow_schema)
+        .create_table(&project, &table_name, &arrow_schema)
         .await?;
     Ok((
         StatusCode::OK,
@@ -171,20 +171,20 @@ pub(crate) async fn commit_table(
     headers: HeaderMap,
     Json(body): Json<CommitTableRequest>,
 ) -> Result<Json<LoadTableResponse>, IcebergRestError> {
-    let url_tenant = parse_namespace(&namespace)?;
-    let tenant = auth::authorize_namespace(&state.cfg, &headers, &url_tenant)?;
+    let url_project = parse_namespace(&namespace)?;
+    let project = auth::authorize_namespace(&state.cfg, &headers, &url_project)?;
     let table_name = parse_table(&table)?;
 
     // Snapshot the current metadata up front. Every requirement check
     // and the optimistic-concurrency boundary read off this view.
-    let current = state.catalog.load_table(&tenant, &table_name).await?;
+    let current = state.catalog.load_table(&project, &table_name).await?;
     validate_requirements(&current, &body.requirements)?;
-    apply_commit(&state, &tenant, &table_name, &current, &body.updates).await?;
+    apply_commit(&state, &project, &table_name, &current, &body.updates).await?;
 
     // Reload to surface the post-commit metadata (snapshot pointer
     // advances inside `append_data_files`; we re-read so the response
     // reflects the same shape `GET tables/{tbl}` would return).
-    let after = state.catalog.load_table(&tenant, &table_name).await?;
+    let after = state.catalog.load_table(&project, &table_name).await?;
     Ok(Json(translate_table_metadata(&state, &after)))
 }
 
@@ -199,8 +199,8 @@ pub(crate) async fn register_table(
     headers: HeaderMap,
     Json(body): Json<RegisterTableRequest>,
 ) -> Result<StatusCode, IcebergRestError> {
-    let url_tenant = parse_namespace(&namespace)?;
-    let _ = auth::authorize_namespace(&state.cfg, &headers, &url_tenant)?;
+    let url_project = parse_namespace(&namespace)?;
+    let _ = auth::authorize_namespace(&state.cfg, &headers, &url_project)?;
     Err(IcebergRestError::NotImplemented(format!(
         "register-table is not supported by Basin v0.1 (table `{}` from `{}`); Basin's catalog \
          only accepts tables created via create-table or the SQL surface",
@@ -217,7 +217,7 @@ pub(crate) async fn register_table(
 /// - `assert-create` → reject (the table already exists by the time
 ///   commit-table is reached).
 /// - `assert-table-uuid` → compare the requested uuid against
-///   [`synthesise_table_uuid`]'s deterministic UUIDv5 over `tenant/table`.
+///   [`synthesise_table_uuid`]'s deterministic UUIDv5 over `project/table`.
 /// - `assert-current-schema-id` → Basin's `TableMetadata` is
 ///   single-schema; the only valid value is 0.
 /// - `assert-ref-snapshot-id` for `ref="main"` → check
@@ -311,7 +311,7 @@ fn validate_requirements(
 /// Anything else surfaces as 501.
 async fn apply_commit(
     state: &State,
-    tenant: &TenantId,
+    project: &ProjectId,
     table: &TableName,
     current: &BasinTableMetadata,
     updates: &[CommitUpdate],
@@ -378,7 +378,7 @@ async fn apply_commit(
     // exact `CommitFailedException` Iceberg clients expect.
     let new_meta = state
         .catalog
-        .append_data_files(tenant, table, current.current_snapshot, files)
+        .append_data_files(project, table, current.current_snapshot, files)
         .await?;
 
     // If the caller explicitly asked for a `set-current-snapshot`,
@@ -495,8 +495,8 @@ fn parse_per_file_u64(raw: Option<&String>) -> Result<Vec<u64>, IcebergRestError
 ///
 /// Surfaced fields:
 /// - `format-version=2`, `table-uuid` (deterministic UUIDv5 over
-///   `tenant/table`).
-/// - `location` = `<base_location><tenant>/<table>/`.
+///   `project/table`).
+/// - `location` = `<base_location><project>/<table>/`.
 /// - One `schemas` entry derived from Basin's Arrow `Schema`. Field
 ///   types map via [`arrow_to_iceberg_type`]; unknown types fall
 ///   back to `"binary"`.
@@ -514,7 +514,7 @@ pub(crate) fn translate_table_metadata(
     state: &State,
     meta: &BasinTableMetadata,
 ) -> LoadTableResponse {
-    let location = format!("{}{}/{}/", state.cfg.base_location, meta.tenant, meta.table);
+    let location = format!("{}{}/{}/", state.cfg.base_location, meta.project, meta.table);
 
     let fields: Vec<IcebergSchemaField> = meta
         .schema

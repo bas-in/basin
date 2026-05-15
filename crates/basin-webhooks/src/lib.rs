@@ -15,7 +15,7 @@
 //!   SQL surface in a follow-up; until then registrations are driven by
 //!   Rust callers (typically the test harness or a router-side wiring).
 //! - Disk-backed retry queue ([`RetryQueue`]) keyed by a stable
-//!   `(subscription_id, tenant, table, seq)` SHA-256 idempotency key.
+//!   `(subscription_id, project, table, seq)` SHA-256 idempotency key.
 //! - Worker ([`WebhookWorker`]) that drains the queue with exponential
 //!   backoff (1s → 2s → … → 5min cap), stops at `max_retries`, and lands
 //!   exhausted entries in a per-subscription dead-letter file.
@@ -24,26 +24,26 @@
 //!   to `paused = true` and an audit-log entry is emitted. Resume is
 //!   explicit ([`WebhookRegistry::resume`]).
 //!
-//! ## Per-tenant cost discipline
+//! ## Per-project cost discipline
 //!
 //! This crate is built to the
-//! [feedback_multitenant_isolation](../../docs/feedback_multitenant_isolation.md)
-//! rule: **per-tenant cost is O(bytes), not O(pool)**. Concretely:
+//! [feedback_multiproject_isolation](../../docs/feedback_multiproject_isolation.md)
+//! rule: **per-project cost is O(bytes), not O(pool)**. Concretely:
 //!
 //! - The retry queue is a *single* shared append-only file, not a per-
-//!   tenant file. Subscriptions carry their `TenantId`, but no pooled
+//!   project file. Subscriptions carry their `ProjectId`, but no pooled
 //!   resource (worker task, file handle, semaphore, connection) is
-//!   allocated per-tenant.
-//! - Per-tenant rate limiting comes from `basin-net::HttpClient`'s
-//!   built-in keyed token bucket (governor crate). One bucket per tenant
+//!   allocated per-project.
+//! - Per-project rate limiting comes from `basin-net::HttpClient`'s
+//!   built-in keyed token bucket (governor crate). One bucket per project
 //!   that has actually issued an outbound request, evicted with the
 //!   `governor` keyed-state TTL — bounded.
 //! - Idempotency keys are 32-byte SHA-256 digests, hex-encoded once on
-//!   the way into the queue. A tenant churning millions of events does
+//!   the way into the queue. A project churning millions of events does
 //!   not allocate millions of `String`s on the engine.
 //!
-//! If a future change wants `HashMap<TenantId, Worker>` or
-//! `HashMap<TenantId, File>`, that's the failure mode this rule exists
+//! If a future change wants `HashMap<ProjectId, Worker>` or
+//! `HashMap<ProjectId, File>`, that's the failure mode this rule exists
 //! to prevent — stop and rethink.
 //!
 //! ## What's deliberately NOT here

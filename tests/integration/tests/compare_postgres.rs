@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_postgres_compare, CompareMetric, WhichWins};
 use object_store::local::LocalFileSystem;
@@ -140,7 +140,7 @@ async fn scaling_5_compare_postgres() {
     };
 
     // Unique schema per run via Ulid (already in deps via basin-common).
-    let suffix = TenantId::new().as_ulid().to_string().to_lowercase();
+    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
     let schema = format!("basin_compare_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema.clone(),
@@ -266,8 +266,8 @@ async fn scaling_5_compare_postgres() {
         catalog,
         shard: Some(shard),
     });
-    let tenant = TenantId::new();
-    let sess = engine.open_session(tenant).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
     sess.execute(
         "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
     )

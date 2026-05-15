@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_engine::{AuthContext, Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -101,13 +101,13 @@ fn first_string(res: ExecResult) -> Option<String> {
 async fn rls_with_auth_uid_filters_per_user() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     let user_a_id = Uuid::new_v4();
     let user_b_id = Uuid::new_v4();
 
     // Admin session: schema setup.
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute(
             "CREATE TABLE items (\
@@ -153,7 +153,7 @@ async fn rls_with_auth_uid_filters_per_user() {
         serde_json::json!({"user_id": user_a_id.to_string()}),
     );
     let sess_a = engine
-        .open_session_with_auth(tenant, user_a_id.to_string(), ctx_a)
+        .open_session_with_auth(project, user_a_id.to_string(), ctx_a)
         .await
         .unwrap();
 
@@ -164,12 +164,12 @@ async fn rls_with_auth_uid_filters_per_user() {
         serde_json::json!({"user_id": user_b_id.to_string()}),
     );
     let sess_b = engine
-        .open_session_with_auth(tenant, user_b_id.to_string(), ctx_b)
+        .open_session_with_auth(project, user_b_id.to_string(), ctx_b)
         .await
         .unwrap();
 
     // Anonymous session (no JWT).
-    let sess_anon = engine.open_session(tenant).await.unwrap();
+    let sess_anon = engine.open_session(project).await.unwrap();
 
     // 5. User A sees exactly 1 row.
     let a_rows = row_count(sess_a.execute("SELECT * FROM items").await.unwrap());
@@ -207,7 +207,7 @@ async fn auth_uid_schema_form_equals_flat_form() {
         serde_json::json!({"user_id": user_id.to_string()}),
     );
     let sess = engine
-        .open_session_with_auth(TenantId::new(), user_id.to_string(), auth)
+        .open_session_with_auth(ProjectId::new(), user_id.to_string(), auth)
         .await
         .unwrap();
 
@@ -233,7 +233,7 @@ async fn auth_uid_schema_form_equals_flat_form() {
 async fn auth_uid_null_and_role_anon_for_anonymous_session() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    let sess = engine.open_session(TenantId::new()).await.unwrap();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // auth_uid() IS NULL
     let uid_result = sess.execute("SELECT auth_uid()").await.unwrap();
@@ -266,7 +266,7 @@ async fn auth_role_authenticated_for_jwt_session() {
     let user_id = Uuid::new_v4();
     let auth = AuthContext::from_jwt(user_id, "authenticated", serde_json::json!({}));
     let sess = engine
-        .open_session_with_auth(TenantId::new(), "alice", auth)
+        .open_session_with_auth(ProjectId::new(), "alice", auth)
         .await
         .unwrap();
 
@@ -281,11 +281,11 @@ async fn auth_role_authenticated_for_jwt_session() {
 async fn rls_auth_uid_union_cannot_bypass() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let user_a_id = Uuid::new_v4();
     let user_b_id = Uuid::new_v4();
 
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute(
             "CREATE TABLE secrets (\
@@ -316,7 +316,7 @@ async fn rls_auth_uid_union_cannot_bypass() {
 
     let ctx_b = AuthContext::from_jwt(user_b_id, "authenticated", serde_json::json!({}));
     let sess_b = engine
-        .open_session_with_auth(tenant, user_b_id.to_string(), ctx_b)
+        .open_session_with_auth(project, user_b_id.to_string(), ctx_b)
         .await
         .unwrap();
 
@@ -371,11 +371,11 @@ async fn rls_auth_uid_union_cannot_bypass() {
 async fn rls_disabled_all_rows_visible() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let user_a_id = Uuid::new_v4();
     let user_b_id = Uuid::new_v4();
 
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute(
             "CREATE TABLE widgets (\
@@ -407,7 +407,7 @@ async fn rls_disabled_all_rows_visible() {
 
     let ctx_a = AuthContext::from_jwt(user_a_id, "authenticated", serde_json::json!({}));
     let sess_a = engine
-        .open_session_with_auth(tenant, user_a_id.to_string(), ctx_a)
+        .open_session_with_auth(project, user_a_id.to_string(), ctx_a)
         .await
         .unwrap();
 
@@ -430,7 +430,7 @@ async fn rls_disabled_all_rows_visible() {
     );
 
     // Anonymous session also sees both rows after RLS is disabled.
-    let sess_anon = engine.open_session(tenant).await.unwrap();
+    let sess_anon = engine.open_session(project).await.unwrap();
     assert_eq!(
         row_count(sess_anon.execute("SELECT * FROM widgets").await.unwrap()),
         2,
@@ -444,11 +444,11 @@ async fn rls_disabled_all_rows_visible() {
 async fn rls_auth_uid_cte_cannot_bypass() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
     let user_a_id = Uuid::new_v4();
     let user_b_id = Uuid::new_v4();
 
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute(
             "CREATE TABLE notes (\
@@ -476,7 +476,7 @@ async fn rls_auth_uid_cte_cannot_bypass() {
 
     let ctx_b = AuthContext::from_jwt(user_b_id, "authenticated", serde_json::json!({}));
     let sess_b = engine
-        .open_session_with_auth(tenant, user_b_id.to_string(), ctx_b)
+        .open_session_with_auth(project, user_b_id.to_string(), ctx_b)
         .await
         .unwrap();
 

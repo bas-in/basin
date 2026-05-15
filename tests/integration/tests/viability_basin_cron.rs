@@ -3,7 +3,7 @@
 //! Card: `viability_basin_cron`
 //! Bar: `runs_executed == ticks` (3 == 3).
 //!
-//! Schedules a `* * * * *` cron job in tenant A. The job inserts one row
+//! Schedules a `* * * * *` cron job in project A. The job inserts one row
 //! into a `markers` table on each fire. We drive three simulated ticks
 //! 60 seconds apart via [`basin_cron::TestClock`] and assert:
 //!
@@ -12,7 +12,7 @@
 //!
 //! What this proves: the scheduler ticks are coalesced correctly across
 //! 60-second intervals, the job's SQL runs through a real `Engine` session
-//! against the tenant's namespace, and the audit log mirrors the real run
+//! against the project's namespace, and the audit log mirrors the real run
 //! count one-for-one.
 
 #![allow(clippy::print_stdout)]
@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use arrow_array::Int64Array;
 use basin_catalog::InMemoryCatalog;
-use basin_common::TenantId;
+use basin_common::ProjectId;
 use basin_cron::{CronRunner, JobStatus, TestClock};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
@@ -47,7 +47,7 @@ async fn viability_basin_cron() {
         shard: None,
     });
 
-    let tenant = TenantId::new();
+    let project = ProjectId::new();
 
     // Anchor the test clock one second before a minute boundary so the
     // very first +60s advance crosses exactly one boundary, fires once,
@@ -56,10 +56,10 @@ async fn viability_basin_cron() {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 1, 12, 30, 59).unwrap();
     let clock = TestClock::new(t0);
     let runner = CronRunner::new(engine.clone(), Arc::new(clock.clone()));
-    runner.register_tenant(tenant).await;
+    runner.register_project(project).await;
 
     // Seed a `markers` table the scheduled job will append into.
-    let admin = engine.open_session(tenant).await.unwrap();
+    let admin = engine.open_session(project).await.unwrap();
     admin
         .execute("CREATE TABLE markers (id BIGINT NOT NULL)")
         .await
@@ -69,7 +69,7 @@ async fn viability_basin_cron() {
     let jobid = runner
         .store()
         .schedule(
-            &tenant,
+            &project,
             "alice",
             "tick-marker",
             "* * * * *",
@@ -92,7 +92,7 @@ async fn viability_basin_cron() {
     }
 
     // Marker rows. Reopen the session to pick up the new commit.
-    let observer = engine.open_session(tenant).await.unwrap();
+    let observer = engine.open_session(project).await.unwrap();
     let res = observer.execute("SELECT id FROM markers").await.unwrap();
     let marker_rows = match res {
         ExecResult::Rows { batches, .. } => {
@@ -115,7 +115,7 @@ async fn viability_basin_cron() {
     };
 
     // Audit rows.
-    let details = runner.store().list_run_details(&tenant).await.unwrap();
+    let details = runner.store().list_run_details(&project).await.unwrap();
     let succeeded = details
         .iter()
         .filter(|d| d.status == JobStatus::Succeeded)

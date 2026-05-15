@@ -1462,7 +1462,7 @@ pub(crate) fn validate_copy_path(path: &str) -> std::result::Result<std::path::P
 /// Writes the rendered CSV bytes to `path` (truncating any existing file)
 /// and returns the row count for the `CommandComplete` tag.
 ///
-/// Sequential, single buffer — no per-tenant file handles allocated.
+/// Sequential, single buffer — no per-project file handles allocated.
 pub(crate) async fn copy_to_file<S: Session + ?Sized>(
     session: &S,
     table: &str,

@@ -14,11 +14,11 @@
 //! [`WebhookConfig::auto_pause_after`] is flipped to `paused = true`
 //! and emits an audit log entry.
 //!
-//! ## Per-tenant cost
+//! ## Per-project cost
 //!
-//! There is **one** worker process-wide. A `HashMap<TenantId, Worker>`
-//! would be a per-tenant heavy resource — that's the failure mode the
-//! crate-level discipline rule exists to prevent. Per-tenant fairness
+//! There is **one** worker process-wide. A `HashMap<ProjectId, Worker>`
+//! would be a per-project heavy resource — that's the failure mode the
+//! crate-level discipline rule exists to prevent. Per-project fairness
 //! is delegated to `basin-net`'s keyed token bucket.
 //!
 //! ## Clock injection
@@ -115,7 +115,7 @@ impl WebhookWorker {
         )
     }
 
-    /// Build with an explicit per-tenant counters registry. Production
+    /// Build with an explicit per-project counters registry. Production
     /// wiring shares the registry between [`crate::WebhookSink`] (which
     /// bumps `pending_queue_depth` on enqueue) and the worker (which
     /// decrements on dequeue and records success / failure / retry /
@@ -140,7 +140,7 @@ impl WebhookWorker {
         }
     }
 
-    /// Per-tenant counters registry handle. Same registry the worker
+    /// Per-project counters registry handle. Same registry the worker
     /// updates on every delivery attempt.
     pub fn counters(&self) -> Arc<WebhookCountersRegistry> {
         self.inner.counters.clone()
@@ -168,7 +168,7 @@ impl WebhookWorker {
             // depth ≈ 0 between ticks.
             self.inner
                 .counters
-                .for_tenant(&entry.tenant)
+                .for_project(&entry.project)
                 .record_dequeue();
             let outcome = self.attempt(entry).await;
             outcomes.push(outcome);
@@ -182,7 +182,7 @@ impl WebhookWorker {
         skip_all,
         name = "webhook_delivery",
         fields(
-            tenant = %entry.tenant,
+            project = %entry.project,
             subscription_id = %entry.subscription_id,
             table = %entry.envelope.table,
             op = ?entry.envelope.op,
@@ -192,7 +192,7 @@ impl WebhookWorker {
         ),
     )]
     async fn attempt(&self, entry: QueueEntry) -> AttemptOutcome {
-        let counters = self.inner.counters.for_tenant(&entry.tenant);
+        let counters = self.inner.counters.for_project(&entry.project);
         let sub = match self.inner.registry.get(entry.subscription_id).await {
             Some(s) => s,
             None => {
@@ -266,7 +266,7 @@ impl WebhookWorker {
 
         let attempt_count_after = entry.attempt_count + 1;
         let started = Instant::now();
-        let resp = self.inner.net.send(&entry.tenant, &req).await;
+        let resp = self.inner.net.send(&entry.project, &req).await;
         let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
         counters.record_latency_ms(elapsed_ms);
 
@@ -402,7 +402,7 @@ impl WebhookWorker {
             tracing::warn!(
                 target: "basin_webhooks::auto_pause",
                 subscription_id = %entry.subscription_id,
-                tenant = %entry.tenant,
+                project = %entry.project,
                 attempt_count = entry.attempt_count,
                 first_attempt_at = %entry.first_attempt_at,
                 "webhook_auto_pauses: auto-paused subscription after sustained failures",

@@ -1,14 +1,14 @@
-//! `basin-storage` — tenant-aware Parquet-on-object-store substrate.
+//! `basin-storage` — project-aware Parquet-on-object-store substrate.
 //!
 //! Phase 1 scope. This crate is the bottom of the Basin stack: it knows
 //! nothing about SQL, transactions, the WAL, or shard owners. Its only job
 //! is to write Arrow `RecordBatch`es as immutable Parquet files under a
-//! strict per-tenant key prefix and read them back with predicate and
+//! strict per-project key prefix and read them back with predicate and
 //! projection pushdown.
 //!
-//! Tenant isolation is enforced by funneling every object key through one
+//! Project isolation is enforced by funneling every object key through one
 //! private helper (`paths::data_file_key`) that always begins with
-//! `tenants/{tenant_id}/`. There is no public escape hatch.
+//! `projects/{project_id}/`. There is no public escape hatch.
 
 #![forbid(unsafe_code)]
 
@@ -32,13 +32,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use basin_catalog::Catalog;
-use basin_common::{Result, TableName, TenantCounterRegistry, TenantId};
+use basin_common::{Result, TableName, ProjectCounterRegistry, ProjectId};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use tokio::sync::Semaphore;
 
-pub use basin_catalog::TenantStorageConfig;
+pub use basin_catalog::ProjectStorageConfig;
 pub use data_file::{ColumnStats, DataFile};
 pub use disk_cache::{DiskCacheConfig, DiskCacheCounters, DiskCachedStore};
 pub use encryption::{EncryptionProvider, WrappedKey};
@@ -47,7 +47,7 @@ pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
     CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
 };
-pub use scheduler::{Scheduler, TenantIoStats, DEFAULT_GLOBAL_BUDGET};
+pub use scheduler::{Scheduler, ProjectIoStats, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 pub use writer::WriteOptions;
@@ -58,17 +58,17 @@ use arrow_array::RecordBatch;
 #[derive(Clone)]
 pub struct StorageConfig {
     pub object_store: Arc<dyn ObjectStore>,
-    /// Optional bucket sub-prefix that all tenant keys are nested under.
+    /// Optional bucket sub-prefix that all project keys are nested under.
     /// `None` means keys live directly at the bucket root.
     pub root_prefix: Option<ObjectPath>,
     /// Optional NVMe / local-SSD disk cache between Storage and the
     /// underlying object store. `None` (the default) is the legacy
     /// behaviour: every read goes straight to the inner store. When
     /// `Some(...)`, the inner store is wrapped in a [`DiskCachedStore`]
-    /// **before** per-tenant wrapping so the wrapping order is
-    /// `TenantScopedStore -> DiskCachedStore -> real ObjectStore` —
-    /// every cache hit still counts against the requesting tenant's
-    /// per-tenant concurrency permit pool.
+    /// **before** per-project wrapping so the wrapping order is
+    /// `ProjectScopedStore -> DiskCachedStore -> real ObjectStore` —
+    /// every cache hit still counts against the requesting project's
+    /// per-project concurrency permit pool.
     ///
     /// See [`DiskCacheConfig`] for the cap / root-dir knobs and
     /// [`DiskCachedStore`] for the cache shape, eviction policy, and
@@ -94,7 +94,7 @@ pub struct StorageConfig {
 impl StorageConfig {
     /// Default disk-cache budget when no override is supplied: 10 GiB.
     /// Sized so a typical NVMe-backed deployment can cache the full
-    /// working set of a multi-tenant SaaS workload while leaving room
+    /// working set of a multi-project SaaS workload while leaving room
     /// for the local filesystem itself; deployments with tighter disks
     /// override via [`StorageConfig::default_disk_cache_with_root`] or
     /// the `BASIN_DISK_CACHE_MAX_BYTES` env var on the production
@@ -180,18 +180,18 @@ impl std::fmt::Debug for StorageConfig {
     }
 }
 
-/// Default per-tenant concurrent in-flight RPC cap. Must be ≥ the peak
+/// Default per-project concurrent in-flight RPC cap. Must be ≥ the peak
 /// concurrent permits a single Parquet scan needs (DataFusion target
 /// partitions × parquet async range fan-out) AND ≥ that figure × the
-/// number of concurrent queries one tenant might run — otherwise the
+/// number of concurrent queries one project might run — otherwise the
 /// parquet reader's range fan-out deadlocks. Empirically cap=4 and
 /// cap=8 both deadlock under the s3_scaling_noisy_neighbor workload
-/// (4 concurrent full scans of 1M rows); 16 holds liveness. Per-tenant
-/// state is O(1) per tenant (~140 bytes for the Semaphore), so this
-/// scales to 1M tenants. v0.2 surfaces the value per tenant from the
-/// catalog so a noisy tenant can be capped without throttling quiet
-/// tenants.
-pub const DEFAULT_TENANT_CONCURRENCY: usize = 16;
+/// (4 concurrent full scans of 1M rows); 16 holds liveness. Per-project
+/// state is O(1) per project (~140 bytes for the Semaphore), so this
+/// scales to 1M projects. v0.2 surfaces the value per project from the
+/// catalog so a noisy project can be capped without throttling quiet
+/// projects.
+pub const DEFAULT_PROJECT_CONCURRENCY: usize = 16;
 
 /// Read knobs for [`Storage::read`]. Filters are ANDed together.
 #[derive(Clone, Debug, Default)]
@@ -201,7 +201,7 @@ pub struct ReadOptions {
     pub partition: Option<basin_common::PartitionKey>,
 }
 
-/// Tenant-aware Parquet store. Cheap to clone (`Arc` inside).
+/// Project-aware Parquet store. Cheap to clone (`Arc` inside).
 #[derive(Clone)]
 pub struct Storage {
     inner: Arc<Inner>,
@@ -217,15 +217,15 @@ struct Inner {
     /// Parsed-HNSW-segment cache for the vector-search path. Same
     /// invariants apply.
     hnsw_segment_cache: Arc<metadata_cache::HnswSegmentCache>,
-    /// Per-tenant concurrent-RPC semaphores, lazy-allocated on first
+    /// Per-project concurrent-RPC semaphores, lazy-allocated on first
     /// use. The mutex protects the map only — permits are acquired on
     /// the [`Semaphore`] itself outside the mutex, so the lock is held
     /// for nanoseconds and never across an `await`. We accept the cost
     /// of one map lookup per RPC; on the hot path it's a HashMap probe
-    /// with `TenantId` (a [`Ulid`] under the hood, so cheap to hash).
-    tenant_semaphores: Mutex<HashMap<TenantId, Arc<Semaphore>>>,
-    /// Default permit count for a newly-created tenant semaphore.
-    default_tenant_concurrency: usize,
+    /// with `ProjectId` (a [`Ulid`] under the hood, so cheap to hash).
+    project_semaphores: Mutex<HashMap<ProjectId, Arc<Semaphore>>>,
+    /// Default permit count for a newly-created project semaphore.
+    default_project_concurrency: usize,
     /// Process-wide counters incremented by the read path so tests can
     /// assert that bloom-filter / stats pruning is doing real work.
     /// `row_groups_considered` counts every row group in every Parquet
@@ -238,11 +238,11 @@ struct Inner {
     /// [`StorageConfig::page_cache`] for the rationale; `None` is the
     /// default (every read decodes from Parquet bytes).
     page_cache: Option<Arc<PageCache>>,
-    /// Optional per-tenant counters registry (Phase 6 telemetry). Attached by
-    /// the engine via [`Storage::attach_tenant_counters`]; first attach wins.
+    /// Optional per-project counters registry (Phase 6 telemetry). Attached by
+    /// the engine via [`Storage::attach_project_counters`]; first attach wins.
     /// When present, every successful write/read bumps `bytes_written_total` /
-    /// `bytes_read_total` for the calling tenant.
-    tenant_counters: OnceLock<Arc<TenantCounterRegistry>>,
+    /// `bytes_read_total` for the calling project.
+    project_counters: OnceLock<Arc<ProjectCounterRegistry>>,
     /// Optional BYO-key envelope-encryption provider (Phase 6). Attached by
     /// the cloud layer via [`Storage::attach_encryption_provider`]; first
     /// attach wins. When `None` the write/read path is byte-for-byte the
@@ -250,26 +250,26 @@ struct Inner {
     /// fresh per-file data key and every GET unwraps before decoding.
     encryption: OnceLock<Arc<dyn encryption::EncryptionProvider>>,
     /// Optional `Catalog` handle. When attached, the encryption call path
-    /// looks up the per-tenant [`TenantStorageConfig`] (cached below) on
-    /// each wrap / unwrap so the provider can route to the per-tenant
+    /// looks up the per-project [`ProjectStorageConfig`] (cached below) on
+    /// each wrap / unwrap so the provider can route to the per-project
     /// CMK. When `None`, the encryption path falls back to the legacy
     /// `wrap_key` / `unwrap_key` shape — back-compat for callers that
     /// haven't yet wired a catalog handle into Storage.
     catalog: OnceLock<Arc<dyn Catalog>>,
-    /// Process-local cache of [`TenantStorageConfig`] keyed by tenant.
+    /// Process-local cache of [`ProjectStorageConfig`] keyed by project.
     /// Populated lazily on first lookup; invalidated by
-    /// [`Storage::set_tenant_storage_config`]. The outer `RwLock` lets
+    /// [`Storage::set_project_storage_config`]. The outer `RwLock` lets
     /// concurrent readers fan in cheaply; writes (cache fill or
-    /// invalidation) are rare. Per-tenant cost discipline: one shared
-    /// HashMap, no per-tenant heavy resource. Each entry stores
-    /// `Option<TenantStorageConfig>` so a known-empty result (tenant has
+    /// invalidation) are rare. Per-project cost discipline: one shared
+    /// HashMap, no per-project heavy resource. Each entry stores
+    /// `Option<ProjectStorageConfig>` so a known-empty result (project has
     /// no config) is also cached and avoids re-querying the catalog on
     /// the hot write path.
-    tenant_config_cache: RwLock<HashMap<TenantId, Option<TenantStorageConfig>>>,
-    /// Cross-tenant EDF (Earliest Deadline First) fair-share scheduler.
+    project_config_cache: RwLock<HashMap<ProjectId, Option<ProjectStorageConfig>>>,
+    /// Cross-project EDF (Earliest Deadline First) fair-share scheduler.
     /// One per `Storage`; cheap-to-clone `Arc` inside. Each underlying
-    /// `ObjectStore` RPC issued through `tenant_object_store` acquires
-    /// a permit from this scheduler AFTER the per-tenant Semaphore
+    /// `ObjectStore` RPC issued through `project_object_store` acquires
+    /// a permit from this scheduler AFTER the per-project Semaphore
     /// liveness floor. Point reads (HEAD / GET / small range / LIST)
     /// arrive with a 5ms deadline; bulk ops (PUT / large range) get a
     /// 1s deadline so they can't crowd out point lookups. See ADR 0008.
@@ -320,19 +320,19 @@ const DEFAULT_PARQUET_META_CACHE_CAP: usize = 1024;
 /// Default capacity for the HNSW segment cache. 256 segments at "few MB
 /// each" is the largest we'd want to hold in process; in practice the cache
 /// stays much smaller because workloads concentrate on a handful of
-/// segments per (tenant, table, column).
+/// segments per (project, table, column).
 const DEFAULT_HNSW_SEGMENT_CACHE_CAP: usize = 256;
 
 impl Storage {
     pub fn new(cfg: StorageConfig) -> Self {
         // If a disk cache is configured, wrap the supplied object store
-        // with [`DiskCachedStore`] *before* the per-tenant wrapping that
-        // [`Storage::tenant_object_store`] adds on top. The result is
-        // `TenantScopedStore -> DiskCachedStore -> real ObjectStore`
+        // with [`DiskCachedStore`] *before* the per-project wrapping that
+        // [`Storage::project_object_store`] adds on top. The result is
+        // `ProjectScopedStore -> DiskCachedStore -> real ObjectStore`
         // for every read, which is what the design calls for: cache
-        // hits still count against the tenant's permit pool, and cache
+        // hits still count against the project's permit pool, and cache
         // keys are content-addressed on the path (which always carries
-        // the tenant prefix) so cross-tenant key collisions are
+        // the project prefix) so cross-project key collisions are
         // mechanically impossible.
         //
         // If construction of the cache fails (cache root not writable,
@@ -366,22 +366,22 @@ impl Storage {
                 hnsw_segment_cache: Arc::new(metadata_cache::HnswSegmentCache::new(
                     DEFAULT_HNSW_SEGMENT_CACHE_CAP,
                 )),
-                tenant_semaphores: Mutex::new(HashMap::new()),
-                default_tenant_concurrency: DEFAULT_TENANT_CONCURRENCY,
+                project_semaphores: Mutex::new(HashMap::new()),
+                default_project_concurrency: DEFAULT_PROJECT_CONCURRENCY,
                 read_counters: Arc::new(ReadCounters::default()),
                 page_cache,
-                tenant_counters: OnceLock::new(),
+                project_counters: OnceLock::new(),
                 encryption: OnceLock::new(),
                 catalog: OnceLock::new(),
-                tenant_config_cache: RwLock::new(HashMap::new()),
+                project_config_cache: RwLock::new(HashMap::new()),
                 scheduler: Scheduler::new(DEFAULT_GLOBAL_BUDGET),
             }),
         }
     }
 
-    /// Attach a per-tenant counter registry. Idempotent (first attach wins).
-    pub fn attach_tenant_counters(&self, registry: Arc<TenantCounterRegistry>) {
-        let _ = self.inner.tenant_counters.set(registry);
+    /// Attach a per-project counter registry. Idempotent (first attach wins).
+    pub fn attach_project_counters(&self, registry: Arc<ProjectCounterRegistry>) {
+        let _ = self.inner.project_counters.set(registry);
     }
 
     /// Attach a BYO-key envelope-encryption provider. Idempotent (first
@@ -401,9 +401,9 @@ impl Storage {
     }
 
     /// Attach a [`Catalog`] handle. Idempotent (first attach wins). When
-    /// attached, [`Storage::set_tenant_storage_config`] /
-    /// [`Storage::get_tenant_storage_config`] become available and the
-    /// encryption call path looks up each tenant's config to route the
+    /// attached, [`Storage::set_project_storage_config`] /
+    /// [`Storage::get_project_storage_config`] become available and the
+    /// encryption call path looks up each project's config to route the
     /// `EncryptionProvider`. Without a catalog the storage layer falls
     /// back to the legacy `wrap_key` / `unwrap_key` path — fully
     /// backwards compatible.
@@ -411,61 +411,61 @@ impl Storage {
         let _ = self.inner.catalog.set(catalog);
     }
 
-    /// Persist a per-tenant storage config. Delegates to the attached
+    /// Persist a per-project storage config. Delegates to the attached
     /// [`Catalog`]; returns an error if no catalog has been attached.
-    /// Invalidates the in-process cache for `tenant` so the next wrap /
+    /// Invalidates the in-process cache for `project` so the next wrap /
     /// unwrap call picks up the new config — production deployments
     /// rotating CMK config rely on this.
-    pub async fn set_tenant_storage_config(
+    pub async fn set_project_storage_config(
         &self,
-        tenant: &TenantId,
-        config: TenantStorageConfig,
+        project: &ProjectId,
+        config: ProjectStorageConfig,
     ) -> Result<()> {
         let catalog = self.inner.catalog.get().ok_or_else(|| {
             basin_common::BasinError::Internal(
-                "set_tenant_storage_config: no catalog attached to Storage".into(),
+                "set_project_storage_config: no catalog attached to Storage".into(),
             )
         })?;
-        catalog.set_tenant_storage_config(tenant, config).await?;
+        catalog.set_project_storage_config(project, config).await?;
         // Invalidate cache so the next read re-fetches the freshly
         // persisted config. Holding the write lock briefly is fine; the
         // path is rare (admin / setup, not hot write).
         self.inner
-            .tenant_config_cache
+            .project_config_cache
             .write()
-            .expect("tenant_config_cache poisoned")
-            .remove(tenant);
+            .expect("project_config_cache poisoned")
+            .remove(project);
         Ok(())
     }
 
-    /// Look up a tenant's persisted storage config. Goes through the
+    /// Look up a project's persisted storage config. Goes through the
     /// in-process cache; populates it on miss. Returns an error if no
     /// catalog has been attached.
-    pub async fn get_tenant_storage_config(
+    pub async fn get_project_storage_config(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Option<TenantStorageConfig>> {
+        project: &ProjectId,
+    ) -> Result<Option<ProjectStorageConfig>> {
         if let Some(cached) = self
             .inner
-            .tenant_config_cache
+            .project_config_cache
             .read()
-            .expect("tenant_config_cache poisoned")
-            .get(tenant)
+            .expect("project_config_cache poisoned")
+            .get(project)
             .cloned()
         {
             return Ok(cached);
         }
         let catalog = self.inner.catalog.get().ok_or_else(|| {
             basin_common::BasinError::Internal(
-                "get_tenant_storage_config: no catalog attached to Storage".into(),
+                "get_project_storage_config: no catalog attached to Storage".into(),
             )
         })?;
-        let cfg = catalog.get_tenant_storage_config(tenant).await?;
+        let cfg = catalog.get_project_storage_config(project).await?;
         self.inner
-            .tenant_config_cache
+            .project_config_cache
             .write()
-            .expect("tenant_config_cache poisoned")
-            .insert(*tenant, cfg.clone());
+            .expect("project_config_cache poisoned")
+            .insert(*project, cfg.clone());
         Ok(cfg)
     }
 
@@ -473,24 +473,24 @@ impl Storage {
     /// path. Returns `Ok(None)` (and skips the catalog round-trip) when
     /// no catalog is attached so the writer / reader can degrade
     /// gracefully to the legacy `wrap_key` / `unwrap_key` shape.
-    pub(crate) async fn tenant_storage_config_cached(
+    pub(crate) async fn project_storage_config_cached(
         &self,
-        tenant: &TenantId,
-    ) -> Result<Option<TenantStorageConfig>> {
+        project: &ProjectId,
+    ) -> Result<Option<ProjectStorageConfig>> {
         if self.inner.catalog.get().is_none() {
             return Ok(None);
         }
-        self.get_tenant_storage_config(tenant).await
+        self.get_project_storage_config(project).await
     }
 
-    pub(crate) fn tenant_counters(
+    pub(crate) fn project_counters(
         &self,
-        tenant: &TenantId,
-    ) -> Option<Arc<basin_common::TenantCounters>> {
+        project: &ProjectId,
+    ) -> Option<Arc<basin_common::ProjectCounters>> {
         self.inner
-            .tenant_counters
+            .project_counters
             .get()
-            .map(|r| r.for_tenant(tenant))
+            .map(|r| r.for_project(project))
     }
 
     /// Handle to the in-RAM page cache, or `None` if the cache is not
@@ -509,61 +509,61 @@ impl Storage {
         &self.inner.read_counters
     }
 
-    /// Per-tenant live I/O stats sourced from the EDF scheduler. Returns
-    /// zeros for tenants that have never run an op through this `Storage`.
-    pub fn tenant_stats(&self, tenant: &TenantId) -> TenantIoStats {
-        self.inner.scheduler.tenant_stats(tenant)
+    /// Per-project live I/O stats sourced from the EDF scheduler. Returns
+    /// zeros for projects that have never run an op through this `Storage`.
+    pub fn project_stats(&self, project: &ProjectId) -> ProjectIoStats {
+        self.inner.scheduler.project_stats(project)
     }
 
-    /// Handle to the cross-tenant EDF scheduler. Cheap to clone. Exposed
+    /// Handle to the cross-project EDF scheduler. Cheap to clone. Exposed
     /// so the engine layer can inspect global state and so tests can
     /// drive the scheduler directly.
     pub fn scheduler(&self) -> &Scheduler {
         &self.inner.scheduler
     }
 
-    /// Per-tenant semaphore handle. Used internally to gate every
-    /// underlying object_store RPC behind a tenant-scoped permit pool.
-    /// Lazy-allocates on first call for a given tenant.
-    fn tenant_semaphore(&self, tenant: &TenantId) -> Arc<Semaphore> {
+    /// Per-project semaphore handle. Used internally to gate every
+    /// underlying object_store RPC behind a project-scoped permit pool.
+    /// Lazy-allocates on first call for a given project.
+    fn project_semaphore(&self, project: &ProjectId) -> Arc<Semaphore> {
         let mut map = self
             .inner
-            .tenant_semaphores
+            .project_semaphores
             .lock()
-            .expect("tenant semaphore map poisoned");
-        if let Some(s) = map.get(tenant) {
+            .expect("project semaphore map poisoned");
+        if let Some(s) = map.get(project) {
             return s.clone();
         }
-        let s = Arc::new(Semaphore::new(self.inner.default_tenant_concurrency));
-        map.insert(*tenant, s.clone());
+        let s = Arc::new(Semaphore::new(self.inner.default_project_concurrency));
+        map.insert(*project, s.clone());
         s
     }
 
-    /// Tenant-scoped view of the underlying object store. Every RPC
+    /// Project-scoped view of the underlying object store. Every RPC
     /// (get / put / list / head / delete / copy) is gated on this
-    /// tenant's semaphore so one tenant's heavy traffic cannot starve
-    /// another tenant's quiet traffic.
+    /// project's semaphore so one project's heavy traffic cannot starve
+    /// another project's quiet traffic.
     ///
     /// This is the right thing to register with DataFusion's runtime
     /// (`SessionContext::register_object_store`) for a session bound to
-    /// `tenant`: every range read DataFusion drives for that session
-    /// will then count against the tenant's permit pool.
-    pub fn tenant_object_store(&self, tenant: &TenantId) -> Arc<dyn ObjectStore> {
-        let sem = self.tenant_semaphore(tenant);
-        Arc::new(concurrency::TenantScopedStore::new(
+    /// `project`: every range read DataFusion drives for that session
+    /// will then count against the project's permit pool.
+    pub fn project_object_store(&self, project: &ProjectId) -> Arc<dyn ObjectStore> {
+        let sem = self.project_semaphore(project);
+        Arc::new(concurrency::ProjectScopedStore::new(
             self.inner.object_store.clone(),
             sem,
             self.inner.scheduler.clone(),
-            *tenant,
+            *project,
         ))
     }
 
-    /// Internal accessor: returns the wrapped tenant-scoped store as a
+    /// Internal accessor: returns the wrapped project-scoped store as a
     /// concrete `Arc<dyn ObjectStore>`, identical to
-    /// [`tenant_object_store`] but at `pub(crate)` visibility for the
+    /// [`project_object_store`] but at `pub(crate)` visibility for the
     /// reader / writer / vector-index modules.
-    pub(crate) fn tenant_store(&self, tenant: &TenantId) -> Arc<dyn ObjectStore> {
-        self.tenant_object_store(tenant)
+    pub(crate) fn project_store(&self, project: &ProjectId) -> Arc<dyn ObjectStore> {
+        self.project_object_store(project)
     }
 
     pub(crate) fn parquet_meta_cache(&self) -> &Arc<metadata_cache::ParquetMetaCache> {
@@ -580,10 +580,10 @@ impl Storage {
 
     /// The underlying [`ObjectStore`]. Exposed so higher layers (e.g.
     /// `basin-engine`) can register the same store with DataFusion's runtime
-    /// without round-tripping through configuration. Tenant-prefix
+    /// without round-tripping through configuration. Project-prefix
     /// enforcement still happens inside `Storage`'s own read/write methods;
     /// callers handed a raw `ObjectStore` are responsible for not crossing
-    /// tenant boundaries themselves.
+    /// project boundaries themselves.
     pub fn object_store_handle(&self) -> Arc<dyn ObjectStore> {
         self.inner.object_store.clone()
     }
@@ -600,15 +600,15 @@ impl Storage {
 
     /// Write one `RecordBatch` as an immutable Parquet file. Returns the
     /// resulting `DataFile` descriptor.
-    #[tracing::instrument(skip(self, batch), fields(tenant=%tenant, table=%table, partition=%partition, rows=batch.num_rows()))]
+    #[tracing::instrument(skip(self, batch), fields(project=%project, table=%table, partition=%partition, rows=batch.num_rows()))]
     pub async fn write_batch(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         partition: &basin_common::PartitionKey,
         batch: &RecordBatch,
     ) -> Result<DataFile> {
-        writer::write_batch(self, tenant, table, partition, batch).await
+        writer::write_batch(self, project, table, partition, batch).await
     }
 
     /// Like [`write_batch`](Self::write_batch) but with explicit per-write
@@ -616,37 +616,37 @@ impl Storage {
     /// have read [`basin_catalog::TableMetadata::bloom_filter_columns`] and
     /// want the writer to materialise bloom filters in the Parquet footer.
     /// All defaults preserve the legacy [`write_batch`] behaviour exactly.
-    #[tracing::instrument(skip(self, batch, opts), fields(tenant=%tenant, table=%table, partition=%partition, rows=batch.num_rows(), bloom_cols=opts.bloom_filter_columns.len()))]
+    #[tracing::instrument(skip(self, batch, opts), fields(project=%project, table=%table, partition=%partition, rows=batch.num_rows(), bloom_cols=opts.bloom_filter_columns.len()))]
     pub async fn write_batch_with_options(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         partition: &basin_common::PartitionKey,
         batch: &RecordBatch,
         opts: &WriteOptions,
     ) -> Result<DataFile> {
-        writer::write_batch_with_options(self, tenant, table, partition, batch, opts).await
+        writer::write_batch_with_options(self, project, table, partition, batch, opts).await
     }
 
-    /// Stream all rows for one tenant+table that match the read options.
-    #[tracing::instrument(skip(self, opts), fields(tenant=%tenant, table=%table))]
+    /// Stream all rows for one project+table that match the read options.
+    #[tracing::instrument(skip(self, opts), fields(project=%project, table=%table))]
     pub async fn read(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         opts: ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        reader::read(self, tenant, table, opts).await
+        reader::read(self, project, table, opts).await
     }
 
-    /// List the data files for one tenant+table without reading their bodies.
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, table=%table))]
+    /// List the data files for one project+table without reading their bodies.
+    #[tracing::instrument(skip(self), fields(project=%project, table=%table))]
     pub async fn list_data_files(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
     ) -> Result<Vec<DataFile>> {
-        reader::list_data_files(self, tenant, table).await
+        reader::list_data_files(self, project, table).await
     }
 
     /// Like [`list_data_files`](Self::list_data_files) but populates each
@@ -654,13 +654,13 @@ impl Storage {
     /// fetching the Parquet footer (cached). Used by the copy-on-write
     /// UPDATE/DELETE pruner; reading-path callers prefer the cheaper
     /// `list_data_files`.
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, table=%table))]
+    #[tracing::instrument(skip(self), fields(project=%project, table=%table))]
     pub async fn list_data_files_with_stats(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
     ) -> Result<Vec<DataFile>> {
-        reader::list_data_files_with_stats(self, tenant, table).await
+        reader::list_data_files_with_stats(self, project, table).await
     }
 
     /// Like [`read`](Self::read) but reads only the supplied `paths`
@@ -675,17 +675,17 @@ impl Storage {
     /// 3. Pass the surviving paths to this method.
     ///
     /// Saves the LIST RPC plus, for catalog-pruned files, the per-file
-    /// Parquet footer fetch. Tenant-prefix enforcement still applies:
-    /// every path must contain the tenant prefix or the call returns
+    /// Parquet footer fetch. Project-prefix enforcement still applies:
+    /// every path must contain the project prefix or the call returns
     /// [`basin_common::BasinError::IsolationViolation`].
-    #[tracing::instrument(skip(self, paths, opts), fields(tenant=%tenant, n_paths=paths.len()))]
+    #[tracing::instrument(skip(self, paths, opts), fields(project=%project, n_paths=paths.len()))]
     pub async fn read_paths(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         paths: Vec<ObjectPath>,
         opts: ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        reader::read_paths(self, tenant, paths, opts).await
+        reader::read_paths(self, project, paths, opts).await
     }
 
     /// Read every batch from a single Parquet data file. Used by the
@@ -694,18 +694,18 @@ impl Storage {
     /// regardless of pruning.
     ///
     /// `path` must be a path returned by a prior [`list_data_files`]
-    /// against the same tenant; passing a foreign path is the caller's
-    /// bug (we only enforce tenant isolation at the listing/path-key
-    /// boundary, not on a raw `read_file`). The `tenant` argument is
-    /// purely so the read counts against this tenant's per-tenant
+    /// against the same project; passing a foreign path is the caller's
+    /// bug (we only enforce project isolation at the listing/path-key
+    /// boundary, not on a raw `read_file`). The `project` argument is
+    /// purely so the read counts against this project's per-project
     /// concurrency permit pool — it is not re-validated against `path`.
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, path=%path))]
+    #[tracing::instrument(skip(self), fields(project=%project, path=%path))]
     pub async fn read_file(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         path: &ObjectPath,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        reader::read_file(self, tenant, path).await
+        reader::read_file(self, project, path).await
     }
 
     /// Copy a hot-tier data file to its cold-tier sibling and return the new
@@ -719,11 +719,11 @@ impl Storage {
     /// follow the canonical layout the call returns `BasinError::Storage`.
     /// Files already in the cold tier are returned unchanged (the descriptor
     /// is rebuilt by re-stat'ing the cold object).
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, from=%from))]
-    pub async fn migrate_to_cold(&self, tenant: &TenantId, from: &ObjectPath) -> Result<DataFile> {
+    #[tracing::instrument(skip(self), fields(project=%project, from=%from))]
+    pub async fn migrate_to_cold(&self, project: &ProjectId, from: &ObjectPath) -> Result<DataFile> {
         // Already cold? Re-stat and return without touching anything.
         if matches!(Tier::from_path(from.as_ref()), Tier::Cold) {
-            let store = self.tenant_store(tenant);
+            let store = self.project_store(project);
             let head = store
                 .head(from)
                 .await
@@ -742,14 +742,14 @@ impl Storage {
                 "migrate_to_cold: path does not match `tables/<t>/data/...`: {from}"
             ))
         })?;
-        let store = self.tenant_store(tenant);
-        // Belt-and-braces: confirm the target sits under this tenant's prefix.
+        let store = self.project_store(project);
+        // Belt-and-braces: confirm the target sits under this project's prefix.
         // The path was derived from `from`, which already cleared this check
         // at write time — we re-check defensively.
-        let expected_prefix = format!("tenants/{}/", tenant.as_prefix());
+        let expected_prefix = format!("projects/{}/", project.as_prefix());
         if !to.as_ref().contains(&expected_prefix) {
             return Err(basin_common::BasinError::isolation(format!(
-                "migrate_to_cold target {to} missing tenant prefix {expected_prefix}"
+                "migrate_to_cold target {to} missing project prefix {expected_prefix}"
             )));
         }
         // Use `copy` (overwrites) rather than `copy_if_not_exists` because a
@@ -773,22 +773,22 @@ impl Storage {
         })
     }
 
-    /// Best-effort delete of one tenant-owned object. Used by the tiering
+    /// Best-effort delete of one project-owned object. Used by the tiering
     /// compactor after an atomic catalog replace_data_files; failure is
     /// logged but not propagated because the catalog is already authoritative
     /// — a leftover hot object is wasted bytes, not a correctness violation.
     ///
-    /// The caller is responsible for ensuring `path` is under `tenant`'s
+    /// The caller is responsible for ensuring `path` is under `project`'s
     /// prefix; we re-check defensively.
-    #[tracing::instrument(skip(self), fields(tenant=%tenant, path=%path))]
-    pub async fn delete_file(&self, tenant: &TenantId, path: &ObjectPath) -> Result<()> {
-        let expected_prefix = format!("tenants/{}/", tenant.as_prefix());
+    #[tracing::instrument(skip(self), fields(project=%project, path=%path))]
+    pub async fn delete_file(&self, project: &ProjectId, path: &ObjectPath) -> Result<()> {
+        let expected_prefix = format!("projects/{}/", project.as_prefix());
         if !path.as_ref().contains(&expected_prefix) {
             return Err(basin_common::BasinError::isolation(format!(
-                "delete_file: {path} missing tenant prefix {expected_prefix}"
+                "delete_file: {path} missing project prefix {expected_prefix}"
             )));
         }
-        let store = self.tenant_store(tenant);
+        let store = self.project_store(project);
         store
             .delete(path)
             .await
@@ -802,13 +802,13 @@ impl Storage {
         Ok(())
     }
 
-    /// Bulk-delete every object under `tenant`'s key prefix. Returns the
+    /// Bulk-delete every object under `project`'s key prefix. Returns the
     /// number of objects deleted.
     ///
     /// Implementation strategy:
     ///
-    /// 1. List the tenant prefix through the per-tenant gated store, so
-    ///    the LIST itself counts against this tenant's permit pool.
+    /// 1. List the project prefix through the per-project gated store, so
+    ///    the LIST itself counts against this project's permit pool.
     /// 2. Pipe the resulting path stream through the **inner** object
     ///    store's `delete_stream`, *not* the wrapped one. The wrapper's
     ///    default `delete_stream` calls our gated `delete()` once per
@@ -821,28 +821,28 @@ impl Storage {
     /// 3. The fan-out is still bounded — on LocalFS by `buffered(10)`,
     ///    on S3 by the bucket-quota for `DeleteObjects`. We don't add
     ///    another semaphore around the bulk path because the LIST in
-    ///    step 1 already counted against this tenant's pool, and the
+    ///    step 1 already counted against this project's pool, and the
     ///    deletes themselves are bounded by the underlying store's
     ///    own concurrency knobs.
     ///
     /// The method intentionally does *not* call `Catalog::drop_table`:
     /// catalog state is the engine's responsibility. This method's
-    /// contract is "physically free the bytes under the tenant prefix".
-    /// A typical caller (the engine's tenant-deletion path) drops the
+    /// contract is "physically free the bytes under the project prefix".
+    /// A typical caller (the engine's project-deletion path) drops the
     /// catalog rows first and only then asks storage to remove the data.
     ///
-    /// Prefer [`Storage::delete_tenant`] when a catalog is available — it
+    /// Prefer [`Storage::delete_project`] when a catalog is available — it
     /// fires `DeleteObjects` against the catalog-known files in parallel
     /// with the LIST RPC, hiding one round-trip on high-RTT object stores
-    /// (~300-500ms saved on a tenant of 100 small files at high-latency endpoints).
-    #[tracing::instrument(skip(self), fields(tenant=%tenant))]
-    pub async fn delete_tenant_prefix(&self, tenant: &TenantId) -> Result<usize> {
+    /// (~300-500ms saved on a project of 100 small files at high-latency endpoints).
+    #[tracing::instrument(skip(self), fields(project=%project))]
+    pub async fn delete_project_prefix(&self, project: &ProjectId) -> Result<usize> {
         let started = std::time::Instant::now();
-        let p = self.tenant_root(tenant);
+        let p = self.project_root(project);
 
         // Step 1: gated LIST.
         let list_started = std::time::Instant::now();
-        let gated = self.tenant_object_store(tenant);
+        let gated = self.project_object_store(project);
         let paths_stream = gated.list(Some(&p)).map_ok(|m| m.location).boxed();
 
         // Step 2: hand the path stream to the *inner* store's
@@ -853,10 +853,10 @@ impl Storage {
         // `.buffered(10)` is the bottleneck at 5000+ files).
         let inner = self.inner.object_store.clone();
         let collected: Vec<ObjectPath> = paths_stream.try_collect().await.map_err(|e| {
-            basin_common::BasinError::storage(format!("delete_tenant_prefix({tenant}) list: {e}"))
+            basin_common::BasinError::storage(format!("delete_project_prefix({project}) list: {e}"))
         })?;
         let deleted: Vec<ObjectPath> = bulk_delete(&inner, collected).await.map_err(|e| {
-            basin_common::BasinError::storage(format!("delete_tenant_prefix({tenant}): {e}"))
+            basin_common::BasinError::storage(format!("delete_project_prefix({project}): {e}"))
         })?;
         let list_delete_ms = list_started.elapsed().as_millis();
         // Drop any cached decoded batches for each deleted file. Same
@@ -869,88 +869,88 @@ impl Storage {
         }
         let total_ms = started.elapsed().as_millis();
         tracing::info!(
-            target: "basin_storage::delete_tenant",
-            tenant = %tenant,
+            target: "basin_storage::delete_project",
+            project = %project,
             mode = "list_only",
             files = deleted.len(),
             list_delete_ms = %list_delete_ms,
             total_ms = %total_ms,
-            "delete_tenant_prefix",
+            "delete_project_prefix",
         );
         Ok(deleted.len())
     }
 
-    /// Build the tenant's full object-store prefix, honouring the optional
-    /// configured root. `…/tenants/{tenant}` — every key the storage layer
-    /// emits for this tenant lives below this.
-    fn tenant_root(&self, tenant: &TenantId) -> ObjectPath {
+    /// Build the project's full object-store prefix, honouring the optional
+    /// configured root. `…/projects/{project}` — every key the storage layer
+    /// emits for this project lives below this.
+    fn project_root(&self, project: &ProjectId) -> ObjectPath {
         let mut p = self
             .inner
             .root_prefix
             .clone()
             .unwrap_or_else(|| ObjectPath::from(""));
-        p = p.child(paths::TENANTS_SEGMENT);
-        p.child(tenant.as_prefix())
+        p = p.child(paths::PROJECTS_SEGMENT);
+        p.child(project.as_prefix())
     }
 
-    /// Catalog-aware tenant deletion. Eliminates the LIST → DELETE
+    /// Catalog-aware project deletion. Eliminates the LIST → DELETE
     /// serial dependency on the hot path:
     ///
     /// 1. **Pull catalog file paths** (one fast SELECT or in-memory walk
-    ///    via [`basin_catalog::Catalog::list_tenant_data_files`]). On
+    ///    via [`basin_catalog::Catalog::list_project_data_files`]). On
     ///    LocalFS / in-memory this is sub-millisecond; on a Postgres
     ///    catalog it's a single round-trip well under 50 ms even from
     ///    APAC.
     /// 2. **Fire `DeleteObjects` on the catalog set** *and* **start a
-    ///    LIST** under the tenant prefix in parallel. The catalog is
+    ///    LIST** under the project prefix in parallel. The catalog is
     ///    authoritative for ~99% of the bytes (every Parquet data file);
     ///    LIST mops up files the catalog doesn't track (HNSW index
-    ///    segments, write-aborted orphans, future per-tenant artefacts).
+    ///    segments, write-aborted orphans, future per-project artefacts).
     /// 3. **Compute LIST diff and delete orphans.** On the common case
     ///    (no orphans) this resolves to a no-op `DeleteObjects` with an
     ///    empty key set; on the off case (a few HNSW segments) it's one
     ///    extra `DeleteObjects` RTT that runs *after* the bulk of the
     ///    bytes are gone.
     /// 4. **Drop catalog rows.** [`Catalog::drop_namespace`] cascades
-    ///    through every table and snapshot row owned by `tenant`. The
+    ///    through every table and snapshot row owned by `project`. The
     ///    in-memory and Postgres backends each implement this in a
     ///    single statement / single locked pass.
     ///
     /// On a high-latency S3-compatible store (e.g. cross-region) for a
-    /// tenant of 100 small files, this drops the wall clock from ~3.2 s
+    /// project of 100 small files, this drops the wall clock from ~3.2 s
     /// (LIST → bulk DELETE serial) to ~1.2 s (parallel LIST + DELETE; one
     /// RTT hidden).
     ///
-    /// Falls back to the LIST-only path when [`Catalog::list_tenant_data_files`]
+    /// Falls back to the LIST-only path when [`Catalog::list_project_data_files`]
     /// returns an error (e.g. a transient catalog outage) — the storage
     /// layer's deletion contract is preserved either way.
-    #[tracing::instrument(skip(self, catalog), fields(tenant=%tenant))]
-    pub async fn delete_tenant(
+    #[tracing::instrument(skip(self, catalog), fields(project=%project))]
+    pub async fn delete_project(
         &self,
         catalog: &dyn basin_catalog::Catalog,
-        tenant: &TenantId,
+        project: &ProjectId,
     ) -> Result<usize> {
         let total_started = std::time::Instant::now();
 
         // ---- 1. Pull catalog file paths (fast) -----------------------
         let cat_started = std::time::Instant::now();
-        let cat_files = match catalog.list_tenant_data_files(tenant).await {
+        let cat_files = match catalog.list_project_data_files(project).await {
             Ok(f) => f,
             Err(e) => {
                 // Catalog read failed. Fall back to the LIST-only path so
                 // a flaky catalog can't strand bytes. Engine callers that
-                // want a hard failure can call `list_tenant_data_files`
+                // want a hard failure can call `list_project_data_files`
                 // themselves first.
                 tracing::warn!(
-                    target: "basin_storage::delete_tenant",
-                    tenant = %tenant,
+                    target: "basin_storage::delete_project",
+                    project = %project,
                     error = %e,
-                    "catalog list_tenant_data_files failed; falling back to LIST-only path",
+                    "catalog list_project_data_files failed; falling back to LIST-only path",
                 );
-                let n = self.delete_tenant_prefix(tenant).await?;
+                let n = self.delete_project_prefix(project).await?;
                 // Still try the namespace drop so the catalog isn't left
                 // dangling. Best-effort: a missing namespace returns Ok.
-                let _ = catalog.drop_namespace(tenant).await;
+                let _ = catalog.drop_namespace(project).await;
                 return Ok(n);
             }
         };
@@ -958,7 +958,7 @@ impl Storage {
         let cat_files_count = cat_files.len();
 
         let inner = self.inner.object_store.clone();
-        let prefix = self.tenant_root(tenant);
+        let prefix = self.project_root(project);
 
         // ---- 2. Concurrently: (a) DELETE catalog set, (b) LIST -------
         //
@@ -981,17 +981,17 @@ impl Storage {
             bulk_delete(&cat_delete_inner, cat_paths_for_delete)
                 .await
                 .map_err(|e| {
-                    basin_common::BasinError::storage(format!("delete_tenant catalog batch: {e}"))
+                    basin_common::BasinError::storage(format!("delete_project catalog batch: {e}"))
                 })
         };
 
-        // (b) LIST under the tenant prefix, gated on the tenant's
-        // semaphore so the LIST counts against this tenant's permit
-        // pool (same property as the legacy `delete_tenant_prefix`
+        // (b) LIST under the project prefix, gated on the project's
+        // semaphore so the LIST counts against this project's permit
+        // pool (same property as the legacy `delete_project_prefix`
         // path). The full collected vector is small (one path per
         // file) and we need the whole set anyway to diff against the
         // catalog set, so a single buffered collect is fine.
-        let gated = self.tenant_object_store(tenant);
+        let gated = self.project_object_store(project);
         let list_prefix = prefix.clone();
         let list_fut = async move {
             gated
@@ -999,7 +999,7 @@ impl Storage {
                 .map_ok(|m| m.location)
                 .try_collect::<Vec<_>>()
                 .await
-                .map_err(|e| basin_common::BasinError::storage(format!("delete_tenant list: {e}")))
+                .map_err(|e| basin_common::BasinError::storage(format!("delete_project list: {e}")))
         };
 
         let cat_delete_started = std::time::Instant::now();
@@ -1021,7 +1021,7 @@ impl Storage {
         let orphan_count = orphans.len();
         let orphan_deleted = if !orphans.is_empty() {
             bulk_delete(&inner, orphans).await.map_err(|e| {
-                basin_common::BasinError::storage(format!("delete_tenant orphan batch: {e}"))
+                basin_common::BasinError::storage(format!("delete_project orphan batch: {e}"))
             })?
         } else {
             Vec::new()
@@ -1030,12 +1030,12 @@ impl Storage {
 
         // ---- 4. Drop catalog rows -----------------------------------
         let cat_drop_started = std::time::Instant::now();
-        catalog.drop_namespace(tenant).await?;
+        catalog.drop_namespace(project).await?;
         let cat_drop_ms = cat_drop_started.elapsed().as_millis();
 
         // Page-cache invalidation. Disk cache is invalidated in the
         // wrapping `DiskCachedStore::delete` already; page cache lives
-        // one layer up. Same hook as `delete_file` / `delete_tenant_prefix`.
+        // one layer up. Same hook as `delete_file` / `delete_project_prefix`.
         if let Some(pc) = self.page_cache_handle() {
             for p in cat_deleted.iter().chain(orphan_deleted.iter()) {
                 pc.invalidate_path(p);
@@ -1045,8 +1045,8 @@ impl Storage {
         let total_files = cat_deleted.len() + orphan_deleted.len();
         let total_ms = total_started.elapsed().as_millis();
         tracing::info!(
-            target: "basin_storage::delete_tenant",
-            tenant = %tenant,
+            target: "basin_storage::delete_project",
+            project = %project,
             mode = "catalog_first",
             cat_files_count = cat_files_count,
             cat_lookup_ms = %cat_lookup_ms,
@@ -1057,30 +1057,30 @@ impl Storage {
             cat_drop_ms = %cat_drop_ms,
             total_files = total_files,
             total_ms = %total_ms,
-            "delete_tenant",
+            "delete_project",
         );
         Ok(total_files)
     }
 
     /// Approximate nearest-neighbour search across all HNSW segments for
-    /// `(tenant, table, column)`. Returns the merged top-`k` by distance.
+    /// `(project, table, column)`. Returns the merged top-`k` by distance.
     ///
     /// The returned `VectorHit::file_path` currently points at the index
     /// segment file rather than the matching Parquet data file — we don't
     /// track the data-side correspondence yet (see ADR 0003 for the
     /// compactor-driven plan). Higher layers (see `basin-engine`) resolve
     /// the row by reading the table's Parquet files and matching `row_id`.
-    #[tracing::instrument(skip(self, query), fields(tenant=%tenant, table=%table, column=%column, k=%k))]
+    #[tracing::instrument(skip(self, query), fields(project=%project, table=%table, column=%column, k=%k))]
     pub async fn vector_search(
         &self,
-        tenant: &TenantId,
+        project: &ProjectId,
         table: &TableName,
         column: &str,
         query: &[f32],
         k: usize,
         distance: basin_vector::Distance,
     ) -> Result<Vec<VectorHit>> {
-        vector_index::vector_search(self, tenant, table, column, query, k, distance).await
+        vector_index::vector_search(self, project, table, column, query, k, distance).await
     }
 }
 
@@ -1088,7 +1088,7 @@ impl Storage {
 ///
 /// Why this exists: `ObjectStore::delete_stream`'s default impl uses
 /// `.buffered(10)` which means LocalFS gets only 10-way parallel unlinks.
-/// On a 5000-file tenant that's 500 sequential rounds × ~1 ms each = ~500 ms
+/// On a 5000-file project that's 500 sequential rounds × ~1 ms each = ~500 ms
 /// of pure latency. The `AmazonS3` backend overrides `delete_stream` with a
 /// native `DeleteObjects` batch path (1000 keys per RPC, 20 in flight) which
 /// is the right thing on the network — we keep using that when the inner
@@ -1166,7 +1166,7 @@ mod tests {
 
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{PartitionKey, TableName, TenantId};
+    use basin_common::{PartitionKey, TableName, ProjectId};
     use futures::StreamExt;
     use object_store::local::LocalFileSystem;
     use object_store::{
@@ -1206,17 +1206,17 @@ mod tests {
         basin_common::telemetry::try_init_for_tests();
         let dir = TempDir::new().unwrap();
         let s = storage_in(&dir);
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("events").unwrap();
         let part = PartitionKey::default_key();
 
         let batch = small_batch(0, 1_000, "row-");
-        let df = s.write_batch(&tenant, &table, &part, &batch).await.unwrap();
+        let df = s.write_batch(&project, &table, &part, &batch).await.unwrap();
         assert_eq!(df.row_count, 1_000);
-        assert!(df.path.as_ref().contains(&format!("tenants/{tenant}/")));
+        assert!(df.path.as_ref().contains(&format!("projects/{project}/")));
 
         let stream = s
-            .read(&tenant, &table, ReadOptions::default())
+            .read(&project, &table, ReadOptions::default())
             .await
             .unwrap();
         let batches: Vec<_> = stream.collect::<Vec<_>>().await;
@@ -1234,12 +1234,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_isolation() {
+    async fn project_isolation() {
         basin_common::telemetry::try_init_for_tests();
         let dir = TempDir::new().unwrap();
         let s = storage_in(&dir);
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let table = TableName::new("t").unwrap();
         let part = PartitionKey::default_key();
 
@@ -1250,7 +1250,7 @@ mod tests {
             .await
             .unwrap();
 
-        let collect = |t: TenantId| {
+        let collect = |t: ProjectId| {
             let s = s.clone();
             let table = table.clone();
             async move {
@@ -1287,7 +1287,7 @@ mod tests {
         basin_common::telemetry::try_init_for_tests();
         let dir = TempDir::new().unwrap();
         let s = storage_in(&dir);
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("wide").unwrap();
         let part = PartitionKey::default_key();
 
@@ -1313,13 +1313,13 @@ mod tests {
             ],
         )
         .unwrap();
-        s.write_batch(&tenant, &table, &part, &batch).await.unwrap();
+        s.write_batch(&project, &table, &part, &batch).await.unwrap();
 
         let opts = ReadOptions {
             projection: Some(vec!["a".into(), "c".into()]),
             ..Default::default()
         };
-        let stream = s.read(&tenant, &table, opts).await.unwrap();
+        let stream = s.read(&project, &table, opts).await.unwrap();
         let batches: Vec<_> = stream.collect::<Vec<_>>().await;
         let first = batches[0].as_ref().unwrap();
         assert_eq!(first.num_columns(), 2);
@@ -1428,7 +1428,7 @@ mod tests {
             disk_cache: None,
             page_cache: None,
         });
-        let tenant = TenantId::new();
+        let project = ProjectId::new();
         let table = TableName::new("rg").unwrap();
         let part = PartitionKey::default_key();
 
@@ -1436,7 +1436,7 @@ mod tests {
         // cap is 65_536, so 200_000 rows splits into ~3 groups; a point
         // query for the last id lands in only one of them.
         let batch = small_batch(0, 200_000, "v");
-        s.write_batch(&tenant, &table, &part, &batch).await.unwrap();
+        s.write_batch(&project, &table, &part, &batch).await.unwrap();
 
         // Reset counters so we measure only the read path.
         counting.range_gets.store(0, Ordering::Relaxed);
@@ -1447,7 +1447,7 @@ mod tests {
             filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(199_500))],
             ..Default::default()
         };
-        let stream = s.read(&tenant, &table, opts).await.unwrap();
+        let stream = s.read(&project, &table, opts).await.unwrap();
         let batches: Vec<_> = stream.collect::<Vec<_>>().await;
         let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
         assert!(total >= 1, "expected the matching row");
@@ -1483,12 +1483,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_data_files_returns_only_one_tenant() {
+    async fn list_data_files_returns_only_one_project() {
         basin_common::telemetry::try_init_for_tests();
         let dir = TempDir::new().unwrap();
         let s = storage_in(&dir);
-        let a = TenantId::new();
-        let b = TenantId::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
         let table = TableName::new("t").unwrap();
         let part = PartitionKey::default_key();
 
@@ -1506,14 +1506,14 @@ mod tests {
         let listed_b = s.list_data_files(&b, &table).await.unwrap();
         assert_eq!(listed_a.len(), 2);
         assert_eq!(listed_b.len(), 1);
-        let prefix_a = format!("tenants/{a}/");
+        let prefix_a = format!("projects/{a}/");
         for f in &listed_a {
             assert!(
                 f.path.as_ref().contains(&prefix_a),
                 "leaked path {}",
                 f.path
             );
-            assert!(!f.path.as_ref().contains(&format!("tenants/{b}/")));
+            assert!(!f.path.as_ref().contains(&format!("projects/{b}/")));
         }
     }
 }
