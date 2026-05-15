@@ -69,7 +69,7 @@ enum Lit {
 fn eval_expr(expr: &Expr, event: &ChangeEvent) -> std::result::Result<Lit, String> {
     match expr {
         Expr::Nested(inner) => eval_expr(inner, event),
-        Expr::Value(v) => Ok(value_to_lit(v)),
+        Expr::Value(v) => Ok(value_to_lit(&v.value)),
         Expr::Identifier(ident) => {
             let v = ident.value.to_ascii_uppercase();
             match v.as_str() {

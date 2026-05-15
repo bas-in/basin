@@ -207,7 +207,7 @@ pub(crate) fn split_simple_query(sql: &str) -> Vec<String> {
     for twl in &tokens {
         match &twl.token {
             Token::SemiColon => {
-                let off = to_byte_offset(twl.location.line, twl.location.column);
+                let off = to_byte_offset(twl.span.start.line, twl.span.start.column);
                 if has_real_token {
                     let segment = sql[start..off].trim();
                     if !segment.is_empty() {

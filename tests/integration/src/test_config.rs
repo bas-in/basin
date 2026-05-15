@@ -300,6 +300,7 @@ impl Drop for CleanupOnDrop {
                 let path = object_store::path::Path::from(prefix.as_str());
                 let mut stream = store.list(Some(&path));
                 use futures::StreamExt as _;
+                use object_store::ObjectStoreExt as _;
                 let mut to_delete = Vec::new();
                 while let Some(meta) = stream.next().await {
                     match meta {

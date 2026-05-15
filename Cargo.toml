@@ -61,12 +61,12 @@ async-trait = "0.1"
 bytes = "1"
 
 # Arrow / Parquet
-arrow = "54"
-arrow-array = "54"
-arrow-schema = { version = "54", features = ["serde"] }
-arrow-select = "54"
-parquet = { version = "54", features = ["async", "object_store"] }
-object_store = { version = "0.11", features = ["aws", "gcp", "http"] }
+arrow = "58"
+arrow-array = "58"
+arrow-schema = { version = "58", features = ["serde"] }
+arrow-select = "58"
+parquet = { version = "58", features = ["async", "object_store"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "http"] }
 
 # Errors / logs
 thiserror = "2"
@@ -88,9 +88,9 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # SQL engine + pgwire
-datafusion = "44"
+datafusion = "53"
 pgwire = "0.28"
-sqlparser = "0.52"
+sqlparser = "0.61"
 
 # Compact binary serialisation, used for the HNSW index segment format.
 bincode = "1.3"

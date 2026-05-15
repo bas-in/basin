@@ -57,8 +57,8 @@ use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
 use tempfile::TempDir;
