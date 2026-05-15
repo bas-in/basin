@@ -2268,6 +2268,51 @@ static MATRIX: &[Entry] = &[
         ],
         &["DROP TABLE t", "DROP TABLE u"],
     ),
+    // Comparison-form ANY subqueries
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id > ANY (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (5)",
+            "INSERT INTO u VALUES (1), (2)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id < ANY (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO u VALUES (5), (10)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id >= ANY (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (3)",
+            "INSERT INTO u VALUES (1), (3)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
+    (
+        "PG/Operators",
+        "SELECT * FROM t WHERE id <= ANY (SELECT id FROM u)",
+        &[
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE u (id INT NOT NULL)",
+            "INSERT INTO t VALUES (3)",
+            "INSERT INTO u VALUES (3), (10)",
+        ],
+        &["DROP TABLE t", "DROP TABLE u"],
+    ),
     // Bitwise operators — DataFusion supports these natively in arithmetic
     ("PG/Operators", "SELECT 5 & 3", &[], &[]),
     ("PG/Operators", "SELECT 5 | 3", &[], &[]),

@@ -919,8 +919,112 @@ pub(crate) fn rewrite_any_some_subquery(sql: &str) -> String {
     let s = rewrite_quantified_op(sql, "= any", "IN");
     // `= SOME (...)` → `IN (...)`
     let s = rewrite_quantified_op(&s, "= some", "IN");
-    // `> ALL (SELECT col FROM t)` → `> (SELECT MAX(col) FROM t)`
+    // `> ALL (SELECT col FROM t)` → `> (SELECT MAX(col) FROM t)`, etc.
     let s = rewrite_all_subquery(&s);
+    // `> ANY (SELECT col FROM t)` → `> (SELECT MIN(col) FROM t)`, etc.
+    let s = rewrite_any_cmp_subquery(&s);
+    s
+}
+
+/// Rewrite `expr OP ANY (SELECT single_expr FROM ...)` to scalar subquery form.
+///
+/// - `> ANY`  → `> (SELECT MIN(...))`
+/// - `>= ANY` → `>= (SELECT MIN(...))`
+/// - `< ANY`  → `< (SELECT MAX(...))`
+/// - `<= ANY` → `<= (SELECT MAX(...))`
+/// - `<> ANY` / `!= ANY` → `<> (SELECT MIN(...))` — left unrewritten (complex)
+///
+/// The ANY semantics: `x > ANY (values)` is true when x > at least one value,
+/// i.e., x > MIN(values). Similarly `x < ANY` ↔ x < MAX(values).
+fn rewrite_any_cmp_subquery(sql: &str) -> String {
+    let mut s = sql.to_string();
+    // Pairs: (op_lower_including_any, aggregate_fn) — longer operators first.
+    const OPS: &[(&str, &str)] = &[
+        (">= any", "MIN"),
+        ("<= any", "MAX"),
+        ("> any",  "MIN"),
+        ("< any",  "MAX"),
+        (">= some", "MIN"),
+        ("<= some", "MAX"),
+        ("> some",  "MIN"),
+        ("< some",  "MAX"),
+    ];
+    for (op_lower, agg) in OPS {
+        s = rewrite_one_any_op(&s, op_lower, agg);
+    }
+    s
+}
+
+fn rewrite_one_any_op(sql: &str, op_lower: &str, agg: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + op_lower.len();
+        let bytes = s.as_bytes();
+
+        // Word boundary after `any`/`some`.
+        let post_ok = kw_end >= s.len() || {
+            let b = bytes[kw_end];
+            b == b'(' || b == b' ' || b == b'\t' || b == b'\n'
+        };
+        if !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // After keyword, skip whitespace and find `(`.
+        let mut j = kw_end;
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || s.as_bytes()[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Find the matching `)` for the subquery.
+        let Some(subq_end) = find_matching_close_paren(&s, j) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        let subq_body = s[j + 1..subq_end].trim().to_string();
+
+        // Parse the subquery: must be `SELECT expr FROM ...`.
+        let subq_lower = subq_body.to_ascii_lowercase();
+        if !subq_lower.trim_start().starts_with("select ") {
+            search_from = kw_end;
+            continue;
+        }
+        // Reject complex subqueries.
+        if subq_lower.contains("group by")
+            || subq_lower.contains("having")
+            || subq_lower.contains(" union ")
+            || subq_lower.contains(" intersect ")
+            || subq_lower.contains(" except ")
+        {
+            search_from = kw_end;
+            continue;
+        }
+
+        let after_select = subq_body.trim_start();
+        let sel_offset = after_select.to_ascii_lowercase().find("select ").unwrap_or(0) + 7;
+        let from_lower = after_select.to_ascii_lowercase();
+        let Some(from_pos) = find_from_at_depth0(&from_lower, sel_offset) else {
+            search_from = kw_end;
+            continue;
+        };
+        let col_expr = after_select[sel_offset..from_pos].trim().to_string();
+        let from_clause = &after_select[from_pos..];
+
+        // Strip the `any`/`some` keyword from op_lower (last word).
+        // e.g. ">= any" → ">=" , "> some" → ">"
+        let op_str = op_lower.split_whitespace().next().unwrap_or(">");
+        let replacement = format!("{op_str} (SELECT {agg}({col_expr}) {from_clause})");
+        s.replace_range(kw_start..subq_end + 1, &replacement);
+        search_from = kw_start + replacement.len();
+    }
     s
 }
 
@@ -1091,9 +1195,14 @@ fn rewrite_quantified_op(sql: &str, op_kw: &str, new_op: &str) -> String {
             search_from = kw_end;
             continue;
         }
-        // Word boundary before: the char before `=` must not be alphanumeric.
-        // (kw_start points to `=` in `= any`; before that is whitespace from expr end)
-        let pre_ok = kw_start == 0 || !bytes[kw_start - 1].is_ascii_alphanumeric();
+        // Word boundary before: the char before `=` must not be alphanumeric,
+        // and must not be `>`, `<`, or `!` — otherwise we would incorrectly
+        // match inside `>= ANY`, `<= ANY`, `!= ANY` which have their own
+        // dedicated rewrite path.
+        let pre_ok = kw_start == 0 || {
+            let prev = bytes[kw_start - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'>' && prev != b'<' && prev != b'!'
+        };
         if !pre_ok {
             search_from = kw_end;
             continue;
@@ -1605,6 +1714,148 @@ fn rewrite_cte_keyword(sql: &str, needle_lower: &str, replacement: &str) -> Stri
         s.replace_range(pos..pos + needle_lower.len(), replacement);
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// PG array-literal cast rewriter
+// ---------------------------------------------------------------------------
+
+/// Rewrite PostgreSQL curly-brace array literal casts to `make_array(...)`.
+///
+/// Pattern: `'<curly-list>'::<type>[]`
+///
+/// Examples:
+/// - `'{1,2,3}'::int[]`   → `make_array(1,2,3)`
+/// - `'{a,b}'::text[]`    → `make_array('a','b')`
+///
+/// Multi-dimensional literals (e.g. `'{{1,2},{3,4}}'::int[][]`) are left
+/// as-is — they are too complex for this pass.
+///
+/// Supported element types: `int2`, `int4`, `int8`, `int`, `bigint`,
+/// `smallint`, `text`, `varchar`, `float4`, `float8`, `bool`, `boolean`.
+pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        // Must start with a single-quoted string that begins with `{`.
+        if bytes[i] != b'\'' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        // Scan the quoted string, looking for its end.
+        let str_start = i; // points to opening `'`
+        i += 1;
+        let str_content_start = i;
+        // Skip past optional leading whitespace to check for `{`.
+        while i < bytes.len() && bytes[i] == b' ' { i += 1; }
+        let is_curly = i < bytes.len() && bytes[i] == b'{';
+        i = str_content_start; // reset scan position
+
+        // Find the closing `'` (handling `''` escapes).
+        let mut str_end = i;
+        while str_end < bytes.len() {
+            if bytes[str_end] == b'\'' {
+                if str_end + 1 < bytes.len() && bytes[str_end + 1] == b'\'' {
+                    str_end += 2;
+                    continue;
+                }
+                break;
+            }
+            str_end += 1;
+        }
+        // str_end now points to the closing `'`.
+        let str_inner = &sql[i..str_end]; // content between quotes
+
+        if !is_curly || str_inner.starts_with("{{") {
+            // Multi-dim or non-curly: pass through unchanged.
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        // After the closing quote, check for `::type[]`.
+        let after_str = str_end + 1; // index after closing `'`
+        if after_str + 2 > sql.len() || &sql[after_str..after_str + 2] != "::" {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        // We have `::` — scan the type name.
+        let type_start = after_str + 2;
+        let mut type_end = type_start;
+        while type_end < sql.len()
+            && (sql.as_bytes()[type_end].is_ascii_alphanumeric()
+                || sql.as_bytes()[type_end] == b'_')
+        {
+            type_end += 1;
+        }
+        let type_name = &sql[type_start..type_end];
+
+        // Must be followed by `[]` (single dim).
+        if type_end + 2 > sql.len()
+            || sql.as_bytes()[type_end] != b'['
+            || sql.as_bytes()[type_end + 1] != b']'
+        {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        // Check for multi-dim `[][]` — leave as-is.
+        let after_bracket = type_end + 2;
+        if after_bracket < sql.len()
+            && sql.as_bytes()[after_bracket] == b'['
+        {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        // Validate the type name.
+        let type_lower = type_name.to_ascii_lowercase();
+        let is_text_type = matches!(
+            type_lower.as_str(),
+            "text" | "varchar" | "char" | "bpchar"
+        );
+        let is_numeric_type = matches!(
+            type_lower.as_str(),
+            "int" | "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint"
+            | "float4" | "float8" | "real" | "numeric" | "bool" | "boolean"
+        );
+        if !is_text_type && !is_numeric_type {
+            out.push_str(&sql[str_start..str_end + 1]);
+            i = str_end + 1;
+            continue;
+        }
+
+        // Parse the curly-brace list: strip outer `{` and `}`, split on `,`.
+        let inner = str_inner.trim();
+        let inner = inner.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(inner);
+        let items: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+
+        // Build `make_array(...)`.
+        let mut args = String::new();
+        for (idx, item) in items.iter().enumerate() {
+            if idx > 0 { args.push_str(", "); }
+            if is_text_type {
+                // Quote the item as a string literal.
+                args.push('\'');
+                args.push_str(item);
+                args.push('\'');
+            } else {
+                args.push_str(item);
+            }
+        }
+        let replacement = format!("make_array({args})");
+        out.push_str(&replacement);
+        i = after_bracket; // skip past `'...'::type[]`
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

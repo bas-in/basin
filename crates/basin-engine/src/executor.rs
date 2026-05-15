@@ -376,6 +376,9 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // array-typed operands. See `pg_operators` for the full operator table.
     let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
     let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
+    // Rewrite `'{1,2,3}'::int[]` curly-brace array literal casts to
+    // `make_array(1,2,3)` before the array-operator pass sees them.
+    let rewritten = crate::pg_operators::rewrite_pg_array_literal_casts(&rewritten);
     let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
     // Rewrite PG bitwise operators that DataFusion's GenericDialect doesn't
     // understand: `A # B` (XOR) → `A ^ B`; `~expr` (unary NOT) →

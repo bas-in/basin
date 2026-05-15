@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778811978 (Unix epoch)
-SQL fragments tested: 486 total / 1236 green (across all three configurations).
+Last run: 1778813114 (Unix epoch)
+SQL fragments tested: 490 total / 1260 green (across all three configurations).
 
 ## Configurations
 
@@ -210,9 +210,9 @@ SQL fragments tested: 486 total / 1236 green (across all three configurations).
 
 | SQL | Default | +PG\_QUERY | +PG\_PLAN | Notes |
 |---|---|---|---|---|
-| `SELECT '{1,2}'::int[] && '{2,3}'::int[]` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: type modifiers, found: [ a… |
+| `SELECT '{1,2}'::int[] && '{2,3}'::int[]` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2,3]` | ✅ | ✅ | ✅ |  |
-| `SELECT '{1,2,3}'::int[]` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Cast error: Cannot cast string '{1,2,3}' to v… |
+| `SELECT '{1,2,3}'::int[]` | ✅ | ✅ | ✅ |  |
 | `SELECT '{{1,2},{3,4}}'::int[][]` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Cast error: Cannot cast string '{{1,2},{3,4}}… |
 | `SELECT (ARRAY[1,2,3])[2]` | ✅ | ✅ | ✅ |  |
 | `SELECT (ARRAY[1,2,3,4,5])[2:4]` | ✅ | ✅ | ✅ |  |
@@ -403,8 +403,12 @@ SQL fragments tested: 486 total / 1236 green (across all three configurations).
 | `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2] && ARRAY[2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id = ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM t WHERE id > ALL (SELECT id FROM u)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported ast node in sqlt… |
+| `SELECT * FROM t WHERE id > ALL (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id = SOME (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t WHERE id > ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t WHERE id < ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t WHERE id >= ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM t WHERE id <= ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT 5 & 3` | ✅ | ✅ | ✅ |  |
 | `SELECT 5 \| 3` | ✅ | ✅ | ✅ |  |
 | `SELECT 5 # 3` | ✅ | ✅ | ✅ |  |
@@ -504,7 +508,7 @@ SQL fragments tested: 486 total / 1236 green (across all three configurations).
 | `SELECT (SELECT MAX(id) FROM u) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id = ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM t WHERE id > ALL (SELECT id FROM u)` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported ast node in sqlt… |
+| `SELECT * FROM t WHERE id > ALL (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported ast node Functio… |
 | `SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
 | `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported ast node Functio… |
