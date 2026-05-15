@@ -38,7 +38,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use tokio::sync::{watch, Mutex, RwLock};
 use ulid::Ulid;
 
