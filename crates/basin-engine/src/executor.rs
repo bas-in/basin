@@ -588,13 +588,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             purge: _,
             temporary: _,
         } => exec_drop_index(sess, if_exists, names).await,
-        Statement::CreateView {
+        Statement::CreateView(sqlparser::ast::CreateView {
             name,
             query,
             materialized,
             or_replace,
             ..
-        } => {
+        }) => {
             if materialized {
                 let view_name = single_part_name(&name)?.to_string();
                 let opts = cv_options.unwrap_or_default();
@@ -633,7 +633,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 crate::view_ddl::exec_create_view(sess, &view_name, &query_sql, or_replace).await
             }
         }
-        Statement::CreateFunction {
+        Statement::CreateFunction(sqlparser::ast::CreateFunction {
             or_replace,
             temporary,
             name,
@@ -641,15 +641,8 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             return_type,
             function_body,
             language,
-            behavior: _,
-            called_on_null: _,
-            parallel: _,
-            using: _,
-            if_not_exists: _,
-            determinism_specifier: _,
-            options: _,
-            remote_connection: _,
-        } => {
+            ..
+        }) => {
             crate::function_ddl::exec_create_function(
                 sess,
                 or_replace,
@@ -662,18 +655,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             )
             .await
         }
-        Statement::DropFunction {
+        Statement::DropFunction(sqlparser::ast::DropFunction {
             if_exists,
             func_desc,
-            option: _,
-        } => {
+            ..
+        }) => {
             let names = func_desc.into_iter().map(|d| d.name).collect();
             crate::function_ddl::exec_drop_function(sess, if_exists, names).await
         }
         Statement::DropProcedure {
             if_exists,
             proc_desc,
-            option: _,
+            ..
         } => crate::procedure_ddl::exec_drop_procedure(sess, if_exists, proc_desc).await,
         Statement::Call(call) => crate::procedure_ddl::exec_call(sess, call).await,
         Statement::CreateType {
@@ -682,16 +675,14 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         } => {
             use sqlparser::ast::UserDefinedTypeRepresentation;
             match representation {
-                UserDefinedTypeRepresentation::Enum { labels } => {
+                Some(UserDefinedTypeRepresentation::Enum { labels }) => {
                     crate::type_ddl::exec_create_type_enum(sess, name, labels).await
                 }
-                UserDefinedTypeRepresentation::Composite { .. } => {
-                    Err(BasinError::FeatureNotSupported(
-                        "CREATE TYPE … AS (composite) is out of scope for v0.1; \
-                         only AS ENUM is supported"
-                            .into(),
-                    ))
-                }
+                _ => Err(BasinError::FeatureNotSupported(
+                    "CREATE TYPE … AS (composite) is out of scope for v0.1; \
+                     only AS ENUM is supported"
+                        .into(),
+                )),
             }
         }
         Statement::Drop {
@@ -766,37 +757,30 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             temporary: _,
         } => crate::schema_ddl::exec_drop_schema(sess, &names, if_exists, cascade).await,
         // ── SET search_path ─────────────────────────────────────────────
-        Statement::SetVariable {
-            local: _,
-            hivevar: _,
-            variables,
-            value,
-        } => {
+        Statement::Set(sqlparser::ast::Set::SingleAssignment {
+            variable,
+            values,
+            ..
+        }) => {
             // Only handle `SET search_path = …`; forward everything else
             // as a silent no-op so ORM migrations that emit PG-specific
             // SET statements (client_encoding, standard_conforming_strings,
             // etc.) don't hard-fail. This mirrors the PG wire protocol
             // server behaviour where un-recognised SET parameters are
             // accepted silently at the session level.
-            // `variables` is `OneOrManyWithParens<ObjectName>`.
-            // Each `ObjectName` holds `Vec<Ident>`; join with `.` to get the
-            // full variable name (e.g. `search_path`).
-            let var_name = variables
+            // `variable` is an `ObjectName` holding `Vec<ObjectNamePart>`;
+            // join with `.` to get the full variable name (e.g.
+            // `search_path`).
+            let var_name = variable
+                .0
                 .iter()
-                .next()
-                .map(|obj_name: &ObjectName| {
-                    obj_name
-                        .0
-                        .iter()
-                        .map(|i| i.id_val().as_str())
-                        .collect::<Vec<_>>()
-                        .join(".")
-                        .to_ascii_lowercase()
-                })
-                .unwrap_or_default();
+                .map(|i| i.id_val().as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+                .to_ascii_lowercase();
 
             if var_name == "search_path" {
-                crate::schema_ddl::exec_set_search_path(sess, &value)
+                crate::schema_ddl::exec_set_search_path(sess, &values)
             } else {
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
@@ -876,17 +860,28 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 Ok(ExecResult::Empty { tag: "SHOW".into() })
             }
         }
-        Statement::AlterTable {
+        Statement::AlterTable(sqlparser::ast::AlterTable {
             name, operations, ..
-        } => exec_alter_table(sess, name, operations).await,
+        }) => exec_alter_table(sess, name, operations).await,
         Statement::Delete(del) => crate::dml_mutate::exec_delete(sess, del).await,
-        Statement::Update {
+        Statement::Update(sqlparser::ast::Update {
             table,
             assignments,
             from,
             selection,
             returning,
-        } => {
+            ..
+        }) => {
+            let from = from.and_then(|f| match f {
+                sqlparser::ast::UpdateTableFromKind::BeforeSet(mut v)
+                | sqlparser::ast::UpdateTableFromKind::AfterSet(mut v) => {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.swap_remove(0))
+                    }
+                }
+            });
             crate::dml_mutate::exec_update(sess, table, assignments, from, selection, returning)
                 .await
         }

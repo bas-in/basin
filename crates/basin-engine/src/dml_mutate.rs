@@ -45,6 +45,7 @@
 
 use std::sync::Arc;
 use crate::pg_ast::ObjectNamePartExt;
+use object_store::ObjectStoreExt;
 
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,

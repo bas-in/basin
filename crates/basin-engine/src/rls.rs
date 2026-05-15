@@ -62,15 +62,15 @@ use sqlparser::ast::{
 ///   user error.
 pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
     match stmt {
-        Statement::CreatePolicy {
+        Statement::CreatePolicy(sqlparser::ast::CreatePolicy {
             name,
             table_name,
-            policy_type: _, // PERMISSIVE only in v0.1; RESTRICTIVE deferred.
             command,
             to,
             using,
             with_check,
-        } => {
+            .. // policy_type: PERMISSIVE only in v0.1; RESTRICTIVE deferred.
+        }) => {
             let table = single_part_object_name(table_name)?;
             let cmd = command
                 .as_ref()
@@ -103,11 +103,12 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
                 },
             }))
         }
-        Statement::AlterPolicy {
+        Statement::AlterPolicy(sqlparser::ast::AlterPolicy {
             name,
             table_name,
             operation,
-        } => {
+            ..
+        }) => {
             let table = single_part_object_name(table_name)?;
             let op = match operation {
                 AlterPolicyOperation::Rename { new_name } => {
@@ -138,12 +139,12 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
                 op,
             }))
         }
-        Statement::DropPolicy {
+        Statement::DropPolicy(sqlparser::ast::DropPolicy {
             if_exists,
             name,
             table_name,
-            option: _,
-        } => {
+            ..
+        }) => {
             let table = single_part_object_name(table_name)?;
             Ok(Some(RlsDdl::DropPolicy {
                 table,
@@ -151,9 +152,9 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
                 if_exists: *if_exists,
             }))
         }
-        Statement::AlterTable {
+        Statement::AlterTable(sqlparser::ast::AlterTable {
             name, operations, ..
-        } => {
+        }) => {
             // We only intercept `ENABLE/DISABLE ROW LEVEL SECURITY`; every
             // other ALTER TABLE op is out of scope for this module and the
             // executor surfaces a clean error from its own dispatch path.

@@ -32,6 +32,7 @@
 use arrow_schema::DataType;
 use basin_common::{BasinError, Result, TableName};
 use object_store::path::Path as ObjectStorePath;
+use object_store::ObjectStoreExt;
 use pg_query::protobuf::node::Node as NodeEnum;
 use std::str::FromStr;
 

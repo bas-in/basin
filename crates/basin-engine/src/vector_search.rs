@@ -20,7 +20,7 @@ use basin_storage::VectorHit;
 use basin_vector::Distance;
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::ProjectSession;
