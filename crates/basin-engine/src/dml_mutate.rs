@@ -237,11 +237,6 @@ pub(crate) async fn exec_delete(sess: &TenantSession, delete: Delete) -> Result<
             "multi-table DELETE not supported".into(),
         ));
     }
-    if delete.returning.is_some() {
-        return Err(BasinError::InvalidSchema(
-            "DELETE ... RETURNING not supported".into(),
-        ));
-    }
     if delete.using.is_some() {
         return Err(BasinError::InvalidSchema(
             "DELETE ... USING not supported".into(),

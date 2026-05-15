@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778808588 (Unix epoch)
-SQL fragments tested: 486 total / 996 green (across all three configurations).
+Last run: 1778809755 (Unix epoch)
+SQL fragments tested: 486 total / 999 green (across all three configurations).
 
 ## Configurations
 
@@ -197,7 +197,7 @@ SQL fragments tested: 486 total / 996 green (across all three configurations).
 |---|---|---|---|---|
 | `SELECT to_tsvector('english', 'a quick brown fox')` | ✅ | ✅ | ✅ |  |
 | `SELECT to_tsquery('english', 'quick & fox')` | ✅ | ✅ | ✅ |  |
-| `SELECT 'a quick brown fox'::tsvector @@ to_tsquery('english', 'fox')` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type Custom(… |
+| `SELECT 'a quick brown fox'::tsvector @@ to_tsquery('english', 'fox')` | ✅ | ✅ | ✅ |  |
 | `SELECT plainto_tsquery('english', 'quick fox')` | ✅ | ✅ | ✅ |  |
 | `SELECT phraseto_tsquery('english', 'quick fox')` | ✅ | ✅ | ✅ |  |
 | `SELECT websearch_to_tsquery('english', 'quick OR fox')` | ✅ | ✅ | ✅ |  |
@@ -408,7 +408,7 @@ SQL fragments tested: 486 total / 996 green (across all three configurations).
 | `SELECT 5 & 3` | ✅ | ✅ | ✅ |  |
 | `SELECT 5 \| 3` | ✅ | ✅ | ✅ |  |
 | `SELECT 5 # 3` | 🛠 | 🛠 | 🛠 | internal: plan: SQL error: ParserError("No infix parser for token Sharp") |
-| `SELECT ~5` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an SQL statement, found: r… |
+| `SELECT ~5` | ❌ | ❌ | ❌ | internal: plan: SQL error: ParserError("Expected: an expression, found: ~") |
 | `SELECT 1 << 3` | ✅ | ✅ | ✅ |  |
 | `SELECT 8 >> 2` | ✅ | ✅ | ✅ |  |
 | `SELECT (NOW(), NOW() + INTERVAL '1 hour') OVERLAPS (NOW() + INTERVAL '30 minutes', NOW() + INTERVAL '90 minutes')` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: (… |
