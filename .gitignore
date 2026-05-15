@@ -18,3 +18,6 @@ basin-test.toml
 .basin-local-s3-data
 .basin-local-s3.pid
 .basin-local-s3.log
+**/target/
+.basin-seaweedfs-data/
+.basin-seaweedfs-*
