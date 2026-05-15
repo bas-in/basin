@@ -46,7 +46,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // On pg_query parse failure we fall through to sqlparser, which will
     // produce its own error. Both errors will surface as
     // BasinError::InvalidSchema (SQLSTATE 42601) to the client.
-    if let Ok(tree) = crate::pg_ast::parse(sql) {
+    //
+    // IMPORTANT: We cache the parse tree so the second noop-accept / reject
+    // gate later in this function (after the string-rewrite pipeline) can
+    // reuse the same tree without calling pg_query::parse a second time.
+    // pg_query::parse calls into a C library and is not cheap.
+    let raw_pg_tree: Option<crate::pg_ast::ParseTree> = crate::pg_ast::parse(sql).ok();
+    if let Some(ref tree) = raw_pg_tree {
         // Collect statement kinds so we can dispatch before sqlparser.
         let kinds: Vec<_> = tree
             .stmts()
@@ -497,7 +503,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // rather than `sql` (which has been through Basin's pre-screen
     // pipeline) because statements in the noop / reject sets are simple
     // PG-native forms that are not rewritten by any pre-screen above.
-    if let Ok(tree) = crate::pg_ast::parse(raw_sql) {
+    // Reuse `raw_pg_tree` from the Phase 1 parse above — same SQL, no
+    // need to call the C library parser a second time.
+    if let Some(ref tree) = raw_pg_tree {
         if let Some(node) = tree.stmts().next() {
             let kind = crate::pg_ast::stmt_kind(node);
             // Noop-accept: return an empty ok result without reaching sqlparser.
