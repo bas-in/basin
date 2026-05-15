@@ -88,7 +88,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
     {
         return None;
     }
@@ -117,6 +117,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
             version,
             with_ordinality,
             partitions,
+            ..
         } => {
             if alias.is_some()
                 || args.is_some()

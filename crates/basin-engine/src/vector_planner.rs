@@ -175,11 +175,11 @@ pub async fn rewrite_vector_order_by(
     }
     let order_expr: &OrderByExpr = &order.ext_exprs()[0];
     // Criterion 6: ASC. `asc = None` means default which is ASC.
-    if let Some(false) = order_expr.asc {
+    if let Some(false) = order_expr.options.asc {
         return Ok(None);
     }
     // Reject NULLS FIRST/LAST which would be ambiguous after routing.
-    if order_expr.nulls_first.is_some() {
+    if order_expr.options.nulls_first.is_some() {
         return Ok(None);
     }
 
@@ -200,7 +200,7 @@ pub async fn rewrite_vector_order_by(
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
     {
         return Ok(None);
     }
@@ -227,6 +227,7 @@ pub async fn rewrite_vector_order_by(
             version,
             with_ordinality,
             partitions,
+            ..
         } => {
             if alias.is_some()
                 || args.is_some()

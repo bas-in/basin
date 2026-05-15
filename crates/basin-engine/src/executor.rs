@@ -583,10 +583,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             object_type: sqlparser::ast::ObjectType::Index,
             if_exists,
             names,
-            cascade: _,
-            restrict: _,
-            purge: _,
-            temporary: _,
+            ..
         } => exec_drop_index(sess, if_exists, names).await,
         Statement::CreateView(sqlparser::ast::CreateView {
             name,
@@ -689,10 +686,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             object_type: sqlparser::ast::ObjectType::Type,
             if_exists,
             names,
-            cascade: _,
-            restrict: _,
-            purge: _,
-            temporary: _,
+            ..
         } => crate::type_ddl::exec_drop_type(sess, if_exists, &names).await,
         Statement::CreateSequence {
             temporary,
@@ -719,19 +713,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             object_type: sqlparser::ast::ObjectType::Sequence,
             if_exists,
             names,
-            cascade: _,
-            restrict: _,
-            purge: _,
-            temporary: _,
+            ..
         } => crate::seq_ddl::exec_drop_sequence(sess, if_exists, &names).await,
         Statement::Drop {
             object_type: sqlparser::ast::ObjectType::View,
             if_exists,
             names,
-            cascade: _,
-            restrict: _,
-            purge: _,
-            temporary: _,
+            ..
         } => {
             // DROP VIEW supports dropping a single view per statement.
             if names.len() != 1 {
@@ -746,15 +734,14 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         Statement::CreateSchema {
             schema_name,
             if_not_exists,
+            ..
         } => crate::schema_ddl::exec_create_schema(sess, schema_name, if_not_exists).await,
         Statement::Drop {
             object_type: sqlparser::ast::ObjectType::Schema,
             if_exists,
             names,
             cascade,
-            restrict: _,
-            purge: _,
-            temporary: _,
+            ..
         } => crate::schema_ddl::exec_drop_schema(sess, &names, if_exists, cascade).await,
         // ── SET search_path ─────────────────────────────────────────────
         Statement::Set(sqlparser::ast::Set::SingleAssignment {
@@ -897,6 +884,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             statement,
             ..
         } => {
+            let format = format.map(|k| match k {
+                sqlparser::ast::AnalyzeFormatKind::Keyword(f)
+                | sqlparser::ast::AnalyzeFormatKind::Assignment(f) => f,
+            });
             crate::explain::exec_explain(sess, analyze, verbose, format, options, statement).await
         }
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),

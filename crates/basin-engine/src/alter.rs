@@ -427,11 +427,13 @@ pub(crate) async fn apply_standard_alter_table(
                 add_column(catalog, project, &table, column_def).await?;
             }
             AlterTableOperation::DropColumn {
-                column_name,
+                column_names,
                 if_exists,
                 ..
             } => {
-                drop_column(catalog, project, &table, &column_name.value, *if_exists).await?;
+                for column_name in column_names {
+                    drop_column(catalog, project, &table, &column_name.value, *if_exists).await?;
+                }
             }
             AlterTableOperation::RenameColumn {
                 old_column_name,
@@ -447,7 +449,11 @@ pub(crate) async fn apply_standard_alter_table(
                 .await?;
             }
             AlterTableOperation::RenameTable { table_name } => {
-                let new_table = single_part_object_name(table_name)?;
+                let new_name = match table_name {
+                    sqlparser::ast::RenameTableNameKind::As(n)
+                    | sqlparser::ast::RenameTableNameKind::To(n) => n,
+                };
+                let new_table = single_part_object_name(new_name)?;
                 catalog.rename_table(project, &table, &new_table).await?;
             }
             AlterTableOperation::AlterColumn { column_name, op } => match op {
@@ -472,8 +478,8 @@ pub(crate) async fn apply_standard_alter_table(
                     ));
                 }
             },
-            AlterTableOperation::AddConstraint(tc) => {
-                add_constraint(catalog, project, &table, tc).await?;
+            AlterTableOperation::AddConstraint { constraint, .. } => {
+                add_constraint(catalog, project, &table, constraint).await?;
             }
             AlterTableOperation::DropConstraint {
                 name, if_exists, ..
@@ -713,7 +719,7 @@ async fn add_constraint(
 ) -> Result<()> {
     let meta = catalog.load_table(project, table).await?;
     match tc {
-        TableConstraint::Check { name, expr } => {
+        TableConstraint::Check(sqlparser::ast::CheckConstraint { name, expr, .. }) => {
             let cname = match name {
                 Some(n) => n.value.clone(),
                 None => format!("{table}_check_{}", meta.check_constraints.len() + 1),
@@ -743,9 +749,9 @@ async fn add_constraint(
                 )
                 .await?;
         }
-        TableConstraint::Unique { .. }
-        | TableConstraint::PrimaryKey { .. }
-        | TableConstraint::ForeignKey { .. } => {
+        TableConstraint::Unique(_)
+        | TableConstraint::PrimaryKey(_)
+        | TableConstraint::ForeignKey(_) => {
             return Err(BasinError::InvalidSchema(
                 "ALTER TABLE ADD CONSTRAINT: only CHECK is supported in v0.1 (UNIQUE / \
                  PRIMARY KEY / FOREIGN KEY additions after table creation are deferred)"
