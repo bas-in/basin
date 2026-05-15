@@ -436,6 +436,16 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
 
         SqlDataType::Bytea => Ok(DataType::Binary),
 
+        // DATE — day-resolution, no time component, no timezone. Arrow's
+        // `Date32` matches PG's wire format (days since 1970-01-01).
+        SqlDataType::Date => Ok(DataType::Date32),
+
+        // TIME / TIME WITHOUT TIME ZONE → microsecond-resolution time-of-day.
+        // TIMETZ is not on the v0.1 roadmap; reject so callers see the gap.
+        SqlDataType::Time(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            Ok(DataType::Time64(TimeUnit::Microsecond))
+        }
+
         // JSONB / JSON. sqlparser 0.52 surfaces both as dedicated AST
         // variants. JSONB rides on Arrow `LargeBinary`, with the bytes
         // being canonical-form serialised JSON (keys sorted, no whitespace
@@ -526,12 +536,12 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         },
 
         // MONEY. PG's `money` type is a fixed-point 8-byte integer; we
-        // represent it as Decimal128(19, 2) — enough range for any PG money
+        // represent it as Decimal128(20, 2) — enough range for any PG money
         // value, two fractional digits matching PG's default lc_monetary.
         // sqlparser surfaces `MONEY` through `Custom`; some future dialect
         // versions may add a dedicated variant. The metadata marker tells the
         // pgwire encoder to emit OID 790.
-        sql if is_money_sql(sql) => Ok(DataType::Decimal128(19, 2)),
+        sql if is_money_sql(sql) => Ok(DataType::Decimal128(20, 2)),
 
         // XML. sqlparser has a dedicated `XML` variant in some dialects and
         // also routes it through `Custom`. Physical type is Utf8.

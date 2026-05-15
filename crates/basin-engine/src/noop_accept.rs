@@ -58,27 +58,10 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::Comment => Some(ExecResult::Empty {
             tag: "COMMENT".into(),
         }),
-        // EXPLAIN — return a synthetic single-row result set rather than
-        // Empty so that clients expecting a result set (psql, JDBC) don't
-        // error. v0.1 does not invoke DataFusion's plan formatter.
-        StmtKind::Explain => {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "QUERY PLAN",
-                DataType::Utf8,
-                false,
-            )]));
-            let msg = format!(
-                "EXPLAIN ANALYZE not yet supported in Basin v0.1; query was: {}",
-                sql.trim()
-            );
-            let col: ArrayRef = Arc::new(StringArray::from(vec![msg]));
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![col]).expect("static schema is valid");
-            Some(ExecResult::Rows {
-                schema,
-                batches: vec![batch],
-            })
-        }
+        // EXPLAIN — fall through to the real exec_explain (explain.rs) which
+        // invokes DataFusion's plan formatter. Earlier this returned a stub
+        // single-row result; with `explain.rs` shipping the real path the
+        // stub would shadow it.
         // RBAC primitives — accepted syntactically; real auth from auth.uid()/role()
         StmtKind::CreateRole => Some(ExecResult::Empty {
             tag: "CREATE ROLE".into(),

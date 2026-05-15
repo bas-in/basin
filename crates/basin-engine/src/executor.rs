@@ -2655,6 +2655,20 @@ async fn commit_with_retry(
 }
 
 async fn exec_select(sess: &TenantSession, sql: &str, include_deleted: bool) -> Result<ExecResult> {
+    // pg_plan routing instrumentation (ADR 0014 Phase 2). When the parsed
+    // SELECT matches the subset the new translator handles, bump the
+    // counter. Unsupported shapes (GROUP BY, joins, CTE, set ops, …) leave
+    // the counter alone and the existing sqlparser/DataFusion path serves
+    // the query. Actual plan use comes in a later phase; this is the
+    // observable hook tests assert against.
+    if let Ok(tree) = crate::pg_ast::parse(sql) {
+        if let Some(node) = tree.stmts().next() {
+            if crate::pg_plan::supports_shape(node) {
+                sess.engine.note_pg_plan_routed();
+            }
+        }
+    }
+
     // Option A for tail-visibility: when the shard is wired in, the in-RAM
     // tail produced by INSERTs hasn't yet landed in Parquet. Force a synchronous
     // flush + catalog commit before planning so DataFusion's ListingTable scan

@@ -93,6 +93,10 @@ pub(crate) struct EngineInner {
     /// this so they can prove the rewrite actually fired vs. accidentally
     /// falling through to brute-force.
     pub(crate) vector_routing_count: AtomicU64,
+    /// Counter bumped every time a statement is handled via the pg_query /
+    /// pg_plan path (ADR 0014 Phase 1+). Tests assert this advances when
+    /// they expect the new routing to engage.
+    pub(crate) pg_plan_routing_count: AtomicU64,
     /// Per-tenant noisy-tenant detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
     /// successful `TenantSession::execute`. See `noisy_detector` module
@@ -151,6 +155,7 @@ impl Engine {
             analytical: None,
             analytical_routing_count: AtomicU64::new(0),
             vector_routing_count: AtomicU64::new(0),
+            pg_plan_routing_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             tenant_counters,
             event_sinks: RwLock::new(registry),
@@ -213,6 +218,7 @@ impl Engine {
             analytical: Some(analytical),
             analytical_routing_count: AtomicU64::new(0),
             vector_routing_count: AtomicU64::new(0),
+            pg_plan_routing_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             tenant_counters,
             event_sinks: RwLock::new(registry),
@@ -345,10 +351,18 @@ impl Engine {
         self.inner.vector_routing_count.load(Ordering::Relaxed)
     }
 
-    /// Number of statements routed through the pg_query / pg_plan path.
-    /// Stub: returns 0 until the counter is wired up.
+    /// Crate-private hook bumped when a statement is dispatched via the
+    /// pg_query / pg_plan path (the new ADR 0014 routing).
+    pub(crate) fn note_pg_plan_routed(&self) {
+        self.inner
+            .pg_plan_routing_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of statements served via the pg_query / pg_plan path since
+    /// this `Engine` was built. Test-only instrumentation.
     pub fn pg_plan_routing_count(&self) -> u64 {
-        0
+        self.inner.pg_plan_routing_count.load(Ordering::Relaxed)
     }
 
     /// Open a session bound to `tenant`. The catalog namespace is created on

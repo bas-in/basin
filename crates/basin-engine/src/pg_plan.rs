@@ -51,6 +51,41 @@ impl std::fmt::Display for TranslateError {
     }
 }
 
+/// Lightweight shape gate: returns `true` if `node` is a SELECT in the
+/// subset the Phase-2 translator handles. Used by `executor::exec_select`
+/// to bump `pg_plan_routing_count` for the supported shape without
+/// requiring a working `SchemaLookup`.
+pub fn supports_shape(node: &pg_query::protobuf::Node) -> bool {
+    let Some(inner) = node.node.as_ref() else {
+        return false;
+    };
+    let stmt = match inner {
+        NodeEnum::SelectStmt(s) => s.as_ref(),
+        _ => return false,
+    };
+    let op = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::Undefined);
+    if op != SetOperation::SetopNone && op != SetOperation::Undefined {
+        return false;
+    }
+    if stmt.with_clause.is_some()
+        || !stmt.group_clause.is_empty()
+        || stmt.having_clause.is_some()
+        || !stmt.window_clause.is_empty()
+        || !stmt.distinct_clause.is_empty()
+        || !stmt.locking_clause.is_empty()
+        || stmt.limit_offset.is_some()
+    {
+        return false;
+    }
+    if stmt.from_clause.len() != 1 {
+        return false;
+    }
+    matches!(
+        stmt.from_clause[0].node.as_ref(),
+        Some(NodeEnum::RangeVar(_))
+    )
+}
+
 /// Translate a single top-level pg_query `Node` into a DataFusion
 /// `LogicalPlan`.
 ///

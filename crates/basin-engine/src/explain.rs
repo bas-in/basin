@@ -192,6 +192,17 @@ fn build_json_result(batches: Vec<RecordBatch>) -> Result<ExecResult> {
 
     for batch in &batches {
         if batch.num_columns() < 2 {
+            // Single-column batch: treat col 0 as the plan text.
+            if batch.num_columns() == 1 {
+                if let Some(plan_arr) = batch.column(0).as_any().downcast_ref::<StringArray>() {
+                    for i in 0..batch.num_rows() {
+                        entries.push(serde_json::json!({
+                            "plan_type": "plan",
+                            "plan": plan_arr.value(i),
+                        }));
+                    }
+                }
+            }
             continue;
         }
         let plan_type_arr = batch
@@ -211,6 +222,15 @@ fn build_json_result(batches: Vec<RecordBatch>) -> Result<ExecResult> {
                 "plan": plan_arr.value(i),
             }));
         }
+    }
+
+    // Guarantee at least one entry so consumers (PG `EXPLAIN (FORMAT JSON)`
+    // shape, ORMs that probe the plan) always see a non-empty array.
+    if entries.is_empty() {
+        entries.push(serde_json::json!({
+            "plan_type": "plan",
+            "plan": "(empty plan)",
+        }));
     }
 
     let json_str = serde_json::to_string_pretty(&entries)

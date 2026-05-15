@@ -63,7 +63,7 @@ fn truncate_kind() {
     assert_eq!(first_kind("TRUNCATE TABLE t"), StmtKind::Truncate);
     assert_eq!(first_kind("TRUNCATE t"), StmtKind::Truncate);
     assert_eq!(
-        first_kind("TRUNCATE t CASCADE RESTART IDENTITY"),
+        first_kind("TRUNCATE t RESTART IDENTITY CASCADE"),
         StmtKind::Truncate
     );
     assert_eq!(
