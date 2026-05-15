@@ -162,7 +162,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
                     ))),
                 })
             } else {
-                Ok(Expr::Value(Value::Number(v.to_string(), false)))
+                Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
             }
         }
         Dt::Utf8 => {
@@ -171,7 +171,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| BasinError::internal("expected StringArray"))?
                 .value(i);
-            Ok(Expr::Value(Value::SingleQuotedString(v.to_string())))
+            Ok(Expr::Value((Value::SingleQuotedString(v.to_string())).into()))
         }
         Dt::Float64 => {
             let v = col
@@ -188,7 +188,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
                     ))),
                 })
             } else {
-                Ok(Expr::Value(Value::Number(v.to_string(), false)))
+                Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
             }
         }
         Dt::Boolean => {
@@ -198,7 +198,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| BasinError::internal("expected BooleanArray"))?
                 .value(i);
-            Ok(Expr::Value(Value::Boolean(v)))
+            Ok(Expr::Value((Value::Boolean(v)).into()))
         }
         other => Err(BasinError::InvalidSchema(format!(
             "IN (SELECT …): column type {other:?} cannot be used as IN list element"

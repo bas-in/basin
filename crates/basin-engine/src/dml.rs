@@ -899,7 +899,7 @@ fn coerce_money(expr: &Expr, precision: u8, scale: i8, col: &str) -> Result<Opti
                 )));
             }
             // Re-wrap in a synthetic Number expression for coerce_decimal128.
-            let synthetic = Expr::Value(Value::Number(stripped, false));
+            let synthetic = Expr::Value((Value::Number(stripped, false)).into());
             coerce_decimal128(&synthetic, precision, scale, col)
         }
         // Plain numeric literals and NULLs flow through unchanged.

@@ -1993,7 +1993,7 @@ async fn exec_insert_default_values(
     let mut row: Vec<Expr> = schema
         .fields()
         .iter()
-        .map(|_| Expr::Value(Value::Null))
+        .map(|_| Expr::Value((Value::Null).into()))
         .collect();
 
     // Apply defaults to every non-generated column (treat all as unmentioned).
@@ -2302,7 +2302,7 @@ fn expand_insert_rows(
             let mut user_iter = row.iter();
             for f in schema.fields() {
                 if crate::types::field_is_generated(f).is_some() {
-                    full.push(Expr::Value(Value::Null));
+                    full.push(Expr::Value((Value::Null).into()));
                 } else {
                     full.push(user_iter.next().expect("count check above").clone());
                 }
@@ -2329,7 +2329,7 @@ fn expand_insert_rows(
                 insert_columns.len()
             )));
         }
-        let mut full: Vec<Expr> = vec![Expr::Value(Value::Null); n_cols];
+        let mut full: Vec<Expr> = vec![Expr::Value((Value::Null).into()); n_cols];
         for (val_idx, &col_idx) in user_positions.iter().enumerate() {
             full[col_idx] = row[val_idx].clone();
         }
@@ -2557,7 +2557,7 @@ async fn apply_identity_columns(
             sess.state.sequence_cache.record(sess.project, seq_name, next).await;
             // BIGINT-shaped literal. The row builder coerces this
             // through the standard Int64 path.
-            row[col_idx] = Expr::Value(Value::Number(next.to_string(), false));
+            row[col_idx] = Expr::Value((Value::Number(next.to_string(), false)).into());
         }
     }
     Ok(())
@@ -3076,17 +3076,15 @@ fn collect_from_expr(expr: &sqlparser::ast::Expr, out: &mut Vec<TableName>) {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(o) = operand {
                 collect_from_expr(o, out);
             }
             for c in conditions {
-                collect_from_expr(c, out);
-            }
-            for r in results {
-                collect_from_expr(r, out);
+                collect_from_expr(&c.condition, out);
+                collect_from_expr(&c.result, out);
             }
             if let Some(e) = else_result {
                 collect_from_expr(e, out);

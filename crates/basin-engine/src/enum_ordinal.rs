@@ -35,8 +35,9 @@ use std::sync::Arc;
 use arrow_schema::Schema;
 use basin_catalog::{Catalog, EnumTypeDef};
 use basin_common::{Result, TableName, ProjectId};
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableFactor, Value,
+    BinaryOperator, CaseWhen, Expr, Ident, Query, Select, SetExpr, Statement, TableFactor, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -216,19 +217,23 @@ async fn resolve_enum_column(
 /// at sort.
 fn build_case_for_enum(col_expr: &Expr, def: &EnumTypeDef) -> Expr {
     let mut conditions = Vec::with_capacity(def.labels.len());
-    let mut results = Vec::with_capacity(def.labels.len());
     for (i, label) in def.labels.iter().enumerate() {
-        conditions.push(Expr::BinaryOp {
-            left: Box::new(col_expr.clone()),
-            op: BinaryOperator::Eq,
-            right: Box::new(Expr::Value(Value::SingleQuotedString(label.clone()))),
+        conditions.push(CaseWhen {
+            condition: Expr::BinaryOp {
+                left: Box::new(col_expr.clone()),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Value(
+                    (Value::SingleQuotedString(label.clone())).into(),
+                )),
+            },
+            result: Expr::Value((Value::Number(i.to_string(), false)).into()),
         });
-        results.push(Expr::Value(Value::Number(i.to_string(), false)));
     }
     Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
         operand: None,
         conditions,
-        results,
         else_result: None,
     }
 }
@@ -394,7 +399,7 @@ async fn rewrite_ordering_pair(
 fn rewrite_label_to_ordinal(expr: &mut Expr, def: &EnumTypeDef) {
     if let Expr::Value(Value::SingleQuotedString(s)) = expr {
         if let Some(idx) = def.labels.iter().position(|l| l == s) {
-            *expr = Expr::Value(Value::Number(idx.to_string(), false));
+            *expr = Expr::Value((Value::Number(idx.to_string(), false)).into());
         }
     }
 }

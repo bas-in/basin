@@ -1526,17 +1526,15 @@ fn walk_expr(expr: &Expr, visit: &mut dyn FnMut(&Expr)) {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(o) = operand.as_deref() {
                 walk_expr(o, visit);
             }
             for c in conditions {
-                walk_expr(c, visit);
-            }
-            for r in results {
-                walk_expr(r, visit);
+                walk_expr(&c.condition, visit);
+                walk_expr(&c.result, visit);
             }
             if let Some(e) = else_result.as_deref() {
                 walk_expr(e, visit);

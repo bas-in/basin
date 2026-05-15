@@ -591,17 +591,15 @@ fn walk_expr_children(expr: &mut Expr, subs: &HashMap<String, Expr>) -> Result<(
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(op) = operand.as_mut() {
                 substitute_args_in_expr(op, subs)?;
             }
             for c in conditions.iter_mut() {
-                substitute_args_in_expr(c, subs)?;
-            }
-            for r in results.iter_mut() {
-                substitute_args_in_expr(r, subs)?;
+                substitute_args_in_expr(&mut c.condition, subs)?;
+                substitute_args_in_expr(&mut c.result, subs)?;
             }
             if let Some(er) = else_result.as_mut() {
                 substitute_args_in_expr(er, subs)?;

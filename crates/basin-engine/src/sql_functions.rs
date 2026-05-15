@@ -707,17 +707,15 @@ fn walk_expr_children_mut(
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(op) = operand.as_mut() {
                 rewrite_expr(op, by_name, depth)?;
             }
             for c in conditions.iter_mut() {
-                rewrite_expr(c, by_name, depth)?;
-            }
-            for r in results.iter_mut() {
-                rewrite_expr(r, by_name, depth)?;
+                rewrite_expr(&mut c.condition, by_name, depth)?;
+                rewrite_expr(&mut c.result, by_name, depth)?;
             }
             if let Some(er) = else_result.as_mut() {
                 rewrite_expr(er, by_name, depth)?;
@@ -948,17 +946,15 @@ fn walk_expr_children_substitute(expr: &mut Expr, subs: &HashMap<String, Expr>) 
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(op) = operand.as_mut() {
                 substitute_args_in_expr(op, subs)?;
             }
             for c in conditions.iter_mut() {
-                substitute_args_in_expr(c, subs)?;
-            }
-            for r in results.iter_mut() {
-                substitute_args_in_expr(r, subs)?;
+                substitute_args_in_expr(&mut c.condition, subs)?;
+                substitute_args_in_expr(&mut c.result, subs)?;
             }
             if let Some(er) = else_result.as_mut() {
                 substitute_args_in_expr(er, subs)?;
@@ -1167,17 +1163,15 @@ fn walk_expr_children_collect(expr: &Expr, out: &mut Vec<String>) {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(op) = operand.as_ref() {
                 collect_expr(op, out);
             }
             for c in conditions.iter() {
-                collect_expr(c, out);
-            }
-            for r in results.iter() {
-                collect_expr(r, out);
+                collect_expr(&c.condition, out);
+                collect_expr(&c.result, out);
             }
             if let Some(er) = else_result.as_ref() {
                 collect_expr(er, out);

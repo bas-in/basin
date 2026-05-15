@@ -301,17 +301,15 @@ fn rewrite_expr(expr: &mut Expr, event: &ChangeEvent) {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(o) = operand.as_mut() {
                 rewrite_expr(o, event);
             }
             for c in conditions.iter_mut() {
-                rewrite_expr(c, event);
-            }
-            for r in results.iter_mut() {
-                rewrite_expr(r, event);
+                rewrite_expr(&mut c.condition, event);
+                rewrite_expr(&mut c.result, event);
             }
             if let Some(else_) = else_result.as_mut() {
                 rewrite_expr(else_, event);
@@ -377,11 +375,11 @@ fn json_field_to_expr(payload: Option<&Value>, col: &str) -> Expr {
 fn json_value_to_expr(v: &Value) -> Expr {
     match v {
         Value::Null => null_expr(),
-        Value::Bool(b) => Expr::Value(SqlValue::Boolean(*b)),
+        Value::Bool(b) => Expr::Value((SqlValue::Boolean(*b)).into()),
         Value::Number(n) => {
             // Numbers render as their canonical JSON text; sqlparser
             // accepts that as `Number(repr, false)`.
-            Expr::Value(SqlValue::Number(n.to_string(), false))
+            Expr::Value((SqlValue::Number(n.to_string(), false)).into())
         }
         Value::String(s) => string_lit(s),
         // Compound JSON values (arrays, objects) render as their
@@ -393,9 +391,9 @@ fn json_value_to_expr(v: &Value) -> Expr {
 }
 
 fn null_expr() -> Expr {
-    Expr::Value(SqlValue::Null)
+    Expr::Value((SqlValue::Null).into())
 }
 
 fn string_lit(s: &str) -> Expr {
-    Expr::Value(SqlValue::SingleQuotedString(s.to_string()))
+    Expr::Value((SqlValue::SingleQuotedString(s.to_string())).into())
 }

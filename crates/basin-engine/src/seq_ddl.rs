@@ -519,7 +519,7 @@ fn int_to_expr(n: i64) -> Expr {
             ))),
         }
     } else {
-        Expr::Value(Value::Number(n.to_string(), false))
+        Expr::Value((Value::Number(n.to_string(), false)).into())
     }
 }
 
