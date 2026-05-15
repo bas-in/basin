@@ -21,8 +21,8 @@ use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig}
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
 
@@ -60,7 +60,7 @@ impl ObjectStore for CountingStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjectPath,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -87,14 +87,17 @@ impl ObjectStore for CountingStore {
         Ok(res)
     }
 
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(
         &self,
         prefix: Option<&ObjectPath>,
-    ) -> futures::stream::BoxStream<'_, object_store::Result<ObjectMeta>> {
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
@@ -105,16 +108,13 @@ impl ObjectStore for CountingStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

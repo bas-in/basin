@@ -22,7 +22,7 @@ use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde_json::json;
 
 const TEST_NAME: &str = "s3_credentials_smoke";

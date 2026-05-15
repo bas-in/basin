@@ -57,8 +57,8 @@ use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -136,7 +136,7 @@ impl ObjectStore for CountingStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjectPath,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -146,7 +146,9 @@ impl ObjectStore for CountingStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        if options.range.is_some() {
+        if options.head {
+            self.head_count.fetch_add(1, Ordering::Relaxed);
+        } else if options.range.is_some() {
             self.range_get_count.fetch_add(1, Ordering::Relaxed);
         } else {
             self.get_count.fetch_add(1, Ordering::Relaxed);
@@ -154,16 +156,17 @@ impl ObjectStore for CountingStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
-        self.head_count.fetch_add(1, Ordering::Relaxed);
-        self.inner.head(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        self.inner.delete_stream(locations)
     }
 
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.inner.delete(location).await
-    }
-
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.list_count.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix)
     }
@@ -176,16 +179,13 @@ impl ObjectStore for CountingStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

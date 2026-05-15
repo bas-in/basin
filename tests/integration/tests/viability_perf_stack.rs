@@ -66,13 +66,12 @@ use basin_storage::{
     DiskCacheConfig, PageCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig,
     WriteOptions,
 };
-use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -165,7 +164,7 @@ impl ObjectStore for LatencyStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjectPath,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -178,19 +177,16 @@ impl ObjectStore for LatencyStore {
         self.inner_gets.fetch_add(1, Ordering::Relaxed);
         self.inner.get_opts(location, options).await
     }
-    async fn get_range(
+    fn delete_stream(
         &self,
-        location: &ObjectPath,
-        range: std::ops::Range<usize>,
-    ) -> object_store::Result<Bytes> {
-        tokio::time::sleep(self.latency).await;
-        self.inner_gets.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_range(location, range).await
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        self.inner.delete_stream(locations)
     }
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.inner.delete(location).await
-    }
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(
@@ -199,15 +195,13 @@ impl ObjectStore for LatencyStore {
     ) -> object_store::Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
