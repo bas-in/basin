@@ -13,7 +13,6 @@ use sqlparser::ast::{
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::analytical_route::is_analytical;
 use crate::convert::{batch_df_to_ws, schema_df_to_ws};
 use crate::ddl::{extract_create_table_cluster_by, partition_spec_from_ast};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
@@ -804,33 +803,6 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         }
         Statement::Insert(ins) => exec_insert(sess, ins).await,
         Statement::Query(_) => {
-            // Analytical routing happens before the point-query fast path so
-            // an explicit `/*+ analytical */` hint on a shape that the fast
-            // path would otherwise grab still gets DuckDB. Aggregate /
-            // GROUP-BY queries don't match the fast path's pattern, so for
-            // those the order doesn't matter.
-            if let Some(analytical) = sess.engine.analytical() {
-                if is_analytical(&stmt, raw_sql) {
-                    match analytical.query(&sess.project, raw_sql).await {
-                        Ok(batches) => {
-                            sess.engine.note_analytical_routed();
-                            return Ok(rows_from_batches(batches));
-                        }
-                        Err(e) => {
-                            // Fallback: DuckDB rejects a fraction of the
-                            // dialect (e.g. some PG-isms, our vector UDFs).
-                            // The caller wrote the same SQL the OLTP engine
-                            // accepts; surface a hard error only if both
-                            // engines fail. v0.3 may tighten this.
-                            tracing::warn!(
-                                error = %e,
-                                "analytical path failed, falling back to OLTP engine"
-                            );
-                        }
-                    }
-                }
-            }
-
             // pg_plan routing instrumentation (ADR 0014 Phase 2). When the
             // parsed SELECT matches the shape the new translator handles,
             // bump the counter — independent of whether the fast path or
@@ -933,18 +905,6 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         }
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     }
-}
-
-/// Wrap analytical-engine output in [`ExecResult::Rows`]. The schema comes
-/// from the first batch; an empty result still needs *some* schema, so we
-/// hand back an empty [`Schema`] in that case (the analytical engine doesn't
-/// expose a typed empty-result API in v0.1).
-fn rows_from_batches(batches: Vec<RecordBatch>) -> ExecResult {
-    let schema = match batches.first() {
-        Some(b) => b.schema(),
-        None => Arc::new(Schema::empty()),
-    };
-    ExecResult::Rows { schema, batches }
 }
 
 /// Execute a `VectorSearchPlan` produced by `vector_planner`. Calls

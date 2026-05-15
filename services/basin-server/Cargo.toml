@@ -21,7 +21,6 @@ basin-wal.workspace = true
 basin-pool.workspace = true
 basin-auth.workspace = true
 basin-rest.workspace = true
-basin-analytical.workspace = true
 
 tokio.workspace = true
 object_store.workspace = true

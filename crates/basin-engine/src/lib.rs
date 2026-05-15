@@ -77,17 +77,6 @@ pub struct Engine {
 
 pub(crate) struct EngineInner {
     pub(crate) cfg: EngineConfig,
-    /// Optional analytical (DuckDB) backend. When `Some`, the executor's
-    /// router checks `analytical_route::is_analytical` before each statement
-    /// and forwards qualifying queries here. Wired in via
-    /// [`Engine::with_analytical`] so existing `EngineConfig` literals across
-    /// the workspace stay byte-stable.
-    pub(crate) analytical: Option<basin_analytical::AnalyticalEngine>,
-    /// Counter incremented every time a statement is successfully served by
-    /// the analytical path. Exposed via [`Engine::analytical_routing_count`]
-    /// so integration tests can assert that routing actually happened
-    /// without resorting to log scraping.
-    pub(crate) analytical_routing_count: AtomicU64,
     /// Counter incremented when the planner detects a vector `ORDER BY <->
     /// LIMIT k` query and routes it to the HNSW fast path. Tests assert on
     /// this so they can prove the rewrite actually fired vs. accidentally
@@ -152,8 +141,6 @@ impl Engine {
         let catalog = cfg.catalog.clone();
         let inner = Arc::new(EngineInner {
             cfg,
-            analytical: None,
-            analytical_routing_count: AtomicU64::new(0),
             vector_routing_count: AtomicU64::new(0),
             pg_plan_routing_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
@@ -193,40 +180,6 @@ impl Engine {
             .storage
             .get_project_storage_config(project)
             .await
-    }
-
-    /// Attach an [`AnalyticalEngine`](basin_analytical::AnalyticalEngine) to
-    /// this engine. Returns a new `Engine` (cheap; only the inner `Arc` is
-    /// rebuilt) so callers can keep the original analytical-less engine
-    /// around if they need it.
-    ///
-    /// When attached, the router's [`is_analytical`](crate::analytical_route)
-    /// heuristic decides per statement whether the analytical path is taken;
-    /// any failure on that path falls back to the OLTP DataFusion engine
-    /// transparently. See `analytical_route` and `executor::execute` for
-    /// the heuristic and the fallback contract.
-    pub fn with_analytical(self, analytical: basin_analytical::AnalyticalEngine) -> Self {
-        let cfg = self.inner.cfg.clone();
-        let project_counters = self.inner.project_counters.clone();
-        let mut registry = EventSinkRegistry::new();
-        if std::env::var("BASIN_TRACE_CHANGE_EVENTS").as_deref() == Ok("1") {
-            registry.register_post_commit(Arc::new(crate::events::TracingSink));
-        }
-        let catalog = cfg.catalog.clone();
-        let inner = Arc::new(EngineInner {
-            cfg,
-            analytical: Some(analytical),
-            analytical_routing_count: AtomicU64::new(0),
-            vector_routing_count: AtomicU64::new(0),
-            pg_plan_routing_count: AtomicU64::new(0),
-            noisy_detector: crate::noisy_detector::NoisyDetector::new(),
-            project_counters,
-            event_sinks: RwLock::new(registry),
-            event_seq: Mutex::new(HashMap::new()),
-            webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
-        });
-        attach_reactor_sink(&inner, catalog);
-        Self { inner }
     }
 
     /// Attach a [`ChangeEventSink`] that runs synchronously *before* the
@@ -314,27 +267,6 @@ impl Engine {
     /// delivery talk to the same map. Cheap to clone (`Arc` inside).
     pub fn webhook_registry(&self) -> &crate::webhook_registry::WebhookRegistry {
         &self.inner.webhook_registry
-    }
-
-    /// Optional analytical engine attached via [`Engine::with_analytical`].
-    pub(crate) fn analytical(&self) -> Option<&basin_analytical::AnalyticalEngine> {
-        self.inner.analytical.as_ref()
-    }
-
-    /// Internal hook used by the executor to record successful analytical
-    /// routings. Crate-private so external callers can't tamper with the
-    /// counter (only [`Engine::analytical_routing_count`] is exposed).
-    pub(crate) fn note_analytical_routed(&self) {
-        self.inner
-            .analytical_routing_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Number of statements successfully routed to the analytical path
-    /// since this `Engine` was built. Test-only instrumentation; production
-    /// code should rely on tracing for routing visibility.
-    pub fn analytical_routing_count(&self) -> u64 {
-        self.inner.analytical_routing_count.load(Ordering::Relaxed)
     }
 
     /// Crate-private hook bumped by `executor::execute` when a vector
@@ -593,7 +525,6 @@ pub enum ExecResult {
 }
 
 mod alter;
-mod analytical_route;
 pub mod noop_accept;
 pub mod pg_ast;
 pub mod pg_plan;

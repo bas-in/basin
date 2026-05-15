@@ -10,7 +10,6 @@ members = [
     "crates/basin-shard",
     "crates/basin-router",
     "crates/basin-placement",
-    "crates/basin-analytical",
     "crates/basin-vector",
     "crates/basin-pool",
     "crates/basin-auth",
@@ -42,7 +41,6 @@ basin-wal = { path = "crates/basin-wal" }
 basin-shard = { path = "crates/basin-shard" }
 basin-router = { path = "crates/basin-router" }
 basin-placement = { path = "crates/basin-placement" }
-basin-analytical = { path = "crates/basin-analytical" }
 basin-engine = { path = "crates/basin-engine" }
 basin-cron = { path = "crates/basin-cron" }
 basin-vector = { path = "crates/basin-vector" }
@@ -93,13 +91,6 @@ chrono = { version = "0.4", features = ["serde"] }
 datafusion = "44"
 pgwire = "0.28"
 sqlparser = "0.52"
-
-# Analytical engine. DuckDB is a sync C++ embedded database; we drive it via
-# spawn_blocking from the async layer. `bundled` builds DuckDB from source so
-# CI doesn't need a system libduckdb. First compile is ~5-10 minutes; cached
-# afterwards. Pinned to 1.2.x because that line tracks `arrow ^54`, matching
-# our workspace arrow-* version; bumping arrow is a separate, larger change.
-duckdb = { version = "=1.2.2", features = ["bundled"] }
 
 # Compact binary serialisation, used for the HNSW index segment format.
 bincode = "1.3"

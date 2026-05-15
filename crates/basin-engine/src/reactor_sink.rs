@@ -57,8 +57,7 @@ use sqlparser::parser::Parser;
 use crate::{EngineInner, ExecResult};
 
 /// Pre-commit sink that fires SQL-bodied reactors. Auto-attached by
-/// [`crate::Engine::new`] / [`crate::Engine::with_analytical`]; users
-/// don't construct it directly.
+/// [`crate::Engine::new`]; users don't construct it directly.
 pub(crate) struct ReactorSink {
     catalog: Arc<dyn Catalog>,
     engine: Weak<EngineInner>,

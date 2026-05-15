@@ -82,20 +82,6 @@
 //! When that env var is set, the server falls back to `AuthService::connect`
 //! (outbound TCP, the old path) instead of `EngineAuthStore`.
 //!
-//! ## Analytical (DuckDB) path
-//!
-//! ```text
-//! BASIN_ANALYTICAL_ENABLED=1               # default 0; build basin-analytical and let basin-engine route
-//! ```
-//!
-//! When set, the server constructs a `basin_analytical::AnalyticalEngine`
-//! over the same `Storage` + `Catalog` the OLTP path uses and attaches it to
-//! the engine via `Engine::with_analytical`. The engine's planner heuristic
-//! (`crates/basin-engine/src/analytical_route.rs`) then forwards aggregate
-//! and GROUP BY queries — and any query carrying a `/*+ analytical */`
-//! hint — to DuckDB, falling back to DataFusion on any execution error.
-//! Local-FS only in v0.1; S3/HTTPFS lands with the analytical engine's v0.2.
-//!
 //! `BASIN_REST_ENABLED=1` *requires* `BASIN_AUTH_ENABLED=1` per ADR 0006 — a
 //! REST stack without auth is the largest data-leak class we know how to
 //! ship, so the binary refuses to start in that combination.
@@ -154,7 +140,6 @@ async fn main() -> Result<()> {
         pool_enabled = cfg.pool_enabled,
         auth_enabled = cfg.auth_enabled,
         rest_enabled = cfg.rest_enabled,
-        analytical_enabled = cfg.analytical_enabled,
         "starting basin-server"
     );
 
@@ -291,27 +276,6 @@ async fn main() -> Result<()> {
         catalog: catalog.clone(),
         shard: shard_for_engine,
     });
-
-    // Optional analytical (DuckDB) path. Wired in via `with_analytical` so
-    // the basic `EngineConfig` literal stays byte-stable across other
-    // crates (basin-router, basin-rest, basin-pool) that build engines
-    // without analytical support.
-    let engine = if cfg.analytical_enabled {
-        let analytical_cfg = basin_analytical::AnalyticalConfig {
-            storage: storage.clone(),
-            catalog: catalog.clone(),
-            local_fs_root: Some(cfg.data_dir.clone()),
-        };
-        let analytical = basin_analytical::AnalyticalEngine::new(analytical_cfg)
-            .context("build basin-analytical engine")?;
-        tracing::info!(
-            data_dir = %cfg.data_dir.display(),
-            "analytical (DuckDB) path enabled; aggregate / GROUP BY queries route to DuckDB"
-        );
-        engine.with_analytical(analytical)
-    } else {
-        engine
-    };
 
     // Build the static resolver from `BASIN_PROJECTS`.
     let mut static_resolver = StaticProjectResolver::default();
@@ -512,7 +476,6 @@ struct Cfg {
     pool_enabled: bool,
     auth_enabled: bool,
     rest_enabled: bool,
-    analytical_enabled: bool,
     rest_bind: SocketAddr,
     projects: Vec<(String, ProjectId)>,
     catalog: CatalogBackend,
@@ -546,7 +509,6 @@ impl Cfg {
         let pool_enabled = bool_env("BASIN_POOL_ENABLED");
         let auth_enabled = bool_env("BASIN_AUTH_ENABLED");
         let rest_enabled = bool_env("BASIN_REST_ENABLED");
-        let analytical_enabled = bool_env("BASIN_ANALYTICAL_ENABLED");
         let rest_bind: SocketAddr = std::env::var("BASIN_REST_BIND")
             .unwrap_or_else(|_| "127.0.0.1:5434".to_string())
             .parse()
@@ -582,7 +544,6 @@ impl Cfg {
             pool_enabled,
             auth_enabled,
             rest_enabled,
-            analytical_enabled,
             rest_bind,
             projects,
             catalog,

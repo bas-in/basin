@@ -97,9 +97,7 @@
 //! - Iceberg-style catalog (durable)      -> covered elsewhere: tests/integration/tests/durable_catalog_smoke.rs
 //!
 //! ## Query execution
-//! - OLTP path via DataFusion             -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
-//! - Analytical path via DuckDB           -> covered elsewhere: tests/integration/tests/viability_analytical.rs
-//! - Engine routes analytical SQL         -> covered elsewhere: tests/integration/tests/viability_analytical_routing.rs
+//! - Query path via DataFusion            -> covered elsewhere: tests/integration/tests/phase1_substrate.rs
 //! - Cost-based query rejection           -> covered elsewhere: crates/basin-engine/src/cost_check.rs (in-crate; OnceLock-cached env var means a process-wide integration test would race)
 //! - Window functions (ranking + offset + frame + aggregate OVER) -> covered elsewhere: tests/integration/tests/window_fns.rs
 //!
