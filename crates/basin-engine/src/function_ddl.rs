@@ -388,7 +388,7 @@ fn extract_body_text(body: &Option<CreateFunctionBody>, fn_name: &str) -> Result
     })?;
     match body {
         CreateFunctionBody::AsBeforeOptions { body: expr, .. }
-        | CreateFunctionBody::AsAfterOptions { body: expr, .. } => {
+        | CreateFunctionBody::AsAfterOptions(expr) => {
             match expr {
                 Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(s), .. }) => Ok(s.value.clone()),
                 Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Ok(s.clone()),
@@ -398,9 +398,9 @@ fn extract_body_text(body: &Option<CreateFunctionBody>, fn_name: &str) -> Result
                 ))),
             }
         }
-        CreateFunctionBody::Return(_) => Err(BasinError::InvalidSchema(format!(
-            "CREATE FUNCTION {fn_name}: SQL/PSM `RETURN <expr>` form is not supported \
-             in v0.1; use `AS $$ SELECT <expr> $$`"
+        _ => Err(BasinError::InvalidSchema(format!(
+            "CREATE FUNCTION {fn_name}: SQL/PSM `RETURN <expr>` / `BEGIN … END` body \
+             forms are not supported in v0.1; use `AS $$ SELECT <expr> $$`"
         ))),
     }
 }
