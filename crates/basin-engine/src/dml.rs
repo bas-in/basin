@@ -4,6 +4,7 @@
 //! parameter binding are out of scope for the PoC.
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use std::collections::BTreeMap;
 
@@ -644,7 +645,7 @@ fn coerce_uuid(expr: &Expr, col: &str) -> Result<Option<[u8; 16]>> {
                 .name
                 .0
                 .last()
-                .map(|i| i.value.to_ascii_lowercase())
+                .map(|i| i.id_val().to_ascii_lowercase())
                 .unwrap_or_default();
             let args_empty = match &f.args {
                 FunctionArguments::None => true,
@@ -1259,7 +1260,7 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
                 .name
                 .0
                 .last()
-                .map(|i| i.value.to_ascii_lowercase())
+                .map(|i| i.id_val().to_ascii_lowercase())
                 .unwrap_or_default();
             let args_empty = match &f.args {
                 FunctionArguments::None => true,

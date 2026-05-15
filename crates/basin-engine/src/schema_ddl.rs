@@ -31,6 +31,7 @@
 //! Basin's auth model is JWT-based, not role-based.
 
 use std::collections::HashSet;
+use crate::pg_ast::ObjectNamePartExt;
 use std::sync::{Arc, RwLock};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
@@ -102,11 +103,11 @@ pub(crate) fn resolve_object_name(name: &ObjectName) -> Result<ResolvedName> {
     match name.0.len() {
         1 => Ok(ResolvedName {
             schema: None,
-            table: name.0[0].value.clone(),
+            table: name.0[0].id_val().clone(),
         }),
         2 => Ok(ResolvedName {
-            schema: Some(name.0[0].value.clone()),
-            table: name.0[1].value.clone(),
+            schema: Some(name.0[0].id_val().clone()),
+            table: name.0[1].id_val().clone(),
         }),
         _ => Err(BasinError::InvalidIdent(format!(
             "expected table name with at most one schema qualifier, got: {name}"
@@ -194,7 +195,7 @@ pub(crate) async fn exec_drop_schema(
         .expect("schema_state lock poisoned");
 
     for name_obj in names {
-        let parts: Vec<&str> = name_obj.0.iter().map(|i| i.value.as_str()).collect();
+        let parts: Vec<&str> = name_obj.0.iter().map(|i| i.id_val().as_str()).collect();
         if parts.len() != 1 {
             return Err(BasinError::InvalidIdent(format!(
                 "expected a simple schema name, got: {name_obj}"
@@ -488,7 +489,7 @@ fn schema_name_str(sn: &SchemaName) -> Result<String> {
                     "expected a simple schema name, got: {name}"
                 )));
             }
-            Ok(name.0[0].value.clone())
+            Ok(name.0[0].id_val().clone())
         }
         SchemaName::UnnamedAuthorization(auth) => {
             // CREATE SCHEMA AUTHORIZATION alice → schema name is "alice"
@@ -500,7 +501,7 @@ fn schema_name_str(sn: &SchemaName) -> Result<String> {
                     "expected a simple schema name, got: {name}"
                 )));
             }
-            Ok(name.0[0].value.clone())
+            Ok(name.0[0].id_val().clone())
         }
     }
 }

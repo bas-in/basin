@@ -37,6 +37,7 @@
 //!   interpreter Basin explicitly skips.
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SqlArgType, SqlFunctionArg, SqlProcedureDef};
@@ -664,7 +665,7 @@ fn single_part_object_name(name: &ObjectName) -> Result<String> {
             "schema-qualified procedure names not supported in v0.1: {name}"
         )));
     }
-    Ok(name.0[0].value.clone())
+    Ok(name.0[0].id_val().clone())
 }
 
 // --- Lexer helpers (mirror function_ddl.rs / type_ddl.rs) ----------------

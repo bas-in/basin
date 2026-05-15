@@ -38,6 +38,7 @@
 //! tier for keeping the storage API stable.
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
@@ -319,7 +320,7 @@ fn single_part_table(name: &ObjectName) -> Result<Option<TableName>> {
     if name.0.len() != 1 {
         return Ok(None);
     }
-    Ok(TableName::new(name.0[0].value.clone()).ok())
+    Ok(TableName::new(name.0[0].id_val().clone()).ok())
 }
 
 fn parse_projection(items: &[SelectItem]) -> Option<Option<Vec<String>>> {
@@ -615,7 +616,7 @@ fn extract_distance_call(expr: &Expr) -> Option<(String, DistanceOp, Vec<f32>)> 
     if func.name.0.len() != 1 {
         return None;
     }
-    let op = match func.name.0[0].value.as_str() {
+    let op = match func.name.0[0].id_val().as_str() {
         "__basin_vop_l2" => DistanceOp::L2,
         "__basin_vop_cos" => DistanceOp::Cosine,
         "__basin_vop_dot" => DistanceOp::Dot,

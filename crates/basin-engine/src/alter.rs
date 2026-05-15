@@ -32,6 +32,7 @@
 //! engine never sees a non-project-qualified `Catalog::set_*` call.
 
 use arrow_schema::{Field, Schema};
+use crate::pg_ast::ObjectNamePartExt;
 use basin_catalog::{Catalog, CheckConstraint};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::{
@@ -867,7 +868,7 @@ fn single_part_object_name(name: &ObjectName) -> Result<TableName> {
             "schema-qualified table not supported in PoC: {name}"
         )));
     }
-    TableName::new(name.0[0].value.clone())
+    TableName::new(name.0[0].id_val().clone())
 }
 
 // ---- Hand-rolled mini-parser for the Basin extension forms ---------------

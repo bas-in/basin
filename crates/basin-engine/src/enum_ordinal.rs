@@ -29,6 +29,7 @@
 //! improvement.
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -167,7 +168,7 @@ fn extract_from_binding(sel: &Select) -> Option<FromBinding> {
                 return None;
             }
             Some(FromBinding {
-                table: name.0[0].value.clone(),
+                table: name.0[0].id_val().clone(),
                 alias: alias.as_ref().map(|a| a.name.value.clone()),
             })
         }

@@ -22,6 +22,7 @@
 //! with a SQLSTATE-tagged message pointing at the right follow-up phase.
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use basin_catalog::{
     Catalog, SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
@@ -277,7 +278,7 @@ pub(crate) fn match_alter_function_rename(sql: &str) -> Result<Option<(String, S
 /// return and routed through [`sql_data_type_to_arg`].
 fn parse_return_type(dt: &SqlDataType, fn_name: &str) -> Result<SqlReturnType> {
     if let SqlDataType::Custom(obj, modifiers) = dt {
-        if obj.0.len() == 1 && obj.0[0].value.eq_ignore_ascii_case("TABLE") {
+        if obj.0.len() == 1 && obj.0[0].id_val().eq_ignore_ascii_case("TABLE") {
             return parse_returns_table(modifiers, fn_name);
         }
     }
@@ -411,7 +412,7 @@ fn single_part_object_name(name: &ObjectName) -> Result<String> {
             "schema-qualified function names not supported in v0.1: {name}"
         )));
     }
-    Ok(name.0[0].value.clone())
+    Ok(name.0[0].id_val().clone())
 }
 
 // --- Lexer helpers (mirrors cv_ddl.rs's textual matchers) ---------------

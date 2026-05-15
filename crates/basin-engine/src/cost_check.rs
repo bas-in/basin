@@ -31,6 +31,7 @@
 //! pays a getenv on the hot path.
 
 use std::sync::OnceLock;
+use crate::pg_ast::ObjectNamePartExt;
 
 use basin_catalog::Catalog;
 use basin_common::{BasinError, Result, TableName, ProjectId};
@@ -92,7 +93,7 @@ pub async fn estimate_query_rows(
     }
     let raw_name = match &twj.relation {
         TableFactor::Table { name, .. } => match name.0.last() {
-            Some(ident) => ident.value.clone(),
+            Some(ident) => ident.id_val().clone(),
             None => return Ok(None),
         },
         _ => return Ok(None),

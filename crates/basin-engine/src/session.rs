@@ -21,6 +21,7 @@
 //! The `register_object_store` call is the single switch point.
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 use std::sync::{Arc, RwLock};
 
 use crate::AuthContext;
@@ -580,7 +581,7 @@ fn collect_table_refs(query: &Query) -> Vec<String> {
         for from in &select.from {
             if let TableFactor::Table { name, .. } = &from.relation {
                 if name.0.len() == 1 {
-                    out.push(name.0[0].value.clone());
+                    out.push(name.0[0].id_val().clone());
                 }
             }
         }

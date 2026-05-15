@@ -30,6 +30,7 @@
 //!   defensive backstop.
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType};
@@ -1210,7 +1211,7 @@ fn object_name_unqualified(name: &ObjectName) -> Option<String> {
     if name.0.len() != 1 {
         return None;
     }
-    Some(name.0[0].value.clone())
+    Some(name.0[0].id_val().clone())
 }
 
 fn is_valid_identifier(s: &str) -> bool {

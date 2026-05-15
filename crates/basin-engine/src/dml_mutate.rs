@@ -44,6 +44,7 @@
 //! - Subquery / function-call WHERE.
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
@@ -1057,10 +1058,10 @@ async fn exec_update_from(
         let col = match &a.target {
             AssignmentTarget::ColumnName(name) => {
                 if name.0.len() == 1 {
-                    name.0[0].value.clone()
+                    name.0[0].id_val().clone()
                 } else {
                     // schema.column — take the last part
-                    name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+                    name.0.last().map(|i| i.id_val().clone()).unwrap_or_default()
                 }
             }
             AssignmentTarget::Tuple(_) => {
@@ -2599,7 +2600,7 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
             "schema-qualified names not supported: {name}"
         )));
     }
-    Ok(&name.0[0].value)
+    Ok(&name.0[0].id_val())
 }
 
 /// Append `(idx, AssignmentValue::Scalar(now_micros))` to `assignments` for

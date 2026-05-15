@@ -1587,3 +1587,26 @@ mod tests {
         }
     }
 }
+
+/// sqlparser 0.61 changed `ObjectName` to `ObjectName(Vec<ObjectNamePart>)`
+/// where `ObjectNamePart` is an enum (`Identifier(Ident)` | `Function(..)`).
+/// Pre-0.61 callers accessed the `.value` String directly on the part.
+/// This extension restores that access shape with a single `&String` getter
+/// so existing call sites keep working (`.value` -> `.id_val()`).
+pub trait ObjectNamePartExt {
+    /// The identifier string for this name part. For function-style parts
+    /// (rare, dialect-specific) returns a reference to an empty string,
+    /// matching the previous "no value" behavior conservatively.
+    fn id_val(&self) -> &String;
+}
+
+static EMPTY_IDENT: String = String::new();
+
+impl ObjectNamePartExt for sqlparser::ast::ObjectNamePart {
+    fn id_val(&self) -> &String {
+        match self {
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => &ident.value,
+            _ => &EMPTY_IDENT,
+        }
+    }
+}

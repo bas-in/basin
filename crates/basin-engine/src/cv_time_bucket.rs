@@ -33,6 +33,7 @@
 //!   to full re-execution. The CV is still correct, just not incremental.
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use crate::pg_ast::ObjectNamePartExt;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, SelectItem, SetExpr,
     Statement, TableFactor, Value,
@@ -248,7 +249,7 @@ fn match_bucket_call(e: &Expr) -> Option<(String, BucketWidth)> {
         .name
         .0
         .last()
-        .map(|p| p.value.to_ascii_lowercase())
+        .map(|p| p.id_val().to_ascii_lowercase())
         .unwrap_or_default();
     let args: &[FunctionArg] = match &func.args {
         FunctionArguments::List(list) => &list.args,

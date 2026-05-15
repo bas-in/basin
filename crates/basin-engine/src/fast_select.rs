@@ -19,6 +19,7 @@
 //! [`ProjectHandle`]: basin_shard::ProjectHandle
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -165,7 +166,7 @@ fn single_part_table(name: &ObjectName) -> Option<TableName> {
     if name.0.len() != 1 {
         return None;
     }
-    TableName::new(name.0[0].value.clone()).ok()
+    TableName::new(name.0[0].id_val().clone()).ok()
 }
 
 fn parse_projection(items: &[SelectItem]) -> Option<Option<Vec<String>>> {

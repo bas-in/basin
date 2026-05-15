@@ -31,6 +31,7 @@
 //! - NULL: literal `NULL`.
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_schema::{DataType, Field};
 use basin_common::{BasinError, Result, TableName};
@@ -386,7 +387,7 @@ fn infer_assignments(
     for a in assignments {
         if let AssignmentTarget::ColumnName(name) = &a.target {
             if name.0.len() == 1 {
-                let col = &name.0[0].value;
+                let col = &name.0[0].id_val();
                 if let Some(n) = placeholder_index(&a.value) {
                     if let Some(field) = column_field(schema, col) {
                         if let Some(slot) = out.get_mut(n - 1) {
@@ -414,7 +415,7 @@ fn name_to_table(name: &ObjectName) -> Result<TableName> {
             "schema-qualified table names not supported: {name}"
         )));
     }
-    TableName::new(name.0[0].value.clone())
+    TableName::new(name.0[0].id_val().clone())
 }
 
 fn placeholder_index(e: &Expr) -> Option<usize> {

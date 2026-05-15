@@ -1,6 +1,7 @@
 //! SQL → side-effects + result sets, dispatched by sqlparser statement kind.
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -787,7 +788,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     obj_name
                         .0
                         .iter()
-                        .map(|i| i.value.as_str())
+                        .map(|i| i.id_val().as_str())
                         .collect::<Vec<_>>()
                         .join(".")
                         .to_ascii_lowercase()
@@ -2202,7 +2203,7 @@ async fn try_on_conflict_do_update(
                 AssignmentTarget::ColumnName(n) => n
                     .0
                     .last()
-                    .map(|i| i.value.clone())
+                    .map(|i| i.id_val().clone())
                     .unwrap_or_default(),
                 AssignmentTarget::Tuple(_) => String::new(),
             };
@@ -2988,7 +2989,7 @@ fn collect_from_table_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<Tab
     match tf {
         TableFactor::Table { name, .. } => {
             if name.0.len() == 1 {
-                if let Ok(t) = TableName::new(name.0[0].value.clone()) {
+                if let Ok(t) = TableName::new(name.0[0].id_val().clone()) {
                     out.push(t);
                 }
             }
@@ -3155,7 +3156,7 @@ async fn exec_alter_table(
     // new column. We pull the (now possibly different) table name out
     // of the AST.
     if name.0.len() == 1 {
-        if let Ok(t) = TableName::new(name.0[0].value.clone()) {
+        if let Ok(t) = TableName::new(name.0[0].id_val().clone()) {
             refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &t).await?;
         }
     }
@@ -3193,10 +3194,10 @@ async fn exec_show_tables(sess: &ProjectSession) -> Result<ExecResult> {
 /// `crate::schema_ddl::table_name_from_object` instead.
 fn single_part_name(name: &ObjectName) -> Result<&str> {
     match name.0.len() {
-        1 => Ok(&name.0[0].value),
+        1 => Ok(&name.0[0].id_val()),
         2 => {
             // schema.table — drop the schema prefix and return the table name.
-            Ok(&name.0[1].value)
+            Ok(&name.0[1].id_val())
         }
         _ => Err(BasinError::InvalidIdent(format!(
             "table name must have at most one schema qualifier: {name}"

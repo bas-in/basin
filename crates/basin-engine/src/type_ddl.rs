@@ -34,6 +34,7 @@
 //! `drop_enum_type` / `drop_domain` time by the catalog (refcounting).
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
@@ -109,7 +110,7 @@ pub(crate) async fn resolve_user_type_columns(
         if obj.0.len() != 1 || !modifiers.is_empty() {
             continue;
         }
-        let name = &obj.0[0].value;
+        let name = &obj.0[0].id_val();
         // `vector(N)` / `JSONB` / `UUID` and all network/bit-string/money
         // types are recognised by `arrow_data_type`; we must not shadow them.
         // Skip the built-in custom-keyword set so unmodified `arrow_data_type`
@@ -842,7 +843,7 @@ fn single_part_object_name(name: &ObjectName) -> Result<String> {
             "schema-qualified type names not supported in v0.1: {name}"
         )));
     }
-    Ok(name.0[0].value.clone())
+    Ok(name.0[0].id_val().clone())
 }
 
 // ==========================================================================

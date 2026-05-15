@@ -1,6 +1,7 @@
 //! sqlparser → Arrow type bridging for the PoC.
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_schema::{DataType, Field, TimeUnit};
 use basin_common::{BasinError, Result};
@@ -334,7 +335,7 @@ pub(crate) fn serial_kind(sql: &SqlDataType) -> Option<SerialKind> {
         if !modifiers.is_empty() || name.0.len() != 1 {
             return None;
         }
-        let kw = name.0[0].value.to_ascii_uppercase();
+        let kw = name.0[0].id_val().to_ascii_uppercase();
         return match kw.as_str() {
             "SMALLSERIAL" | "SERIAL2" => Some(SerialKind::Small),
             "SERIAL" | "SERIAL4" => Some(SerialKind::Regular),
@@ -389,7 +390,7 @@ pub(crate) fn is_tstzrange_sql(sql: &SqlDataType) -> bool {
 fn custom_type_name_eq(sql: &SqlDataType, keyword: &str) -> bool {
     if let SqlDataType::Custom(name, modifiers) = sql {
         name.0.len() == 1
-            && name.0[0].value.eq_ignore_ascii_case(keyword)
+            && name.0[0].id_val().eq_ignore_ascii_case(keyword)
             && modifiers.is_empty()
     } else {
         false
@@ -469,7 +470,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // keywords). Same Arrow type, same JSONB tag downstream.
         SqlDataType::Custom(name, modifiers)
             if name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("jsonb")
+                && name.0[0].id_val().eq_ignore_ascii_case("jsonb")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::LargeBinary)
@@ -484,7 +485,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         SqlDataType::Uuid => Ok(DataType::FixedSizeBinary(16)),
         SqlDataType::Custom(name, modifiers)
             if name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("uuid")
+                && name.0[0].id_val().eq_ignore_ascii_case("uuid")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::FixedSizeBinary(16))
@@ -498,14 +499,14 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // in the `Custom` catch-all.
         SqlDataType::Custom(name, modifiers)
             if name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("tsvector")
+                && name.0[0].id_val().eq_ignore_ascii_case("tsvector")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::Utf8)
         }
         SqlDataType::Custom(name, modifiers)
             if name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("tsquery")
+                && name.0[0].id_val().eq_ignore_ascii_case("tsquery")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::Utf8)
@@ -595,7 +596,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // the FTS UDF stubs echo the text value.
         SqlDataType::Custom(name, modifiers)
             if name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("tsvector")
+                && name.0[0].id_val().eq_ignore_ascii_case("tsvector")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::Utf8)
@@ -605,7 +606,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // TSVECTOR; distinguished only by the `BASIN_TYPE=TSQUERY` marker.
         SqlDataType::Custom(name, modifiers)
             if name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("tsquery")
+                && name.0[0].id_val().eq_ignore_ascii_case("tsquery")
                 && modifiers.is_empty() =>
         {
             Ok(DataType::Utf8)
@@ -624,7 +625,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         // semantics — no real tokenisation).  The FTS UDFs in `fts_udf` all
         // accept/return Utf8, so this mapping is consistent end-to-end.
         SqlDataType::Custom(name, modifiers) => {
-            let kw = name.0[0].value.to_ascii_uppercase();
+            let kw = name.0[0].id_val().to_ascii_uppercase();
             match kw.as_str() {
                 "VECTOR" => {
                     let dim = parse_vector_dim(modifiers)?;
@@ -748,7 +749,7 @@ pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
     if name.0.len() != 1 {
         return None;
     }
-    let kw = name.0[0].value.to_ascii_uppercase();
+    let kw = name.0[0].id_val().to_ascii_uppercase();
     match kw.as_str() {
         "INET" if modifiers.is_empty() => Some(BASIN_TYPE_INET.to_string()),
         "CIDR" if modifiers.is_empty() => Some(BASIN_TYPE_CIDR.to_string()),

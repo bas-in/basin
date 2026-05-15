@@ -40,6 +40,7 @@
 //!    integration test `viability_rls_isolation` is the back-stop.
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 use std::sync::Arc;
 
 use basin_catalog::{Policy, PolicyCommand};
@@ -320,7 +321,7 @@ fn single_part_object_name(name: &ObjectName) -> Result<TableName> {
             "schema-qualified policy table not supported in PoC: {name}"
         )));
     }
-    TableName::new(name.0[0].value.clone())
+    TableName::new(name.0[0].id_val().clone())
 }
 
 // --- Predicate selection ----------------------------------------------------

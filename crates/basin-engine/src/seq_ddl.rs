@@ -46,6 +46,7 @@
 //! for inline `nextval(...)` calls — no separate UDF bridge.
 
 use std::sync::Arc;
+use crate::pg_ast::ObjectNamePartExt;
 
 use basin_catalog::{Catalog, SequenceDef};
 use basin_common::{BasinError, Result, ProjectId};
@@ -279,7 +280,7 @@ fn single_part_object_name(name: &ObjectName) -> Result<String> {
             "schema-qualified sequence names not supported in v0.1: {name}"
         )));
     }
-    Ok(name.0[0].value.clone())
+    Ok(name.0[0].id_val().clone())
 }
 
 /// At INSERT time, evaluate a stored DEFAULT expression text.

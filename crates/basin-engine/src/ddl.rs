@@ -1,6 +1,7 @@
 //! CREATE TABLE: sqlparser AST → Arrow [`Schema`].
 
 use std::collections::HashMap;
+use crate::pg_ast::ObjectNamePartExt;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::{CheckConstraint, ForeignKeyDef, PartitionSpec, RefAction, UniqueConstraint};
@@ -68,7 +69,7 @@ fn is_jsonb_sql(sql: &sqlparser::ast::DataType) -> bool {
         SqlDataType::JSONB | SqlDataType::JSON => true,
         SqlDataType::Custom(name, modifiers) => {
             name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("jsonb")
+                && name.0[0].id_val().eq_ignore_ascii_case("jsonb")
                 && modifiers.is_empty()
         }
         _ => false,
@@ -85,7 +86,7 @@ fn is_uuid_sql(sql: &sqlparser::ast::DataType) -> bool {
         SqlDataType::Uuid => true,
         SqlDataType::Custom(name, modifiers) => {
             name.0.len() == 1
-                && name.0[0].value.eq_ignore_ascii_case("uuid")
+                && name.0[0].id_val().eq_ignore_ascii_case("uuid")
                 && modifiers.is_empty()
         }
         _ => false,
@@ -132,7 +133,7 @@ fn is_tsvector_sql(sql: &sqlparser::ast::DataType) -> bool {
     use sqlparser::ast::DataType as SqlDataType;
     if let SqlDataType::Custom(name, modifiers) = sql {
         name.0.len() == 1
-            && name.0[0].value.eq_ignore_ascii_case("tsvector")
+            && name.0[0].id_val().eq_ignore_ascii_case("tsvector")
             && modifiers.is_empty()
     } else {
         false
@@ -146,7 +147,7 @@ fn is_tsquery_sql(sql: &sqlparser::ast::DataType) -> bool {
     use sqlparser::ast::DataType as SqlDataType;
     if let SqlDataType::Custom(name, modifiers) = sql {
         name.0.len() == 1
-            && name.0[0].value.eq_ignore_ascii_case("tsquery")
+            && name.0[0].id_val().eq_ignore_ascii_case("tsquery")
             && modifiers.is_empty()
     } else {
         false
@@ -860,7 +861,7 @@ pub(crate) fn partition_spec_from_ast(
         .name
         .0
         .last()
-        .map(|i| i.value.to_ascii_uppercase())
+        .map(|i| i.id_val().to_ascii_uppercase())
         .unwrap_or_default();
     // PARTITION BY LIST / HASH are accepted syntactically and recorded
     // as Unpartitioned. Basin's v0.1 storage layer only buckets on
