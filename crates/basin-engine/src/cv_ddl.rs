@@ -662,6 +662,86 @@ pub(crate) async fn exec_create_materialized_view(
     })
 }
 
+/// Execute a plain `CREATE MATERIALIZED VIEW <name> AS <select_query>` (without
+/// `WITH (basin.continuous)`).  This is a one-time snapshot: the source query is
+/// run immediately, its rows are persisted as a regular table (no refresh
+/// interval), and no `CvDef` is stamped.  `REFRESH MATERIALIZED VIEW` on a
+/// snapshot view re-executes the query and replaces the stored rows.
+///
+/// Errors if the source query returns no rows (the schema cannot be inferred
+/// from an empty result).
+pub(crate) async fn exec_create_snapshot_materialized_view(
+    sess: &TenantSession,
+    name: &str,
+    source_sql: &str,
+) -> Result<ExecResult> {
+    let table = TableName::new(name)?;
+
+    let existing = sess
+        .engine
+        .config()
+        .catalog
+        .list_tables(&sess.tenant)
+        .await?;
+    if existing.iter().any(|t| t.as_str() == table.as_str()) {
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE MATERIALIZED VIEW: relation {name:?} already exists"
+        )));
+    }
+
+    let res = Box::pin(crate::executor::execute(sess, source_sql)).await?;
+    let (schema, batches) = match res {
+        ExecResult::Rows { schema, batches } => (schema, batches),
+        ExecResult::Empty { tag } => {
+            return Err(BasinError::InvalidSchema(format!(
+                "CREATE MATERIALIZED VIEW: source query is not a SELECT (got {tag})"
+            )));
+        }
+    };
+
+    let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
+    catalog
+        .create_table(&sess.tenant, &table, schema.as_ref())
+        .await?;
+
+    if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) {
+        let merged = if batches.len() == 1 {
+            batches[0].clone()
+        } else {
+            let refs: Vec<&RecordBatch> = batches.iter().collect();
+            arrow_select::concat::concat_batches(&schema, refs).map_err(|e| {
+                BasinError::internal(format!("CREATE MATERIALIZED VIEW: concat: {e}"))
+            })?
+        };
+        let part = PartitionKey::default_key();
+        let written = sess
+            .engine
+            .config()
+            .storage
+            .write_batch(&sess.tenant, &table, &part, &merged)
+            .await?;
+        catalog
+            .append_data_files(
+                &sess.tenant,
+                &table,
+                SnapshotId::GENESIS,
+                vec![DataFileRef {
+                    path: written.path.as_ref().to_string(),
+                    size_bytes: written.size_bytes,
+                    row_count: written.row_count,
+                    column_stats: written.column_stats.clone(),
+                }],
+            )
+            .await?;
+    }
+
+    refresh_table(&sess.engine, &sess.tenant, &sess.ctx, &sess.state, &table).await?;
+
+    Ok(ExecResult::Empty {
+        tag: "CREATE MATERIALIZED VIEW".into(),
+    })
+}
+
 /// Execute a `REFRESH MATERIALIZED VIEW <name> [WITH (full=true)]`.
 ///
 /// Mirrors `basin_cv::CvRefresher::do_refresh`:

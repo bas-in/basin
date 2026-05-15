@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, TimeUnit};
 use basin_common::{BasinError, Result};
+use sqlparser::ast::ArrayElemTypeDef;
 use sqlparser::ast::DataType as SqlDataType;
 use sqlparser::ast::ExactNumberInfo;
 use sqlparser::ast::TimezoneInfo;
@@ -434,6 +435,10 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         | SqlDataType::Float8
         | SqlDataType::Float(_) => Ok(DataType::Float64),
 
+        // REAL / FLOAT4 — 32-bit floating point. PG's `real` is a synonym for
+        // `float4`. Stored as Arrow Float32.
+        SqlDataType::Real => Ok(DataType::Float32),
+
         SqlDataType::Bytea => Ok(DataType::Binary),
 
         // DATE — day-resolution, no time component, no timezone. Arrow's
@@ -534,6 +539,27 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             )),
             _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         },
+
+        // INTERVAL — PG's interval type. Stored as Arrow
+        // `Interval(MonthDayNano)` which matches DataFusion's native interval
+        // representation and allows arithmetic with timestamps.
+        SqlDataType::Interval => Ok(DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)),
+
+        // Array types: INT[], TEXT[], etc. Stored as Arrow List<element_type>.
+        // Supports the `INT[]` / `TEXT[]` PG syntax (sqlparser SquareBracket
+        // form). Nested arrays (e.g. INT[][]) use nested List types.
+        SqlDataType::Array(ArrayElemTypeDef::SquareBracket(elem, _))
+        | SqlDataType::Array(ArrayElemTypeDef::AngleBracket(elem))
+        | SqlDataType::Array(ArrayElemTypeDef::Parenthesis(elem)) => {
+            let elem_dt = arrow_data_type(elem)?;
+            Ok(DataType::List(Arc::new(Field::new("item", elem_dt, true))))
+        }
+        SqlDataType::Array(ArrayElemTypeDef::None) => {
+            // Bare ARRAY keyword with no element type — not representable; reject.
+            Err(BasinError::InvalidSchema(
+                "ARRAY type requires an element type (e.g. INT[])".into(),
+            ))
+        }
 
         // MONEY. PG's `money` type is a fixed-point 8-byte integer; we
         // represent it as Decimal128(20, 2) — enough range for any PG money
@@ -651,6 +677,12 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                 // ── FTS types ────────────────────────────────────────────
                 // TSVECTOR / TSQUERY stored as Utf8 (stub — no real FTS engine).
                 "TSVECTOR" | "TSQUERY" if modifiers.is_empty() => Ok(DataType::Utf8),
+                // ── CITEXT ───────────────────────────────────────────────
+                // Case-insensitive text. Stored as plain Utf8 in Basin v0.1.
+                "CITEXT" if modifiers.is_empty() => Ok(DataType::Utf8),
+                // ── POINT ────────────────────────────────────────────────
+                // PG geometric point type. Stored as Utf8 "(x,y)" for v0.1.
+                "POINT" if modifiers.is_empty() => Ok(DataType::Utf8),
                 _ => Err(BasinError::InvalidSchema(format!(
                     "unsupported custom type: {name}"
                 ))),

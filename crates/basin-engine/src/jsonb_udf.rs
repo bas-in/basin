@@ -35,6 +35,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
+use datafusion::catalog::TableFunctionImpl;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -232,15 +233,9 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
         ),
     }));
 
-    // jsonb_agg(any) -> jsonb  [aggregate stub]
-    ctx.register_udf(ScalarUDF::from(JsonbAggStubUdf {
-        signature: Signature::any(1, Volatility::Immutable),
-    }));
-
-    // jsonb_object_agg(key, value) -> jsonb  [aggregate stub]
-    ctx.register_udf(ScalarUDF::from(JsonbObjectAggStubUdf {
-        signature: Signature::any(2, Volatility::Immutable),
-    }));
+    // Note: jsonb_agg and jsonb_object_agg are registered as real AggregateUDFs
+    // in crate::pg_agg_udf::register_json_agg_udafs (called after this function).
+    // Do NOT register scalar stubs here — they would shadow the real aggregate.
 
     // ---------------------------------------------------------------------------
     // JSON (non-jsonb) variants — accept Utf8 or LargeBinary
@@ -458,6 +453,21 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
         ),
     }));
 
+    // jsonb_delete_key(jsonb, text) -> jsonb   (rewrite target for jsonb - 'key')
+    ctx.register_udf(ScalarUDF::from(JsonbDeleteKeyUdf {
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+    }));
+
+    // jsonb_delete_keys(jsonb, text[]) -> jsonb   (rewrite target for jsonb - ARRAY[...])
+    ctx.register_udf(ScalarUDF::from(JsonbDeleteKeysUdf {
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+    }));
+
+    // jsonb_delete_index(jsonb, int8) -> jsonb   (rewrite target for jsonb - idx)
+    ctx.register_udf(ScalarUDF::from(JsonbDeleteIndexUdf {
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+    }));
+
     // json_to_record / jsonb_to_record (scalar stubs)
     ctx.register_udf(ScalarUDF::from(JsonToRecordStubUdf {
         signature: Signature::any(1, Volatility::Immutable),
@@ -477,6 +487,17 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
         signature: Signature::any(1, Volatility::Immutable),
         name: "jsonb_to_recordset",
     }));
+
+    // ---------------------------------------------------------------------------
+    // Table-valued functions (UDTFs) — for use in FROM clauses.
+    // These require register_udtf (not register_udf) because DataFusion looks
+    // them up separately when planning FROM <function>(...) syntax.
+    // ---------------------------------------------------------------------------
+    ctx.register_udtf("jsonb_each", Arc::new(JsonbEachTf { text_values: false }));
+    ctx.register_udtf("jsonb_each_text", Arc::new(JsonbEachTf { text_values: true }));
+    ctx.register_udtf("jsonb_array_elements", Arc::new(JsonbArrayElementsTf { text_values: false }));
+    ctx.register_udtf("jsonb_array_elements_text", Arc::new(JsonbArrayElementsTf { text_values: true }));
+    ctx.register_udtf("jsonb_object_keys", Arc::new(JsonbObjectKeysTf {}));
 }
 
 // ---------------------------------------------------------------------------
@@ -2758,6 +2779,197 @@ impl ScalarUDFImpl for JsonbConcatUdf {
 }
 
 // ---------------------------------------------------------------------------
+// jsonb_delete_key(jsonb, text) -> jsonb   (operator: jsonb - 'key')
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct JsonbDeleteKeyUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for JsonbDeleteKeyUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "jsonb_delete_key" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("jsonb_delete_key expects 2 arguments, got {}", args.len());
+        }
+        let n = row_count(args);
+        let doc_arr = args[0].clone().into_array(n)?;
+        let key_arr = args[1].clone().into_array(n)?;
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut doc = match extract_jsonb_value(&doc_arr, i, "jsonb_delete_key")? {
+                Some(v) => v,
+                None => { out.push(None); continue; }
+            };
+            let key = match extract_string(&key_arr, i) {
+                Some(s) => s,
+                None => { out.push(None); continue; }
+            };
+            if let Value::Object(ref mut map) = doc {
+                map.remove(key.as_str());
+            }
+            out.push(Some(value_to_jsonb(&doc)?));
+        }
+        let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// jsonb_delete_keys(jsonb, text[]) -> jsonb   (operator: jsonb - ARRAY[...])
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct JsonbDeleteKeysUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for JsonbDeleteKeysUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "jsonb_delete_keys" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        use datafusion::arrow::array::ListArray;
+        use datafusion::arrow::array::LargeListArray;
+        if args.len() != 2 {
+            return exec_err!("jsonb_delete_keys expects 2 arguments, got {}", args.len());
+        }
+        let n = row_count(args);
+        let doc_arr = args[0].clone().into_array(n)?;
+        let keys_arr = args[1].clone().into_array(n)?;
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut doc = match extract_jsonb_value(&doc_arr, i, "jsonb_delete_keys")? {
+                Some(v) => v,
+                None => { out.push(None); continue; }
+            };
+            let keys: Vec<String> = match keys_arr.data_type() {
+                DataType::Utf8 => {
+                    let a = keys_arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                        DataFusionError::Execution("jsonb_delete_keys: not StringArray".into())
+                    })?;
+                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    parse_key_list(a.value(i))
+                }
+                DataType::List(_) => {
+                    let a = keys_arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                        DataFusionError::Execution("jsonb_delete_keys: not ListArray".into())
+                    })?;
+                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    let values = a.value(i);
+                    let sa = values.as_any().downcast_ref::<StringArray>();
+                    match sa {
+                        Some(sa) => (0..sa.len()).filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) }).collect(),
+                        None => vec![],
+                    }
+                }
+                DataType::LargeList(_) => {
+                    let a = keys_arr.as_any().downcast_ref::<LargeListArray>().ok_or_else(|| {
+                        DataFusionError::Execution("jsonb_delete_keys: not LargeListArray".into())
+                    })?;
+                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    let values = a.value(i);
+                    let sa = values.as_any().downcast_ref::<StringArray>();
+                    match sa {
+                        Some(sa) => (0..sa.len()).filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) }).collect(),
+                        None => vec![],
+                    }
+                }
+                _ => {
+                    match extract_string(&keys_arr, i) {
+                        Some(s) => parse_key_list(&s),
+                        None => { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    }
+                }
+            };
+            if let Value::Object(ref mut map) = doc {
+                for k in &keys {
+                    map.remove(k.as_str());
+                }
+            }
+            out.push(Some(value_to_jsonb(&doc)?));
+        }
+        let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// jsonb_delete_index(jsonb, int8) -> jsonb   (operator: jsonb - idx)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct JsonbDeleteIndexUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for JsonbDeleteIndexUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "jsonb_delete_index" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        use datafusion::arrow::array::Int32Array;
+        if args.len() != 2 {
+            return exec_err!("jsonb_delete_index expects 2 arguments, got {}", args.len());
+        }
+        let n = row_count(args);
+        let doc_arr = args[0].clone().into_array(n)?;
+        let idx_arr = args[1].clone().into_array(n)?;
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut doc = match extract_jsonb_value(&doc_arr, i, "jsonb_delete_index")? {
+                Some(v) => v,
+                None => { out.push(None); continue; }
+            };
+            let idx: i64 = match idx_arr.data_type() {
+                DataType::Int64 => {
+                    let a = idx_arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                        DataFusionError::Execution("jsonb_delete_index: not Int64Array".into())
+                    })?;
+                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    a.value(i)
+                }
+                DataType::Int32 => {
+                    let a = idx_arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                        DataFusionError::Execution("jsonb_delete_index: not Int32Array".into())
+                    })?;
+                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    a.value(i) as i64
+                }
+                _ => {
+                    match extract_string(&idx_arr, i) {
+                        Some(s) => s.trim().parse::<i64>().unwrap_or(0),
+                        None => { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    }
+                }
+            };
+            if let Value::Array(ref mut arr) = doc {
+                let len = arr.len() as i64;
+                let actual = if idx < 0 { len + idx } else { idx };
+                if actual >= 0 && actual < len {
+                    arr.remove(actual as usize);
+                }
+            }
+            out.push(Some(value_to_jsonb(&doc)?));
+        }
+        let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // json_to_record / jsonb_to_record / json_to_recordset / jsonb_to_recordset
 // (scalar stubs — SRF table functions require DataFusion TableProvider)
 // ---------------------------------------------------------------------------
@@ -2818,5 +3030,235 @@ fn parse_key_list(s: &str) -> Vec<String> {
             .map(|k| k.trim().to_string())
             .filter(|k| !k.is_empty())
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Table-valued UDFs (UDTFs) — for FROM jsonb_each(...) / jsonb_array_elements()
+// ---------------------------------------------------------------------------
+//
+// DataFusion's UDTF machinery calls `TableFunctionImpl::call()` at *plan time*
+// with the argument `Expr` list.  For literal JSON arguments we materialise
+// the rows eagerly into a MemTable; for column references we return an error
+// (SRF over columns requires proper LATERAL support which is a v0.2 item).
+//
+// `jsonb_each(jsonb)       -> SETOF (key TEXT, value TEXT)`
+// `jsonb_each_text(jsonb)  -> SETOF (key TEXT, value TEXT)`
+// `jsonb_array_elements(jsonb)      -> SETOF (value TEXT)`
+// `jsonb_array_elements_text(jsonb) -> SETOF (value TEXT)`
+// `jsonb_object_keys(jsonb)         -> SETOF TEXT`
+
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
+use datafusion::common::{plan_err, ScalarValue};
+use datafusion::datasource::MemTable;
+use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::TableType;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::catalog::Session;
+
+/// Extract JSON text from a literal Expr (Utf8 or LargeBinary).
+fn json_from_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s))) => Some(s.clone()),
+        Expr::Literal(ScalarValue::LargeBinary(Some(b))) => String::from_utf8(b.clone()).ok(),
+        _ => None,
+    }
+}
+
+// ── jsonb_each / jsonb_each_text ────────────────────────────────────────────
+
+#[derive(Debug)]
+struct JsonbEachTf {
+    text_values: bool,
+}
+
+#[derive(Debug)]
+struct JsonbEachTable {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for JsonbEachTable {
+    fn as_any(&self) -> &dyn Any { self }
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn table_type(&self) -> TableType { TableType::Base }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+    }
+}
+
+impl TableFunctionImpl for JsonbEachTf {
+    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        if args.len() != 1 {
+            return plan_err!("jsonb_each requires exactly 1 argument");
+        }
+        let json_str = match json_from_expr(&args[0]) {
+            Some(s) => s,
+            None => return plan_err!("jsonb_each: argument must be a JSON literal"),
+        };
+        let v: Value = serde_json::from_str(&json_str)
+            .map_err(|e| DataFusionError::Plan(format!("jsonb_each: JSON parse error: {e}")))?;
+        let obj = match v {
+            Value::Object(m) => m,
+            _ => return plan_err!("jsonb_each: argument must be a JSON object"),
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let mut keys: Vec<String> = Vec::with_capacity(obj.len());
+        let mut vals: Vec<String> = Vec::with_capacity(obj.len());
+        for (k, v) in &obj {
+            keys.push(k.clone());
+            vals.push(if self.text_values {
+                match v {
+                    Value::String(s) => s.clone(),
+                    _ => serde_json::to_string(v).unwrap_or_default(),
+                }
+            } else {
+                serde_json::to_string(v).unwrap_or_default()
+            });
+        }
+        let key_arr: ArrayRef = Arc::new(StringArray::from(keys));
+        let val_arr: ArrayRef = Arc::new(StringArray::from(vals));
+        let batch = RecordBatch::try_new(schema.clone(), vec![key_arr, val_arr])
+            .map_err(|e| DataFusionError::Plan(format!("jsonb_each: RecordBatch error: {e}")))?;
+        Ok(Arc::new(JsonbEachTable { schema, batches: vec![batch] }))
+    }
+}
+
+// ── jsonb_array_elements / jsonb_array_elements_text ────────────────────────
+
+#[derive(Debug)]
+struct JsonbArrayElementsTf {
+    text_values: bool,
+}
+
+#[derive(Debug)]
+struct JsonbArrayElementsTable {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for JsonbArrayElementsTable {
+    fn as_any(&self) -> &dyn Any { self }
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn table_type(&self) -> TableType { TableType::Base }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+    }
+}
+
+impl TableFunctionImpl for JsonbArrayElementsTf {
+    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        if args.len() != 1 {
+            return plan_err!("jsonb_array_elements requires exactly 1 argument");
+        }
+        let json_str = match json_from_expr(&args[0]) {
+            Some(s) => s,
+            None => return plan_err!("jsonb_array_elements: argument must be a JSON literal"),
+        };
+        let v: Value = serde_json::from_str(&json_str)
+            .map_err(|e| DataFusionError::Plan(format!("jsonb_array_elements: JSON parse error: {e}")))?;
+        let arr = match v {
+            Value::Array(a) => a,
+            _ => return plan_err!("jsonb_array_elements: argument must be a JSON array"),
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let vals: Vec<String> = arr.iter().map(|v| {
+            if self.text_values {
+                match v {
+                    Value::String(s) => s.clone(),
+                    _ => serde_json::to_string(v).unwrap_or_default(),
+                }
+            } else {
+                serde_json::to_string(v).unwrap_or_default()
+            }
+        }).collect();
+
+        let val_arr: ArrayRef = Arc::new(StringArray::from(vals));
+        let batch = RecordBatch::try_new(schema.clone(), vec![val_arr])
+            .map_err(|e| DataFusionError::Plan(format!("jsonb_array_elements: RecordBatch error: {e}")))?;
+        Ok(Arc::new(JsonbArrayElementsTable { schema, batches: vec![batch] }))
+    }
+}
+
+// ── jsonb_object_keys (UDTF variant) ────────────────────────────────────────
+
+#[derive(Debug)]
+struct JsonbObjectKeysTf {}
+
+#[derive(Debug)]
+struct JsonbObjectKeysTable {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for JsonbObjectKeysTable {
+    fn as_any(&self) -> &dyn Any { self }
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn table_type(&self) -> TableType { TableType::Base }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+    }
+}
+
+impl TableFunctionImpl for JsonbObjectKeysTf {
+    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        if args.len() != 1 {
+            return plan_err!("jsonb_object_keys requires exactly 1 argument");
+        }
+        let json_str = match json_from_expr(&args[0]) {
+            Some(s) => s,
+            None => return plan_err!("jsonb_object_keys: argument must be a JSON literal"),
+        };
+        let v: Value = serde_json::from_str(&json_str)
+            .map_err(|e| DataFusionError::Plan(format!("jsonb_object_keys: JSON parse error: {e}")))?;
+        let obj = match v {
+            Value::Object(m) => m,
+            _ => return plan_err!("jsonb_object_keys: argument must be a JSON object"),
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("jsonb_object_keys", DataType::Utf8, false),
+        ]));
+
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        let key_arr: ArrayRef = Arc::new(StringArray::from(keys));
+        let batch = RecordBatch::try_new(schema.clone(), vec![key_arr])
+            .map_err(|e| DataFusionError::Plan(format!("jsonb_object_keys: RecordBatch error: {e}")))?;
+        Ok(Arc::new(JsonbObjectKeysTable { schema, batches: vec![batch] }))
     }
 }

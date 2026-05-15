@@ -226,6 +226,16 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
         return crate::seq_ddl::exec_alter_sequence(sess, intent).await;
     }
 
+    // `ALTER TABLE t ALTER COLUMN col SET GENERATED ALWAYS/BY DEFAULT` and
+    // `ALTER TABLE t ALTER COLUMN col DROP IDENTITY` — sqlparser 0.52 does not
+    // parse these PG-specific identity-sequence manipulation forms.  We accept
+    // them as metadata-only no-ops (same policy as SET NOT NULL / SET DEFAULT).
+    if match_alter_column_identity(sql) {
+        return Ok(ExecResult::Empty {
+            tag: "ALTER TABLE".into(),
+        });
+    }
+
     // CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] <name> [opt …] —
     // sqlparser 0.52 only parses one option per CREATE SEQUENCE
     // statement, so the full PG grammar fails at the second option. The
@@ -367,6 +377,20 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
     let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
     let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
+    // Rewrite PG bitwise operators that DataFusion's GenericDialect doesn't
+    // understand: `A # B` (XOR) → `A ^ B`; `~expr` (unary NOT) →
+    // `(-1 ^ (expr))`.
+    let rewritten = crate::pg_operators::rewrite_pg_bitwise_operators(&rewritten);
+    // Rewrite `= ANY (subquery)` / `= SOME (subquery)` → `IN (subquery)`.
+    // DataFusion's ANY subquery planner has type-coercion issues; the IN form
+    // is equivalent for equality comparisons and works reliably.
+    let rewritten = crate::pg_operators::rewrite_any_some_subquery(&rewritten);
+    // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
+    let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
+    // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.
+    let rewritten = crate::pg_operators::rewrite_aggregate_filter(&rewritten);
+    // Strip `[NOT] MATERIALIZED` hint from `WITH cte AS [NOT] MATERIALIZED (…)`.
+    let rewritten = crate::pg_operators::rewrite_cte_materialized(&rewritten);
     // Translate PG range infix operators (`@>`, `<@`, `&&`, `<<`, `>>`,
     // `-|-`) into UDF calls. Must run before sqlparser sees the SQL because
     // sqlparser's PostgreSqlDialect does not model these operators.
@@ -374,6 +398,10 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // at least one operand textually starts with a range constructor call
     // (int4range, numrange, …) so future JSONB `@>` rewrites won't collide.
     let rewritten = crate::range_udf::rewrite_range_operators(&rewritten);
+    // Rewrite `'...'::int4range` / `'...'::daterange` etc. to just `'...'`
+    // because Basin stores range values as plain Utf8; the cast suffix confuses
+    // DataFusion's planner which doesn't know these custom types.
+    let rewritten = crate::range_udf::rewrite_range_casts(&rewritten);
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
@@ -386,11 +414,18 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
     // `extract_epoch_from_interval(interval_expr)` — DataFusion's built-in
     // `EXTRACT(EPOCH FROM x)` handles timestamps but not interval values.
     let rewritten = crate::interval_tz_udf::rewrite_extract_epoch_interval(&rewritten);
-    // Rewrite `every(...)` → `bool_and(...)` — PG alias for the same aggregate.
+    // Rewrite `every(...)` → `bool_and(...) AS every` — PG alias for the same
+    // aggregate. The AS alias preserves a distinct output column name so that
+    // DataFusion doesn't see two expressions both resolving to `bool_and`.
     let rewritten = crate::pg_scalar_aliases::rewrite_every_to_bool_and(&rewritten);
     // Rewrite PG aggregate name aliases that DataFusion exposes under a
-    // different name: `variance(x)` → `var(x)`, `every(x)` → `bool_and(x)`.
+    // different name: `variance(x)` → `var(x)`.
     let rewritten = crate::udf::rewrite_pg_agg_aliases(&rewritten);
+    // Add explicit AS aliases to known aliased aggregates that would otherwise
+    // produce duplicate column names when DataFusion normalises them to the
+    // primary UDAF name: `stddev_samp(x)` → `stddev_samp(x) AS stddev_samp`;
+    // `var_samp(x)` → `var_samp(x) AS var_samp`.
+    let rewritten = crate::pg_scalar_aliases::rewrite_agg_unique_aliases(&rewritten);
     // Rewrite `'infinity'::timestamp` / `'-infinity'::timestamp` to the
     // `cast_infinity_timestamp(...)` UDF before sqlparser sees the SQL.
     let rewritten = crate::datetime_extras::rewrite_infinity_timestamp(&rewritten);
@@ -551,31 +586,36 @@ pub(crate) async fn execute(sess: &TenantSession, sql: &str) -> Result<ExecResul
             ..
         } => {
             if materialized {
-                // Continuous-aggregate path (existing behaviour).
                 let view_name = single_part_name(&name)?.to_string();
                 let opts = cv_options.unwrap_or_default();
-                if !opts.continuous {
-                    return Err(BasinError::InvalidSchema(
-                        "CREATE MATERIALIZED VIEW requires WITH (basin.continuous, \
-                         refresh_interval = '<duration>')"
-                            .into(),
-                    ));
-                }
-                let interval = opts.refresh_interval_secs.ok_or_else(|| {
-                    BasinError::InvalidSchema(
-                        "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
-                         requires refresh_interval = '<duration>'"
-                            .into(),
-                    )
-                })?;
                 let source_sql = query.to_string();
-                crate::cv_ddl::exec_create_materialized_view(
-                    sess,
-                    &view_name,
-                    &source_sql,
-                    interval,
-                )
-                .await
+                if opts.continuous {
+                    // Continuous-aggregate path: requires refresh_interval.
+                    let interval = opts.refresh_interval_secs.ok_or_else(|| {
+                        BasinError::InvalidSchema(
+                            "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
+                             requires refresh_interval = '<duration>'"
+                                .into(),
+                        )
+                    })?;
+                    crate::cv_ddl::exec_create_materialized_view(
+                        sess,
+                        &view_name,
+                        &source_sql,
+                        interval,
+                    )
+                    .await
+                } else {
+                    // Plain (snapshot) materialized view: run the query once and
+                    // persist the result as a regular table.  No automatic
+                    // refresh; use REFRESH MATERIALIZED VIEW to update.
+                    crate::cv_ddl::exec_create_snapshot_materialized_view(
+                        sess,
+                        &view_name,
+                        &source_sql,
+                    )
+                    .await
+                }
             } else {
                 // Plain view path (new).
                 let view_name = single_part_name(&name)?.to_string();
@@ -3313,4 +3353,37 @@ async fn exec_cursor_move(
     Ok(ExecResult::Empty {
         tag: "MOVE".into(),
     })
+}
+
+/// Return `true` if `sql` is one of the PG-specific identity-sequence forms
+/// that sqlparser 0.52 cannot parse:
+///
+/// - `ALTER TABLE t ALTER COLUMN col SET GENERATED ALWAYS`
+/// - `ALTER TABLE t ALTER COLUMN col SET GENERATED BY DEFAULT`
+/// - `ALTER TABLE t ALTER COLUMN col DROP IDENTITY [IF EXISTS]`
+///
+/// These are accepted as metadata-only no-ops (same policy as SET NOT NULL).
+fn match_alter_column_identity(sql: &str) -> bool {
+    // Normalise: collapse whitespace, upper-case, trim trailing semicolon.
+    let norm: String = sql
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let upper = norm.trim_end_matches(';').trim().to_ascii_uppercase();
+
+    // Must start with ALTER TABLE … ALTER COLUMN …
+    if !upper.starts_with("ALTER TABLE ") {
+        return false;
+    }
+    // Look for SET GENERATED or DROP IDENTITY anywhere after ALTER COLUMN.
+    let has_alter_column = {
+        let uc = upper.as_str();
+        uc.contains(" ALTER COLUMN ") || uc.contains(" ALTER ")
+    };
+    if !has_alter_column {
+        return false;
+    }
+    upper.contains(" SET GENERATED ALWAYS")
+        || upper.contains(" SET GENERATED BY DEFAULT")
+        || upper.contains(" DROP IDENTITY")
 }

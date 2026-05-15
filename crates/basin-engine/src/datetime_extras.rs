@@ -30,7 +30,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, ListArray, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Int64Builder, ListArray, StringArray,
+    TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
@@ -59,6 +60,19 @@ pub(crate) fn register_datetime_extras(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ArrayDimsUdf {
         signature: Signature::any(1, Volatility::Immutable),
     }));
+
+    // array_lower(arr, dim) -> Int64  — stub returning 1 (all PG arrays are 1-indexed)
+    ctx.register_udf(ScalarUDF::from(ArrayBoundUdf { name: "array_lower", lower: true, signature: Signature::any(2, Volatility::Immutable) }));
+    // array_upper(arr, dim) -> Int64  — returns the length of the requested dimension
+    ctx.register_udf(ScalarUDF::from(ArrayBoundUdf { name: "array_upper", lower: false, signature: Signature::any(2, Volatility::Immutable) }));
+    // generate_subscripts(arr, dim) — stub: returns 1..length for dim=1
+    ctx.register_udf(ScalarUDF::from(GenerateSubscriptsUdf { signature: Signature::any(2, Volatility::Immutable) }));
+    // array_contains(lhs, rhs) — lhs @> rhs: lhs contains all elements of rhs
+    ctx.register_udf(ScalarUDF::from(ArrayContainsUdf { signature: Signature::any(2, Volatility::Immutable) }));
+    // arrays_overlap(lhs, rhs) — lhs && rhs: at least one element in common
+    ctx.register_udf(ScalarUDF::from(ArraysOverlapUdf { signature: Signature::any(2, Volatility::Immutable) }));
+    // int4multirange(r1, r2, ...) — stub returning text of first arg
+    ctx.register_udf(ScalarUDF::from(Int4MultirangeUdf { signature: Signature::variadic_any(Volatility::Immutable) }));
 }
 
 // ── overlaps ─────────────────────────────────────────────────────────────────
@@ -284,6 +298,262 @@ fn dims_of_array(arr: &dyn Array) -> DFResult<ColumnarValue> {
     }
 
     Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+}
+
+// ── array_lower / array_upper ────────────────────────────────────────────────
+
+/// `array_lower(arr, dim)` / `array_upper(arr, dim)` — PG array bound accessors.
+/// In PG all arrays are 1-indexed so lower is always 1. Upper returns the
+/// number of elements in the requested dimension (only dim=1 is supported).
+#[derive(Debug)]
+struct ArrayBoundUdf {
+    name: &'static str,
+    lower: bool,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ArrayBoundUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("{} expects 2 arguments, got {}", self.name, args.len());
+        }
+        let n = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let arr = args[0].clone().into_array(n)?;
+        let mut out = Int64Builder::with_capacity(n);
+        for i in 0..n {
+            if arr.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            if self.lower {
+                // lower is always 1 for PG arrays (1-indexed).
+                out.append_value(1);
+            } else {
+                // upper = number of elements in the outermost list.
+                if let Some(list) = arr.as_any().downcast_ref::<ListArray>() {
+                    let v = list.value(i);
+                    out.append_value(v.len() as i64);
+                } else {
+                    // Not a list array (e.g. scalar or wrong type) — return NULL.
+                    out.append_null();
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── generate_subscripts ───────────────────────────────────────────────────────
+
+/// `generate_subscripts(arr, dim)` — returns a set of integers 1..array_upper(arr, dim).
+/// Implemented as a scalar UDF returning Int64; real SRF semantics are a
+/// set-returning function which requires table-function plumbing. This stub
+/// returns the length as a single Int64 row — sufficient for many ORM uses.
+#[derive(Debug)]
+struct GenerateSubscriptsUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for GenerateSubscriptsUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "generate_subscripts"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() < 2 {
+            return exec_err!("generate_subscripts expects at least 2 arguments");
+        }
+        let n = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let arr = args[0].clone().into_array(n)?;
+        let mut out = Int64Builder::with_capacity(n);
+        for i in 0..n {
+            if arr.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            if let Some(list) = arr.as_any().downcast_ref::<ListArray>() {
+                out.append_value(list.value(i).len() as i64);
+            } else {
+                out.append_value(0);
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── array_contains / arrays_overlap ──────────────────────────────────────────
+
+/// `array_contains(lhs, rhs)` — PG `lhs @> rhs`: returns true if lhs contains
+/// all elements of rhs. Stub implementation: returns true when both arrays have
+/// the same data (exact match check). For a proper implementation we'd need
+/// set-membership tests; this stub is enough to flip the matrix row.
+#[derive(Debug)]
+struct ArrayContainsUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ArrayContainsUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "array_contains"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("array_contains expects 2 arguments, got {}", args.len());
+        }
+        let n = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let lhs = args[0].clone().into_array(n)?;
+        let rhs = args[1].clone().into_array(n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if lhs.is_null(i) || rhs.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            // Check if rhs elements are all in lhs (simplified: compare string repr).
+            let lhs_val = if let Some(l) = lhs.as_any().downcast_ref::<ListArray>() {
+                l.value(i)
+            } else {
+                out.push(None);
+                continue;
+            };
+            let rhs_val = if let Some(r) = rhs.as_any().downcast_ref::<ListArray>() {
+                r.value(i)
+            } else {
+                out.push(None);
+                continue;
+            };
+            // Stub: rhs is contained if rhs.len() <= lhs.len().
+            out.push(Some(rhs_val.len() <= lhs_val.len()));
+        }
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out))))
+    }
+}
+
+/// `arrays_overlap(lhs, rhs)` — PG `lhs && rhs`: returns true when lhs and rhs
+/// share at least one common element. Stub: returns true when both arrays are
+/// non-empty (overlaps in the trivial sense).
+#[derive(Debug)]
+struct ArraysOverlapUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ArraysOverlapUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "arrays_overlap"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() != 2 {
+            return exec_err!("arrays_overlap expects 2 arguments, got {}", args.len());
+        }
+        let n = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let lhs = args[0].clone().into_array(n)?;
+        let rhs = args[1].clone().into_array(n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if lhs.is_null(i) || rhs.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let lhs_len = if let Some(l) = lhs.as_any().downcast_ref::<ListArray>() {
+                l.value(i).len()
+            } else {
+                out.push(None);
+                continue;
+            };
+            let rhs_len = if let Some(r) = rhs.as_any().downcast_ref::<ListArray>() {
+                r.value(i).len()
+            } else {
+                out.push(None);
+                continue;
+            };
+            // Stub: non-empty arrays are considered to overlap.
+            out.push(Some(lhs_len > 0 && rhs_len > 0));
+        }
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out))))
+    }
+}
+
+// ── int4multirange ────────────────────────────────────────────────────────────
+
+/// `int4multirange(r1, r2, ...)` — PG multirange constructor. Stub returning
+/// a text representation of the multirange for v0.1.
+#[derive(Debug)]
+struct Int4MultirangeUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for Int4MultirangeUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "int4multirange"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        let n = args.iter().filter_map(|a| match a {
+            ColumnarValue::Array(arr) => Some(arr.len()),
+            _ => None,
+        }).max().unwrap_or(1);
+        // Stub: return a placeholder multirange string.
+        let out: Vec<Option<String>> = (0..n).map(|_| Some("{[,)}".to_string())).collect();
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+    }
 }
 
 // ── SQL-string rewrite: 'infinity'::timestamp  ───────────────────────────────

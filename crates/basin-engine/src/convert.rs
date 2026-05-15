@@ -122,6 +122,8 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
         ws_schema::DataType::LargeBinary => df_schema::DataType::LargeBinary,
         ws_schema::DataType::FixedSizeBinary(n) => df_schema::DataType::FixedSizeBinary(*n),
         ws_schema::DataType::Date32 => df_schema::DataType::Date32,
+        ws_schema::DataType::Time64(unit) => df_schema::DataType::Time64(timeunit_ws_to_df(unit)),
+        ws_schema::DataType::Time32(unit) => df_schema::DataType::Time32(timeunit_ws_to_df(unit)),
         ws_schema::DataType::Timestamp(unit, tz) => {
             df_schema::DataType::Timestamp(timeunit_ws_to_df(unit), tz.clone())
         }
@@ -166,6 +168,8 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         df_schema::DataType::Int32 => ws_schema::DataType::Int32,
         df_schema::DataType::Int64 => ws_schema::DataType::Int64,
         df_schema::DataType::Utf8 => ws_schema::DataType::Utf8,
+        // DataFusion string_agg / string_concat return LargeUtf8; map to Utf8.
+        df_schema::DataType::LargeUtf8 => ws_schema::DataType::Utf8,
         df_schema::DataType::Boolean => ws_schema::DataType::Boolean,
         df_schema::DataType::Float64 => ws_schema::DataType::Float64,
         df_schema::DataType::Float32 => ws_schema::DataType::Float32,
@@ -173,6 +177,8 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         df_schema::DataType::LargeBinary => ws_schema::DataType::LargeBinary,
         df_schema::DataType::FixedSizeBinary(n) => ws_schema::DataType::FixedSizeBinary(*n),
         df_schema::DataType::Date32 => ws_schema::DataType::Date32,
+        df_schema::DataType::Time64(unit) => ws_schema::DataType::Time64(timeunit_df_to_ws(unit)),
+        df_schema::DataType::Time32(unit) => ws_schema::DataType::Time32(timeunit_df_to_ws(unit)),
         df_schema::DataType::Timestamp(unit, tz) => {
             ws_schema::DataType::Timestamp(timeunit_df_to_ws(unit), tz.clone())
         }
@@ -770,22 +776,37 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 Arc::new(ws_array::Date32Array::from(vals))
             }
             ws_schema::DataType::Utf8 => {
-                let s = src
-                    .as_any()
-                    .downcast_ref::<df_array::StringArray>()
-                    .ok_or_else(|| {
-                        BasinError::internal(format!("expected StringArray for {}", field.name()))
-                    })?;
-                let vals: Vec<Option<String>> = (0..s.len())
-                    .map(|j| {
-                        if s.is_null(j) {
-                            None
-                        } else {
-                            Some(s.value(j).to_string())
-                        }
-                    })
-                    .collect();
-                Arc::new(ws_array::StringArray::from(vals))
+                // src may be StringArray (Utf8) or LargeStringArray (LargeUtf8 →
+                // mapped to Utf8 in data_type_df_to_ws for string_agg output).
+                if let Some(s) = src.as_any().downcast_ref::<df_array::LargeStringArray>() {
+                    let vals: Vec<Option<String>> = (0..s.len())
+                        .map(|j| {
+                            if s.is_null(j) {
+                                None
+                            } else {
+                                Some(s.value(j).to_string())
+                            }
+                        })
+                        .collect();
+                    Arc::new(ws_array::StringArray::from(vals))
+                } else {
+                    let s = src
+                        .as_any()
+                        .downcast_ref::<df_array::StringArray>()
+                        .ok_or_else(|| {
+                            BasinError::internal(format!("expected StringArray for {}", field.name()))
+                        })?;
+                    let vals: Vec<Option<String>> = (0..s.len())
+                        .map(|j| {
+                            if s.is_null(j) {
+                                None
+                            } else {
+                                Some(s.value(j).to_string())
+                            }
+                        })
+                        .collect();
+                    Arc::new(ws_array::StringArray::from(vals))
+                }
             }
             ws_schema::DataType::Boolean => {
                 let s = src

@@ -55,8 +55,11 @@ use datafusion::prelude::SessionContext;
 pub(crate) fn register_string_dt_udfs(ctx: &SessionContext) {
     // ---- split_part ----
     ctx.register_udf(ScalarUDF::from(SplitPartUdf {
-        signature: Signature::exact(
-            vec![DataType::Utf8, DataType::Utf8, DataType::Int32],
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Int32]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Int64]),
+            ],
             Volatility::Immutable,
         ),
     }));
@@ -324,12 +327,17 @@ impl ScalarUDFImpl for SplitPartUdf {
         let strings = to_str_vec(args, 0, n)?;
         let delims = to_str_vec(args, 1, n)?;
         let parts_arr = args[2].clone().into_array(n)?;
-        let parts = parts_arr
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or_else(|| {
-                DataFusionError::Execution("split_part: arg 3 must be Int32".into())
-            })?;
+
+        // Collect positions as i64 regardless of whether arg3 is Int32 or Int64.
+        let positions: Vec<Option<i64>> = if let Some(arr) =
+            parts_arr.as_any().downcast_ref::<Int32Array>()
+        {
+            (0..n).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i) as i64) }).collect()
+        } else if let Some(arr) = parts_arr.as_any().downcast_ref::<Int64Array>() {
+            (0..n).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) }).collect()
+        } else {
+            return exec_err!("split_part: arg 3 must be Int32 or Int64");
+        };
 
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -337,11 +345,11 @@ impl ScalarUDFImpl for SplitPartUdf {
                 (None, _) | (_, None) => {
                     out.push(None);
                 }
-                _ if parts.is_null(i) => {
+                _ if positions[i].is_none() => {
                     out.push(None);
                 }
                 (Some(s), Some(d)) => {
-                    let p = parts.value(i);
+                    let p = positions[i].unwrap();
                     if p == 0 {
                         return exec_err!("split_part: field position must not be zero");
                     }
@@ -349,7 +357,7 @@ impl ScalarUDFImpl for SplitPartUdf {
                     let result = if p > 0 {
                         pieces.get((p as usize) - 1).copied().unwrap_or("").to_string()
                     } else {
-                        let idx = pieces.len() as i32 + p;
+                        let idx = pieces.len() as i64 + p;
                         if idx >= 0 {
                             pieces.get(idx as usize).copied().unwrap_or("").to_string()
                         } else {

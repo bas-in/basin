@@ -894,6 +894,30 @@ const RANGE_CTOR_KEYWORDS: &[&str] = &[
     "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
 ];
 
+/// Rewrite range type cast suffixes like `'[1,10)'::int4range` to just
+/// `'[1,10)'`. Basin stores range values as plain Utf8 strings; the cast
+/// target is not a type DataFusion understands so we strip it.
+pub(crate) fn rewrite_range_casts(sql: &str) -> String {
+    let mut s = sql.to_string();
+    // Case-insensitive replacement of `::int4range`, `::daterange`, etc.
+    // (with or without whitespace between `::` and the type name).
+    for kw in RANGE_CTOR_KEYWORDS {
+        let pattern = format!("::{}", kw);
+        // Case-insensitive search.
+        let lower = s.to_lowercase();
+        let mut positions: Vec<usize> = Vec::new();
+        let mut search_start = 0;
+        while let Some(pos) = lower[search_start..].find(pattern.as_str()) {
+            positions.push(search_start + pos);
+            search_start += pos + pattern.len();
+        }
+        for pos in positions.into_iter().rev() {
+            s.replace_range(pos..pos + pattern.len(), "");
+        }
+    }
+    s
+}
+
 /// Rewrite PostgreSQL range infix operators to UDF calls before handing SQL
 /// to sqlparser / DataFusion, which don't understand these operators.
 ///
@@ -1129,6 +1153,21 @@ fn range_extract_right(s: &str, start: usize) -> (usize, usize) {
                 continue;
             }
             i += 1;
+        }
+        // If the identifier is immediately followed by `(`, it's a function call.
+        // Consume the entire argument list so that `int4range(5,15)` is captured
+        // as a single operand rather than just the bare name `int4range`.
+        if i < bytes.len() && bytes[i] == b'(' {
+            let mut depth = 1i32;
+            i += 1;
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
         }
     }
     (operand_start, i)

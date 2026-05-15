@@ -899,6 +899,715 @@ fn array_extract_right(s: &str, start: usize) -> (usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// ANY / SOME / ALL subquery rewrites
+// ---------------------------------------------------------------------------
+
+/// Rewrite quantified subquery comparisons to forms DataFusion can execute.
+///
+/// - `expr = ANY (subquery)`  → `expr IN (subquery)`
+/// - `expr = SOME (subquery)` → `expr IN (subquery)`
+/// - `expr > ALL (SELECT col FROM t)`  → `expr > (SELECT MAX(col) FROM t)`
+/// - `expr >= ALL (SELECT col FROM t)` → `expr >= (SELECT MAX(col) FROM t)`
+/// - `expr < ALL (SELECT col FROM t)`  → `expr < (SELECT MIN(col) FROM t)`
+/// - `expr <= ALL (SELECT col FROM t)` → `expr <= (SELECT MIN(col) FROM t)`
+///
+/// DataFusion's `= ANY (subquery)` planner has type-coercion issues; `IN
+/// (subquery)` is the standard SQL equivalent and works reliably.
+/// `OP ALL` is rewritten using aggregate scalar subqueries.
+pub(crate) fn rewrite_any_some_subquery(sql: &str) -> String {
+    // `= ANY (...)` → `IN (...)`
+    let s = rewrite_quantified_op(sql, "= any", "IN");
+    // `= SOME (...)` → `IN (...)`
+    let s = rewrite_quantified_op(&s, "= some", "IN");
+    // `> ALL (SELECT col FROM t)` → `> (SELECT MAX(col) FROM t)`
+    let s = rewrite_all_subquery(&s);
+    s
+}
+
+/// Rewrite `expr OP ALL (SELECT single_expr FROM ...)` to scalar subquery form.
+///
+/// - `> ALL`  → `> (SELECT MAX(...))`
+/// - `>= ALL` → `>= (SELECT MAX(...))`
+/// - `< ALL`  → `< (SELECT MIN(...))`
+/// - `<= ALL` → `<= (SELECT MIN(...))`
+/// - `<> ALL` / `!= ALL` → `NOT IN (...)`
+///
+/// Only handles simple single-column subqueries. Complex subqueries
+/// (UNION, aggregates, etc.) are left untouched.
+fn rewrite_all_subquery(sql: &str) -> String {
+    let mut s = sql.to_string();
+    // Pairs: (op, aggregate_fn) — longer operators first.
+    const OPS: &[(&str, &str)] = &[
+        (">= all", "MAX"),
+        ("<= all", "MIN"),
+        ("> all",  "MAX"),
+        ("< all",  "MIN"),
+        // <> ALL / != ALL → NOT IN
+        ("<> all", "NOT_IN"),
+        ("!= all", "NOT_IN"),
+    ];
+    for (op_lower, agg) in OPS {
+        s = rewrite_one_all_op(&s, op_lower, agg);
+    }
+    s
+}
+
+fn rewrite_one_all_op(sql: &str, op_lower: &str, agg: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + op_lower.len();
+        let bytes = s.as_bytes();
+
+        // Word boundary after `all`.
+        let post_ok = kw_end >= s.len() || {
+            let b = bytes[kw_end];
+            b == b'(' || b == b' ' || b == b'\t' || b == b'\n'
+        };
+        if !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // After keyword, skip whitespace and find `(`.
+        let mut j = kw_end;
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || s.as_bytes()[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Find the matching `)` for the subquery.
+        let Some(subq_end) = find_matching_close_paren(&s, j) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        // Extract the subquery body (without outer parens).
+        let subq_body = s[j + 1..subq_end].trim().to_string();
+
+        // For NOT IN, just replace `OP ALL (subq)` with `NOT IN (subq)`.
+        if agg == "NOT_IN" {
+            // Replace `op_lower (subq)` with `NOT IN (subq)`.
+            let op_part = &op_lower[..op_lower.len() - 4]; // strip " all"
+            let replacement = format!("{op_part} NOT IN ({subq_body})");
+            s.replace_range(kw_start..subq_end + 1, &replacement);
+            search_from = kw_start + replacement.len();
+            continue;
+        }
+
+        // Parse the subquery: must be `SELECT expr FROM ...` with no GROUP BY,
+        // HAVING, LIMIT, UNION — keep it simple.
+        let subq_lower = subq_body.to_ascii_lowercase();
+        if !subq_lower.trim_start().starts_with("select ") {
+            search_from = kw_end;
+            continue;
+        }
+        // Reject complex subqueries to avoid incorrect rewrites.
+        if subq_lower.contains("group by")
+            || subq_lower.contains("having")
+            || subq_lower.contains(" union ")
+            || subq_lower.contains(" intersect ")
+            || subq_lower.contains(" except ")
+        {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Extract the SELECT expression (between `SELECT ` and `FROM `).
+        // Naive: find `FROM` at depth 0 after `SELECT`.
+        let after_select = subq_body.trim_start();
+        let sel_offset = after_select.to_ascii_lowercase().find("select ").unwrap_or(0) + 7;
+        let from_lower = after_select.to_ascii_lowercase();
+        let Some(from_pos) = find_from_at_depth0(&from_lower, sel_offset) else {
+            search_from = kw_end;
+            continue;
+        };
+        let col_expr = after_select[sel_offset..from_pos].trim().to_string();
+        let from_clause = &after_select[from_pos..]; // includes `FROM ...`
+
+        // Build the replacement: `op (SELECT AGG(col_expr) FROM ...)`.
+        let op_str = &op_lower[..op_lower.len() - 4].trim(); // strip " all"
+        let replacement = format!("{op_str} (SELECT {agg}({col_expr}) {from_clause})");
+        s.replace_range(kw_start..subq_end + 1, &replacement);
+        search_from = kw_start + replacement.len();
+    }
+    s
+}
+
+/// Find the `FROM` keyword at depth 0 (outside parens) starting from `offset`.
+fn find_from_at_depth0(lower: &str, offset: usize) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut depth = 0i32;
+    let mut i = offset;
+    while i < lower.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => { if depth > 0 { depth -= 1; } }
+            b'\'' => {
+                i += 1;
+                while i < lower.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {
+                if depth == 0 && lower[i..].starts_with("from ") {
+                    let pre_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                    if pre_ok { return Some(i); }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Replace `expr OP keyword (subquery)` with `expr new_op (subquery)`.
+fn rewrite_quantified_op(sql: &str, op_kw: &str, new_op: &str) -> String {
+    // `op_kw` is lowercase, e.g. `"= any"` or `"= some"`.
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(op_kw) else { break; };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + op_kw.len();
+        let bytes = s.as_bytes();
+
+        // Word boundary after keyword: must be followed by `(` or whitespace.
+        let post_ok = kw_end >= s.len() || {
+            let b = bytes[kw_end];
+            b == b'(' || b == b' ' || b == b'\t' || b == b'\n'
+        };
+        if !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+        // Word boundary before: the char before `=` must not be alphanumeric.
+        // (kw_start points to `=` in `= any`; before that is whitespace from expr end)
+        let pre_ok = kw_start == 0 || !bytes[kw_start - 1].is_ascii_alphanumeric();
+        if !pre_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // After keyword, skip whitespace and find `(`.
+        let mut j = kw_end;
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || s.as_bytes()[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+        // Replace `= any (` / `= some (` with `IN (`.
+        // The replacement starts at kw_start (the `=`).
+        let replace_end = j + 1; // include the `(`
+        let replacement = format!("{new_op} (");
+        s.replace_range(kw_start..replace_end, &replacement);
+        search_from = kw_start + replacement.len();
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Bitwise operator rewrites
+// ---------------------------------------------------------------------------
+
+/// Rewrite PG bitwise operators that DataFusion's GenericDialect parser
+/// cannot handle:
+///
+/// - `A # B`  → `A ^ B`   (PG bitwise XOR; DataFusion GenericDialect maps `^`
+///                          to BitwiseXor, but `#` is unknown to it)
+/// - `~expr`  → `(-1 ^ expr)` (PG unary bitwise NOT = XOR with all-ones mask)
+///
+/// The `#` rewrite is purely character-level: replace each bare `#` that is
+/// not inside a string literal with `^`.
+///
+/// The `~` unary rewrite only fires for an isolated `~` that is **not**
+/// followed by `*` or preceded by `!` (those are regex operators handled
+/// by `rewrite_posix_regex_operators`). The pattern
+/// `SELECT ~expr` / `WHERE ~expr` is re-spelled `(-1 ^ expr)` so that
+/// DataFusion's generic XOR operator evaluates it.
+pub(crate) fn rewrite_pg_bitwise_operators(sql: &str) -> String {
+    // Step 1: rewrite `A # B` → `A ^ B` (bitwise XOR).
+    // `#` inside string literals is skipped.
+    let s = rewrite_bitwise_xor_hash(sql);
+    // Step 2: rewrite unary `~ expr` → `(-1 ^ (expr))`.
+    rewrite_unary_bitwise_not(&s)
+}
+
+fn rewrite_bitwise_xor_hash(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Skip single-quoted string literals.
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < bytes.len() { i += 1; }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Replace `#` that is NOT part of `#>` or `#>>` (JSON operators) or
+        // `#"` (quoted identifier start in some dialects). Plain `#` between
+        // tokens is the PG bitwise XOR.
+        if bytes[i] == b'#' {
+            let next = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+            if next == b'>' || next == b'"' {
+                // `#>` / `#>>` / `#"` — pass through.
+                out.push('#');
+            } else {
+                // PG bitwise XOR: `A # B` → `A ^ B`.
+                out.push('^');
+            }
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn rewrite_unary_bitwise_not(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 16);
+    let mut i = 0usize;
+    while i < len {
+        // Skip string literals.
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != b'"' { i += 1; }
+            if i < len { i += 1; }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Look for `~` that is:
+        //   - not preceded by `!` (regex operators — already rewritten)
+        //   - not followed by `*` (regex operators)
+        //   - not followed by `~` (double-tilde = LIKE)
+        //   - followed only by whitespace / `(` / digit / identifier start
+        if bytes[i] == b'~' {
+            let preceded_by_bang = i > 0 && bytes[i - 1] == b'!';
+            let next = if i + 1 < len { bytes[i + 1] } else { 0 };
+            let followed_by_star = next == b'*';
+            let followed_by_tilde = next == b'~';
+            if !preceded_by_bang && !followed_by_star && !followed_by_tilde {
+                // This looks like a unary bitwise NOT.
+                // Extract the expression that follows.
+                let expr_start = i + 1;
+                // Skip whitespace.
+                let mut j = expr_start;
+                while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
+                // Collect the operand expression: parenthesised group or simple token.
+                let (_, expr_end) = array_extract_right_pub(sql, j);
+                let operand = sql[j..expr_end].trim();
+                let replacement = format!("(-1 ^ ({operand}))");
+                out.push_str(&replacement);
+                i = expr_end;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+// Re-export the internal right-extraction helper so `rewrite_unary_bitwise_not`
+// can call it without duplication.
+fn array_extract_right_pub(s: &str, start: usize) -> (usize, usize) {
+    array_extract_right(s, start)
+}
+
+// ---------------------------------------------------------------------------
+// OVERLAPS rewrite
+// ---------------------------------------------------------------------------
+
+/// Rewrite PG `(s1, e1) OVERLAPS (s2, e2)` to `overlaps(s1, e1, s2, e2)`.
+///
+/// The PG `OVERLAPS` predicate checks whether two time intervals share any
+/// point: `(S1, E1) OVERLAPS (S2, E2)`. DataFusion doesn't understand this
+/// syntax, but Basin registers an `overlaps(s1, e1, s2, e2)` UDF. This
+/// textual rewrite converts the PG tuple form to the UDF call form.
+///
+/// Only rewrites the exact pattern `(expr, expr) OVERLAPS (expr, expr)`;
+/// leaves everything else untouched.
+pub(crate) fn rewrite_overlaps(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower_view = s.to_ascii_lowercase();
+        // Find `overlaps` keyword.
+        let Some(rel) = lower_view[search_from..].find("overlaps") else {
+            break;
+        };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + 8;
+
+        // Must be a word boundary.
+        let pre_ok = kw_start == 0 || !s.as_bytes()[kw_start - 1].is_ascii_alphanumeric();
+        let post_ok = kw_end >= s.len() || !s.as_bytes()[kw_end].is_ascii_alphanumeric();
+        if !pre_ok || !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Require `(expr, expr)` on the right.
+        let mut j = kw_end;
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || s.as_bytes()[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+        // Parse right tuple: `(e1, e2)`.
+        let rhs_paren_start = j;
+        let Some((r1, r2, rhs_paren_end)) = parse_two_tuple(&s, rhs_paren_start) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        // Look back for `(expr, expr)` before OVERLAPS.
+        let before = &s[..kw_start];
+        let trimmed_before = before.trim_end();
+        if !trimmed_before.ends_with(')') {
+            search_from = kw_end;
+            continue;
+        }
+        // Find the matching opening `(` for the left tuple.
+        let lhs_paren_end_in_full = kw_start - (before.len() - trimmed_before.len()); // exclusive
+        let Some(lhs_paren_start) =
+            find_matching_open_paren(&s, lhs_paren_end_in_full - 1) else {
+            search_from = kw_end;
+            continue;
+        };
+        let Some((l1, l2, _)) = parse_two_tuple(&s, lhs_paren_start) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        let replacement = format!("overlaps({l1}, {l2}, {r1}, {r2})");
+        s.replace_range(lhs_paren_start..rhs_paren_end, &replacement);
+        search_from = lhs_paren_start + replacement.len();
+    }
+    let _ = lower; // suppress unused warning
+    s
+}
+
+/// Parse `(expr, expr)` starting at `start` (the opening paren).
+/// Returns `(expr1_str, expr2_str, end_exclusive)` or `None`.
+fn parse_two_tuple(s: &str, start: usize) -> Option<(String, String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'(') {
+        return None;
+    }
+    let mut i = start + 1;
+    // Skip whitespace.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    // Parse first expression up to `,` at depth 0.
+    let e1_start = i;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 { return None; } // no comma found
+                depth -= 1;
+            }
+            b',' if depth == 0 => break,
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b',' { return None; }
+    let e1 = s[e1_start..i].trim().to_string();
+    i += 1; // skip comma
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    let e2_start = i;
+    depth = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 { break; }
+                depth -= 1;
+            }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b')' { return None; }
+    let e2 = s[e2_start..i].trim().to_string();
+    Some((e1, e2, i + 1))
+}
+
+/// Walk backwards from `close_paren` (index of the `)`) to find the matching `(`.
+fn find_matching_open_paren(s: &str, close_paren: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(close_paren) != Some(&b')') { return None; }
+    let mut depth = 1i32;
+    let mut i = close_paren;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 { return Some(i); }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// FILTER (WHERE ...) rewrite for aggregate functions
+// ---------------------------------------------------------------------------
+
+/// Rewrite `agg(args) FILTER (WHERE cond)` to an inline CASE WHEN form.
+///
+/// DataFusion's internal SQL parser (GenericDialect) doesn't support the
+/// `FILTER (WHERE ...)` clause on aggregates, even though DataFusion's
+/// logical plan supports filtered aggregation. This textual rewrite converts
+/// the PG-standard form to the CASE-expression equivalent that DataFusion
+/// *does* parse:
+///
+/// - `COUNT(*) FILTER (WHERE cond)` → `COUNT(CASE WHEN cond THEN 1 END)`
+/// - `SUM(x) FILTER (WHERE cond)`   → `SUM(CASE WHEN cond THEN x END)`
+/// - `agg(x) FILTER (WHERE cond)`   → `agg(CASE WHEN cond THEN x END)`
+///
+/// Only fires on `FILTER` that appears outside string literals and is
+/// preceded by `)` (end of the aggregate's argument list).
+pub(crate) fn rewrite_aggregate_filter(sql: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        // Find `FILTER` keyword at or after `search_from`.
+        let Some(rel) = lower[search_from..].find("filter") else { break; };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + 6;
+        let bytes = s.as_bytes();
+
+        // Word boundary checks.
+        let pre_ok = kw_start == 0 || !bytes[kw_start - 1].is_ascii_alphanumeric();
+        let post_ok = kw_end >= s.len() || !bytes[kw_end].is_ascii_alphanumeric();
+        if !pre_ok || !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Must be preceded (after whitespace) by `)` — end of aggregate args.
+        let before = s[..kw_start].trim_end();
+        if !before.ends_with(')') {
+            search_from = kw_end;
+            continue;
+        }
+
+        // After FILTER there must be `(WHERE ...)`.
+        let mut j = kw_end;
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || s.as_bytes()[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+        let filter_paren_start = j;
+        let filter_lower = s.to_ascii_lowercase();
+        if !filter_lower[filter_paren_start + 1..].trim_start().starts_with("where") {
+            search_from = kw_end;
+            continue;
+        }
+        // Find the matching `)` for the FILTER clause.
+        let Some(filter_paren_end) =
+            find_matching_close_paren(&s, filter_paren_start) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        // Extract the condition (everything inside `(WHERE ...)`).
+        let inner = s[filter_paren_start + 1..filter_paren_end].trim();
+        // Strip leading `WHERE` keyword.
+        let cond = if inner.to_ascii_lowercase().starts_with("where") {
+            inner[5..].trim().to_string()
+        } else {
+            inner.to_string()
+        };
+
+        // Find the matching `(` for the aggregate's argument list.
+        let agg_close_paren = kw_start - (s[..kw_start].len() - before.len()) - 1;
+        let Some(agg_open_paren) = find_matching_open_paren(&s, agg_close_paren) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        // Extract the function name (everything before the opening `(`).
+        let func_name = s[..agg_open_paren].trim_end();
+        let func_start = {
+            let fb = func_name.as_bytes();
+            let mut k = func_name.len();
+            while k > 0 && (fb[k-1].is_ascii_alphanumeric() || fb[k-1] == b'_') { k -= 1; }
+            k
+        };
+        let fname = &func_name[func_start..];
+
+        // Extract the original args inside the aggregate.
+        let orig_args = s[agg_open_paren + 1..agg_close_paren].trim().to_string();
+
+        // Build the replacement.
+        let case_expr = if orig_args == "*" {
+            // COUNT(*) FILTER (WHERE cond) → COUNT(CASE WHEN cond THEN 1 END)
+            format!("CASE WHEN {cond} THEN 1 END")
+        } else {
+            format!("CASE WHEN {cond} THEN {orig_args} END")
+        };
+        let replacement = format!("{fname}({case_expr})");
+
+        // Replace from agg_open_paren - func_name_len .. filter_paren_end+1.
+        let replace_start = func_start;
+        s.replace_range(replace_start..filter_paren_end + 1, &replacement);
+        search_from = replace_start + replacement.len();
+    }
+    s
+}
+
+/// Find the matching `)` for an opening `(` at `open_paren`.
+fn find_matching_close_paren(s: &str, open_paren: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(open_paren) != Some(&b'(') { return None; }
+    let mut depth = 1i32;
+    let mut i = open_paren + 1;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth == 0 { Some(i - 1) } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// WITH ... [NOT] MATERIALIZED hint strip
+// ---------------------------------------------------------------------------
+
+/// Strip the `[NOT] MATERIALIZED` hint from `WITH cte AS MATERIALIZED (...)`.
+///
+/// DataFusion's sqlparser doesn't parse this optional PG syntax hint.
+/// The hint is purely advisory (it affects PG's CTE materialisation decision)
+/// and can be dropped without changing query semantics for Basin's purposes.
+///
+/// Rewrites:
+/// - `WITH cte AS MATERIALIZED (...)` → `WITH cte AS (...)`
+/// - `WITH cte AS NOT MATERIALIZED (...)` → `WITH cte AS (...)`
+pub(crate) fn rewrite_cte_materialized(sql: &str) -> String {
+    // Replace `AS NOT MATERIALIZED (` → `AS (` (longer match first).
+    let s = rewrite_cte_keyword(sql, "as not materialized (", "AS (");
+    rewrite_cte_keyword(&s, "as materialized (", "AS (")
+}
+
+fn rewrite_cte_keyword(sql: &str, needle_lower: &str, replacement: &str) -> String {
+    let mut s = sql.to_string();
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(pos) = lower.find(needle_lower) else { break; };
+        // Word boundary before `as`.
+        let pre_ok = pos == 0 || !s.as_bytes()[pos - 1].is_ascii_alphanumeric();
+        if !pre_ok {
+            // Avoid infinite loop: move past this occurrence.
+            break;
+        }
+        // Replace the keyword (keep existing paren; replacement ends with `AS (`).
+        s.replace_range(pos..pos + needle_lower.len(), replacement);
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 

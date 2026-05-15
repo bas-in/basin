@@ -141,7 +141,7 @@ static MATRIX: &[Entry] = &[
     (
         "DDL/Tables",
         "CREATE TABLE t (id INT REFERENCES u(id))",
-        &["CREATE TABLE u (id INT NOT NULL)"],
+        &["CREATE TABLE u (id INT PRIMARY KEY)"],
         &["DROP TABLE t", "DROP TABLE u"],
     ),
     (
@@ -328,7 +328,7 @@ static MATRIX: &[Entry] = &[
     (
         "DDL/Other",
         "DROP SCHEMA s",
-        &[],
+        &["CREATE SCHEMA s"],
         &[],
     ),
     (
@@ -406,13 +406,13 @@ static MATRIX: &[Entry] = &[
     (
         "DDL/Other",
         "DROP VIEW v",
-        &["CREATE TABLE t (id INT NOT NULL)"],
+        &["CREATE TABLE t (id INT NOT NULL)", "CREATE VIEW v AS SELECT * FROM t"],
         &["DROP TABLE t"],
     ),
     (
         "DDL/Other",
         "CREATE MATERIALIZED VIEW mv AS SELECT * FROM t",
-        &["CREATE TABLE t (id INT NOT NULL)"],
+        &["CREATE TABLE t (id INT NOT NULL)", "INSERT INTO t VALUES (1)"],
         &["DROP TABLE t"],
     ),
     (
@@ -420,6 +420,7 @@ static MATRIX: &[Entry] = &[
         "REFRESH MATERIALIZED VIEW mv",
         &[
             "CREATE TABLE t (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1)",
             "CREATE MATERIALIZED VIEW mv WITH (basin.continuous, refresh_interval = '1h') AS SELECT * FROM t",
         ],
         &["DROP TABLE t"],
@@ -429,6 +430,7 @@ static MATRIX: &[Entry] = &[
         "DROP MATERIALIZED VIEW mv",
         &[
             "CREATE TABLE t (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1)",
             "CREATE MATERIALIZED VIEW mv WITH (basin.continuous, refresh_interval = '1h') AS SELECT * FROM t",
         ],
         &["DROP TABLE t"],
@@ -556,7 +558,7 @@ static MATRIX: &[Entry] = &[
         "DML",
         "UPDATE t SET id = 1 FROM u WHERE t.id = u.id",
         &[
-            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE t (id INT PRIMARY KEY)",
             "CREATE TABLE u (id INT NOT NULL)",
             "INSERT INTO t VALUES (1)",
             "INSERT INTO u VALUES (1)",
@@ -596,7 +598,7 @@ static MATRIX: &[Entry] = &[
         "DML",
         "DELETE FROM t USING u WHERE t.id = u.id",
         &[
-            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE TABLE t (id INT PRIMARY KEY)",
             "CREATE TABLE u (id INT NOT NULL)",
             "INSERT INTO t VALUES (1)",
             "INSERT INTO u VALUES (1)",
@@ -2798,13 +2800,13 @@ static MATRIX: &[Entry] = &[
     (
         "Admin/Sessions",
         "FETCH 1 FROM c",
-        &[],
+        &["DECLARE c CURSOR FOR SELECT 1"],
         &[],
     ),
     (
         "Admin/Sessions",
         "CLOSE c",
-        &[],
+        &["DECLARE c CURSOR FOR SELECT 1"],
         &[],
     ),
     (

@@ -272,6 +272,78 @@ fn register_all(ctx: &SessionContext) {
         name: "pg_catalog.has_schema_privilege".into(),
         signature: sig_priv,
     }));
+
+    // ----------- pg_advisory_lock / pg_advisory_unlock / pg_try_advisory_lock -----------
+    // Advisory locks are no-ops in Basin (no distributed lock manager in v0.1).
+    let sig_advisory = Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![DataType::Int64]),
+            TypeSignature::Exact(vec![DataType::Int32]),
+            TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+            TypeSignature::Exact(vec![DataType::Int32, DataType::Int32]),
+        ],
+        Volatility::Volatile,
+    );
+    ctx.register_udf(ScalarUDF::from(VoidNullArgUdf {
+        name: "pg_advisory_lock".into(),
+        signature: sig_advisory.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(VoidNullArgUdf {
+        name: "pg_advisory_unlock".into(),
+        signature: sig_advisory.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(SimpleConstBoolUdf {
+        name: "pg_try_advisory_lock".into(),
+        value: true,
+        signature: sig_advisory,
+    }));
+
+    // ----------- pg_typeof -----------
+    // Returns the type of the argument as a text string.  Best-effort: we
+    // cannot easily introspect Arrow types here so return "unknown".
+    let sig_any = Signature::variadic_any(Volatility::Stable);
+    ctx.register_udf(ScalarUDF::from(SimpleConstTextUdf {
+        name: "pg_typeof".into(),
+        value: "unknown".into(),
+        signature: sig_any.clone(),
+    }));
+
+    // ----------- pg_size_pretty -----------
+    let sig_size = Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![DataType::Int64]),
+            TypeSignature::Exact(vec![DataType::Int32]),
+            TypeSignature::Exact(vec![DataType::UInt32]),
+        ],
+        Volatility::Immutable,
+    );
+    ctx.register_udf(ScalarUDF::from(SimpleConstTextUdf {
+        name: "pg_size_pretty".into(),
+        value: "0 bytes".into(),
+        signature: sig_size,
+    }));
+
+    // ----------- pg_column_size -----------
+    ctx.register_udf(ScalarUDF::from(SimpleConstInt64Udf {
+        name: "pg_column_size".into(),
+        value: 0,
+        signature: sig_any.clone(),
+    }));
+
+    // ----------- current_user / session_user -----------
+    // These are SQL standard keywords; DataFusion doesn't support them natively
+    // so we register them as 0-argument scalar UDFs that return a stub string.
+    let sig_nullary = Signature::nullary(Volatility::Stable);
+    ctx.register_udf(ScalarUDF::from(SimpleConstTextUdf {
+        name: "current_user".into(),
+        value: "anonymous".into(),
+        signature: sig_nullary.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(SimpleConstTextUdf {
+        name: "session_user".into(),
+        value: "anonymous".into(),
+        signature: sig_nullary,
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +885,141 @@ impl ScalarUDFImpl for HasPrivilegeUdf {
     fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));
+        Ok(ColumnarValue::Array(arr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VoidNullArgUdf — (any args) -> NULL (void stub for pg_advisory_lock etc.)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct VoidNullArgUdf {
+    name: String,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for VoidNullArgUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Null)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        let _ = args;
+        Ok(ColumnarValue::Scalar(ScalarValue::Null))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimpleConstBoolUdf — (any args) -> bool constant
+// Used for: pg_try_advisory_lock (always returns true = lock acquired)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SimpleConstBoolUdf {
+    name: String,
+    value: bool,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SimpleConstBoolUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        let n = num_rows(args);
+        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![self.value; n]));
+        Ok(ColumnarValue::Array(arr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimpleConstTextUdf — (any args) -> text constant
+// Used for: pg_typeof, pg_size_pretty, current_user, session_user
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SimpleConstTextUdf {
+    name: String,
+    value: String,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SimpleConstTextUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        let n = if args.is_empty() { 1 } else { num_rows(args) };
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![self.value.as_str(); n]));
+        Ok(ColumnarValue::Array(arr))
+    }
+    #[allow(deprecated)]
+    fn invoke_no_args(&self, _number_rows: usize) -> DFResult<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            self.value.clone(),
+        ))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimpleConstInt64Udf — (any args) -> int64 constant
+// Used for: pg_column_size
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SimpleConstInt64Udf {
+    name: String,
+    value: i64,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SimpleConstInt64Udf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        let n = num_rows(args);
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![self.value; n]));
         Ok(ColumnarValue::Array(arr))
     }
 }

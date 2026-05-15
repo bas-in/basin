@@ -154,6 +154,53 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
         ),
     }));
 
+    // ── make_timestamptz(y, mo, d, h, mi, s, tz) → Timestamp(Microsecond, UTC) ──
+    // PG: make_timestamptz(year, month, day, hour, min, sec [, timezone])
+    // Same arithmetic as make_timestamp but returns timestamptz.
+    ctx.register_udf(ScalarUDF::from(MakeTimestamptzUdf {
+        signature: Signature::one_of(
+            vec![
+                // 7-arg form with timezone string.
+                TypeSignature::Exact(vec![
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Float64,
+                    DataType::Utf8,
+                ]),
+                // 6-arg form without timezone (uses server timezone = UTC).
+                TypeSignature::Exact(vec![
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Float64,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                ]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+
     // ── make_interval — stub returning 0 interval for now ────────────────────
     // PG: make_interval(years=0, months=0, weeks=0, days=0, hours=0, mins=0, secs=0.0)
     // DataFusion has no native make_interval; register a stub that accepts
@@ -553,6 +600,80 @@ impl ScalarUDFImpl for MakeTimestampUdf {
 }
 
 // ---------------------------------------------------------------------------
+// make_timestamptz(y, mo, d, h, mi, s [, tz]) → Timestamp(Microsecond, UTC)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct MakeTimestamptzUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for MakeTimestamptzUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "make_timestamptz"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+    }
+    #[allow(deprecated)]
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        if args.len() < 6 || args.len() > 7 {
+            return exec_err!("make_timestamptz expects 6 or 7 arguments, got {}", args.len());
+        }
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let years = extract_i64(args, 0, n)?;
+        let months = extract_i64(args, 1, n)?;
+        let days = extract_i64(args, 2, n)?;
+        let hours = extract_i64(args, 3, n)?;
+        let mins = extract_i64(args, 4, n)?;
+        let secs = extract_f64(args, 5, n)?;
+        let mut out = TimestampMicrosecondBuilder::with_capacity(n);
+        for i in 0..n {
+            match (years[i], months[i], days[i], hours[i], mins[i], secs[i]) {
+                (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) => {
+                    let date = NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32)
+                        .ok_or_else(|| {
+                            datafusion::common::DataFusionError::Execution(
+                                "make_timestamptz: invalid date".into(),
+                            )
+                        })?;
+                    let whole_s = s as u32;
+                    let micros = (s.fract() * 1_000_000.0).round() as u32;
+                    let time = NaiveTime::from_hms_micro_opt(h as u32, mi as u32, whole_s, micros)
+                        .ok_or_else(|| {
+                            datafusion::common::DataFusionError::Execution(
+                                "make_timestamptz: invalid time".into(),
+                            )
+                        })?;
+                    let dt = date
+                        .and_time(time)
+                        .and_utc()
+                        .timestamp_micros();
+                    out.append_value(dt);
+                }
+                _ => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(
+            out.finish().with_timezone_opt(Some("UTC")),
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // make_interval — stub, always returns "0 seconds" as text (ORM probe only)
 // ---------------------------------------------------------------------------
 
@@ -735,12 +856,14 @@ impl ScalarUDFImpl for ToNumberUdf {
 // SQL-string rewriter: `every(...)` → `bool_and(...)`
 // ---------------------------------------------------------------------------
 
-/// Rewrite `every(...)` to `bool_and(...)` so DataFusion's aggregate planner
-/// resolves the call.  Called from the executor SQL-string pipeline alongside
-/// the vector-operator and auth-schema rewriters.
+/// Rewrite `every(...)` to `bool_and(...) AS every` so DataFusion's aggregate
+/// planner resolves the call, but the output column has a distinct name.
+/// Without the AS alias, `every(x)` and `bool_and(x)` in the same SELECT
+/// would both map to the UDAF named `bool_and` and DataFusion would reject the
+/// plan with "Projections require unique expression names".
 pub(crate) fn rewrite_every_to_bool_and(sql: &str) -> String {
     // Case-insensitive token-boundary match for `every(`.
-    let mut out = String::with_capacity(sql.len());
+    let mut out = String::with_capacity(sql.len() + 32);
     let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0;
@@ -759,8 +882,51 @@ pub(crate) fn rewrite_every_to_bool_and(sql: &str) -> String {
             let right_ok = i + 5 < len
                 && (bytes[i + 5] == b'(' || bytes[i + 5] == b' ' || bytes[i + 5] == b'\t');
             if left_ok && right_ok {
+                // Emit `bool_and` in place of `every`.
                 out.push_str("bool_and");
                 i += 5;
+                // Find the opening `(` and its matching `)`, then append
+                // ` AS every` right after the closing paren to give DataFusion
+                // a unique output column name.
+                // Skip whitespace between function name and `(`.
+                let ws_start = i;
+                while i < len && bytes[i].is_ascii_whitespace() { i += 1; }
+                if i < len && bytes[i] == b'(' {
+                    // Emit whitespace + `(` + body + `)`.
+                    let open = i;
+                    i += 1;
+                    let mut depth = 1i32;
+                    while i < len && depth > 0 {
+                        match bytes[i] {
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            b'\'' => {
+                                out.push_str(&sql[ws_start..i + 1]);
+                                // Advance inside string literal.
+                                i += 1;
+                                while i < len {
+                                    if bytes[i] == b'\'' {
+                                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                                            i += 2; continue;
+                                        }
+                                        i += 1; break;
+                                    }
+                                    i += 1;
+                                }
+                                out.push_str(&sql[open + 1..i]);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    // `i` is now past the closing `)`.
+                    out.push_str(&sql[ws_start..i]);
+                    out.push_str(" AS every");
+                } else {
+                    // Unexpected — just emit as-is (no closing paren found).
+                    out.push_str(&sql[ws_start..i]);
+                }
                 continue;
             }
         }
@@ -768,6 +934,109 @@ pub(crate) fn rewrite_every_to_bool_and(sql: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Rewrite aggregate function alias calls that would produce duplicate output
+/// column names when DataFusion normalises them to the primary UDAF name.
+///
+/// DataFusion maps `stddev_samp(x)` to the UDAF whose primary name is
+/// `stddev`, so a SELECT with both `stddev(x)` and `stddev_samp(x)` produces
+/// two columns both named `stddev(t.x)` and DataFusion rejects the plan.
+/// Adding an explicit `AS "original_name"` alias avoids the collision.
+///
+/// Handles:
+/// - `stddev_samp(...)` → `stddev_samp(...) AS stddev_samp`
+/// - `var_samp(...)` / `var(...)` coexisting with `variance(...)` — handled by
+///   the `variance → var(x) AS variance` pass in `rewrite_pg_agg_aliases`.
+pub(crate) fn rewrite_agg_unique_aliases(sql: &str) -> String {
+    // Pairs of (function_name, alias_to_add). Only add the alias when the
+    // name would collide with another function that resolves to the same UDAF.
+    // We always add the alias for these known-alias names; the extra AS clause
+    // is harmless when only one of the pair appears.
+    const ALWAYS_ALIAS: &[(&str, &str)] = &[
+        ("stddev_samp", "stddev_samp"),
+        ("var_samp",    "var_samp"),
+    ];
+    let mut s = sql.to_string();
+    for (func_name, alias) in ALWAYS_ALIAS {
+        s = add_alias_after_call(&s, func_name, alias);
+    }
+    s
+}
+
+/// For each bare call to `func_name(...)` in `sql` that is **not** already
+/// followed by `AS <something>`, append ` AS alias_name` after the closing `)`.
+fn add_alias_after_call(sql: &str, func_name: &str, alias: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(func_name) else { break; };
+        let name_start = search_from + rel;
+        let name_end = name_start + func_name.len();
+        let bytes = s.as_bytes();
+
+        // Word boundary checks.
+        let pre_ok = name_start == 0 || {
+            let b = bytes[name_start - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let post_ok = name_end >= s.len() || {
+            let b = bytes[name_end];
+            b == b'(' || b == b' ' || b == b'\t' || b == b'\n'
+        };
+        if !pre_ok || !post_ok {
+            search_from = name_end;
+            continue;
+        }
+
+        // Find the opening `(`.
+        let mut j = name_end;
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || s.as_bytes()[j] != b'(' {
+            search_from = name_end;
+            continue;
+        }
+        // Find the matching `)`.
+        let open = j;
+        let mut k = open + 1;
+        let mut depth = 1i32;
+        while k < s.len() && depth > 0 {
+            match s.as_bytes()[k] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'\'' => {
+                    k += 1;
+                    while k < s.len() {
+                        if s.as_bytes()[k] == b'\'' {
+                            if k + 1 < s.len() && s.as_bytes()[k + 1] == b'\'' { k += 2; continue; }
+                            k += 1; break;
+                        }
+                        k += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let close = k - 1; // index of `)`
+
+        // Check if already has an `AS` alias right after the `)`.
+        let after = s[close + 1..].trim_start();
+        if after.to_ascii_lowercase().starts_with("as ") || after.starts_with("as\t") || after.starts_with("as\n") {
+            // Already aliased — skip.
+            search_from = close + 1;
+            continue;
+        }
+
+        // Insert ` AS alias_name` after the `)`.
+        let insert_pos = close + 1;
+        let insertion = format!(" AS {alias}");
+        s.insert_str(insert_pos, &insertion);
+        search_from = insert_pos + insertion.len();
+    }
+    s
 }
 
 #[cfg(test)]

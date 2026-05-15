@@ -82,6 +82,8 @@ pub(crate) fn register_pg_udfs(ctx: &SessionContext) {
             vec![
                 TypeSignature::Exact(vec![DataType::Binary, DataType::Utf8]),
                 TypeSignature::Exact(vec![DataType::LargeBinary, DataType::Utf8]),
+                // PG also accepts text input — treated as UTF-8 bytes.
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
             ],
             Volatility::Immutable,
         ),
@@ -130,31 +132,17 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
         ),
     }));
     ctx.register_udf(ScalarUDF::from(AgeUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Nanosecond, None),
-                    DataType::Timestamp(TimeUnit::Nanosecond, None),
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Second, None),
-                    DataType::Timestamp(TimeUnit::Second, None),
-                ]),
-            ],
-            Volatility::Immutable,
-        ),
+        // Use `any(2)` to accept all timestamp unit/timezone variants.
+        // NOW() may produce Timestamp(Nanosecond, Some("UTC")) or
+        // Timestamp(Microsecond, None) depending on context; the UDF
+        // extracts the raw i64 value at runtime and handles all forms.
+        signature: Signature::any(2, Volatility::Immutable),
     }));
     // to_char — one combined UDF covering timestamp, date, and numeric inputs.
     // Registering a single UDF avoids the DataFusion registry overwrite that
     // would occur if two UDFs share the same name.
+    // Use TypeSignature::UserDefined so the UDF matches any 2-arg call
+    // regardless of timestamp timezone/unit variant, then validates at runtime.
     ctx.register_udf(ScalarUDF::from(ToCharPgUdf {
         signature: Signature::one_of(
             vec![
@@ -172,6 +160,23 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
                 ]),
                 TypeSignature::Exact(vec![
                     DataType::Timestamp(TimeUnit::Second, None),
+                    DataType::Utf8,
+                ]),
+                // Timestamptz (with timezone) variants — NOW() may produce these.
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
                     DataType::Utf8,
                 ]),
                 TypeSignature::Exact(vec![DataType::Date32, DataType::Utf8]),
@@ -927,9 +932,22 @@ fn invoke_encode(args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
                 }
                 arr.value(i)
             }
+            DataType::Utf8 => {
+                let arr = bytes_arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("encode: not a StringArray".into())
+                    })?;
+                if arr.is_null(i) {
+                    out.push(None);
+                    continue;
+                }
+                arr.value(i).as_bytes()
+            }
             other => {
                 return Err(DataFusionError::Execution(format!(
-                    "encode: arg 1 must be Binary or LargeBinary, got {other:?}"
+                    "encode: arg 1 must be Binary, LargeBinary, or Utf8, got {other:?}"
                 )));
             }
         };
@@ -3191,14 +3209,22 @@ impl ScalarUDFImpl for AuthJwtUdf {
 
 /// Rewrite JSON/JSONB infix operators to UDF calls.
 pub(crate) fn rewrite_json_operators(sql: &str) -> String {
+    // Strip ::jsonb / ::json casts first so that DataFusion's planner does not
+    // reject the statement with "Unsupported SQL type JSONB/Custom(JSONB)".
+    let stripped = strip_jsonb_casts(sql);
+    let sql_s = stripped.as_str();
+
     // Handle @> specially — only when RHS token looks like a JSON literal
-    let mut s = rewrite_json_at_gt(sql);
+    let mut s = rewrite_json_at_gt(sql_s);
 
     // Handle || for JSON concat — only when RHS looks like JSON
     s = rewrite_json_concat_op(&s);
 
     // @? — jsonpath exists
     s = rewrite_binary_op_to_fn(&s, "@?", "jsonb_path_exists");
+
+    // Rewrite `jsonb - key/ARRAY/idx` to delete UDF calls.
+    s = rewrite_jsonb_delete_op(&s);
 
     // Operators ordered longest-first to avoid prefix collisions
     for &(op, func) in &[
@@ -3211,9 +3237,137 @@ pub(crate) fn rewrite_json_operators(sql: &str) -> String {
         ("?",   "jsonb_has_key"),
         ("<@",  "jsonb_contained_by"),
     ] {
-        s = rewrite_binary_op_to_fn(&s, op, func);
+        // For `<@`, skip the rewrite when either operand looks like an ARRAY
+        // literal or ARRAY constructor — those are handled later by
+        // `pg_operators::rewrite_array_operators`.
+        if op == "<@" {
+            s = rewrite_binary_op_skip_arrays(&s, op, func);
+        } else {
+            s = rewrite_binary_op_to_fn(&s, op, func);
+        }
     }
     s
+}
+
+/// Strip `::jsonb` and `::json` casts so DataFusion's planner does not reject
+/// them with "Unsupported SQL type JSONB". Safe because every JSONB UDF already
+/// accepts Utf8 string literals, and stored JSONB columns are LargeBinary.
+fn strip_jsonb_casts(sql: &str) -> String {
+    if !sql.contains("::") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' { i += 2; }
+                    else { i += 1; break; }
+                } else { i += 1; }
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < len { if bytes[i] == b'"' { i += 1; break; } i += 1; }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' { i += 1; }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') { i += 1; }
+            if i + 1 < len { i += 2; }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
+            let mut j = i + 2;
+            while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
+            let name_start = j;
+            while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') { j += 1; }
+            let name = &sql[name_start..j];
+            if name.eq_ignore_ascii_case("jsonb") || name.eq_ignore_ascii_case("json") {
+                let mut k = j;
+                while k < len && bytes[k].is_ascii_whitespace() { k += 1; }
+                if k < len && bytes[k] == b'(' {
+                    let mut depth = 1i32;
+                    k += 1;
+                    while k < len && depth > 0 {
+                        match bytes[k] { b'(' => depth += 1, b')' => depth -= 1, _ => {} }
+                        k += 1;
+                    }
+                    i = k;
+                } else {
+                    i = j;
+                }
+                continue;
+            }
+        }
+        let char_len = if b < 0x80 { 1 } else if b < 0xC0 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
+        let end = (i + char_len).min(len);
+        out.push_str(&sql[i..end]);
+        i = end;
+    }
+    out
+}
+
+/// Rewrite `jsonb - key/ARRAY/idx` to jsonb_delete_* UDF calls.
+fn rewrite_jsonb_delete_op(sql: &str) -> String {
+    if !sql.contains(" - ") {
+        return sql.to_string();
+    }
+    let mut out = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let Some(rel) = out[search_from..].find(" - ") else { break; };
+        let op_start = search_from + rel + 1;
+        let op_end = op_start + 1;
+        let bytes = out.as_bytes();
+        let mut rhs_scan = op_end;
+        while rhs_scan < bytes.len() && bytes[rhs_scan].is_ascii_whitespace() { rhs_scan += 1; }
+        if rhs_scan >= bytes.len() { break; }
+        let rhs_first = bytes[rhs_scan];
+        let is_string_key = rhs_first == b'\'';
+        let is_array_key = out[rhs_scan..].starts_with("ARRAY") || out[rhs_scan..].starts_with("array");
+        let is_int_idx = rhs_first.is_ascii_digit();
+        if !is_string_key && !is_array_key && !is_int_idx {
+            search_from = op_end;
+            continue;
+        }
+        let lhs_pre = op_start.saturating_sub(1);
+        let mut lhs_end_scan = lhs_pre;
+        while lhs_end_scan > 0 && bytes[lhs_end_scan - 1].is_ascii_whitespace() { lhs_end_scan -= 1; }
+        let lhs_last = if lhs_end_scan == 0 { b' ' } else { bytes[lhs_end_scan - 1] };
+        if lhs_last != b'\'' && lhs_last != b')' {
+            search_from = op_end;
+            continue;
+        }
+        let (lhs_start, lhs_end) = extract_left_operand(&out, op_start);
+        let (rhs_start, rhs_end) = extract_right_operand(&out, op_end);
+        let lhs = out[lhs_start..lhs_end].to_string();
+        let rhs = out[rhs_start..rhs_end].to_string();
+        let func = if is_array_key { "jsonb_delete_keys" } else if is_int_idx { "jsonb_delete_index" } else { "jsonb_delete_key" };
+        let replacement = format!("{func}({lhs}, {rhs})");
+        out.replace_range(lhs_start..rhs_end, &replacement);
+        search_from = lhs_start + replacement.len();
+    }
+    out
 }
 
 /// Rewrite `expr @> json_literal` to `jsonb_contains(expr, json_literal)`.
@@ -3258,10 +3412,12 @@ fn rewrite_json_at_gt(s: &str) -> String {
 /// The rewrite fires before DataFusion's SQL planner so users can write
 /// standard PostgreSQL aggregate names in their queries.
 pub(crate) fn rewrite_pg_agg_aliases(sql: &str) -> String {
-    // Each entry: (name_without_paren, replacement_name_with_open_paren)
+    // Each entry: (name_without_paren, replacement_name_with_open_paren).
+    // `every` is NOT listed here because `rewrite_every_to_bool_and` in
+    // `pg_scalar_aliases` handles it (with an AS alias to avoid column name
+    // collisions with sibling `bool_and(…)` calls).
     const TARGETS: &[(&str, &str)] = &[
         ("variance", "var("),
-        ("every", "bool_and("),
     ];
     let mut out = sql.to_string();
     for (from_name, to_with_paren) in TARGETS {
@@ -3370,6 +3526,51 @@ fn rewrite_binary_op_to_fn(sql: &str, op: &str, func: &str) -> String {
         let (rhs_start, rhs_end) = extract_right_operand(&s, op_end);
         let lhs = s[lhs_start..lhs_end].to_string();
         let rhs = s[rhs_start..rhs_end].to_string();
+        let replacement = format!("{func}({lhs}, {rhs})");
+        s.replace_range(lhs_start..rhs_end, &replacement);
+        search_from = lhs_start + replacement.len();
+    }
+    s
+}
+
+/// Like `rewrite_binary_op_to_fn` but skips occurrences where either operand
+/// starts with `ARRAY` (case-insensitive). Used for `<@` to avoid hijacking
+/// array containment expressions that should be handled by the array rewriter.
+fn rewrite_binary_op_skip_arrays(sql: &str, op: &str, func: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let Some(rel) = s[search_from..].find(op) else { break; };
+        let op_start = search_from + rel;
+        let op_end = op_start + op.len();
+
+        let prev_ok = op_start == 0 || {
+            let b = s.as_bytes()[op_start - 1];
+            !b.is_ascii_alphanumeric() && b != b'_' && b != b'#' && b != b'?' && b != b'@' && b != b'<' && b != b'>'
+        };
+        let next_ok = op_end >= s.len() || {
+            let b = s.as_bytes()[op_end];
+            !b.is_ascii_alphanumeric() && b != b'_' && b != b'>' && b != b'|' && b != b'&'
+        };
+
+        if !prev_ok || !next_ok {
+            search_from = op_end;
+            continue;
+        }
+
+        let (lhs_start, lhs_end) = extract_left_operand(&s, op_start);
+        let (rhs_start, rhs_end) = extract_right_operand(&s, op_end);
+        let lhs = s[lhs_start..lhs_end].to_string();
+        let rhs = s[rhs_start..rhs_end].to_string();
+
+        // Skip if either operand looks like an ARRAY literal or constructor.
+        let lhs_upper = lhs.trim_start().to_ascii_uppercase();
+        let rhs_upper = rhs.trim_start().to_ascii_uppercase();
+        if lhs_upper.starts_with("ARRAY") || rhs_upper.starts_with("ARRAY") {
+            search_from = op_end;
+            continue;
+        }
+
         let replacement = format!("{func}({lhs}, {rhs})");
         s.replace_range(lhs_start..rhs_end, &replacement);
         search_from = lhs_start + replacement.len();
