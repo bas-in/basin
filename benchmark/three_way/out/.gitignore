@@ -1,0 +1,3 @@
+# Result JSONs are large and contain run-specific timestamps.
+# Commit them explicitly if you want to track a specific run.
+*.json
