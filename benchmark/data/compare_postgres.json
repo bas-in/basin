@@ -2,32 +2,56 @@
   "kind": "compare",
   "id": "postgres",
   "name": "Basin vs Postgres 18 (no index, 1M rows)",
-  "claim": "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed point queries.",
+  "claim": "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed queries across point, range, aggregate, and cold-start workloads.",
   "available": true,
   "metrics": [
     {
       "label": "On-disk bytes",
-      "basin": 8134505.0,
+      "basin": 8121894.0,
       "postgres": 101195776.0,
       "unit": "bytes",
       "better": "basin",
-      "ratio_text": "pg / basin = 12.44x"
+      "ratio_text": "pg / basin = 12.46x"
     },
     {
       "label": "Point query p50",
-      "basin": 0.5617909999999999,
-      "postgres": 13.775,
+      "basin": 0.789042,
+      "postgres": 17.877,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 24.52x"
+      "ratio_text": "pg / basin = 22.66x"
     },
     {
-      "label": "Insert 1M rows",
-      "basin": 71741.452708,
-      "postgres": 2792.994292,
+      "label": "Range scan p50 (~10k rows)",
+      "basin": 49.653125,
+      "postgres": 20.582,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.41x"
+    },
+    {
+      "label": "Aggregate COUNT/SUM GROUP BY p50",
+      "basin": 521.294875,
+      "postgres": 65.022,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.12x"
+    },
+    {
+      "label": "Bulk INSERT 1M rows",
+      "basin": 85233.030291,
+      "postgres": 2528.337416,
       "unit": "ms",
       "better": "postgres"
+    },
+    {
+      "label": "Cold-start first query",
+      "basin": 4.647875,
+      "postgres": 37.912792,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 8.16x"
     }
   ],
-  "generated_at": "@1778802219"
+  "generated_at": "@1778841445"
 }

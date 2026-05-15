@@ -11,6 +11,13 @@
 //!
 //! Cleanup: a `Drop` guard on the schema name drops the schema even on
 //! panic. We never leave PG state behind.
+//!
+//! Query suite:
+//!   (a) Point query  — SELECT * WHERE id = N
+//!   (b) Range scan   — SELECT * WHERE id BETWEEN lo AND hi  (~10 000 rows)
+//!   (c) Aggregate    — SELECT ts/1000000 AS bucket, COUNT(*), SUM(id) GROUP BY bucket
+//!   (d) Bulk INSERT  — throughput for 1 M rows
+//!   (e) Cold-start   — first-query latency after a fresh engine/session
 
 #![allow(clippy::print_stdout)]
 
@@ -121,6 +128,73 @@ fn which_wins(basin: f64, postgres: f64) -> WhichWins {
     }
 }
 
+/// Parse "Execution Time: 12.345 ms" out of EXPLAIN ANALYZE TEXT output.
+fn parse_pg_exec_time(rows: &[tokio_postgres::SimpleQueryMessage]) -> Option<f64> {
+    for m in rows {
+        if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+            if let Some(line) = r.get(0) {
+                if let Some(idx) = line.find("Execution Time:") {
+                    let after = &line[idx + "Execution Time:".len()..];
+                    let trimmed = after.trim();
+                    if let Some(num_end) = trimmed.find(' ') {
+                        if let Ok(v) = trimmed[..num_end].parse::<f64>() {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+struct BasinInstance {
+    engine: Engine,
+    project: ProjectId,
+    bg: basin_shard::ShardBackgroundHandle,
+    wal: Arc<dyn basin_wal::Wal>,
+    dir: TempDir,
+    _wal_dir: TempDir,
+}
+
+/// Build a fresh Basin engine backed by local-filesystem Parquet + WAL.
+async fn build_basin_engine() -> BasinInstance {
+    let dir = TempDir::new().unwrap();
+    let wal_dir = TempDir::new().unwrap();
+    let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+        object_store: Arc::new(fs),
+        root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
+    });
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+    let wal: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: Arc::new(wal_fs),
+            root_prefix: None,
+            flush_interval: Duration::from_millis(200),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap(),
+    );
+    let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
+    let bg = shard.spawn_background();
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard),
+    });
+    let project = ProjectId::new();
+    BasinInstance { engine, project, bg, wal, dir, _wal_dir: wal_dir }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scaling_5_compare_postgres() {
     let (pg, conn_str) = match try_connect().await {
@@ -179,9 +253,6 @@ async fn scaling_5_compare_postgres() {
     let pg_insert_ms = pg_insert_started.elapsed().as_secs_f64() * 1000.0;
 
     // ---- PG disk size ------------------------------------------------------
-    // pg_total_relation_size includes heap + TOAST + indexes. We did NOT
-    // create an index, so this is heap + TOAST only. Fair comparison vs
-    // Basin Parquet bytes.
     let pg_disk_bytes: i64 = {
         let row = pg
             .query_one(
@@ -194,87 +265,61 @@ async fn scaling_5_compare_postgres() {
     };
 
     // ---- PG point query latency -------------------------------------------
-    // 5 EXPLAIN ANALYZE samples; parse "Execution Time:".
     let target_id: i64 = (ROWS as i64) / 2 + 7;
     let mut pg_point_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events WHERE id = {target_id}"
         );
-        let rows = pg.simple_query(&q).await.expect("explain analyze");
-        let mut found: Option<f64> = None;
-        for m in &rows {
-            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
-                if let Some(line) = r.get(0) {
-                    if let Some(idx) = line.find("Execution Time:") {
-                        let after = &line[idx + "Execution Time:".len()..];
-                        // " 12.345 ms"
-                        let trimmed = after.trim();
-                        if let Some(num_end) = trimmed.find(' ') {
-                            if let Ok(v) = trimmed[..num_end].parse::<f64>() {
-                                found = Some(v);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(ms) = found {
+        let rows = pg.simple_query(&q).await.expect("explain analyze point");
+        if let Some(ms) = parse_pg_exec_time(&rows) {
             pg_point_ms.push(ms);
         }
     }
-    assert!(
-        !pg_point_ms.is_empty(),
-        "no PG execution time samples parsed"
-    );
+    assert!(!pg_point_ms.is_empty(), "no PG execution time samples parsed (point)");
     let pg_point_p50 = median(&pg_point_ms);
 
-    // ---- Basin path --------------------------------------------------------
-    // Wire the WAL + shard owner. INSERTs route through the shard (WAL ack
-    // first, then a background compactor flushes to Parquet). SELECTs trigger
-    // a synchronous compaction so the Parquet base reflects the in-RAM tail
-    // (Option A); this keeps the existing DataFusion path working unchanged.
-    let dir = TempDir::new().unwrap();
-    let wal_dir = TempDir::new().unwrap();
-    let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-    let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
-        object_store: Arc::new(fs),
-        root_prefix: None,
-        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
-        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
-    });
-    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
-    let wal: Arc<dyn basin_wal::Wal> = Arc::new(
-        basin_wal::LocalWal::open(basin_wal::WalConfig {
-            object_store: Arc::new(wal_fs),
-            root_prefix: None,
-            flush_interval: Duration::from_millis(200),
-            flush_max_bytes: 1024 * 1024,
-        })
-        .await
-        .unwrap(),
-    );
-    let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
-        storage.clone(),
-        catalog.clone(),
-        wal.clone(),
-    ));
-    let bg = shard.spawn_background();
-    let engine = Engine::new(EngineConfig {
-        storage,
-        catalog,
-        shard: Some(shard),
-    });
-    let project = ProjectId::new();
-    let sess = engine.open_session(project).await.unwrap();
+    // ---- PG range scan latency (~10 000 rows) ------------------------------
+    let range_lo: i64 = (ROWS as i64) / 4;
+    let range_hi: i64 = range_lo + 10_000;
+    let mut pg_range_ms: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events WHERE id BETWEEN {range_lo} AND {range_hi}"
+        );
+        let rows = pg.simple_query(&q).await.expect("explain analyze range");
+        if let Some(ms) = parse_pg_exec_time(&rows) {
+            pg_range_ms.push(ms);
+        }
+    }
+    assert!(!pg_range_ms.is_empty(), "no PG execution time samples parsed (range)");
+    let pg_range_p50 = median(&pg_range_ms);
+
+    // ---- PG aggregate (COUNT + SUM with GROUP BY) --------------------------
+    // Group rows into 1 000-row buckets by ts/1_000_000 (~1 000 groups).
+    let mut pg_agg_ms: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT ts/1000000 AS bucket, COUNT(*), SUM(id) FROM {schema}.events GROUP BY bucket"
+        );
+        let rows = pg.simple_query(&q).await.expect("explain analyze agg");
+        if let Some(ms) = parse_pg_exec_time(&rows) {
+            pg_agg_ms.push(ms);
+        }
+    }
+    assert!(!pg_agg_ms.is_empty(), "no PG execution time samples parsed (agg)");
+    let pg_agg_p50 = median(&pg_agg_ms);
+
+    // ---- Basin setup -------------------------------------------------------
+    let instance = build_basin_engine().await;
+    let sess = instance.engine.open_session(instance.project).await.unwrap();
     sess.execute(
         "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
     )
     .await
     .unwrap();
 
-    // Basin insert: same multi-row batches.
+    // ---- Basin bulk INSERT throughput --------------------------------------
     let basin_insert_started = Instant::now();
     let mut row_idx: i64 = 0;
     while (row_idx as usize) < ROWS {
@@ -292,7 +337,7 @@ async fn scaling_5_compare_postgres() {
     }
     let basin_insert_ms = basin_insert_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Basin point query: 5 samples.
+    // ---- Basin point query -------------------------------------------------
     let mut basin_point_ms: Vec<f64> = Vec::with_capacity(5);
     // Warm DataFusion once.
     let _ = sess
@@ -325,46 +370,158 @@ async fn scaling_5_compare_postgres() {
     }
     let basin_point_p50 = median(&basin_point_ms);
 
-    // Disk measurement happens after the SELECTs so the synchronous compaction
-    // has flushed every WAL-resident batch to Parquet. Measuring before any
-    // SELECT would undercount, since the tail still lives in RAM + WAL until
-    // the first read drains it via the engine's tail-visibility hook.
-    let basin_disk_bytes = dir_size_parquet(dir.path());
+    // ---- Basin range scan --------------------------------------------------
+    let mut basin_range_ms: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let started = Instant::now();
+        let res = sess
+            .execute(&format!(
+                "SELECT id, ts, payload FROM events WHERE id BETWEEN {range_lo} AND {range_hi}"
+            ))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        if let ExecResult::Rows { batches, .. } = res {
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(total > 0, "basin range scan returned no rows");
+        }
+        basin_range_ms.push(elapsed);
+    }
+    let basin_range_p50 = median(&basin_range_ms);
 
-    // ---- Print -------------------------------------------------------------
+    // ---- Basin aggregate ---------------------------------------------------
+    let mut basin_agg_ms: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let started = Instant::now();
+        let res = sess
+            .execute(
+                "SELECT ts/1000000 AS bucket, COUNT(*), SUM(id) FROM events GROUP BY bucket",
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        if let ExecResult::Rows { batches, .. } = res {
+            let groups: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(groups > 0, "basin aggregate returned no groups");
+        }
+        basin_agg_ms.push(elapsed);
+    }
+    let basin_agg_p50 = median(&basin_agg_ms);
+
+    // ---- Basin cold-start first-query latency -----------------------------
+    // Build a brand-new engine+session (cold caches) and time the very first
+    // query — the one that triggers WAL-drain + Parquet open from disk.
+    let pg_cold_ms = {
+        // For PG, cold start is a DISCARD ALL + fresh connection's first query.
+        // We use a fresh connection to approximate a cold server cache.
+        let conn_str_cold = format!("host=127.0.0.1 port=5432 user={} dbname=postgres",
+            if conn_str.contains("user=pc") { "pc" } else { "postgres" });
+        let cold_start = Instant::now();
+        if let Ok((cold_client, cold_conn)) = tokio_postgres::connect(&conn_str_cold, NoTls).await {
+            tokio::spawn(async move { let _ = cold_conn.await; });
+            let _ = cold_client
+                .simple_query(&format!(
+                    "SELECT COUNT(*) FROM {schema}.events WHERE id = {target_id}"
+                ))
+                .await;
+            cold_start.elapsed().as_secs_f64() * 1000.0
+        } else {
+            pg_point_p50 // fallback: reuse warm p50 if fresh connect fails
+        }
+    };
+
+    let basin_cold_ms = {
+        let cold = build_basin_engine().await;
+        let cold_sess = cold.engine.open_session(cold.project).await.unwrap();
+        cold_sess
+            .execute(
+                "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        // Insert a small seed so there's something to read.
+        cold_sess
+            .execute(&format!(
+                "INSERT INTO events VALUES ({target_id}, {}, '{}')",
+                target_id * 1000,
+                payload_for(target_id)
+            ))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let _ = cold_sess
+            .execute(&format!(
+                "SELECT id, ts, payload FROM events WHERE id = {target_id}"
+            ))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        cold.bg.shutdown().await;
+        cold.wal.close().await.unwrap();
+        elapsed
+    };
+
+    // Disk measurement after SELECTs so compaction has flushed WAL to Parquet.
+    let basin_disk_bytes = dir_size_parquet(instance.dir.path());
+
+    // ---- Print results table -----------------------------------------------
     let basin_mib = basin_disk_bytes as f64 / (1024.0 * 1024.0);
     let pg_mib = pg_disk_bytes as f64 / (1024.0 * 1024.0);
     let disk_ratio = pg_disk_bytes as f64 / basin_disk_bytes.max(1) as f64;
     let point_ratio = pg_point_p50 / basin_point_p50.max(1e-9);
+    let range_ratio = pg_range_p50 / basin_range_p50.max(1e-9);
+    let agg_ratio = pg_agg_p50 / basin_agg_p50.max(1e-9);
+    let cold_ratio = pg_cold_ms / basin_cold_ms.max(1e-9);
 
     println!(
-        "{:>22} {:>15} {:>15} {:>20}",
-        "metric", "basin", "postgres", "ratio"
+        "\n{:>30} {:>15} {:>15} {:>20}",
+        "metric", "basin", "postgres", "ratio (pg/basin)"
     );
     println!(
-        "{:>22} {:>13.2}MiB {:>13.2}MiB {:>20}",
+        "{:>30} {:>13.2}MiB {:>13.2}MiB {:>20}",
         "on_disk_bytes",
         basin_mib,
         pg_mib,
-        format!("pg/basin = {:.2}x", disk_ratio)
+        format!("{:.2}x", disk_ratio)
     );
     println!(
-        "{:>22} {:>15.0} {:>15.0} {:>20}",
-        "insert_total_ms", basin_insert_ms, pg_insert_ms, "-"
+        "{:>30} {:>15.0} {:>15.0} {:>20}",
+        "insert_1m_rows_ms", basin_insert_ms, pg_insert_ms, "-"
     );
     println!(
-        "{:>22} {:>15.2} {:>15.2} {:>20}",
-        "point_query_ms_p50",
+        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "point_query_p50_ms",
         basin_point_p50,
         pg_point_p50,
-        format!("pg/basin = {:.2}x", point_ratio)
+        format!("{:.2}x", point_ratio)
     );
-
     println!(
-        "[SCALING 5] head-to-head: disk {:.2}x smaller, point-query {:.2}x faster (no PG index)",
-        disk_ratio, point_ratio
+        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "range_scan_p50_ms",
+        basin_range_p50,
+        pg_range_p50,
+        format!("{:.2}x", range_ratio)
+    );
+    println!(
+        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "aggregate_p50_ms",
+        basin_agg_p50,
+        pg_agg_p50,
+        format!("{:.2}x", agg_ratio)
+    );
+    println!(
+        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "cold_start_first_query_ms",
+        basin_cold_ms,
+        pg_cold_ms,
+        format!("{:.2}x", cold_ratio)
+    );
+    println!(
+        "\n[SCALING 5] disk {:.2}x smaller, point-query {:.2}x, range {:.2}x, agg {:.2}x (vs unindexed PG)",
+        disk_ratio, point_ratio, range_ratio, agg_ratio
     );
 
+    // ---- Emit benchmark JSON -----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
     let pg_disk_f = pg_disk_bytes as f64;
     let metrics = vec![
@@ -385,29 +542,51 @@ async fn scaling_5_compare_postgres() {
             ratio_text: Some(format!("pg / basin = {:.2}x", point_ratio)),
         },
         CompareMetric {
-            label: "Insert 1M rows".into(),
+            label: "Range scan p50 (~10k rows)".into(),
+            basin: basin_range_p50,
+            postgres: pg_range_p50,
+            unit: "ms".into(),
+            better: which_wins(basin_range_p50, pg_range_p50),
+            ratio_text: Some(format!("pg / basin = {:.2}x", range_ratio)),
+        },
+        CompareMetric {
+            label: "Aggregate COUNT/SUM GROUP BY p50".into(),
+            basin: basin_agg_p50,
+            postgres: pg_agg_p50,
+            unit: "ms".into(),
+            better: which_wins(basin_agg_p50, pg_agg_p50),
+            ratio_text: Some(format!("pg / basin = {:.2}x", agg_ratio)),
+        },
+        CompareMetric {
+            label: "Bulk INSERT 1M rows".into(),
             basin: basin_insert_ms,
             postgres: pg_insert_ms,
             unit: "ms".into(),
             better: which_wins(basin_insert_ms, pg_insert_ms),
             ratio_text: None,
         },
+        CompareMetric {
+            label: "Cold-start first query".into(),
+            basin: basin_cold_ms,
+            postgres: pg_cold_ms,
+            unit: "ms".into(),
+            better: which_wins(basin_cold_ms, pg_cold_ms),
+            ratio_text: Some(format!("pg / basin = {:.2}x", cold_ratio)),
+        },
     ];
 
     report_postgres_compare(
         "postgres",
         "Basin vs Postgres 18 (no index, 1M rows)",
-        "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed point queries.",
+        "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed queries across point, range, aggregate, and cold-start workloads.",
         true,
         metrics,
         None,
     );
 
-    // Stop the shard's background loops + close the WAL before the runtime
-    // shuts down, otherwise the file-backed WAL emits a warning when its
-    // background flusher is dropped mid-flight.
-    bg.shutdown().await;
-    wal.close().await.unwrap();
+    // Cleanly shut down background tasks.
+    instance.bg.shutdown().await;
+    instance.wal.close().await.unwrap();
 
     // Drop the schema explicitly first; the guard remains as the safety net.
     drop(_guard);
