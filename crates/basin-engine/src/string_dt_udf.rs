@@ -310,7 +310,7 @@ fn str_vec_to_array(v: Vec<Option<String>>) -> ArrayRef {
 // split_part
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct SplitPartUdf {
     signature: Signature,
 }
@@ -377,14 +377,14 @@ impl ScalarUDFImpl for SplitPartUdf {
 // SimpleStrUdf — single-string → string transformations
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum StrOp {
     Reverse,
     QuoteIdent,
     QuoteLiteral,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct SimpleStrUdf {
     name: String,
     signature: Signature,
@@ -430,7 +430,7 @@ fn pg_quote_literal(s: &str) -> String {
 // format(fmt, args...)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct FormatUdf {
     signature: Signature,
 }
@@ -523,7 +523,7 @@ fn get_format_arg<'a>(args: &[Option<&'a str>], idx: usize) -> DFResult<Option<&
 // quote_nullable
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct QuoteNullableUdf {
     signature: Signature,
 }
@@ -575,7 +575,7 @@ impl ScalarUDFImpl for QuoteNullableUdf {
 // regexp_match / regexp_matches  →  List(Utf8)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpMatchUdf {
     name: String,
     signature: Signature,
@@ -653,7 +653,7 @@ impl ScalarUDFImpl for RegexpMatchUdf {
 // regexp_split_to_array → List(Utf8)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpSplitToArrayUdf {
     name: String,
     signature: Signature,
@@ -721,7 +721,7 @@ impl ScalarUDFImpl for RegexpSplitToArrayUdf {
 // regexp_split_to_table stub → Utf8 (returns input; real SETOF deferred)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpSplitToTableStubUdf {
     signature: Signature,
 }
@@ -745,7 +745,7 @@ impl ScalarUDFImpl for RegexpSplitToTableStubUdf {
 // chr(int) → text
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ChrUdf {
     signature: Signature,
 }
@@ -801,7 +801,7 @@ impl ScalarUDFImpl for ChrUdf {
 // ascii(text) → int
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct AsciiUdf {
     signature: Signature,
 }
@@ -833,7 +833,7 @@ impl ScalarUDFImpl for AsciiUdf {
 // translate(string, from, to) → text
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct TranslateUdf {
     signature: Signature,
 }
@@ -882,14 +882,14 @@ impl ScalarUDFImpl for TranslateUdf {
 // btrim / ltrim / rtrim with optional chars arg
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TrimMode {
     Both,
     Left,
     Right,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct TrimCharsUdf {
     name: String,
     signature: Signature,
@@ -945,7 +945,7 @@ fn trim_string(s: &str, chars: &str, mode: TrimMode) -> String {
 // convert_from(bytea, encoding) → text
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ConvertFromUdf {
     signature: Signature,
 }
@@ -985,7 +985,7 @@ impl ScalarUDFImpl for ConvertFromUdf {
 // convert_to(text, encoding) → bytea
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ConvertToUdf {
     signature: Signature,
 }
@@ -1015,7 +1015,7 @@ impl ScalarUDFImpl for ConvertToUdf {
 // isfinite → bool (always true in v0.1; infinity timestamps deferred)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct IsFiniteUdf {
     signature: Signature,
 }

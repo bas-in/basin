@@ -109,7 +109,7 @@ pub(crate) struct SequenceContext<'a> {
 
 /// Tombstone UDF for `nextval(text) -> bigint`. Always errors on
 /// invocation; the rewriter is the load-bearing path. See module docs.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NextvalUdf {
     signature: Signature,
 }
@@ -144,7 +144,7 @@ impl ScalarUDFImpl for NextvalUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CurrvalUdf {
     signature: Signature,
 }
@@ -179,7 +179,7 @@ impl ScalarUDFImpl for CurrvalUdf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SetvalUdf {
     signature: Signature,
 }
@@ -224,7 +224,7 @@ impl ScalarUDFImpl for SetvalUdf {
 /// the pre-execution rewriter is the load-bearing path (same pattern as
 /// `NextvalUdf` / `CurrvalUdf` / `SetvalUdf`). `lastval()` takes no
 /// arguments so its signature is a zero-argument volatile scalar.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct LastvalUdf {
     signature: Signature,
 }

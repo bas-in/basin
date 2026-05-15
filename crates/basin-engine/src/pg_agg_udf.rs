@@ -28,7 +28,7 @@ use serde_json::Value as JValue;
 
 /// UDAF that accumulates any column into a JSON array string.
 /// Used for both `json_agg` and `jsonb_agg`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct JsonAggUdaf {
     pub name: &'static str,
     signature: Signature,
@@ -131,7 +131,7 @@ impl datafusion::logical_expr::Accumulator for JsonAggAccumulator {
 
 /// UDAF that accumulates (key, value) pairs into a JSON object string.
 /// Used for both `json_object_agg` and `jsonb_object_agg`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct JsonObjectAggUdaf {
     pub name: &'static str,
     signature: Signature,

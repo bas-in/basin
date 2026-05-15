@@ -300,14 +300,14 @@ fn num_rows(args: &[ColumnarValue]) -> usize {
 // justify_days / justify_hours / justify_interval
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum JustifyKind {
     Days,
     Hours,
     Interval,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JustifyUdf {
     name: String,
     kind: JustifyKind,
@@ -379,7 +379,7 @@ fn justify(iv: IntervalMonthDayNano, kind: JustifyKind) -> IntervalMonthDayNano 
 // to_char(interval, fmt)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToCharIntervalUdf {
     signature: Signature,
 }
@@ -498,7 +498,7 @@ fn format_interval(iv: &IntervalMonthDayNano, fmt: &str) -> String {
 /// this is the identity conversion. For other zones we return the input
 /// unchanged (UTC-normalised stub — sufficient for cross-zone storage
 /// compatibility tests; a full tzdata implementation is deferred to v0.2).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct TimezoneUdf {
     signature: Signature,
 }
@@ -561,7 +561,7 @@ impl ScalarUDFImpl for TimezoneUdf {
 ///
 /// Display conversion: interpret a UTC timestamp as a wall-clock in `zone`.
 /// Stub implementation: returns the same raw value with UTC tz annotation.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct AtTimeZoneUdf {
     signature: Signature,
 }
@@ -617,10 +617,10 @@ impl ScalarUDFImpl for AtTimeZoneUdf {
 // date + integer / date - integer
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DateIntOp { Add, Sub }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DateIntUdf {
     name: String,
     op: DateIntOp,
@@ -684,7 +684,7 @@ impl ScalarUDFImpl for DateIntUdf {
 // date - date → integer days
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DateDiffDaysUdf {
     signature: Signature,
 }
@@ -726,7 +726,7 @@ impl ScalarUDFImpl for DateDiffDaysUdf {
 // extract(epoch from interval) → float8
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct EpochFromIntervalUdf {
     signature: Signature,
 }

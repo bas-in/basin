@@ -190,6 +190,7 @@ fn format_range(lower: Option<&str>, upper: Option<&str>, li: bool, ui: bool) ->
 /// Generic two-argument range constructor.  The `arg_type` controls what
 /// DataFusion signature we advertise; at evaluation time we just stringify
 /// each bound and encode them into JSON. Default bounds are `[lower, upper)`.
+#[derive(PartialEq, Eq, Hash)]
 struct RangeConstructorUdf {
     name: &'static str,
     sig: Signature,
@@ -307,12 +308,13 @@ fn columnar_to_strings(cv: &ColumnarValue, n: usize) -> DFResult<Vec<Option<Stri
 // Accessor: lower / upper
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RangeField {
     Lower,
     Upper,
 }
 
+#[derive(PartialEq, Eq, Hash)]
 struct RangeAccessorUdf {
     field: RangeField,
     sig: Signature,
@@ -381,6 +383,7 @@ impl ScalarUDFImpl for RangeAccessorUdf {
 // isempty
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq, Hash)]
 struct IsEmptyUdf {
     sig: Signature,
 }
@@ -436,7 +439,7 @@ impl ScalarUDFImpl for IsEmptyUdf {
 // Bound flag accessors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BoundFlag {
     LowerInc,
     UpperInc,
@@ -444,6 +447,7 @@ enum BoundFlag {
     UpperInf,
 }
 
+#[derive(PartialEq, Eq, Hash)]
 struct BoundFlagUdf {
     name: &'static str,
     flag: BoundFlag,
@@ -501,6 +505,7 @@ impl ScalarUDFImpl for BoundFlagUdf {
 // range_contains_elem — element-in-range check
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq, Hash)]
 struct RangeContainsElemUdf {
     sig: Signature,
 }
@@ -564,6 +569,7 @@ impl ScalarUDFImpl for RangeContainsElemUdf {
 // range_overlaps — two ranges overlap check
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq, Hash)]
 struct RangeOverlapsUdf {
     sig: Signature,
 }
@@ -644,6 +650,7 @@ fn range_bound_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
 // range_contains_range — range @> range (containment)
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq, Hash)]
 struct RangeContainsRangeUdf {
     sig: Signature,
 }
@@ -727,13 +734,14 @@ impl ScalarUDFImpl for RangeContainsRangeUdf {
 // Relational operators: strictly_left (<<), strictly_right (>>), adjacent (-|-)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RangeRelKind {
     StrictlyLeft,
     StrictlyRight,
     Adjacent,
 }
 
+#[derive(PartialEq, Eq, Hash)]
 struct RangeRelationalUdf {
     name: &'static str,
     kind: RangeRelKind,
@@ -832,6 +840,7 @@ impl ScalarUDFImpl for RangeRelationalUdf {
 // range_merge — bounding range of two ranges (union hull)
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq, Hash)]
 struct RangeMergeUdf {
     sig: Signature,
 }

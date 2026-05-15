@@ -505,7 +505,7 @@ fn num_rows(args: &[ColumnarValue]) -> usize {
 // SimpleOidBoolUdf — (any oid-ish arg) -> bool constant
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SimpleOidBoolUdf {
     name: String,
     value: bool,
@@ -538,7 +538,7 @@ impl ScalarUDFImpl for SimpleOidBoolUdf {
 // SimpleOidTextUdf — (any oid-ish arg) -> text constant (non-null)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SimpleOidTextUdf {
     name: String,
     value: String,
@@ -572,7 +572,7 @@ impl ScalarUDFImpl for SimpleOidTextUdf {
 // Used for: pg_get_expr, pg_get_indexdef, pg_get_constraintdef
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EmptyTextMultiArgUdf {
     name: String,
     signature: Signature,
@@ -605,7 +605,7 @@ impl ScalarUDFImpl for EmptyTextMultiArgUdf {
 // Used for: obj_description, col_description, pg_get_partkeydef
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NullTextMultiArgUdf {
     name: String,
     signature: Signature,
@@ -641,7 +641,7 @@ impl ScalarUDFImpl for NullTextMultiArgUdf {
 // not error.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FormatTypeUdf {
     name: String,
     signature: Signature,
@@ -734,7 +734,7 @@ impl ScalarUDFImpl for FormatTypeUdf {
 //                   -> bigint : 0
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RelationSizeUdf {
     name: String,
     signature: Signature,
@@ -766,7 +766,7 @@ impl ScalarUDFImpl for RelationSizeUdf {
 // PgEncodingToCharUdf — pg_encoding_to_char(int) -> text : 'UTF8'
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PgEncodingToCharUdf {
     name: String,
     signature: Signature,
@@ -798,7 +798,7 @@ impl ScalarUDFImpl for PgEncodingToCharUdf {
 // CurrentSchemaUdf — current_schema() -> text : 'public'
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CurrentSchemaUdf {
     name: String,
     signature: Signature,
@@ -835,7 +835,7 @@ impl ScalarUDFImpl for CurrentSchemaUdf {
 // because they mostly care about the strings inside, not the wire type.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CurrentSchemasUdf {
     name: String,
     signature: Signature,
@@ -870,7 +870,7 @@ impl ScalarUDFImpl for CurrentSchemasUdf {
 // HasPrivilegeUdf — has_table_privilege / has_schema_privilege -> bool : true
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HasPrivilegeUdf {
     name: String,
     signature: Signature,
@@ -902,7 +902,7 @@ impl ScalarUDFImpl for HasPrivilegeUdf {
 // VoidNullArgUdf — (any args) -> NULL (void stub for pg_advisory_lock etc.)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VoidNullArgUdf {
     name: String,
     signature: Signature,
@@ -934,7 +934,7 @@ impl ScalarUDFImpl for VoidNullArgUdf {
 // Used for: pg_try_advisory_lock (always returns true = lock acquired)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SimpleConstBoolUdf {
     name: String,
     value: bool,
@@ -968,7 +968,7 @@ impl ScalarUDFImpl for SimpleConstBoolUdf {
 // Used for: pg_typeof, pg_size_pretty, current_user, session_user
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SimpleConstTextUdf {
     name: String,
     value: String,
@@ -1001,7 +1001,7 @@ impl ScalarUDFImpl for SimpleConstTextUdf {
 // Used for: pg_column_size
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SimpleConstInt64Udf {
     name: String,
     value: i64,

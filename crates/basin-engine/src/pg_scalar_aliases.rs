@@ -273,7 +273,7 @@ fn make_alias_f64(name: &str, f: fn(f64) -> f64) -> ScalarUDF {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct AliasF64Udf {
     name: String,
     signature: Signature,
@@ -346,7 +346,7 @@ impl ScalarUDFImpl for AliasF64Udf {
 //              localtimestamp all return the current wall-clock instant.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct NowStubUdf {
     name: String,
     signature: Signature,
@@ -390,7 +390,7 @@ impl ScalarUDFImpl for NowStubUdf {
 // localtime → returns seconds-since-midnight as a string (stub)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct LocaltimeUdf {
     signature: Signature,
 }
@@ -424,7 +424,7 @@ impl ScalarUDFImpl for LocaltimeUdf {
 // make_time(h, m, s) → Utf8 "HH:MM:SS.ffffff"
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct MakeTimeUdf {
     signature: Signature,
 }
@@ -534,7 +534,7 @@ impl ScalarUDFImpl for MakeTimeUdf {
 // make_timestamp(y, mo, d, h, mi, s) → Timestamp(Microsecond, None)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct MakeTimestampUdf {
     signature: Signature,
 }
@@ -607,7 +607,7 @@ impl ScalarUDFImpl for MakeTimestampUdf {
 // make_timestamptz(y, mo, d, h, mi, s [, tz]) → Timestamp(Microsecond, UTC)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct MakeTimestamptzUdf {
     signature: Signature,
 }
@@ -682,7 +682,7 @@ impl ScalarUDFImpl for MakeTimestamptzUdf {
 // make_interval — stub, always returns "0 seconds" as text (ORM probe only)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct MakeIntervalUdf {
     signature: Signature,
 }
@@ -715,7 +715,7 @@ impl ScalarUDFImpl for MakeIntervalUdf {
 // below-range, count+1 for above-range.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct WidthBucketUdf {
     signature: Signature,
 }
@@ -797,7 +797,7 @@ impl ScalarUDFImpl for WidthBucketUdf {
 // except `.` and `-` and parse the result.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToNumberUdf {
     signature: Signature,
 }

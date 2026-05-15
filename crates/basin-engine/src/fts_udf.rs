@@ -265,7 +265,7 @@ fn num_rows(args: &[ColumnarValue]) -> usize {
 // For the 2-arg forms the last arg is the body/query (the config is first).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PassthroughLastTextUdf {
     name: String,
     signature: Signature,
@@ -305,7 +305,7 @@ impl ScalarUDFImpl for PassthroughLastTextUdf {
 // Used for: setweight (return the tsvector arg, ignoring the weight char).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PassthroughFirstTextUdf {
     name: String,
     signature: Signature,
@@ -344,7 +344,7 @@ impl ScalarUDFImpl for PassthroughFirstTextUdf {
 // Used for: ts_rank, ts_rank_cd.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ZeroFloat32Udf {
     name: String,
     signature: Signature,
@@ -377,7 +377,7 @@ impl ScalarUDFImpl for ZeroFloat32Udf {
 // Used for: numnode (returns 1).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConstInt32Udf {
     name: String,
     value: i32,
@@ -412,7 +412,7 @@ impl ScalarUDFImpl for ConstInt32Udf {
 // The approximation is "split on ASCII whitespace and count non-empty pieces".
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TsvectorLengthUdf {
     name: String,
     signature: Signature,
@@ -464,7 +464,7 @@ impl ScalarUDFImpl for TsvectorLengthUdf {
 // For ts_headline(config, text, tsq, opts) → return arg 1
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TsHeadlineUdf {
     name: String,
     signature: Signature,
@@ -517,7 +517,7 @@ impl ScalarUDFImpl for TsHeadlineUdf {
 //   zero rows.  Real selectivity is deferred to `basin-fts`.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TsvectorMatchUdf {
     name: String,
     /// `true` → return all-true column (match-all stub, used for `tsvector_match_udf`).

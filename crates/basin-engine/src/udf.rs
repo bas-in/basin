@@ -283,7 +283,7 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(crate::seq_udf::LastvalUdf::default()));
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DistanceFn {
     L2,
     Cosine,
@@ -319,7 +319,7 @@ fn make_udf(name: &str, kind: DistanceFn) -> ScalarUDF {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct VectorDistanceUdf {
     name: String,
     signature: Signature,
@@ -721,7 +721,7 @@ fn extract_right_operand(s: &str, start: usize) -> (usize, usize) {
 // `Volatile` is load-bearing here.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct GenRandomUuid {
     name: String,
     signature: Signature,
@@ -759,7 +759,7 @@ fn build_uuid_array(n: usize) -> FixedSizeBinaryArray {
         .expect("16-byte UUID slices are uniformly sized")
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DigestUdf {
     signature: Signature,
 }
@@ -860,7 +860,7 @@ fn compute_digest(algo: &str, input: &[u8]) -> DFResult<Vec<u8>> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct EncodeUdf {
     signature: Signature,
 }
@@ -988,7 +988,7 @@ fn encode_bytes(fmt: &str, bytes: &[u8]) -> DFResult<String> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DecodeUdf {
     signature: Signature,
 }
@@ -1091,7 +1091,7 @@ fn decode_bytes(fmt: &str, s: &str) -> DFResult<Vec<u8>> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct CryptUdf {
     signature: Signature,
 }
@@ -1224,7 +1224,7 @@ fn bcrypt_base64_decode(s: &str) -> Option<Vec<u8>> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct GenSaltUdf {
     signature: Signature,
 }
@@ -1493,7 +1493,7 @@ fn pg_format_postprocess(s: String, dt: chrono::NaiveDateTime) -> String {
      .replace("\x01J\x01", &format!("{julian}"))
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ModUdf {
     signature: Signature,
 }
@@ -1586,7 +1586,7 @@ impl ScalarUDFImpl for ModUdf {
 /// components elided and a sign on the last one if the interval is negative.
 /// This matches the default psql output for the `interval` type, which is
 /// the rendering ORMs see when they `cast(age(...) AS text)`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct AgeUdf {
     signature: Signature,
 }
@@ -1807,7 +1807,7 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 
 /// PG-format-aware `to_char(timestamp, format)`. Translates PG directives
 /// to chrono and renders via `chrono::DateTime::format`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToCharPgUdf {
     signature: Signature,
 }
@@ -1892,7 +1892,7 @@ impl ScalarUDFImpl for ToCharPgUdf {
 /// chrono and parses via `chrono::NaiveDateTime::parse_from_str`. Returns
 /// `Timestamp(Nanosecond, None)` to match DataFusion's default `to_timestamp`
 /// shape.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToTimestampPgUdf {
     signature: Signature,
 }
@@ -1977,7 +1977,7 @@ impl ScalarUDFImpl for ToTimestampPgUdf {
 /// `to_timestamp`.
 ///
 /// Example: `to_date('2024-01-15', 'YYYY-MM-DD')` → the Date32 value for 2024-01-15.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToDatePgUdf {
     signature: Signature,
 }
@@ -2050,7 +2050,7 @@ impl ScalarUDFImpl for ToDatePgUdf {
 // (encoding names accepted but bytes returned unchanged). Non-UTF-8 encoding
 // conversions raise an Execution error explaining the limitation.
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ConvertBytesUdf {
     signature: Signature,
 }
@@ -2122,7 +2122,7 @@ impl ScalarUDFImpl for ConvertBytesUdf {
 // For Utf8 it counts Unicode codepoints (matching PG + DF's prior behaviour);
 // for Binary it counts bytes (PG's `length(bytea)` semantics).
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct LengthPgUdf {
     signature: Signature,
 }
@@ -2335,7 +2335,7 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
 /// (`'999,999.99'`, `'9G999D99'`, `'FM9990.009'`, etc.).
 ///
 /// Example: `to_number('1,234.56', '9,999.99')` → 1234.56.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToNumberPgUdf {
     signature: Signature,
 }
@@ -2616,7 +2616,7 @@ mod tests {
 /// `power`'s result to `numeric` or use it in float arithmetic break on
 /// the Int64 shape; widening to Float64 unconditionally is the practical
 /// fix.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct PowerFloat64Udf {
     signature: Signature,
 }
@@ -2684,7 +2684,7 @@ impl ScalarUDFImpl for PowerFloat64Udf {
 /// any session-registered planner is consulted, so the string rewrite
 /// sidesteps that ordering problem and matches the existing pg_vector
 /// operator-rewrite pattern.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ExtractSecondPgUdf {
     signature: Signature,
 }
@@ -2738,7 +2738,7 @@ impl ScalarUDFImpl for ExtractSecondPgUdf {
 /// Volatility is `Volatile` to keep the planner from constant-folding a
 /// constant-true predicate into the literal `1` (the side-effect of
 /// raising on false is the whole point of the UDF).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct BasinAssertUdf {
     signature: Signature,
 }
@@ -3086,6 +3086,18 @@ struct AuthUidUdf {
     signature: Signature,
 }
 
+impl PartialEq for AuthUidUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature
+    }
+}
+impl Eq for AuthUidUdf {}
+impl std::hash::Hash for AuthUidUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.signature.hash(state);
+    }
+}
+
 impl ScalarUDFImpl for AuthUidUdf {
     fn as_any(&self) -> &dyn Any {
         self
@@ -3127,6 +3139,18 @@ struct AuthRoleUdf {
     signature: Signature,
 }
 
+impl PartialEq for AuthRoleUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature
+    }
+}
+impl Eq for AuthRoleUdf {}
+impl std::hash::Hash for AuthRoleUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.signature.hash(state);
+    }
+}
+
 impl ScalarUDFImpl for AuthRoleUdf {
     fn as_any(&self) -> &dyn Any {
         self
@@ -3158,6 +3182,18 @@ impl ScalarUDFImpl for AuthRoleUdf {
 struct AuthJwtUdf {
     auth_context: Arc<AuthContext>,
     signature: Signature,
+}
+
+impl PartialEq for AuthJwtUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature
+    }
+}
+impl Eq for AuthJwtUdf {}
+impl std::hash::Hash for AuthJwtUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.signature.hash(state);
+    }
 }
 
 impl ScalarUDFImpl for AuthJwtUdf {

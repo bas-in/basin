@@ -686,7 +686,7 @@ fn array_element_to_json(arr: &ArrayRef, i: usize) -> Value {
 // jsonb_typeof
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbTypeofUdf {
     signature: Signature,
 }
@@ -731,7 +731,7 @@ impl ScalarUDFImpl for JsonbTypeofUdf {
 // jsonb_pretty
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbPrettyUdf {
     signature: Signature,
 }
@@ -771,7 +771,7 @@ impl ScalarUDFImpl for JsonbPrettyUdf {
 // jsonb_array_length
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbArrayLengthUdf {
     signature: Signature,
 }
@@ -807,7 +807,7 @@ impl ScalarUDFImpl for JsonbArrayLengthUdf {
 // jsonb_strip_nulls
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbStripNullsUdf {
     signature: Signature,
 }
@@ -845,7 +845,7 @@ impl ScalarUDFImpl for JsonbStripNullsUdf {
 // jsonb_set
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbSetUdf {
     signature: Signature,
 }
@@ -939,7 +939,7 @@ impl ScalarUDFImpl for JsonbSetUdf {
 // jsonb_insert
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbInsertUdf {
     signature: Signature,
 }
@@ -1032,7 +1032,7 @@ impl ScalarUDFImpl for JsonbInsertUdf {
 // jsonb_path_query  (best-effort: simple dotted-path navigation)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbPathQueryUdf {
     signature: Signature,
 }
@@ -1121,7 +1121,7 @@ impl ScalarUDFImpl for JsonbPathQueryUdf {
 // jsonb_path_exists
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbPathExistsUdf {
     signature: Signature,
 }
@@ -1190,7 +1190,7 @@ impl ScalarUDFImpl for JsonbPathExistsUdf {
 // jsonb_path_match  (alias of jsonb_path_exists for simple paths)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbPathMatchUdf {
     signature: Signature,
 }
@@ -1215,7 +1215,7 @@ impl ScalarUDFImpl for JsonbPathMatchUdf {
 // jsonb_object_keys  (SRF stub: returns comma-joined keys as Utf8)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbObjectKeysUdf {
     signature: Signature,
 }
@@ -1257,7 +1257,7 @@ impl ScalarUDFImpl for JsonbObjectKeysUdf {
 // jsonb_each  (SRF stub: returns JSON text of record pairs)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbEachUdf {
     signature: Signature,
 }
@@ -1296,7 +1296,7 @@ impl ScalarUDFImpl for JsonbEachUdf {
 // jsonb_each_text  (SRF stub)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbEachTextUdf {
     signature: Signature,
 }
@@ -1348,7 +1348,7 @@ impl ScalarUDFImpl for JsonbEachTextUdf {
 // jsonb_array_elements  (SRF stub: returns first element as LargeBinary)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbArrayElementsUdf {
     signature: Signature,
 }
@@ -1391,7 +1391,7 @@ impl ScalarUDFImpl for JsonbArrayElementsUdf {
 // jsonb_array_elements_text  (SRF stub: first element as Utf8)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbArrayElementsTextUdf {
     signature: Signature,
 }
@@ -1438,7 +1438,7 @@ impl ScalarUDFImpl for JsonbArrayElementsTextUdf {
 // jsonb_build_object(variadic any) -> jsonb
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbBuildObjectUdf {
     signature: Signature,
 }
@@ -1494,7 +1494,7 @@ impl ScalarUDFImpl for JsonbBuildObjectUdf {
 // json_build_object(variadic any) -> text  (Utf8 variant)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonBuildObjectUdf {
     signature: Signature,
 }
@@ -1551,7 +1551,7 @@ impl ScalarUDFImpl for JsonBuildObjectUdf {
 // jsonb_build_array(variadic any) -> jsonb
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbBuildArrayUdf {
     signature: Signature,
 }
@@ -1586,7 +1586,7 @@ impl ScalarUDFImpl for JsonbBuildArrayUdf {
 // to_jsonb(any) -> jsonb
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToJsonbUdf {
     signature: Signature,
 }
@@ -1623,7 +1623,7 @@ impl ScalarUDFImpl for ToJsonbUdf {
 // row_to_json(record) -> jsonb  (stub: returns text representation)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RowToJsonUdf {
     signature: Signature,
 }
@@ -1657,7 +1657,7 @@ impl ScalarUDFImpl for RowToJsonUdf {
 // array_to_json(array [, pretty bool]) -> jsonb
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ArrayToJsonUdf {
     signature: Signature,
 }
@@ -1703,7 +1703,7 @@ impl ScalarUDFImpl for ArrayToJsonUdf {
 // jsonb_agg(any) -> jsonb  [aggregate stub]
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbAggStubUdf {
     signature: Signature,
 }
@@ -1727,7 +1727,7 @@ impl ScalarUDFImpl for JsonbAggStubUdf {
 // jsonb_object_agg(key, value) -> jsonb  [aggregate stub]
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbObjectAggStubUdf {
     signature: Signature,
 }
@@ -1892,7 +1892,7 @@ fn collect_recursive(v: &Value, out: &mut Vec<Value>) {
 // jsonb_path_query_first(jsonb, jsonpath) -> jsonb
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbPathQueryFirstUdf {
     signature: Signature,
 }
@@ -1936,7 +1936,7 @@ impl ScalarUDFImpl for JsonbPathQueryFirstUdf {
 // jsonb_path_query_array(jsonb, jsonpath) -> jsonb  (array of all matches)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbPathQueryArrayUdf {
     signature: Signature,
 }
@@ -1977,7 +1977,7 @@ impl ScalarUDFImpl for JsonbPathQueryArrayUdf {
 // json_typeof(json) -> text  (alias of jsonb_typeof for plain json input)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonTypeofUdf {
     signature: Signature,
 }
@@ -2022,7 +2022,7 @@ impl ScalarUDFImpl for JsonTypeofUdf {
 // json_strip_nulls(json) -> text  (strips nulls, returns JSON text)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonStripNullsUdf {
     signature: Signature,
 }
@@ -2063,7 +2063,7 @@ impl ScalarUDFImpl for JsonStripNullsUdf {
 // to_json(any) -> text  (like to_jsonb but returns Utf8)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ToJsonUdf {
     signature: Signature,
 }
@@ -2103,7 +2103,7 @@ impl ScalarUDFImpl for ToJsonUdf {
 // json_each(json) -> text  (scalar stub: "key=value,..." pairs)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonEachUdf {
     signature: Signature,
 }
@@ -2145,7 +2145,7 @@ impl ScalarUDFImpl for JsonEachUdf {
 // json_each_text(json) -> text  (scalar stub: key=text_value pairs)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonEachTextUdf {
     signature: Signature,
 }
@@ -2193,7 +2193,7 @@ impl ScalarUDFImpl for JsonEachTextUdf {
 // json_object_keys(json) -> text  (scalar stub: comma-joined keys)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonObjectKeysUdf {
     signature: Signature,
 }
@@ -2232,7 +2232,7 @@ impl ScalarUDFImpl for JsonObjectKeysUdf {
 // json_array_elements(json) -> json  (scalar stub: first element as LargeBinary)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonArrayElementsUdf {
     signature: Signature,
 }
@@ -2274,7 +2274,7 @@ impl ScalarUDFImpl for JsonArrayElementsUdf {
 // json_array_elements_text(json) -> text  (scalar stub: first element as text)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonArrayElementsTextUdf {
     signature: Signature,
 }
@@ -2321,7 +2321,7 @@ impl ScalarUDFImpl for JsonArrayElementsTextUdf {
 // json_get(jsonb, key_or_idx) -> jsonb   (operator ->)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonGetUdf {
     signature: Signature,
 }
@@ -2378,7 +2378,7 @@ impl ScalarUDFImpl for JsonGetUdf {
 // json_get_text(jsonb, key_or_idx) -> text   (operator ->>)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonGetTextUdf {
     signature: Signature,
 }
@@ -2438,7 +2438,7 @@ impl ScalarUDFImpl for JsonGetTextUdf {
 // json_path_extract(jsonb, path_array) -> jsonb   (operator #>)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonPathExtractUdf {
     signature: Signature,
 }
@@ -2506,7 +2506,7 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
 // json_path_extract_text(jsonb, path_array) -> text   (operator #>>)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonPathExtractTextUdf {
     signature: Signature,
 }
@@ -2578,7 +2578,7 @@ impl ScalarUDFImpl for JsonPathExtractTextUdf {
 // jsonb_contains(jsonb, jsonb) -> bool   (operator @> — jsonb containment)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbContainsUdf {
     signature: Signature,
 }
@@ -2634,7 +2634,7 @@ fn json_contains(left: &Value, right: &Value) -> bool {
 // jsonb_contained_by(jsonb, jsonb) -> bool   (operator <@)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbContainedByUdf {
     signature: Signature,
 }
@@ -2676,7 +2676,7 @@ impl ScalarUDFImpl for JsonbContainedByUdf {
 // jsonb_has_key(jsonb, text) -> bool   (operator ?)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbHasKeyUdf {
     signature: Signature,
 }
@@ -2724,7 +2724,7 @@ impl ScalarUDFImpl for JsonbHasKeyUdf {
 // jsonb_has_all_keys(jsonb, text) -> bool   (operator ?& — check comma-list)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbHasAllKeysUdf {
     signature: Signature,
 }
@@ -2771,7 +2771,7 @@ impl ScalarUDFImpl for JsonbHasAllKeysUdf {
 // jsonb_has_any_key(jsonb, text) -> bool   (operator ?|)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbHasAnyKeyUdf {
     signature: Signature,
 }
@@ -2817,7 +2817,7 @@ impl ScalarUDFImpl for JsonbHasAnyKeyUdf {
 // jsonb_concat(jsonb, jsonb) -> jsonb   (operator ||)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbConcatUdf {
     signature: Signature,
 }
@@ -2883,7 +2883,7 @@ impl ScalarUDFImpl for JsonbConcatUdf {
 // jsonb_delete_key(jsonb, text) -> jsonb   (operator: jsonb - 'key')
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbDeleteKeyUdf {
     signature: Signature,
 }
@@ -2927,7 +2927,7 @@ impl ScalarUDFImpl for JsonbDeleteKeyUdf {
 // jsonb_delete_keys(jsonb, text[]) -> jsonb   (operator: jsonb - ARRAY[...])
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbDeleteKeysUdf {
     signature: Signature,
 }
@@ -3010,7 +3010,7 @@ impl ScalarUDFImpl for JsonbDeleteKeysUdf {
 // jsonb_delete_index(jsonb, int8) -> jsonb   (operator: jsonb - idx)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonbDeleteIndexUdf {
     signature: Signature,
 }
@@ -3078,7 +3078,7 @@ impl ScalarUDFImpl for JsonbDeleteIndexUdf {
 // (scalar stubs — SRF table functions require DataFusion TableProvider)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonToRecordStubUdf {
     signature: Signature,
     name: &'static str,

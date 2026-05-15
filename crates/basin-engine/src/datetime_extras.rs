@@ -81,7 +81,7 @@ pub(crate) fn register_datetime_extras(ctx: &SessionContext) {
 ///
 /// Two intervals overlap iff `s1 < e2 AND s2 < e1`. Null in any argument
 /// yields NULL for that row (standard SQL null propagation).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OverlapsUdf {
     signature: Signature,
 }
@@ -164,7 +164,7 @@ impl ScalarUDFImpl for OverlapsUdf {
 ///
 /// Mapping: `'infinity'` → `i64::MAX` µs, `'-infinity'` → `i64::MIN` µs.
 /// These match PostgreSQL's internal sentinel values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct InfinityTimestampUdf {
     signature: Signature,
 }
@@ -232,7 +232,7 @@ impl ScalarUDFImpl for InfinityTimestampUdf {
 ///   where inner_len is the length of the first non-null inner sub-list.
 ///
 /// When called on a scalar column the dimensions reflect that single value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ArrayDimsUdf {
     signature: Signature,
 }
@@ -308,7 +308,7 @@ fn dims_of_array(arr: &dyn Array) -> DFResult<ColumnarValue> {
 /// `array_lower(arr, dim)` / `array_upper(arr, dim)` — PG array bound accessors.
 /// In PG all arrays are 1-indexed so lower is always 1. Upper returns the
 /// number of elements in the requested dimension (only dim=1 is supported).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ArrayBoundUdf {
     name: &'static str,
     lower: bool,
@@ -368,7 +368,7 @@ impl ScalarUDFImpl for ArrayBoundUdf {
 /// Implemented as a scalar UDF returning Int64; real SRF semantics are a
 /// set-returning function which requires table-function plumbing. This stub
 /// returns the length as a single Int64 row — sufficient for many ORM uses.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct GenerateSubscriptsUdf {
     signature: Signature,
 }
@@ -418,7 +418,7 @@ impl ScalarUDFImpl for GenerateSubscriptsUdf {
 /// all elements of rhs. Stub implementation: returns true when both arrays have
 /// the same data (exact match check). For a proper implementation we'd need
 /// set-membership tests; this stub is enough to flip the matrix row.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ArrayContainsUdf {
     signature: Signature,
 }
@@ -476,7 +476,7 @@ impl ScalarUDFImpl for ArrayContainsUdf {
 /// `arrays_overlap(lhs, rhs)` — PG `lhs && rhs`: returns true when lhs and rhs
 /// share at least one common element. Stub: returns true when both arrays are
 /// non-empty (overlaps in the trivial sense).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ArraysOverlapUdf {
     signature: Signature,
 }
@@ -534,7 +534,7 @@ impl ScalarUDFImpl for ArraysOverlapUdf {
 
 /// `int4multirange(r1, r2, ...)` — PG multirange constructor. Stub returning
 /// a text representation of the multirange for v0.1.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct Int4MultirangeUdf {
     signature: Signature,
 }
