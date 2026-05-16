@@ -2,7 +2,7 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778948330 (Unix epoch)
+Last run: 1778950748 (Unix epoch)
 SQL fragments tested: 697 total / 1875 green (across all three configurations).
 
 ## Configurations

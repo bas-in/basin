@@ -37,9 +37,11 @@ use arrow_schema::{DataType, Field};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, Expr, FromTable, ObjectName, Query, SetExpr,
-    Statement, TableFactor, Value,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, Expr, FromTable, ObjectName, Query,
+    SelectItem, SetExpr, Statement, TableFactor, Value,
 };
+use sqlparser::ast::DataType as SqlDataType;
+use arrow_schema::TimeUnit;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::sync::RwLock;
@@ -439,6 +441,150 @@ fn column_field<'a>(schema: &'a arrow_schema::Schema, col: &str) -> Option<&'a F
         .map(|f| f.as_ref())
 }
 
+/// Map a `sqlparser` SQL [`DataType`][SqlDataType] that appears in an explicit
+/// cast (`$1::int4`, `CAST($1 AS timestamptz)`) to the Arrow [`DataType`] that
+/// Basin uses for that Postgres type.
+///
+/// Returns `None` for any type not in Basin's supported set; the caller leaves
+/// that placeholder at the TEXT default (safe degradation, no panic).
+fn cast_data_type_to_arrow(sql: &SqlDataType) -> Option<DataType> {
+    match sql {
+        // ── Integer family ──────────────────────────────────────────────────
+        SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Some(DataType::Int16),
+        SqlDataType::Int(_)
+        | SqlDataType::Integer(_)
+        | SqlDataType::Int4(_) => Some(DataType::Int32),
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Some(DataType::Int64),
+
+        // ── Floating-point ──────────────────────────────────────────────────
+        // REAL and FLOAT4 are synonyms in PostgreSQL; sqlparser 0.61 has both.
+        SqlDataType::Real | SqlDataType::Float4 => Some(DataType::Float32),
+        SqlDataType::Double(_)
+        | SqlDataType::DoublePrecision
+        | SqlDataType::Float8
+        | SqlDataType::Float(_) => Some(DataType::Float64),
+
+        // ── Text ────────────────────────────────────────────────────────────
+        SqlDataType::Text
+        | SqlDataType::Varchar(_)
+        | SqlDataType::CharacterVarying(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::Character(_)
+        | SqlDataType::String(_) => Some(DataType::Utf8),
+
+        // ── Boolean ─────────────────────────────────────────────────────────
+        SqlDataType::Boolean | SqlDataType::Bool => Some(DataType::Boolean),
+
+        // ── Binary ──────────────────────────────────────────────────────────
+        SqlDataType::Bytea => Some(DataType::Binary),
+
+        // ── Date / Time ─────────────────────────────────────────────────────
+        SqlDataType::Date => Some(DataType::Date32),
+        SqlDataType::Time(_, sqlparser::ast::TimezoneInfo::None)
+        | SqlDataType::Time(_, sqlparser::ast::TimezoneInfo::WithoutTimeZone) => {
+            Some(DataType::Time64(TimeUnit::Microsecond))
+        }
+        SqlDataType::Timestamp(_, tz) => match tz {
+            sqlparser::ast::TimezoneInfo::Tz | sqlparser::ast::TimezoneInfo::WithTimeZone => {
+                Some(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+            }
+            _ => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        },
+
+        // ── UUID ─────────────────────────────────────────────────────────────
+        // UUID occupies FixedSizeBinary(16) in Basin. The is_uuid flag is set
+        // separately by the caller so the pgwire layer emits OID 2950.
+        SqlDataType::Uuid => Some(DataType::FixedSizeBinary(16)),
+        SqlDataType::Custom(name, modifiers)
+            if name.0.len() == 1
+                && name.0[0].id_val().eq_ignore_ascii_case("uuid")
+                && modifiers.is_empty() =>
+        {
+            Some(DataType::FixedSizeBinary(16))
+        }
+
+        // ── Interval ────────────────────────────────────────────────────────
+        SqlDataType::Interval { .. } => {
+            Some(DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano))
+        }
+
+        // ── Numeric / Decimal ────────────────────────────────────────────────
+        // Use (38, 0) — Basin's default for bare NUMERIC — rather than trying
+        // to infer precision/scale at this stage. The probe SQL will carry the
+        // right literal anyway; type-inference just needs a non-TEXT Arrow type.
+        SqlDataType::Numeric(_) | SqlDataType::Decimal(_) | SqlDataType::Dec(_) => {
+            Some(DataType::Decimal128(38, 0))
+        }
+
+        // Anything else: fall back to TEXT (safe default).
+        _ => None,
+    }
+}
+
+/// Walk each SELECT projection item looking for `$N::type` / `CAST($N AS type)`
+/// patterns. For each match, record the inferred Arrow type (and UUID flag) for
+/// placeholder slot N without overwriting any type already resolved by the more
+/// authoritative WHERE-clause / catalog path.
+fn walk_projection_for_casts(
+    projection: &[SelectItem],
+    out: &mut [DataType],
+    is_uuid_out: &mut [bool],
+) {
+    for item in projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => continue,
+        };
+        pin_cast_placeholder(expr, out, is_uuid_out);
+    }
+}
+
+/// If `expr` is `Cast { expr: Placeholder($N), data_type, .. }` (any CastKind),
+/// record the inferred Arrow type in slot N. Only fills a slot that still holds
+/// the TEXT default — it will not overwrite a type already set by the more
+/// authoritative catalog-backed WHERE-clause path.
+fn pin_cast_placeholder(expr: &Expr, out: &mut [DataType], is_uuid_out: &mut [bool]) {
+    if let Expr::Cast {
+        kind: CastKind::Cast | CastKind::DoubleColon | CastKind::TryCast | CastKind::SafeCast,
+        expr: inner,
+        data_type,
+        ..
+    } = expr
+    {
+        // We only handle a direct placeholder inside the cast, e.g. `$1::int4`.
+        // Nested casts (`CAST(CAST($1 AS text) AS int4)`) are uncommon in
+        // ORM output; if needed they can be added later.
+        if let Some(n) = placeholder_index(inner) {
+            if let Some(arrow_dt) = cast_data_type_to_arrow(data_type) {
+                if let Some(slot) = out.get_mut(n - 1) {
+                    // Only fill slots that are still TEXT (the default). A slot
+                    // set by the WHERE-clause catalog path takes priority.
+                    if *slot == DataType::Utf8 {
+                        *slot = arrow_dt;
+                    }
+                }
+                // UUID needs the metadata flag regardless of whether we set the type.
+                let is_uuid = matches!(
+                    data_type,
+                    SqlDataType::Uuid
+                ) || matches!(
+                    data_type,
+                    SqlDataType::Custom(name, modifiers)
+                    if name.0.len() == 1
+                        && name.0[0].id_val().eq_ignore_ascii_case("uuid")
+                        && modifiers.is_empty()
+                );
+                if is_uuid {
+                    if let Some(s) = is_uuid_out.get_mut(n - 1) {
+                        *s = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Walk a SELECT looking for `<col> OP $N` and `$N OP <col>` predicates we
 /// can resolve to a column type. JSONB / UUID metadata flags are propagated
 /// for the SELECT WHERE side so prepared `WHERE id = $1` over a UUID column
@@ -475,6 +621,18 @@ async fn walk_select_for_predicates(
             }
         }
     }
+
+    // Walk SELECT projection items for explicit-cast placeholders: `$1::int4`,
+    // `CAST($2 AS timestamptz)`, etc. This runs before the WHERE-clause walk
+    // so that if the same placeholder appears in both positions the
+    // catalog-backed WHERE inference (below) takes priority (it overwrites only
+    // if the slot is still TEXT after projection inference — see `pin_cast_placeholder`).
+    // Actually we want WHERE to win, so we call projection inference FIRST and
+    // WHERE inference SECOND; `pin_cast_placeholder` only fills TEXT slots, so
+    // a catalog-set type from WHERE will NOT be overwritten.
+    //
+    // Order: projection (explicit cast, low-authority) then WHERE (catalog, high-authority).
+    walk_projection_for_casts(&select.projection, out, is_uuid_out);
 
     if let Some(pred) = &select.selection {
         walk_pred(pred, &tables, out, is_jsonb_out, is_uuid_out);
@@ -1024,5 +1182,180 @@ mod tests {
     fn substitute_param_appearing_twice() {
         let out = substitute("SELECT $1 + $1", &[ScalarParam::Int4(5)]).unwrap();
         assert_eq!(out, "SELECT 5 + 5");
+    }
+
+    // -------------------------------------------------------------------------
+    // Projection-cast type inference unit tests (#60)
+    //
+    // These tests exercise `walk_projection_for_casts` + `pin_cast_placeholder`
+    // + `cast_data_type_to_arrow` via a small harness that parses a SQL string
+    // and runs the projection walker, mimicking what `infer_param_types` does.
+    // -------------------------------------------------------------------------
+
+    /// Parse a SELECT SQL string, run the projection-cast walker, and return the
+    /// resulting `out` vector (one DataType per placeholder, 1-indexed).
+    fn infer_via_projection(sql: &str, placeholder_count: usize) -> (Vec<DataType>, Vec<bool>) {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = PostgreSqlDialect {};
+        let stmts = Parser::parse_sql(&dialect, sql).expect("parse");
+        let stmt = stmts.into_iter().next().expect("one stmt");
+        let q = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("expected Query"),
+        };
+        let select = match q.body.as_ref() {
+            sqlparser::ast::SetExpr::Select(s) => s,
+            _ => panic!("expected Select"),
+        };
+        let mut out = vec![DataType::Utf8; placeholder_count];
+        let mut is_uuid = vec![false; placeholder_count];
+        walk_projection_for_casts(&select.projection, &mut out, &mut is_uuid);
+        (out, is_uuid)
+    }
+
+    #[test]
+    fn projection_cast_infers_int2() {
+        let (out, _) = infer_via_projection("SELECT $1::int2 AS v", 1);
+        assert_eq!(out[0], DataType::Int16);
+    }
+
+    #[test]
+    fn projection_cast_infers_int4_double_colon() {
+        let (out, _) = infer_via_projection("SELECT $1::int4 AS v", 1);
+        assert_eq!(out[0], DataType::Int32);
+    }
+
+    #[test]
+    fn projection_cast_infers_int4_cast_syntax() {
+        let (out, _) = infer_via_projection("SELECT CAST($1 AS int4) AS v", 1);
+        assert_eq!(out[0], DataType::Int32);
+    }
+
+    #[test]
+    fn projection_cast_infers_int8() {
+        let (out, _) = infer_via_projection("SELECT $1::int8 AS v", 1);
+        assert_eq!(out[0], DataType::Int64);
+    }
+
+    #[test]
+    fn projection_cast_infers_bigint() {
+        let (out, _) = infer_via_projection("SELECT $1::bigint AS v", 1);
+        assert_eq!(out[0], DataType::Int64);
+    }
+
+    #[test]
+    fn projection_cast_infers_float4() {
+        let (out, _) = infer_via_projection("SELECT $1::float4 AS v", 1);
+        assert_eq!(out[0], DataType::Float32);
+    }
+
+    #[test]
+    fn projection_cast_infers_float8() {
+        let (out, _) = infer_via_projection("SELECT $1::float8 AS v", 1);
+        assert_eq!(out[0], DataType::Float64);
+    }
+
+    #[test]
+    fn projection_cast_infers_text() {
+        // text → Utf8 (stays at the default but is explicitly asserted)
+        let (out, _) = infer_via_projection("SELECT $1::text AS v", 1);
+        assert_eq!(out[0], DataType::Utf8);
+    }
+
+    #[test]
+    fn projection_cast_infers_bool() {
+        let (out, _) = infer_via_projection("SELECT $1::bool AS v", 1);
+        assert_eq!(out[0], DataType::Boolean);
+    }
+
+    #[test]
+    fn projection_cast_infers_boolean() {
+        let (out, _) = infer_via_projection("SELECT $1::boolean AS v", 1);
+        assert_eq!(out[0], DataType::Boolean);
+    }
+
+    #[test]
+    fn projection_cast_infers_date() {
+        let (out, _) = infer_via_projection("SELECT $1::date AS v", 1);
+        assert_eq!(out[0], DataType::Date32);
+    }
+
+    #[test]
+    fn projection_cast_infers_timestamp() {
+        let (out, _) = infer_via_projection("SELECT $1::timestamp AS v", 1);
+        assert_eq!(out[0], DataType::Timestamp(TimeUnit::Microsecond, None));
+    }
+
+    #[test]
+    fn projection_cast_infers_timestamptz() {
+        let (out, _) = infer_via_projection("SELECT $1::timestamptz AS v", 1);
+        assert_eq!(
+            out[0],
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn projection_cast_infers_uuid_sets_flag() {
+        let (out, is_uuid) = infer_via_projection("SELECT $1::uuid AS v", 1);
+        assert_eq!(out[0], DataType::FixedSizeBinary(16));
+        assert!(is_uuid[0], "UUID placeholder must set is_uuid flag");
+    }
+
+    #[test]
+    fn projection_cast_infers_bytea() {
+        let (out, _) = infer_via_projection("SELECT $1::bytea AS v", 1);
+        assert_eq!(out[0], DataType::Binary);
+    }
+
+    #[test]
+    fn projection_cast_infers_multiple_params() {
+        let (out, is_uuid) =
+            infer_via_projection("SELECT $1::int4 AS a, $2::uuid AS b, $3::text AS c", 3);
+        assert_eq!(out[0], DataType::Int32);
+        assert_eq!(out[1], DataType::FixedSizeBinary(16));
+        assert!(is_uuid[1]);
+        assert_eq!(out[2], DataType::Utf8);
+    }
+
+    #[test]
+    fn projection_cast_does_not_overwrite_already_set_type() {
+        // Simulate: slot 0 already set to Int64 by the WHERE-clause path.
+        // walk_projection_for_casts must not overwrite it with Int32.
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "SELECT $1::int4 AS v";
+        let dialect = PostgreSqlDialect {};
+        let stmts = Parser::parse_sql(&dialect, sql).expect("parse");
+        let stmt = stmts.into_iter().next().unwrap();
+        let q = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!(),
+        };
+        let select = match q.body.as_ref() {
+            sqlparser::ast::SetExpr::Select(s) => s,
+            _ => panic!(),
+        };
+        // Pre-set slot 0 to Int64 (as if WHERE col = $1 on a BIGINT column had run).
+        let mut out = vec![DataType::Int64];
+        let mut is_uuid = vec![false];
+        walk_projection_for_casts(&select.projection, &mut out, &mut is_uuid);
+        // Int64 must survive; projection cast cannot overwrite a non-TEXT slot.
+        assert_eq!(out[0], DataType::Int64, "catalog type must not be overwritten");
+    }
+
+    #[test]
+    fn projection_cast_unknown_type_leaves_text() {
+        // An unsupported custom type (e.g., a domain type) must leave TEXT.
+        // "citext" is not in cast_data_type_to_arrow's supported set.
+        let (out, _) = infer_via_projection("SELECT $1::citext AS v", 1);
+        assert_eq!(
+            out[0],
+            DataType::Utf8,
+            "unsupported cast type must degrade to TEXT"
+        );
     }
 }

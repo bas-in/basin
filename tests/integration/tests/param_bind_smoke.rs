@@ -111,19 +111,6 @@ async fn connect(addr: SocketAddr) -> tokio_postgres::Client {
 /// extended-protocol round-trip with no table involved.
 /// tokio-postgres sends Parse → Bind (value="hello") → Execute.
 /// The engine must receive `SELECT 'hello' AS v` and return one row.
-///
-/// Note: `SELECT $1::int4 AS v` with an i32 value currently fails at
-/// ParameterDescription time because the type-inference pass in
-/// `basin-engine::prepared::infer_param_types` does not yet recognise the
-/// explicit-cast pattern `$N::type` on SELECT projection expressions — it
-/// falls back to TEXT (the safe default), causing tokio-postgres to reject
-/// the i32 binding client-side with "WrongType { postgres: Text, rust: i32 }".
-/// That type-inference gap lives in `crates/basin-engine/src/prepared.rs`
-/// (`infer_param_types` / `walk_select_for_predicates`) and is outside this
-/// PR's lane. The fix needed: recognise `Expr::Cast { data_type, .. }` or
-/// `Expr::BinaryOp` with `::` and map the Postgres type name to Arrow DataType.
-/// Table-backed queries (WHERE col = $1) infer correctly because the column
-/// type is known from the catalog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn param_bind_text_scalar_select() {
     let server = start_server().await;
@@ -295,4 +282,98 @@ async fn param_bind_two_params_mixed_types() {
     let v: &str = rows[0].get(1);
     assert_eq!(k, 999);
     assert_eq!(v, "hello world");
+}
+
+// =============================================================================
+// Scenarios 6+: Explicit-cast projection type inference (#60).
+//
+// `SELECT $1::type AS v` must infer the parameter type from the cast so that
+// ParameterDescription returns the correct OID and drivers (tokio-postgres,
+// asyncpg, pgx, Prisma) bind the value without a WrongType rejection.
+// =============================================================================
+
+/// `SELECT $1::int4 AS v` with i32 — the canonical form Prisma / asyncpg emit
+/// for scalar projections. The engine must infer OID INT4 (23) for $1 so the
+/// driver can bind an i32 without a WrongType error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn param_bind_int4_projection_cast() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+
+    let stmt = client
+        .prepare("SELECT $1::int4 AS v")
+        .await
+        .expect("prepare SELECT $1::int4");
+
+    let rows = client
+        .query(&stmt, &[&42_i32])
+        .await
+        .expect("query SELECT $1::int4 with i32 42");
+
+    assert_eq!(rows.len(), 1, "expected 1 row");
+    let v: i32 = rows[0].get(0);
+    assert_eq!(v, 42, "int4 cast param must round-trip as i32");
+}
+
+/// `SELECT $1::int8 AS v` with i64 — verifies int8/bigint inference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn param_bind_int8_projection_cast() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+
+    let stmt = client
+        .prepare("SELECT $1::int8 AS v")
+        .await
+        .expect("prepare SELECT $1::int8");
+
+    let rows = client
+        .query(&stmt, &[&9_000_000_000_i64])
+        .await
+        .expect("query SELECT $1::int8");
+
+    assert_eq!(rows.len(), 1);
+    let v: i64 = rows[0].get(0);
+    assert_eq!(v, 9_000_000_000_i64);
+}
+
+/// `SELECT $1::bool AS v` with bool — verifies boolean projection cast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn param_bind_bool_projection_cast() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+
+    let stmt = client
+        .prepare("SELECT $1::bool AS v")
+        .await
+        .expect("prepare SELECT $1::bool");
+
+    let rows = client
+        .query(&stmt, &[&true])
+        .await
+        .expect("query SELECT $1::bool with true");
+
+    assert_eq!(rows.len(), 1);
+    let v: bool = rows[0].get(0);
+    assert!(v, "bool cast param must round-trip as true");
+}
+
+/// CAST syntax (`CAST($1 AS int4)`) must infer the same as `::` sugar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn param_bind_cast_syntax_int4() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+
+    let stmt = client
+        .prepare("SELECT CAST($1 AS int4) AS v")
+        .await
+        .expect("prepare SELECT CAST($1 AS int4)");
+
+    let rows = client
+        .query(&stmt, &[&-7_i32])
+        .await
+        .expect("query CAST($1 AS int4) with -7");
+
+    assert_eq!(rows.len(), 1);
+    let v: i32 = rows[0].get(0);
+    assert_eq!(v, -7);
 }
