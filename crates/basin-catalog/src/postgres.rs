@@ -348,6 +348,17 @@ impl PostgresCatalog {
                     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 )"
             ),
+            // Bug #41 fix: persist removed_paths in Replace snapshots so
+            // `TableMetadata::live_data_files()` can reconstruct the exact
+            // live file set at any snapshot without a directory scan. New
+            // deployments get the column via the snapshots table DDL above;
+            // existing deployments get it from this idempotent ADD COLUMN.
+            // NULL / absent means no paths were removed (Append / Genesis) —
+            // back-compat: old rows deserialise as an empty Vec<String>.
+            format!(
+                "ALTER TABLE {schema}.snapshots
+                 ADD COLUMN IF NOT EXISTS removed_paths_json JSONB"
+            ),
         ];
         let client = self.client.lock().await;
         for stmt in stmts {
@@ -475,6 +486,7 @@ impl Catalog for PostgresCatalog {
                 parent: None,
                 committed_at: now,
                 data_files: empty_files,
+                removed_paths: vec![],
                 summary: genesis_summary,
             }],
             format_version: 2,
@@ -928,9 +940,11 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("serialise summary: {e}")))?;
         let files_json = serde_json::to_value(&added_files)
             .map_err(|e| BasinError::catalog(format!("serialise data files: {e}")))?;
-        // Suppress unused-warning. Path list is acted on by the engine; we
-        // record only the count in the snapshot summary.
-        let _ = removed_paths;
+        // Persist removed_paths so live_data_files() can reconstruct the exact
+        // live set at any snapshot. The engine also physically deletes these
+        // files; we record the paths for catalog-side PITR correctness.
+        let removed_paths_json = serde_json::to_value(&removed_paths)
+            .map_err(|e| BasinError::catalog(format!("serialise removed paths: {e}")))?;
 
         let mut client = self.client.lock().await;
         let tx = client
@@ -970,8 +984,8 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots
-                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
-                 VALUES ($1, $2, $3, $4, 'replace', $5, $6, $7)"
+                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files, removed_paths_json)
+                 VALUES ($1, $2, $3, $4, 'replace', $5, $6, $7, $8)"
             ),
             &[
                 &project_str,
@@ -981,6 +995,7 @@ impl Catalog for PostgresCatalog {
                 &now,
                 &summary_json,
                 &files_json,
+                &removed_paths_json,
             ],
         )
         .await
@@ -1609,10 +1624,12 @@ impl Catalog for PostgresCatalog {
             &format!(
                 "INSERT INTO {sch}.snapshots (
                     project_id, table_name, snapshot_id, parent_id,
-                    operation, committed_at, summary_json, data_files
+                    operation, committed_at, summary_json, data_files,
+                    removed_paths_json
                  )
                  SELECT project_id, $3, snapshot_id, parent_id,
-                        operation, committed_at, summary_json, data_files
+                        operation, committed_at, summary_json, data_files,
+                        removed_paths_json
                  FROM {sch}.snapshots
                  WHERE project_id = $1 AND table_name = $2"
             ),
@@ -2968,7 +2985,8 @@ async fn fetch_snapshots(
     let rows = client
         .query(
             &format!(
-                "SELECT snapshot_id, parent_id, committed_at, summary_json, data_files
+                "SELECT snapshot_id, parent_id, committed_at, summary_json, data_files,
+                        removed_paths_json
                  FROM {schema}.snapshots
                  WHERE project_id = $1 AND table_name = $2
                  ORDER BY snapshot_id ASC"
@@ -2984,15 +3002,22 @@ async fn fetch_snapshots(
         let committed_at: chrono::DateTime<Utc> = row.get(2);
         let summary_json: serde_json::Value = row.get(3);
         let files_json: serde_json::Value = row.get(4);
+        let removed_paths_json: Option<serde_json::Value> = row.get(5);
         let summary: SnapshotSummary = serde_json::from_value(summary_json)
             .map_err(|e| BasinError::catalog(format!("deserialise summary: {e}")))?;
         let data_files: Vec<DataFileRef> = serde_json::from_value(files_json)
             .map_err(|e| BasinError::catalog(format!("deserialise data files: {e}")))?;
+        let removed_paths: Vec<String> = match removed_paths_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise removed paths: {e}")))?,
+            None => vec![],
+        };
         out.push(Snapshot {
             id: SnapshotId(id as u64),
             parent: parent.map(|p| SnapshotId(p as u64)),
             committed_at,
             data_files,
+            removed_paths,
             summary,
         });
     }

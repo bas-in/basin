@@ -73,6 +73,21 @@ pub struct Snapshot {
     pub id: SnapshotId,
     pub parent: Option<SnapshotId>,
     pub committed_at: DateTime<Utc>,
+    /// Files added by this snapshot (the delta). For [`SnapshotOperation::Append`]
+    /// these are newly-written Parquet files. For [`SnapshotOperation::Replace`]
+    /// these are the replacement files written by a copy-on-write UPDATE/DELETE.
+    /// [`SnapshotOperation::Genesis`] always has an empty list.
     pub data_files: Vec<DataFileRef>,
+    /// Object-store paths that were logically removed by this snapshot. Non-empty
+    /// only for [`SnapshotOperation::Replace`] commits (copy-on-write UPDATE /
+    /// DELETE). The physical files are deleted by the engine at commit time; this
+    /// field records the paths so the catalog can compute the complete live file
+    /// set at any snapshot via [`crate::TableMetadata::live_data_files`].
+    ///
+    /// `#[serde(default)]` ensures historic snapshots serialised before this
+    /// field existed deserialise to an empty vec — preserving the pre-fix read
+    /// path where `removed_paths` was always implicitly empty.
+    #[serde(default)]
+    pub removed_paths: Vec<String>,
     pub summary: SnapshotSummary,
 }

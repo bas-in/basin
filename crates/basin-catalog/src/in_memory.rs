@@ -62,6 +62,7 @@ impl TableState {
             parent: None,
             committed_at: now,
             data_files: Vec::new(),
+            removed_paths: vec![],
             summary: SnapshotSummary {
                 operation: SnapshotOperation::Genesis,
                 added_files: 0,
@@ -419,6 +420,7 @@ impl Catalog for InMemoryCatalog {
             parent: Some(parent),
             committed_at: Utc::now(),
             data_files: files,
+            removed_paths: vec![],
             summary: SnapshotSummary {
                 operation: SnapshotOperation::Append,
                 added_files,
@@ -466,17 +468,19 @@ impl Catalog for InMemoryCatalog {
         let added_bytes: u64 = added_files.iter().map(|f| f.size_bytes).sum();
         let removed_files_count = removed_paths.len() as u64;
 
-        // Per-snapshot data_files mirrors the Append convention: the snapshot
-        // records the *delta* (the new files written by this commit). The
-        // catalog isn't asked to materialise the full file set; the engine
-        // physically deletes the removed files from the object store as part
-        // of the same commit so subsequent listings see the new state.
+        // Per-snapshot data_files records the delta (new files written by this
+        // commit). removed_paths records the object-store paths that were
+        // logically removed so live_data_files() can reconstruct the exact live
+        // set at any snapshot without a directory scan. The engine physically
+        // deletes these files; the catalog keeps the path list for PITR
+        // correctness.
         let new_id = parent.next();
         let snap = Snapshot {
             id: new_id,
             parent: Some(parent),
             committed_at: Utc::now(),
             data_files: added_files,
+            removed_paths,
             summary: SnapshotSummary {
                 operation: SnapshotOperation::Replace,
                 added_files: added_files_count,
@@ -485,12 +489,6 @@ impl Catalog for InMemoryCatalog {
                 removed_files: removed_files_count,
             },
         };
-        // Suppress the "unused" warning for `removed_paths` — its value is
-        // recorded in the summary count above. The path list itself is the
-        // engine's responsibility to act on (file deletion); the catalog
-        // snapshot history records *that* the swap happened, not which old
-        // bytes were thrown away.
-        let _ = removed_paths;
         state.snapshots.push(snap);
         state.current = new_id;
         Ok(Self::build_metadata(project, table, &state))
@@ -2190,5 +2188,141 @@ mod tests {
         let late_meta = cat.load_table(&t, &late).await.unwrap();
         assert_eq!(late_meta.current_snapshot, SnapshotId(1));
         assert_eq!(late_meta.snapshots.len(), 2);
+    }
+
+    // ── live_data_files() unit tests (Bug #41) ──────────────────────────────
+
+    /// After inserting two batches and rolling back to the first-batch snapshot,
+    /// `live_data_files()` must return only the first batch's files. This is the
+    /// catalog-level contract that the engine's read path must honour to fix #41.
+    #[tokio::test]
+    async fn live_data_files_after_rollback_excludes_post_snapshot_files() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("bug41_live").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+
+        // Batch A: 1 file, 3 rows — mirrors the bug#41 3-row insert.
+        // file(path, rows, bytes): rows=3, bytes=10.
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("batch_a.parquet", 3, 10)],
+        )
+        .await
+        .unwrap();
+        let target_snap = SnapshotId(1); // post-batch-A snapshot
+
+        // Batch B: 2 more files, 1 row each — mirrors the 2-row second insert.
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId(1),
+            vec![file("batch_b1.parquet", 1, 5), file("batch_b2.parquet", 1, 5)],
+        )
+        .await
+        .unwrap();
+
+        // Before rollback: live set has all three files (5 rows total).
+        let before = cat.load_table(&t, &tbl).await.unwrap();
+        let mut before_paths: Vec<String> =
+            before.live_data_files().into_iter().map(|f| f.path).collect();
+        before_paths.sort();
+        assert_eq!(
+            before_paths,
+            vec!["batch_a.parquet", "batch_b1.parquet", "batch_b2.parquet"],
+            "pre-rollback live set should include both batches",
+        );
+        let rows_before: u64 = before.live_data_files().iter().map(|f| f.row_count).sum();
+        assert_eq!(rows_before, 5, "pre-rollback: 3+1+1 = 5 rows");
+
+        // Rollback to batch-A snapshot.
+        let rolled = cat
+            .rollback_to_snapshot(&t, &tbl, target_snap)
+            .await
+            .unwrap();
+
+        // After rollback: live set must contain ONLY batch_a.parquet.
+        let mut post_paths: Vec<String> =
+            rolled.live_data_files().into_iter().map(|f| f.path).collect();
+        post_paths.sort();
+        assert_eq!(
+            post_paths,
+            vec!["batch_a.parquet"],
+            "post-rollback live set must exclude batch-B files (bug #41)",
+        );
+
+        // Row count via live_data_files should be 3 (batch A only).
+        let row_count: u64 = rolled.live_data_files().iter().map(|f| f.row_count).sum();
+        assert_eq!(row_count, 3, "post-rollback row count via catalog must be 3");
+    }
+
+    /// Genesis snapshot → live_data_files returns empty.
+    #[tokio::test]
+    async fn live_data_files_at_genesis_is_empty() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("bug41_genesis").unwrap();
+        let meta = cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        assert!(
+            meta.live_data_files().is_empty(),
+            "genesis live set must be empty",
+        );
+    }
+
+    /// Append two files → live_data_files returns both.
+    #[tokio::test]
+    async fn live_data_files_accumulates_across_appends() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("bug41_append").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        cat.append_data_files(&t, &tbl, SnapshotId::GENESIS, vec![file("f1.parquet", 1, 10)])
+            .await
+            .unwrap();
+        let meta = cat
+            .append_data_files(&t, &tbl, SnapshotId(1), vec![file("f2.parquet", 2, 20)])
+            .await
+            .unwrap();
+        let mut paths: Vec<String> =
+            meta.live_data_files().into_iter().map(|f| f.path).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["f1.parquet", "f2.parquet"]);
+    }
+
+    /// Replace removes the specified files and adds the replacements.
+    #[tokio::test]
+    async fn live_data_files_replace_removes_old_adds_new() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("bug41_replace").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("old1.parquet", 1, 10), file("old2.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+
+        // Replace old1 with new1, keep old2.
+        let meta = cat
+            .replace_data_files(
+                &t,
+                &tbl,
+                SnapshotId(1),
+                vec!["old1.parquet".to_string()],
+                vec![file("new1.parquet", 2, 20)],
+            )
+            .await
+            .unwrap();
+
+        let mut paths: Vec<String> =
+            meta.live_data_files().into_iter().map(|f| f.path).collect();
+        paths.sort();
+        // old1 removed, new1 added, old2 retained.
+        assert_eq!(paths, vec!["new1.parquet", "old2.parquet"]);
     }
 }

@@ -387,4 +387,49 @@ impl TableMetadata {
             .iter()
             .find(|s| s.id == self.current_snapshot)
     }
+
+    /// Compute the **complete live data-file set** at `current_snapshot` by
+    /// replaying the snapshot chain from the genesis snapshot forward.
+    ///
+    /// Each [`SnapshotOperation::Append`] adds its `data_files` to the live
+    /// set; each [`SnapshotOperation::Replace`] removes the paths recorded in
+    /// `removed_paths` and adds the replacement `data_files`. Genesis snapshots
+    /// contribute nothing (they have no files by construction).
+    ///
+    /// This is the correct input for the engine's read path: after a
+    /// `rollback_to_snapshot` call the catalog prunes every snapshot with
+    /// `id > snapshot_id`, so `live_data_files()` on the returned
+    /// [`TableMetadata`] yields exactly the files that were live at the
+    /// rollback target — post-rollback files never appear.
+    ///
+    /// Callers that scan the object-store directory directly (e.g.
+    /// DataFusion's `ListingTable` with a directory URL) see *all* physical
+    /// files, including those logically removed by rollback. Using this
+    /// method instead makes the read path catalog-driven and correct.
+    pub fn live_data_files(&self) -> Vec<DataFileRef> {
+        use std::collections::HashMap;
+        // Walk snapshots in id order (genesis → current) and maintain the
+        // live set as a path → DataFileRef map so we can apply removes in O(1).
+        let mut live: HashMap<String, DataFileRef> = HashMap::new();
+        let mut ordered: Vec<&Snapshot> = self.snapshots.iter().collect();
+        ordered.sort_by_key(|s| s.id);
+        for snap in ordered {
+            if snap.id > self.current_snapshot {
+                // Snapshots beyond the head are not part of the live set.
+                // This can occur if the metadata was loaded before a concurrent
+                // rollback fully flushed; being defensive here is cheaper than
+                // enforcing strict ordering at every commit site.
+                break;
+            }
+            // Remove any paths this snapshot replaced (Replace operation).
+            for path in &snap.removed_paths {
+                live.remove(path);
+            }
+            // Add the files written by this snapshot.
+            for f in &snap.data_files {
+                live.insert(f.path.clone(), f.clone());
+            }
+        }
+        live.into_values().collect()
+    }
 }
