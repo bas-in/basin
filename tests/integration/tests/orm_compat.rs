@@ -596,7 +596,6 @@ async fn inner_vs_left_join_eager_load() {
 /// Ecto, Drizzle, Prisma) trips this. Pinned with `#[ignore]` until the
 /// extended-protocol RETURNING projection gap is fixed; flip to a guard then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (extended-protocol INSERT/UPDATE/DELETE RETURNING) — newly-found gap: extended path returns 0-column DataRows; un-ignore when fixed"]
 async fn insert_update_delete_returning() {
     let server = start_server().await;
     let client = connect(server.addr).await;

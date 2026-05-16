@@ -66,7 +66,9 @@ use pgwire::messages::response::{
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use sqlparser::ast::{FromTable, SelectItem, Statement, TableFactor};
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 use tokio::sync::Mutex;
 
@@ -381,6 +383,12 @@ struct StatementEntry {
     /// SQL string we sent to `prepare`. Useful for error logs.
     #[allow(dead_code)]
     sql: String,
+    /// For `INSERT/UPDATE/DELETE … RETURNING …` statements: the DML verb
+    /// (`"INSERT"`, `"UPDATE"`, `"DELETE"`) so `Execute` can emit the
+    /// correct Postgres-style command tag (`"INSERT 0 N"`, `"UPDATE N"`,
+    /// `"DELETE N"`) instead of the generic `"SELECT N"` tag the row-path
+    /// would otherwise produce.
+    dml_tag_prefix: Option<String>,
 }
 
 #[derive(Clone)]
@@ -395,6 +403,10 @@ struct PortalEntry {
     /// row data back; otherwise drivers like `tokio-postgres` (which
     /// hard-code binary) misdecode the bytes.
     result_format_codes: Vec<i16>,
+    /// Propagated from `StatementEntry::dml_tag_prefix` at bind time.
+    /// Present for RETURNING DML portals; `None` for SELECT portals and
+    /// plain DML without RETURNING.
+    dml_tag_prefix: Option<String>,
 }
 
 impl ExtendedState {
@@ -681,6 +693,95 @@ fn decode_param_binary(
     }
 }
 
+/// Detect whether `sql` is a DML statement with a `RETURNING` clause and, if
+/// so, return the projected column schema plus the DML verb (for the
+/// CommandComplete tag).
+///
+/// Strategy: parse the SQL with sqlparser, check for Insert / Update / Delete
+/// with a non-empty `returning` vec, synthesise a safe
+/// `SELECT <returning_items> FROM <table> WHERE false` probe query, execute it
+/// against the engine (zero rows touched), and extract the Arrow schema from
+/// the result. Returns `None` on any error so callers fall back to an empty
+/// column list — the worst case is we fall back to the old `NoData` behaviour
+/// (not a regression).
+async fn probe_returning_schema<S>(
+    session: &S,
+    sql: &str,
+) -> Option<(Vec<arrow_schema::Field>, String)>
+where
+    S: Session + ?Sized,
+{
+    let dialect = PostgreSqlDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    let stmt = stmts.into_iter().next()?;
+
+    // Extract (table_name_sql, returning_items, dml_verb).
+    let (table_sql, returning_items, dml_verb): (String, Vec<SelectItem>, &'static str) =
+        match stmt {
+            Statement::Insert(ins) => {
+                let ret = ins.returning.clone()?; // None → no RETURNING → return None
+                if ret.is_empty() {
+                    return None;
+                }
+                let table_sql = match &ins.table {
+                    sqlparser::ast::TableObject::TableName(name) => name.to_string(),
+                    _ => return None,
+                };
+                (table_sql, ret, "INSERT")
+            }
+            Statement::Update(upd) => {
+                let ret = upd.returning.clone()?;
+                if ret.is_empty() {
+                    return None;
+                }
+                let table_sql = match &upd.table.relation {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return None,
+                };
+                (table_sql, ret, "UPDATE")
+            }
+            Statement::Delete(del) => {
+                let ret = del.returning.clone()?;
+                if ret.is_empty() {
+                    return None;
+                }
+                let tables = match &del.from {
+                    FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+                };
+                let twj = tables.first()?;
+                let table_sql = match &twj.relation {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return None,
+                };
+                (table_sql, ret, "DELETE")
+            }
+            _ => return None,
+        };
+
+    // Build a safe probe: SELECT <returning_items> FROM <table> WHERE false.
+    // This never modifies any row; it only plans and executes a schema-discovery
+    // query that returns 0 rows.
+    let projection = returning_items
+        .iter()
+        .map(|it| it.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let probe_sql = format!("SELECT {projection} FROM {table_sql} WHERE false");
+
+    match session.execute(&probe_sql).await {
+        Ok(ExecResult::Rows { schema, .. }) => {
+            let fields: Vec<arrow_schema::Field> =
+                schema.fields().iter().map(|f| (**f).clone()).collect();
+            if fields.is_empty() {
+                None
+            } else {
+                Some((fields, dml_verb.to_owned()))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Compute the [`Response`] sequence for one Parse + Bind + Sync exchange.
 /// Lives outside the pgwire trait so tests can pin its behaviour.
 ///
@@ -750,7 +851,36 @@ where
         }
     }
     match session.prepare(&msg.query).await {
-        Ok((handle, schema)) => {
+        Ok((handle, mut schema)) => {
+            // basin-engine's `probe_schema` returns an empty column list for
+            // DML statements (INSERT / UPDATE / DELETE) because DataFusion
+            // cannot plan them as SELECT-style queries at prepare time. When
+            // the statement carries a RETURNING clause the router must bridge
+            // this gap: without a column list, `handle_describe` emits
+            // `NoData` instead of a `RowDescription`, and drivers like
+            // `tokio-postgres` then cache a 0-column schema — producing the
+            // observed "0-column DataRow" bug even though the engine correctly
+            // emits the RETURNING rows at execute time.
+            //
+            // Fix: if the engine returned no columns, check whether the SQL
+            // has a RETURNING clause. If it does, synthesise a safe
+            // `SELECT <returning_items> FROM <table> WHERE false` probe query,
+            // execute it (0 rows affected / returned), and use its schema to
+            // populate `schema.columns`. The probe is side-effect-free.
+            let mut dml_tag_prefix: Option<String> = None;
+            if schema.columns.is_empty() {
+                if let Some((fields, verb)) =
+                    probe_returning_schema(session, &msg.query).await
+                {
+                    schema.columns = fields;
+                    dml_tag_prefix = Some(verb);
+                    tracing::debug!(
+                        dml_verb = %dml_tag_prefix.as_deref().unwrap_or(""),
+                        cols = schema.columns.len(),
+                        "RETURNING schema probed at parse time"
+                    );
+                }
+            }
             let mut g = state.lock().await;
             g.copy_statements.remove(&name);
             g.statements.insert(
@@ -759,6 +889,7 @@ where
                     handle,
                     schema,
                     sql: msg.query,
+                    dml_tag_prefix,
                 },
             );
             vec![PgWireBackendMessage::ParseComplete(ParseComplete::new())]
@@ -948,6 +1079,7 @@ where
                     bound,
                     schema: entry.schema,
                     result_format_codes: msg.result_column_format_codes,
+                    dml_tag_prefix: entry.dml_tag_prefix,
                 },
             );
             vec![PgWireBackendMessage::BindComplete(BindComplete::new())]
@@ -1169,8 +1301,17 @@ where
                     pgwire::messages::extendedquery::PortalSuspended::new(),
                 ));
             } else {
+                // For DML … RETURNING portals emit the correct Postgres-style
+                // command tag so drivers that inspect it (JDBC, libpq checks)
+                // see "INSERT 0 N" / "UPDATE N" / "DELETE N" rather than the
+                // generic "SELECT N" this branch would otherwise produce.
+                let tag = match entry.dml_tag_prefix.as_deref() {
+                    Some("INSERT") => format!("INSERT 0 {emitted}"),
+                    Some(verb) => format!("{verb} {emitted}"),
+                    None => format!("SELECT {emitted}"),
+                };
                 out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
-                    format!("SELECT {emitted}"),
+                    tag,
                 )));
             }
         }
