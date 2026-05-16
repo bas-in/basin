@@ -39,7 +39,7 @@
 //!   so a plan upgrade propagates within the TTL.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
@@ -79,12 +79,19 @@ impl ConnectionLimitProvider for NoConnectionLimit {
 /// Per-project live-connection counter map, shared across all connections.
 ///
 /// Cheap to clone (the interior is `Arc`-wrapped).
+///
+/// ## Locking strategy
+///
+/// The underlying `HashMap` is protected by an `RwLock` instead of a `Mutex`
+/// so that the common path — a connection for a project that already has a
+/// live-count entry — only takes a **shared read lock**. The exclusive write
+/// lock is acquired only when a new project's counter must be lazily inserted,
+/// which happens at most once per project per server lifetime. Under concurrent
+/// connection load this removes the global exclusive-lock bottleneck from
+/// every accept.
 #[derive(Clone, Debug, Default)]
 pub struct LiveCounts {
-    // Mutex-guarded HashMap to lazily create per-project atomics. The lock
-    // is only held during the map lookup / insertion, not while I/O is in
-    // progress, so contention is minimal.
-    counts: Arc<Mutex<HashMap<ProjectId, Arc<AtomicU32>>>>,
+    counts: Arc<RwLock<HashMap<ProjectId, Arc<AtomicU32>>>>,
 }
 
 impl LiveCounts {
@@ -94,8 +101,25 @@ impl LiveCounts {
     }
 
     /// Return (or lazily create) the `AtomicU32` for `project`.
+    ///
+    /// Fast path (project already present): acquires a shared read lock, clones
+    /// the `Arc`, and returns immediately. Slow path (first connection for this
+    /// project ever): drops the read lock, acquires the exclusive write lock,
+    /// and inserts the new counter. The double-check after acquiring the write
+    /// lock handles the race where two accepts both miss the read lock and then
+    /// both try to insert.
     fn counter_for(&self, project: ProjectId) -> Arc<AtomicU32> {
-        let mut map = self.counts.lock().expect("LiveCounts lock poisoned");
+        // Fast path: shared read lock — no exclusive contention when the
+        // counter already exists (the common case for an established project).
+        {
+            let map = self.counts.read().expect("LiveCounts lock poisoned");
+            if let Some(counter) = map.get(&project) {
+                return counter.clone();
+            }
+        }
+        // Slow path: first connection for this project — take the write lock
+        // and insert. Double-check in case another thread beat us.
+        let mut map = self.counts.write().expect("LiveCounts lock poisoned");
         map.entry(project)
             .or_insert_with(|| Arc::new(AtomicU32::new(0)))
             .clone()
@@ -104,7 +128,7 @@ impl LiveCounts {
     /// Return the current live-connection count for `project`.
     pub fn get(&self, project: ProjectId) -> u32 {
         self.counts
-            .lock()
+            .read()
             .expect("LiveCounts lock poisoned")
             .get(&project)
             .map(|v| v.load(Ordering::SeqCst))

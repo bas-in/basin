@@ -1558,10 +1558,14 @@ pub(crate) struct BasinStartupHandler<F: SessionFactory + 'static> {
     /// if the limit is reached. `None` means unlimited.
     connection_limiter: Option<Arc<crate::ConnectionLimiter>>,
     /// Holds the `ConnectionGuard` for the duration of this connection.
-    /// Filled after successful authentication (when the limiter admits the
-    /// connection). Dropped automatically when the handler is dropped at
-    /// connection close, which decrements the per-project live count.
-    conn_guard: Arc<Mutex<Option<crate::ConnectionGuard>>>,
+    /// Filled exactly once after successful authentication (when the limiter
+    /// admits the connection). Dropped automatically when the handler is dropped
+    /// at connection close, which decrements the per-project live count.
+    ///
+    /// No `Arc` wrapper is needed: the guard is set once during `on_startup`
+    /// and is never shared with any other struct. Removing the `Arc` saves one
+    /// heap allocation per connection on the accept hot-path.
+    conn_guard: Mutex<Option<crate::ConnectionGuard>>,
 }
 
 impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
@@ -1576,7 +1580,7 @@ impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
             resolver,
             slot,
             connection_limiter,
-            conn_guard: Arc::new(Mutex::new(None)),
+            conn_guard: Mutex::new(None),
         }
     }
 }
