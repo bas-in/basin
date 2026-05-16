@@ -353,6 +353,17 @@ pub(crate) async fn execute_simple_select(
             })
             .unwrap_or(false);
 
+    // Build the catalog-driven live file list. `live_data_files()` replays the
+    // snapshot chain up to `current_snapshot`, so after a rollback it returns
+    // only the pre-rollback files — physical files from post-rollback snapshots
+    // are never included (bug #41 fix). Convert each path string to an
+    // `ObjectPath` for `storage.read_paths`.
+    let live_paths: Vec<object_store::path::Path> = meta
+        .live_data_files()
+        .into_iter()
+        .map(|f| object_store::path::Path::from(f.path.as_str()))
+        .collect();
+
     let batches = if let Some(shard) = sess.engine.config().shard.as_ref() {
         // Shard path: this read merges the in-RAM tail with the Parquet base.
         // The pre-flush above already drained the tail into Parquet so this
@@ -367,29 +378,30 @@ pub(crate) async fn execute_simple_select(
         } else {
             handle.read(&plan.table, opts).await?
         }
-    } else {
-        if heavy {
-            let storage = sess.engine.config().storage.clone();
-            let project = sess.project;
-            let table = plan.table.clone();
-            run_blocking(move || async move {
-                use futures::StreamExt;
-                let stream = storage.read(&project, &table, opts).await?;
-                let collected: Vec<Result<RecordBatch>> = stream.collect().await;
-                collected.into_iter().collect::<Result<Vec<_>>>()
-            })
-            .await?
-        } else {
+    } else if live_paths.is_empty() {
+        // No live files at this snapshot — return an empty batch set rather
+        // than listing the directory (which would see rolled-back files).
+        vec![]
+    } else if heavy {
+        let storage = sess.engine.config().storage.clone();
+        let project = sess.project;
+        run_blocking(move || async move {
             use futures::StreamExt;
-            let stream = sess
-                .engine
-                .config()
-                .storage
-                .read(&sess.project, &plan.table, opts)
-                .await?;
+            let stream = storage.read_paths(&project, live_paths, opts).await?;
             let collected: Vec<Result<RecordBatch>> = stream.collect().await;
-            collected.into_iter().collect::<Result<Vec<_>>>()?
-        }
+            collected.into_iter().collect::<Result<Vec<_>>>()
+        })
+        .await?
+    } else {
+        use futures::StreamExt;
+        let stream = sess
+            .engine
+            .config()
+            .storage
+            .read_paths(&sess.project, live_paths, opts)
+            .await?;
+        let collected: Vec<Result<RecordBatch>> = stream.collect().await;
+        collected.into_iter().collect::<Result<Vec<_>>>()?
     };
 
     let projected_schema: Arc<Schema> = match &proj_indices {

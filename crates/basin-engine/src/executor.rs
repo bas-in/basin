@@ -2755,16 +2755,24 @@ async fn commit_with_retry(
 }
 
 async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) -> Result<ExecResult> {
-    // Option A for tail-visibility: when the shard is wired in, the in-RAM
-    // tail produced by INSERTs hasn't yet landed in Parquet. Force a synchronous
-    // flush + catalog commit before planning so DataFusion's ListingTable scan
-    // sees the just-written rows. After the flush we refresh every table this
-    // session has touched so the cached `ListingTable` picks up the new data
-    // file. This trades a small per-SELECT latency cost for keeping joins /
-    // aggregations / projections on the existing planner without teaching them
-    // about the tail.
+    // Refresh the catalog-driven file set for every table before planning.
+    //
+    // Rationale: `refresh_table` now registers per-file `ListingTableUrl`s
+    // derived from `TableMetadata::live_data_files()` rather than a directory
+    // URL. This means the registered `ListingTable` is a point-in-time
+    // snapshot of the catalog's current file set — it does NOT re-list the
+    // object store on each scan.  That is the fix for bug #41 (rollback
+    // correctness), but it means we must refresh before every SELECT so
+    // that inserts committed in this session, and catalog mutations performed
+    // externally (e.g. `rollback_to_snapshot`), are reflected in the plan.
+    //
+    // When the shard is wired in we additionally flush the in-RAM tail to
+    // Parquet first so the just-written rows land in object storage before
+    // the catalog-driven refresh reads the file list.
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
+    }
+    {
         let tables: Vec<_> = sess
             .engine
             .config()

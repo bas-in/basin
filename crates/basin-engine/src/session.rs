@@ -26,16 +26,16 @@ use std::sync::{Arc, RwLock};
 
 use crate::AuthContext;
 
-use basin_catalog::{PartitionSpec, SnapshotId};
+use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId};
 use basin_common::{BasinError, Result, TableName, ProjectId};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use object_store::path::Path as ObjectPath;
 use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -310,35 +310,45 @@ pub(crate) async fn refresh_table(
     // version DataFusion's `register_listing_table` expects.
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
 
-    // Build the URL for this table's hot prefix. Tables with an active
-    // tier policy *also* register the cold URL so the tiering compactor's
-    // migrations remain transparent to readers; tables without a policy
-    // skip that — the cold prefix can never receive files for them, and
-    // an extra empty-directory list per query is wasted work on real
-    // object stores.
-    let root = engine.config().storage.root_prefix_handle();
-    let hot_url = build_table_tier_url(&root, project, table, "data");
-    let has_tier_policy = meta.cold_after_seconds.is_some();
-    let cold_url = if has_tier_policy {
-        Some(build_table_tier_url(&root, project, table, "cold"))
-    } else {
-        None
-    };
-
-    let listing_options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-
     // Drop any stale registration before re-registering. `deregister_table`
     // returns Ok(None) for the first-time path, which is exactly what we want.
     let _ = ctx.deregister_table(table.as_str());
 
-    if let Some(cold_url) = cold_url {
-        let urls = vec![
-            ListingTableUrl::parse(&hot_url)
-                .map_err(|e| BasinError::internal(format!("listing url parse {hot_url}: {e}")))?,
-            ListingTableUrl::parse(&cold_url)
-                .map_err(|e| BasinError::internal(format!("listing url parse {cold_url}: {e}")))?,
-        ];
+    // Catalog-driven read path: enumerate exactly the files that are live at
+    // `current_snapshot`. This is the fix for bug #41: a directory-URL
+    // ListingTable would re-list the object store on every scan and return ALL
+    // physical Parquet files, including those logically removed by a rollback
+    // (GC is deferred by design). Using `live_data_files()` instead restricts
+    // the scan to the canonical file set the catalog records for the current
+    // snapshot, so post-rollback rows are never visible.
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+
+    if live_files.is_empty() {
+        // Table has no data at this snapshot (genesis, TRUNCATE, or rolled back
+        // to genesis). Register an empty in-memory table so queries return zero
+        // rows with the correct schema rather than erroring.
+        // MemTable requires at least one partition; supply an empty one.
+        let provider = MemTable::try_new(df_schema, vec![vec![]])
+            .map_err(|e| BasinError::internal(format!("MemTable empty {table}: {e}")))?;
+        ctx.register_table(table.as_str(), Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
+    } else {
+        // Build per-file listing URLs. Each `DataFileRef::path` is a full
+        // bucket-relative key (no scheme, no leading slash) that already
+        // includes any configured `root_prefix` — identical to the paths that
+        // `Storage::list_data_files` emits and that `register_pruned_listing_table`
+        // already handles the same way. Prepend the synthetic `basin://engine/`
+        // scheme so DataFusion routes I/O through the registered ObjectStore.
+        let listing_options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
+        for f in &live_files {
+            let mut s = String::from(BASIN_URL_BASE);
+            s.push_str(&f.path);
+            let url = ListingTableUrl::parse(&s)
+                .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
+            urls.push(url);
+        }
         let cfg = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(listing_options)
             .with_schema(df_schema);
@@ -346,16 +356,6 @@ pub(crate) async fn refresh_table(
             .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
         ctx.register_table(table.as_str(), Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
-    } else {
-        ctx.register_listing_table(
-            table.as_str(),
-            &hot_url,
-            listing_options,
-            Some(df_schema),
-            None,
-        )
-        .await
-        .map_err(|e| BasinError::internal(format!("register_listing_table {table}: {e}")))?;
     }
 
     // Cache the snapshot id for this session's INSERT path.
@@ -374,36 +374,6 @@ pub(crate) async fn refresh_table(
     Ok(())
 }
 
-/// Build `basin://engine/<root?>/projects/<project>/tables/<table>/<tier>/`,
-/// where `<tier>` is `data` (hot) or `cold`. The trailing slash is critical
-/// — DataFusion uses it to distinguish a directory listing from a single-file
-/// reference. Tier-aware so `refresh_table` can register both URLs and
-/// have the cold-prefix migration land transparently.
-fn build_table_tier_url(
-    root: &Option<ObjectPath>,
-    project: &ProjectId,
-    table: &TableName,
-    tier_segment: &str,
-) -> String {
-    let mut url = String::from(BASIN_URL_BASE);
-    if let Some(r) = root {
-        let s = r.as_ref();
-        if !s.is_empty() {
-            url.push_str(s);
-            if !url.ends_with('/') {
-                url.push('/');
-            }
-        }
-    }
-    url.push_str("projects/");
-    url.push_str(&project.as_prefix());
-    url.push_str("/tables/");
-    url.push_str(table.as_str());
-    url.push('/');
-    url.push_str(tier_segment);
-    url.push('/');
-    url
-}
 
 /// Inspect `sql` for tables with [`PartitionSpec::RangeMonthly`] and, if the
 /// query's WHERE clause restricts the partition column to a sub-range of the
