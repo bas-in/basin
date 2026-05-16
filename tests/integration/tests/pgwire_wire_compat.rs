@@ -1093,7 +1093,6 @@ async fn empty_result_set_from_table_scan() {
 /// PG spec requires this to fail with a protocol error. Real drivers (pgx,
 /// asyncpg, JDBC) hit an unexpected extra `RowDescription` and de-sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — Basin silently accepts multi-statement extended-query Parse (should reject with parse error per PG protocol §55.2.3); drivers can de-sync on the unexpected extra result set"]
 async fn extended_parse_multi_statement_rejected() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -1277,7 +1276,6 @@ async fn named_statement_survives_unnamed_overwrite() {
 
 /// Binary timestamptz param — real gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — Type::TIMESTAMPTZ has no binary decode arm in decode_param_binary; raw i64 bytes are not valid UTF-8, causing a wire error; SQLAlchemy/Hibernate datetime binding broken"]
 async fn binary_param_timestamp() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -1305,7 +1303,6 @@ async fn binary_param_timestamp() {
 
 /// Binary date param — real gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — Type::DATE has no binary decode arm in decode_param_binary; raw i32 bytes are not valid UTF-8, causing a wire error; drivers binding NaiveDate broken"]
 async fn binary_param_date() {
     let server = start_server().await;
     let client = connect(server.addr).await;
