@@ -53,6 +53,7 @@ pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 pub use writer::WriteOptions;
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 
 /// Configuration for [`Storage`].
 #[derive(Clone)]
@@ -481,6 +482,27 @@ impl Storage {
             return Ok(None);
         }
         self.get_project_storage_config(project).await
+    }
+
+    /// Look up the Arrow [`SchemaRef`] for a table from the attached catalog.
+    /// Returns `Ok(None)` when no catalog is attached (degrades gracefully so
+    /// reads without a catalog behave exactly as before — schema evolution
+    /// synthesis is skipped). Used by the reader to synthesise NULL-filled
+    /// columns for projected fields that pre-date an `ALTER TABLE ADD COLUMN`.
+    pub(crate) async fn catalog_table_schema(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<Option<SchemaRef>> {
+        let Some(catalog) = self.inner.catalog.get() else {
+            return Ok(None);
+        };
+        match catalog.load_table(project, table).await {
+            Ok(meta) => Ok(Some(meta.schema)),
+            // Table not found is not fatal — treat it like "no catalog".
+            Err(basin_common::BasinError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub(crate) fn project_counters(

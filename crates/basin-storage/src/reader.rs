@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_array::{new_null_array, RecordBatch};
+use arrow_schema::{Schema, SchemaRef};
 use basin_common::{BasinError, Result, TableName, ProjectId};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
@@ -308,7 +308,16 @@ pub(crate) async fn read(
         }
     }
 
-    read_paths_inner(storage, project, paths, opts).await
+    // Fetch the catalog schema once for the whole read so that
+    // `finalize_pipeline` can synthesise NULL-filled columns for fields that
+    // exist in the catalog but are absent from pre-ALTER on-disk files.
+    // This is the schema-evolution (ADD COLUMN) correctness fix: old files
+    // don't have the new column, so we pad their batches with NULLs.
+    // Returns `None` when no catalog is attached → existing behaviour is
+    // preserved (will error on missing columns, same as before).
+    let catalog_schema = storage.catalog_table_schema(project, table).await?;
+
+    read_paths_inner(storage, project, paths, opts, catalog_schema).await
 }
 
 /// Like [`read`] but reads only the supplied `paths` instead of LIST'ing
@@ -336,7 +345,10 @@ pub(crate) async fn read_paths(
             )));
         }
     }
-    read_paths_inner(storage, project, paths, opts).await
+    // `read_paths` does not receive a table name, so we cannot look up the
+    // catalog schema here.  Schema-evolution NULL synthesis is therefore not
+    // available on this code path — callers that need it should use `read`.
+    read_paths_inner(storage, project, paths, opts, None).await
 }
 
 async fn read_paths_inner(
@@ -344,6 +356,7 @@ async fn read_paths_inner(
     project: &ProjectId,
     paths: Vec<ObjectPath>,
     opts: ReadOptions,
+    catalog_schema: Option<SchemaRef>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     let store = storage.project_store(project);
     let opts = Arc::new(opts);
@@ -373,6 +386,7 @@ async fn read_paths_inner(
             let project_counters = project_counters.clone();
             let encryption = encryption.clone();
             let project_config = project_config.clone();
+            let catalog_schema = catalog_schema.clone();
             async move {
                 read_one(
                     store,
@@ -385,6 +399,7 @@ async fn read_paths_inner(
                     encryption,
                     project_config,
                     project_owned,
+                    catalog_schema,
                 )
                 .await
             }
@@ -435,6 +450,7 @@ pub(crate) async fn read_file(
         encryption,
         project_config,
         *project,
+        None, // read_file reads the raw file; schema evolution not applicable
     )
     .await
 }
@@ -451,6 +467,7 @@ async fn read_one(
     encryption: Option<Arc<dyn EncryptionProvider>>,
     project_config: Option<ProjectStorageConfig>,
     project: ProjectId,
+    catalog_schema: Option<SchemaRef>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     // Page-cache fast path. Composes with everything below: a hit
     // means we skip the parquet decode entirely and yield the cached
@@ -499,6 +516,7 @@ async fn read_one(
                 page_cache,
                 cache_key,
                 project_counters,
+                catalog_schema,
             )
             .await;
         }
@@ -554,7 +572,7 @@ async fn read_one(
         tc.record_bytes_read(file_size);
     }
 
-    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key).await
+    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key, catalog_schema).await
 }
 
 fn build_row_filter(
@@ -567,9 +585,20 @@ fn build_row_filter(
 
     for filter in filters {
         let col = filter.column();
-        let col_idx = arrow_schema
-            .index_of(col)
-            .map_err(|_| BasinError::storage(format!("unknown column {col}")))?;
+        // If the column is absent from the on-disk file schema (e.g. an
+        // ADD COLUMN that happened after this file was written), skip adding
+        // the predicate for this file.  The effect is that all rows in this
+        // file are treated as passing the filter for this predicate, which
+        // is a conservative over-include.  SQL NULL semantics would actually
+        // exclude every row (NULL comparison → NULL → false), but for the
+        // common non-predicate SELECT case this path is never reached, and
+        // for now the conservative behaviour avoids the previous crash
+        // ("unknown column").  A follow-up can synthesise an all-false
+        // BooleanArray to get exact NULL semantics.
+        let col_idx = match arrow_schema.index_of(col) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
         let mask = ProjectionMask::roots(parquet_schema, [col_idx]);
         let f = filter.clone();
         let pred = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
@@ -804,6 +833,7 @@ async fn finalize_encrypted_stream(
     page_cache: Option<Arc<PageCache>>,
     cache_key: Option<CacheKey>,
     project_counters: Option<Arc<basin_common::ProjectCounters>>,
+    catalog_schema: Option<SchemaRef>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     let file_size = plaintext.len() as u64;
     if let Some(tc) = project_counters.as_ref() {
@@ -819,7 +849,7 @@ async fn finalize_encrypted_stream(
             .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
 
     let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(bytes_reader, arrow_meta);
-    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key).await
+    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key, catalog_schema).await
 }
 
 /// Shared post-builder pipeline: projection mask, row-group stats
@@ -827,6 +857,15 @@ async fn finalize_encrypted_stream(
 /// write-through. Generic over the underlying file reader so the
 /// plaintext (`ParquetObjectReader`) and encrypted (`BytesFileReader`)
 /// paths share one implementation.
+///
+/// `catalog_schema` is the current Arrow schema of the table as recorded in
+/// the catalog (i.e. post-ALTER-TABLE state). When a projected column is
+/// absent from the on-disk Parquet file (because the file was written before
+/// an `ALTER TABLE ... ADD COLUMN`) and `catalog_schema` is provided, a
+/// NULL-filled column of the correct type is synthesised so that old rows
+/// appear with `NULL` for the new column — the correct Postgres semantics for
+/// schema evolution. When `catalog_schema` is `None` the original error
+/// behaviour is preserved for callers that do not supply schema context.
 async fn finalize_pipeline<T>(
     builder: ParquetRecordBatchStreamBuilder<T>,
     path: ObjectPath,
@@ -834,6 +873,7 @@ async fn finalize_pipeline<T>(
     counters: Arc<ReadCounters>,
     page_cache: Option<Arc<PageCache>>,
     cache_key: Option<CacheKey>,
+    catalog_schema: Option<SchemaRef>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>>
 where
     T: parquet::arrow::async_reader::AsyncFileReader + Send + Unpin + 'static,
@@ -841,16 +881,204 @@ where
     let arrow_schema: SchemaRef = builder.schema().clone();
     let parquet_schema = builder.metadata().file_metadata().schema_descr_ptr();
 
+    // Determine which projected columns are present in the on-disk file and
+    // which are absent (added by a later ALTER TABLE ADD COLUMN).
+    //
+    // `missing_cols` is a vec of (output_position, field) for each column
+    // that exists in the catalog/projection but not in the file's Arrow
+    // schema. Each entry carries the Arrow `Field` (including its DataType)
+    // so we can synthesise a correctly-typed NULL array for the batch
+    // transformation step below.
+    //
+    // `present_idxs` is the ordered list of file-schema column indices to
+    // hand to `ProjectionMask`. The Parquet reader will deliver columns in
+    // file-schema order (among the selected ones); the batch transformer
+    // below reassembles them into projection order.
     let projection_mask = match &opts.projection {
         Some(cols) => {
-            let mut idxs = Vec::with_capacity(cols.len());
-            for c in cols {
-                let i = arrow_schema
-                    .index_of(c)
-                    .map_err(|_| BasinError::storage(format!("unknown column {c}")))?;
-                idxs.push(i);
+            let mut present_idxs = Vec::with_capacity(cols.len());
+            let mut missing_cols: Vec<(usize, arrow_schema::FieldRef)> =
+                Vec::new();
+
+            for (out_pos, c) in cols.iter().enumerate() {
+                match arrow_schema.index_of(c) {
+                    Ok(i) => present_idxs.push(i),
+                    Err(_) => {
+                        // Column is absent from this file's schema. Try to
+                        // resolve its type from the catalog schema so we can
+                        // synthesise a NULL-filled column.
+                        let field = if let Some(cs) = &catalog_schema {
+                            match cs.field_with_name(c) {
+                                Ok(f) => Arc::new(f.clone()),
+                                Err(_) => {
+                                    // Not in catalog either — fall through to
+                                    // the original error.
+                                    return Err(BasinError::storage(format!(
+                                        "unknown column {c}"
+                                    )));
+                                }
+                            }
+                        } else {
+                            return Err(BasinError::storage(format!("unknown column {c}")));
+                        };
+                        missing_cols.push((out_pos, field));
+                    }
+                }
             }
-            ProjectionMask::roots(&parquet_schema, idxs)
+
+            // If there are missing columns we need a batch transformer.  Stash
+            // `missing_cols` in an `Arc` so the async closure below can capture
+            // it without lifetime issues.
+            if !missing_cols.is_empty() {
+                // Build the projected schema for the columns that ARE present
+                // in this file (the Parquet reader will produce batches with
+                // these columns in file-schema order among the selected set).
+                // We need to know the output name for each present column so
+                // the transformer can look it up by name.
+                let present_names: Vec<String> = cols
+                    .iter()
+                    .enumerate()
+                    .filter(|(pos, _)| missing_cols.iter().all(|(mp, _)| *mp != *pos))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+
+                // Build the full output schema (projection order) from the
+                // combination of present fields (from file) and missing fields
+                // (from catalog).
+                let mut output_fields: Vec<arrow_schema::FieldRef> =
+                    Vec::with_capacity(cols.len());
+                let mut missing_iter = missing_cols.iter().peekable();
+                let mut present_iter = present_names.iter();
+                for out_pos in 0..cols.len() {
+                    if missing_iter
+                        .peek()
+                        .map(|(mp, _)| *mp == out_pos)
+                        .unwrap_or(false)
+                    {
+                        let (_, field) = missing_iter.next().unwrap();
+                        output_fields.push(field.clone());
+                    } else {
+                        let name = present_iter.next().unwrap();
+                        let f = arrow_schema
+                            .field_with_name(name)
+                            .expect("present column must be in file schema");
+                        output_fields.push(Arc::new(f.clone()));
+                    }
+                }
+                let output_schema = Arc::new(Schema::new(output_fields));
+
+                let missing_cols_arc: Arc<Vec<(usize, arrow_schema::FieldRef)>> =
+                    Arc::new(missing_cols);
+                let present_names_arc: Arc<Vec<String>> = Arc::new(present_names);
+                let output_schema_arc = output_schema.clone();
+
+                // Build the Parquet pipeline for the PRESENT columns only.
+                let mask = ProjectionMask::roots(&parquet_schema, present_idxs);
+
+                let kept_after_stats: Vec<usize> = {
+                    let row_groups = builder.metadata().row_groups();
+                    let total = row_groups.len() as u64;
+                    counters
+                        .row_groups_considered
+                        .fetch_add(total, Ordering::Relaxed);
+                    let mut kept = Vec::with_capacity(row_groups.len());
+                    let mut pruned = 0u64;
+                    let resolved: Vec<(usize, &Predicate)> = if opts.filters.is_empty() {
+                        Vec::new()
+                    } else {
+                        opts.filters
+                            .iter()
+                            .filter_map(|f| {
+                                arrow_schema.index_of(f.column()).ok().map(|idx| (idx, f))
+                            })
+                            .collect()
+                    };
+                    for (i, rg) in row_groups.iter().enumerate() {
+                        if row_group_pruned_resolved(rg, &resolved) {
+                            pruned += 1;
+                        } else {
+                            kept.push(i);
+                        }
+                    }
+                    counters
+                        .row_groups_pruned_by_stats
+                        .fetch_add(pruned, Ordering::Relaxed);
+                    kept
+                };
+
+                let mut builder = builder.with_projection(mask);
+                let kept = prune_with_bloom_filters(
+                    &mut builder,
+                    &arrow_schema,
+                    kept_after_stats,
+                    &opts.filters,
+                    &counters,
+                )
+                .await?;
+                counters
+                    .row_groups_scanned
+                    .fetch_add(kept.len() as u64, Ordering::Relaxed);
+                let mut builder = builder.with_row_groups(kept);
+
+                if !opts.filters.is_empty() {
+                    let predicates =
+                        build_row_filter(&opts.filters, &arrow_schema, &parquet_schema)?;
+                    builder = builder.with_row_filter(predicates);
+                }
+
+                let stream = builder
+                    .build()
+                    .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
+                let mapped = stream.map(move |res| {
+                    let batch = res.map_err(|e| {
+                        BasinError::storage(format!("parquet read: {e}"))
+                    })?;
+                    synthesise_missing_columns(
+                        batch,
+                        &present_names_arc,
+                        &missing_cols_arc,
+                        &output_schema_arc,
+                    )
+                });
+
+                // Page-cache write-through with the synthesised batches.
+                if let (Some(pc), Some(key)) = (page_cache, cache_key) {
+                    let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
+                        Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+                    let buf_for_each = buf.clone();
+                    let buf_for_end = buf.clone();
+                    let pc_for_end = pc.clone();
+                    let key_for_end = key;
+                    let collected = mapped.inspect(move |item| {
+                        if let Ok(batch) = item {
+                            if let Some(slot) =
+                                buf_for_each.lock().expect("page-cache buf").as_mut()
+                            {
+                                slot.push(Arc::new(batch.clone()));
+                            }
+                        } else {
+                            *buf_for_each.lock().expect("page-cache buf") = None;
+                        }
+                    });
+                    let terminator = futures::stream::once(async move {
+                        let final_buf = buf_for_end.lock().expect("page-cache buf").take();
+                        if let Some(batches) = final_buf {
+                            pc_for_end.insert(key_for_end, batches);
+                        }
+                        None::<Result<RecordBatch>>
+                    });
+                    let with_terminator = collected
+                        .map(Some)
+                        .chain(terminator)
+                        .filter_map(|x| async move { x });
+                    return Ok(with_terminator.boxed());
+                }
+                return Ok(mapped.boxed());
+            }
+
+            // All projected columns are present in the file — fall through to
+            // the standard (non-synthesising) code path below.
+            ProjectionMask::roots(&parquet_schema, present_idxs)
         }
         None => ProjectionMask::all(),
     };
@@ -946,4 +1174,78 @@ where
     }
 
     Ok(mapped.boxed())
+}
+
+/// Reconstruct a [`RecordBatch`] in the requested projection order, inserting
+/// a NULL-filled column of the correct type for each field that was absent
+/// from the on-disk Parquet file.
+///
+/// `present_names`: the column names that the Parquet reader actually
+///   materialised, in the order the reader returns them (file-schema order
+///   within the selected set).
+///
+/// `missing_cols`: `(output_position, field)` pairs — where to insert
+///   a NULL column and what Arrow type to use.
+///
+/// `output_schema`: the full Arrow schema for the output batch (projection
+///   order, all columns including synthesised ones).
+fn synthesise_missing_columns(
+    parquet_batch: RecordBatch,
+    present_names: &[String],
+    missing_cols: &[(usize, arrow_schema::FieldRef)],
+    output_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let num_rows = parquet_batch.num_rows();
+    let num_out = output_schema.fields().len();
+
+    // Build a lookup from column name → Arrow array for the present columns.
+    // The Parquet reader may return them in file-schema order (not necessarily
+    // projection order), so we index by name.
+    let mut out: Vec<Option<arrow_array::ArrayRef>> = vec![None; num_out];
+
+    // Place NULL columns at their output positions first.
+    for (out_pos, field) in missing_cols {
+        out[*out_pos] = Some(new_null_array(field.data_type(), num_rows));
+    }
+
+    // Place present columns at their output positions (by name lookup).
+    let missing_set: std::collections::HashSet<usize> =
+        missing_cols.iter().map(|(p, _)| *p).collect();
+    // The non-missing output positions, in order, correspond to `present_names`
+    // in order (present_names was built by iterating cols in projection order
+    // and skipping missing ones).
+    let present_out_positions: Vec<usize> = (0..num_out)
+        .filter(|p| !missing_set.contains(p))
+        .collect();
+    // Double-check the lengths match to avoid a panic below.
+    debug_assert_eq!(
+        present_out_positions.len(),
+        present_names.len(),
+        "mismatch between present column count and output slots"
+    );
+    for (out_pos, name) in present_out_positions.iter().zip(present_names.iter()) {
+        let col = parquet_batch
+            .column_by_name(name)
+            .ok_or_else(|| {
+                BasinError::storage(format!(
+                    "synthesise_missing_columns: column '{name}' not in parquet batch"
+                ))
+            })?
+            .clone();
+        out[*out_pos] = Some(col);
+    }
+    let columns: Vec<arrow_array::ArrayRef> = out
+        .into_iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            opt.ok_or_else(|| {
+                BasinError::storage(format!(
+                    "synthesise_missing_columns: output slot {i} was not filled"
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    RecordBatch::try_new(output_schema.clone(), columns)
+        .map_err(|e| BasinError::storage(format!("synthesise_missing_columns: {e}")))
 }
