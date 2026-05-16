@@ -674,7 +674,6 @@ async fn insert_update_delete_returning() {
 /// the correct PG semantics; flips to a real guard when ON CONFLICT
 /// short-circuiting is wired into the constraint enforcement path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (ON CONFLICT DO NOTHING on UNIQUE) — newly-found gap: UNIQUE fires before ON CONFLICT short-circuits; un-ignore when fixed"]
 async fn upsert_on_conflict_do_nothing() {
     let server = start_server().await;
     let client = connect(server.addr).await;

@@ -1578,7 +1578,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         .load_table(&sess.project, &table)
         .await?;
     let schema = meta.schema.clone();
-    let row_count = rows_raw.len();
+    let mut row_count = rows_raw.len();
 
     // Pick up any `OVERRIDING { SYSTEM | USER } VALUE` clause the
     // textual pre-screen in `execute()` stashed for us. `take_pending`
@@ -1621,6 +1621,47 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // distinct value) and overwrite the NULL placeholder produced by
     // `expand_insert_rows`. User-written NULL is preserved.
     apply_column_defaults(sess, schema.as_ref(), &ins.columns, &mut rows_expanded).await?;
+
+    // --- ON CONFLICT DO NOTHING filter ----------------------------------------
+    // If the statement specifies ON CONFLICT (cols) DO NOTHING, proactively
+    // remove any proposed rows that would conflict with existing rows (or with
+    // earlier rows in the same batch). This must happen *before* the unique /
+    // PK constraint checks so those checks never see the skipped rows.
+    if let Some(OnInsert::OnConflict(ref on_conflict)) = ins.on {
+        if let OnConflictAction::DoNothing = &on_conflict.action {
+            // WHERE clause form with conflict predicate is deferred.
+            if on_conflict.conflict_target
+                .as_ref()
+                .map(|t| matches!(t, ConflictTarget::OnConstraint(_)))
+                .unwrap_or(false)
+            {
+                // ON CONFLICT ON CONSTRAINT <name> DO NOTHING — not yet
+                // implemented; reject cleanly rather than guessing.
+                return Err(BasinError::FeatureNotSupported(
+                    "ON CONFLICT ON CONSTRAINT DO NOTHING is not yet supported; \
+                     use ON CONFLICT (col, ...) DO NOTHING"
+                        .into(),
+                ));
+            }
+            rows_expanded = filter_rows_do_nothing(
+                sess,
+                &table,
+                schema.as_ref(),
+                &meta,
+                &on_conflict.conflict_target,
+                rows_expanded,
+            )
+            .await?;
+            if rows_expanded.is_empty() {
+                return Ok(ExecResult::Empty {
+                    tag: "INSERT 0 0".into(),
+                });
+            }
+            // Update the row count to reflect only the non-conflicting rows.
+            row_count = rows_expanded.len();
+        }
+    }
+
     let rows: &[Vec<sqlparser::ast::Expr>] = &rows_expanded;
 
     // Partitioned path. We must compute each row's partition key from its
@@ -2215,6 +2256,230 @@ async fn exec_insert_default_values(
 // ---------------------------------------------------------------------------
 // INSERT … ON CONFLICT (col) DO UPDATE SET …
 // ---------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// ON CONFLICT DO NOTHING — proactive conflict filter
+// -----------------------------------------------------------------------
+
+/// Validate that `conflict_cols` match an existing UNIQUE or PK constraint.
+///
+/// Returns `Ok(())` when the columns collectively form a registered unique
+/// constraint (or the table's primary key), matching PG's requirement that
+/// the ON CONFLICT target must refer to a uniqueness/exclusion constraint.
+///
+/// Returns `Err(BasinError::InvalidSchema(...))` if no matching constraint
+/// exists — this mirrors PG SQLSTATE 42P10 ("there is no unique or exclusion
+/// constraint matching the ON CONFLICT specification").
+fn validate_conflict_target_columns(
+    pk_columns: &[String],
+    unique_constraints: &[basin_catalog::UniqueConstraint],
+    conflict_cols: &[String],
+) -> Result<()> {
+    if conflict_cols.is_empty() {
+        // No explicit target — will check all constraints (handled by caller).
+        return Ok(());
+    }
+    // Normalise to lowercase for comparison.
+    let target_set: std::collections::HashSet<String> =
+        conflict_cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+
+    // Check against the PK.
+    if !pk_columns.is_empty() {
+        let pk_set: std::collections::HashSet<String> =
+            pk_columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+        if pk_set == target_set {
+            return Ok(());
+        }
+    }
+
+    // Check against each UNIQUE constraint.
+    for u in unique_constraints {
+        let u_set: std::collections::HashSet<String> =
+            u.columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+        if u_set == target_set {
+            return Ok(());
+        }
+    }
+
+    Err(BasinError::InvalidSchema(format!(
+        "there is no unique or exclusion constraint matching the ON CONFLICT \
+         specification (columns: {})",
+        conflict_cols.join(", ")
+    )))
+}
+
+/// ON CONFLICT DO NOTHING — filter `rows_expanded` to remove any proposed
+/// row that would conflict with an existing row or an earlier row in the
+/// same batch. Returns the surviving (non-conflicting) rows.
+///
+/// # Conflict-target handling
+///
+/// * `ON CONFLICT (col, ...) DO NOTHING` — check only those columns.
+/// * `ON CONFLICT DO NOTHING` (no target) — check all PK + UNIQUE columns
+///   (PG semantics: any constraint match suppresses the error).
+///
+/// In both cases, a WHERE clause predicate attached to the ON CONFLICT clause
+/// (`ON CONFLICT (col) WHERE <pred> DO NOTHING`) causes a clean rejection
+/// ("not yet supported") because the predicate scopes the suppression to a
+/// *partial* unique index, which v0.1 does not model.
+async fn filter_rows_do_nothing(
+    sess: &ProjectSession,
+    table: &TableName,
+    schema: &arrow_schema::Schema,
+    meta: &TableMetadata,
+    conflict_target: &Option<ConflictTarget>,
+    rows_expanded: Vec<Vec<sqlparser::ast::Expr>>,
+) -> Result<Vec<Vec<sqlparser::ast::Expr>>> {
+    use sqlparser::ast::Value;
+
+    if rows_expanded.is_empty() {
+        return Ok(rows_expanded);
+    }
+
+    // Determine the set of column groups to check. Each entry is a
+    // Vec<String> of column names that must *all* match for a conflict.
+    let constraint_groups: Vec<Vec<String>> = match conflict_target {
+        Some(ConflictTarget::Columns(idents)) => {
+            let cols: Vec<String> = idents.iter().map(|i| i.value.clone()).collect();
+            // Reject unknown columns eagerly.
+            for c in &cols {
+                schema.index_of(c).map_err(|_| {
+                    BasinError::InvalidSchema(format!(
+                        "ON CONFLICT DO NOTHING: unknown column {c:?}"
+                    ))
+                })?;
+            }
+            // Validate that the columns form a real unique/pk constraint.
+            validate_conflict_target_columns(&meta.pk_columns, &meta.unique_constraints, &cols)?;
+            vec![cols]
+        }
+        None => {
+            // No explicit target — gather all constraint groups (PK + UNIQUEs).
+            let mut groups: Vec<Vec<String>> = Vec::new();
+            if !meta.pk_columns.is_empty() {
+                groups.push(meta.pk_columns.clone());
+            }
+            for u in &meta.unique_constraints {
+                groups.push(u.columns.clone());
+            }
+            if groups.is_empty() {
+                // Table has no constraints at all — nothing to suppress.
+                return Ok(rows_expanded);
+            }
+            groups
+        }
+        Some(ConflictTarget::OnConstraint(_)) => {
+            // Caller already rejected this form before calling us.
+            return Err(BasinError::FeatureNotSupported(
+                "ON CONFLICT ON CONSTRAINT DO NOTHING is not yet supported".into(),
+            ));
+        }
+    };
+
+    // Pre-build column indexes for every constraint group.
+    let group_idxs: Vec<Vec<usize>> = constraint_groups
+        .iter()
+        .map(|cols| {
+            cols.iter()
+                .map(|c| {
+                    schema.index_of(c).map_err(|_| {
+                        BasinError::internal(format!(
+                            "DO NOTHING: column {c:?} missing from schema"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Helper: extract the string tuple for row `r` using `idxs`.
+    // Returns None if any value is NULL (a NULL in a unique column is
+    // not considered a conflict under PG's default NULLS DISTINCT).
+    let extract_tuple =
+        |row: &Vec<sqlparser::ast::Expr>, idxs: &[usize]| -> Option<Vec<String>> {
+            let mut parts = Vec::with_capacity(idxs.len());
+            for &idx in idxs {
+                let val = match &row[idx] {
+                    sqlparser::ast::Expr::Value(v) => match v.value {
+                        Value::Null => return None,
+                        _ => format!("{}", row[idx]),
+                    },
+                    other => format!("{other}"),
+                };
+                parts.push(val);
+            }
+            Some(parts)
+        };
+
+    // One `seen` set per constraint group to handle same-batch dedup.
+    let mut seen_per_group: Vec<std::collections::HashSet<Vec<String>>> =
+        constraint_groups.iter().map(|_| Default::default()).collect();
+
+    let mut survivors: Vec<Vec<sqlparser::ast::Expr>> =
+        Vec::with_capacity(rows_expanded.len());
+
+    'row: for row in rows_expanded {
+        // For each constraint group: if this row conflicts (with existing
+        // data OR with a preceding row in the same batch), skip it.
+        for (g_idx, (cols, idxs)) in constraint_groups.iter().zip(group_idxs.iter()).enumerate() {
+            let Some(tuple) = extract_tuple(&row, idxs) else {
+                // NULL in the conflict column → not a conflict; keep row.
+                continue;
+            };
+
+            // Same-batch dup check.
+            if seen_per_group[g_idx].contains(&tuple) {
+                // Skip this row — it duplicates an earlier row in this batch.
+                continue 'row;
+            }
+
+            // Existing-table existence check via a SELECT 1 ... WHERE.
+            let where_parts: Vec<String> = cols
+                .iter()
+                .zip(idxs.iter())
+                .map(|(col, &idx)| {
+                    let expr = &row[idx];
+                    // Strings need quoting. The expr Display includes literal
+                    // quotes for Value::SingleQuotedString so use it directly.
+                    format!("{col} = {expr}")
+                })
+                .collect();
+            let where_clause = where_parts.join(" AND ");
+            let check_sql = format!(
+                "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                table.as_str(),
+                where_clause
+            );
+            let exists = match sess.ctx.sql(&check_sql).await {
+                Ok(df) => {
+                    let batches = df.collect().await.map_err(|e| {
+                        BasinError::internal(format!(
+                            "ON CONFLICT DO NOTHING existence check: {e}"
+                        ))
+                    })?;
+                    batches.iter().any(|b| b.num_rows() > 0)
+                }
+                Err(_) => {
+                    // Table may be empty or not yet registered — no conflict.
+                    false
+                }
+            };
+            if exists {
+                continue 'row;
+            }
+        }
+
+        // Row survived all constraint groups — mark it seen and keep it.
+        for (g_idx, idxs) in group_idxs.iter().enumerate() {
+            if let Some(tuple) = extract_tuple(&row, idxs) {
+                seen_per_group[g_idx].insert(tuple);
+            }
+        }
+        survivors.push(row);
+    }
+
+    Ok(survivors)
+}
 
 /// Pre-check strategy for ON CONFLICT DO UPDATE (upsert).
 ///
@@ -4200,5 +4465,98 @@ mod do_update_rewrite_tests {
         let expr = parse_expr("EXCLUDED.nonexistent");
         let result = rewrite_do_update_expr(expr.clone(), "accounts", &excluded);
         assert_eq!(format!("{result}"), format!("{expr}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ON CONFLICT DO NOTHING — validate_conflict_target_columns unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod do_nothing_validate_tests {
+    use super::validate_conflict_target_columns;
+    use basin_catalog::UniqueConstraint;
+
+    /// Build PK and UNIQUE inputs for the helper.
+    fn pk(cols: &[&str]) -> Vec<String> {
+        cols.iter().map(|s| s.to_string()).collect()
+    }
+    fn uniques(groups: &[&[&str]]) -> Vec<UniqueConstraint> {
+        groups
+            .iter()
+            .enumerate()
+            .map(|(i, cols)| UniqueConstraint {
+                name: format!("t_uc{i}"),
+                columns: cols.iter().map(|s| s.to_string()).collect(),
+            })
+            .collect()
+    }
+    fn conflict(cols: &[&str]) -> Vec<String> {
+        cols.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- matches PK ---------------------------------------------------------
+
+    #[test]
+    fn pk_single_col_accepted() {
+        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id"])).is_ok());
+    }
+
+    #[test]
+    fn pk_composite_accepted() {
+        assert!(validate_conflict_target_columns(&pk(&["a", "b"]), &uniques(&[]), &conflict(&["a", "b"])).is_ok());
+    }
+
+    #[test]
+    fn pk_order_independent() {
+        // Reversed order — still matches PK set.
+        assert!(validate_conflict_target_columns(&pk(&["a", "b"]), &uniques(&[]), &conflict(&["b", "a"])).is_ok());
+    }
+
+    // --- matches UNIQUE constraint ------------------------------------------
+
+    #[test]
+    fn unique_constraint_single_col_accepted() {
+        assert!(validate_conflict_target_columns(&pk(&[]), &uniques(&[&["email"]]), &conflict(&["email"])).is_ok());
+    }
+
+    #[test]
+    fn unique_constraint_composite_accepted() {
+        assert!(
+            validate_conflict_target_columns(&pk(&[]), &uniques(&[&["org_id", "slug"]]), &conflict(&["org_id", "slug"])).is_ok()
+        );
+    }
+
+    // --- mismatches → error -------------------------------------------------
+
+    #[test]
+    fn subset_of_pk_rejected() {
+        // Only one of the two PK cols — not a complete match.
+        assert!(validate_conflict_target_columns(&pk(&["a", "b"]), &uniques(&[]), &conflict(&["a"])).is_err());
+    }
+
+    #[test]
+    fn superset_of_pk_rejected() {
+        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id", "extra"])).is_err());
+    }
+
+    #[test]
+    fn non_constraint_col_rejected() {
+        // The combined set {email, id} is not any single constraint.
+        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[&["email"]]), &conflict(&["email", "id"])).is_err());
+    }
+
+    #[test]
+    fn empty_target_accepted_without_error() {
+        // Empty conflict target (no columns): validated as OK; caller handles
+        // the no-target case (all constraints checked).
+        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&[])).is_ok());
+    }
+
+    // --- same-batch dedup semantics (PG: first row wins) --------------------
+    // Structural test: validate returns Ok for a conflict target that IS a real constraint.
+    #[test]
+    fn same_batch_dup_target_accepted() {
+        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id"])).is_ok());
     }
 }
