@@ -2271,4 +2271,268 @@ mod tests {
             other => panic!("expected Rows, got {other:?}"),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Correlated-subquery tests (EXISTS / NOT EXISTS in DELETE / UPDATE WHERE)
+    // -------------------------------------------------------------------------
+
+    /// Helper: create table `t(id BIGINT PK, v BIGINT)` with rows {1,2,3}
+    /// and table `u(id BIGINT)` with row {2}.
+    async fn seed_correlated_tables(sess: &ProjectSession) {
+        sess.execute(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap();
+        sess.execute("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO u VALUES (2)")
+            .await
+            .unwrap();
+    }
+
+    /// `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)`
+    /// t={1,2,3}, u={2} → deletes {1,3}, leaves {2}.
+    #[tokio::test]
+    async fn delete_where_not_exists_correlated() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        seed_correlated_tables(&sess).await;
+
+        let res = sess
+            .execute(
+                "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+            )
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(
+                tag.starts_with("DELETE 2"),
+                "expected DELETE 2, got {tag}"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess
+            .execute("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(
+                    col_i64(&batches, "id"),
+                    vec![2],
+                    "expected only id=2 to remain"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// `DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)`
+    /// t={1,2,3}, u={2} → deletes {2}, leaves {1,3}.
+    #[tokio::test]
+    async fn delete_where_exists_correlated() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        seed_correlated_tables(&sess).await;
+
+        let res = sess
+            .execute(
+                "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+            )
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(
+                tag.starts_with("DELETE 1"),
+                "expected DELETE 1, got {tag}"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess
+            .execute("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(
+                    col_i64(&batches, "id"),
+                    vec![1, 3],
+                    "expected [1,3] to remain"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)`
+    /// when u is empty → NOT EXISTS matches every row → all deleted.
+    #[tokio::test]
+    async fn delete_not_exists_empty_subquery_deletes_all() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+        sess.execute("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY)")
+            .await
+            .unwrap();
+        // u is empty
+
+        let res = sess
+            .execute(
+                "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+            )
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(
+                tag.starts_with("DELETE 2"),
+                "expected DELETE 2, got {tag}"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // t must now be empty
+        let res = sess.execute("SELECT id FROM t").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 0, "table t must be empty");
+            }
+            ExecResult::Empty { .. } => {} // also fine — no rows
+        }
+    }
+
+    /// `DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)`
+    /// when u is empty → EXISTS matches nothing → nothing deleted.
+    #[tokio::test]
+    async fn delete_exists_empty_subquery_deletes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+        sess.execute("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY)")
+            .await
+            .unwrap();
+
+        let res = sess
+            .execute(
+                "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+            )
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(
+                tag.starts_with("DELETE 0"),
+                "expected DELETE 0, got {tag}"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess
+            .execute("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1, 2]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// `UPDATE t SET v = v + 1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)`
+    /// t={(1,10),(2,20),(3,30)}, u={2} → only rows 1 and 3 updated.
+    #[tokio::test]
+    async fn update_where_not_exists_correlated() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        seed_correlated_tables(&sess).await;
+
+        let res = sess
+            .execute(
+                "UPDATE t SET v = v + 1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+            )
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(
+                tag.starts_with("UPDATE 2"),
+                "expected UPDATE 2, got {tag}"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // id=2 must still have v=20 (NOT EXISTS did not match it).
+        let res = sess
+            .execute("SELECT id, v FROM t ORDER BY id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3]);
+                let vs = col_i64(&batches, "v");
+                // rows 1 and 3 bumped; row 2 unchanged
+                assert_eq!(vs[0], 11, "id=1: v should be 11");
+                assert_eq!(vs[1], 20, "id=2: v should be unchanged 20");
+                assert_eq!(vs[2], 31, "id=3: v should be 31");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// `DELETE FROM t WHERE t.id IN (SELECT id FROM u)` — non-correlated
+    /// IN-subquery still works via the existing materialise-then-IN path.
+    #[tokio::test]
+    async fn delete_where_in_subquery() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        seed_correlated_tables(&sess).await;
+
+        let res = sess
+            .execute("DELETE FROM t WHERE id IN (SELECT id FROM u)")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(
+                tag.starts_with("DELETE 1"),
+                "expected DELETE 1, got {tag}"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let res = sess
+            .execute("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(col_i64(&batches, "id"), vec![1, 3]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
 }

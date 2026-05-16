@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778943578 (Unix epoch)
-SQL fragments tested: 697 total / 1860 green (across all three configurations).
+Last run: 1778945904 (Unix epoch)
+SQL fragments tested: 697 total / 1863 green (across all three configurations).
 
 ## Configurations
 
@@ -197,7 +197,7 @@ SQL fragments tested: 697 total / 1860 green (across all three configurations).
 | `INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE t.id > 0` | ✅ | ✅ | ✅ |  |
 | `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.id > 0 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | ✅ | ✅ | ✅ |  |
-| `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | 📜 | 📜 | 📜 | invalid schema: WHERE clause not representable in v0.1: NOT EXISTS (SELECT 1 … |
+| `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING USER VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |

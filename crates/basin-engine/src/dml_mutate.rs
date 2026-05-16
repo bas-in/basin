@@ -224,6 +224,25 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     if let Some(using_tables) = delete.using {
         return exec_delete_using(sess, delete.selection, &table, using_tables).await;
     }
+
+    // Correlated EXISTS / NOT EXISTS: route through DataFusion's optimizer
+    // (which decorrelates EXISTS to semi/anti join) to get the matching PK
+    // set, then issue a plain DELETE WHERE pk IN (…).
+    // This must happen before `resolve_subqueries_in_expr` (which only handles
+    // non-correlated IN-subqueries) and before `parse_compound_predicate`
+    // (which cannot represent EXISTS at all).
+    if let Some(ref sel) = delete.selection {
+        if has_exists_subquery(sel) {
+            // Refuse multi-table first so the error message is clear.
+            if !delete.tables.is_empty() {
+                return Err(BasinError::InvalidSchema(
+                    "multi-table DELETE not supported".into(),
+                ));
+            }
+            return exec_delete_via_df_rowset(sess, &table, sel).await;
+        }
+    }
+
     let resolved_selection: Option<Expr> = match delete.selection {
         None => None,
         Some(e) => Some(resolve_subqueries_in_expr(sess, e).await?),
@@ -551,7 +570,16 @@ pub(crate) async fn exec_update(
             ));
         }
     };
-    let table = TableName::new(table_name)?;
+    let table = TableName::new(table_name.clone())?;
+
+    // Correlated EXISTS / NOT EXISTS in WHERE: route through DataFusion's
+    // optimizer (decorrelates to semi/anti join) before the custom
+    // CompoundPredicate engine sees the expression.
+    if let Some(ref sel) = selection {
+        if has_exists_subquery(sel) {
+            return exec_update_via_df_rowset(sess, &table_name, &assignments, sel).await;
+        }
+    }
 
     // Resolve any IN (SELECT …) subqueries to literal lists before the flush
     // so the subquery SELECT sees the committed state.
@@ -1145,6 +1173,269 @@ async fn exec_update_from(
     Ok(ExecResult::Empty {
         tag: format!("UPDATE {updated}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Correlated-subquery path (EXISTS / NOT EXISTS in WHERE)
+// ---------------------------------------------------------------------------
+//
+// DataFusion's optimizer decorrelates EXISTS / NOT EXISTS subqueries when they
+// appear inside a SELECT plan (it rewrites them to semi/anti joins).  The
+// custom CompoundPredicate engine used by the file-scan layer has no such
+// capability.
+//
+// Strategy when the WHERE clause contains an EXISTS node:
+//
+// *With PRIMARY KEY*: run `SELECT <pk_cols> FROM t WHERE <selection>` through
+// DataFusion (decorrelates EXISTS → semi/anti join), collect the PK set, then
+// re-issue `DELETE FROM t WHERE pk IN (…)` / `UPDATE t SET … WHERE pk IN (…)`
+// so cascades, soft-delete, and audit still fire.
+//
+// *Without PRIMARY KEY* (DELETE only): run `SELECT * FROM t WHERE NOT
+// (<selection>)` to obtain the rows to *keep*, then replace the table with
+// those rows using a direct write+commit.  UPDATE without PK is rejected with
+// a clear error.
+//
+// Correctness invariants preserved by this design:
+//  * NULL semantics: DataFusion's anti-join (NOT EXISTS) ignores NULLs in
+//    the correlated column — NOT EXISTS finds rows with no match, which is
+//    the correct SQL semantic even when u.col has NULLs.
+//  * Empty subquery result: NOT EXISTS over an empty table returns every row
+//    of the outer table (all match); EXISTS returns nothing.  DataFusion
+//    handles both correctly via the anti/semi join rewrite.
+//  * EXISTS vs NOT EXISTS: `negated = false` in the AST node → EXISTS (semi);
+//    `negated = true` → NOT EXISTS (anti). DataFusion respects this.
+//  * If UPDATE is requested on a table with no PK, we fail cleanly with a
+//    clear error rather than silently applying wrong mutations.
+
+/// `DELETE FROM t WHERE [NOT] EXISTS (SELECT 1 FROM u WHERE u.x = t.x)` and
+/// similar correlated-EXISTS forms.
+///
+/// *With PK*:
+/// 1. Run `SELECT <pk_cols> FROM t WHERE <selection>` through DataFusion
+///    so the optimizer decorrelates the EXISTS → semi/anti join.
+/// 2. Collect the matching PK tuples.
+/// 3. Re-issue `DELETE FROM t WHERE pk IN (…)` through the normal path so
+///    cascades, soft-delete, and audit all fire.
+///
+/// *Without PK*:
+/// 1. Run `SELECT * FROM t WHERE NOT (<selection>)` to get rows to KEEP.
+/// 2. Replace the entire table with those rows via direct write+commit.
+/// 3. Return `DELETE <dropped_count>`.
+async fn exec_delete_via_df_rowset(
+    sess: &ProjectSession,
+    table: &TableName,
+    selection: &Expr,
+) -> Result<ExecResult> {
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await?;
+    let table_str = table.as_str();
+
+    if !meta.pk_columns.is_empty() {
+        // --- PK path: get matching row PKs, re-issue plain DELETE ---
+        let pk = &meta.pk_columns;
+
+        // Build: SELECT t.pk1, t.pk2, … FROM t WHERE <selection>
+        // The table qualifier prevents ambiguity when the subquery also
+        // references `t`.
+        let pk_proj: Vec<String> = pk
+            .iter()
+            .map(|c| format!("{table_str}.{c}"))
+            .collect();
+
+        let rowset_sql = format!(
+            "SELECT {proj} FROM {tbl} WHERE {pred}",
+            proj = pk_proj.join(", "),
+            tbl = table_str,
+            pred = selection,
+        );
+
+        // Execute through the full engine pipeline (refresh_table, optimizer,
+        // DataFusion decorrelation) so EXISTS is lowered to semi/anti join.
+        let rowset_result = Box::pin(sess.execute(&rowset_sql)).await?;
+        let batches = match rowset_result {
+            ExecResult::Rows { batches, .. } => batches,
+            ExecResult::Empty { .. } => {
+                return Ok(ExecResult::Empty {
+                    tag: "DELETE 0".into(),
+                })
+            }
+        };
+
+        let pk_tuples = collect_pk_batches(&batches, pk)?;
+        if pk_tuples.is_empty() {
+            return Ok(ExecResult::Empty {
+                tag: "DELETE 0".into(),
+            });
+        }
+
+        let schema = meta.schema.clone();
+        let where_pred = build_pk_in_predicate(&pk_tuples, pk, &schema)?;
+        let delete_sql = format!("DELETE FROM {table_str} WHERE {where_pred}");
+        return Box::pin(sess.execute(&delete_sql)).await;
+    }
+
+    // --- No-PK path: get rows to KEEP by inverting the predicate ---
+    //
+    // Rows to keep = those that do NOT match the DELETE predicate:
+    //   SELECT * FROM t WHERE NOT (<selection>)
+    //
+    // We select all columns; DataFusion still decorrelates the EXISTS
+    // inside `NOT (EXISTS(...))`.
+    let keep_sql = format!(
+        "SELECT * FROM {tbl} WHERE NOT ({pred})",
+        tbl = table_str,
+        pred = selection,
+    );
+
+    pre_mutation_flush(sess).await?;
+
+    // Re-load metadata after the flush (snapshot id must be current).
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await?;
+    let schema = meta.schema.clone();
+    let storage = sess.engine.config().storage.clone();
+
+    // Count total rows BEFORE deletion so we can report DELETE <n>.
+    let total_rows_before: usize = storage
+        .list_data_files_with_stats(&sess.project, table)
+        .await?
+        .iter()
+        .map(|f| f.row_count as usize)
+        .sum();
+
+    if total_rows_before == 0 {
+        return Ok(ExecResult::Empty {
+            tag: "DELETE 0".into(),
+        });
+    }
+
+    // Execute the KEEP query through the full engine pipeline (refreshes
+    // table registrations, decorrelates EXISTS).
+    let keep_result = Box::pin(sess.execute(&keep_sql)).await?;
+    let keep_batches: Vec<RecordBatch> = match keep_result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => Vec::new(),
+    };
+    // keep_batches are already in workspace Arrow format — exec_select
+    // converts them via batch_df_to_ws before placing them in ExecResult::Rows.
+
+    let kept_rows: usize = keep_batches.iter().map(|b| b.num_rows()).sum();
+    let deleted = total_rows_before.saturating_sub(kept_rows);
+
+    if deleted == 0 {
+        return Ok(ExecResult::Empty {
+            tag: "DELETE 0".into(),
+        });
+    }
+
+    // List ALL current data files so we can remove them all and replace
+    // with the kept-rows batch.
+    let data_files = storage
+        .list_data_files_with_stats(&sess.project, table)
+        .await?;
+    let all_paths: Vec<String> = data_files
+        .iter()
+        .map(|f| f.path.as_ref().to_string())
+        .collect();
+
+    // Write the kept rows as a new file (empty → no file written).
+    let added = write_replacement(sess, table, schema.clone(), keep_batches).await?;
+
+    // Atomically swap old files → new file in the catalog snapshot.
+    commit_replace(sess, table, meta.current_snapshot, all_paths.clone(), added).await?;
+
+    // Physical cleanup + session refresh.
+    delete_objects(sess, table, schema.as_ref(), &all_paths).await?;
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
+
+    Ok(ExecResult::Empty {
+        tag: format!("DELETE {deleted}"),
+    })
+}
+
+/// `UPDATE t SET … WHERE [NOT] EXISTS (SELECT 1 FROM u WHERE u.x = t.x)` and
+/// similar correlated-EXISTS forms.
+///
+/// Requires the target table to have a PRIMARY KEY.  Materialises the matching
+/// PK set via a DataFusion SELECT (which decorrelates EXISTS), then re-issues
+/// `UPDATE t SET … WHERE pk IN (…)` through the normal path.
+///
+/// UPDATE on a no-PK table with EXISTS is rejected with a clear error; a
+/// correct fix would require a full-table scan with per-row identity tracking
+/// that is out of scope for v0.1.
+async fn exec_update_via_df_rowset(
+    sess: &ProjectSession,
+    table_str: &str,
+    assignments: &[Assignment],
+    selection: &Expr,
+) -> Result<ExecResult> {
+    let table = TableName::new(table_str.to_string())?;
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, &table)
+        .await?;
+    if meta.pk_columns.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "UPDATE WHERE EXISTS/NOT EXISTS requires the target table {:?} to have a PRIMARY KEY",
+            table_str
+        )));
+    }
+    let pk = &meta.pk_columns;
+
+    // Build: SELECT t.pk1, … FROM t WHERE <selection>
+    let pk_proj: Vec<String> = pk
+        .iter()
+        .map(|c| format!("{table_str}.{c}"))
+        .collect();
+
+    let rowset_sql = format!(
+        "SELECT {proj} FROM {tbl} WHERE {pred}",
+        proj = pk_proj.join(", "),
+        tbl = table_str,
+        pred = selection,
+    );
+
+    let rowset_result = Box::pin(sess.execute(&rowset_sql)).await?;
+    let batches = match rowset_result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => {
+            return Ok(ExecResult::Empty {
+                tag: "UPDATE 0".into(),
+            })
+        }
+    };
+
+    let pk_tuples = collect_pk_batches(&batches, pk)?;
+    if pk_tuples.is_empty() {
+        return Ok(ExecResult::Empty {
+            tag: "UPDATE 0".into(),
+        });
+    }
+
+    // Build SET clause text.
+    let set_parts: Vec<String> = assignments
+        .iter()
+        .map(|a| format!("{}", a))
+        .collect();
+    let set_clause = set_parts.join(", ");
+
+    let schema = meta.schema.clone();
+    let where_pred = build_pk_in_predicate(&pk_tuples, pk, &schema)?;
+    let update_sql = format!(
+        "UPDATE {table_str} SET {set_clause} WHERE {where_pred}"
+    );
+    Box::pin(sess.execute(&update_sql)).await
 }
 
 /// Collect `(pk_col1, pk_col2, …)` tuples from a result set as string
@@ -2244,6 +2535,21 @@ fn contains_subquery(expr: &Expr) -> bool {
         E::Cast { expr: inner, .. } => contains_subquery(inner),
         E::IsNull(inner) | E::IsNotNull(inner) => contains_subquery(inner),
         E::Function(_) | E::Identifier(_) | E::CompoundIdentifier(_) | E::Value(_) => false,
+        _ => false,
+    }
+}
+
+/// Return `true` when `expr` (a WHERE clause) contains at least one
+/// `EXISTS (…)` or `NOT EXISTS (…)` node.  Used to route DELETE/UPDATE
+/// through the DataFusion-decorrelation path before the custom predicate
+/// engine (which can't represent correlated subqueries) sees the expression.
+fn has_exists_subquery(expr: &Expr) -> bool {
+    use sqlparser::ast::Expr as E;
+    match expr {
+        E::Exists { .. } => true,
+        E::Nested(inner) => has_exists_subquery(inner),
+        E::UnaryOp { expr: inner, .. } => has_exists_subquery(inner),
+        E::BinaryOp { left, right, .. } => has_exists_subquery(left) || has_exists_subquery(right),
         _ => false,
     }
 }
