@@ -744,7 +744,6 @@ async fn upsert_on_conflict_do_nothing() {
 /// row carries the new value); flips to a real guard when the planner
 /// resolves the alias.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (upsert DO UPDATE SET … = EXCLUDED.col) — newly-found gap: ON CONFLICT DO UPDATE can't resolve EXCLUDED/<table> col refs; un-ignore when fixed"]
 async fn upsert_on_conflict_do_update() {
     let server = start_server().await;
     let client = connect(server.addr).await;

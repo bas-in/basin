@@ -9,7 +9,8 @@ use basin_catalog::{DataFileRef, TableMetadata};
 use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName};
 use basin_storage::WriteOptions;
 use sqlparser::ast::{
-    AssignmentTarget, ConflictTarget, ObjectName, OnConflictAction, OnInsert, SetExpr, Statement,
+    AssignmentTarget, ConflictTarget, Expr, ObjectName, OnConflictAction, OnInsert, SetExpr,
+    Statement,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -2314,8 +2315,29 @@ async fn try_on_conflict_do_update(
         return Ok(None); // No conflict — let the caller do a normal INSERT.
     }
 
+    // Build EXCLUDED map: col_name_lowercase → proposed-row expr.
+    // This lets us resolve `EXCLUDED.col` in the DO UPDATE expressions.
+    let mut excluded_map: std::collections::HashMap<String, Expr> =
+        std::collections::HashMap::with_capacity(schema.fields().len());
+    for (i, field) in schema.fields().iter().enumerate() {
+        excluded_map.insert(
+            field.name().to_ascii_lowercase(),
+            rows_expanded[0][i].clone(),
+        );
+    }
+
+    // The bare table name (last component) for resolving `tablename.col`
+    // references → existing-row column in the UPDATE context.
+    let table_bare = table.as_str().to_ascii_lowercase();
+
     // Conflict found. Build and execute an UPDATE.
-    let set_parts: Vec<String> = do_update
+    //
+    // Before formatting each assignment's RHS expression, rewrite any
+    // `EXCLUDED.col` references to the literal proposed-row value and any
+    // `tablename.col` references to a bare `col` identifier (the existing row
+    // in the UPDATE context).  Unqualified `col` references are left as-is
+    // and naturally bind to the existing row — matching PG semantics.
+    let set_parts: Result<Vec<String>> = do_update
         .assignments
         .iter()
         .map(|a| {
@@ -2327,14 +2349,16 @@ async fn try_on_conflict_do_update(
                     .unwrap_or_default(),
                 AssignmentTarget::Tuple(_) => String::new(),
             };
-            format!("{col} = {}", a.value)
+            if col.is_empty() {
+                return Err(BasinError::InvalidSchema(
+                    "ON CONFLICT DO UPDATE: malformed assignment".into(),
+                ));
+            }
+            let rhs = rewrite_do_update_expr(a.value.clone(), &table_bare, &excluded_map);
+            Ok(format!("{col} = {rhs}"))
         })
         .collect();
-    if set_parts.iter().any(|s| s.starts_with(" =")) {
-        return Err(BasinError::InvalidSchema(
-            "ON CONFLICT DO UPDATE: malformed assignment".into(),
-        ));
-    }
+    let set_parts = set_parts?;
     let update_sql = format!(
         "UPDATE {} SET {} WHERE {}",
         table.as_str(),
@@ -2343,6 +2367,59 @@ async fn try_on_conflict_do_update(
     );
     let result = Box::pin(sess.execute(&update_sql)).await?;
     Ok(Some(result))
+}
+
+/// Rewrite a DO UPDATE SET RHS expression to resolve PostgreSQL upsert
+/// column-reference semantics before passing the expression to a plain UPDATE:
+///
+/// - `EXCLUDED.col`     → the literal proposed-row value for `col`
+/// - `tablename.col`    → bare `col` identifier (existing row in UPDATE scope)
+/// - unqualified `col`  → left unchanged (already refers to the existing row)
+///
+/// The function is purely structural; it does not need access to the session
+/// because `rows_expanded` already holds concrete literal / bind-param Expr
+/// nodes for every column in the proposed row.
+fn rewrite_do_update_expr(
+    expr: Expr,
+    table_name_lower: &str,
+    excluded_map: &std::collections::HashMap<String, Expr>,
+) -> Expr {
+    match expr {
+        // Two-part qualified identifier: either `EXCLUDED.col` or `table.col`.
+        Expr::CompoundIdentifier(ref parts) if parts.len() == 2 => {
+            let qualifier = parts[0].value.to_ascii_lowercase();
+            let col_lower = parts[1].value.to_ascii_lowercase();
+            if qualifier == "excluded" {
+                // EXCLUDED.col → proposed-row value (or keep as-is if unknown).
+                if let Some(proposed) = excluded_map.get(&col_lower) {
+                    return proposed.clone();
+                }
+            } else if qualifier == table_name_lower {
+                // tablename.col → bare col (existing row in the UPDATE scope).
+                return Expr::Identifier(parts[1].clone());
+            }
+            expr
+        }
+        // Recurse into binary operations (the common case: `t.hits + EXCLUDED.hits`).
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(rewrite_do_update_expr(*left, table_name_lower, excluded_map)),
+            op,
+            right: Box::new(rewrite_do_update_expr(*right, table_name_lower, excluded_map)),
+        },
+        // Recurse into unary operations.
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op,
+            expr: Box::new(rewrite_do_update_expr(*inner, table_name_lower, excluded_map)),
+        },
+        // Recurse into parenthesised expressions.
+        Expr::Nested(inner) => {
+            Expr::Nested(Box::new(rewrite_do_update_expr(*inner, table_name_lower, excluded_map)))
+        }
+        // All other expression forms (literals, bind params, functions, …) are
+        // left unchanged — they either have no column references or reference
+        // forms we don't need to rewrite for the DO UPDATE scope.
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4013,5 +4090,115 @@ mod json_agg_rewrite_tests {
         let lower = rewritten.to_ascii_lowercase();
         assert!(lower.contains("named_struct"), "JSON_AGG uppercase should be expanded: {rewritten}");
         assert!(lower.contains("'x'"), "expected 'x' key: {rewritten}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ON CONFLICT DO UPDATE — rewrite_do_update_expr unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod do_update_rewrite_tests {
+    use super::rewrite_do_update_expr;
+    use sqlparser::ast::{BinaryOperator, Expr, Ident, Value, ValueWithSpan};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+    use std::collections::HashMap;
+
+    /// Parse a single SQL expression string into an `Expr` node.
+    fn parse_expr(sql: &str) -> Expr {
+        let mut p = Parser::new(&PostgreSqlDialect {});
+        // Wrap in SELECT so the parser reaches the expression context.
+        let stmt = Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {sql}"))
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("stmt");
+        if let sqlparser::ast::Statement::Query(q) = stmt {
+            if let sqlparser::ast::SetExpr::Select(sel) = *q.body {
+                if let sqlparser::ast::SelectItem::UnnamedExpr(e) = sel.projection.into_iter().next().expect("item") {
+                    return e;
+                }
+            }
+        }
+        panic!("could not parse expression: {sql}");
+    }
+
+    /// Build a simple integer literal Expr.
+    fn int_expr(n: i64) -> Expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n.to_string(), false),
+            span: sqlparser::tokenizer::Span::empty(),
+        })
+    }
+
+    fn make_excluded(pairs: &[(&str, Expr)]) -> HashMap<String, Expr> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    // EXCLUDED.col → proposed-row literal value.
+    #[test]
+    fn excluded_col_rewritten_to_literal() {
+        let excluded = make_excluded(&[("hits", int_expr(42))]);
+        let expr = parse_expr("EXCLUDED.hits");
+        let result = rewrite_do_update_expr(expr, "accounts", &excluded);
+        assert_eq!(format!("{result}"), "42");
+    }
+
+    // tablename.col → bare col identifier (existing row).
+    #[test]
+    fn table_col_rewritten_to_bare_identifier() {
+        let excluded: HashMap<String, Expr> = HashMap::new();
+        let expr = parse_expr("accounts.hits");
+        let result = rewrite_do_update_expr(expr, "accounts", &excluded);
+        // Should become bare `hits` identifier.
+        assert!(
+            matches!(&result, Expr::Identifier(i) if i.value == "hits"),
+            "expected bare identifier `hits`, got: {result}"
+        );
+    }
+
+    // Unqualified col → unchanged (existing row in UPDATE scope).
+    #[test]
+    fn unqualified_col_unchanged() {
+        let excluded: HashMap<String, Expr> = HashMap::new();
+        let expr = parse_expr("hits");
+        let result = rewrite_do_update_expr(expr, "accounts", &excluded);
+        assert!(
+            matches!(&result, Expr::Identifier(i) if i.value == "hits"),
+            "expected unchanged identifier `hits`, got: {result}"
+        );
+    }
+
+    // BinaryOp: t.hits + EXCLUDED.hits → hits + 42
+    #[test]
+    fn binary_op_mixed_refs() {
+        let excluded = make_excluded(&[("hits", int_expr(5))]);
+        let expr = parse_expr("accounts.hits + EXCLUDED.hits");
+        let result = rewrite_do_update_expr(expr, "accounts", &excluded);
+        // Should be `hits + 5`.
+        let s = format!("{result}");
+        assert!(s.contains("hits"), "expected `hits` in result: {s}");
+        assert!(s.contains('5'), "expected `5` in result: {s}");
+        assert!(!s.contains("accounts"), "table qualifier must be stripped: {s}");
+        assert!(!s.contains("EXCLUDED"), "EXCLUDED must be resolved: {s}");
+    }
+
+    // Case-insensitive: EXCLUDED.HITS, ACCOUNTS.HITS → resolved correctly.
+    #[test]
+    fn case_insensitive_matching() {
+        let excluded = make_excluded(&[("hits", int_expr(99))]);
+        let expr = parse_expr("EXCLUDED.HITS");
+        let result = rewrite_do_update_expr(expr, "accounts", &excluded);
+        assert_eq!(format!("{result}"), "99");
+    }
+
+    // Unknown EXCLUDED column → left unchanged (pass-through for unknown refs).
+    #[test]
+    fn excluded_unknown_col_passthrough() {
+        let excluded: HashMap<String, Expr> = HashMap::new();
+        let expr = parse_expr("EXCLUDED.nonexistent");
+        let result = rewrite_do_update_expr(expr.clone(), "accounts", &excluded);
+        assert_eq!(format!("{result}"), format!("{expr}"));
     }
 }
