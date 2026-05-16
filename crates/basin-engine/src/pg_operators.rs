@@ -3335,13 +3335,45 @@ pub(crate) fn rewrite_recursive_cte_column_aliases(sql: &str) -> String {
 
     // For each expression, add `AS col_name` if the expression doesn't
     // already end with an alias.
+    //
+    // DataFusion 53 optimizer bug workaround (multi-column recursive CTEs):
+    // The `optimize_projections` rule incorrectly pushes parent column
+    // requirements into both the static and recursive terms of a RecursiveQuery,
+    // even when the recursive term needs additional columns internally (e.g.
+    // `SELECT b, a+b FROM fib WHERE b < 100` needs both `a` and `b` even if
+    // the outer query only selects `a`). This causes `project index N out of
+    // bounds` errors at execution time when the outer query selects a proper
+    // subset of the CTE's columns.
+    //
+    // The escape hatch: DataFusion's `optimize_projections` skips the entire
+    // RecursiveQuery when `plan_contains_other_subqueries` returns true for
+    // the static term (anchor). We trigger this by wrapping the FIRST anchor
+    // expression in a scalar subquery `(SELECT expr) AS col_name`. A scalar
+    // subquery in the anchor's expression list causes the optimizer to detect
+    // "other subqueries" and leave all columns intact. This only applies when
+    // there are 2+ CTE column names (single-column CTEs don't have this issue
+    // because the outer query always needs all 1 column).
+    let multi_col = col_names.len() >= 2;
+    let mut scalar_wrap_applied = false;
+
     let mut new_exprs: Vec<String> = Vec::with_capacity(exprs.len());
-    for (expr, col) in exprs.iter().zip(col_names.iter()) {
+    for (idx, (expr, col)) in exprs.iter().zip(col_names.iter()).enumerate() {
         let trimmed = expr.trim();
-        if expr_has_alias(trimmed) {
+        // For the first expression of a multi-column CTE, wrap in a scalar
+        // subquery to inhibit the DataFusion 53 projection-pushdown bug.
+        if multi_col && idx == 0 && !scalar_wrap_applied {
+            // Strip any existing alias so we can re-wrap cleanly.
+            let raw = if expr_has_alias(trimmed) {
+                strip_expr_alias(trimmed)
+            } else {
+                trimmed
+            };
+            new_exprs.push(format!("(SELECT {raw}) AS {col}"));
+            scalar_wrap_applied = true;
+        } else if expr_has_alias(trimmed) {
             new_exprs.push(trimmed.to_string());
         } else {
-            new_exprs.push(format!("{} AS {}", trimmed, col));
+            new_exprs.push(format!("{trimmed} AS {col}"));
         }
     }
 
@@ -3469,6 +3501,42 @@ fn expr_has_alias(expr: &str) -> bool {
         }
     }
     false
+}
+
+/// Strip a trailing ` AS name` alias from `expr` (depth-0 scan) and return
+/// the expression part only.  If no alias is found, returns `expr` unchanged.
+/// Used when we need to re-wrap an already-aliased expression.
+fn strip_expr_alias(expr: &str) -> &str {
+    let lower = expr.to_ascii_lowercase();
+    let bytes = expr.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut alias_start: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => { depth += 1; i += 1; }
+            b')' => { depth -= 1; i += 1; }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
+                    } else { i += 1; }
+                }
+            }
+            _ => {
+                if depth == 0 && lower[i..].starts_with(" as ") {
+                    alias_start = Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    match alias_start {
+        Some(pos) => expr[..pos].trim(),
+        None => expr,
+    }
 }
 
 
@@ -4732,7 +4800,22 @@ mod tests {
     fn recursive_cte_multi_col_alias_added() {
         let sql = "WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib";
         let out = rewrite_recursive_cte_column_aliases(sql);
-        assert!(out.contains("SELECT 1 AS a, 1 AS b"), "expected AS aliases: {out}");
+        // First expression is wrapped in a scalar subquery (DataFusion 53 optimizer
+        // bug workaround: triggers the plan_contains_other_subqueries escape hatch
+        // in optimize_projections so the recursive CTE's columns are not pruned).
+        assert!(out.contains("(SELECT 1) AS a"), "expected scalar-subquery wrap for first col: {out}");
+        // Second expression gets a plain alias.
+        assert!(out.contains("1 AS b"), "expected plain alias for second col: {out}");
+    }
+
+    #[test]
+    fn recursive_cte_multi_col_already_aliased_first() {
+        // If the first expression already has an alias, it still gets wrapped.
+        let sql = "WITH RECURSIVE fib(a, b) AS (SELECT 1 AS a, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib";
+        let out = rewrite_recursive_cte_column_aliases(sql);
+        // First expression `1 AS a` → strip alias → `1` → `(SELECT 1) AS a`
+        assert!(out.contains("(SELECT 1) AS a"), "pre-aliased first col must be re-wrapped: {out}");
+        assert!(out.contains("1 AS b"), "second col gets plain alias: {out}");
     }
 
     #[test]

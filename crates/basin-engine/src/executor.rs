@@ -4573,3 +4573,109 @@ mod do_nothing_validate_tests {
         assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id"])).is_ok());
     }
 }
+
+// ---------------------------------------------------------------------------
+// WITH RECURSIVE multi-column — DataFusion execution tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recursive_cte_exec_tests {
+    use crate::pg_operators::rewrite_recursive_cte_column_aliases;
+    use datafusion::arrow::array::Array;
+    use datafusion::prelude::SessionContext;
+
+    /// Run a SQL string through the recursive-CTE alias rewriter then execute
+    /// it in a bare DataFusion `SessionContext`.  Returns the flattened i64
+    /// values from the first column of all result batches.
+    async fn run_i64(sql: &str) -> Result<Vec<i64>, String> {
+        let rewritten = rewrite_recursive_cte_column_aliases(sql);
+        let ctx = SessionContext::new();
+        let df = ctx.sql(&rewritten).await.map_err(|e| format!("sql: {e}"))?;
+        let batches = df.collect().await.map_err(|e| format!("collect: {e}"))?;
+        let mut vals = Vec::new();
+        for batch in &batches {
+            let col = batch.column(0);
+            let arr = col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .ok_or_else(|| format!("expected Int64Array, got {:?}", col.data_type()))?;
+            for i in 0..arr.len() {
+                vals.push(arr.value(i));
+            }
+        }
+        Ok(vals)
+    }
+
+    /// Run a SQL string through the rewriter and execute it; returns first
+    /// column as `Vec<String>` (Utf8).
+    async fn run_str(sql: &str) -> Result<Vec<String>, String> {
+        let rewritten = rewrite_recursive_cte_column_aliases(sql);
+        let ctx = SessionContext::new();
+        let df = ctx.sql(&rewritten).await.map_err(|e| format!("sql: {e}"))?;
+        let batches = df.collect().await.map_err(|e| format!("collect: {e}"))?;
+        let mut vals = Vec::new();
+        for batch in &batches {
+            let col = batch.column(0);
+            let arr = col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .ok_or_else(|| format!("expected StringArray, got {:?}", col.data_type()))?;
+            for i in 0..arr.len() {
+                vals.push(arr.value(i).to_string());
+            }
+        }
+        Ok(vals)
+    }
+
+    /// Fibonacci multi-column WITH RECURSIVE: fib(a, b).
+    ///
+    /// PostgreSQL spec: anchor row (1,1) + 10 recursive rows where source b < 100.
+    /// Full table: (1,1),(1,2),(2,3),(3,5),(5,8),(8,13),(13,21),(21,34),(34,55),(55,89),(89,144)
+    /// SELECT a → 11 values: 1,1,2,3,5,8,13,21,34,55,89
+    #[tokio::test]
+    async fn fib_multi_col_exact_sequence() {
+        let sql = "WITH RECURSIVE fib(a, b) AS \
+            (SELECT 1, 1 \
+             UNION ALL \
+             SELECT b, a+b FROM fib WHERE b < 100) \
+            SELECT a FROM fib";
+        let vals = run_i64(sql).await.expect("fib query must succeed");
+        let expected: Vec<i64> = vec![1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89];
+        assert_eq!(vals, expected, "fib(a,b) SELECT a must match PG Fibonacci sequence");
+    }
+
+    /// Single-column regression: existing behaviour must be preserved.
+    #[tokio::test]
+    async fn single_col_regression() {
+        let sql = "WITH RECURSIVE r(n) AS \
+            (SELECT 1 \
+             UNION ALL \
+             SELECT n+1 FROM r WHERE n < 5) \
+            SELECT n FROM r";
+        let vals = run_i64(sql).await.expect("single-col recursive CTE must succeed");
+        let expected: Vec<i64> = vec![1, 2, 3, 4, 5];
+        assert_eq!(vals, expected, "single-col r(n) must produce 1..=5");
+    }
+
+    /// Two-column string-hierarchy accumulator (non-numeric confidence test).
+    #[tokio::test]
+    async fn two_col_string_hierarchy() {
+        // Builds a chain: path grows left-to-right, depth counts steps.
+        // anchor: ('root', 0)
+        // recursive: append '->child' while depth < 3
+        // Rows: ('root',0), ('root->child',1), ('root->child->child',2), ('root->child->child->child',3)
+        let sql = "WITH RECURSIVE tree(path, depth) AS \
+            (SELECT 'root', 0 \
+             UNION ALL \
+             SELECT path || '->child', depth + 1 FROM tree WHERE depth < 3) \
+            SELECT path FROM tree";
+        let vals = run_str(sql).await.expect("string hierarchy CTE must succeed");
+        let expected = vec![
+            "root".to_string(),
+            "root->child".to_string(),
+            "root->child->child".to_string(),
+            "root->child->child->child".to_string(),
+        ];
+        assert_eq!(vals, expected, "string hierarchy paths must match");
+    }
+}

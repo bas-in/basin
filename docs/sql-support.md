@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778971463 (Unix epoch)
-SQL fragments tested: 697 total / 1914 green (across all three configurations).
+Last run: 1778973257 (Unix epoch)
+SQL fragments tested: 697 total / 1917 green (across all three configurations).
 
 ## Configurations
 
@@ -641,7 +641,7 @@ SQL fragments tested: 697 total / 1914 green (across all three configurations).
 | `WITH ins AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM ins` | ✅ | ✅ | ✅ |  |
 | `WITH upd AS (UPDATE t SET id = 99 WHERE id = 1 RETURNING id) SELECT * FROM upd` | ✅ | ✅ | ✅ |  |
 | `WITH del AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT * FROM del` | ✅ | ✅ | ✅ |  |
-| `WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Schema error: project index 1 out of bounds, … |
+| `WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib` | ✅ | ✅ | ✅ |  |
 | `WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a, b` | ✅ | ✅ | ✅ |  |
