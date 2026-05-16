@@ -30,6 +30,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::TimeZone as _; // for Utc.timestamp_opt()
 use basin_common::Result;
 use basin_engine::{
     AuthContext, BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema,
@@ -603,6 +604,64 @@ fn decode_param_binary(
             let s = uuid::Uuid::from_bytes(arr).hyphenated().to_string();
             Ok(ScalarParam::Text(s))
         }
+        // TIMESTAMP / TIMESTAMPTZ binary wire format: 8-byte big-endian i64
+        // microseconds since the Postgres epoch 2000-01-01 00:00:00 UTC
+        // (NOT the Unix epoch 1970-01-01). Render as an ISO-8601 string so
+        // the engine's text-substitution path parses it back correctly.
+        // TIMESTAMPTZ uses the same encoding but always represents UTC.
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+            if bytes.len() != 8 {
+                return Err(bad_len(8));
+            }
+            let pg_usec = i64::from_be_bytes(bytes.try_into().unwrap());
+            // PG epoch: 2000-01-01 00:00:00 UTC
+            // Unix epoch: 1970-01-01 00:00:00 UTC  →  delta = 10957 days
+            const PG_EPOCH_DELTA_USEC: i64 = 10_957 * 86_400 * 1_000_000;
+            let unix_usec = pg_usec
+                .checked_add(PG_EPOCH_DELTA_USEC)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22P03".to_owned(),
+                        "timestamp binary value overflows i64 microseconds".to_owned(),
+                    )))
+                })?;
+            let secs = unix_usec.div_euclid(1_000_000);
+            let nanos = (unix_usec.rem_euclid(1_000_000) * 1_000) as u32;
+            let dt = chrono::Utc.timestamp_opt(secs, nanos).single().ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P03".to_owned(),
+                    format!("timestamp binary value out of range: pg_usec={pg_usec}"),
+                )))
+            })?;
+            let s = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+            Ok(ScalarParam::Text(s))
+        }
+        // DATE binary wire format: 4-byte big-endian i32 days since the
+        // Postgres epoch 2000-01-01 (NOT Unix epoch 1970-01-01).
+        Type::DATE => {
+            if bytes.len() != 4 {
+                return Err(bad_len(4));
+            }
+            let pg_days = i32::from_be_bytes(bytes.try_into().unwrap());
+            // PG epoch is 2000-01-01; add/subtract pg_days to get the date.
+            let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+            let date = if pg_days >= 0 {
+                pg_epoch.checked_add_days(chrono::Days::new(pg_days as u64))
+            } else {
+                pg_epoch.checked_sub_days(chrono::Days::new((-pg_days) as u64))
+            }
+            .ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P03".to_owned(),
+                    format!("date binary value out of range: pg_days={pg_days}"),
+                )))
+            })?;
+            let s = date.format("%Y-%m-%d").to_string();
+            Ok(ScalarParam::Text(s))
+        }
         _ => {
             // Unknown binary type: best-effort treat as raw text bytes. The
             // engine's text substitution will then SQL-escape them. If the
@@ -638,6 +697,23 @@ where
     S: Session + ?Sized,
 {
     let name = msg.name.clone().unwrap_or_default();
+    // PG protocol §55.2.3: extended-query Parse accepts exactly one
+    // statement. Multi-statement SQL (e.g. "SELECT 1; SELECT 2") must be
+    // rejected with SQLSTATE 42601 before any Bind/Execute so drivers
+    // (pgx, JDBC, asyncpg) do not de-sync on an unexpected extra
+    // RowDescription. Simple-query multi-statement (split before dispatch)
+    // is unaffected — this guard is extended-query only.
+    {
+        let stmts = split_simple_query(&msg.query);
+        if stmts.len() > 1 {
+            let info = ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(), // syntax_error
+                "cannot insert multiple commands into a prepared statement".to_owned(),
+            );
+            return vec![PgWireBackendMessage::ErrorResponse(info.into())];
+        }
+    }
     // COPY is intercepted before the engine; the engine's parser would
     // reject it, but we want it to flow through Bind/Execute so
     // tokio-postgres' `copy_in` / `copy_out` (which always use the
