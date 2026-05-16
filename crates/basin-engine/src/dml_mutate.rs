@@ -48,11 +48,12 @@ use crate::pg_ast::ObjectNamePartExt;
 use object_store::ObjectStoreExt;
 
 use arrow_array::builder::{
-    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
+    StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::DataFileRef;
@@ -2362,6 +2363,71 @@ fn build_assigned_column(
             }
             Ok(Arc::new(b.finish()))
         }
+        // INT4 column — scalar is Int64 (from literal parsing), narrowed to i32.
+        (DataType::Int32, ScalarValue::Int64(v)) => {
+            let set_val = i32::try_from(*v).map_err(|_| {
+                BasinError::InvalidSchema(format!(
+                    "UPDATE SET: value {v} out of range for INT4 column"
+                ))
+            })?;
+            let arr = original
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| BasinError::internal("expected Int32Array for SET"))?;
+            let mut b = Int32Builder::with_capacity(n);
+            for i in 0..n {
+                if matched(i) {
+                    b.append_value(set_val);
+                } else if arr.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(arr.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // INT2 column — scalar is Int64, narrowed to i16.
+        (DataType::Int16, ScalarValue::Int64(v)) => {
+            let set_val = i16::try_from(*v).map_err(|_| {
+                BasinError::InvalidSchema(format!(
+                    "UPDATE SET: value {v} out of range for INT2 column"
+                ))
+            })?;
+            let arr = original
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| BasinError::internal("expected Int16Array for SET"))?;
+            let mut b = Int16Builder::with_capacity(n);
+            for i in 0..n {
+                if matched(i) {
+                    b.append_value(set_val);
+                } else if arr.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(arr.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // FLOAT4 column — scalar is Float64 (from literal parsing), narrowed to f32.
+        (DataType::Float32, ScalarValue::Float64(v)) => {
+            let set_val = *v as f32;
+            let arr = original
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| BasinError::internal("expected Float32Array for SET"))?;
+            let mut b = Float32Builder::with_capacity(n);
+            for i in 0..n {
+                if matched(i) {
+                    b.append_value(set_val);
+                } else if arr.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(arr.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         (DataType::Utf8, ScalarValue::Utf8(v)) => {
             let arr = original
                 .as_any()
@@ -2584,6 +2650,7 @@ fn literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<ScalarValu
 fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option<ScalarValue>> {
     let (negated, inner) = peel_unary(expr);
     match (dt, inner) {
+        // BIGINT / INT8 column — 64-bit signed.
         (DataType::Int64, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
             let parsed: i64 = s.parse().map_err(|e| {
                 BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
@@ -2594,7 +2661,35 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
                 parsed
             })))
         }
+        // INT / INTEGER / INT4 column — 32-bit. Store as Int64 so the SET
+        // path can range-check and narrow back to i32.
+        (DataType::Int32, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+            let parsed: i64 = s.parse().map_err(|e| {
+                BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
+            })?;
+            Ok(Some(ScalarValue::Int64(if negated { -parsed } else { parsed })))
+        }
+        // SMALLINT / INT2 column — 16-bit. Store as Int64 for the same reason.
+        (DataType::Int16, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+            let parsed: i64 = s.parse().map_err(|e| {
+                BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
+            })?;
+            Ok(Some(ScalarValue::Int64(if negated { -parsed } else { parsed })))
+        }
+        // DOUBLE PRECISION / FLOAT8 column.
         (DataType::Float64, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+            let parsed: f64 = s
+                .parse()
+                .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")))?;
+            Ok(Some(ScalarValue::Float64(if negated {
+                -parsed
+            } else {
+                parsed
+            })))
+        }
+        // REAL / FLOAT4 column — 32-bit. Store as Float64 so the SET path
+        // can narrow to f32.
+        (DataType::Float32, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
             let parsed: f64 = s
                 .parse()
                 .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")))?;

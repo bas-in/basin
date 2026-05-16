@@ -206,7 +206,6 @@ async fn param_select_where_eq_match_nomatch_multiparam() {
 /// app models as `int` must succeed. Gated on #54 (param-binding /
 /// ParameterDescription fix).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (int4 param coercion) — gated on ParameterDescription fix #54; un-ignore when landed"]
 async fn param_int4_coercion() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -279,7 +278,6 @@ async fn param_null_three_valued_logic() {
 /// `param_select_where_eq_match_nomatch_multiparam`'s neighbour
 /// `where_in_literal` test below. Gated on #54.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (parameterised IN-list) — gated on ParameterDescription fix #54; un-ignore when landed"]
 async fn param_where_in_list() {
     let server = start_server().await;
     let client = connect(server.addr).await;

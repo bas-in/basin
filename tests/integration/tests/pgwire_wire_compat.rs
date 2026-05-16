@@ -286,7 +286,6 @@ async fn binary_param_bytea() {
 /// written to. This is a driver-compat gap because JDBC defaults to INT2 for
 /// short columns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — SMALLINT (Int16) column INSERT not supported by the engine DML path; driver-compat gap for JDBC/pgx short columns"]
 async fn binary_param_int2() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -331,7 +330,6 @@ async fn binary_param_int2() {
 /// support Int32 as well. This is a real driver-compat gap for any ORM that
 /// uses `int` / `int4` typed columns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — Basin maps INTEGER/INT4 columns to Arrow Int64 (OID INT8), so the driver receives OID 20 and rejects an i32 binding with WrongType; INT4 column/param parity not yet implemented"]
 async fn binary_param_int4() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -370,7 +368,6 @@ async fn binary_param_int4() {
 /// This is a driver-compat gap for Hibernate (which maps Java `float` to
 /// FLOAT4 binary by default).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — FLOAT4/REAL column INSERT not supported by the engine DML path; driver-compat gap for Hibernate/SQLAlchemy float columns"]
 async fn binary_param_float4() {
     let server = start_server().await;
     let client = connect(server.addr).await;

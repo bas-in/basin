@@ -315,8 +315,7 @@ pub(crate) fn audit_table_name(schema: &arrow_schema::Schema) -> Option<&str> {
 pub(crate) enum SerialKind {
     /// `SMALLSERIAL` / `SERIAL2` → INT2-backed.
     Small,
-    /// `SERIAL` / `SERIAL4` → INT4-backed (we widen to Int64 since the
-    /// engine treats `INTEGER` as Int64 throughout).
+    /// `SERIAL` / `SERIAL4` → INT4-backed (Int32, OID 23).
     Regular,
     /// `BIGSERIAL` / `SERIAL8` → INT8-backed.
     Big,
@@ -401,25 +400,29 @@ fn custom_type_name_eq(sql: &SqlDataType, keyword: &str) -> bool {
 /// listed in the engine's PoC SQL contract is accepted; anything else is an
 /// `InvalidSchema` error so callers see exactly which type they tripped on.
 pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
-    // SERIAL family: widen to Int64 across all three widths. PG uses
-    // int2/int4/int8 distinctly, but the engine's INSERT/builder path
-    // only supports `Int64` for now (SmallInt columns exist in DDL but
-    // have no Int16 row-builder), so SMALLSERIAL would otherwise trip
-    // an "unsupported Arrow column type for INSERT: Int16". Widening
-    // here trades a small PG-fidelity loss (you can't write a value
-    // outside the int4 / int2 range and have it rejected at the column
-    // level) for end-to-end correctness through INSERT / pgwire / OIDs.
+    // SERIAL family mapping — each width keeps its natural Arrow type so that
+    // the INSERT path, pgwire RowDescription, and param-decode all agree.
+    //   SMALLSERIAL / SERIAL2  → Int16 (INT2, OID 21)
+    //   SERIAL / SERIAL4       → Int32 (INT4, OID 23)
+    //   BIGSERIAL / SERIAL8    → Int64 (INT8, OID 20)
     // The auto-created sequence + DEFAULT lives in the DDL site, not here.
-    if serial_kind(sql).is_some() {
-        return Ok(DataType::Int64);
+    if let Some(kind) = serial_kind(sql) {
+        return match kind {
+            SerialKind::Small => Ok(DataType::Int16),
+            SerialKind::Regular => Ok(DataType::Int32),
+            SerialKind::Big => Ok(DataType::Int64),
+        };
     }
     match sql {
-        SqlDataType::Int(_)
-        | SqlDataType::Integer(_)
-        | SqlDataType::Int4(_)
-        | SqlDataType::BigInt(_)
-        | SqlDataType::Int8(_) => Ok(DataType::Int64),
+        // INT / INTEGER / INT4  → 32-bit (PG default integer width, OID 23).
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
+            Ok(DataType::Int32)
+        }
 
+        // BIGINT / INT8 → 64-bit (OID 20). Unchanged.
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(DataType::Int64),
+
+        // SMALLINT / INT2 → 16-bit (OID 21).
         SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Ok(DataType::Int16),
 
         SqlDataType::Text
@@ -437,8 +440,9 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         | SqlDataType::Float(_) => Ok(DataType::Float64),
 
         // REAL / FLOAT4 — 32-bit floating point. PG's `real` is a synonym for
-        // `float4`. Stored as Arrow Float32.
-        SqlDataType::Real => Ok(DataType::Float32),
+        // `float4`. sqlparser has both a `Real` variant and a `Float4` variant
+        // (introduced alongside `Float8`); both map to Arrow Float32.
+        SqlDataType::Real | SqlDataType::Float4 => Ok(DataType::Float32),
 
         SqlDataType::Bytea => Ok(DataType::Binary),
 
@@ -906,5 +910,112 @@ mod tests {
     fn uuid_keyword_parses_to_fixed_size_binary_16() {
         let dt = arrow_data_type(&parse_col_type("UUID")).unwrap();
         assert_eq!(dt, DataType::FixedSizeBinary(16));
+    }
+
+    // ── Narrow integer / float type-fidelity tests (#66) ────────────────────
+
+    /// `INTEGER` / `INT` / `INT4` → Arrow `Int32`, not `Int64`. This is the
+    /// canonical PG 4-byte integer width; pgwire OID 23.
+    #[test]
+    fn integer_maps_to_int32() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("INTEGER")).unwrap(),
+            DataType::Int32
+        );
+    }
+
+    #[test]
+    fn int_keyword_maps_to_int32() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("INT")).unwrap(),
+            DataType::Int32
+        );
+    }
+
+    #[test]
+    fn int4_maps_to_int32() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("INT4")).unwrap(),
+            DataType::Int32
+        );
+    }
+
+    /// `SMALLINT` / `INT2` → Arrow `Int16` (PG OID 21).
+    #[test]
+    fn smallint_maps_to_int16() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("SMALLINT")).unwrap(),
+            DataType::Int16
+        );
+    }
+
+    #[test]
+    fn int2_maps_to_int16() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("INT2")).unwrap(),
+            DataType::Int16
+        );
+    }
+
+    /// `BIGINT` / `INT8` stays `Int64` (PG OID 20). Regression guard.
+    #[test]
+    fn bigint_stays_int64() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("BIGINT")).unwrap(),
+            DataType::Int64
+        );
+    }
+
+    #[test]
+    fn int8_stays_int64() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("INT8")).unwrap(),
+            DataType::Int64
+        );
+    }
+
+    /// `REAL` → Arrow `Float32` (PG OID 700).
+    #[test]
+    fn real_maps_to_float32() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("REAL")).unwrap(),
+            DataType::Float32
+        );
+    }
+
+    /// `FLOAT4` → Arrow `Float32` (same as REAL, PG OID 700).
+    #[test]
+    fn float4_maps_to_float32() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("FLOAT4")).unwrap(),
+            DataType::Float32
+        );
+    }
+
+    /// `DOUBLE PRECISION` / `FLOAT8` stays `Float64` (PG OID 701). Regression guard.
+    #[test]
+    fn double_precision_stays_float64() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("DOUBLE PRECISION")).unwrap(),
+            DataType::Float64
+        );
+    }
+
+    /// `SERIAL` → Arrow `Int32` (PG OID 23, INT4-backed).
+    #[test]
+    fn serial_maps_to_int32() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("SERIAL")).unwrap(),
+            DataType::Int32
+        );
+    }
+
+    /// `BIGSERIAL` → Arrow `Int64` (PG OID 20).
+    #[test]
+    fn bigserial_stays_int64() {
+        assert_eq!(
+            arrow_data_type(&parse_col_type("BIGSERIAL")).unwrap(),
+            DataType::Int64
+        );
     }
 }

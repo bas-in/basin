@@ -667,8 +667,8 @@ fn walk_pred(
     is_jsonb_out: &mut [bool],
     is_uuid_out: &mut [bool],
 ) {
-    if let Expr::BinaryOp { left, op, right } = expr {
-        match op {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And | BinaryOperator::Or => {
                 walk_pred(left, tables, out, is_jsonb_out, is_uuid_out);
                 walk_pred(right, tables, out, is_jsonb_out, is_uuid_out);
@@ -683,7 +683,35 @@ fn walk_pred(
                 pin_pair(right, left, tables, out, is_jsonb_out, is_uuid_out);
             }
             _ => {}
+        },
+        // `<col> IN ($1, $2, ...)` — type each placeholder in the list
+        // to the column's type. Both `col IN (...)` and `$N IN (col)` are
+        // handled; ORMs almost always use the former.
+        Expr::InList { expr: col_expr, list, negated: _ } => {
+            if let Some((dt, is_jsonb, is_uuid)) = resolve_column_meta(col_expr, tables) {
+                for item in list {
+                    if let Some(n) = placeholder_index(item) {
+                        if let Some(slot) = out.get_mut(n - 1) {
+                            *slot = dt.clone();
+                        }
+                        if is_jsonb {
+                            if let Some(s) = is_jsonb_out.get_mut(n - 1) {
+                                *s = true;
+                            }
+                        } else if is_uuid {
+                            if let Some(s) = is_uuid_out.get_mut(n - 1) {
+                                *s = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
+        // Recurse into nested parentheses or NOT expressions.
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            walk_pred(inner, tables, out, is_jsonb_out, is_uuid_out);
+        }
+        _ => {}
     }
 }
 

@@ -9,13 +9,14 @@ use crate::pg_ast::ObjectNamePartExt;
 use std::collections::BTreeMap;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder,
-    LargeBinaryBuilder, StringBuilder, TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder,
+    Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    ArrayRef, BooleanArray, Decimal128Array, FixedSizeListArray, Float64Array, Int64Array,
-    RecordBatch, StringArray,
+    ArrayRef, BooleanArray, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Schema, TimeUnit};
 use basin_catalog::PartitionSpec;
@@ -68,6 +69,52 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 for row in rows {
                     match coerce_i64(&row[col_idx])? {
                         Some(v) => b.append_value(v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            // INT / INTEGER / INT4 — 32-bit signed (PG OID 23). Coerce from
+            // numeric literals, widening to i64 and range-checking on the way
+            // in (mirrors what PG does: out-of-range is a runtime error).
+            DataType::Int32 => {
+                let mut b = Int32Builder::with_capacity(rows.len());
+                for row in rows {
+                    match coerce_i64(&row[col_idx])? {
+                        Some(v) => {
+                            let v32 = i32::try_from(v).map_err(|_| {
+                                BasinError::InvalidSchema(format!(
+                                    "integer out of range for INT4 column {:?}: {v}",
+                                    field.name()
+                                ))
+                            })?;
+                            b.append_value(v32);
+                        }
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            // SMALLINT / INT2 — 16-bit signed (PG OID 21).
+            DataType::Int16 => {
+                let mut b = Int16Builder::with_capacity(rows.len());
+                for row in rows {
+                    match coerce_i64(&row[col_idx])? {
+                        Some(v) => {
+                            let v16 = i16::try_from(v).map_err(|_| {
+                                BasinError::InvalidSchema(format!(
+                                    "integer out of range for INT2 column {:?}: {v}",
+                                    field.name()
+                                ))
+                            })?;
+                            b.append_value(v16);
+                        }
                         None => {
                             check_null_allowed(field)?;
                             b.append_null();
@@ -207,6 +254,22 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 for row in rows {
                     match coerce_f64(&row[col_idx])? {
                         Some(v) => b.append_value(v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            // REAL / FLOAT4 — 32-bit IEEE 754 (PG OID 700). Coerce through
+            // f64 then cast down to f32; precision narrowing is expected and
+            // matches PG behaviour.
+            DataType::Float32 => {
+                let mut b = Float32Builder::with_capacity(rows.len());
+                for row in rows {
+                    match coerce_f64(&row[col_idx])? {
+                        Some(v) => b.append_value(v as f32),
                         None => {
                             check_null_allowed(field)?;
                             b.append_null();

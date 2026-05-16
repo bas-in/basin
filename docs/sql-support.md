@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778952883 (Unix epoch)
-SQL fragments tested: 697 total / 1875 green (across all three configurations).
+Last run: 1778959070 (Unix epoch)
+SQL fragments tested: 697 total / 1866 green (across all three configurations).
 
 ## Configurations
 
@@ -123,7 +123,7 @@ SQL fragments tested: 697 total / 1875 green (across all three configurations).
 | `CREATE TABLE t (id INT GENERATED ALWAYS AS (1+1) STORED)` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE t (LIKE u INCLUDING ALL)` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE t () INHERITS (u)` | ✅ | ✅ | ✅ |  |
-| `CREATE TABLE t (id INT) PARTITION BY RANGE (id)` | ✅ | ✅ | ✅ |  |
+| `CREATE TABLE t (id INT) PARTITION BY RANGE (id)` | 📜 | 📜 | 📜 | invalid schema: PARTITION BY RANGE column id must be TIMESTAMPTZ or BIGINT-as… |
 | `CREATE TEMPORARY TABLE t (id INT)` | ✅ | ✅ | ✅ |  |
 | `CREATE UNLOGGED TABLE t (id INT)` | ✅ | ✅ | ✅ |  |
 | `ALTER TABLE t ADD COLUMN c TEXT` | ✅ | ✅ | ✅ |  |
@@ -158,7 +158,7 @@ SQL fragments tested: 697 total / 1875 green (across all three configurations).
 | `CREATE TABLE t (id INT NOT NULL, name TEXT, UNIQUE (id, name) INCLUDE (name))` | ✅ | ✅ | ✅ |  |
 | `ALTER TABLE t VALIDATE CONSTRAINT ck` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM ONLY t` | ✅ | ✅ | ✅ |  |
-| `CREATE TABLE t_2024 PARTITION OF t FOR VALUES FROM (2024) TO (2025)` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TABLE … PARTITION OF is not supported (SQLSTA… |
+| `CREATE TABLE t_2024 PARTITION OF t FOR VALUES FROM (2024) TO (2025)` | 📜 | 📜 | 📜 | setup failed: invalid schema: PARTITION BY RANGE column id must be TIMESTAMPT… |
 | `CREATE TABLE t (region TEXT) PARTITION BY LIST (region)` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE t (id INT) PARTITION BY HASH (id)` | ✅ | ✅ | ✅ |  |
 | `ALTER TABLE t ATTACH PARTITION p FOR VALUES IN ('us')` | ✅ | ✅ | ✅ |  |
@@ -166,7 +166,7 @@ SQL fragments tested: 697 total / 1875 green (across all three configurations).
 | `CREATE TABLE t (name TEXT COLLATE "C")` | 📜 | 📜 | 📜 | invalid schema: unsupported column option in PoC: COLLATE "C" |
 | `CREATE TABLE t2 AS SELECT * FROM t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE t2 AS SELECT * FROM t WITH NO DATA` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: W… |
-| `CREATE TABLE t_default PARTITION OF t DEFAULT` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TABLE … PARTITION OF is not supported (SQLSTA… |
+| `CREATE TABLE t_default PARTITION OF t DEFAULT` | 📜 | 📜 | 📜 | setup failed: invalid schema: PARTITION BY RANGE column id must be TIMESTAMPT… |
 
 ## DML
 
@@ -186,7 +186,7 @@ SQL fragments tested: 697 total / 1875 green (across all three configurations).
 | `UPDATE t SET id = (SELECT MAX(id) FROM u)` | 🚫 | 🚫 | 🚫 | invalid schema: UPDATE SET id: scalar subquery on RHS not supported in v0.1 |
 | `UPDATE t SET id = 1 FROM u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 1 RETURNING id` | ✅ | ✅ | ✅ |  |
-| `UPDATE t SET id = 1 WHERE id IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
+| `UPDATE t SET id = 1 WHERE id IN (SELECT id FROM u)` | 📜 | 📜 | 📜 | invalid schema: IN (SELECT …): column type Int32 cannot be used as IN list … |
 | `DELETE FROM t` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t WHERE id = 1` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t USING u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
@@ -198,7 +198,7 @@ SQL fragments tested: 697 total / 1875 green (across all three configurations).
 | `INSERT INTO t (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE t.id > 0` | ✅ | ✅ | ✅ |  |
 | `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.id > 0 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
-| `UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
+| `UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)` | 📜 | 📜 | 📜 | invalid schema: IN (SELECT …): column type Int32 cannot be used as IN list … |
 | `INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING USER VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
 

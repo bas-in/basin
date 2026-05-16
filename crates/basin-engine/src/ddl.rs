@@ -524,14 +524,12 @@ pub(crate) fn schema_and_constraints_from_columns(
                     col.name.value
                 )));
             }
-            // IDENTITY only applies to integer columns. PG accepts INT /
-            // BIGINT / SMALLINT here; the engine widens SmallInt to Int16
-            // in the type bridge but the INSERT row builder only handles
-            // Int64. Restrict to Int64 to match what the rest of the
-            // engine actually serves.
-            if !matches!(dt, DataType::Int64) {
+            // IDENTITY applies to integer columns only. PG accepts INT /
+            // BIGINT / SMALLINT; the engine now preserves all three widths
+            // (Int16, Int32, Int64) through the full INSERT/SELECT/wire path.
+            if !matches!(dt, DataType::Int16 | DataType::Int32 | DataType::Int64) {
                 return Err(BasinError::InvalidSchema(format!(
-                    "IDENTITY column {:?} must be an integer type (INT / BIGINT)",
+                    "IDENTITY column {:?} must be an integer type (SMALLINT / INT / BIGINT)",
                     col.name.value
                 )));
             }

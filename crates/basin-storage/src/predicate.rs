@@ -55,9 +55,10 @@ pub fn evaluate(
     predicate: &Predicate,
 ) -> Result<arrow_array::BooleanArray> {
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Float64Type, Int64Type, UInt64Type};
+    use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt64Type};
     use arrow_array::Array;
     use arrow_array::BooleanArray;
+    use arrow_schema::DataType as Dt;
 
     let col_name = predicate.column();
     let col = batch
@@ -80,13 +81,99 @@ pub fn evaluate(
         }};
     }
 
+    // Helper: compare an Int64 scalar against a narrower integer column
+    // (Int32 / Int16). We widen each element to i64 and compare there.
+    macro_rules! cmp_narrow_int_as_i64 {
+        ($arrow_ty:ty, $v:expr, $op:tt) => {{
+            let arr = col.as_primitive::<$arrow_ty>();
+            let v: i64 = $v;
+            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    b.append_value(false);
+                } else {
+                    b.append_value((arr.value(i) as i64) $op v);
+                }
+            }
+            b.finish()
+        }};
+    }
+
+    // Helper: compare a Float64 scalar against a Float32 column (widen to f64).
+    macro_rules! cmp_f32_as_f64 {
+        ($v:expr, $op:tt) => {{
+            let arr = col.as_primitive::<Float32Type>();
+            let v: f64 = $v;
+            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    b.append_value(false);
+                } else {
+                    b.append_value((arr.value(i) as f64) $op v);
+                }
+            }
+            b.finish()
+        }};
+    }
+
     let mask: BooleanArray = match (predicate, &predicate_value(predicate)) {
+        // INT8 column vs Int64 scalar — direct.
+        (Predicate::Eq(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int64 => {
+            cmp_primitive!(Int64Type, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int64 => {
+            cmp_primitive!(Int64Type, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int64 => {
+            cmp_primitive!(Int64Type, *v, <)
+        }
+        // INT4 column vs Int64 scalar — widen column element to i64.
+        (Predicate::Eq(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int32 => {
+            cmp_narrow_int_as_i64!(Int32Type, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int32 => {
+            cmp_narrow_int_as_i64!(Int32Type, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int32 => {
+            cmp_narrow_int_as_i64!(Int32Type, *v, <)
+        }
+        // INT2 column vs Int64 scalar — widen column element to i64.
+        (Predicate::Eq(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int16 => {
+            cmp_narrow_int_as_i64!(Int16Type, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int16 => {
+            cmp_narrow_int_as_i64!(Int16Type, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int16 => {
+            cmp_narrow_int_as_i64!(Int16Type, *v, <)
+        }
+        // Fallback: Int64 scalar vs any remaining int type (original arms).
         (Predicate::Eq(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, ==),
         (Predicate::Gt(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, >),
         (Predicate::Lt(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, <),
         (Predicate::Eq(_, _), ScalarValue::UInt64(v)) => cmp_primitive!(UInt64Type, *v, ==),
         (Predicate::Gt(_, _), ScalarValue::UInt64(v)) => cmp_primitive!(UInt64Type, *v, >),
         (Predicate::Lt(_, _), ScalarValue::UInt64(v)) => cmp_primitive!(UInt64Type, *v, <),
+        // FLOAT8 column vs Float64 scalar — direct.
+        (Predicate::Eq(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float64 => {
+            cmp_primitive!(Float64Type, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float64 => {
+            cmp_primitive!(Float64Type, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float64 => {
+            cmp_primitive!(Float64Type, *v, <)
+        }
+        // FLOAT4 column vs Float64 scalar — widen column element to f64.
+        (Predicate::Eq(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float32 => {
+            cmp_f32_as_f64!(*v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float32 => {
+            cmp_f32_as_f64!(*v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float32 => {
+            cmp_f32_as_f64!(*v, <)
+        }
         (Predicate::Eq(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, ==),
         (Predicate::Gt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, >),
         (Predicate::Lt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, <),
