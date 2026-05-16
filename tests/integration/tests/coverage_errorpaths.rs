@@ -340,14 +340,13 @@ async fn error_pk_intra_batch_duplicate_is_unique_violation() {
 // CHECK constraint violation (SQLSTATE 23514)
 // ---------------------------------------------------------------------------
 
-/// Inserting a row that violates a CHECK constraint should raise an error.
+/// Inserting a row that violates a CHECK constraint must raise a real
+/// check-constraint violation (SQLSTATE 23514 / check_violation).
 ///
-/// Additional defect observed: the CHECK predicate text stored in the catalog
-/// includes the outer `CHECK (...)` wrapper. When enforce_check_constraints
-/// re-parses it through DataFusion, `CHECK` is treated as a function name
-/// that does not exist → "Invalid function 'check'". This means the error
-/// you get is a planning failure rather than a true 23514 check_violation.
-/// Both outcomes are "errors" and both are pinned here.
+/// Fix #47 (commit edc7575) stripped the outer `CHECK (...)` wrapper before
+/// handing the predicate to DataFusion, so the engine now raises a proper
+/// CheckViolation instead of "Invalid function 'check'". A valid row must
+/// now INSERT successfully.
 #[tokio::test]
 async fn error_check_constraint_violation_on_insert() {
     basin_common::telemetry::try_init_for_tests();
@@ -361,46 +360,38 @@ async fn error_check_constraint_violation_on_insert() {
     .await
     .unwrap();
 
-    // Insert a row that violates the CHECK (score >= 0).
-    // The engine currently errors but the error may be:
-    //   (a) a real CheckViolation ("check_violation" / "23514"), OR
-    //   (b) a planning failure because the stored predicate "CHECK (score >= 0)"
-    //       is re-parsed by DataFusion as a call to undefined function 'check'.
-    // Either way the INSERT must ERROR — it must not silently succeed.
+    // A valid row must INSERT successfully (the CHECK is satisfied).
+    sess.execute("INSERT INTO t VALUES (1, 10)")
+        .await
+        .expect("valid row must INSERT successfully into a CHECK-constrained table (fix #47)");
+
+    // A violating row must raise a real check-constraint violation.
     let err = sess
-        .execute("INSERT INTO t VALUES (1, -5)")
+        .execute("INSERT INTO t VALUES (2, -5)")
         .await
         .expect_err("CHECK constraint violation must error");
 
     let msg = err.to_string();
     assert!(
         msg.contains("check") || msg.contains("constraint") || msg.contains("CHECK")
-            || msg.contains("violat") || msg.contains("23514")
-            || msg.contains("Invalid function")
-            || msg.contains("planning"),
-        "CHECK violation error must mention 'check'/'constraint'/'violat' or planning failure, got: {msg}"
+            || msg.contains("violat") || msg.contains("23514"),
+        "CHECK violation error must mention 'check'/'constraint'/'violat'/'23514', got: {msg}"
     );
-    println!("[error_paths] CHECK violation on INSERT: {msg}");
+    // Must NOT be the old planning-failure message.
+    assert!(
+        !msg.contains("Invalid function"),
+        "CHECK violation must not surface as 'Invalid function' after fix #47, got: {msg}"
+    );
+    println!("[error_paths] CHECK violation on INSERT (fix #47): {msg}");
 }
 
-/// An UPDATE that violates a CHECK constraint must also error.
+/// An UPDATE that creates a PK duplicate must raise UniqueViolation.
 ///
-/// This test uses a table WITHOUT the CHECK keyword in the constraint to
-/// avoid the planner bug where "CHECK (expr)" stored text is re-parsed
-/// by DataFusion as a call to the undefined function `check(...)`.
-/// Instead we use a reactor-style constraint (REACT ON) pattern — but
-/// since that is not available inline, we focus on the PRIMARY KEY
-/// enforcement path for the UPDATE test and separately document the
-/// CHECK-on-UPDATE planning bug.
-///
-/// DEFECT DOCUMENTED: The CHECK enforcement path in enforce_check_constraints
-/// stores the predicate with the outer `CHECK (...)` wrapper. When it re-parses
-/// the predicate through DataFusion, `check` is treated as a function name
-/// → "Invalid function 'check'". This means:
-///   - Valid INSERTs on a table with CHECK constraints ALSO fail.
-///   - The CHECK constraint is effectively non-functional for both INSERT & UPDATE.
-/// This is a real bug: the predicate text must strip the outer `CHECK(...)` before
-/// being handed to DataFusion.
+/// This test verifies the UPDATE-path constraint enforcement using a PRIMARY KEY
+/// (rather than CHECK) to keep the test independent of any constraint type.
+/// CHECK constraints are fixed in fix #47 (commit edc7575); the old planning
+/// bug where "CHECK (expr)" was re-parsed as a call to undefined function
+/// `check(...)` is resolved.
 #[tokio::test]
 async fn error_check_constraint_violation_on_update() {
     basin_common::telemetry::try_init_for_tests();
@@ -851,17 +842,9 @@ async fn error_alter_add_column_not_null_rejected() {
 // CREATE TABLE IF NOT EXISTS — new-bug pin
 // ---------------------------------------------------------------------------
 
-/// pins: CREATE TABLE IF NOT EXISTS flag ignored — flip when fixed
-///
-/// Bug: exec_create_table does not check ct.if_not_exists before calling
-/// catalog.create_table. When the table already exists the call returns
-/// Catalog("already exists") instead of returning Ok(Empty).
-///
-/// This pin documents the *current* (broken) behavior so CI stays green
-/// and the defect is tracked. When the IF NOT EXISTS flag is honoured, remove
-/// #[ignore] and assert Ok instead of Err.
+/// Verifies that CREATE TABLE IF NOT EXISTS on an existing table succeeds
+/// as a no-op — fix #49 landed (commit 25d9a5f); #[ignore] removed.
 #[tokio::test]
-#[ignore = "pins: CREATE TABLE IF NOT EXISTS flag ignored — remove when fixed"]
 async fn pin_create_table_if_not_exists_ignored() {
     basin_common::telemetry::try_init_for_tests();
     let dir = TempDir::new().unwrap();
@@ -872,21 +855,17 @@ async fn pin_create_table_if_not_exists_ignored() {
         .await
         .unwrap();
 
-    // When fixed: this must succeed silently.
+    // Fix #49: must succeed silently when table already exists.
     sess.execute("CREATE TABLE IF NOT EXISTS existing_t (id BIGINT NOT NULL)")
         .await
         .expect(
-            "CREATE TABLE IF NOT EXISTS must not error when table exists — \
-             flip this assertion when the IF NOT EXISTS flag is respected"
+            "CREATE TABLE IF NOT EXISTS must not error when table exists (fix #49)"
         );
 }
 
-/// Hard assertion version of the same bug — documents the *current* broken
-/// behavior with expect_err so the test suite stays GREEN while the bug is
-/// tracked. Unlike the #[ignore] pin above, this one actively runs and
-/// asserts the exact current error message so we notice any drift.
-///
-/// When fixed: change expect_err to expect("must not error when table exists").
+/// Verifies that CREATE TABLE IF NOT EXISTS on an existing table succeeds as
+/// a no-op (fix #49, commit 25d9a5f). Previously asserted the broken behavior
+/// (expect_err); now asserts the correct behavior (expect success).
 #[tokio::test]
 async fn pin_create_table_if_not_exists_currently_errors() {
     basin_common::telemetry::try_init_for_tests();
@@ -899,42 +878,28 @@ async fn pin_create_table_if_not_exists_currently_errors() {
         .unwrap();
     sess.execute("INSERT INTO ine_t VALUES (42)").await.unwrap();
 
-    // Currently errors with "catalog error: table <id>/ine_t already exists"
-    let err = sess
-        .execute("CREATE TABLE IF NOT EXISTS ine_t (id BIGINT NOT NULL)")
+    // IF NOT EXISTS is now respected — must succeed silently as a no-op.
+    sess.execute("CREATE TABLE IF NOT EXISTS ine_t (id BIGINT NOT NULL)")
         .await
-        .expect_err(
-            "pins: CREATE TABLE IF NOT EXISTS flag ignored — \
-             flip to expect() when exec_create_table respects ct.if_not_exists"
-        );
+        .expect("CREATE TABLE IF NOT EXISTS must not error when table already exists (fix #49)");
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains("already exists") || msg.contains("Catalog"),
-        "current error must mention 'already exists', got: {msg}"
-    );
-    // Existing data must survive the failed re-create.
+    // Existing data must be intact.
     let res = sess.execute("SELECT id FROM ine_t").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 1, "existing table data must survive the failed IF NOT EXISTS");
+        assert_eq!(total, 1, "existing table data must survive CREATE IF NOT EXISTS no-op");
     }
-    println!("[pin] CREATE TABLE IF NOT EXISTS currently errors: {msg}");
+    println!("[pin] CREATE TABLE IF NOT EXISTS is a no-op (fix #49)");
 }
 
 // ---------------------------------------------------------------------------
 // DROP TABLE — new-bug pin
 // ---------------------------------------------------------------------------
 
-/// pins: DROP TABLE falls to "unsupported in PoC" — remove when DROP TABLE is wired
-///
-/// DROP TABLE hits the catch-all `other => Err(BasinError::internal("unsupported in PoC: …"))`
-/// arm in executor.rs. This #[ignore] pin documents the desired post-fix behavior:
-/// DROP TABLE should succeed and the table should be gone.
-///
-/// When fixed: remove #[ignore], execute DROP TABLE, assert SELECT errors.
+/// Verifies that DROP TABLE succeeds and removes the table (fix #49, commit 25d9a5f).
+/// Previously #[ignore]d while the executor arm was missing; now runs as a
+/// positive assertion.
 #[tokio::test]
-#[ignore = "pins: DROP TABLE falls to unsupported in PoC — remove when executor arm is wired"]
 async fn pin_drop_table_should_remove_table() {
     basin_common::telemetry::try_init_for_tests();
     let dir = TempDir::new().unwrap();
@@ -946,19 +911,20 @@ async fn pin_drop_table_should_remove_table() {
         .unwrap();
     sess.execute("INSERT INTO droppable VALUES (1)").await.unwrap();
 
-    // When fixed: must succeed and remove the table.
+    // Fix #49: DROP TABLE must succeed and remove the table.
     sess.execute("DROP TABLE droppable")
         .await
-        .expect("DROP TABLE must succeed when executor arm is wired");
+        .expect("DROP TABLE must succeed (fix #49)");
 
-    // And a subsequent SELECT must error (table gone).
+    // Subsequent SELECT must error (table is gone).
     sess.execute("SELECT * FROM droppable")
         .await
         .expect_err("SELECT from dropped table must error");
 }
 
-/// Hard assertion version — runs today and documents the current "unsupported in PoC" behavior.
-/// When DROP TABLE is wired, flip the logic: remove expect_err, add the SELECT failure check.
+/// Verifies that DROP TABLE now succeeds (fix #49, commit 25d9a5f).
+/// Previously asserted the broken "unsupported in PoC" error; now asserts
+/// the correct behavior: DROP TABLE succeeds and the table is gone.
 #[tokio::test]
 async fn pin_drop_table_currently_unsupported_in_poc() {
     basin_common::telemetry::try_init_for_tests();
@@ -973,27 +939,15 @@ async fn pin_drop_table_currently_unsupported_in_poc() {
         .await
         .unwrap();
 
-    // pins: DROP TABLE falls to "unsupported in PoC" — flip when executor arm is wired
-    let err = sess
-        .execute("DROP TABLE t_to_drop")
+    // Fix #49: DROP TABLE must succeed.
+    sess.execute("DROP TABLE t_to_drop")
         .await
-        .expect_err("pins: DROP TABLE falls to unsupported in PoC — flip when wired");
+        .expect("DROP TABLE must succeed (fix #49)");
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported") || msg.contains("not supported") || msg.contains("PoC"),
-        "DROP TABLE must report unsupported-in-PoC, got: {msg}"
-    );
+    // The table is gone — SELECT must error.
+    sess.execute("SELECT COUNT(*) FROM t_to_drop")
+        .await
+        .expect_err("SELECT from dropped table must error");
 
-    // Data must still be readable (the failed drop did not corrupt anything).
-    let count_res = sess.execute("SELECT COUNT(*) FROM t_to_drop").await.unwrap();
-    if let ExecResult::Rows { batches, .. } = count_res {
-        let n = batches
-            .first()
-            .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
-            .map(|a| a.value(0))
-            .unwrap_or(0);
-        assert_eq!(n, 3, "data must be intact after failed DROP TABLE");
-    }
-    println!("[pin] DROP TABLE currently unsupported: {msg}");
+    println!("[pin] DROP TABLE succeeded; table removed (fix #49)");
 }

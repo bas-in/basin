@@ -79,16 +79,13 @@ fn count_rows(result: ExecResult) -> i64 {
 // FAIL (it pins the current error so any future silent change is caught).
 // ---------------------------------------------------------------------------
 
-/// Asserts that the error message produced by the Utf8View path is exactly
-/// the known `InvalidSchema` message, pinning the bug.
+/// Asserts that the Utf8View → workspace-arrow conversion works correctly
+/// after the fix in commit 71e1d36 (data_type_df_to_ws: Utf8View => Utf8 +
+/// StringViewArray downcast in batch_df_to_ws).
 ///
-/// When #40 is fixed (Utf8View mapped to Utf8 in data_type_df_to_ws + the
-/// array downcast in batch_df_to_ws handles StringViewArray), this test
-/// should start returning Ok and the assertion must be inverted. At that
-/// point remove the #[ignore] or update the assertion.
+/// Previously #[ignore]d while the bug was live; now runs as a positive
+/// assertion that all common string functions succeed.
 #[tokio::test]
-#[ignore = "Bug #40: Utf8View not handled in df-arrow→workspace-arrow conversion (engine panics/errors). \
-            Remove #[ignore] and update assertion when #40 is fixed."]
 async fn bug40_utf8view_df_to_ws_conversion() {
     basin_common::telemetry::try_init_for_tests();
 
@@ -104,9 +101,8 @@ async fn bug40_utf8view_df_to_ws_conversion() {
         .await
         .unwrap();
 
-    // These string functions are the category most likely to return Utf8View
-    // in DataFusion 53. Any one of them triggering the conversion error
-    // demonstrates the bug.
+    // These string functions produce Utf8View (StringView) output in DataFusion 53.
+    // After fix #40 all must succeed without a conversion error.
     let queries = [
         "SELECT concat(name, '!') AS v FROM t",
         "SELECT upper(name) AS v FROM t",
@@ -117,32 +113,17 @@ async fn bug40_utf8view_df_to_ws_conversion() {
     for sql in queries {
         match sess.execute(sql).await {
             Ok(ExecResult::Rows { .. }) => {
-                // Good — this means #40 is fixed for this query. Keep going.
-            }
-            Err(e) => {
-                // Expected until #40 is fixed: record the exact error so the
-                // test can compare against it.
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("cannot convert df-arrow type to workspace-arrow")
-                        || msg.contains("Utf8View")
-                        || msg.contains("InvalidSchema"),
-                    "Bug #40 should produce a known InvalidSchema error, got: {msg}\n\
-                     (query: {sql})"
-                );
-                println!("[bug#40] got expected conversion error for `{sql}`: {msg}");
-                // One confirmed failure is enough to pin the bug.
-                return;
+                println!("[bug#40 fixed] query succeeded: {sql}");
             }
             Ok(other) => panic!("unexpected result variant for {sql}: {other:?}"),
+            Err(e) => {
+                panic!(
+                    "Bug #40 is fixed — query must not error. Got: {}\n(query: {sql})",
+                    e
+                );
+            }
         }
     }
-
-    panic!(
-        "Bug #40: expected at least one Utf8View conversion error across the test queries, \
-         but all succeeded. If #40 is truly fixed, update this test to assert success instead \
-         and remove the #[ignore]."
-    );
 }
 
 /// Documents bug #40: the conversion bridge in basin-engine/src/convert.rs
@@ -185,7 +166,7 @@ async fn bug40_fix_location_documented() {
         "[bug#40 documented] Fix location: crates/basin-engine/src/convert.rs\n\
          - data_type_df_to_ws: add Utf8View => Utf8\n\
          - batch_df_to_ws Utf8 arm: add StringViewArray downcast\n\
-         Symptom tested by #[ignore] test `bug40_utf8view_df_to_ws_conversion`."
+         Fix verified by `bug40_utf8view_df_to_ws_conversion` (commit 71e1d36)."
     );
 }
 
@@ -657,9 +638,8 @@ async fn schema_alter_add_column_null_backfill() {
     }
 }
 
-/// DROP TABLE is not yet implemented in the engine (returns an error).
-/// This test documents the current state; when DROP TABLE is wired up
-/// the assertion should be flipped to expect success.
+/// DROP TABLE is now implemented (commit 25d9a5f).
+/// Verify that DROP TABLE succeeds and the table is no longer accessible.
 #[tokio::test]
 async fn schema_drop_table_currently_unsupported() {
     basin_common::telemetry::try_init_for_tests();
@@ -671,18 +651,11 @@ async fn schema_drop_table_currently_unsupported() {
     sess.execute("CREATE TABLE recycled (id BIGINT NOT NULL)").await.unwrap();
     sess.execute("INSERT INTO recycled VALUES (1)").await.unwrap();
 
-    // DROP TABLE is not yet wired in the executor (falls through to the
-    // "unsupported in PoC" arm). Verify the error message is stable.
-    let err = sess
-        .execute("DROP TABLE recycled")
+    // DROP TABLE is now wired in the executor (fix #49, commit 25d9a5f).
+    sess.execute("DROP TABLE recycled")
         .await
-        .expect_err("DROP TABLE must error until the executor arm is added");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported") || msg.contains("not supported") || msg.contains("DROP"),
-        "DROP TABLE error should explain it is unsupported, got: {msg}"
-    );
-    println!("[schema] DROP TABLE unsupported (expected): {msg}");
+        .expect("DROP TABLE must succeed after fix #49");
+    println!("[schema] DROP TABLE succeeded (fix #49)");
 }
 
 /// ALTER TABLE SET BLOOM FILTERS ON column must not lose data.
@@ -1161,14 +1134,8 @@ async fn error_create_table_duplicate() {
     );
 }
 
-/// CREATE TABLE IF NOT EXISTS on an existing table currently errors because
-/// the engine does not check the `if_not_exists` flag in exec_create_table.
-/// This test documents the current (broken) behavior so any future fix
-/// is immediately visible: when IF NOT EXISTS is properly handled, the
-/// assertion must be flipped to expect success.
-///
-/// Bug: exec_create_table ignores ct.if_not_exists and always calls
-/// catalog.create_table which returns Catalog("already exists") error.
+/// CREATE TABLE IF NOT EXISTS on an existing table now succeeds as a no-op
+/// (fix #49, commit 25d9a5f: exec_create_table respects ct.if_not_exists).
 #[tokio::test]
 async fn schema_create_table_if_not_exists_currently_errors() {
     basin_common::telemetry::try_init_for_tests();
@@ -1180,26 +1147,15 @@ async fn schema_create_table_if_not_exists_currently_errors() {
     sess.execute("CREATE TABLE maybe (id BIGINT NOT NULL)").await.unwrap();
     sess.execute("INSERT INTO maybe VALUES (1)").await.unwrap();
 
-    // Currently errors because IF NOT EXISTS is not honoured in exec_create_table.
-    // When this is fixed, change expect_err to expect("must not error") and verify
-    // that the row is still accessible.
-    let err = sess
-        .execute("CREATE TABLE IF NOT EXISTS maybe (id BIGINT NOT NULL)")
+    // IF NOT EXISTS is now honoured — must succeed silently as a no-op.
+    sess.execute("CREATE TABLE IF NOT EXISTS maybe (id BIGINT NOT NULL)")
         .await
-        .expect_err(
-            "CREATE TABLE IF NOT EXISTS currently errors when table exists (exec_create_table \
-             ignores if_not_exists flag). Fix: check ct.if_not_exists before calling \
-             catalog.create_table and return Ok(Empty) early."
-        );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("already exists") || msg.contains("Catalog"),
-        "CREATE TABLE IF NOT EXISTS error should mention 'already exists', got: {msg}"
-    );
-    // Data must still be intact.
+        .expect("CREATE TABLE IF NOT EXISTS must not error when table already exists (fix #49)");
+
+    // Existing data must be intact.
     let n = count_rows(sess.execute("SELECT count(*) FROM maybe").await.unwrap());
-    assert_eq!(n, 1, "existing table data must survive the failed CREATE IF NOT EXISTS");
-    println!("[schema] CREATE TABLE IF NOT EXISTS errors as expected (bug): {msg}");
+    assert_eq!(n, 1, "existing table data must survive CREATE IF NOT EXISTS no-op");
+    println!("[schema] CREATE TABLE IF NOT EXISTS is a no-op as expected (fix #49)");
 }
 
 /// DELETE with a WHERE clause that matches nothing must succeed with 0 affected rows.
@@ -1319,9 +1275,8 @@ async fn select_limit_zero_returns_no_rows() {
     assert_eq!(rows, 0, "LIMIT 0 must return zero rows");
 }
 
-/// DROP TABLE is currently unsupported ("unsupported in PoC").
-/// When DROP TABLE support is wired this test should be updated to
-/// assert that data is gone after the drop.
+/// DROP TABLE is now implemented (commit 25d9a5f).
+/// Verify that DROP TABLE succeeds and subsequent SELECT errors (table is gone).
 #[tokio::test]
 async fn dml_drop_table_unsupported_in_poc() {
     basin_common::telemetry::try_init_for_tests();
@@ -1333,18 +1288,14 @@ async fn dml_drop_table_unsupported_in_poc() {
     sess.execute("CREATE TABLE gone (id BIGINT NOT NULL)").await.unwrap();
     sess.execute("INSERT INTO gone VALUES (1), (2), (3)").await.unwrap();
 
-    // Confirm DROP TABLE errors with the PoC "unsupported" message.
-    let err = sess
-        .execute("DROP TABLE gone")
+    // DROP TABLE is now wired (fix #49, commit 25d9a5f).
+    sess.execute("DROP TABLE gone")
         .await
-        .expect_err("DROP TABLE must error in current PoC (executor arm not wired)");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported") || msg.contains("not supported") || msg.contains("DROP"),
-        "DROP TABLE error should say unsupported, got: {msg}"
-    );
-    // Data must still be readable (the drop did not execute).
-    let n = count_rows(sess.execute("SELECT count(*) FROM gone").await.unwrap());
-    assert_eq!(n, 3, "data must be intact since DROP TABLE did not execute");
-    println!("[dml] DROP TABLE unsupported (expected), data intact: {msg}");
+        .expect("DROP TABLE must succeed after fix #49");
+
+    // The table no longer exists — SELECT must error.
+    sess.execute("SELECT count(*) FROM gone")
+        .await
+        .expect_err("SELECT from dropped table must error");
+    println!("[dml] DROP TABLE succeeded; table gone (fix #49)");
 }
