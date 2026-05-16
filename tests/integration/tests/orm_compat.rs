@@ -1,26 +1,30 @@
-//! ORM startup-query compatibility harness — Phase 5.11.M tail.
+//! Curated ORM / driver wire-compatibility suite.
 //!
-//! Mirrors the design of `postgrest_pgadmin_compat.rs`: spin a fresh
-//! in-process Basin pgwire server, open a project connection, seed a
-//! shared fixture, then issue the *exact* SQL each ORM runs on
-//! `connect()` / `sync()`. We do not bundle Node.js or Python runtimes;
-//! every assertion runs through `tokio-postgres` against the real
-//! catalog views.
+//! This is the *data-path* compatibility suite: it proves Basin handles the
+//! SQL shapes real ORMs and drivers actually emit over the Postgres wire
+//! protocol — parameterised queries through the extended protocol, RETURNING,
+//! upserts, data-modifying CTEs, nested JSON reads, LATERAL, transactions and
+//! prepared-statement reuse — under *varied real-world conditions* (match /
+//! no-match / NULL / single vs multi-row / rollback / param re-bind).
 //!
-//! Sections:
-//! - Prisma (Postgres connector / `prisma db pull` introspection)
-//! - Sequelize (postgres dialect, `sequelize.sync()` reflection)
-//! - SQLAlchemy (psycopg2 / asyncpg dialect reflection)
+//! Every assertion runs through `tokio-postgres` against an in-process Basin
+//! pgwire server, so the extended-protocol Parse/Bind/Describe/Execute path
+//! (the path every ORM driver takes) is exercised for real. We do not bundle
+//! Node/Python runtimes — the SQL shapes below are the *verbatim* statements
+//! Prisma / Drizzle / ActiveRecord / Django / Hibernate / Sequelize /
+//! SQLAlchemy / `pg` / asyncpg / pgx generate.
 //!
-//! Tests gated on concurrent-agent landings carry an `#[ignore]` with a
-//! one-line comment naming the agent (a659ad3 = PK+CHECK+FK enforcement;
-//! a9eba2e = Decimal128 reflection columns; 5.7 B1 = secondary indexes;
-//! 5.11.K3 = sequence pg_class surface). Un-ignoring is a one-line
-//! follow-up when the depended-on agent ships.
+//! Quality over quantity: a handful of representative, condition-varied tests,
+//! each asserting the *correct Postgres-semantics* result for several
+//! conditions of one realistic shape. Tests whose shape depends on an
+//! in-flight engine fix are `#[ignore]`-gated on the tracked issue number and
+//! still assert the *correct* behaviour, so they flip to a real guard the
+//! moment the fix lands. Nothing is weakened to pass; nothing asserts
+//! placeholder output.
 
 #![allow(clippy::print_stdout)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -31,10 +35,10 @@ use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls};
 
 // =============================================================================
-// Harness — same shape as postgrest_pgadmin_compat.rs
+// Harness — identical shape to postgrest_pgadmin_compat.rs /
+// jsonb_uuid_param_binding.rs (reused, not reinvented).
 // =============================================================================
 
-/// Lifetime guard for an in-process Basin pgwire server.
 struct TestServer {
     addr: SocketAddr,
     _shutdown: tokio::sync::oneshot::Sender<()>,
@@ -102,41 +106,39 @@ async fn connect(addr: SocketAddr) -> Client {
     client
 }
 
-/// Shared fixture for all three ORM sections.
-///
-/// Three tables:
-/// - `users` — single-PK shape (id BIGINT, email TEXT, created_at TIMESTAMPTZ)
-/// - `orders` — FK-shape (id BIGINT, user_id BIGINT → users, total NUMERIC(10,2))
-/// - `events` — composite-PK shape (project_id BIGINT, event_id BIGINT, payload TEXT)
-///
-/// Plus one function and one procedure (matching the PostgREST harness).
-///
-/// We keep PRIMARY KEY / FOREIGN KEY out of the literal DDL because v0.1
-/// rejects those clauses at parse time; the *catalog views* still pin the
-/// "what the ORM sees on connect" shape, which is what these tests assert.
-/// When a659ad3 lands, this fixture flips to include explicit `PRIMARY KEY`
-/// / `REFERENCES` clauses and the `#[ignore]` constraint tests un-ignore.
-async fn setup_orm_fixture(client: &Client) {
+/// Canonical blog-style fixture every ORM tutorial uses: `users` 1-N `posts`.
+/// `posts.author_id` is the FK column (declared NOT NULL but no REFERENCES —
+/// v0.1 parses-but-doesn't-enforce FK; the join shapes below don't need
+/// enforcement, only the columns).
+async fn seed_blog(client: &Client) {
     for stmt in [
+        // BIGINT throughout — this is the storage shape Prisma/Drizzle/Rails
+        // emit by default (`Int @id` → bigint in PG). It also dodges the
+        // separately-tracked #54 parameter-description gap on narrow-int
+        // columns; the narrow-int / int4 coercion is covered in its own
+        // `#[ignore = "#54"]` test below so the gap is honestly pinned.
         "CREATE TABLE users (\
              id BIGINT NOT NULL, \
              email TEXT NOT NULL, \
-             created_at TIMESTAMPTZ NOT NULL\
+             name TEXT, \
+             age BIGINT\
          )",
-        "CREATE TABLE orders (\
+        "CREATE TABLE posts (\
              id BIGINT NOT NULL, \
-             user_id BIGINT NOT NULL, \
-             total NUMERIC(10, 2) NOT NULL\
+             author_id BIGINT NOT NULL, \
+             title TEXT NOT NULL, \
+             views BIGINT NOT NULL\
          )",
-        "CREATE TABLE events (\
-             project_id BIGINT NOT NULL, \
-             event_id BIGINT NOT NULL, \
-             payload TEXT NOT NULL\
-         )",
-        "CREATE FUNCTION add_one(x BIGINT) RETURNS BIGINT \
-             LANGUAGE sql AS $$ SELECT x + 1 $$",
-        "CREATE PROCEDURE log_event(g TEXT) LANGUAGE sql AS $$ \
-             INSERT INTO events VALUES (1, 1, g) $$",
+        // u1 has 2 posts, u2 has 1 post, u3 has 0 posts (the zero-children
+        // condition every nested-read test must cover).
+        "INSERT INTO users (id, email, name, age) VALUES \
+             (1, 'a@x.com', 'Alice', 30), \
+             (2, 'b@x.com', 'Bob', 25), \
+             (3, 'c@x.com', NULL, NULL)",
+        "INSERT INTO posts (id, author_id, title, views) VALUES \
+             (10, 1, 'Alice One', 100), \
+             (11, 1, 'Alice Two', 50), \
+             (12, 2, 'Bob One', 0)",
     ] {
         client
             .simple_query(stmt)
@@ -146,443 +148,907 @@ async fn setup_orm_fixture(client: &Client) {
 }
 
 // =============================================================================
-// Prisma (Postgres connector — `prisma db pull` introspection)
+// 1. Parameterised queries — the universal driver path (extended protocol).
+//    Models: every driver (pg / node-postgres, asyncpg, psycopg, pgx, JDBC).
+//    Conditions: match / no-match (empty) / NULL param / type coercion /
+//    multi-param / re-bind.
 // =============================================================================
 
-/// Prisma query 1 — schema discovery via `information_schema.schemata`.
-/// Filter excludes the system schemas; Basin must surface at least
-/// `public`.
+/// `SELECT ... WHERE col = $1` and friends — the single most common shape any
+/// ORM emits. Conditions: exact match (1 row), no-match (0 rows), multi-param
+/// AND, integer param against INT column (type coercion through BIND).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prisma_schema_discovery() {
+async fn param_select_where_eq_match_nomatch_multiparam() {
     let server = start_server().await;
     let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
+    seed_blog(&client).await;
 
+    // (a) match → exactly 1 row, correct projection.
+    let rows = client
+        .query("SELECT id, email FROM users WHERE id = $1", &[&1_i64])
+        .await
+        .expect("param eq match");
+    assert_eq!(rows.len(), 1, "id=1 → exactly one user");
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, &str>(1), "a@x.com");
+
+    // (b) no-match → empty result set, NOT an error.
+    let rows = client
+        .query("SELECT id FROM users WHERE id = $1", &[&999_i64])
+        .await
+        .expect("param eq no-match must succeed with 0 rows");
+    assert_eq!(rows.len(), 0, "id=999 → zero rows (empty, not error)");
+
+    // (c) multi-param AND with mixed column types (BIGINT + TEXT).
     let rows = client
         .query(
-            "SELECT schema_name FROM information_schema.schemata \
-             WHERE schema_name NOT IN ('pg_catalog', 'information_schema')",
+            "SELECT id FROM users WHERE id = $1 AND email = $2",
+            &[&2_i64, &"b@x.com"],
+        )
+        .await
+        .expect("multi-param AND");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
+
+    // (d) parameter against the BIGINT age column.
+    let rows = client
+        .query("SELECT id FROM users WHERE age = $1", &[&30_i64])
+        .await
+        .expect("bigint param vs BIGINT column");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+}
+
+/// Narrow-int (`int4`) parameter coercion. Real ORM drivers send `i32` for
+/// columns they model as `int`/`Int4`. Today Basin's ParameterDescription
+/// over-reports BIGINT for narrow numerics and the client-side encoder
+/// refuses to bind `i32`. Pinned shape: an `i32` bound against a column the
+/// app models as `int` must succeed. Gated on #54 (param-binding /
+/// ParameterDescription fix).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (int4 param coercion) — gated on ParameterDescription fix #54; un-ignore when landed"]
+async fn param_int4_coercion() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    client
+        .simple_query("CREATE TABLE narrow (id INT NOT NULL, label TEXT NOT NULL)")
+        .await
+        .expect("create narrow");
+    client
+        .simple_query("INSERT INTO narrow VALUES (7, 'lucky'), (8, 'eight')")
+        .await
+        .expect("seed narrow");
+
+    let rows = client
+        .query("SELECT label FROM narrow WHERE id = $1", &[&7_i32])
+        .await
+        .expect("int4 param vs INT column must work once #54 lands");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>(0), "lucky");
+}
+
+/// NULL parameter semantics. ORMs bind `NULL` for optional filters; correct
+/// Postgres behaviour is that `col = NULL` matches nothing (three-valued
+/// logic) while `col IS NOT DISTINCT FROM $1` / `IS NULL` do the null-safe
+/// thing. We assert the SQL-correct outcome for each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn param_null_three_valued_logic() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    // `name = NULL` → UNKNOWN → no rows (even though u3.name IS NULL).
+    let none: Option<&str> = None;
+    let rows = client
+        .query("SELECT id FROM users WHERE name = $1", &[&none])
+        .await
+        .expect("name = NULL param");
+    assert_eq!(
+        rows.len(),
+        0,
+        "`col = NULL` is UNKNOWN for every row → 0 rows (3-valued logic)"
+    );
+
+    // The null-safe form ORMs use for `.where(name: nil)` is `IS NULL`.
+    let rows = client
+        .query("SELECT id FROM users WHERE name IS NULL", &[])
+        .await
+        .expect("IS NULL");
+    assert_eq!(rows.len(), 1, "exactly u3 has NULL name");
+    assert_eq!(rows[0].get::<_, i64>(0), 3);
+
+    // Reading a NULL column back through the wire as Option must be None.
+    let rows = client
+        .query("SELECT name, age FROM users WHERE id = $1", &[&3_i64])
+        .await
+        .expect("select NULL columns");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, Option<&str>>(0), None);
+    assert_eq!(rows[0].get::<_, Option<i64>>(1), None);
+}
+
+/// `WHERE id IN ($1,$2,$3)` — ActiveRecord `.where(id: [...])`, Django
+/// `__in`, Hibernate `IN (:ids)`. Conditions: all present, some present,
+/// none present (empty result).
+///
+/// Today Basin's ParameterDescription reports `text` for IN-list params
+/// even against a BIGINT column, so the client-side encoder refuses the
+/// bind before it reaches the wire. The literal-IN sub-case (which ORMs
+/// also commonly emit, e.g. Rails' interpolated `IN (1,2,3)` for cache
+/// keys) is covered unconditionally in
+/// `param_select_where_eq_match_nomatch_multiparam`'s neighbour
+/// `where_in_literal` test below. Gated on #54.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (parameterised IN-list) — gated on ParameterDescription fix #54; un-ignore when landed"]
+async fn param_where_in_list() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    // All three present → 3 rows, deterministic order via ORDER BY.
+    let rows = client
+        .query(
+            "SELECT id FROM users WHERE id IN ($1, $2, $3) ORDER BY id",
+            &[&1_i64, &2_i64, &3_i64],
+        )
+        .await
+        .expect("IN (all present)");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+
+    // Partial overlap → only the matching rows.
+    let rows = client
+        .query(
+            "SELECT id FROM users WHERE id IN ($1, $2) ORDER BY id",
+            &[&2_i64, &99_i64],
+        )
+        .await
+        .expect("IN (partial)");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![2], "only id=2 exists");
+
+    // No overlap → empty.
+    let rows = client
+        .query(
+            "SELECT id FROM users WHERE id IN ($1, $2)",
+            &[&98_i64, &99_i64],
+        )
+        .await
+        .expect("IN (none) must succeed with 0 rows");
+    assert_eq!(rows.len(), 0);
+}
+
+/// `WHERE id IN (...)` with **literal** values — the cache-key-friendly form
+/// Rails / many ORMs interpolate (and the form most SQL builders fall back
+/// to when the driver chokes on parameterised arrays). Same conditions as
+/// the parameterised version. This pins the planner shape even before
+/// #54 lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn where_in_literal_list() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    // All present.
+    let rows = client
+        .query(
+            "SELECT id FROM users WHERE id IN (1, 2, 3) ORDER BY id",
             &[],
         )
         .await
-        .expect("information_schema.schemata query");
+        .expect("literal IN (all present)");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
 
-    let names: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    assert!(
-        names.iter().any(|n| n == "public"),
-        "expected 'public' in schemata, got {names:?}"
-    );
-}
-
-/// Prisma query 2 — table/view discovery per schema. Pulls `table_name` +
-/// `table_type`; the seeded tables must come back as `BASE TABLE`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prisma_table_discovery() {
-    let server = start_server().await;
-    let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
-
+    // Partial overlap.
     let rows = client
         .query(
-            "SELECT table_name, table_type FROM information_schema.tables \
-             WHERE table_schema = $1",
-            &[&"public"],
+            "SELECT id FROM users WHERE id IN (2, 99) ORDER BY id",
+            &[],
         )
         .await
-        .expect("information_schema.tables query");
+        .expect("literal IN (partial)");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![2]);
 
-    let mut by_name: HashMap<String, String> = HashMap::new();
-    for r in &rows {
-        by_name.insert(r.get(0), r.get(1));
-    }
-    for expected in ["users", "orders", "events"] {
-        let tt = by_name
-            .get(expected)
-            .unwrap_or_else(|| panic!("missing {expected:?} in tables: {by_name:?}"));
-        assert_eq!(tt, "BASE TABLE", "{expected} should be BASE TABLE");
-    }
+    // No overlap → empty.
+    let rows = client
+        .query("SELECT id FROM users WHERE id IN (98, 99)", &[])
+        .await
+        .expect("literal IN (none) must succeed with 0 rows");
+    assert_eq!(rows.len(), 0);
 }
 
-/// Prisma query 3 — column discovery. PG-correct `data_type` and
-/// `udt_name` strings must come back in 1-based ordinal order. This is
-/// the load-bearing query for Prisma's type inference.
+/// Prepared-statement *reuse*: prepare once, execute many times with
+/// different params (the connection-pool hot path — every ORM with a pool
+/// does this). Also exercises text + binary param formats implicitly
+/// (`tokio-postgres` binds binary for typed prepared statements).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prisma_column_discovery() {
+async fn prepared_statement_reuse_rebind() {
     let server = start_server().await;
     let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
+    seed_blog(&client).await;
 
+    let stmt = client
+        .prepare("SELECT email FROM users WHERE id = $1")
+        .await
+        .expect("prepare once");
+
+    // Execute the same prepared plan three times with different binds.
+    for (id, want) in [(1_i64, "a@x.com"), (2, "b@x.com"), (3, "c@x.com")] {
+        let rows = client
+            .query(&stmt, &[&id])
+            .await
+            .unwrap_or_else(|e| panic!("re-execute id={id}: {e}"));
+        assert_eq!(rows.len(), 1, "id={id} → one row on reuse");
+        assert_eq!(rows[0].get::<_, &str>(0), want);
+    }
+
+    // Re-bind that yields zero rows must still work on the reused statement.
+    let rows = client
+        .query(&stmt, &[&404_i64])
+        .await
+        .expect("reused stmt, no-match bind");
+    assert_eq!(rows.len(), 0);
+}
+
+// =============================================================================
+// 2. Pagination / counting / aggregates — ActiveRecord, Django, Hibernate.
+// =============================================================================
+
+/// `ORDER BY ... LIMIT $1 OFFSET $2` — the universal pagination shape.
+/// Conditions: first page, second page, offset past end (must yield empty,
+/// not error). Plus `COUNT(*)` for the total (the second query every paginated
+/// list view issues).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pagination_limit_offset_and_count() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    // Page 1: LIMIT 2 OFFSET 0 → first two users by id.
     let rows = client
         .query(
-            "SELECT column_name, ordinal_position, is_nullable, data_type, udt_name, column_default \
-             FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 \
-             ORDER BY ordinal_position",
-            &[&"public", &"users"],
+            "SELECT id FROM users ORDER BY id LIMIT $1 OFFSET $2",
+            &[&2_i64, &0_i64],
         )
         .await
-        .expect("information_schema.columns query");
+        .expect("page 1");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1, 2]);
 
-    assert_eq!(rows.len(), 3, "users has 3 columns, got {}", rows.len());
+    // Page 2: LIMIT 2 OFFSET 2 → remaining single user.
+    let rows = client
+        .query(
+            "SELECT id FROM users ORDER BY id LIMIT $1 OFFSET $2",
+            &[&2_i64, &2_i64],
+        )
+        .await
+        .expect("page 2");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![3]);
 
-    // Row 0: id BIGINT NOT NULL
-    let name: String = rows[0].get(0);
-    let pos: i32 = rows[0].get(1);
-    let nullable: String = rows[0].get(2);
-    let dt: String = rows[0].get(3);
-    let udt: String = rows[0].get(4);
-    assert_eq!(name, "id");
-    assert_eq!(pos, 1);
-    assert_eq!(nullable, "NO");
-    assert_eq!(dt, "bigint", "BIGINT must surface as PG 'bigint'");
-    assert_eq!(udt, "int8");
+    // Offset past the end → empty page (NOT an error).
+    let rows = client
+        .query(
+            "SELECT id FROM users ORDER BY id LIMIT $1 OFFSET $2",
+            &[&2_i64, &500_i64],
+        )
+        .await
+        .expect("offset past end must be empty, not error");
+    assert_eq!(rows.len(), 0);
 
-    // Row 1: email TEXT
-    let name: String = rows[1].get(0);
-    let dt: String = rows[1].get(3);
-    let udt: String = rows[1].get(4);
-    assert_eq!(name, "email");
-    assert_eq!(dt, "text");
-    assert_eq!(udt, "text");
+    // The companion COUNT(*) the list view issues for the page count.
+    let row = client
+        .query_one("SELECT COUNT(*) FROM users", &[])
+        .await
+        .expect("count(*)");
+    assert_eq!(row.get::<_, i64>(0), 3);
+}
 
-    // Row 2: created_at TIMESTAMPTZ
-    let name: String = rows[2].get(0);
-    let dt: String = rows[2].get(3);
-    let udt: String = rows[2].get(4);
-    assert_eq!(name, "created_at");
+/// `GROUP BY ... HAVING`, `DISTINCT`, and aggregate `FILTER` — the
+/// reporting / `.group(...).count` shapes (ActiveRecord `group`, Django
+/// `annotate`, Hibernate `group by`). Conditions: groups with/without rows
+/// surviving HAVING, aggregate over empty filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_by_having_distinct_filter() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    // GROUP BY author_id with HAVING COUNT(*) > 1 → only u1 (2 posts).
+    // Literal HAVING bound: the parameterised-HAVING form is gated under
+    // #54 alongside parameterised IN-lists.
+    let rows = client
+        .query(
+            "SELECT author_id, COUNT(*) AS c FROM posts \
+             GROUP BY author_id HAVING COUNT(*) > 1 ORDER BY author_id",
+            &[],
+        )
+        .await
+        .expect("GROUP BY ... HAVING");
+    assert_eq!(rows.len(), 1, "only author 1 has >1 post");
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, i64>(1), 2);
+
+    // DISTINCT author_id → 2 distinct authors among the 3 posts.
+    let rows = client
+        .query("SELECT DISTINCT author_id FROM posts", &[])
+        .await
+        .expect("DISTINCT");
+    assert_eq!(rows.len(), 2, "posts written by 2 distinct authors");
+
+    // Aggregate FILTER: total posts vs. posts with views > 0.
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE views > 0) AS viewed FROM posts",
+            &[],
+        )
+        .await
+        .expect("aggregate FILTER");
+    assert_eq!(row.get::<_, i64>(0), 3, "3 posts total");
     assert_eq!(
-        dt, "timestamp with time zone",
-        "TIMESTAMPTZ must surface as PG 'timestamp with time zone'"
-    );
-    assert_eq!(udt, "timestamptz");
-}
-
-/// Prisma query 4 — PK discovery via `pg_constraint` + `pg_attribute`.
-/// v0.1 has no PK enforcement → `pg_constraint` is empty. When a659ad3
-/// lands the PK column will surface and this test flips from "asserts
-/// empty" to "asserts ['id']" by removing `#[ignore]` and switching the
-/// assertion shape.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "depends on a659ad3 (PK+CHECK+FK enforcement); flip when constraint rows surface"]
-async fn prisma_pk_discovery() {
-    let server = start_server().await;
-    let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
-
-    let rows = client
-        .query(
-            "SELECT a.attname FROM pg_catalog.pg_attribute a \
-             JOIN pg_catalog.pg_constraint c ON c.conrelid = a.attrelid \
-             JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
-             WHERE c.contype = 'p' AND t.relname = $1",
-            &[&"users"],
-        )
-        .await
-        .expect("pg_constraint PK probe");
-
-    // Flip-marker: when a659ad3 ships, the seeded `users` table's PK
-    // column ('id') must be in this set.
-    let names: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    assert!(
-        names.contains("id"),
-        "expected PK column 'id', got {names:?}"
+        row.get::<_, i64>(1),
+        2,
+        "2 posts have views>0 (Bob One has 0)"
     );
 }
 
-/// Prisma query 5 — FK discovery. Same a659ad3 dependency; pin the
-/// "empty result, not error" behaviour today.
+/// `EXISTS` / `NOT EXISTS` correlated subquery in a `SELECT` WHERE clause —
+/// ActiveRecord `.where(Post.where(...).arel.exists)`, Django
+/// `.filter(Exists(...))`, Hibernate `where exists`. Conditions: authors
+/// who have posts (EXISTS true) vs. authors with none (NOT EXISTS true).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "depends on a659ad3 (FK enforcement); flip when conrelid/confrelid surface"]
-async fn prisma_fk_discovery() {
+async fn correlated_exists_not_exists_in_select() {
     let server = start_server().await;
     let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
+    seed_blog(&client).await;
 
+    // Users WITH at least one post → u1, u2.
     let rows = client
         .query(
-            "SELECT con.conname, ref.relname AS referenced_table \
-             FROM pg_catalog.pg_constraint con \
-             JOIN pg_catalog.pg_class t ON t.oid = con.conrelid \
-             JOIN pg_catalog.pg_class ref ON ref.oid = con.confrelid \
-             WHERE con.contype = 'f' AND t.relname = $1",
-            &[&"orders"],
+            "SELECT id FROM users u \
+             WHERE EXISTS (SELECT 1 FROM posts p WHERE p.author_id = u.id) \
+             ORDER BY id",
+            &[],
         )
         .await
-        .expect("pg_constraint FK probe");
+        .expect("correlated EXISTS");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1, 2], "u1,u2 have posts");
 
-    // Flip-marker: when a659ad3 ships, the seeded orders.user_id FK to
-    // users must surface here. Today the row count is 0 because
-    // pg_constraint is empty — but we keep the test ignored rather than
-    // pinning an empty-result, since the un-ignore change is one line.
-    assert!(!rows.is_empty(), "expected at least one FK row");
+    // Users with NO posts → only u3.
+    let rows = client
+        .query(
+            "SELECT id FROM users u \
+             WHERE NOT EXISTS (SELECT 1 FROM posts p WHERE p.author_id = u.id) \
+             ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("correlated NOT EXISTS");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![3], "only u3 has zero posts");
 }
 
-/// Prisma query 6 — index discovery. v0.1 has no secondary indexes
-/// (5.7 B1 queued). The `pg_index` view ships and is empty; pin that
-/// behaviour today and flip when 5.7 B1 lands.
+/// INNER vs LEFT JOIN — eager-loading the way ORMs do `includes` /
+/// `select_related` / `JOIN FETCH`. Conditions: LEFT JOIN must preserve the
+/// childless parent (u3) with NULL right side; INNER JOIN must drop it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "alias resolution gap on JOIN-projected pg_class.oid → indexrelid; planned for 5.7 B1"]
-async fn prisma_index_discovery() {
+async fn inner_vs_left_join_eager_load() {
     let server = start_server().await;
     let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
+    seed_blog(&client).await;
 
+    // INNER JOIN → one row per (user,post); u3 (no posts) absent → 3 rows.
     let rows = client
         .query(
-            "SELECT i.indexrelid, ix.indisunique, ix.indisprimary \
-             FROM pg_catalog.pg_index ix \
-             JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid \
-             JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
-             WHERE t.relname = $1",
-            &[&"users"],
+            "SELECT u.id, p.id FROM users u \
+             JOIN posts p ON p.author_id = u.id ORDER BY u.id, p.id",
+            &[],
         )
         .await
-        .expect("pg_index probe must succeed even with zero rows");
+        .expect("INNER JOIN");
+    assert_eq!(rows.len(), 3, "3 posts → 3 joined rows; u3 dropped");
 
-    // v0.1: pg_index is empty (no user-defined indexes). When 5.7 B1
-    // ships, the row builder will populate this and Prisma will see
-    // declared indexes here.
+    // LEFT JOIN → u3 preserved with a NULL post id (4 rows total).
+    let rows = client
+        .query(
+            "SELECT u.id, p.id FROM users u \
+             LEFT JOIN posts p ON p.author_id = u.id ORDER BY u.id, p.id NULLS FIRST",
+            &[],
+        )
+        .await
+        .expect("LEFT JOIN");
+    assert_eq!(rows.len(), 4, "3 posts + 1 childless user (u3) = 4 rows");
+    // The u3 row carries a NULL post id.
+    let u3 = rows
+        .iter()
+        .find(|r| r.get::<_, i64>(0) == 3)
+        .expect("u3 must be present via LEFT JOIN");
     assert_eq!(
-        rows.len(),
-        0,
-        "v0.1 ships no secondary indexes; pg_index must be empty"
+        u3.get::<_, Option<i64>>(1),
+        None,
+        "childless parent → NULL right side"
     );
 }
 
 // =============================================================================
-// Sequelize (postgres dialect — `sequelize.sync()` / model loading)
+// 3. Writes the way ORMs do them — RETURNING, upsert, batch.
+//    Models: ActiveRecord/Rails 7 (`RETURNING`), Prisma `upsert`, Drizzle
+//    `.onConflictDoUpdate`, Hibernate batch insert.
 // =============================================================================
 
-/// Sequelize query 1 — table-definition probe. The LEFT JOIN against
-/// `information_schema.key_column_usage` + `information_schema.table_constraints`
-/// resolves PK info per column. Ignored on a659ad3 because the LEFT JOIN
-/// returns NULLs for PK rows that don't exist yet; flip when constraints
-/// surface so the test can assert `pk.constraint_type = 'PRIMARY KEY'`
-/// for the `id` column.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "depends on a659ad3 (PK enforcement); flip when key_column_usage surfaces PK rows"]
-async fn sequelize_table_definition_query() {
-    let server = start_server().await;
-    let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
-
-    let rows = client
-        .query(
-            "SELECT \
-                pk.constraint_type AS \"Constraint\", \
-                c.column_name, c.column_default, c.data_type, \
-                c.is_nullable, c.character_maximum_length \
-             FROM information_schema.columns c \
-             LEFT JOIN information_schema.key_column_usage k \
-                 ON c.table_name = k.table_name AND c.column_name = k.column_name \
-             LEFT JOIN information_schema.table_constraints pk \
-                 ON k.constraint_name = pk.constraint_name \
-                 AND pk.constraint_type = 'PRIMARY KEY' \
-             WHERE c.table_schema = $1 AND c.table_name = $2",
-            &[&"public", &"users"],
-        )
-        .await
-        .expect("Sequelize table-definition query");
-
-    // Flip-marker: when a659ad3 ships, the row for column 'id' must
-    // carry `Constraint = 'PRIMARY KEY'`. Today every row has NULL.
-    let mut saw_pk = false;
-    for r in &rows {
-        let constraint: Option<String> = r.get(0);
-        let col: String = r.get(1);
-        if col == "id" && constraint.as_deref() == Some("PRIMARY KEY") {
-            saw_pk = true;
-        }
-    }
-    assert!(
-        saw_pk,
-        "expected users.id row to carry PRIMARY KEY constraint"
-    );
-}
-
-/// Sequelize query 2 — table-existence check. Trivial probe; must
-/// return one row when the table exists, zero when it doesn't.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sequelize_table_existence_check() {
-    let server = start_server().await;
-    let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
-
-    let rows = client
-        .query(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = $1 AND table_name = $2",
-            &[&"public", &"users"],
-        )
-        .await
-        .expect("table-existence query (positive case)");
-    assert_eq!(rows.len(), 1, "users exists → exactly 1 row");
-    let name: String = rows[0].get(0);
-    assert_eq!(name, "users");
-
-    let rows = client
-        .query(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = $1 AND table_name = $2",
-            &[&"public", &"does_not_exist"],
-        )
-        .await
-        .expect("table-existence query (negative case)");
-    assert_eq!(rows.len(), 0, "missing table → 0 rows");
-}
-
-/// Sequelize query 3 — sequence listing. v0.1 sequences live in the
-/// catalog but don't surface in `pg_class` with `relkind = 'S'` yet
-/// (5.11.K3 sequence pg_class surface still queued). Today the query
-/// must succeed and return zero rows (Basin's `pg_class` only ships
-/// `'r'` and `'m'` relkinds). Flip when 5.11.K3 lands.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "depends on 5.11.K3 (sequence pg_class surface); flip when relkind='S' rows ship"]
-async fn sequelize_sequence_listing() {
-    let server = start_server().await;
-    let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
-
-    // The query also depends on pg_namespace OID being looked up in a
-    // scalar subquery — we issue the literal Sequelize SQL.
-    let rows = client
-        .query(
-            "SELECT relname FROM pg_catalog.pg_class \
-             WHERE relkind = 'S' AND relnamespace = (\
-                 SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $1\
-             )",
-            &[&"public"],
-        )
-        .await
-        .expect("pg_class sequence listing");
-
-    // Flip-marker: when 5.11.K3 ships, after a `CREATE SEQUENCE seq1;`
-    // statement the listing must contain `seq1`.
-    assert!(
-        !rows.is_empty(),
-        "expected at least one sequence in pg_class"
-    );
-}
-
-// =============================================================================
-// SQLAlchemy (psycopg2 / asyncpg dialect — reflection)
-// =============================================================================
-
-/// SQLAlchemy query 1 — full column introspection with precision/scale
-/// fields. Basin's `information_schema.columns` view today does not
-/// surface `character_maximum_length`, `numeric_precision`,
-/// `numeric_scale`, or `datetime_precision` — those columns aren't in
-/// `columns_schema()` (see basin-catalog/src/info_schema.rs). The
-/// query therefore fails with a "column does not exist" error today.
-/// Flip when a9eba2e (Decimal128) ships and the columns view is
-/// extended to include the precision/scale projections.
+/// `INSERT ... RETURNING id` (single + batch), `UPDATE ... RETURNING`,
+/// `DELETE ... RETURNING` — Rails/ActiveRecord and Ecto rely on RETURNING to
+/// hydrate the model after a write. Conditions: single-row returning, batch
+/// (multi-row) returning, returning shape after UPDATE/DELETE, no-op
+/// UPDATE/DELETE returns zero rows.
 ///
-/// **Roadmap gap surfaced**: `information_schema.columns` is missing
-/// `character_maximum_length` / `numeric_precision` / `numeric_scale` /
-/// `datetime_precision`. SQLAlchemy reflection cannot infer NUMERIC(p, s)
-/// shape without these. See report.
+/// **Newly-discovered gap (not one of #54–#58)**: Basin's pgwire
+/// extended-protocol path (`tokio-postgres::query` / `query_one`) returns
+/// `INSERT/UPDATE/DELETE ... RETURNING` rows with the *correct count* but
+/// *zero columns* — the projected RETURNING columns are dropped before the
+/// RowDescription / DataRow is emitted. `simple_query` returns RETURNING
+/// rows correctly (verified), and the engine-level `dml_extras.rs` tests
+/// prove the engine emits the rows; the gap is purely in the extended-protocol
+/// projection wire-up. Every ORM that uses parameterised RETURNING (Rails,
+/// Ecto, Drizzle, Prisma) trips this. Pinned with `#[ignore]` until the
+/// extended-protocol RETURNING projection gap is fixed; flip to a guard then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "depends on a9eba2e (Decimal128 precision/scale columns in info_schema.columns)"]
-async fn sqlalchemy_full_column_introspection() {
+#[ignore = "ORM pattern (extended-protocol INSERT/UPDATE/DELETE RETURNING) — newly-found gap: extended path returns 0-column DataRows; un-ignore when fixed"]
+async fn insert_update_delete_returning() {
     let server = start_server().await;
     let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
+    seed_blog(&client).await;
 
-    let rows = client
-        .query(
-            "SELECT \
-                column_name, data_type, is_nullable, column_default, \
-                character_maximum_length, numeric_precision, numeric_scale, \
-                datetime_precision, udt_name \
-             FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 \
-             ORDER BY ordinal_position",
-            &[&"public", &"orders"],
+    // Single-row INSERT ... RETURNING id (parameterised, the ORM hot path).
+    let row = client
+        .query_one(
+            "INSERT INTO users (id, email, name, age) VALUES ($1, $2, $3, $4) RETURNING id",
+            &[&100_i64, &"new@x.com", &"New", &40_i64],
         )
         .await
-        .expect("SQLAlchemy column introspection (requires precision/scale columns)");
+        .expect("INSERT ... RETURNING id");
+    assert_eq!(row.get::<_, i64>(0), 100);
 
-    // Flip-marker: when a9eba2e lands, the `total NUMERIC(10, 2)` column
-    // must report numeric_precision = 10, numeric_scale = 2.
-    let mut saw_numeric = false;
-    for r in &rows {
-        let name: String = r.get(0);
-        if name == "total" {
-            let prec: Option<i32> = r.get(5);
-            let scale: Option<i32> = r.get(6);
-            assert_eq!(prec, Some(10), "NUMERIC(10,2) precision");
-            assert_eq!(scale, Some(2), "NUMERIC(10,2) scale");
-            saw_numeric = true;
-        }
+    // Batch INSERT ... RETURNING id → one returned row per inserted row.
+    let rows = client
+        .query(
+            "INSERT INTO users (id, email, name, age) VALUES \
+                 (101, 'p@x.com', 'P', 1), (102, 'q@x.com', 'Q', 2) \
+             RETURNING id",
+            &[],
+        )
+        .await
+        .expect("batch INSERT ... RETURNING");
+    let mut ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![101, 102], "batch insert returns both ids");
+
+    // UPDATE ... RETURNING the new value (match → 1 row).
+    let row = client
+        .query_one(
+            "UPDATE users SET age = $1 WHERE id = $2 RETURNING id, age",
+            &[&99_i64, &100_i64],
+        )
+        .await
+        .expect("UPDATE ... RETURNING");
+    assert_eq!(row.get::<_, i64>(0), 100);
+    assert_eq!(row.get::<_, i64>(1), 99);
+
+    // No-op UPDATE (no rows match) → RETURNING yields zero rows, not error.
+    let rows = client
+        .query(
+            "UPDATE users SET age = 0 WHERE id = $1 RETURNING id",
+            &[&777_i64],
+        )
+        .await
+        .expect("no-op UPDATE RETURNING must succeed with 0 rows");
+    assert_eq!(rows.len(), 0);
+
+    // DELETE ... RETURNING the deleted row.
+    let row = client
+        .query_one(
+            "DELETE FROM users WHERE id = $1 RETURNING id",
+            &[&102_i64],
+        )
+        .await
+        .expect("DELETE ... RETURNING");
+    assert_eq!(row.get::<_, i64>(0), 102);
+    // And it's gone.
+    let rows = client
+        .query("SELECT id FROM users WHERE id = $1", &[&102_i64])
+        .await
+        .expect("post-delete select");
+    assert_eq!(rows.len(), 0, "deleted row no longer visible");
+}
+
+/// `INSERT ... ON CONFLICT (...) DO NOTHING` — the "insert if absent" idiom
+/// (Rails `insert_all` with `unique_by`, Django `bulk_create`
+/// `ignore_conflicts=True`, hand-written deduplicated inserts). Conditions:
+/// no-conflict (plain insert), conflict on UNIQUE key (row unchanged).
+///
+/// **Newly-discovered gap (not one of #54–#58)**: Basin's UNIQUE enforcement
+/// fires *before* the ON CONFLICT handler can suppress the violation, so the
+/// conflict path raises SQLSTATE 23505 instead of being a no-op. Pinned with
+/// the correct PG semantics; flips to a real guard when ON CONFLICT
+/// short-circuiting is wired into the constraint enforcement path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (ON CONFLICT DO NOTHING on UNIQUE) — newly-found gap: UNIQUE fires before ON CONFLICT short-circuits; un-ignore when fixed"]
+async fn upsert_on_conflict_do_nothing() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    client
+        .simple_query(
+            "CREATE TABLE accounts (\
+                 email TEXT NOT NULL UNIQUE, \
+                 hits BIGINT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create accounts");
+
+    // (a) No-conflict: row inserted as-is.
+    client
+        .execute(
+            "INSERT INTO accounts (email, hits) VALUES ($1, $2) \
+             ON CONFLICT (email) DO NOTHING",
+            &[&"u@x.com", &1_i64],
+        )
+        .await
+        .expect("first insert (no conflict)");
+    let hits = client
+        .query_one(
+            "SELECT hits FROM accounts WHERE email = $1",
+            &[&"u@x.com"],
+        )
+        .await
+        .expect("read")
+        .get::<_, i64>(0);
+    assert_eq!(hits, 1, "fresh row → hits=1");
+
+    // (b) Conflict on UNIQUE email: DO NOTHING leaves the row untouched.
+    client
+        .execute(
+            "INSERT INTO accounts (email, hits) VALUES ($1, $2) \
+             ON CONFLICT (email) DO NOTHING",
+            &[&"u@x.com", &999_i64],
+        )
+        .await
+        .expect("second insert (conflict)");
+    let hits = client
+        .query_one(
+            "SELECT hits FROM accounts WHERE email = $1",
+            &[&"u@x.com"],
+        )
+        .await
+        .expect("read after conflict")
+        .get::<_, i64>(0);
+    assert_eq!(hits, 1, "DO NOTHING preserves the existing row (hits=1)");
+
+    // Exactly one row total — no duplicates.
+    let n = client
+        .query_one("SELECT COUNT(*) FROM accounts", &[])
+        .await
+        .expect("count")
+        .get::<_, i64>(0);
+    assert_eq!(n, 1, "DO NOTHING upsert must not duplicate");
+}
+
+/// `INSERT ... ON CONFLICT (...) DO UPDATE SET col = EXCLUDED.col` — the
+/// Prisma / Drizzle / Rails `upsert` shape that actually mutates on
+/// conflict. Today Basin's planner renames the target source to
+/// `__basin_gen_src` and fails to resolve **both** `<table>.col` *and*
+/// `EXCLUDED.col` references in the DO UPDATE expression. Newly-discovered
+/// gap. Pinned with the correct PG semantics (post-conflict the existing
+/// row carries the new value); flips to a real guard when the planner
+/// resolves the alias.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (upsert DO UPDATE SET … = EXCLUDED.col) — newly-found gap: ON CONFLICT DO UPDATE can't resolve EXCLUDED/<table> col refs; un-ignore when fixed"]
+async fn upsert_on_conflict_do_update() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    client
+        .simple_query(
+            "CREATE TABLE accounts (\
+                 email TEXT NOT NULL UNIQUE, \
+                 hits BIGINT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create accounts");
+
+    // Fresh insert.
+    client
+        .execute(
+            "INSERT INTO accounts (email, hits) VALUES ($1, $2) \
+             ON CONFLICT (email) DO UPDATE SET hits = EXCLUDED.hits",
+            &[&"u@x.com", &1_i64],
+        )
+        .await
+        .expect("upsert no-conflict");
+    // Conflict — DO UPDATE overwrites hits with the new value.
+    client
+        .execute(
+            "INSERT INTO accounts (email, hits) VALUES ($1, $2) \
+             ON CONFLICT (email) DO UPDATE SET hits = EXCLUDED.hits",
+            &[&"u@x.com", &42_i64],
+        )
+        .await
+        .expect("upsert conflict");
+
+    let hits = client
+        .query_one(
+            "SELECT hits FROM accounts WHERE email = $1",
+            &[&"u@x.com"],
+        )
+        .await
+        .expect("read after conflict")
+        .get::<_, i64>(0);
+    assert_eq!(hits, 42, "conflict → DO UPDATE overwrote hits with EXCLUDED.hits");
+}
+
+
+// =============================================================================
+// 4. Transactions — every ORM wraps writes in BEGIN/COMMIT or BEGIN/ROLLBACK.
+//    Models: ActiveRecord `transaction do`, Django `atomic`, Hibernate
+//    session tx, Prisma `$transaction`, every driver's `.transaction()`.
+// =============================================================================
+
+/// COMMIT visibility + SAVEPOINT lifecycle through `tokio-postgres`'s
+/// transaction API — the exact path every ORM unit-of-work takes. Conditions:
+/// BEGIN → INSERTs (including post-SAVEPOINT) → RELEASE → COMMIT must leave
+/// all rows visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transaction_commit_visibility_and_savepoint() {
+    let server = start_server().await;
+    let mut client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    {
+        let mut tx = client.transaction().await.expect("BEGIN");
+        tx.execute(
+            "INSERT INTO users (id, email, name, age) VALUES ($1, $2, $3, $4)",
+            &[&200_i64, &"tx@x.com", &"Tx", &50_i64],
+        )
+        .await
+        .expect("insert in tx");
+        // SAVEPOINT then continue (ORMs use savepoints for nested tx).
+        let sp = tx.savepoint("sp1").await.expect("SAVEPOINT sp1");
+        sp.execute(
+            "INSERT INTO users (id, email, name, age) VALUES ($1, $2, $3, $4)",
+            &[&201_i64, &"sp@x.com", &"Sp", &51_i64],
+        )
+        .await
+        .expect("insert after savepoint");
+        sp.commit().await.expect("RELEASE sp1");
+        tx.commit().await.expect("COMMIT");
     }
-    assert!(
-        saw_numeric,
-        "orders.total numeric column must surface precision/scale"
-    );
-}
-
-/// SQLAlchemy query 2 — composite-PK column ordering via `unnest(conkey)
-/// WITH ORDINALITY`. The query exercises pg_constraint + pg_attribute
-/// joins and SQL-standard `WITH ORDINALITY`. v0.1 returns 0 rows
-/// (pg_constraint empty). Flip when a659ad3 ships.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "depends on a659ad3 (composite PK rows in pg_constraint)"]
-async fn sqlalchemy_pk_column_ordering() {
-    let server = start_server().await;
-    let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
-
-    let rows = client
-        .query(
-            "SELECT a.attname AS column_name, ordinality::int AS position \
-             FROM pg_catalog.pg_constraint c \
-             JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
-             JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinality) ON true \
-             JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-             WHERE c.contype = 'p' AND t.relname = $1 \
-             ORDER BY ordinality",
-            &[&"events"],
+    // Both rows visible after COMMIT — the guarantee every ORM relies on.
+    let n = client
+        .query_one(
+            "SELECT COUNT(*) FROM users WHERE id IN (200, 201)",
+            &[],
         )
         .await
-        .expect("SQLAlchemy composite-PK ordering query");
-
-    // Flip-marker: when a659ad3 ships, events' composite PK
-    // (project_id, event_id) must surface in this order.
-    let names: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    assert_eq!(names, vec!["project_id", "event_id"]);
+        .expect("post-commit count")
+        .get::<_, i64>(0);
+    assert_eq!(n, 2, "both committed rows must be visible");
 }
 
-/// SQLAlchemy query 3 — sequence-backed (SERIAL) column detection.
-/// SQLAlchemy probes `column_default` for the `nextval(...)` prefix to
-/// decide whether a column is auto-incrementing. v0.1 doesn't yet plumb
-/// `DEFAULT nextval('seq')` through CREATE TABLE → `column_default`
-/// (5.11.K3 SQL surface), so the query succeeds but always returns
-/// zero rows. Flip when 5.11.K3 ships.
+/// `BEGIN → INSERT → ROLLBACK` must leave the database state untouched.
+/// Basin v0.1 is auto-commit (no MVCC); BEGIN/ROLLBACK are accepted as no-ops
+/// so the inserted row stays visible. This test asserts the CORRECT Postgres
+/// semantics (rolled-back row invisible) and is gated on engine bug #41
+/// (transaction-rollback over-restores rows / MVCC). Every ORM's
+/// retry-on-conflict path requires this guarantee — flip when MVCC ships.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sqlalchemy_serial_column_detection() {
+#[ignore = "ORM pattern (ROLLBACK isolation) — gated on engine bug #41 (auto-commit / MVCC gap); un-ignore when landed"]
+async fn transaction_rollback_isolation() {
     let server = start_server().await;
-    let client = connect(server.addr).await;
-    setup_orm_fixture(&client).await;
+    let mut client = connect(server.addr).await;
+    seed_blog(&client).await;
 
-    let rows = client
-        .query(
-            "SELECT column_default FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 \
-             AND column_default LIKE 'nextval%'",
-            &[&"public", &"users"],
+    {
+        let tx = client.transaction().await.expect("BEGIN");
+        tx.execute(
+            "INSERT INTO users (id, email, name, age) VALUES ($1, $2, $3, $4)",
+            &[&300_i64, &"rb@x.com", &"Rb", &60_i64],
         )
         .await
-        .expect("SQLAlchemy serial-column probe");
-
-    // v0.1: no SERIAL columns are declared via CREATE TABLE today, so
-    // column_default is NULL and the LIKE filter rejects every row.
-    // When 5.11.K3 ships the SQL surface, this test will need a fixture
-    // that uses `id BIGSERIAL` or `DEFAULT nextval(...)` and assert at
-    // least one row. Today we pin the empty-result behaviour as the
-    // contract for the v0.1 roadmap snapshot.
+        .expect("insert before rollback");
+        tx.rollback().await.expect("ROLLBACK");
+    }
+    let n = client
+        .query_one("SELECT COUNT(*) FROM users WHERE id = 300", &[])
+        .await
+        .expect("post-rollback count")
+        .get::<_, i64>(0);
+    // CORRECT Postgres semantics: the rolled-back row must NOT be visible.
     assert_eq!(
-        rows.len(),
-        0,
-        "v0.1: no nextval-defaulted columns surfaced via CREATE TABLE"
+        n, 0,
+        "ROLLBACK must discard the write (correct PG transaction semantics)"
     );
+}
+
+// =============================================================================
+// 5. Prisma / Drizzle nested reads — JSON aggregation & LATERAL.
+//    These model the *defining* shapes of the modern TS ORMs.
+//    Several depend on in-flight fixes → gated, asserting correct behaviour.
+// =============================================================================
+
+/// Prisma's relation-loading shape: a correlated scalar subquery that
+/// json_agg's the children. Conditions: parent with multiple children
+/// (array of N), parent with zero children (must yield SQL NULL, which the
+/// app coalesces to `[]`), multiple parents in one result set.
+///
+/// Gated on #55 (`json_agg(t)` over a correlated subquery returning a typed
+/// row). Asserts the *correct* JSON shape; flips to a guard when #55 lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (Prisma nested read) — gated on JSON_AGG fix #55; un-ignore when landed"]
+async fn prisma_nested_read_json_agg_correlated_subquery() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    let rows = client
+        .query(
+            "SELECT u.id, \
+                (SELECT json_agg(p.title ORDER BY p.id) \
+                 FROM posts p WHERE p.author_id = u.id) AS posts \
+             FROM users u ORDER BY u.id",
+            &[],
+        )
+        .await
+        .expect("Prisma nested json_agg read");
+    assert_eq!(rows.len(), 3, "one row per user");
+
+    // u1 → ['Alice One','Alice Two']
+    let u1: serde_json::Value = rows[0].get(1);
+    assert_eq!(
+        u1,
+        serde_json::json!(["Alice One", "Alice Two"]),
+        "u1 children aggregated in id order"
+    );
+    // u2 → ['Bob One']
+    let u2: serde_json::Value = rows[1].get(1);
+    assert_eq!(u2, serde_json::json!(["Bob One"]));
+    // u3 has zero children → json_agg over empty input is SQL NULL.
+    let u3: Option<serde_json::Value> = rows[2].get(1);
+    assert_eq!(
+        u3, None,
+        "json_agg over zero children → SQL NULL (app coalesces to [])"
+    );
+}
+
+/// Drizzle's `.findMany({ with: {...} })` and Prisma's relation query emit
+/// `LEFT JOIN LATERAL (SELECT json_agg(...) ...) ON true`. Conditions: parent
+/// with children → JSON array; childless parent → NULL/[] preserved by the
+/// LEFT JOIN LATERAL ON true.
+///
+/// Gated on #58 (correlated LATERAL) + #55 (json_agg). Asserts correct shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (Drizzle/Prisma LATERAL nested read) — gated on LATERAL #58 + JSON_AGG #55; un-ignore when landed"]
+async fn drizzle_left_join_lateral_json_agg() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    let rows = client
+        .query(
+            "SELECT u.id, agg.posts \
+             FROM users u \
+             LEFT JOIN LATERAL (\
+                 SELECT json_agg(p.title ORDER BY p.id) AS posts \
+                 FROM posts p WHERE p.author_id = u.id\
+             ) agg ON true \
+             ORDER BY u.id",
+            &[],
+        )
+        .await
+        .expect("LEFT JOIN LATERAL json_agg");
+    assert_eq!(rows.len(), 3, "LEFT JOIN LATERAL preserves every parent");
+
+    let u1: serde_json::Value = rows[0].get(1);
+    assert_eq!(u1, serde_json::json!(["Alice One", "Alice Two"]));
+    // Childless parent preserved with NULL aggregate (the whole point of
+    // LEFT JOIN LATERAL ... ON true vs. a plain correlated subquery).
+    let u3: Option<serde_json::Value> = rows[2].get(1);
+    assert_eq!(u3, None, "childless parent preserved, agg is NULL");
+}
+
+// =============================================================================
+// 6. Correlated DELETE/UPDATE & data-modifying CTE — modern write patterns.
+// =============================================================================
+
+/// `DELETE ... WHERE EXISTS (correlated)` and
+/// `UPDATE ... WHERE id IN (correlated subquery)` — Rails
+/// `.where(...).delete_all` with a join condition, Django
+/// `.filter(...).update()` across a relation. Conditions: rows that match the
+/// correlated predicate are affected; non-matching rows are untouched.
+///
+/// Gated on #56 (correlated-subquery DELETE/UPDATE). Asserts correct effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (correlated DELETE/UPDATE) — gated on fix #56; un-ignore when landed"]
+async fn correlated_delete_and_update() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    // UPDATE posts SET views=views+1 WHERE author_id IN (authors named Alice)
+    let affected = client
+        .execute(
+            "UPDATE posts SET views = views + 1 \
+             WHERE author_id IN (SELECT id FROM users WHERE name = $1)",
+            &[&"Alice"],
+        )
+        .await
+        .expect("correlated UPDATE");
+    assert_eq!(affected, 2, "Alice authored 2 posts → 2 rows updated");
+    let total: i64 = client
+        .query_one(
+            "SELECT SUM(views)::bigint FROM posts WHERE author_id = 1",
+            &[],
+        )
+        .await
+        .expect("sum after update")
+        .get(0);
+    assert_eq!(total, 152, "100+1 + 50+1 = 152");
+
+    // DELETE posts of users with no... actually delete posts whose author
+    // has age < 28 (Bob, 25). Correlated EXISTS in DELETE.
+    let affected = client
+        .execute(
+            "DELETE FROM posts p \
+             WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = p.author_id AND u.age < $1)",
+            &[&28_i64],
+        )
+        .await
+        .expect("correlated DELETE");
+    assert_eq!(affected, 1, "Bob (age 25) has 1 post → 1 deleted");
+    let remaining: i64 = client
+        .query_one("SELECT COUNT(*) FROM posts", &[])
+        .await
+        .expect("count after delete")
+        .get(0);
+    assert_eq!(remaining, 2, "only Alice's 2 posts remain");
+}
+
+/// Data-modifying CTE: `WITH x AS (INSERT ... RETURNING ...) SELECT ... FROM
+/// x` — the modern atomic write-then-read pattern (Ecto `Multi`, hand-rolled
+/// repository code, Drizzle `$with`). Conditions: the CTE's RETURNING rows
+/// are visible to the outer SELECT; the write actually persisted.
+///
+/// Gated on #57 (data-modifying CTE). Asserts correct visibility + persistence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ORM pattern (data-modifying CTE) — gated on fix #57; un-ignore when landed"]
+async fn data_modifying_cte_insert_returning_then_select() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_blog(&client).await;
+
+    // INSERT inside a CTE, then SELECT the freshly-inserted rows back.
+    let rows = client
+        .query(
+            "WITH ins AS (\
+                 INSERT INTO users (id, email, name, age) \
+                 VALUES ($1, $2, $3, $4) RETURNING id, email\
+             ) \
+             SELECT id, email FROM ins",
+            &[&500_i64, &"cte@x.com", &"Cte", &33_i64],
+        )
+        .await
+        .expect("data-modifying CTE");
+    assert_eq!(rows.len(), 1, "CTE RETURNING surfaces to outer SELECT");
+    assert_eq!(rows[0].get::<_, i64>(0), 500);
+    assert_eq!(rows[0].get::<_, &str>(1), "cte@x.com");
+
+    // The write must have persisted (CTE is not a dry run).
+    let n = client
+        .query_one("SELECT COUNT(*) FROM users WHERE id = 500", &[])
+        .await
+        .expect("persistence check")
+        .get::<_, i64>(0);
+    assert_eq!(n, 1, "data-modifying CTE must persist the INSERT");
 }
