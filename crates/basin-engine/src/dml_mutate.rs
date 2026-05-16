@@ -145,7 +145,13 @@ pub(crate) async fn resolve_subqueries_in_expr(
 }
 
 /// Convert a single cell from an Arrow array column into a sqlparser `Expr`
-/// literal. Supports Int64, Utf8, Float64, Boolean.
+/// literal. Supports Int16/Int32/Int64, Float32/Float64, Utf8, Boolean.
+///
+/// Narrow integer types (INT2/INT4) and FLOAT4 are widened to their number
+/// literal form so the generated `IN (…)` list is type-agnostic — the
+/// predicate evaluator will coerce back to the column's declared width.
+/// This is necessary because #66 stores INTEGER columns as Int32Array, so
+/// `SELECT id FROM u` for an INTEGER `u.id` returns Int32, not Int64.
 fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Expr> {
     use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::DataType as Dt;
@@ -156,6 +162,44 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| BasinError::internal("expected Int64Array"))?
                 .value(i);
+            if v < 0 {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Value(
+                        Value::Number((-v).to_string(), false).into(),
+                    )),
+                })
+            } else {
+                Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
+            }
+        }
+        // INT4 / INTEGER columns are stored as Int32Array after #66.
+        // Widen to i64 for the number literal — the predicate evaluator coerces
+        // back to the column's declared width when evaluating IN (…).
+        Dt::Int32 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| BasinError::internal("expected Int32Array"))?
+                .value(i) as i64;
+            if v < 0 {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Value(
+                        Value::Number((-v).to_string(), false).into(),
+                    )),
+                })
+            } else {
+                Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
+            }
+        }
+        // INT2 / SMALLINT columns are stored as Int16Array after #66.
+        Dt::Int16 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| BasinError::internal("expected Int16Array"))?
+                .value(i) as i64;
             if v < 0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
@@ -181,6 +225,24 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| BasinError::internal("expected Float64Array"))?
                 .value(i);
+            if v < 0.0 {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Value(
+                        Value::Number((-v).to_string(), false).into(),
+                    )),
+                })
+            } else {
+                Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
+            }
+        }
+        // FLOAT4 / REAL columns are stored as Float32Array after #66.
+        Dt::Float32 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| BasinError::internal("expected Float32Array"))?
+                .value(i) as f64;
             if v < 0.0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
@@ -3297,4 +3359,191 @@ fn returning_column_indices(items: &[SelectItem], schema: &Schema) -> Result<Vec
         }
     }
     Ok(indices)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── arrow_col_value_to_expr narrow-width regression (#66×#56) ────────────
+    //
+    // Before this fix, `arrow_col_value_to_expr` only handled Int64 / Float64 /
+    // Utf8 / Boolean. After #66 started storing INTEGER columns as Int32Array
+    // and SMALLINT as Int16Array, `resolve_subqueries_in_expr` would call
+    // `arrow_col_value_to_expr` on the subquery result column and hit the
+    // catch-all `other` arm, producing:
+    //
+    //   "IN (SELECT …): column type Int32 cannot be used as IN list element"
+    //
+    // This caused `UPDATE t SET id=1 WHERE id IN (SELECT id FROM u)` and
+    // the NOT IN variant to be rejected as planner-errors (📜) even though
+    // they were green (✅) before #66.
+
+    /// Int32 column (INT4 / INTEGER after #66) round-trips through
+    /// `arrow_col_value_to_expr` as a Number literal, not an error.
+    #[test]
+    fn arrow_col_value_to_expr_int32_positive() {
+        use arrow_array::Int32Array;
+        let arr = Int32Array::from(vec![42i32]);
+        let expr = arrow_col_value_to_expr(&arr, 0).expect("Int32 must not error");
+        match expr {
+            Expr::Value(ref v) => {
+                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                    panic!("expected Number literal, got {expr:?}");
+                };
+                assert_eq!(s, "42");
+            }
+            other => panic!("expected Value(Number), got {other:?}"),
+        }
+    }
+
+    /// Negative Int32 renders as UnaryOp(Minus, Number(…)).
+    #[test]
+    fn arrow_col_value_to_expr_int32_negative() {
+        use arrow_array::Int32Array;
+        let arr = Int32Array::from(vec![-7i32]);
+        let expr = arrow_col_value_to_expr(&arr, 0).expect("negative Int32 must not error");
+        match expr {
+            Expr::UnaryOp { op: UnaryOperator::Minus, ref expr } => {
+                let Expr::Value(ref v) = **expr else {
+                    panic!("expected Number inside UnaryOp, got {expr:?}");
+                };
+                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                    panic!("expected Number literal, got {v:?}");
+                };
+                assert_eq!(s, "7");
+            }
+            other => panic!("expected UnaryOp(Minus, Number), got {other:?}"),
+        }
+    }
+
+    /// Int16 column (SMALLINT / INT2 after #66) round-trips correctly.
+    #[test]
+    fn arrow_col_value_to_expr_int16_positive() {
+        use arrow_array::Int16Array;
+        let arr = Int16Array::from(vec![100i16]);
+        let expr = arrow_col_value_to_expr(&arr, 0).expect("Int16 must not error");
+        match expr {
+            Expr::Value(ref v) => {
+                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                    panic!("expected Number literal, got {expr:?}");
+                };
+                assert_eq!(s, "100");
+            }
+            other => panic!("expected Value(Number), got {other:?}"),
+        }
+    }
+
+    /// Float32 column (REAL / FLOAT4 after #66) round-trips correctly.
+    #[test]
+    fn arrow_col_value_to_expr_float32_positive() {
+        use arrow_array::Float32Array;
+        let arr = Float32Array::from(vec![3.14f32]);
+        let expr = arrow_col_value_to_expr(&arr, 0).expect("Float32 must not error");
+        // The value is widened to f64 — just verify it's a Number and parses
+        // back to something close to 3.14.
+        match expr {
+            Expr::Value(ref v) => {
+                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                    panic!("expected Number literal, got {expr:?}");
+                };
+                let parsed: f64 = s.parse().expect("must be numeric string");
+                assert!((parsed - 3.14f64).abs() < 0.01, "got {parsed}");
+            }
+            other => panic!("expected Value(Number), got {other:?}"),
+        }
+    }
+
+    /// Int64 still works as before (regression guard for the pre-#66 path).
+    #[test]
+    fn arrow_col_value_to_expr_int64_unchanged() {
+        use arrow_array::Int64Array;
+        let arr = Int64Array::from(vec![9_000_000_000i64]);
+        let expr = arrow_col_value_to_expr(&arr, 0).expect("Int64 must not error");
+        match expr {
+            Expr::Value(ref v) => {
+                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                    panic!("expected Number literal, got {expr:?}");
+                };
+                assert_eq!(s, "9000000000");
+            }
+            other => panic!("expected Value(Number), got {other:?}"),
+        }
+    }
+
+    /// Unknown column type returns an error (the catch-all must still fire).
+    #[test]
+    fn arrow_col_value_to_expr_unsupported_type_errors() {
+        use arrow_array::Date32Array;
+        let arr = Date32Array::from(vec![0i32]);
+        let err = arrow_col_value_to_expr(&arr, 0).expect_err("Date32 must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used as IN list element"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // ── try_literal_to_scalar narrow-width regression (#66) ──────────────────
+    //
+    // Verify that the literal-to-scalar path added by #66 for INT4/INT2/FLOAT4
+    // columns still produces the correct ScalarValue for SET col = <literal>.
+
+    fn parse_expr(sql: &str) -> Expr {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+        let full = format!("SELECT {sql}");
+        let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, &full).unwrap();
+        match stmts.pop().unwrap() {
+            sqlparser::ast::Statement::Query(q) => {
+                match q.body.as_ref() {
+                    sqlparser::ast::SetExpr::Select(s) => {
+                        match &s.projection[0] {
+                            sqlparser::ast::SelectItem::UnnamedExpr(e) => e.clone(),
+                            other => panic!("not an expr: {other:?}"),
+                        }
+                    }
+                    other => panic!("not a SELECT: {other:?}"),
+                }
+            }
+            other => panic!("not a query: {other:?}"),
+        }
+    }
+
+    /// `SET col = 5` where col is INT4 → ScalarValue::Int64(5).
+    #[test]
+    fn literal_to_scalar_int32_col_positive() {
+        let expr = parse_expr("5");
+        let sv = try_literal_to_scalar(&expr, &DataType::Int32, "id")
+            .expect("should parse")
+            .expect("should be Some");
+        assert_eq!(sv, ScalarValue::Int64(5), "Int32 col literal → Int64(5)");
+    }
+
+    /// `SET col = -3` where col is INT2 → ScalarValue::Int64(-3).
+    #[test]
+    fn literal_to_scalar_int16_col_negative() {
+        let expr = parse_expr("-3");
+        let sv = try_literal_to_scalar(&expr, &DataType::Int16, "n")
+            .expect("should parse")
+            .expect("should be Some");
+        assert_eq!(sv, ScalarValue::Int64(-3), "Int16 col literal → Int64(-3)");
+    }
+
+    /// `SET col = 1.5` where col is FLOAT4 → ScalarValue::Float64(1.5).
+    #[test]
+    fn literal_to_scalar_float32_col() {
+        let expr = parse_expr("1.5");
+        let sv = try_literal_to_scalar(&expr, &DataType::Float32, "x")
+            .expect("should parse")
+            .expect("should be Some");
+        assert!(
+            matches!(sv, ScalarValue::Float64(v) if (v - 1.5).abs() < 1e-6),
+            "Float32 col literal → Float64(1.5), got {sv:?}"
+        );
+    }
 }

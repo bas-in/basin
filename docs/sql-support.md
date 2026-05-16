@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778959070 (Unix epoch)
-SQL fragments tested: 697 total / 1866 green (across all three configurations).
+Last run: 1778960373 (Unix epoch)
+SQL fragments tested: 697 total / 1872 green (across all three configurations).
 
 ## Configurations
 
@@ -186,7 +186,7 @@ SQL fragments tested: 697 total / 1866 green (across all three configurations).
 | `UPDATE t SET id = (SELECT MAX(id) FROM u)` | 🚫 | 🚫 | 🚫 | invalid schema: UPDATE SET id: scalar subquery on RHS not supported in v0.1 |
 | `UPDATE t SET id = 1 FROM u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 1 RETURNING id` | ✅ | ✅ | ✅ |  |
-| `UPDATE t SET id = 1 WHERE id IN (SELECT id FROM u)` | 📜 | 📜 | 📜 | invalid schema: IN (SELECT …): column type Int32 cannot be used as IN list … |
+| `UPDATE t SET id = 1 WHERE id IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t WHERE id = 1` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t USING u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
@@ -198,7 +198,7 @@ SQL fragments tested: 697 total / 1866 green (across all three configurations).
 | `INSERT INTO t (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE t.id > 0` | ✅ | ✅ | ✅ |  |
 | `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.id > 0 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
-| `UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)` | 📜 | 📜 | 📜 | invalid schema: IN (SELECT …): column type Int32 cannot be used as IN list … |
+| `UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING USER VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
 
