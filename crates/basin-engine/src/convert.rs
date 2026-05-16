@@ -170,6 +170,12 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         df_schema::DataType::Utf8 => ws_schema::DataType::Utf8,
         // DataFusion string_agg / string_concat return LargeUtf8; map to Utf8.
         df_schema::DataType::LargeUtf8 => ws_schema::DataType::Utf8,
+        // DataFusion 53 may emit Utf8View (StringView) for certain string
+        // functions (e.g. initcap, substr, regexp_replace). Map to Utf8 so
+        // the workspace-arrow side never sees the view type.
+        df_schema::DataType::Utf8View => ws_schema::DataType::Utf8,
+        // Analogous view-type for binary data.
+        df_schema::DataType::BinaryView => ws_schema::DataType::Binary,
         df_schema::DataType::Boolean => ws_schema::DataType::Boolean,
         df_schema::DataType::Float64 => ws_schema::DataType::Float64,
         df_schema::DataType::Float32 => ws_schema::DataType::Float32,
@@ -776,9 +782,22 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 Arc::new(ws_array::Date32Array::from(vals))
             }
             ws_schema::DataType::Utf8 => {
-                // src may be StringArray (Utf8) or LargeStringArray (LargeUtf8 →
-                // mapped to Utf8 in data_type_df_to_ws for string_agg output).
+                // src may be StringArray (Utf8), LargeStringArray (LargeUtf8,
+                // mapped to Utf8 in data_type_df_to_ws for string_agg output),
+                // or StringViewArray (Utf8View, emitted by DataFusion 53 for
+                // functions like initcap/substr/regexp_replace — Bug #40 fix).
                 if let Some(s) = src.as_any().downcast_ref::<df_array::LargeStringArray>() {
+                    let vals: Vec<Option<String>> = (0..s.len())
+                        .map(|j| {
+                            if s.is_null(j) {
+                                None
+                            } else {
+                                Some(s.value(j).to_string())
+                            }
+                        })
+                        .collect();
+                    Arc::new(ws_array::StringArray::from(vals))
+                } else if let Some(s) = src.as_any().downcast_ref::<df_array::StringViewArray>() {
                     let vals: Vec<Option<String>> = (0..s.len())
                         .map(|j| {
                             if s.is_null(j) {
@@ -848,16 +867,32 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 Arc::new(ws_array::Float32Array::from(vals))
             }
             ws_schema::DataType::Binary => {
-                let s = src
-                    .as_any()
-                    .downcast_ref::<df_array::BinaryArray>()
-                    .ok_or_else(|| {
-                        BasinError::internal(format!("expected BinaryArray for {}", field.name()))
-                    })?;
-                let vals: Vec<Option<&[u8]>> = (0..s.len())
-                    .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
-                    .collect();
-                Arc::new(ws_array::BinaryArray::from(vals))
+                // src may be BinaryArray (Binary) or BinaryViewArray (BinaryView,
+                // analogous to the Utf8View → Utf8 mapping added for Bug #40).
+                if let Some(s) = src.as_any().downcast_ref::<df_array::BinaryViewArray>() {
+                    let vals: Vec<Option<Vec<u8>>> = (0..s.len())
+                        .map(|j| {
+                            if s.is_null(j) {
+                                None
+                            } else {
+                                Some(s.value(j).to_vec())
+                            }
+                        })
+                        .collect();
+                    let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
+                    Arc::new(ws_array::BinaryArray::from(refs))
+                } else {
+                    let s = src
+                        .as_any()
+                        .downcast_ref::<df_array::BinaryArray>()
+                        .ok_or_else(|| {
+                            BasinError::internal(format!("expected BinaryArray for {}", field.name()))
+                        })?;
+                    let vals: Vec<Option<&[u8]>> = (0..s.len())
+                        .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                        .collect();
+                    Arc::new(ws_array::BinaryArray::from(vals))
+                }
             }
             ws_schema::DataType::LargeBinary => {
                 let s = src
@@ -1543,5 +1578,72 @@ mod tests {
         assert!(out.is_null(1));
         assert_eq!(out.value(0), 3600);
         assert_eq!(out.value(2), -60);
+    }
+
+    // ── Bug #40 fix: Utf8View (StringViewArray) → workspace Utf8 ─────────────
+    // DataFusion 53 emits StringViewArray for certain string functions (e.g.
+    // initcap, substr). data_type_df_to_ws now maps Utf8View → Utf8, and
+    // batch_df_to_ws downcasts StringViewArray in the Utf8 arm.
+
+    #[test]
+    fn test_batch_df_to_ws_utf8view() {
+        use datafusion::arrow::array::{
+            RecordBatch as DfRecordBatch, StringViewArray as DfStringViewArray,
+        };
+        use datafusion::arrow::datatypes::{DataType as DfDataType, Field as DfField, Schema as DfSchema};
+
+        let df_schema = Arc::new(DfSchema::new(vec![DfField::new(
+            "s",
+            DfDataType::Utf8View,
+            true,
+        )]));
+        let arr: Arc<dyn datafusion::arrow::array::Array> = Arc::new(
+            DfStringViewArray::from(vec![Some("hello"), None, Some("world")]),
+        );
+        let df_batch = DfRecordBatch::try_new(df_schema, vec![arr]).expect("df batch");
+
+        let ws_batch = batch_df_to_ws(&df_batch).expect("df→ws Utf8View should succeed");
+        assert_eq!(ws_batch.schema().field(0).data_type(), &ws_schema::DataType::Utf8);
+        let out = ws_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::StringArray>()
+            .expect("StringArray");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.value(0), "hello");
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), "world");
+    }
+
+    // ── Bug #40 fix: BinaryView (BinaryViewArray) → workspace Binary ──────────
+
+    #[test]
+    fn test_batch_df_to_ws_binaryview() {
+        use datafusion::arrow::array::{
+            BinaryViewArray as DfBinaryViewArray, RecordBatch as DfRecordBatch,
+        };
+        use datafusion::arrow::datatypes::{DataType as DfDataType, Field as DfField, Schema as DfSchema};
+
+        let df_schema = Arc::new(DfSchema::new(vec![DfField::new(
+            "b",
+            DfDataType::BinaryView,
+            true,
+        )]));
+        let arr: Arc<dyn datafusion::arrow::array::Array> = Arc::new(
+            DfBinaryViewArray::from(vec![Some(b"foo" as &[u8]), None, Some(b"bar")]),
+        );
+        let df_batch = DfRecordBatch::try_new(df_schema, vec![arr]).expect("df batch");
+
+        let ws_batch = batch_df_to_ws(&df_batch).expect("df→ws BinaryView should succeed");
+        assert_eq!(ws_batch.schema().field(0).data_type(), &ws_schema::DataType::Binary);
+        let out = ws_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ws_array::BinaryArray>()
+            .expect("BinaryArray");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.value(0), b"foo");
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), b"bar");
     }
 }
