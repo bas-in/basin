@@ -431,6 +431,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let rewritten = crate::pg_operators::rewrite_aggregate_filter(&rewritten);
     // Strip `[NOT] MATERIALIZED` hint from `WITH cte AS [NOT] MATERIALIZED (…)`.
     let rewritten = crate::pg_operators::rewrite_cte_materialized(&rewritten);
+    // Inject explicit `AS col` aliases into the base case of
+    // `WITH RECURSIVE cte(col1, col2) AS (SELECT expr1, expr2 UNION ALL ...)`.
+    // DataFusion builds the working-table schema from the static term's schema
+    // before applying the CTE column list; unnamed literals (e.g. `SELECT 1`)
+    // get auto-names like `"Int64(1)"` which break the recursive term's
+    // field references.  Adding `AS col` in the base case fixes the schema.
+    let rewritten = crate::pg_operators::rewrite_recursive_cte_column_aliases(&rewritten);
     // Translate PG range infix operators (`@>`, `<@`, `&&`, `<<`, `>>`,
     // `-|-`) into UDF calls. Must run before sqlparser sees the SQL because
     // sqlparser's PostgreSqlDialect does not model these operators.

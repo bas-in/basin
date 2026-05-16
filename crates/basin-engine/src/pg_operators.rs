@@ -30,8 +30,8 @@
 //! ### Array containment / overlap
 //! | PG operator | Rewrites to (array heuristic)            |
 //! |-------------|------------------------------------------|
-//! | `@>`        | `array_contains(lhs, rhs)`               |
-//! | `<@`        | `array_contains(rhs, lhs)`               |
+//! | `@>`        | `list_has_all(lhs, rhs)`                 |
+//! | `<@`        | `list_has_all(rhs, lhs)`                 |
 //! | `&&`        | `arrays_overlap(lhs, rhs)`               |
 //!
 //! The heuristic fires only when at least one operand textually starts with
@@ -248,9 +248,14 @@ fn find_and_after(lower: &str, start: usize) -> Option<usize> {
 /// Rewrite array containment / overlap operators for array-typed operands.
 ///
 /// Operators translated:
-/// - `A @> B`  → `array_contains(A, B)`   (A contains all elements of B)
-/// - `A <@ B`  → `array_contains(B, A)`   (A contained in B)
+/// - `A @> B`  → `list_has_all(A, B)`     (A contains all elements of B)
+/// - `A <@ B`  → `list_has_all(B, A)`     (A contained in B)
 /// - `A && B`  → `arrays_overlap(A, B)`   (A and B share at least one element)
+///
+/// `list_has_all` (alias `array_has_all`) has signature (array, array) in
+/// DataFusion 53 and is the correct mapping.  The former `array_contains` /
+/// `array_has` has signature (array, element) — passing two arrays triggers
+/// a type-coercion error in most engine configurations.
 ///
 /// Only fires when at least one operand looks like an array (starts with
 /// `ARRAY[` or contains `::` followed by a type ending in `[]`). Leaves
@@ -689,8 +694,15 @@ fn rewrite_array_op_once(sql: String, op: &str, _placeholder: bool) -> String {
         }
 
         let replacement = match op {
-            "@>" => format!("array_contains({lhs}, {rhs})"),
-            "<@" => format!("array_contains({rhs}, {lhs})"),
+            // `A @> B` — A contains all elements of B.
+            // DataFusion's `array_contains` (= `array_has`) has signature
+            // (array, element) — passing two arrays triggers a coercion
+            // error in most configs.  `list_has_all(A, B)` has signature
+            // (array, array) and is the correct mapping.
+            "@>" => format!("list_has_all({lhs}, {rhs})"),
+            // `A <@ B` — A is contained in B (all elements of A exist in B).
+            // Equivalent to `list_has_all(B, A)`.
+            "<@" => format!("list_has_all({rhs}, {lhs})"),
             "&&" => format!("arrays_overlap({lhs}, {rhs})"),
             _ => unreachable!(),
         };
@@ -2006,6 +2018,321 @@ fn rewrite_cte_keyword(sql: &str, needle_lower: &str, replacement: &str) -> Stri
 }
 
 // ---------------------------------------------------------------------------
+// WITH RECURSIVE column-alias propagation
+// ---------------------------------------------------------------------------
+
+/// Rewrite `WITH RECURSIVE cte_name(col1, col2) AS (SELECT expr1, expr2 UNION ALL ...)`
+/// so that the base-case SELECT expressions carry explicit `AS col` aliases.
+///
+/// ## Problem
+///
+/// DataFusion 53's recursive-CTE planner builds the *working-table* schema
+/// from the **static (base) term** before the CTE column list is applied.
+/// When the base term is `SELECT 1` (unnamed literal), the inferred column
+/// name is `"Int64(1)"`.  The recursive term later references `n` — which
+/// does not exist in the working table — causing:
+///
+///   `Schema error: No field named n. Valid fields are r."Int64(1)".`
+///
+/// ## Fix
+///
+/// Inject explicit `AS col_name` aliases into the base-case SELECT list so
+/// that DataFusion sees the correct field names when it builds the working-table
+/// schema.  Only expressions that do not already carry an `AS` alias receive
+/// one.
+///
+/// ## Scope / limits
+///
+/// * Only fires for `WITH RECURSIVE` with a column list `name(col1, ...)`.
+/// * Only rewrites the base case (the part before `UNION` / `UNION ALL`).
+/// * Uses a conservative text scan — handles literals, parenthesised
+///   expressions, and simple identifiers.  Nested CTEs / subqueries inside
+///   the base case are left unchanged.
+pub(crate) fn rewrite_recursive_cte_column_aliases(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+
+    // Fast path: no WITH RECURSIVE → nothing to do.
+    let rec_start = match lower.find("with recursive") {
+        Some(p) => p,
+        None => return sql.to_string(),
+    };
+
+    // Word-boundary check: nothing alphanumeric before `with`.
+    if rec_start > 0 {
+        let pre = sql.as_bytes()[rec_start - 1];
+        if pre.is_ascii_alphanumeric() || pre == b'_' {
+            return sql.to_string();
+        }
+    }
+
+    let after_rec = rec_start + "with recursive".len();
+
+    // Skip whitespace after RECURSIVE.
+    let bytes = sql.as_bytes();
+    let mut i = after_rec;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Read the CTE name (identifier).
+    let name_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i == name_start {
+        return sql.to_string(); // no name found
+    }
+
+    // Skip whitespace.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Must be followed by `(` for the column list.
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return sql.to_string(); // no column list
+    }
+
+    // Parse the column list `(col1, col2, ...)`.
+    i += 1; // skip '('
+    let col_list_start = i;
+    let mut paren_depth = 1i32;
+    while i < bytes.len() && paren_depth > 0 {
+        match bytes[i] {
+            b'(' => { paren_depth += 1; i += 1; }
+            b')' => { paren_depth -= 1; i += 1; }
+            b'\'' => {
+                // skip string literal
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            _ => { i += 1; }
+        }
+    }
+    let col_list_end = i - 1; // position of closing ')'
+    let col_list_str = &sql[col_list_start..col_list_end];
+
+    // Parse column names (simple comma-split; we don't expect sub-expressions here).
+    let col_names: Vec<&str> = col_list_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if col_names.is_empty() {
+        return sql.to_string();
+    }
+
+    // Skip whitespace and `AS` keyword.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let lower_rest = lower[i..].to_string();
+    if !lower_rest.starts_with("as") {
+        return sql.to_string();
+    }
+    i += 2; // skip "AS"
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Must be `(` — start of the CTE body.
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return sql.to_string();
+    }
+    let body_open = i;
+    i += 1; // skip '('
+
+    // Skip whitespace.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Must be SELECT keyword.
+    if !lower[i..].starts_with("select") {
+        return sql.to_string();
+    }
+    let select_kw_end = i + "select".len();
+    // Check word boundary after SELECT.
+    if select_kw_end < bytes.len() && (bytes[select_kw_end].is_ascii_alphanumeric() || bytes[select_kw_end] == b'_') {
+        return sql.to_string();
+    }
+    i = select_kw_end;
+
+    // Skip whitespace after SELECT.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    let select_list_start = i;
+
+    // Scan the SELECT list to find the UNION boundary.
+    // We need to track parenthesis depth to skip over nested subqueries.
+    let union_pos = find_union_in_base_select(sql, select_list_start);
+    let union_pos = match union_pos {
+        Some(p) => p,
+        None => return sql.to_string(), // no UNION found — not a recursive CTE body
+    };
+
+    // The base SELECT list runs from select_list_start to union_pos.
+    let base_list = &sql[select_list_start..union_pos];
+
+    // Parse the base SELECT list into individual expressions.
+    let exprs = split_select_list(base_list);
+
+    if exprs.len() != col_names.len() {
+        // Column count mismatch — leave as-is to avoid silently producing
+        // wrong results.  The planner will error out with a clear message.
+        return sql.to_string();
+    }
+
+    // For each expression, add `AS col_name` if the expression doesn't
+    // already end with an alias.
+    let mut new_exprs: Vec<String> = Vec::with_capacity(exprs.len());
+    for (expr, col) in exprs.iter().zip(col_names.iter()) {
+        let trimmed = expr.trim();
+        if expr_has_alias(trimmed) {
+            new_exprs.push(trimmed.to_string());
+        } else {
+            new_exprs.push(format!("{} AS {}", trimmed, col));
+        }
+    }
+
+    let new_base_list = new_exprs.join(", ");
+    // Reconstruct the SQL: keep everything up to select_list_start, inject
+    // the aliased list, then the UNION and everything after.
+    // Always insert a single space before UNION so that the alias name and
+    // the UNION keyword don't merge into a single token (e.g. `nUNION`).
+    let prefix = &sql[..select_list_start];
+    let suffix = &sql[union_pos..];
+    format!("{prefix}{new_base_list} {suffix}")
+}
+
+/// Find the position of `UNION` (or `UNION ALL`) in the base SELECT, at
+/// depth-0 paren level (i.e. not inside a nested subquery).
+/// Returns the byte offset of the `U` in `UNION`.
+fn find_union_in_base_select(sql: &str, from: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    let mut i = from;
+    let mut depth = 0i32;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => { depth += 1; i += 1; }
+            b')' => {
+                if depth == 0 {
+                    // Hit the closing paren of the CTE body without finding UNION.
+                    return None;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
+                    } else { i += 1; }
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                // Line comment — skip to end of line.
+                while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+            }
+            _ => {
+                if depth == 0 && lower[i..].starts_with("union") {
+                    // Word boundary check.
+                    let after = i + 5;
+                    let after_ok = after >= bytes.len()
+                        || bytes[after].is_ascii_whitespace()
+                        || bytes[after] == b'(';
+                    if after_ok {
+                        return Some(i);
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Split a SELECT column list (the part after SELECT, before UNION/FROM) into
+/// individual expression strings, respecting parenthesis depth.
+fn split_select_list(list: &str) -> Vec<String> {
+    let bytes = list.as_bytes();
+    let mut exprs = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'\'' => {
+                // skip: handled by forward scan in the caller already; here we
+                // just count parens correctly inside non-string regions.
+            }
+            b',' if depth == 0 => {
+                exprs.push(list[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = list[start..].trim();
+    if !last.is_empty() {
+        exprs.push(last.to_string());
+    }
+    exprs
+}
+
+/// Return `true` if `expr` already carries an explicit `AS alias` or is a
+/// bare identifier that DataFusion will name correctly (i.e. an unqualified
+/// column reference like `n`).  We only inject aliases for literals and
+/// arithmetic/function expressions.
+fn expr_has_alias(expr: &str) -> bool {
+    let lower = expr.to_ascii_lowercase();
+    // Explicit AS alias.
+    // Scan for ` AS ` outside of string literals.
+    let bytes = expr.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => { depth += 1; i += 1; }
+            b')' => { depth -= 1; i += 1; }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
+                    } else { i += 1; }
+                }
+            }
+            _ => {
+                if depth == 0 && lower[i..].starts_with(" as ") {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+
+// ---------------------------------------------------------------------------
 // UUID cast rewriter
 // ---------------------------------------------------------------------------
 
@@ -2503,17 +2830,21 @@ mod tests {
 
     #[test]
     fn array_contains_rewrite() {
+        // @> rewrites to list_has_all(lhs, rhs) — (array, array) signature.
         let sql = "SELECT ARRAY[1,2,3] @> ARRAY[1,2]";
         let out = rewrite_array_operators(sql);
-        assert!(out.contains("array_contains("), "got: {out}");
+        assert!(out.contains("list_has_all("), "got: {out}");
+        assert!(out.contains("ARRAY[1,2,3], ARRAY[1,2]"), "got: {out}");
     }
 
     #[test]
     fn array_contained_by_rewrite() {
+        // <@ rewrites to list_has_all(rhs, lhs) — haystack is rhs, needle-set is lhs.
         let sql = "SELECT ARRAY[1,2] <@ ARRAY[1,2,3]";
         let out = rewrite_array_operators(sql);
-        // <@ rewrites to array_contains(rhs, lhs).
-        assert!(out.contains("array_contains("), "got: {out}");
+        assert!(out.contains("list_has_all("), "got: {out}");
+        // rhs comes first in the call: list_has_all(ARRAY[1,2,3], ARRAY[1,2])
+        assert!(out.contains("ARRAY[1,2,3], ARRAY[1,2]"), "got: {out}");
     }
 
     #[test]
@@ -2627,5 +2958,39 @@ mod tests {
         let sql = "SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub";
         let out = rewrite_lateral_unnest(sql);
         assert_eq!(out, sql, "LATERAL subquery must be unchanged: {out}");
+    }
+
+    // ── WITH RECURSIVE column alias rewriter ────────────────────────────────
+
+    #[test]
+    fn recursive_cte_single_col_alias_added() {
+        let sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r";
+        let out = rewrite_recursive_cte_column_aliases(sql);
+        assert!(out.contains("SELECT 1 AS n"), "expected AS alias: {out}");
+        // Ensure a space separates the alias from UNION (no `nUNION` token merge).
+        assert!(out.contains("1 AS n UNION"), "expected space before UNION: {out}");
+    }
+
+    #[test]
+    fn recursive_cte_multi_col_alias_added() {
+        let sql = "WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib";
+        let out = rewrite_recursive_cte_column_aliases(sql);
+        assert!(out.contains("SELECT 1 AS a, 1 AS b"), "expected AS aliases: {out}");
+    }
+
+    #[test]
+    fn recursive_cte_already_aliased_unchanged() {
+        // If the base case already has AS aliases, they are preserved.
+        let sql = "WITH RECURSIVE r AS (SELECT 1 AS n UNION SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r";
+        let out = rewrite_recursive_cte_column_aliases(sql);
+        // No additional aliasing should happen (no column list on the CTE).
+        assert_eq!(out, sql, "no column list — must not touch: {out}");
+    }
+
+    #[test]
+    fn non_recursive_cte_unchanged() {
+        let sql = "WITH foo AS (SELECT 1 AS x) SELECT * FROM foo";
+        let out = rewrite_recursive_cte_column_aliases(sql);
+        assert_eq!(out, sql, "non-recursive must be unchanged: {out}");
     }
 }

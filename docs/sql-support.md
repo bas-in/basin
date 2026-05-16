@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778932487 (Unix epoch)
-SQL fragments tested: 697 total / 1806 green (across all three configurations).
+Last run: 1778934671 (Unix epoch)
+SQL fragments tested: 697 total / 1830 green (across all three configurations).
 
 ## Configurations
 
@@ -285,12 +285,12 @@ SQL fragments tested: 697 total / 1806 green (across all three configurations).
 | `SELECT unnest(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM unnest(ARRAY[1,2,3]) WITH ORDINALITY` | 🚫 | 🚫 | 🚫 | internal: plan: This feature is not implemented: UNNEST with ordinality is no… |
 | `SELECT generate_subscripts(ARRAY[10,20,30], 1)` | ✅ | ✅ | ✅ |  |
-| `SELECT ARRAY[1,2] @> ARRAY[1]` | 🛠 | ✅ | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
-| `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
+| `SELECT ARRAY[1,2] @> ARRAY[1]` | ✅ | ✅ | ✅ |  |
+| `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2] \|\| ARRAY[3,4]` | ✅ | ✅ | ✅ |  |
 | `SELECT cardinality(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
-| `SELECT array_fill(0, ARRAY[3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'array_fill'. Did you… |
-| `SELECT array_fill(0, ARRAY[2,3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'array_fill'. Did you… |
+| `SELECT array_fill(0, ARRAY[3])` | ✅ | ✅ | ✅ |  |
+| `SELECT array_fill(0, ARRAY[2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT 2 = ANY(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT 5 > ALL(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT array_positions(ARRAY[1,2,1,3], 1)` | ✅ | ✅ | ✅ |  |
@@ -392,9 +392,9 @@ SQL fragments tested: 697 total / 1806 green (across all three configurations).
 | `SELECT * FROM jsonb_to_recordset('[{"a":1},{"a":2}]'::jsonb) AS t(a int)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_to_recordset' no… |
 | `SELECT jsonb_path_query_array('{"a":[1,2,3]}'::jsonb, '$.a[*]')` | ✅ | ✅ | ✅ |  |
 | `SELECT '{"a":1}'::jsonb #- '{a}'` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot infer common type for bitwise o… |
-| `SELECT jsonb_extract_path('{"a":{"b":1}}'::jsonb, 'a', 'b')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_extract_path'.… |
-| `SELECT jsonb_extract_path_text('{"a":{"b":"x"}}'::jsonb, 'a', 'b')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_extract_path_t… |
-| `SELECT jsonb_populate_record(NULL::t, '{"id":1}'::jsonb) FROM t LIMIT 1` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'jsonb_populate_recor… |
+| `SELECT jsonb_extract_path('{"a":{"b":1}}'::jsonb, 'a', 'b')` | ✅ | ✅ | ✅ |  |
+| `SELECT jsonb_extract_path_text('{"a":{"b":"x"}}'::jsonb, 'a', 'b')` | ✅ | ✅ | ✅ |  |
+| `SELECT jsonb_populate_record(NULL::t, '{"id":1}'::jsonb) FROM t LIMIT 1` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type t |
 
 ## Functions/Math
 
@@ -527,8 +527,8 @@ SQL fragments tested: 697 total / 1806 green (across all three configurations).
 | `SELECT * FROM t WHERE name ~* '^A'` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE name !~* '^Z'` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2] \|\| ARRAY[3,4]` | ✅ | ✅ | ✅ |  |
-| `SELECT ARRAY[1,2,3] @> ARRAY[1,2]` | 🛠 | ✅ | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
-| `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | 🛠 | ✅ | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
+| `SELECT ARRAY[1,2,3] @> ARRAY[1,2]` | ✅ | ✅ | ✅ |  |
+| `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2] && ARRAY[2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id = ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id > ALL (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
@@ -637,11 +637,11 @@ SQL fragments tested: 697 total / 1806 green (across all three configurations).
 |---|---|---|---|---|
 | `WITH cte AS (SELECT 1 AS x) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH cte AS (SELECT * FROM t) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
-| `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r` | 🛠 | 🛠 | 🛠 | internal: plan: Schema error: No field named n. Valid fields are r."Int64(1)". |
+| `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r` | ✅ | ✅ | ✅ |  |
 | `WITH ins AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM ins` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query INSERT INTO t VALUES (… |
 | `WITH upd AS (UPDATE t SET id = 99 WHERE id = 1 RETURNING id) SELECT * FROM upd` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query UPDATE t SET id = 99 W… |
 | `WITH del AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT * FROM del` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query DELETE FROM t WHERE id… |
-| `WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Projections require unique expression … |
+| `WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Schema error: project index 1 out of bounds, … |
 | `WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a, b` | ✅ | ✅ | ✅ |  |

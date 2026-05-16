@@ -41,10 +41,10 @@ use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveTime, Timelike, Utc};
 use datafusion::arrow::array::{
-    Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    StringArray, StringBuilder, TimestampMicrosecondBuilder,
+    Array, ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    ListArray, StringArray, StringBuilder, TimestampMicrosecondBuilder,
 };
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
@@ -321,6 +321,13 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
             ],
             Volatility::Immutable,
         ),
+    }));
+
+    // ── array_fill(anyelement, ARRAY[dim1 [,dim2 ...]]) → anyarray ───────────
+    // Fills an array with copies of a scalar value.  Accepts any 2-argument
+    // call so it can handle both integer and numeric fill values.
+    ctx.register_udf(ScalarUDF::from(ArrayFillUdf {
+        signature: Signature::any(2, Volatility::Immutable),
     }));
 }
 
@@ -1422,6 +1429,117 @@ fn add_alias_after_call(sql: &str, func_name: &str, alias: &str) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// array_fill(anyelement, ARRAY[dim1 [,dim2 ...]]) → anyarray
+// ---------------------------------------------------------------------------
+
+/// `array_fill(val, dims)` — return an array of `dims[0]` copies of `val`
+/// (or a nested array for multi-dimensional dims).
+///
+/// Postgres: `array_fill(0, ARRAY[3])` → `{0,0,0}` (int4[]).
+///
+/// Basin returns a 1-D `List<Int64>` or `List<Float64>` depending on the
+/// fill value type; multi-dimensional dims are supported by flattening into
+/// a 1-D list of the total element count (dims[0] * dims[1] * ...).
+///
+/// The `dims` argument is the result of evaluating `ARRAY[n1, n2, ...]`, which
+/// DataFusion materialises as a `List<Int64>` scalar.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ArrayFillUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ArrayFillUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "array_fill" }
+    fn signature(&self) -> &Signature { &self.signature }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        // Return type is List<fill_value_type>.
+        let elem_type = if arg_types.is_empty() {
+            DataType::Int64
+        } else {
+            arg_types[0].clone()
+        };
+        Ok(DataType::List(Arc::new(Field::new_list_field(elem_type, true))))
+    }
+
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        if args.len() != 2 {
+            return exec_err!("array_fill requires exactly 2 arguments, got {}", args.len());
+        }
+
+        // ── arg 0: fill value ──────────────────────────────────────────────
+        let fill_scalar = match &args[0] {
+            ColumnarValue::Scalar(sv) => sv.clone(),
+            ColumnarValue::Array(arr) => {
+                if arr.len() == 0 {
+                    return exec_err!("array_fill: fill value array is empty");
+                }
+                ScalarValue::try_from_array(arr.as_ref(), 0)?
+            }
+        };
+
+        // ── arg 1: dims array ──────────────────────────────────────────────
+        // DataFusion evaluates `ARRAY[3]` → List<Int64> scalar containing [3].
+        let dims_arr: ArrayRef = args[1].clone().into_array(1)?;
+        let dims: Vec<i64> = extract_dims_from_list(&dims_arr)?;
+
+        if dims.is_empty() {
+            return exec_err!("array_fill: dims array must have at least 1 element");
+        }
+        for &d in &dims {
+            if d < 0 {
+                return exec_err!("array_fill: dimension must be non-negative, got {d}");
+            }
+        }
+
+        // Total element count = product of all dims.
+        let total: i64 = dims.iter().product();
+        if total > 10_000_000 {
+            return exec_err!("array_fill: requested {total} elements exceeds 10 million limit");
+        }
+
+        // Build a list of `total` copies of `fill_scalar`.
+        let elements: Vec<ScalarValue> = (0..total as usize).map(|_| fill_scalar.clone()).collect();
+        let elem_type = fill_scalar.data_type();
+        let list_arr = ScalarValue::new_list(&elements, &elem_type, true);
+        Ok(ColumnarValue::Scalar(ScalarValue::List(list_arr)))
+    }
+}
+
+/// Extract dimension values from the dims argument (a `List<Int64>` scalar or
+/// a `Int64Array` with a single row).
+fn extract_dims_from_list(arr: &ArrayRef) -> DFResult<Vec<i64>> {
+    match arr.data_type() {
+        DataType::List(_) => {
+            let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution("array_fill: dims not a ListArray".into())
+            })?;
+            if list.len() == 0 {
+                return Ok(vec![]);
+            }
+            // The first (and only, for a scalar) row.
+            let values = list.value(0);
+            let ints = values.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution(
+                    "array_fill: dims list must contain Int64 values".into()
+                )
+            })?;
+            Ok((0..ints.len()).map(|i| ints.value(i)).collect())
+        }
+        DataType::Int64 => {
+            let ints = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution("array_fill: dims not Int64Array".into())
+            })?;
+            Ok((0..ints.len()).map(|i| ints.value(i)).collect())
+        }
+        other => exec_err!("array_fill: expected List<Int64> for dims, got {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,5 +1561,90 @@ mod tests {
             rewrite_every_to_bool_and("SELECT noevery(x) FROM t"),
             "SELECT noevery(x) FROM t"
         );
+    }
+
+    // ── array_fill ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn array_fill_1d_int_three_zeros() {
+        use datafusion::arrow::array::ListArray;
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::config::ConfigOptions;
+        use datafusion::scalar::ScalarValue;
+        use datafusion::logical_expr::ScalarFunctionArgs;
+
+        let udf = ArrayFillUdf { signature: Signature::any(2, Volatility::Immutable) };
+
+        // Simulate: array_fill(0, ARRAY[3])
+        // dims = List<Int64> with value [3]
+        let fill = ColumnarValue::Scalar(ScalarValue::Int64(Some(0)));
+        let dim_list = ScalarValue::new_list(
+            &[ScalarValue::Int64(Some(3))],
+            &DataType::Int64,
+            true,
+        );
+        let dims = ColumnarValue::Scalar(ScalarValue::List(dim_list));
+        let return_field = Arc::new(Field::new("_", DataType::List(
+            Arc::new(Field::new_list_field(DataType::Int64, true)),
+        ), true));
+
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args: vec![fill, dims],
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field,
+            config_options: Arc::new(ConfigOptions::default()),
+        }).unwrap();
+
+        match result {
+            ColumnarValue::Scalar(ScalarValue::List(list_arr)) => {
+                assert_eq!(list_arr.len(), 1, "outer list has 1 row");
+                let inner = list_arr.value(0);
+                let ints = inner.as_any().downcast_ref::<Int64Array>().expect("Int64Array");
+                assert_eq!(ints.len(), 3, "should have 3 elements");
+                assert_eq!(ints.value(0), 0);
+                assert_eq!(ints.value(1), 0);
+                assert_eq!(ints.value(2), 0);
+            }
+            other => panic!("expected ScalarValue::List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_fill_2d_total_six_elements() {
+        use datafusion::config::ConfigOptions;
+        use datafusion::scalar::ScalarValue;
+        use datafusion::logical_expr::ScalarFunctionArgs;
+        use datafusion::arrow::datatypes::Field;
+
+        let udf = ArrayFillUdf { signature: Signature::any(2, Volatility::Immutable) };
+
+        // Simulate: array_fill(0, ARRAY[2,3]) — total 6 elements
+        let fill = ColumnarValue::Scalar(ScalarValue::Int64(Some(0)));
+        let dim_list = ScalarValue::new_list(
+            &[ScalarValue::Int64(Some(2)), ScalarValue::Int64(Some(3))],
+            &DataType::Int64,
+            true,
+        );
+        let dims = ColumnarValue::Scalar(ScalarValue::List(dim_list));
+        let return_field = Arc::new(Field::new("_", DataType::List(
+            Arc::new(Field::new_list_field(DataType::Int64, true)),
+        ), true));
+
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args: vec![fill, dims],
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field,
+            config_options: Arc::new(ConfigOptions::default()),
+        }).unwrap();
+
+        match result {
+            ColumnarValue::Scalar(ScalarValue::List(list_arr)) => {
+                let inner = list_arr.value(0);
+                assert_eq!(inner.len(), 6, "2×3 = 6 elements");
+            }
+            other => panic!("expected ScalarValue::List, got {other:?}"),
+        }
     }
 }
