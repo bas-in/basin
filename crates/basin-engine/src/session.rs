@@ -255,6 +255,12 @@ pub(crate) async fn open(
     let store = engine.config().storage.project_object_store(&project);
     ctx.register_object_store(&url, store);
 
+    // Register JSONB table-valued functions (UDTFs) directly on the real
+    // session context. UDTFs are stored in a separate `table_functions` map
+    // that is not captured by `StatelessUdfCache` (which only snapshots scalar
+    // and aggregate functions). These must be registered per-session.
+    crate::jsonb_udf::register_jsonb_udtfs(&ctx);
+
     // Auth session functions: `auth_uid()`, `auth_role()`, `auth_jwt()`.
     // These capture a per-session Arc<AuthContext> so they cannot be cached.
     // Only these 3 UDFs require individual write-lock acquisitions per session.

@@ -516,16 +516,32 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
         name: "jsonb_to_recordset",
     }));
 
-    // ---------------------------------------------------------------------------
-    // Table-valued functions (UDTFs) — for use in FROM clauses.
-    // These require register_udtf (not register_udf) because DataFusion looks
-    // them up separately when planning FROM <function>(...) syntax.
-    // ---------------------------------------------------------------------------
+    // jsonb_delete_path(jsonb, text) -> jsonb  (rewrite target for jsonb #- '{path}')
+    ctx.register_udf(ScalarUDF::from(JsonbDeletePathUdf {
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+    }));
+
+    // Note: UDTFs (table-valued functions used in FROM clauses) are NOT
+    // registered here because the StatelessUdfCache only captures scalar and
+    // aggregate functions. UDTFs must be registered directly on every real
+    // session context — see `register_jsonb_udtfs` below.
+}
+
+/// Register JSONB table-valued functions (UDTFs) on `ctx`.
+///
+/// DataFusion stores UDTFs in a separate `table_functions` map that is NOT
+/// included in the scalar/aggregate UDF cache snapshot.  This function must
+/// be called on every real [`SessionContext`] after it is built.
+pub(crate) fn register_jsonb_udtfs(ctx: &SessionContext) {
     ctx.register_udtf("jsonb_each", Arc::new(JsonbEachTf { text_values: false }));
     ctx.register_udtf("jsonb_each_text", Arc::new(JsonbEachTf { text_values: true }));
     ctx.register_udtf("jsonb_array_elements", Arc::new(JsonbArrayElementsTf { text_values: false }));
     ctx.register_udtf("jsonb_array_elements_text", Arc::new(JsonbArrayElementsTf { text_values: true }));
     ctx.register_udtf("jsonb_object_keys", Arc::new(JsonbObjectKeysTf {}));
+    // json_to_recordset / jsonb_to_recordset — table functions that expand a
+    // JSON array of objects into rows.
+    ctx.register_udtf("json_to_recordset", Arc::new(JsonToRecordsetTf {}));
+    ctx.register_udtf("jsonb_to_recordset", Arc::new(JsonToRecordsetTf {}));
 }
 
 // ---------------------------------------------------------------------------
@@ -3540,5 +3556,190 @@ impl TableFunctionImpl for JsonbObjectKeysTf {
         let batch = RecordBatch::try_new(schema.clone(), vec![key_arr])
             .map_err(|e| DataFusionError::Plan(format!("jsonb_object_keys: RecordBatch error: {e}")))?;
         Ok(Arc::new(JsonbObjectKeysTable { schema, batches: vec![batch] }))
+    }
+}
+
+// ── jsonb_delete_path(jsonb, text) — scalar UDF target for `jsonb #- '{path}'`
+//
+// Postgres: `'{"a":{"b":1}}'::jsonb #- '{a,b}'` removes the nested key at
+// the given path. The second arg is a text-path like `'{a,b}'` (PG text-array
+// literal). Our rewriter converts `lhs #- rhs` to `jsonb_delete_path(lhs, rhs)`.
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonbDeletePathUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for JsonbDeletePathUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "jsonb_delete_path" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        if arrays.len() != 2 {
+            return exec_err!("jsonb_delete_path expects 2 arguments, got {}", arrays.len());
+        }
+        let doc_arr = &arrays[0];
+        let path_arr = &arrays[1];
+        let len = doc_arr.len();
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(len);
+        for i in 0..len {
+            if doc_arr.is_null(i) || path_arr.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let mut doc_val = match extract_jsonb_value(doc_arr, i, "jsonb_delete_path")? {
+                Some(v) => v,
+                None => { out.push(None); continue; }
+            };
+            let path_str = match extract_string(path_arr, i) {
+                Some(s) => s,
+                None => { out.push(Some(value_to_jsonb(&doc_val)?)); continue; }
+            };
+            let path_parts = parse_key_list(&path_str);
+            if !path_parts.is_empty() {
+                delete_json_path(&mut doc_val, &path_parts);
+            }
+            out.push(Some(value_to_jsonb(&doc_val)?));
+        }
+        let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+}
+
+/// Recursively delete the value at `path` from `doc`.
+fn delete_json_path(doc: &mut Value, path: &[String]) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() == 1 {
+        match doc {
+            Value::Object(m) => { m.remove(&path[0]); }
+            Value::Array(a) => {
+                if let Ok(idx) = path[0].parse::<usize>() {
+                    if idx < a.len() { a.remove(idx); }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    match doc {
+        Value::Object(m) => {
+            if let Some(child) = m.get_mut(&path[0]) {
+                delete_json_path(child, &path[1..]);
+            }
+        }
+        Value::Array(a) => {
+            if let Ok(idx) = path[0].parse::<usize>() {
+                if let Some(child) = a.get_mut(idx) {
+                    delete_json_path(child, &path[1..]);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── json_to_recordset / jsonb_to_recordset ────────────────────────────────────
+//
+// Expands a JSON array of objects into a table. The output schema is inferred
+// from the first object in the array. Column types are all Utf8 (scalars are
+// serialised to their JSON text representation so the planner can apply CAST
+// from the `AS t(col type)` alias hint).
+//
+// Example: `SELECT * FROM json_to_recordset('[{"a":1},{"a":2}]') AS t(a int)`
+//          → two rows with column `a` = "1", "2" (cast to int by DataFusion).
+
+#[derive(Debug)]
+struct JsonToRecordsetTf {}
+
+#[derive(Debug)]
+struct JsonToRecordsetTable {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for JsonToRecordsetTable {
+    fn as_any(&self) -> &dyn Any { self }
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn table_type(&self) -> TableType { TableType::Base }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+    }
+}
+
+impl TableFunctionImpl for JsonToRecordsetTf {
+    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        if args.len() != 1 {
+            return plan_err!("json_to_recordset / jsonb_to_recordset requires exactly 1 argument");
+        }
+        let json_str = match json_from_expr(&args[0]) {
+            Some(s) => s,
+            None => return plan_err!("json_to_recordset: argument must be a JSON array literal"),
+        };
+        let arr: Vec<Value> = serde_json::from_str(&json_str)
+            .map_err(|e| DataFusionError::Plan(format!("json_to_recordset: JSON parse error: {e}")))?;
+
+        // Collect all keys across all objects (preserving insertion order from first object).
+        let mut keys: Vec<String> = Vec::new();
+        for row in &arr {
+            if let Value::Object(m) = row {
+                for k in m.keys() {
+                    if !keys.contains(k) {
+                        keys.push(k.clone());
+                    }
+                }
+            }
+        }
+
+        if keys.is_empty() {
+            // Empty input or non-object rows — return empty table with one Utf8 column.
+            let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+            return Ok(Arc::new(JsonToRecordsetTable { schema, batches: vec![] }));
+        }
+
+        let schema = Arc::new(Schema::new(
+            keys.iter().map(|k| Field::new(k.as_str(), DataType::Utf8, true)).collect::<Vec<_>>()
+        ));
+
+        // Build one StringArray per column.
+        let mut columns: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(arr.len()); keys.len()];
+        for row in &arr {
+            let obj = match row {
+                Value::Object(m) => m,
+                _ => {
+                    for col in &mut columns { col.push(None); }
+                    continue;
+                }
+            };
+            for (col_idx, key) in keys.iter().enumerate() {
+                let cell: Option<String> = match obj.get(key) {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(other) => serde_json::to_string(other).ok(),
+                };
+                columns[col_idx].push(cell);
+            }
+        }
+
+        let arrays: Vec<ArrayRef> = columns.into_iter()
+            .map(|col| Arc::new(StringArray::from(col)) as ArrayRef)
+            .collect();
+
+        let batch = RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| DataFusionError::Plan(format!("json_to_recordset: RecordBatch error: {e}")))?;
+        Ok(Arc::new(JsonToRecordsetTable { schema, batches: vec![batch] }))
     }
 }

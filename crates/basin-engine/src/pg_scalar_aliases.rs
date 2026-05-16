@@ -757,6 +757,149 @@ impl ScalarUDFImpl for MakeTimestamptzUdf {
 }
 
 // ---------------------------------------------------------------------------
+// rewrite_make_interval_named_args — convert PG named-arg form to positional
+// ---------------------------------------------------------------------------
+
+/// Rewrite `make_interval(years => 1, days => 30)` to positional form
+/// `make_interval(1, 0, 0, 30, 0, 0, 0)` so DataFusion's planner accepts it.
+///
+/// PG positional order: (years, months, weeks, days, hours, mins, secs).
+/// All unspecified args default to 0.  Best-effort text rewrite; only fires
+/// when `make_interval` is followed by an opening `(` that contains `=>`.
+pub(crate) fn rewrite_make_interval_named_args(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("make_interval") {
+        return sql.to_string();
+    }
+
+    // Named-arg parameter name → positional index (0-based).
+    let param_order = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+
+    let mut out = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower_slice = out[search_from..].to_ascii_lowercase();
+        let Some(rel) = lower_slice.find("make_interval") else { break; };
+        let name_start = search_from + rel;
+        let name_end = name_start + "make_interval".len();
+
+        // Must be a word boundary: char before must not be ident.
+        let before_ok = name_start == 0 || {
+            let b = out.as_bytes()[name_start - 1];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        if !before_ok {
+            search_from = name_end;
+            continue;
+        }
+
+        // Skip whitespace then look for `(`.
+        let bytes = out.as_bytes();
+        let mut j = name_end;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            search_from = name_end;
+            continue;
+        }
+        let open = j;
+
+        // Find the matching closing `)`.
+        let mut depth = 1i32;
+        let mut k = open + 1;
+        while k < bytes.len() && depth > 0 {
+            match bytes[k] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'\'' => {
+                    k += 1;
+                    while k < bytes.len() {
+                        if bytes[k] == b'\'' {
+                            if k + 1 < bytes.len() && bytes[k + 1] == b'\'' { k += 2; continue; }
+                            k += 1;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let close = k - 1; // index of `)`
+
+        let inner = out[open + 1..close].to_string();
+
+        // Only rewrite if the args contain `=>` (named form).
+        if !inner.contains("=>") {
+            search_from = close + 1;
+            continue;
+        }
+
+        // Parse named args: split by `,` at depth 0, then parse `name => value`.
+        let mut positional = [0.0f64; 7]; // years, months, weeks, days, hours, mins, secs
+        let inner_lower = inner.to_ascii_lowercase();
+        let parts = split_at_top_level_commas(&inner_lower);
+        for part in &parts {
+            let part = part.trim();
+            if let Some(arrow_pos) = part.find("=>") {
+                let name = part[..arrow_pos].trim();
+                let val_str = part[arrow_pos + 2..].trim();
+                if let Some(idx) = param_order.iter().position(|&p| p == name) {
+                    if let Ok(v) = val_str.parse::<f64>() {
+                        positional[idx] = v;
+                    }
+                }
+            }
+        }
+
+        // Build replacement: make_interval(y, mo, w, d, h, mi, s)
+        let replacement = format!(
+            "make_interval({}, {}, {}, {}, {}, {}, {})",
+            positional[0] as i64, positional[1] as i64, positional[2] as i64,
+            positional[3] as i64, positional[4] as i64, positional[5] as i64,
+            positional[6] as i64,
+        );
+        out.replace_range(name_start..=close, &replacement);
+        search_from = name_start + replacement.len();
+    }
+    out
+}
+
+/// Split a string at top-level commas (not inside parentheses or quotes).
+fn split_at_top_level_commas(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b',' if depth == 0 => {
+                parts.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(s[start..].to_string());
+    parts
+}
+
+// ---------------------------------------------------------------------------
 // make_interval — stub, always returns "0 seconds" as text (ORM probe only)
 // ---------------------------------------------------------------------------
 
@@ -779,11 +922,41 @@ impl ScalarUDFImpl for MakeIntervalUdf {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        // v0.1 stub: returns "0 seconds" — sufficient for ORM startup probes.
-        Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(
-            Some("0 seconds".into()),
-        )))
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Positional order: years, months, weeks, days, hours, mins, secs.
+        // Each arg is Int64 (named-arg rewriter converts to positional ints).
+        // Returns an ISO-8601-style interval text that DataFusion can parse
+        // (e.g. "1 year 30 days 0 seconds").
+        let get_i64 = |idx: usize| -> i64 {
+            if idx >= args.args.len() { return 0; }
+            match &args.args[idx] {
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => *v,
+                ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => *v as i64,
+                _ => 0,
+            }
+        };
+        let years  = get_i64(0);
+        let months = get_i64(1);
+        let weeks  = get_i64(2);
+        let days   = get_i64(3);
+        let hours  = get_i64(4);
+        let mins   = get_i64(5);
+        let secs   = get_i64(6);
+
+        // Convert to total seconds for a simple interval text representation.
+        let total_days = years * 365 + months * 30 + weeks * 7 + days;
+        let total_secs = hours * 3600 + mins * 60 + secs;
+
+        let interval_text = if total_days == 0 && total_secs == 0 {
+            "0 seconds".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if total_days != 0 { parts.push(format!("{total_days} days")); }
+            if total_secs != 0 { parts.push(format!("{total_secs} seconds")); }
+            parts.join(" ")
+        };
+
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(interval_text))))
     }
 }
 
@@ -1646,5 +1819,39 @@ mod tests {
             }
             other => panic!("expected ScalarValue::List, got {other:?}"),
         }
+    }
+
+    // ── make_interval named-arg rewriter ─────────────────────────────────────
+
+    #[test]
+    fn test_rewrite_make_interval_named_args_years_days() {
+        let sql = "SELECT make_interval(years => 1, days => 30)";
+        let out = rewrite_make_interval_named_args(sql);
+        // years=1 → index 0; days=30 → index 3; rest 0
+        assert_eq!(out, "SELECT make_interval(1, 0, 0, 30, 0, 0, 0)");
+    }
+
+    #[test]
+    fn test_rewrite_make_interval_named_args_passthrough_positional() {
+        // Positional call (no =>) must be left unchanged.
+        let sql = "SELECT make_interval(1, 0, 0, 30, 0, 0, 0)";
+        let out = rewrite_make_interval_named_args(sql);
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn test_rewrite_make_interval_named_args_no_match() {
+        // No make_interval → fast path, no change.
+        let sql = "SELECT 1 + 1";
+        let out = rewrite_make_interval_named_args(sql);
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn test_rewrite_make_interval_named_args_hours_only() {
+        let sql = "SELECT make_interval(hours => 3)";
+        let out = rewrite_make_interval_named_args(sql);
+        // hours=3 → index 4
+        assert_eq!(out, "SELECT make_interval(0, 0, 0, 0, 3, 0, 0)");
     }
 }

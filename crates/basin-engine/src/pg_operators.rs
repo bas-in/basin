@@ -1587,13 +1587,13 @@ fn rewrite_bitwise_xor_hash(sql: &str) -> String {
             out.push_str(&sql[start..i]);
             continue;
         }
-        // Replace `#` that is NOT part of `#>` or `#>>` (JSON operators) or
-        // `#"` (quoted identifier start in some dialects). Plain `#` between
-        // tokens is the PG bitwise XOR.
+        // Replace `#` that is NOT part of `#>` or `#>>` (JSON path operators),
+        // `#"` (quoted identifier), or `#-` (JSONB path-delete operator).
+        // Plain `#` between tokens is the PG bitwise XOR.
         if bytes[i] == b'#' {
             let next = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
-            if next == b'>' || next == b'"' {
-                // `#>` / `#>>` / `#"` — pass through.
+            if next == b'>' || next == b'"' || next == b'-' {
+                // `#>` / `#>>` / `#"` / `#-` — pass through unchanged.
                 out.push('#');
             } else {
                 // PG bitwise XOR: `A # B` → `A ^ B`.
@@ -2992,5 +2992,30 @@ mod tests {
         let sql = "WITH foo AS (SELECT 1 AS x) SELECT * FROM foo";
         let out = rewrite_recursive_cte_column_aliases(sql);
         assert_eq!(out, sql, "non-recursive must be unchanged: {out}");
+    }
+
+    // ── bitwise `#` vs JSONB `#-` ────────────────────────────────────────────
+
+    #[test]
+    fn bitwise_xor_hash_rewrites_bare_hash() {
+        // `A # B` (bitwise XOR) must become `A ^ B`.
+        let out = rewrite_bitwise_xor_hash("SELECT 5 # 3");
+        assert_eq!(out, "SELECT 5 ^ 3");
+    }
+
+    #[test]
+    fn bitwise_xor_hash_preserves_hash_minus() {
+        // `jsonb #- path` must NOT be mangled to `^-`.
+        let sql = "SELECT '{\"a\":1}' #- '{a}'";
+        let out = rewrite_bitwise_xor_hash(sql);
+        assert_eq!(out, sql, "#- must be left untouched: {out}");
+    }
+
+    #[test]
+    fn bitwise_xor_hash_preserves_hash_arrow() {
+        // `#>` and `#>>` must not be touched.
+        let sql = "SELECT data #> '{a}' FROM t";
+        let out = rewrite_bitwise_xor_hash(sql);
+        assert_eq!(out, sql, "#> must be left untouched: {out}");
     }
 }

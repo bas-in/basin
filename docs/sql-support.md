@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778934671 (Unix epoch)
-SQL fragments tested: 697 total / 1830 green (across all three configurations).
+Last run: 1778936205 (Unix epoch)
+SQL fragments tested: 697 total / 1857 green (across all three configurations).
 
 ## Configurations
 
@@ -322,7 +322,7 @@ SQL fragments tested: 697 total / 1830 green (across all three configurations).
 | `SELECT make_time(12, 30, 45.5)` | ✅ | ✅ | ✅ |  |
 | `SELECT make_timestamp(2024, 1, 15, 12, 30, 45.5)` | ✅ | ✅ | ✅ |  |
 | `SELECT make_timestamptz(2024, 1, 15, 12, 30, 45.5, 'UTC')` | ✅ | ✅ | ✅ |  |
-| `SELECT make_interval(years => 1, days => 30)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Function 'make_interval' does not supp… |
+| `SELECT make_interval(years => 1, days => 30)` | ✅ | ✅ | ✅ |  |
 | `SELECT date_part('year', NOW())` | ✅ | ✅ | ✅ |  |
 | `SELECT EXTRACT(EPOCH FROM NOW())` | ✅ | ✅ | ✅ |  |
 | `SELECT date '2024-01-01' + interval '1 day'` | ✅ | ✅ | ✅ |  |
@@ -370,10 +370,10 @@ SQL fragments tested: 697 total / 1830 green (across all three configurations).
 | `SELECT jsonb_pretty('{"a":1}'::jsonb)` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_array_length('[1,2,3]'::jsonb)` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_object_keys('{"a":1,"b":2}'::jsonb)` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM jsonb_each('{"a":1}'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_each' not found |
-| `SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_each_text' not f… |
-| `SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_array_elements' … |
-| `SELECT * FROM jsonb_array_elements_text('["a","b"]'::jsonb)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_array_elements_t… |
+| `SELECT * FROM jsonb_each('{"a":1}'::jsonb)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM jsonb_array_elements_text('["a","b"]'::jsonb)` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_build_object('a', 1, 'b', 2)` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_build_array(1, 'a', true)` | ✅ | ✅ | ✅ |  |
 | `SELECT to_jsonb(ROW(1, 'a'))` | ✅ | ✅ | ✅ |  |
@@ -388,10 +388,10 @@ SQL fragments tested: 697 total / 1830 green (across all three configurations).
 | `SELECT '{"a":1}'::jsonb \|\| '{"b":2}'::jsonb` | ✅ | ✅ | ✅ |  |
 | `SELECT json_to_record('{"a":1,"b":"foo"}'::json) AS t(a int, b text)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: (… |
 | `SELECT jsonb_to_record('{"a":1,"b":"foo"}'::jsonb) AS t(a int, b text)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: (… |
-| `SELECT * FROM json_to_recordset('[{"a":1},{"a":2}]'::json) AS t(a int)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'json_to_recordset' not… |
-| `SELECT * FROM jsonb_to_recordset('[{"a":1},{"a":2}]'::jsonb) AS t(a int)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_to_recordset' no… |
+| `SELECT * FROM json_to_recordset('[{"a":1},{"a":2}]'::json) AS t(a int)` | ✅ | ✅ | ✅ |  |
+| `SELECT * FROM jsonb_to_recordset('[{"a":1},{"a":2}]'::jsonb) AS t(a int)` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_path_query_array('{"a":[1,2,3]}'::jsonb, '$.a[*]')` | ✅ | ✅ | ✅ |  |
-| `SELECT '{"a":1}'::jsonb #- '{a}'` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot infer common type for bitwise o… |
+| `SELECT '{"a":1}'::jsonb #- '{a}'` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_extract_path('{"a":{"b":1}}'::jsonb, 'a', 'b')` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_extract_path_text('{"a":{"b":"x"}}'::jsonb, 'a', 'b')` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_populate_record(NULL::t, '{"id":1}'::jsonb) FROM t LIMIT 1` | 📜 | 📜 | 📜 | internal: plan: This feature is not implemented: Unsupported SQL type t |
@@ -670,7 +670,7 @@ SQL fragments tested: 697 total / 1830 green (across all three configurations).
 | `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Argument #2 must be an INTEGER or NULL… |
 | `SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
 | `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | ✅ | ✅ | ✅ |  |
-| `SELECT t.id, sub.* FROM t, LATERAL jsonb_each('{"a":1}'::jsonb) sub` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_each' not found |
+| `SELECT t.id, sub.* FROM t, LATERAL jsonb_each('{"a":1}'::jsonb) sub` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
 
 ## SELECT/Locking

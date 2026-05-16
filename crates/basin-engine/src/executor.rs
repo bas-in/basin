@@ -461,6 +461,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // `extract_epoch_from_interval(interval_expr)` — DataFusion's built-in
     // `EXTRACT(EPOCH FROM x)` handles timestamps but not interval values.
     let rewritten = crate::interval_tz_udf::rewrite_extract_epoch_interval(&rewritten);
+    // Rewrite `make_interval(years => 1, days => 30)` (PG named-arg form) to
+    // the positional form `make_interval(1, 0, 0, 30, 0, 0, 0)` so DataFusion's
+    // planner accepts it (named arguments are not supported by the UDF machinery).
+    let rewritten = crate::pg_scalar_aliases::rewrite_make_interval_named_args(&rewritten);
     // Rewrite `every(...)` → `bool_and(...) AS every` — PG alias for the same
     // aggregate. The AS alias preserves a distinct output column name so that
     // DataFusion doesn't see two expressions both resolving to `bool_and`.

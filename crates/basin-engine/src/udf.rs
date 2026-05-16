@@ -3280,6 +3280,11 @@ pub(crate) fn rewrite_json_operators(sql: &str) -> String {
     // Rewrite `jsonb - key/ARRAY/idx` to delete UDF calls.
     s = rewrite_jsonb_delete_op(&s);
 
+    // Rewrite `jsonb #- '{path}'` (PG path-delete operator) to
+    // `jsonb_delete_path(jsonb, '{path}')`. Must run before the `#>` / `#>>`
+    // rewrites and before `rewrite_pg_bitwise_operators` converts `#` to `^`.
+    s = rewrite_binary_op_to_fn(&s, "#-", "jsonb_delete_path");
+
     // Operators ordered longest-first to avoid prefix collisions
     for &(op, func) in &[
         ("#>>", "json_path_extract_text"),
