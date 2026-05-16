@@ -259,11 +259,15 @@ pub(crate) fn schema_and_constraints_from_columns(
                         columns: vec![col.name.value.clone()],
                     });
                 }
-                ColumnOption::Check(expr) => {
+                ColumnOption::Check(constraint) => {
                     let name = format!("{table_name}_{}_check", col.name.value);
+                    // `constraint` is a `CheckConstraint` struct whose `Display`
+                    // renders `CHECK (<expr>)`. We want only the bare boolean
+                    // expression so DataFusion can evaluate it without treating
+                    // "CHECK" as an unknown function. Use the inner `expr` field.
                     extracted.checks.push(CheckConstraint {
                         name,
-                        predicate: expr.to_string(),
+                        predicate: constraint.expr.to_string(),
                     });
                 }
                 ColumnOption::ForeignKey(sqlparser::ast::ForeignKeyConstraint {

@@ -392,6 +392,54 @@ fn scalar_to_canonical_string(arr: &dyn Array, row: usize) -> Result<String> {
 // CHECK enforcement
 // --------------------------------------------------------------------
 
+/// Normalise a stored CHECK predicate so it is a bare boolean expression
+/// suitable for `SELECT (<expr>) FROM t`.
+///
+/// The column-level DDL path historically called `CheckConstraint::to_string()`
+/// which renders `CHECK (<inner>)` including the keyword wrapper. DataFusion
+/// would then see `check(...)` as an unknown scalar function call. This helper
+/// strips a leading (case-insensitive) `CHECK` keyword followed by a balanced
+/// outer `(...)`, returning only the inner expression text. If the predicate
+/// does not start with the `CHECK` keyword the function is a no-op (idempotent).
+///
+/// Robustness: we locate the matching close-paren by counting nesting depth
+/// rather than naive string-slicing, so expressions that contain function
+/// calls with their own parentheses are handled correctly.
+fn strip_check_wrapper(predicate: &str) -> &str {
+    let trimmed = predicate.trim();
+    // Case-insensitive prefix check for "CHECK".
+    let after_kw = if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("CHECK") {
+        trimmed[5..].trim_start()
+    } else {
+        return predicate;
+    };
+    // Expect the next character to be '('.
+    if !after_kw.starts_with('(') {
+        return predicate;
+    }
+    // Walk the string tracking paren depth to find the matching ')'.
+    let mut depth: usize = 0;
+    let mut close_pos: Option<usize> = None;
+    for (i, ch) in after_kw.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    match close_pos {
+        // The matching ')' must be the last non-whitespace character.
+        Some(end) if after_kw[end + 1..].trim().is_empty() => &after_kw[1..end],
+        _ => predicate,
+    }
+}
+
 /// Evaluate every CHECK predicate against the batch via DataFusion.
 /// Rows where the predicate is false (or NULL — PG treats NULL as
 /// satisfying the predicate, so we accept NULL) raise SQLSTATE 23514.
@@ -420,7 +468,11 @@ pub(crate) async fn enforce_check_constraints(
         .map_err(|e| BasinError::internal(format!("CHECK register: {e}")))?;
 
     for c in checks {
-        let sql = format!("SELECT ({}) AS ok FROM t", c.predicate);
+        // Normalize: strip any leading CHECK (...) wrapper that may have been
+        // stored by an earlier version of the DDL path, making evaluation
+        // idempotent whether the stored form is bare or wrapped.
+        let bare = strip_check_wrapper(&c.predicate);
+        let sql = format!("SELECT ({bare}) AS ok FROM t");
         let df = ctx.sql(&sql).await.map_err(|e| {
             BasinError::InvalidSchema(format!(
                 "CHECK constraint {:?} predicate {:?}: {e}",
@@ -795,4 +847,81 @@ pub(crate) fn build_in_predicate_sql(
         clauses.push(format!("({})", parts.join(" AND ")));
     }
     Ok(clauses.join(" OR "))
+}
+
+// --------------------------------------------------------------------
+// Unit tests
+// --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::strip_check_wrapper;
+
+    // --- strip_check_wrapper ------------------------------------------------
+
+    /// Bare expression without a CHECK wrapper must be returned unchanged.
+    #[test]
+    fn strip_bare_expression_is_noop() {
+        assert_eq!(strip_check_wrapper("score >= 0"), "score >= 0");
+        assert_eq!(strip_check_wrapper("price > 0"), "price > 0");
+        assert_eq!(strip_check_wrapper("a AND b"), "a AND b");
+    }
+
+    /// Typical column-level predicate stored with the CHECK (...) wrapper.
+    #[test]
+    fn strip_column_level_check_wrapper() {
+        assert_eq!(strip_check_wrapper("CHECK (score >= 0)"), "score >= 0");
+        assert_eq!(strip_check_wrapper("CHECK (price > 0)"), "price > 0");
+    }
+
+    /// Case-insensitive matching.
+    #[test]
+    fn strip_check_wrapper_case_insensitive() {
+        assert_eq!(strip_check_wrapper("check (score >= 0)"), "score >= 0");
+        assert_eq!(strip_check_wrapper("Check (score >= 0)"), "score >= 0");
+        assert_eq!(strip_check_wrapper("CHECK (score >= 0)"), "score >= 0");
+    }
+
+    /// Whitespace between CHECK and the opening paren.
+    #[test]
+    fn strip_check_wrapper_with_extra_whitespace() {
+        assert_eq!(strip_check_wrapper("CHECK  (score >= 0)"), "score >= 0");
+        assert_eq!(strip_check_wrapper("  CHECK (score >= 0)  "), "score >= 0");
+    }
+
+    /// Nested parentheses inside the expression must not be stripped incorrectly.
+    #[test]
+    fn strip_check_wrapper_nested_parens() {
+        // The outer CHECK (...) wraps an expression that contains a function call.
+        let stored = "CHECK (coalesce(score, 0) >= 0)";
+        assert_eq!(strip_check_wrapper(stored), "coalesce(score, 0) >= 0");
+    }
+
+    /// Named constraint form: `CONSTRAINT name CHECK (expr)` — the stored predicate
+    /// is just the bare inner expr (table-level path uses `expr.to_string()`),
+    /// so the wrapper is not present and strip is a no-op.
+    #[test]
+    fn strip_bare_named_constraint_predicate_is_noop() {
+        assert_eq!(
+            strip_check_wrapper("end_day >= start_day"),
+            "end_day >= start_day"
+        );
+    }
+
+    /// If `CHECK` appears but is not followed by `(`, treat as bare expression.
+    #[test]
+    fn strip_check_without_paren_is_noop() {
+        // Pathological but must not panic.
+        assert_eq!(strip_check_wrapper("CHECK_COLUMN > 0"), "CHECK_COLUMN > 0");
+    }
+
+    /// Idempotent: stripping twice gives the same result as stripping once.
+    #[test]
+    fn strip_check_wrapper_idempotent() {
+        let stored = "CHECK (score >= 0)";
+        let once = strip_check_wrapper(stored);
+        let twice = strip_check_wrapper(once);
+        assert_eq!(once, twice);
+        assert_eq!(once, "score >= 0");
+    }
 }
