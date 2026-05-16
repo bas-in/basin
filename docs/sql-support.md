@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778962124 (Unix epoch)
-SQL fragments tested: 697 total / 1878 green (across all three configurations).
+Last run: 1778964422 (Unix epoch)
+SQL fragments tested: 697 total / 1884 green (across all three configurations).
 
 ## Configurations
 
@@ -386,8 +386,8 @@ SQL fragments tested: 697 total / 1878 green (across all three configurations).
 | `SELECT '{"a":1,"b":2}'::jsonb - ARRAY['a','b']` | ✅ | ✅ | ✅ |  |
 | `SELECT '[1,2,3]'::jsonb - 1` | ✅ | ✅ | ✅ |  |
 | `SELECT '{"a":1}'::jsonb \|\| '{"b":2}'::jsonb` | ✅ | ✅ | ✅ |  |
-| `SELECT json_to_record('{"a":1,"b":"foo"}'::json) AS t(a int, b text)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: (… |
-| `SELECT jsonb_to_record('{"a":1,"b":"foo"}'::jsonb) AS t(a int, b text)` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: (… |
+| `SELECT json_to_record('{"a":1,"b":"foo"}'::json) AS t(a int, b text)` | ✅ | ✅ | ✅ |  |
+| `SELECT jsonb_to_record('{"a":1,"b":"foo"}'::jsonb) AS t(a int, b text)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM json_to_recordset('[{"a":1},{"a":2}]'::json) AS t(a int)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM jsonb_to_recordset('[{"a":1},{"a":2}]'::jsonb) AS t(a int)` | ✅ | ✅ | ✅ |  |
 | `SELECT jsonb_path_query_array('{"a":[1,2,3]}'::jsonb, '$.a[*]')` | ✅ | ✅ | ✅ |  |

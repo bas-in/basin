@@ -384,6 +384,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.
     let rewritten = crate::udf::rewrite_json_operators(&rewritten);
+    // Rewrite `json_to_record(J) AS t(coldefs)` / `jsonb_to_record(J) AS t(coldefs)`
+    // → `SELECT * FROM json_to_recordset([J]) AS t(coldefs)` so that sqlparser
+    // does not choke on the typed coldef list in scalar-SELECT / FROM position.
+    let rewritten = crate::pg_operators::rewrite_json_to_record(&rewritten);
     // Rewrite PostgreSQL POSIX regex operators (`~`, `!~`, `~*`, `!~*`) to
     // `regexp_like(…)` calls DataFusion accepts; expand `BETWEEN SYMMETRIC`;
     // rewrite array containment / overlap operators (`@>`, `<@`, `&&`) for

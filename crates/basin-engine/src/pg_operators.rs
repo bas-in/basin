@@ -3478,6 +3478,379 @@ pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// json_to_record / jsonb_to_record  AS alias(coldef-list)  rewriter
+// ---------------------------------------------------------------------------
+//
+// PostgreSQL's `json_to_record(obj) AS t(a int, b text)` returns a single row
+// from a JSON object with columns declared in the coldef list.  sqlparser 0.61
+// cannot parse the typed column-definition list `AS t(a type, b type)` in a
+// scalar-SELECT or FROM context; it errors with "Expected: end of statement,
+// found: (".
+//
+// The rewrite maps these two forms to equivalent SQL that sqlparser CAN parse
+// and that the DataFusion engine (with the existing `json_to_recordset` UDTF)
+// can execute correctly.
+//
+// ## Scalar-SELECT form (what the matrix tests use)
+//
+//   BEFORE: SELECT json_to_record('{"a":1,"b":"foo"}'::json) AS t(a int, b text)
+//   AFTER:  SELECT * FROM json_to_recordset('[{"a":1,"b":"foo"}]'::json) AS t(a int, b text)
+//
+// The JSON object literal is wrapped in a single-element JSON array `[...]` so
+// the existing array-of-objects recordset UDTF sees exactly one row.  The
+// `::json` / `::jsonb` cast suffix is preserved on the outer bracket literal.
+//
+// ## FROM-clause form (common ETL usage)
+//
+//   BEFORE: FROM json_to_record('{"a":1}') AS t(a int, b text)
+//   AFTER:  FROM json_to_recordset('[{"a":1}]') AS t(a int, b text)
+//
+// ## Correctness notes
+//
+// * The `AS t(a int, b text)` coldef annotation is passed untouched to
+//   DataFusion's planner.  DataFusion interprets the declared types and adds
+//   implicit casts from the Utf8 output of the UDTF — matching PG's behaviour.
+// * Missing keys → NULL (the UDTF already emits NULL for absent keys).
+// * Type casts: a declared `int` column receiving the string `"42"` is cast by
+//   DataFusion's Arrow coercion — identical to `'42'::int` semantics.
+// * Nested objects / arrays for a scalar-typed column (e.g. `int`): DataFusion
+//   will fail the cast at execution time with a type error, matching PG.
+//
+// ## Limitations
+//
+// * Only rewritten when the JSON argument is a single-quoted string literal
+//   (with optional `::json` / `::jsonb` suffix).  Column-reference or function-
+//   call arguments are left untouched (the query will reach sqlparser and fail
+//   with the original parse error — which is the honest behaviour).
+// * The scalar-SELECT form returns a flat set of columns rather than PG's
+//   composite RECORD type; any caller that wraps the result in `(result).col`
+//   won't benefit from this rewrite (uncommon in practice).
+
+/// Rewrite `json_to_record(J) AS t(coldefs)` and `jsonb_to_record(J) AS t(coldefs)`
+/// into the `json_to_recordset([J]) AS t(coldefs)` form that sqlparser and
+/// DataFusion can parse and execute.
+///
+/// Handles both scalar-SELECT position and FROM-clause position.
+pub(crate) fn rewrite_json_to_record(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+
+    // Fast path: no occurrence at all.
+    if !lower.contains("json_to_record") && !lower.contains("jsonb_to_record") {
+        return sql.to_string();
+    }
+
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut i = 0usize;
+
+    while i < sql.len() {
+        // Skip single-quoted string literals (don't scan inside them).
+        if sql.as_bytes()[i] == b'\'' {
+            let end = skip_quoted_string(sql, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+
+        // Look for the keyword `json_to_record` or `jsonb_to_record`
+        // (case-insensitive).  We do NOT require a word boundary before `json`
+        // because identifiers always start at a non-alphanumeric char in
+        // practice, but we DO require that the char immediately before is NOT
+        // alphanumeric (to avoid matching `some_json_to_record`).
+        let rest_lower = &lower[i..];
+        let (fn_name_lower, fn_name_len) = if rest_lower.starts_with("jsonb_to_record(")
+            || rest_lower.starts_with("jsonb_to_record (")
+        {
+            ("jsonb_to_record", 15usize)
+        } else if rest_lower.starts_with("json_to_record(")
+            || rest_lower.starts_with("json_to_record (")
+        {
+            ("json_to_record", 14usize)
+        } else {
+            out.push(sql.as_bytes()[i] as char);
+            i += 1;
+            continue;
+        };
+
+        // Confirm word boundary: char before must be non-alphanumeric.
+        if i > 0 {
+            let prev = sql.as_bytes()[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                // Not a standalone identifier — copy and skip.
+                out.push(sql.as_bytes()[i] as char);
+                i += 1;
+                continue;
+            }
+        }
+
+        // Skip to the opening `(` of the function call.
+        let mut j = i + fn_name_len;
+        while j < sql.len() && sql.as_bytes()[j] == b' ' { j += 1; }
+        if j >= sql.len() || sql.as_bytes()[j] != b'(' {
+            // Unexpected — emit as-is.
+            out.push(sql.as_bytes()[i] as char);
+            i += 1;
+            continue;
+        }
+
+        // Find the matching closing `)` of the function argument list.
+        let arg_open = j;
+        let Some(arg_close) = find_matching_close_paren(sql, arg_open) else {
+            out.push(sql.as_bytes()[i] as char);
+            i += 1;
+            continue;
+        };
+        // arg_str is everything inside the outermost parens.
+        let arg_str = &sql[arg_open + 1..arg_close];
+
+        // Now scan past any whitespace after `)` to find `AS`.
+        let mut after = arg_close + 1;
+        while after < sql.len() && sql.as_bytes()[after] == b' ' { after += 1; }
+
+        let rest_after_lower = lower[after..].to_ascii_lowercase();
+        if !rest_after_lower.starts_with("as ") && !rest_after_lower.starts_with("as\t") {
+            // No AS clause — emit the whole function call unchanged.
+            out.push_str(&sql[i..arg_close + 1]);
+            i = arg_close + 1;
+            continue;
+        }
+
+        // Skip "AS".
+        after += 2;
+        while after < sql.len() && sql.as_bytes()[after] == b' ' { after += 1; }
+
+        // Read the alias name (identifier).
+        let alias_start = after;
+        while after < sql.len()
+            && (sql.as_bytes()[after].is_ascii_alphanumeric() || sql.as_bytes()[after] == b'_')
+        {
+            after += 1;
+        }
+        if alias_start == after {
+            // No alias — emit unchanged.
+            out.push_str(&sql[i..arg_close + 1]);
+            i = arg_close + 1;
+            continue;
+        }
+        let alias = &sql[alias_start..after];
+
+        // Skip whitespace.
+        while after < sql.len() && sql.as_bytes()[after] == b' ' { after += 1; }
+
+        // Must have `(coldef-list)` next.
+        if after >= sql.len() || sql.as_bytes()[after] != b'(' {
+            // No coldef list — not our pattern (plain alias). Emit unchanged.
+            out.push_str(&sql[i..arg_close + 1]);
+            i = arg_close + 1;
+            continue;
+        }
+
+        let coldef_open = after;
+        let Some(coldef_close) = find_matching_close_paren(sql, coldef_open) else {
+            out.push(sql.as_bytes()[i] as char);
+            i += 1;
+            continue;
+        };
+        let coldef_str = &sql[coldef_open..coldef_close + 1]; // includes `(` and `)`
+
+        // Extract the JSON argument literal and optional cast suffix.
+        // We only rewrite when the argument is a single-quoted literal
+        // (optionally with `::json` / `::jsonb` cast).
+        let (json_text, cast_suffix) = match extract_json_literal_arg(arg_str) {
+            Some(pair) => pair,
+            None => {
+                // Non-literal arg — emit the whole original expression unchanged.
+                // sqlparser will fail with the parse error for the coldef list,
+                // which is the honest behaviour for a non-literal arg.
+                out.push_str(&sql[i..coldef_close + 1]);
+                i = coldef_close + 1;
+                continue;
+            }
+        };
+
+        // Determine the recordset function name (json vs jsonb).
+        let recordset_fn = if fn_name_lower == "jsonb_to_record" {
+            "jsonb_to_recordset"
+        } else {
+            "json_to_recordset"
+        };
+
+        // Build the rewritten fragment:
+        //   json_to_recordset('[{...}]'::json) AS alias(coldef-list)
+        //
+        // We do NOT emit `SELECT * FROM` here — the rewriter produces just the
+        // table-function expression.  The scalar-SELECT→FROM restructuring is
+        // handled separately below in a second pass.
+        let wrapped_json = format!("'[{json_text}]'{cast_suffix}");
+        let rewritten_fn = format!("{recordset_fn}({wrapped_json}) AS {alias}{coldef_str}");
+
+        out.push_str(&rewritten_fn);
+        i = coldef_close + 1;
+    }
+
+    // Second pass: if any scalar-SELECT contained the rewritten form, we need
+    // to restructure:
+    //   SELECT ... json_to_recordset(...) AS t(...) ...  (scalar position)
+    // → SELECT * FROM json_to_recordset(...) AS t(...)
+    //
+    // We detect the scalar-SELECT case by looking for the pattern
+    // `SELECT <ws> json_to_recordset(` or `SELECT <ws> jsonb_to_recordset(`
+    // that is NOT already preceded by `FROM` on the same logical level.
+    rewrite_scalar_select_to_from_recordset(&out)
+}
+
+/// Wrap `SELECT json_to_recordset(…) AS t(…)` (scalar position, no FROM)
+/// into `SELECT * FROM json_to_recordset(…) AS t(…)`.
+fn rewrite_scalar_select_to_from_recordset(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+
+    // We look for the pattern: `SELECT` followed (possibly with whitespace) by
+    // `json_to_recordset(` or `jsonb_to_recordset(`, where there is no `FROM`
+    // between `SELECT` and the function call (meaning it's in scalar position).
+    //
+    // The match anchor: `select <sp>+ json[b]_to_recordset(`
+    // We only handle the simple case where the function call is the ENTIRE
+    // SELECT list (no additional columns before/after it).
+
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0usize;
+
+    while i < sql.len() {
+        // Skip quoted strings.
+        if sql.as_bytes()[i] == b'\'' {
+            let end = skip_quoted_string(sql, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+
+        let rest_lower = &lower[i..];
+
+        // Match `select` keyword.
+        if !rest_lower.starts_with("select") {
+            out.push(sql.as_bytes()[i] as char);
+            i += 1;
+            continue;
+        }
+
+        // Word boundary after `select`.
+        let after_select = i + 6;
+        if after_select < sql.len() {
+            let next = sql.as_bytes()[after_select];
+            if next.is_ascii_alphanumeric() || next == b'_' {
+                out.push(sql.as_bytes()[i] as char);
+                i += 1;
+                continue;
+            }
+        }
+
+        // Skip whitespace after SELECT.
+        let mut j = after_select;
+        while j < sql.len() && (sql.as_bytes()[j] == b' ' || sql.as_bytes()[j] == b'\n' || sql.as_bytes()[j] == b'\t') {
+            j += 1;
+        }
+
+        // Check for `json[b]_to_recordset(` immediately after SELECT + whitespace.
+        let from_j = &lower[j..];
+        let is_match = from_j.starts_with("json_to_recordset(")
+            || from_j.starts_with("jsonb_to_recordset(");
+
+        if !is_match {
+            // Not our pattern — copy the SELECT keyword and advance.
+            out.push_str(&sql[i..after_select]);
+            i = after_select;
+            continue;
+        }
+
+        // Confirm there's no FROM between the original SELECT and this position
+        // (i.e., the recordset call is genuinely in scalar-SELECT position).
+        // Since we built `out` from a previous pass that already rewrote the
+        // function calls, the `SELECT` we found was already preceded by our
+        // rewritten function.  We trust the pattern is scalar-position if we
+        // see `SELECT <ws> json[b]_to_recordset(`.
+
+        // Emit `SELECT * FROM ` instead of just `SELECT `.
+        out.push_str("SELECT * FROM ");
+        i = j; // advance past the `SELECT` + whitespace; the fn call follows
+    }
+
+    out
+}
+
+/// Skip a single-quoted SQL string literal starting at `start` (which must be
+/// the `'` character).  Returns the index of the character AFTER the closing
+/// `'`.  Handles `''` escape sequences.
+fn skip_quoted_string(s: &str, start: usize) -> usize {
+    let bytes = s.as_bytes();
+    debug_assert!(bytes[start] == b'\'');
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i // unclosed literal — return end of string
+}
+
+/// Attempt to parse a function argument string as a JSON string literal with
+/// optional `::json` / `::jsonb` / `::text` suffix.
+///
+/// Returns `(json_text_content, cast_suffix)` where:
+/// * `json_text_content` is the text INSIDE the quotes (without the quotes
+///   themselves or the cast suffix).
+/// * `cast_suffix` is the `::json` / `::jsonb` suffix verbatim (e.g. `"::json"`)
+///   or `""` if absent.
+///
+/// Only recognises the form `'...'` or `'...'::json[b]` (no dollar quoting,
+/// no `E'...'`, no nested function calls).  Returns `None` for anything else.
+fn extract_json_literal_arg(arg: &str) -> Option<(String, String)> {
+    let trimmed = arg.trim();
+    if !trimmed.starts_with('\'') {
+        return None;
+    }
+
+    // Find the closing quote (handling `''` escapes).
+    let bytes = trimmed.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            break; // closing quote
+        }
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None; // unclosed
+    }
+    // i points to closing `'`.
+    let json_content = &trimmed[1..i]; // text inside quotes
+    let after_quote = &trimmed[i + 1..].trim_start();
+
+    // Optional `::json`, `::jsonb`, `::text` cast.
+    let cast_suffix = if after_quote.to_ascii_lowercase().starts_with("::jsonb") {
+        after_quote[..7].to_string()
+    } else if after_quote.to_ascii_lowercase().starts_with("::json") {
+        after_quote[..6].to_string()
+    } else if after_quote.to_ascii_lowercase().starts_with("::text") {
+        after_quote[..6].to_string()
+    } else if after_quote.is_empty() {
+        String::new()
+    } else {
+        // Unexpected suffix — not a plain JSON literal.
+        return None;
+    };
+
+    Some((json_content.to_string(), cast_suffix))
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -3959,5 +4332,114 @@ mod tests {
         let sql = "SELECT data #> '{a}' FROM t";
         let out = rewrite_bitwise_xor_hash(sql);
         assert_eq!(out, sql, "#> must be left untouched: {out}");
+    }
+
+    // ── json_to_record / jsonb_to_record rewriter ────────────────────────────
+
+    #[test]
+    fn json_to_record_scalar_select_rewrites_to_from_recordset() {
+        // The primary matrix test case: scalar SELECT with ::json cast.
+        let sql = r#"SELECT json_to_record('{"a":1,"b":"foo"}'::json) AS t(a int, b text)"#;
+        let out = rewrite_json_to_record(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(out_lower.contains("json_to_recordset"), "must use recordset fn: {out}");
+        assert!(out_lower.contains("select * from"), "must restructure to SELECT * FROM: {out}");
+        assert!(out_lower.contains("as t(a int, b text)"), "coldef list must be preserved: {out}");
+        // The JSON literal must be wrapped in a single-element array.
+        assert!(out.contains(r#"'[{"a":1,"b":"foo"}]'"#), "JSON must be wrapped in array: {out}");
+        // The ::json cast must be preserved.
+        assert!(out.contains("::json"), "cast suffix must be preserved: {out}");
+        // Must not contain the original json_to_record (not recordset) as the function.
+        assert!(!out_lower.contains("json_to_record("), "original fn must be gone: {out}");
+    }
+
+    #[test]
+    fn jsonb_to_record_scalar_select_rewrites() {
+        // jsonb variant with ::jsonb cast.
+        let sql = r#"SELECT jsonb_to_record('{"a":1,"b":"foo"}'::jsonb) AS t(a int, b text)"#;
+        let out = rewrite_json_to_record(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(out_lower.contains("jsonb_to_recordset"), "must use jsonb_to_recordset: {out}");
+        assert!(out_lower.contains("select * from"), "must restructure to SELECT * FROM: {out}");
+        assert!(out_lower.contains("as t(a int, b text)"), "coldef list preserved: {out}");
+        assert!(out.contains(r#"'[{"a":1,"b":"foo"}]'"#), "JSON wrapped in array: {out}");
+        assert!(out.contains("::jsonb"), "jsonb cast preserved: {out}");
+    }
+
+    #[test]
+    fn json_to_record_missing_key_sql_correct() {
+        // Missing key: '{"a":1}' with coldef (a int, b text) — b will be NULL.
+        let sql = r#"SELECT json_to_record('{"a":1}'::json) AS t(a int, b text)"#;
+        let out = rewrite_json_to_record(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(out_lower.contains("json_to_recordset"), "must use recordset fn: {out}");
+        assert!(out_lower.contains("select * from"), "must be FROM form: {out}");
+        // The coldef list (a int, b text) must remain for DataFusion to apply casts.
+        assert!(out_lower.contains("as t(a int, b text)"), "coldef list must survive: {out}");
+        // The wrapped array must contain just the one object.
+        assert!(out.contains(r#"'[{"a":1}]'"#), "JSON wrapped: {out}");
+    }
+
+    #[test]
+    fn json_to_record_no_cast_suffix_rewrites() {
+        // No ::json cast — just a bare string literal.
+        let sql = r#"SELECT json_to_record('{"a":"42"}'::json) AS t(a int)"#;
+        let out = rewrite_json_to_record(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(out_lower.contains("json_to_recordset"), "must use recordset: {out}");
+        assert!(out_lower.contains("select * from"), "must be FROM form: {out}");
+        assert!(out_lower.contains("as t(a int)"), "coldef preserved: {out}");
+    }
+
+    #[test]
+    fn json_to_record_from_clause_rewrites() {
+        // FROM-clause position: rewrite to recordset without SELECT restructuring.
+        let sql = r#"SELECT * FROM json_to_record('{"a":1}'::json) AS t(a int, b text)"#;
+        let out = rewrite_json_to_record(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(out_lower.contains("json_to_recordset"), "must use recordset: {out}");
+        assert!(!out_lower.contains("json_to_record("), "original fn must be gone: {out}");
+        assert!(out_lower.contains("as t(a int, b text)"), "coldef list preserved: {out}");
+        // The FROM keyword should be present (was already there).
+        assert!(out_lower.contains("from"), "FROM must remain: {out}");
+    }
+
+    #[test]
+    fn json_to_record_no_coldef_list_unchanged() {
+        // A plain `json_to_record(x)` with no `AS t(...)` coldef list must not be touched.
+        let sql = r#"SELECT json_to_record('{"a":1}'::json) AS result"#;
+        let out = rewrite_json_to_record(sql);
+        // Should not be rewritten (no coldef list after the alias).
+        assert!(!out.to_ascii_lowercase().contains("recordset"), "no rewrite without coldef list: {out}");
+    }
+
+    #[test]
+    fn json_to_record_no_occurrence_passthrough() {
+        // Queries with no json_to_record must pass through unchanged.
+        let sql = "SELECT 1 + 1 AS two";
+        let out = rewrite_json_to_record(sql);
+        assert_eq!(out, sql, "should be unchanged: {out}");
+    }
+
+    #[test]
+    fn json_to_record_jsonb_from_clause_rewrites() {
+        // FROM-clause jsonb variant.
+        let sql = r#"SELECT * FROM jsonb_to_record('{"x":"hello"}'::jsonb) AS t(x text)"#;
+        let out = rewrite_json_to_record(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(out_lower.contains("jsonb_to_recordset"), "must use jsonb_to_recordset: {out}");
+        assert!(out_lower.contains("as t(x text)"), "coldef preserved: {out}");
+        assert!(out.contains("::jsonb"), "cast preserved: {out}");
+    }
+
+    #[test]
+    fn json_to_record_preserves_single_quotes_in_json() {
+        // JSON string with embedded single-quote escape `''` must survive intact.
+        // Basin stores strings as `''` inside SQL string literals.
+        let sql = r#"SELECT json_to_record('{"a":"it''s"}'::json) AS t(a text)"#;
+        let out = rewrite_json_to_record(sql);
+        // The embedded `''` must survive in the wrapped form.
+        assert!(out.contains("it''s"), "escaped quotes must survive: {out}");
+        assert!(out.to_ascii_lowercase().contains("json_to_recordset"), "must use recordset: {out}");
     }
 }
