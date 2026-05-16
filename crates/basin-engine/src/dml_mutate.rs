@@ -539,18 +539,20 @@ pub(crate) async fn exec_update(
     selection: Option<Expr>,
     returning: Option<Vec<sqlparser::ast::SelectItem>>,
 ) -> Result<ExecResult> {
-    if returning.is_some() {
-        return Err(BasinError::InvalidSchema(
-            "UPDATE ... RETURNING not supported".into(),
-        ));
-    }
     if !table_with_joins.joins.is_empty() {
         return Err(BasinError::InvalidSchema(
             "UPDATE with JOIN not supported".into(),
         ));
     }
     // UPDATE t SET col = u.col FROM u WHERE t.id = u.id — handled separately.
+    // RETURNING is not yet threaded through exec_update_from; reject early so
+    // the caller gets a clear error rather than a silent missing-RETURNING.
     if let Some(from_table) = from {
+        if returning.is_some() {
+            return Err(BasinError::InvalidSchema(
+                "UPDATE … FROM … RETURNING not supported".into(),
+            ));
+        }
         return exec_update_from(sess, table_with_joins, assignments, from_table, selection).await;
     }
     let table_name = match &table_with_joins.relation {
@@ -575,8 +577,14 @@ pub(crate) async fn exec_update(
     // Correlated EXISTS / NOT EXISTS in WHERE: route through DataFusion's
     // optimizer (decorrelates to semi/anti join) before the custom
     // CompoundPredicate engine sees the expression.
+    // RETURNING is not yet threaded through exec_update_via_df_rowset; reject early.
     if let Some(ref sel) = selection {
         if has_exists_subquery(sel) {
+            if returning.is_some() {
+                return Err(BasinError::InvalidSchema(
+                    "UPDATE … EXISTS … RETURNING not supported in this shape".into(),
+                ));
+            }
             return exec_update_via_df_rowset(sess, &table_name, &assignments, sel).await;
         }
     }

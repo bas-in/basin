@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778945904 (Unix epoch)
-SQL fragments tested: 697 total / 1863 green (across all three configurations).
+Last run: 1778947265 (Unix epoch)
+SQL fragments tested: 697 total / 1875 green (across all three configurations).
 
 ## Configurations
 
@@ -185,7 +185,7 @@ SQL fragments tested: 697 total / 1863 green (across all three configurations).
 | `UPDATE t SET id = id + 1` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = (SELECT MAX(id) FROM u)` | 🚫 | 🚫 | 🚫 | invalid schema: UPDATE SET id: scalar subquery on RHS not supported in v0.1 |
 | `UPDATE t SET id = 1 FROM u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
-| `UPDATE t SET id = 1 RETURNING id` | 🚫 | 🚫 | 🚫 | invalid schema: UPDATE ... RETURNING not supported |
+| `UPDATE t SET id = 1 RETURNING id` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 1 WHERE id IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t WHERE id = 1` | ✅ | ✅ | ✅ |  |
@@ -638,9 +638,9 @@ SQL fragments tested: 697 total / 1863 green (across all three configurations).
 | `WITH cte AS (SELECT 1 AS x) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH cte AS (SELECT * FROM t) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r` | ✅ | ✅ | ✅ |  |
-| `WITH ins AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM ins` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query INSERT INTO t VALUES (… |
-| `WITH upd AS (UPDATE t SET id = 99 WHERE id = 1 RETURNING id) SELECT * FROM upd` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query UPDATE t SET id = 99 W… |
-| `WITH del AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT * FROM del` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: Query DELETE FROM t WHERE id… |
+| `WITH ins AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM ins` | ✅ | ✅ | ✅ |  |
+| `WITH upd AS (UPDATE t SET id = 99 WHERE id = 1 RETURNING id) SELECT * FROM upd` | ✅ | ✅ | ✅ |  |
+| `WITH del AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT * FROM del` | ✅ | ✅ | ✅ |  |
 | `WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Schema error: project index 1 out of bounds, … |
 | `WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |
 | `WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte` | ✅ | ✅ | ✅ |  |

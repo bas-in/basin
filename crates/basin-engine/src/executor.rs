@@ -14,7 +14,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::convert::{batch_df_to_ws, schema_df_to_ws};
+use crate::convert::{batch_df_to_ws, batch_ws_to_df, schema_df_to_ws};
 use crate::ddl::{extract_create_table_cluster_by, partition_spec_from_ast};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
 use crate::events::{
@@ -817,7 +817,17 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             }
         }
         Statement::Insert(ins) => exec_insert(sess, ins).await,
-        Statement::Query(_) => {
+        Statement::Query(ref query) => {
+            // ── Data-modifying CTE intercept ─────────────────────────────────
+            // `WITH x AS (INSERT/UPDATE/DELETE … RETURNING …) SELECT … FROM x`
+            // DataFusion 53 cannot plan DML statements as relations, so we
+            // orchestrate them ourselves: execute each DML CTE in declaration
+            // order, capture the RETURNING batch, register it as a MemTable in
+            // the session context, then hand the outer SELECT to DataFusion.
+            if query_has_dml_cte(query) {
+                return exec_dml_cte_query(sess, query, sql, include_deleted).await;
+            }
+
             // pg_plan routing instrumentation (ADR 0014 Phase 2). When the
             // parsed SELECT matches the shape the new translator handles,
             // bump the counter — independent of whether the fast path or
@@ -3650,6 +3660,267 @@ pub(crate) async fn rewrite_json_agg_whole_row(
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Data-modifying CTE orchestrator
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when any CTE in the `WITH` clause has a DML body
+/// (`INSERT`, `UPDATE`, or `DELETE`).  Pure-SELECT CTEs return `false`.
+fn query_has_dml_cte(query: &sqlparser::ast::Query) -> bool {
+    let Some(ref with) = query.with else {
+        return false;
+    };
+    with.cte_tables.iter().any(|cte| {
+        matches!(
+            cte.query.body.as_ref(),
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_)
+        )
+    })
+}
+
+/// Execute a `WITH … SELECT …` query whose CTE list contains at least one
+/// data-modifying CTE (`INSERT`/`UPDATE`/`DELETE … RETURNING …`).
+///
+/// Strategy:
+/// 1. Walk the CTE list in declaration order.
+///    - Pure-SELECT CTEs: skip (DataFusion handles them in the outer query).
+///    - DML CTEs: execute via the existing DML paths, forcing `RETURNING *`
+///      when the user omitted a RETURNING clause, to capture the affected rows.
+/// 2. Register each captured batch as a named `MemTable` in `sess.ctx` under
+///    the CTE alias.  DataFusion's subsequent planning of the outer SELECT will
+///    find these in scope exactly as it does for real tables.
+/// 3. Execute the outer SELECT body (stripped of DML CTEs; any remaining
+///    pure-SELECT CTEs stay in the query string) through the normal
+///    `exec_select` path.
+///
+/// Atomicity: if any DML leg fails, the function returns the error immediately
+/// and subsequent legs are not executed.  Already-committed legs are NOT
+/// rolled back (Basin has no multi-statement rollback yet).  This is documented
+/// behaviour: a failed DML-CTE may partially apply.  When the session is inside
+/// an explicit transaction the existing transaction machinery provides the
+/// rollback guarantee.
+///
+/// Recursive DML CTEs and Postgres's "snapshot-at-statement-start" inter-leg
+/// visibility semantics are deferred — they require planner-level support that
+/// is out of scope for this implementation.
+async fn exec_dml_cte_query(
+    sess: &ProjectSession,
+    query: &sqlparser::ast::Query,
+    original_sql: &str,
+    include_deleted: bool,
+) -> Result<ExecResult> {
+    use datafusion::datasource::memory::MemTable;
+    use sqlparser::ast::{SelectItem, WildcardAdditionalOptions};
+
+    let with = query.with.as_ref().expect("caller verified query.with is Some");
+
+    // Reject RECURSIVE data-modifying CTEs — the interaction with our sequential
+    // execution model would be incorrect.
+    if with.recursive {
+        return Err(BasinError::InvalidSchema(
+            "RECURSIVE data-modifying CTEs are not supported".into(),
+        ));
+    }
+
+    // Table names registered during this call so we can clean them up if the
+    // outer SELECT fails (best effort; DataFusion contexts are per-session anyway).
+    let mut registered: Vec<String> = Vec::new();
+
+    for cte in &with.cte_tables {
+        let cte_name = cte.alias.name.value.clone();
+
+        match cte.query.body.as_ref() {
+            SetExpr::Insert(Statement::Insert(ins)) => {
+                let mut ins = ins.clone();
+                // Force RETURNING * when the user omitted it so we always capture
+                // the inserted rows for the MemTable.
+                let user_had_returning = ins.returning.is_some();
+                if ins.returning.is_none() {
+                    ins.returning = Some(vec![SelectItem::Wildcard(
+                        WildcardAdditionalOptions::default(),
+                    )]);
+                }
+                let result = exec_insert(sess, ins).await?;
+                let (schema, batches) = dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
+                register_dml_cte_memtable(sess, &cte_name, schema, batches, &mut registered)?;
+            }
+            SetExpr::Update(Statement::Update(sqlparser::ast::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+                ..
+            })) => {
+                let from_twj = from.as_ref().and_then(|f| match f {
+                    sqlparser::ast::UpdateTableFromKind::BeforeSet(v)
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(v) => {
+                        v.first().cloned()
+                    }
+                });
+                let user_had_returning = returning.is_some();
+                // If the user didn't supply RETURNING we force RETURNING * so
+                // we can capture affected rows for the MemTable.
+                let effective_returning = if returning.is_some() {
+                    returning.clone()
+                } else {
+                    Some(vec![SelectItem::Wildcard(
+                        WildcardAdditionalOptions::default(),
+                    )])
+                };
+                let result = crate::dml_mutate::exec_update(
+                    sess,
+                    table.clone(),
+                    assignments.clone(),
+                    from_twj,
+                    selection.clone(),
+                    effective_returning,
+                )
+                .await?;
+                let (schema, batches) = dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
+                register_dml_cte_memtable(sess, &cte_name, schema, batches, &mut registered)?;
+            }
+            SetExpr::Delete(Statement::Delete(del)) => {
+                let mut del = del.clone();
+                let user_had_returning = del.returning.is_some();
+                if del.returning.is_none() {
+                    del.returning = Some(vec![SelectItem::Wildcard(
+                        WildcardAdditionalOptions::default(),
+                    )]);
+                }
+                let result = crate::dml_mutate::exec_delete(sess, del).await?;
+                let (schema, batches) = dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
+                register_dml_cte_memtable(sess, &cte_name, schema, batches, &mut registered)?;
+            }
+            // Non-DML CTE body: leave it for DataFusion to handle in the outer query.
+            _ => continue,
+        }
+    }
+
+    // Build the outer SELECT SQL: strip DML CTEs, keep pure-SELECT CTEs.
+    // Strategy: reconstruct the query with only the non-DML CTEs in `WITH`,
+    // or drop the `WITH` clause entirely if all CTEs were DML.
+    let outer_sql = build_outer_select_sql(query)?;
+
+    // Execute the outer SELECT through the normal path, which will find the
+    // registered MemTables in `sess.ctx` when it references them.
+    exec_select(sess, &outer_sql, include_deleted).await
+}
+
+/// Extract rows from a DML result.  When `user_had_returning` is false (we
+/// forced `RETURNING *` ourselves), a `ExecResult::Empty` is not expected but
+/// we defend against it by returning an empty batch with an empty schema.
+fn dml_cte_extract_rows(
+    result: ExecResult,
+    _user_had_returning: bool,
+    cte_name: &str,
+) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+    match result {
+        ExecResult::Rows { schema, batches } => Ok((schema, batches)),
+        ExecResult::Empty { .. } => {
+            // DML returned no rows (e.g. 0-row UPDATE).  Register an empty
+            // schema placeholder so that any outer SELECT FROM <cte_name> returns
+            // 0 rows without a "table not found" error.
+            Ok((Arc::new(Schema::empty()), vec![]))
+        }
+        #[allow(unreachable_patterns)]
+        _ => Err(BasinError::internal(format!(
+            "unexpected DML result for CTE {cte_name:?}"
+        ))),
+    }
+}
+
+/// Register `batches` under `cte_name` as a `MemTable` in the session context.
+/// The `ws`-side schema is converted to DataFusion's schema for the MemTable.
+fn register_dml_cte_memtable(
+    sess: &ProjectSession,
+    cte_name: &str,
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+    registered: &mut Vec<String>,
+) -> Result<()> {
+    use datafusion::datasource::memory::MemTable;
+
+    // Convert ws batches → df batches for MemTable.
+    let df_batches: Vec<datafusion::arrow::record_batch::RecordBatch> = batches
+        .iter()
+        .map(|b| crate::convert::batch_ws_to_df(b))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Build the DataFusion schema from the ws schema.
+    let df_schema = if df_batches.is_empty() {
+        // No rows: convert the ws schema to df schema manually.
+        let ws_to_df_schema = crate::convert::schema_ws_to_df(&schema)?;
+        Arc::new(ws_to_df_schema)
+    } else {
+        df_batches[0].schema()
+    };
+
+    let provider = MemTable::try_new(df_schema, vec![df_batches])
+        .map_err(|e| BasinError::internal(format!("MemTable for CTE {cte_name:?}: {e}")))?;
+
+    // Deregister any pre-existing table with this name (e.g. a real table that
+    // shares the CTE alias).  DataFusion's `register_table` returns an error if
+    // the name is already occupied.
+    let _ = sess.ctx.deregister_table(cte_name);
+    sess.ctx
+        .register_table(cte_name, Arc::new(provider))
+        .map_err(|e| BasinError::internal(format!("register CTE {cte_name:?}: {e}")))?;
+    registered.push(cte_name.to_string());
+    Ok(())
+}
+
+/// Build the SQL for the outer SELECT by stripping DML CTEs from the `WITH`
+/// clause.  Pure-SELECT CTEs are retained because DataFusion can plan them.
+///
+/// If all CTEs were DML (none remain), the `WITH` clause is dropped entirely
+/// and we return just the outer query body as SQL.
+fn build_outer_select_sql(query: &sqlparser::ast::Query) -> Result<String> {
+    let with = query.with.as_ref().expect("caller verified non-None");
+
+    // Collect only the non-DML CTEs.
+    let pure_ctes: Vec<_> = with
+        .cte_tables
+        .iter()
+        .filter(|cte| {
+            !matches!(
+                cte.query.body.as_ref(),
+                SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_)
+            )
+        })
+        .collect();
+
+    // Reconstruct the outer query body SQL.
+    let body_sql = query.body.to_string();
+
+    // Append ORDER BY / LIMIT / OFFSET / FETCH if present.
+    let mut suffix = String::new();
+    if let Some(ref order_by) = query.order_by {
+        suffix.push(' ');
+        suffix.push_str(&order_by.to_string());
+    }
+    if let Some(ref lc) = query.limit_clause {
+        suffix.push_str(&lc.to_string());
+    }
+    if let Some(ref fetch) = query.fetch {
+        suffix.push(' ');
+        suffix.push_str(&fetch.to_string());
+    }
+
+    if pure_ctes.is_empty() {
+        // No pure-SELECT CTEs remain; drop the WITH clause.
+        Ok(format!("{body_sql}{suffix}"))
+    } else {
+        // Reconstruct WITH <pure_ctes> <body>.
+        let ctes_sql = pure_ctes
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!("WITH {ctes_sql} {body_sql}{suffix}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
