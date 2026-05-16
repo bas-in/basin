@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778968726 (Unix epoch)
-SQL fragments tested: 697 total / 1905 green (across all three configurations).
+Last run: 1778971463 (Unix epoch)
+SQL fragments tested: 697 total / 1914 green (across all three configurations).
 
 ## Configurations
 
@@ -658,7 +658,7 @@ SQL fragments tested: 697 total / 1905 green (across all three configurations).
 | `SELECT * FROM t CROSS JOIN u` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t NATURAL JOIN u` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t JOIN u USING (id)` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
+| `SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM (SELECT 1 AS x) sub` | ✅ | ✅ | ✅ |  |
 | `SELECT (SELECT MAX(id) FROM u) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
@@ -668,10 +668,10 @@ SQL fragments tested: 697 total / 1905 green (across all three configurations).
 | `SELECT * FROM t WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT t.id, (SELECT COUNT(*) FROM u WHERE u.id = t.id) AS cnt FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Argument #2 must be an INTEGER or NULL… |
-| `SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
+| `SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | ✅ | ✅ | ✅ |  |
 | `SELECT t.id, sub.* FROM t, LATERAL jsonb_each('{"a":1}'::jsonb) sub` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
+| `SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true` | ✅ | ✅ | ✅ |  |
 
 ## SELECT/Locking
 

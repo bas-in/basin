@@ -445,6 +445,15 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // non-aggregate projections, or multiple correlation predicates cause the
     // rewriter to defer (leaving the query to fail with the upstream error).
     let rewritten = crate::pg_operators::rewrite_lateral_nested_agg(&rewritten);
+    // Rewrite correlated non-aggregate LATERAL subqueries into ordinary JOINs.
+    //   `FROM t, LATERAL (SELECT col FROM u WHERE u.col = t.col) sub`
+    //     → `FROM t INNER JOIN (SELECT col FROM u) sub ON sub.col = t.col`
+    //   `LEFT JOIN LATERAL (SELECT col FROM u WHERE u.col = t.col) sub ON true`
+    //     → `LEFT JOIN (SELECT col FROM u) sub ON sub.col = t.col`
+    //   `JOIN LATERAL (SELECT expr AS a FROM u WHERE u.col = t.col) sub ON true`
+    //     → `INNER JOIN (SELECT u.col, expr AS a FROM u) sub ON sub.col = t.col`
+    // Only fires for non-aggregate, single-predicate, no-ORDER-BY/LIMIT bodies.
+    let rewritten = crate::pg_operators::rewrite_lateral_correlated_row(&rewritten);
     // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
     let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
     // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.

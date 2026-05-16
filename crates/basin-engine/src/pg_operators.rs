@@ -2031,6 +2031,355 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
     s
 }
 
+/// Rewrite correlated non-aggregate LATERAL subqueries into ordinary JOINs.
+///
+/// Handles three syntactic patterns where the LATERAL body is a single-table
+/// `SELECT <projection> FROM <child> [AS <calias>] WHERE <child.col = outer.col>` with:
+/// - no ORDER BY, LIMIT, or GROUP BY (those change semantics and cannot be safely
+///   lifted into a plain join)
+/// - no aggregate functions in the projection (that case is handled by
+///   `rewrite_lateral_nested_agg`)
+/// - exactly one equality predicate in WHERE (no AND/OR compound)
+///
+/// ### Patterns and rewrites
+///
+/// **Comma-LATERAL** (= CROSS JOIN LATERAL with correlation = INNER JOIN):
+/// ```sql
+/// -- in:
+/// SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub
+/// -- out:
+/// SELECT * FROM t INNER JOIN (SELECT id FROM u) sub ON sub.id = t.id
+/// ```
+///
+/// **`LEFT JOIN LATERAL … ON true`** (outer-row-preserving):
+/// ```sql
+/// -- in:
+/// SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true
+/// -- out:
+/// SELECT * FROM t LEFT JOIN (SELECT id FROM u) sub ON sub.id = t.id
+/// ```
+///
+/// **`JOIN LATERAL … ON true`** (INNER JOIN with computed projection):
+/// ```sql
+/// -- in:
+/// SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true
+/// -- out:
+/// SELECT * FROM t INNER JOIN (SELECT u.id, id * 2 AS dbl FROM u) sub ON sub.id = t.id
+/// ```
+///
+/// ### Correctness guards (NOT rewritten — honest upstream defer)
+///
+/// - ORDER BY or LIMIT inside the LATERAL body → wrong results after join lift.
+/// - GROUP BY inside the body → semantics differ.
+/// - Multiple WHERE predicates (AND/OR) → compound ON would need careful handling.
+/// - ALL projection items are aggregate calls → handled by `rewrite_lateral_nested_agg`.
+/// - CROSS JOIN LATERAL with a correlated SRF argument
+///   (e.g. `generate_series(1, t.id)`) → the SRF table-function form is not a
+///   `LATERAL (subquery)` shape; it uses `TableFactor::Function { lateral:true }`
+///   which cannot be trivially rewritten without DataFusion upstream support.
+///   Left failing with the original error.
+///
+/// ### Projection wrapping
+///
+/// If the correlation key column (`child_col`) already appears verbatim in the
+/// subquery projection, the body's SELECT list is used as-is for the rewritten
+/// subquery and `ON sub.<child_col> = <outer_ref>` refers to it directly.
+///
+/// If the column is absent (e.g. a purely computed projection `id * 2 AS dbl`),
+/// `<child_alias>.<child_col>` is prepended to the projection so the ON clause
+/// can resolve `sub.<child_col>`.  This preserves the outer `SELECT *` correctly:
+/// the extra join-key column is exposed under the `sub` alias and accessible.
+pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
+    let lower_check = sql.to_ascii_lowercase();
+    if !lower_check.contains("lateral") { return sql.to_string(); }
+
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+
+    loop {
+        let lower = s.to_ascii_lowercase();
+
+        // Detect one of three join forms at depth 0:
+        //   1. comma-LATERAL: "," ... "lateral"
+        //   2. "left join lateral"
+        //   3. "join lateral" (but not "left join lateral" or "cross join lateral")
+        //
+        // We scan for the LATERAL keyword and inspect what precedes it.
+        let Some(rel) = lower[search_from..].find("lateral") else { break; };
+        let lat_start = search_from + rel;
+        let lat_end = lat_start + 7; // len("lateral")
+        let bytes = s.as_bytes();
+
+        // Word boundary before and after LATERAL.
+        let pre_ok = lat_start == 0 || !bytes[lat_start - 1].is_ascii_alphanumeric();
+        let post_ok = lat_end >= s.len()
+            || bytes[lat_end].is_ascii_whitespace()
+            || bytes[lat_end] == b'(';
+        if !pre_ok || !post_ok {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Skip whitespace after LATERAL; must be followed by `(`.
+        let mut j = lat_end;
+        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || bytes[j] != b'(' {
+            // Not a subquery form (table function etc.) — skip.
+            search_from = lat_end;
+            continue;
+        }
+        let paren_start = j;
+        let Some(paren_end) = find_matching_close_paren(&s, paren_start) else {
+            search_from = lat_end;
+            continue;
+        };
+
+        let body = s[paren_start + 1..paren_end].trim().to_string();
+        let body_lower = body.to_ascii_lowercase();
+
+        // Must be a SELECT subquery.
+        if !body_lower.trim_start().starts_with("select") {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Reject if body contains ORDER BY, LIMIT, or GROUP BY — can't safely lift.
+        if body_lower.contains("order by")
+            || body_lower.contains("limit")
+            || body_lower.contains("group by")
+        {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Parse SELECT projection.
+        let after_select = body_lower.trim_start();
+        let sel_body_offset = if after_select.starts_with("select ") || after_select.starts_with("select\t") {
+            7
+        } else {
+            search_from = lat_end;
+            continue;
+        };
+
+        // Find FROM keyword at depth 0.
+        let Some(from_pos) = find_from_at_depth0(&body_lower, sel_body_offset) else {
+            search_from = lat_end;
+            continue;
+        };
+        let proj_str = body[sel_body_offset..from_pos].trim(); // original case
+
+        // Find WHERE keyword after FROM at depth 0.
+        let after_from_offset = from_pos + 5; // skip "from "
+        let Some(where_pos) = find_keyword_at_depth0(&body_lower, "where", after_from_offset) else {
+            // No WHERE → no correlation predicate → not our pattern.
+            search_from = lat_end;
+            continue;
+        };
+
+        // Extract child table declaration (between FROM and WHERE).
+        let child_clause = body[after_from_offset..where_pos].trim().to_string();
+        let (child_table, child_alias) = match parse_simple_table_ref(&child_clause) {
+            Some(pair) => pair,
+            None => {
+                search_from = lat_end;
+                continue;
+            }
+        };
+
+        // Extract WHERE body.
+        let where_body = body[where_pos + 6..].trim(); // skip "where "
+        let where_lower = where_body.to_ascii_lowercase();
+
+        // Parse exactly one correlation predicate.
+        let corr = match parse_single_correlation_predicate(
+            where_body,
+            &where_lower,
+            &child_alias,
+            &child_table,
+        ) {
+            Some(c) => c,
+            None => {
+                search_from = lat_end;
+                continue;
+            }
+        };
+
+        // Reject if ALL projections are aggregate calls — that case is
+        // handled by `rewrite_lateral_nested_agg`.
+        let proj_lower = proj_str.to_ascii_lowercase();
+        if all_projections_are_aggregates(&proj_lower) {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Determine the join type by inspecting the text before `lat_start`.
+        // We look for the keyword tokens immediately preceding LATERAL.
+        let pre_text = lower[..lat_start].trim_end();
+        let join_type = if pre_text.ends_with("left join") {
+            "LEFT JOIN"
+        } else if pre_text.ends_with("join") {
+            // Matches "join", "inner join". Must not be "left join" (already
+            // caught above), "right join", "full join", or "cross join".
+            let before_join = pre_text[..pre_text.len() - 4].trim_end();
+            if before_join.ends_with("right") || before_join.ends_with("full") || before_join.ends_with("cross") {
+                // Right/full/cross LATERAL — not supported by this rewriter.
+                search_from = lat_end;
+                continue;
+            }
+            "INNER JOIN"
+        } else if pre_text.ends_with(',') {
+            // Comma-join: FROM t, LATERAL (...)
+            "COMMA"
+        } else {
+            // Unrecognised prefix — leave alone.
+            search_from = lat_end;
+            continue;
+        };
+
+        // For LEFT/INNER JOIN forms, we also need `ON true` after the alias.
+        // For COMMA form there is no ON clause.
+        // First, find the subquery alias after `)`.
+        let mut after_paren = paren_end + 1;
+        while after_paren < s.len() && bytes[after_paren].is_ascii_whitespace() {
+            after_paren += 1;
+        }
+        // Optional `AS` before alias.
+        let mut alias_start = after_paren;
+        if lower[after_paren..].starts_with("as ") || lower[after_paren..].starts_with("as\t") {
+            alias_start = after_paren + 3;
+            while alias_start < s.len() && bytes[alias_start].is_ascii_whitespace() {
+                alias_start += 1;
+            }
+        }
+        let mut alias_end = alias_start;
+        while alias_end < s.len() && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_') {
+            alias_end += 1;
+        }
+        if alias_end == alias_start {
+            // No alias — can't construct ON clause.
+            search_from = lat_end;
+            continue;
+        }
+        let sub_alias = s[alias_start..alias_end].to_string();
+
+        // For JOIN/LEFT-JOIN forms verify `ON true`.
+        let rewrite_end;
+        match join_type {
+            "INNER JOIN" | "LEFT JOIN" => {
+                let mut on_start = alias_end;
+                while on_start < s.len() && bytes[on_start].is_ascii_whitespace() { on_start += 1; }
+                if !lower[on_start..].starts_with("on ") && !lower[on_start..].starts_with("on\t") {
+                    search_from = lat_end;
+                    continue;
+                }
+                let on_kw_end = on_start + 3;
+                let mut on_val_start = on_kw_end;
+                while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() { on_val_start += 1; }
+                let on_lower_slice = lower[on_val_start..].trim_start().to_string();
+                if !on_lower_slice.starts_with("true") {
+                    search_from = lat_end;
+                    continue;
+                }
+                let on_true_end = on_val_start + 4;
+                let post_ok2 = on_true_end >= s.len() || {
+                    let b = bytes[on_true_end];
+                    !b.is_ascii_alphanumeric() && b != b'_'
+                };
+                if !post_ok2 {
+                    search_from = lat_end;
+                    continue;
+                }
+                rewrite_end = on_true_end;
+            }
+            _ => {
+                // COMMA: replacement ends at alias_end.
+                rewrite_end = alias_end;
+            }
+        }
+
+        // Build the child subquery.
+        // Check if child_col is directly available as a projected column — i.e.,
+        // one of the depth-0 projection items (after stripping its AS alias) is
+        // exactly `child_col`, `child_alias.child_col`, or `child_table.child_col`.
+        // A bare occurrence inside an expression (e.g. `id * 2`) does NOT count.
+        let child_col_in_proj = {
+            let col = corr.child_col.as_str();
+            let items = split_at_depth0_commas(&proj_lower);
+            items.iter().any(|item| {
+                let expr = strip_trailing_alias(item.trim()).trim();
+                // Accept exact match (unqualified) or qualified with child alias/table.
+                expr == col
+                    || expr == format!("{}.{}", child_alias, col).as_str()
+                    || expr == format!("{}.{}", child_table, col).as_str()
+            })
+        };
+
+        // Build the subquery projection: if child_col is absent, prepend the
+        // qualified reference so the ON clause can resolve `sub.<child_col>`.
+        let sub_proj = if child_col_in_proj {
+            proj_str.to_string()
+        } else {
+            format!("{}.{}, {}", child_alias, corr.child_col, proj_str)
+        };
+
+        // Build the child table declaration (with alias if different).
+        let child_decl = if child_table != child_alias {
+            format!("{} AS {}", child_table, child_alias)
+        } else {
+            child_table.clone()
+        };
+
+        let new_on = format!("{sub_alias}.{} = {}", corr.child_col, corr.outer_ref);
+        let new_subquery = format!("(SELECT {sub_proj} FROM {child_decl}) {sub_alias}");
+
+        // Build the replacement string for the matched range.
+        let (replace_from, replacement) = match join_type {
+            "LEFT JOIN" => {
+                // Replace from "left join lateral" start through "on true" end.
+                // Locate "left join lateral" start = lat_start - len("left join ").
+                let ljl_marker = "left join";
+                let pre = &lower[..lat_start];
+                // Find the last occurrence of "left join" before lat_start.
+                let Some(ljl_rel) = pre.rfind(ljl_marker) else {
+                    search_from = lat_end;
+                    continue;
+                };
+                let ljl_start = ljl_rel;
+                (ljl_start, format!("LEFT JOIN {new_subquery} ON {new_on}"))
+            }
+            "INNER JOIN" => {
+                // Find the last "join" before lat_start (could be "inner join").
+                let pre = &lower[..lat_start];
+                // Try "inner join" first.
+                let join_marker_start = if let Some(r) = pre.rfind("inner join") {
+                    r
+                } else if let Some(r) = pre.rfind("join") {
+                    r
+                } else {
+                    search_from = lat_end;
+                    continue;
+                };
+                (join_marker_start, format!("INNER JOIN {new_subquery} ON {new_on}"))
+            }
+            _ => {
+                // COMMA: replace from "," before lat_start through alias_end.
+                // Find the comma immediately before LATERAL.
+                let pre = &lower[..lat_start];
+                let Some(comma_rel) = pre.rfind(',') else {
+                    search_from = lat_end;
+                    continue;
+                };
+                let comma_start = comma_rel;
+                (comma_start, format!(" INNER JOIN {new_subquery} ON {new_on}"))
+            }
+        };
+
+        s.replace_range(replace_from..rewrite_end, &replacement);
+        search_from = replace_from + replacement.len();
+    }
+    s
+}
+
 /// Result of parsing a single correlation predicate from the LATERAL WHERE clause.
 struct CorrPredicate {
     /// The child-side column name (unqualified) used as the FK.
@@ -4265,14 +4614,107 @@ mod tests {
     }
 
     #[test]
-    fn lateral_non_rewritable_correlated_still_fails_path() {
-        // Arbitrary correlated LATERAL (not agg, not uncorrelated) is left intact.
-        // Both rewriters should leave it untouched.
+    fn lateral_nested_agg_not_stolen_by_row_rewriter() {
+        // The nested-agg ORM shape (all projections are aggregates) must be handled
+        // by rewrite_lateral_nested_agg, NOT by rewrite_lateral_correlated_row.
+        // Verify that the row-rewriter leaves it intact.
+        let sql = "SELECT u.id, agg.posts FROM users u LEFT JOIN LATERAL (SELECT json_agg(p.title) AS posts FROM posts p WHERE p.author_id = u.id) agg ON true ORDER BY u.id";
+        let out = rewrite_lateral_correlated_row(sql);
+        // Row-rewriter must not touch it (all projections are aggregates).
+        assert!(out.to_ascii_lowercase().contains("lateral"),
+            "nested-agg shape must not be stolen by row-rewriter: {out}");
+        // But nested_agg rewriter handles it.
+        let out2 = rewrite_lateral_nested_agg(&out);
+        assert!(!out2.to_ascii_lowercase().contains("lateral"),
+            "nested_agg rewriter must still handle the ORM shape: {out2}");
+    }
+
+    // ── Correlated row-returning LATERAL → JOIN decorrelation ────────────────
+
+    #[test]
+    fn lateral_corr_row_comma_join_simple_col() {
+        // Comma-LATERAL with simple column projection.
+        // SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub
+        // → uses INNER JOIN; correlation key (id) is already in projection.
+        let sql = "SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub";
+        let out = rewrite_lateral_correlated_row(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        assert!(out_lower.contains("inner join"), "must become INNER JOIN: {out}");
+        assert!(out_lower.contains("on sub.id = t.id"), "ON clause must be correct: {out}");
+        // The original subquery body projection must be preserved.
+        assert!(out.contains("SELECT id FROM u") || out.contains("SELECT id FROM u"), "body must be preserved: {out}");
+    }
+
+    #[test]
+    fn lateral_corr_row_left_join_simple_col() {
+        // LEFT JOIN LATERAL with single-column correlated body and ON true.
+        // → rewrite to LEFT JOIN ... ON correlation_predicate.
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true";
+        let out = rewrite_lateral_correlated_row(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        assert!(out_lower.contains("left join"), "must remain LEFT JOIN: {out}");
+        assert!(out_lower.contains("on sub.id = t.id"), "ON clause must be correct: {out}");
+        // Must not contain ON true any more.
+        assert!(!out_lower.contains("on true"), "ON true must be replaced: {out}");
+    }
+
+    #[test]
+    fn lateral_corr_row_inner_join_computed_proj() {
+        // JOIN LATERAL with computed projection (id * 2 AS dbl).
+        // child_col (id) is NOT in projection → must be prepended.
         let sql = "SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true";
+        let out = rewrite_lateral_correlated_row(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        assert!(out_lower.contains("inner join"), "must become INNER JOIN: {out}");
+        assert!(out_lower.contains("on sub.id = t.id"), "ON clause must be correct: {out}");
+        // The correlation key must be prepended to the subquery projection.
+        assert!(out_lower.contains("u.id"), "join key u.id must appear in sub projection: {out}");
+        // The computed expression must still be present.
+        assert!(out.contains("id * 2 AS dbl") || out.contains("id * 2 as dbl"), "computed expr must be preserved: {out}");
+    }
+
+    #[test]
+    fn lateral_corr_row_limit_in_body_not_rewritten() {
+        // LIMIT inside LATERAL body → must NOT rewrite (LIMIT changes top-N semantics).
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id LIMIT 1) sub ON true";
+        let out = rewrite_lateral_correlated_row(sql);
+        assert!(out.to_ascii_lowercase().contains("lateral"),
+            "LIMIT inside body must prevent rewrite: {out}");
+    }
+
+    #[test]
+    fn lateral_corr_row_order_by_in_body_not_rewritten() {
+        // ORDER BY inside LATERAL body → must NOT rewrite.
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id ORDER BY id) sub ON true";
+        let out = rewrite_lateral_correlated_row(sql);
+        assert!(out.to_ascii_lowercase().contains("lateral"),
+            "ORDER BY inside body must prevent rewrite: {out}");
+    }
+
+    #[test]
+    fn lateral_corr_row_does_not_touch_uncorrelated() {
+        // Uncorrelated LATERAL must not be handled by the row-rewriter
+        // (the uncorrelated rewriter handles it earlier).  After both run, LATERAL gone.
+        let sql = "SELECT t.id, sub.c FROM t, LATERAL (SELECT 42 AS c) sub";
+        // uncorrelated rewriter strips LATERAL first.
         let out1 = rewrite_lateral_uncorrelated(sql);
-        let out2 = rewrite_lateral_nested_agg(&out1);
-        // Still has LATERAL — will fail at DataFusion physical plan (upstream limitation).
-        assert!(out2.to_ascii_lowercase().contains("lateral"), "non-rewritable correlated LATERAL must remain: {out2}");
+        assert!(!out1.to_ascii_lowercase().contains("lateral"),
+            "uncorrelated strip must remove LATERAL first: {out1}");
+        // row-rewriter sees no LATERAL → identity.
+        let out2 = rewrite_lateral_correlated_row(&out1);
+        assert!(!out2.to_ascii_lowercase().contains("lateral"), "still no LATERAL after row-rewriter: {out2}");
+    }
+
+    #[test]
+    fn lateral_corr_row_multiple_where_preds_not_rewritten() {
+        // Multiple WHERE predicates (AND) → must NOT rewrite.
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id AND u.active = true) sub ON true";
+        let out = rewrite_lateral_correlated_row(sql);
+        assert!(out.to_ascii_lowercase().contains("lateral"),
+            "multi-predicate WHERE must prevent rewrite: {out}");
     }
 
     // ── WITH RECURSIVE column alias rewriter ────────────────────────────────
