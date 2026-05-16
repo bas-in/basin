@@ -458,7 +458,6 @@ async fn binary_param_text_ascii() {
 /// This causes a server-side panic and a `Kind::Closed` connection reset on
 /// the client side, which is a crash-severity protocol bug.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — basin_engine::pg_operators::find_word_sequence panics on multi-byte UTF-8 in substituted SQL (byte-index slicing bug at pg_operators.rs:195); crash-severity protocol bug"]
 async fn binary_param_text_multibyte_utf8() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -499,7 +498,6 @@ async fn binary_param_text_multibyte_utf8() {
 /// apostrophe concern can be un-ignored independently once the UTF-8 bug
 /// is fixed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real gap — same UTF-8 byte-slicing panic as binary_param_text_multibyte_utf8; apostrophe/special-char binary text blocked by pg_operators crash"]
 async fn binary_param_text_with_apostrophe() {
     let server = start_server().await;
     let client = connect(server.addr).await;

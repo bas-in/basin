@@ -189,18 +189,20 @@ fn rewrite_between_symmetric_inner(sql: &str, not_form: bool) -> String {
 /// Returns the byte offset of the first character of the sequence.
 fn find_word_sequence(lower: &str, sequence: &str) -> Option<usize> {
     let lb = lower.as_bytes();
-    let needle = sequence.as_bytes();
-    let mut i = 0usize;
-    while i + needle.len() <= lower.len() {
+    // Use char_indices so every `i` is guaranteed to be a char boundary —
+    // slicing `lower[i..]` is always safe even for multi-byte UTF-8 input.
+    for (i, _ch) in lower.char_indices() {
+        if i + sequence.len() > lower.len() {
+            break;
+        }
         if lower[i..].starts_with(sequence) {
             let pre_ok = i == 0 || !lb[i - 1].is_ascii_alphanumeric();
-            let post = i + needle.len();
+            let post = i + sequence.len();
             let post_ok = post >= lower.len() || !lb[post].is_ascii_alphanumeric();
             if pre_ok && post_ok {
                 return Some(i);
             }
         }
-        i += 1;
     }
     None
 }
@@ -211,11 +213,15 @@ fn find_and_after(lower: &str, start: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = start;
     while i + 3 <= lower.len() {
+        // lb[i] is a valid index (i < lower.len()); reading a single byte is
+        // always safe.  We only slice `lower[i..]` inside branches where we
+        // have already confirmed `i` is on a char boundary (all ASCII-byte
+        // arms guarantee it; the `_` arm advances by char width below).
         match lb[i] {
             b'(' => depth += 1,
             b')' => depth -= 1,
             b'\'' => {
-                // Skip string literal.
+                // Skip string literal — all bytes checked individually via lb[].
                 i += 1;
                 while i < lower.len() {
                     if lb[i] == b'\'' {
@@ -231,13 +237,28 @@ fn find_and_after(lower: &str, start: usize) -> Option<usize> {
                 continue;
             }
             _ => {
-                if depth == 0 && lower[i..].starts_with("and") {
+                // `i` may be in the middle of a multi-byte char.  Only slice
+                // lower[i..] when we know i is on a char boundary.
+                if lower.is_char_boundary(i) && depth == 0 && lower[i..].starts_with("and") {
                     let pre_ok = i == 0 || !lb[i - 1].is_ascii_alphanumeric();
                     let post_ok = i + 3 >= lower.len() || !lb[i + 3].is_ascii_alphanumeric();
                     if pre_ok && post_ok {
                         return Some(i);
                     }
                 }
+                // Advance by the full char width so we never land mid-char.
+                // Compute char width from the leading byte without slicing.
+                // Continuation bytes (0x80–0xBF) advance by 1; lead bytes
+                // advance by their declared width.
+                let char_len = match lb[i] {
+                    b if b < 0x80 => 1,           // ASCII
+                    b if b < 0xC0 => 1,           // UTF-8 continuation byte — step by 1
+                    b if b < 0xE0 => 2,           // 2-byte lead
+                    b if b < 0xF0 => 3,           // 3-byte lead
+                    _ => 4,                        // 4-byte lead
+                };
+                i += char_len;
+                continue;
             }
         }
         i += 1;
@@ -3501,6 +3522,47 @@ mod tests {
         let out = rewrite_posix_regex_operators(sql);
         // Should not introduce regexp_like.
         assert!(!out.contains("regexp_like"), "got: {out}");
+    }
+
+    // ── find_word_sequence: multi-byte UTF-8 safety ─────────────────────────
+
+    #[test]
+    fn find_word_sequence_ascii_match() {
+        // Basic sanity: still finds needle in ASCII-only input.
+        assert_eq!(find_word_sequence("between symmetric", "between symmetric"), Some(0));
+        assert_eq!(find_word_sequence("select between symmetric foo", "between symmetric"), Some(7));
+    }
+
+    #[test]
+    fn find_word_sequence_no_panic_multibyte_em_dash() {
+        // em-dash is 3 bytes (U+2014 → 0xE2 0x80 0x94).  Must not panic.
+        let lower = "hello \u{2014} world";
+        assert_eq!(find_word_sequence(lower, "between symmetric"), None);
+    }
+
+    #[test]
+    fn find_word_sequence_no_panic_emoji() {
+        // Emoji is 4 bytes (U+1F44D → 0xF0 0x9F 0x91 0x8D).  Must not panic.
+        let lower = "select '\u{1F44D}' from t";
+        assert_eq!(find_word_sequence(lower, "between symmetric"), None);
+    }
+
+    #[test]
+    fn find_word_sequence_no_panic_cjk() {
+        // CJK characters are 3 bytes each.  Must not panic.
+        let lower = "select '\u{65E5}\u{672C}\u{8A9E}' from t";
+        assert_eq!(find_word_sequence(lower, "between symmetric"), None);
+    }
+
+    #[test]
+    fn find_word_sequence_match_after_multibyte() {
+        // Needle appears AFTER multi-byte content — offset must still be correct.
+        let lower = "caf\u{00E9} between symmetric 1 and 10";
+        // "café" is 5 bytes (c-a-f + 2-byte U+00E9), so "between" starts at 6.
+        let pos = find_word_sequence(lower, "between symmetric");
+        assert!(pos.is_some(), "should find 'between symmetric' after multibyte prefix");
+        // Verify the returned position is actually a char boundary.
+        assert!(lower.is_char_boundary(pos.unwrap()), "returned offset must be a char boundary");
     }
 
     // ── BETWEEN SYMMETRIC rewriter ──────────────────────────────────────────

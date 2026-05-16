@@ -1493,8 +1493,27 @@ pub(crate) fn rewrite_every_to_bool_and(sql: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Pass through one full Unicode scalar value so multi-byte UTF-8
+        // chars (em-dash, emoji, accented letters …) are not corrupted.
+        // `b as char` treats each byte as a Latin-1 codepoint; pushing the
+        // full char (or copying the raw bytes for non-char-boundary positions)
+        // preserves the original encoding.
+        let char_len = match bytes[i] {
+            b if b < 0x80 => { out.push(b as char); 1 }
+            b if b < 0xC0 => { out.push(b as char); 1 } // stray continuation — pass through
+            _ => {
+                // Lead byte: find char boundary end and push_str the slice.
+                let ch_width = match bytes[i] {
+                    b if b < 0xE0 => 2,
+                    b if b < 0xF0 => 3,
+                    _ => 4,
+                };
+                let end = (i + ch_width).min(len);
+                out.push_str(&sql[i..end]);
+                ch_width
+            }
+        };
+        i += char_len;
     }
     out
 }
