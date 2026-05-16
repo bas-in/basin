@@ -6,6 +6,7 @@
 //! timestamp variant as RFC3339 for PoC simplicity (production will need
 //! distinct mappings for `timestamp` vs `timestamptz`).
 
+use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -40,6 +41,48 @@ const PG_EPOCH_MICROS_FROM_UNIX: i64 = (PG_EPOCH_DAYS_FROM_UNIX as i64) * 86_400
 const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 const BASIN_TYPE_JSONB: &str = "JSONB";
 const BASIN_TYPE_UUID: &str = "UUID";
+
+/// A tiny `fmt::Write` adaptor that formats values into a fixed-size stack
+/// buffer, avoiding any heap allocation for numeric-to-text rendering.
+/// 32 bytes covers i64::MIN (20 digits + sign) and f64 (at most 24 chars).
+struct StackFmt {
+    buf: [u8; 32],
+    len: usize,
+}
+
+impl StackFmt {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 32],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl FmtWrite for StackFmt {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let b = s.as_bytes();
+        let new_len = self.len + b.len();
+        if new_len > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..new_len].copy_from_slice(b);
+        self.len = new_len;
+        Ok(())
+    }
+}
 
 fn field_is_jsonb(f: &Field) -> bool {
     f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_JSONB)
@@ -130,9 +173,16 @@ fn type_size(ty: &Type) -> i16 {
 
 /// Encode every row in `batches` as a `DataRow`. Returns the rows in batch
 /// order, batch-internal row order. All values are encoded as text.
+///
+/// A single `BytesMut` scratch buffer is allocated once and reused across all
+/// rows via `split()`: each call to `split()` transfers ownership of the
+/// accumulated bytes to `DataRow` while the original `BytesMut` retains its
+/// heap allocation (capacity) for the next row, amortising the per-row alloc
+/// to a one-time cost.
 pub(crate) fn encode_batches(schema: &Arc<Schema>, batches: &[RecordBatch]) -> Vec<DataRow> {
-    let mut rows = Vec::new();
     let n_cols = schema.fields().len();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let mut rows = Vec::with_capacity(total_rows);
     // Pre-compute the `is_jsonb` / `is_uuid` bitmaps so the per-cell hot
     // loop doesn't redo a metadata lookup per row.
     let jsonb_cols: Vec<bool> = schema
@@ -145,15 +195,20 @@ pub(crate) fn encode_batches(schema: &Arc<Schema>, batches: &[RecordBatch]) -> V
         .iter()
         .map(|f| field_is_uuid(f.as_ref()))
         .collect();
+    // One scratch buffer reused across all rows. `split()` hands the
+    // accumulated bytes off to `DataRow` while this handle retains its
+    // underlying heap allocation.
+    let mut scratch = BytesMut::with_capacity(256);
+    // Stack-allocated numeric formatter — no heap alloc per integer cell.
+    let mut sf = StackFmt::new();
     for batch in batches {
         let n_rows = batch.num_rows();
         for r in 0..n_rows {
-            let mut buf = BytesMut::with_capacity(64);
             for c in 0..n_cols {
                 let col = batch.column(c);
-                encode_value(col.as_ref(), r, &mut buf, jsonb_cols[c], uuid_cols[c]);
+                encode_value(col.as_ref(), r, &mut scratch, jsonb_cols[c], uuid_cols[c], &mut sf);
             }
-            rows.push(DataRow::new(buf, n_cols as i16));
+            rows.push(DataRow::new(scratch.split(), n_cols as i16));
         }
     }
     rows
@@ -166,12 +221,16 @@ pub(crate) fn encode_batches(schema: &Arc<Schema>, batches: &[RecordBatch]) -> V
 /// Used by the extended-query path. Drivers that hard-code binary result
 /// columns (notably `tokio-postgres`) need this — text-only would garble
 /// every numeric column.
+///
+/// As with `encode_batches`, a single scratch `BytesMut` is reused across
+/// rows via `split()` to eliminate O(rows) heap allocations.
 pub(crate) fn encode_batches_with_formats(
     schema: &Arc<Schema>,
     batches: &[RecordBatch],
     format_codes: &[i16],
 ) -> Result<Vec<DataRow>> {
     let n_cols = schema.fields().len();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     let jsonb_cols: Vec<bool> = schema
         .fields()
         .iter()
@@ -182,25 +241,50 @@ pub(crate) fn encode_batches_with_formats(
         .iter()
         .map(|f| field_is_uuid(f.as_ref()))
         .collect();
-    let mut rows = Vec::new();
+    // Pre-compute per-column binary flag when format_codes has one entry per
+    // column; avoids the repeated match inside the hot cell loop.
+    let binary_cols: Option<Vec<bool>> = if format_codes.len() > 1 {
+        Some(
+            (0..n_cols)
+                .map(|c| format_codes.get(c).copied().unwrap_or(0) == 1)
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let all_binary = format_codes.len() == 1 && format_codes[0] == 1;
+    let mut rows = Vec::with_capacity(total_rows);
+    let mut scratch = BytesMut::with_capacity(256);
+    let mut sf = StackFmt::new();
     for batch in batches {
         let n_rows = batch.num_rows();
         for r in 0..n_rows {
-            let mut buf = BytesMut::with_capacity(64);
             for c in 0..n_cols {
                 let col = batch.column(c);
-                let is_binary = match format_codes.len() {
-                    0 => false,
-                    1 => format_codes[0] == 1,
-                    _ => format_codes.get(c).copied().unwrap_or(0) == 1,
+                let is_binary = match &binary_cols {
+                    Some(v) => v[c],
+                    None => all_binary,
                 };
                 if is_binary {
-                    encode_value_binary(col.as_ref(), r, &mut buf, jsonb_cols[c], uuid_cols[c])?;
+                    encode_value_binary(
+                        col.as_ref(),
+                        r,
+                        &mut scratch,
+                        jsonb_cols[c],
+                        uuid_cols[c],
+                    )?;
                 } else {
-                    encode_value(col.as_ref(), r, &mut buf, jsonb_cols[c], uuid_cols[c]);
+                    encode_value(
+                        col.as_ref(),
+                        r,
+                        &mut scratch,
+                        jsonb_cols[c],
+                        uuid_cols[c],
+                        &mut sf,
+                    );
                 }
             }
-            rows.push(DataRow::new(buf, n_cols as i16));
+            rows.push(DataRow::new(scratch.split(), n_cols as i16));
         }
     }
     Ok(rows)
@@ -366,7 +450,11 @@ fn encode_value_binary(
                 ?other,
                 "binary format not implemented for type, emitting text"
             );
-            encode_value(col, idx, buf, is_jsonb, is_uuid);
+            // Fallback path: uncommon / unmapped types fall back to text.
+            // A local StackFmt is fine here because this branch is not on
+            // the hot path (well-typed columns never reach it).
+            let mut sf = StackFmt::new();
+            encode_value(col, idx, buf, is_jsonb, is_uuid, &mut sf);
         }
     }
     Ok(())
@@ -374,7 +462,20 @@ fn encode_value_binary(
 
 /// Encode the value at row `idx` of `col` into `buf` as a length-prefixed
 /// text-format Postgres field. NULLs get a -1 length and no body.
-fn encode_value(col: &dyn Array, idx: usize, buf: &mut BytesMut, is_jsonb: bool, is_uuid: bool) {
+///
+/// Common types (`Boolean`, `Utf8`, `LargeUtf8`, integer and float primitives)
+/// are written directly into `buf` without a heap-allocated intermediate
+/// `String`. `sf` is a reusable stack-allocated scratch buffer for integer/
+/// float-to-text formatting; callers pass the same `StackFmt` across all cells
+/// in all rows so no additional allocations occur on the hot path.
+fn encode_value(
+    col: &dyn Array,
+    idx: usize,
+    buf: &mut BytesMut,
+    is_jsonb: bool,
+    is_uuid: bool,
+    sf: &mut StackFmt,
+) {
     if col.is_null(idx) {
         buf.put_i32(-1);
         return;
@@ -411,7 +512,109 @@ fn encode_value(col: &dyn Array, idx: usize, buf: &mut BytesMut, is_jsonb: bool,
             return;
         }
     }
-    // Render the cell as a UTF-8 string in `s`, then prefix with length.
+
+    // Fast-path: types where we can write directly into `buf` without an
+    // intermediate `String` heap allocation.
+    match col.data_type() {
+        // Text columns: bytes are already UTF-8 in the Arrow buffer — zero
+        // copy, zero heap allocation.
+        DataType::Utf8 => {
+            let s = col.as_string::<i32>().value(idx);
+            buf.put_i32(s.len() as i32);
+            buf.put_slice(s.as_bytes());
+            return;
+        }
+        DataType::LargeUtf8 => {
+            let s = col.as_string::<i64>().value(idx);
+            buf.put_i32(s.len() as i32);
+            buf.put_slice(s.as_bytes());
+            return;
+        }
+        // Boolean: Postgres text is 't' or 'f' (1 byte).
+        DataType::Boolean => {
+            let v = col.as_boolean().value(idx);
+            buf.put_i32(1);
+            buf.put_u8(if v { b't' } else { b'f' });
+            return;
+        }
+        // Integer primitives: format into the stack scratch buffer, then
+        // write length + bytes. No heap allocation.
+        DataType::Int8 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<Int8Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::Int16 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<Int16Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::Int32 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<Int32Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::Int64 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<Int64Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::UInt8 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<UInt8Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::UInt16 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<UInt16Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::UInt32 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<UInt32Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::UInt64 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<UInt64Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::Float32 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<Float32Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        DataType::Float64 => {
+            sf.reset();
+            let _ = write!(sf, "{}", col.as_primitive::<Float64Type>().value(idx));
+            buf.put_i32(sf.as_bytes().len() as i32);
+            buf.put_slice(sf.as_bytes());
+            return;
+        }
+        _ => {}
+    }
+
+    // Fallback: types that still need render_cell (timestamps, dates,
+    // intervals, bytea, decimal, fallback debug). These are less common on
+    // the hot path in typical OLTP-style result sets.
     let s = render_cell(col, idx);
     buf.put_i32(s.len() as i32);
     buf.put_slice(s.as_bytes());
@@ -515,7 +718,9 @@ fn render_bytea(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(2 + bytes.len() * 2);
     s.push_str("\\x");
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        // write! into a &mut String uses fmt::Write, which avoids the
+        // inner heap allocation that `format!("{b:02x}")` would produce.
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
