@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778960373 (Unix epoch)
-SQL fragments tested: 697 total / 1872 green (across all three configurations).
+Last run: 1778962124 (Unix epoch)
+SQL fragments tested: 697 total / 1878 green (across all three configurations).
 
 ## Configurations
 
@@ -614,8 +614,8 @@ SQL fragments tested: 697 total / 1872 green (across all three configurations).
 | `SELECT id, name FROM t GROUP BY CUBE (id, name)` | ✅ | ✅ | ✅ |  |
 | `SELECT id, name FROM t GROUP BY GROUPING SETS ((id), (name))` | ✅ | ✅ | ✅ |  |
 | `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM t` | ✅ | ✅ | ✅ |  |
-| `SELECT percentile_disc(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY id) FROM t` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'percentile_disc'. Di… |
-| `SELECT mode() WITHIN GROUP (ORDER BY id) FROM t` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'mode'. Did you mean … |
+| `SELECT percentile_disc(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY id) FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT mode() WITHIN GROUP (ORDER BY id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT stddev(id), stddev_pop(id), stddev_samp(id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT variance(id), var_pop(id), var_samp(id) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT corr(id, id), covar_pop(id, id), covar_samp(id, id) FROM t` | ✅ | ✅ | ✅ |  |
