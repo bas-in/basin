@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778936205 (Unix epoch)
-SQL fragments tested: 697 total / 1857 green (across all three configurations).
+Last run: 1778943578 (Unix epoch)
+SQL fragments tested: 697 total / 1860 green (across all three configurations).
 
 ## Configurations
 
@@ -607,7 +607,7 @@ SQL fragments tested: 697 total / 1857 green (across all three configurations).
 | `SELECT COUNT(*) FILTER (WHERE id > 0) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT STRING_AGG(name, ',') FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY_AGG(id) FROM t` | ✅ | ✅ | ✅ |  |
-| `SELECT JSON_AGG(t) FROM t` | 🛠 | 🛠 | 🛠 | internal: plan: Schema error: No field named t. Valid fields are t.id. |
+| `SELECT JSON_AGG(t) FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT id, SUM(id) FROM t GROUP BY id` | ✅ | ✅ | ✅ |  |
 | `SELECT id, SUM(id) FROM t GROUP BY id HAVING SUM(id) > 0` | ✅ | ✅ | ✅ |  |
 | `SELECT id, GROUPING(id) FROM t GROUP BY ROLLUP (id)` | ✅ | ✅ | ✅ |  |
