@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778964422 (Unix epoch)
-SQL fragments tested: 697 total / 1884 green (across all three configurations).
+Last run: 1778968726 (Unix epoch)
+SQL fragments tested: 697 total / 1905 green (across all three configurations).
 
 ## Configurations
 
@@ -249,16 +249,16 @@ SQL fragments tested: 697 total / 1884 green (across all three configurations).
 | `SELECT websearch_to_tsquery('english', 'quick OR fox')` | ✅ | ✅ | ✅ |  |
 | `SELECT ts_rank(to_tsvector('a quick'), to_tsquery('quick'))` | ✅ | ✅ | ✅ |  |
 | `SELECT ts_headline('a quick fox', to_tsquery('quick'))` | ✅ | ✅ | ✅ |  |
-| `CREATE TABLE doc (body TEXT, ts TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', body)) STORED)` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: TSVECTOR |
-| `CREATE INDEX ON doc USING gin (ts)` | 📜 | 📜 | 📜 | setup failed: invalid schema: unsupported column type in PoC: TSVECTOR |
-| `SELECT tsvector_to_array(to_tsvector('a quick fox'))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'tsvector_to_array'. … |
-| `SELECT tsquery_phrase(to_tsquery('quick'), to_tsquery('fox'))` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'tsquery_phrase'. Did… |
+| `CREATE TABLE doc (body TEXT, ts TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', body)) STORED)` | ✅ | ✅ | ✅ |  |
+| `CREATE INDEX ON doc USING gin (ts)` | ✅ | ✅ | ✅ |  |
+| `SELECT tsvector_to_array(to_tsvector('a quick fox'))` | ✅ | ✅ | ✅ |  |
+| `SELECT tsquery_phrase(to_tsquery('quick'), to_tsquery('fox'))` | ✅ | ✅ | ✅ |  |
 | `SELECT to_tsvector('a') @@ to_tsquery('b')` | ✅ | ✅ | ✅ |  |
 | `SELECT ts_rank_cd(to_tsvector('a quick fox'), to_tsquery('quick'))` | ✅ | ✅ | ✅ |  |
 | `SELECT numnode(to_tsquery('quick & fox'))` | ✅ | ✅ | ✅ |  |
 | `SELECT querytree(to_tsquery('quick & fox'))` | ✅ | ✅ | ✅ |  |
 | `SELECT strip(to_tsvector('a quick fox'))` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM t WHERE ts @@ to_tsquery('english', 'quick')` | 📜 | 📜 | 📜 | setup failed: invalid schema: unsupported column type in PoC: TSVECTOR |
+| `SELECT * FROM t WHERE ts @@ to_tsquery('english', 'quick')` | ✅ | ✅ | ✅ |  |
 
 ## Functions/Array
 
@@ -827,7 +827,7 @@ SQL fragments tested: 697 total / 1884 green (across all three configurations).
 | `CREATE TABLE __t (c MACADDR); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c MONEY); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c XML); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
-| `CREATE TABLE __t (c TSVECTOR); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: TSVECTOR |
+| `CREATE TABLE __t (c TSVECTOR); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c POINT); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c INT4RANGE); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c VECTOR(3)); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
@@ -836,7 +836,7 @@ SQL fragments tested: 697 total / 1884 green (across all three configurations).
 | `CREATE TABLE __t (c OID); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: OID |
 | `CREATE TABLE __t (c REGCLASS); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: REGCLASS |
 | `CREATE TABLE __t (c REGTYPE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: REGTYPE |
-| `CREATE TABLE __t (c TSQUERY); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: TSQUERY |
+| `CREATE TABLE __t (c TSQUERY); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c PG_LSN); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: PG_LSN |
 | `CREATE TABLE __t (c INT8RANGE); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c NUMRANGE); DROP TABLE __t` | ✅ | ✅ | ✅ |  |

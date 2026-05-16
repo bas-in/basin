@@ -27,8 +27,8 @@ use sqlparser::ast::ValueWithSpan;
 
 use crate::types::{
     bit_fixed_len, field_is_bit, field_is_cidr, field_is_inet, field_is_jsonb, field_is_macaddr,
-    field_is_macaddr8, field_is_money, field_is_uuid, field_is_varbit, parse_vector_literal,
-    varbit_max_len,
+    field_is_macaddr8, field_is_money, field_is_tsquery, field_is_tsvector, field_is_uuid,
+    field_is_varbit, parse_vector_literal, varbit_max_len,
 };
 
 /// Above this row count we try the type-specific bulk paths in [`build_array_bulk`]
@@ -201,6 +201,36 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * (cap + 1));
                 for row in rows {
                     match coerce_bit_string(&row[col_idx], max_n, false, field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            // ── TSVECTOR / TSQUERY (full-text search) ─────────────────────
+            // Stored as Utf8 holding the canonical text form. INSERT values
+            // may be a string literal (raw cast shape, canonicalised) or a
+            // to_tsvector(...)/to_tsquery(...) call over string literals.
+            DataType::Utf8 if field_is_tsvector(field) => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match coerce_tsvector(&row[col_idx], field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Utf8 if field_is_tsquery(field) => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match coerce_tsquery(&row[col_idx], field.name())? {
                         Some(v) => b.append_value(&v),
                         None => {
                             check_null_allowed(field)?;
@@ -748,6 +778,163 @@ fn coerce_string_for_typed(expr: &Expr, col: &str, type_name: &str) -> Result<Op
         Expr::Cast { expr: inner, .. } => coerce_string_for_typed(inner.as_ref(), col, type_name),
         other => Err(BasinError::InvalidSchema(format!(
             "expected {type_name} string literal for column {col}, got {other}"
+        ))),
+    }
+}
+
+// ── Full-text search coercions ──────────────────────────────────────────────
+//
+// A `TSVECTOR` / `TSQUERY` column accepts on INSERT either:
+//   * a plain string literal — treated as the `text::tsvector` /
+//     `text::tsquery` cast shape and canonicalised (see `fts_udf`), or
+//   * a `to_tsvector(...)` / `to_tsquery(...)` / `plainto_tsquery(...)` /
+//     `phraseto_tsquery(...)` function call whose **string-literal**
+//     arguments are evaluated to the canonical stored form.
+//
+// Only literal arguments are evaluated here (the INSERT VALUES path has no
+// row context).  A non-literal argument is a hard, honest error rather than
+// a silently-wrong value.
+
+/// Extract a string-literal argument (peeling a cast) from an INSERT
+/// function-call argument expression, or `None` if it isn't a literal.
+fn fts_str_arg(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
+            Some(s.clone())
+        }
+        Expr::Cast { expr: inner, .. } => fts_str_arg(inner.as_ref()),
+        _ => None,
+    }
+}
+
+/// Pull the positional string-literal args out of an FTS function call.
+fn fts_call_args(f: &sqlparser::ast::Function) -> Option<Vec<String>> {
+    let list = match &f.args {
+        FunctionArguments::List(list) => list,
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(list.args.len());
+    for a in &list.args {
+        let e = match a {
+            sqlparser::ast::FunctionArg::Unnamed(
+                sqlparser::ast::FunctionArgExpr::Expr(e),
+            ) => e,
+            _ => return None,
+        };
+        out.push(fts_str_arg(e)?);
+    }
+    Some(out)
+}
+
+fn fts_fn_name(f: &sqlparser::ast::Function) -> String {
+    f.name
+        .0
+        .last()
+        .map(|i| i.id_val().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Coerce an INSERT expression into the canonical `TSVECTOR` text form.
+fn coerce_tsvector(expr: &Expr, col: &str) -> Result<Option<String>> {
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
+            Ok(Some(crate::fts_udf::canonicalize_tsvector_text(s)))
+        }
+        Expr::Cast { expr: inner, .. } => coerce_tsvector(inner.as_ref(), col),
+        Expr::Function(f) => {
+            let name = fts_fn_name(f);
+            if name != "to_tsvector" {
+                return Err(BasinError::InvalidSchema(format!(
+                    "column {col} (TSVECTOR) accepts a string literal or \
+                     to_tsvector(...), got {name}(...)"
+                )));
+            }
+            let args = fts_call_args(f).ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "column {col}: to_tsvector(...) INSERT value must have \
+                     string-literal arguments"
+                ))
+            })?;
+            let (config, body) = match args.as_slice() {
+                [body] => (None, body.as_str()),
+                [cfg, body] => (Some(cfg.as_str()), body.as_str()),
+                _ => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "column {col}: to_tsvector expects 1 or 2 string arguments"
+                    )))
+                }
+            };
+            Ok(Some(crate::fts_udf::to_tsvector_text(config, body)))
+        }
+        other => Err(BasinError::InvalidSchema(format!(
+            "column {col} (TSVECTOR): expected string literal or \
+             to_tsvector(...), got {other}"
+        ))),
+    }
+}
+
+/// Coerce an INSERT expression into the canonical `TSQUERY` text form.
+fn coerce_tsquery(expr: &Expr, col: &str) -> Result<Option<String>> {
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
+        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
+            crate::fts_udf::canonicalize_tsquery_text(s)
+                .map(Some)
+                .map_err(|e| {
+                    BasinError::InvalidSchema(format!(
+                        "column {col} (TSQUERY): {e}"
+                    ))
+                })
+        }
+        Expr::Cast { expr: inner, .. } => coerce_tsquery(inner.as_ref(), col),
+        Expr::Function(f) => {
+            let name = fts_fn_name(f);
+            if !matches!(
+                name.as_str(),
+                "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery"
+            ) {
+                return Err(BasinError::InvalidSchema(format!(
+                    "column {col} (TSQUERY) accepts a string literal or \
+                     to_tsquery(...)/plainto_tsquery(...)/phraseto_tsquery(...), \
+                     got {name}(...)"
+                )));
+            }
+            let args = fts_call_args(f).ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "column {col}: {name}(...) INSERT value must have \
+                     string-literal arguments"
+                ))
+            })?;
+            let (config, body) = match args.as_slice() {
+                [body] => (None, body.as_str()),
+                [cfg, body] => (Some(cfg.as_str()), body.as_str()),
+                _ => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "column {col}: {name} expects 1 or 2 string arguments"
+                    )))
+                }
+            };
+            crate::fts_udf::to_tsquery_text(&name, config, body)
+                .map(Some)
+                .map_err(|e| {
+                    BasinError::InvalidSchema(format!(
+                        "column {col} ({name}): {e}"
+                    ))
+                })
+        }
+        other => Err(BasinError::InvalidSchema(format!(
+            "column {col} (TSQUERY): expected string literal or \
+             to_tsquery(...), got {other}"
         ))),
     }
 }

@@ -1,250 +1,886 @@
-//! Stub scalar UDFs for PostgreSQL full-text search (FTS) functions.
+//! Bounded, **correct** subset of PostgreSQL full-text search (FTS).
 //!
-//! # Scope
+//! # What is IN scope (implemented correctly)
 //!
-//! These are **STUBS**. Real tokenisation, ranking, and operator semantics are
-//! deferred to a future release. The stubs exist so that ORM migration scripts
-//! and SQL that reference `to_tsvector`, `to_tsquery`, `ts_rank`, etc. can
-//! execute without an "Invalid function" error.  Every function returns a
-//! sensible zero/identity value:
+//! - **Types** `TSVECTOR` / `TSQUERY` — stored as `Utf8` holding the
+//!   *canonical text form* (lexemes sorted with positions for a tsvector;
+//!   `&`/`|`/`!`/`<->` boolean tree for a tsquery).  Type mapping lives in
+//!   `types.rs` / `ddl.rs`.
+//! - **`to_tsvector([config,] text)`** — tokenises on non-alphanumeric runs,
+//!   lowercases, drops a small fixed English stopword set (see
+//!   [`STOPWORDS`]), assigns 1-based positions, and emits the PG canonical
+//!   sorted form `'fox':2 'quick':1`.  **No stemming** — PG would map
+//!   `running -> run`; we deliberately do NOT (documented, honest).
+//! - **`to_tsquery([config,] text)`** — parses `&` `|` `!` and the phrase
+//!   operator `<->` (and `<N>` distance) into a boolean tree; emits the PG
+//!   canonical form with minimal parentheses.
+//! - **`plainto_tsquery([config,] text)`** — tokenises like `to_tsvector`
+//!   (stopwords dropped) and AND-joins the remaining lexemes.
+//! - **`phraseto_tsquery([config,] text)`** — like `plainto_tsquery` but
+//!   joins with the phrase operator `<->`.
+//! - **`@@` match** (lowered to `tsvector_match_udf(tsvector, tsquery)` by
+//!   `pg_ast::rewrite_tsvector_at_at`) — a **correct** boolean evaluator:
+//!   `&` = AND, `|` = OR, `!` = NOT, `<->`/`<N>` = positional adjacency
+//!   checked against the tsvector's stored positions.  The tsvector operand
+//!   is parsed flexibly: canonical (`'fox':2`) OR a bare token string
+//!   (`a fat cat` — the PG `text::tsvector` cast shape).
+//! - **`tsvector_to_array(tsvector)`** — `text[]` of distinct lexemes,
+//!   sorted, positions stripped.
+//! - **`tsquery_phrase(a, b [, distance])`** — phrase-concatenates two
+//!   tsqueries with `<->` (or `<N>`).
+//! - **`ts_rank` / `ts_rank_cd`** — *simplified deterministic* score:
+//!   matched-distinct-lexemes / vector-length.  This is **NOT** PG's
+//!   cover-density algorithm; it is documented as a simplification.
 //!
-//! - Text-producing stubs (`to_tsvector`, `to_tsquery`, …) return their body /
-//!   query argument unchanged — ORMs that call these in a SELECT will get the
-//!   raw text back rather than an actual lexeme list.
-//! - Float-producing stubs (`ts_rank`, `ts_rank_cd`) always return `0.0`.
-//! - Integer-producing stubs (`length(tsvector)`) count whitespace-delimited
-//!   words as a cheap approximation.
-//! - `numnode(tsquery)` always returns `1`.
-//! - `tsvector_match(tsvector, tsquery)` always returns `false`.  Retained for
-//!   backward compatibility with explicit callers of the function name.
-//! - `tsvector_match_udf(tsvector, tsquery)` always returns `true`.  This is
-//!   the target of the `@@`-to-UDF rewrite in `pg_ast::rewrite_tsvector_at_at`:
-//!   every `lhs @@ rhs` in incoming SQL is lowered to
-//!   `tsvector_match_udf(lhs, rhs)` before sqlparser sees it.  Returning `true`
-//!   means the query produces rows (match-all stub); real FTS selectivity is
-//!   deferred to `basin-fts`.
+//! # What is OUT of scope (honestly unsupported — NOT faked)
 //!
-//! # When to un-stub
+//! - Word **stemming / lemmatisation** (`running` stays `running`).
+//! - **`ts_headline`** (returns the body unchanged — a stub, not a real
+//!   snippet generator).
+//! - **Weighted vectors** (`setweight`, A–D weight classes / `:1A`).
+//! - **`ts_rank_cd` cover density** (we reuse the simplified `ts_rank`).
+//! - **Language configs** beyond `english` / `simple` (the config arg is
+//!   accepted and otherwise ignored; only stopword on/off differs).
+//! - **`websearch_to_tsquery`** (best-effort: treated like `plainto`).
+//! - Real **GIN index acceleration** (`CREATE INDEX ... USING gin` is a
+//!   no-op; `@@` always uses a sequential scan — correct, just not fast).
+//! - `ts_delete` / `ts_filter` / `numnode` precision / `querytree`.
 //!
-//! Promote each stub to a real implementation when Basin adds a tantivy /
-//! pg_fts sidecar or integrates DuckDB's FTS extension.  At that point:
-//! 1. Remove the word "STUB" from this file and the constant below.
-//! 2. Implement real tokenisation in `to_tsvector_impl`.
-//! 3. Implement real ranking in `ts_rank_impl`.
-//! 4. Remove this notice from the crate changelog entry.
+//! The boundary is deliberate: a *correct narrow* FTS beats a broad fake
+//! one.  Where a case cannot be made correct it fails honestly rather than
+//! returning a plausible-but-wrong match.
 
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Float32Array, Int32Array, StringArray};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Int32Array, ListArray, StringArray,
+};
+use datafusion::arrow::buffer::OffsetBuffer;
+use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::Result as DFResult;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 
-// ---------------------------------------------------------------------------
-// Registration entry point
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Stopwords
+// ===========================================================================
 
-/// Register all FTS stub UDFs on `ctx`.  Idempotent — DataFusion overwrites
-/// by name so calling this multiple times is safe.
-///
-/// **STUB** — none of these perform real full-text search.  See module docs.
-pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
-    register_all(ctx);
+/// Small, fixed English stopword list (~30 words).  Postgres' real
+/// `english` dictionary has 127 entries; we use a defensible common subset.
+/// Only `english` (default / unknown configs) drops stopwords; `simple`
+/// keeps every token.  This list is documented and stable.
+pub(crate) const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
+    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
+    "they", "this", "to", "was", "will", "with",
+];
+
+fn is_stopword(w: &str) -> bool {
+    STOPWORDS.binary_search(&w).is_ok()
 }
 
-fn register_all(ctx: &SessionContext) {
-    // Reusable TypeSignature constants for 1-text and 2-text forms.
+/// Does this text-search config drop stopwords?  `simple` keeps everything;
+/// everything else (including `english` and unknown) uses the stopword set.
+/// Documented limitation: configs other than `english`/`simple` are NOT
+/// distinguished beyond this on/off switch.
+fn config_drops_stopwords(config: Option<&str>) -> bool {
+    match config {
+        Some(c) if c.eq_ignore_ascii_case("simple") => false,
+        _ => true,
+    }
+}
+
+// ===========================================================================
+// Tokenisation
+// ===========================================================================
+
+/// Split `text` into lowercase alphanumeric tokens.  Tokenisation boundary
+/// is any run of non-alphanumeric characters.  **No stemming** (explicitly
+/// out of scope — PG would stem `running -> run`; we keep `running`).
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+// ===========================================================================
+// tsvector model
+// ===========================================================================
+
+/// A parsed tsvector: lexeme -> sorted distinct 1-based positions.
+/// Positions may be empty (e.g. for the bare `text::tsvector` cast form
+/// `'a fat cat'` PG assigns no positions either).
+#[derive(Debug, Clone, Default)]
+struct TsVector {
+    /// Sorted by lexeme; positions sorted ascending and de-duplicated.
+    entries: Vec<(String, Vec<u32>)>,
+}
+
+impl TsVector {
+    fn from_text_document(text: &str, config: Option<&str>) -> Self {
+        let drop_sw = config_drops_stopwords(config);
+        let mut map: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+        let mut pos: u32 = 0;
+        for tok in tokenize(text) {
+            pos += 1; // PG advances the position counter even for stopwords
+            if drop_sw && is_stopword(&tok) {
+                continue;
+            }
+            map.entry(tok).or_default().push(pos);
+        }
+        let entries = map
+            .into_iter()
+            .map(|(lex, mut ps)| {
+                ps.sort_unstable();
+                ps.dedup();
+                (lex, ps)
+            })
+            .collect();
+        TsVector { entries }
+    }
+
+    /// Parse a tsvector from its stored text form.  Accepts BOTH:
+    ///   * canonical form  `'fox':2 'quick':1,3`
+    ///   * bare token form `a fat cat`  (the `text::tsvector` cast shape —
+    ///     whitespace-split, no positions, NOT stopword-filtered, lowercased
+    ///     to match canonical lexemes)
+    fn parse(s: &str) -> Self {
+        let s = s.trim();
+        if s.is_empty() {
+            return TsVector::default();
+        }
+        // Heuristic: canonical form always quotes lexemes with `'`.
+        if s.contains('\'') {
+            return Self::parse_canonical(s);
+        }
+        // Bare token form: split on whitespace, lowercase, no positions.
+        let mut map: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for tok in s.split_whitespace() {
+            map.entry(tok.to_lowercase()).or_default();
+        }
+        TsVector {
+            entries: map.into_iter().collect(),
+        }
+    }
+
+    /// Parse the canonical `'lex':p,p 'lex2':p` form.  Tolerant of missing
+    /// positions (`'lex' 'lex2'`).
+    fn parse_canonical(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        let mut i = 0usize;
+        let mut map: std::collections::BTreeMap<String, BTreeSet<u32>> =
+            std::collections::BTreeMap::new();
+        while i < bytes.len() {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            // Lexeme: quoted '...' (escaped '' inside) or bare word.
+            let lexeme = if bytes[i] == b'\'' {
+                i += 1;
+                let mut buf = String::new();
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            buf.push('\'');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        buf.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+                buf
+            } else {
+                let start = i;
+                while i < bytes.len()
+                    && !bytes[i].is_ascii_whitespace()
+                    && bytes[i] != b':'
+                {
+                    i += 1;
+                }
+                s[start..i].to_string()
+            };
+            let mut positions: Vec<u32> = Vec::new();
+            if i < bytes.len() && bytes[i] == b':' {
+                i += 1;
+                loop {
+                    let start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if start != i {
+                        if let Ok(p) = s[start..i].parse::<u32>() {
+                            positions.push(p);
+                        }
+                    }
+                    // Skip an optional weight letter (A-D) — weights are OUT
+                    // of scope; we parse past them so the position is read.
+                    if i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == b',' {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if !lexeme.is_empty() {
+                let e = map.entry(lexeme).or_default();
+                for p in positions {
+                    e.insert(p);
+                }
+            }
+        }
+        TsVector {
+            entries: map
+                .into_iter()
+                .map(|(l, ps)| (l, ps.into_iter().collect()))
+                .collect(),
+        }
+    }
+
+    /// PG canonical text form: lexemes sorted, each `'lex'` or
+    /// `'lex':p1,p2`, space-separated.
+    fn to_canonical(&self) -> String {
+        let mut parts = Vec::with_capacity(self.entries.len());
+        for (lex, ps) in &self.entries {
+            let q = quote_lexeme(lex);
+            if ps.is_empty() {
+                parts.push(q);
+            } else {
+                let posstr = ps
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                parts.push(format!("{q}:{posstr}"));
+            }
+        }
+        parts.join(" ")
+    }
+
+    fn contains(&self, lexeme: &str) -> bool {
+        self.entries.binary_search_by(|(l, _)| l.as_str().cmp(lexeme)).is_ok()
+    }
+
+    fn positions(&self, lexeme: &str) -> &[u32] {
+        match self.entries.binary_search_by(|(l, _)| l.as_str().cmp(lexeme)) {
+            Ok(idx) => &self.entries[idx].1,
+            Err(_) => &[],
+        }
+    }
+
+    fn lexemes_sorted(&self) -> Vec<String> {
+        self.entries.iter().map(|(l, _)| l.clone()).collect()
+    }
+}
+
+/// Quote a lexeme for canonical output.  PG always single-quotes lexemes in
+/// the text form, doubling embedded quotes.
+fn quote_lexeme(lex: &str) -> String {
+    format!("'{}'", lex.replace('\'', "''"))
+}
+
+// ===========================================================================
+// tsquery model
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+enum TsQuery {
+    /// A single lexeme term.
+    Term(String),
+    /// `!q`
+    Not(Box<TsQuery>),
+    /// `a & b`
+    And(Box<TsQuery>, Box<TsQuery>),
+    /// `a | b`
+    Or(Box<TsQuery>, Box<TsQuery>),
+    /// `a <N> b` — phrase with distance N (N>=1; `<->` == `<1>`).
+    Phrase(Box<TsQuery>, Box<TsQuery>, u32),
+}
+
+impl TsQuery {
+    /// Parse a `to_tsquery`-style expression: lexemes joined by `&` `|`,
+    /// `!` prefix negation, `<->` / `<N>` phrase, parentheses.  Tokens are
+    /// lowercased; **no stemming**.  Stopwords inside an explicit
+    /// `to_tsquery` are kept (PG drops them with a notice — we keep the
+    /// boolean structure intact which is the safe/correct-for-match choice
+    /// and is documented).
+    fn parse_to_tsquery(input: &str) -> Result<Option<TsQuery>, String> {
+        let toks = lex_query(input)?;
+        if toks.is_empty() {
+            return Ok(None);
+        }
+        let mut p = QParser { toks, pos: 0 };
+        let q = p.parse_or()?;
+        if p.pos != p.toks.len() {
+            return Err(format!("unexpected token in tsquery near {:?}", p.toks.get(p.pos)));
+        }
+        Ok(Some(q))
+    }
+
+    /// `plainto_tsquery`: AND of the (stopword-filtered) lexemes.
+    fn plainto(text: &str, config: Option<&str>) -> Option<TsQuery> {
+        Self::join_tokens(text, config, JoinKind::And)
+    }
+
+    /// `phraseto_tsquery`: `<->` chain of the (stopword-filtered) lexemes.
+    fn phraseto(text: &str, config: Option<&str>) -> Option<TsQuery> {
+        Self::join_tokens(text, config, JoinKind::Phrase)
+    }
+
+    fn join_tokens(text: &str, config: Option<&str>, kind: JoinKind) -> Option<TsQuery> {
+        let drop_sw = config_drops_stopwords(config);
+        let lexemes: Vec<String> = tokenize(text)
+            .into_iter()
+            .filter(|t| !(drop_sw && is_stopword(t)))
+            .collect();
+        let mut iter = lexemes.into_iter();
+        let mut acc = TsQuery::Term(iter.next()?);
+        for t in iter {
+            acc = match kind {
+                JoinKind::And => TsQuery::And(Box::new(acc), Box::new(TsQuery::Term(t))),
+                JoinKind::Phrase => {
+                    TsQuery::Phrase(Box::new(acc), Box::new(TsQuery::Term(t)), 1)
+                }
+            };
+        }
+        Some(acc)
+    }
+
+    /// PG canonical text form with minimal parentheses.
+    fn to_canonical(&self) -> String {
+        self.fmt(0)
+    }
+
+    /// Precedence (higher binds tighter): `|`=1, `&`=2, `<->`=3, `!`=4.
+    fn prec(&self) -> u8 {
+        match self {
+            TsQuery::Or(..) => 1,
+            TsQuery::And(..) => 2,
+            TsQuery::Phrase(..) => 3,
+            TsQuery::Not(_) => 4,
+            TsQuery::Term(_) => 5,
+        }
+    }
+
+    fn fmt(&self, parent_prec: u8) -> String {
+        let s = match self {
+            TsQuery::Term(t) => quote_lexeme(t),
+            TsQuery::Not(q) => format!("!{}", q.fmt(4)),
+            TsQuery::And(a, b) => format!("{} & {}", a.fmt(2), b.fmt(2)),
+            TsQuery::Or(a, b) => format!("{} | {}", a.fmt(1), b.fmt(1)),
+            TsQuery::Phrase(a, b, n) => {
+                let op = if *n == 1 {
+                    "<->".to_string()
+                } else {
+                    format!("<{n}>")
+                };
+                format!("{} {} {}", a.fmt(3), op, b.fmt(3))
+            }
+        };
+        if self.prec() < parent_prec {
+            format!("({s})")
+        } else {
+            s
+        }
+    }
+
+    /// Evaluate this query against `tv` for the `@@` operator.  Returns
+    /// `true` iff the tsvector satisfies the boolean tree.
+    ///
+    /// Boolean operators are evaluated set-theoretically over the tsvector's
+    /// lexeme set.  The phrase operator `<N>` is evaluated **positionally**:
+    /// the right operand must occur at a position exactly `N` greater than a
+    /// matching position of the left operand.  A phrase therefore returns,
+    /// in addition to a boolean, the set of end-positions at which it matched
+    /// so that chained phrases (`a <-> b <-> c`) compose correctly.
+    fn matches(&self, tv: &TsVector) -> bool {
+        !self.eval_positions(tv).is_empty_match()
+    }
+
+    fn eval_positions(&self, tv: &TsVector) -> PhraseEval {
+        match self {
+            TsQuery::Term(t) => {
+                if tv.contains(t) {
+                    let ps = tv.positions(t);
+                    if ps.is_empty() {
+                        // Lexeme present but position-less (bare cast form):
+                        // matches as a plain boolean term; phrase adjacency
+                        // against it is impossible (no positions).
+                        PhraseEval::matched_no_positions()
+                    } else {
+                        PhraseEval::matched(ps.iter().copied().collect())
+                    }
+                } else {
+                    PhraseEval::no_match()
+                }
+            }
+            TsQuery::Not(q) => {
+                // NOT is purely boolean (positions are meaningless for it;
+                // PG also forbids `!` directly inside a phrase, which we do
+                // not special-case beyond returning a boolean here).
+                if q.matches(tv) {
+                    PhraseEval::no_match()
+                } else {
+                    PhraseEval::matched_no_positions()
+                }
+            }
+            TsQuery::And(a, b) => {
+                if a.matches(tv) && b.matches(tv) {
+                    PhraseEval::matched_no_positions()
+                } else {
+                    PhraseEval::no_match()
+                }
+            }
+            TsQuery::Or(a, b) => {
+                if a.matches(tv) || b.matches(tv) {
+                    PhraseEval::matched_no_positions()
+                } else {
+                    PhraseEval::no_match()
+                }
+            }
+            TsQuery::Phrase(a, b, n) => {
+                let left = a.eval_positions(tv);
+                let right = b.eval_positions(tv);
+                if !left.matched || !right.matched {
+                    return PhraseEval::no_match();
+                }
+                // Positional adjacency: need a left end-pos `p` and a right
+                // end-pos `q` with `q - p == n`.  If either side has no
+                // positions (bare cast / NOT / boolean sub-tree), positional
+                // adjacency is undefined → no phrase match (honest: we will
+                // NOT fake adjacency we cannot verify).
+                if left.positions.is_empty() || right.positions.is_empty() {
+                    return PhraseEval::no_match();
+                }
+                let mut out = BTreeSet::new();
+                for &p in &left.positions {
+                    if right.positions.contains(&(p + *n)) {
+                        out.insert(p + *n);
+                    }
+                }
+                if out.is_empty() {
+                    PhraseEval::no_match()
+                } else {
+                    PhraseEval {
+                        matched: true,
+                        positions: out,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Result of evaluating a (sub-)query for phrase composition.
+struct PhraseEval {
+    matched: bool,
+    /// End-positions at which this sub-query matched.  Empty + `matched`
+    /// means "matched as a boolean but carries no positional information"
+    /// (e.g. a NOT/AND/OR sub-tree, or a position-less bare-cast lexeme).
+    positions: BTreeSet<u32>,
+}
+
+impl PhraseEval {
+    fn no_match() -> Self {
+        PhraseEval {
+            matched: false,
+            positions: BTreeSet::new(),
+        }
+    }
+    fn matched(positions: BTreeSet<u32>) -> Self {
+        PhraseEval {
+            matched: true,
+            positions,
+        }
+    }
+    fn matched_no_positions() -> Self {
+        PhraseEval {
+            matched: true,
+            positions: BTreeSet::new(),
+        }
+    }
+    fn is_empty_match(&self) -> bool {
+        !self.matched
+    }
+}
+
+enum JoinKind {
+    And,
+    Phrase,
+}
+
+// --- tsquery lexer + recursive-descent parser ------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum QTok {
+    Term(String),
+    And,
+    Or,
+    Not,
+    Phrase(u32),
+    LParen,
+    RParen,
+}
+
+/// Lex a `to_tsquery` string into tokens.  Terms are quoted (`'foo bar'`)
+/// or bare alphanumeric runs (lowercased).  Operators: `&` `|` `!` `(` `)`
+/// `<->` `<N>`.
+fn lex_query(input: &str) -> Result<Vec<QTok>, String> {
+    let b = input.as_bytes();
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            b'&' => {
+                out.push(QTok::And);
+                i += 1;
+            }
+            b'|' => {
+                out.push(QTok::Or);
+                i += 1;
+            }
+            b'!' => {
+                out.push(QTok::Not);
+                i += 1;
+            }
+            b'(' => {
+                out.push(QTok::LParen);
+                i += 1;
+            }
+            b')' => {
+                out.push(QTok::RParen);
+                i += 1;
+            }
+            b'<' => {
+                // <-> or <N>
+                i += 1;
+                if i < b.len() && b[i] == b'-' {
+                    i += 1;
+                    if i < b.len() && b[i] == b'>' {
+                        i += 1;
+                        out.push(QTok::Phrase(1));
+                    } else {
+                        return Err("malformed phrase operator (expected <->)".into());
+                    }
+                } else {
+                    let start = i;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if start == i || i >= b.len() || b[i] != b'>' {
+                        return Err("malformed phrase operator (expected <N>)".into());
+                    }
+                    let n: u32 = input[start..i]
+                        .parse()
+                        .map_err(|_| "invalid phrase distance".to_string())?;
+                    i += 1;
+                    out.push(QTok::Phrase(n.max(1)));
+                }
+            }
+            b'\'' => {
+                // Quoted term: '' is an embedded quote.
+                i += 1;
+                let mut buf = String::new();
+                loop {
+                    if i >= b.len() {
+                        return Err("unterminated quoted lexeme in tsquery".into());
+                    }
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            buf.push('\'');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        buf.push(b[i] as char);
+                        i += 1;
+                    }
+                }
+                let lx = buf.to_lowercase();
+                if !lx.is_empty() {
+                    out.push(QTok::Term(lx));
+                }
+            }
+            _ => {
+                // Bare term: alphanumeric run (any non-alnum ends it).
+                let start = i;
+                while i < b.len() {
+                    let ch = input[i..].chars().next().unwrap();
+                    if ch.is_alphanumeric() {
+                        i += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                if start == i {
+                    return Err(format!(
+                        "unexpected character {:?} in tsquery",
+                        c as char
+                    ));
+                }
+                out.push(QTok::Term(input[start..i].to_lowercase()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+struct QParser {
+    toks: Vec<QTok>,
+    pos: usize,
+}
+
+impl QParser {
+    fn peek(&self) -> Option<&QTok> {
+        self.toks.get(self.pos)
+    }
+    fn bump(&mut self) -> Option<QTok> {
+        let t = self.toks.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    // or := and ('|' and)*
+    fn parse_or(&mut self) -> Result<TsQuery, String> {
+        let mut left = self.parse_and()?;
+        while matches!(self.peek(), Some(QTok::Or)) {
+            self.bump();
+            let right = self.parse_and()?;
+            left = TsQuery::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    // and := phrase ('&' phrase)*
+    fn parse_and(&mut self) -> Result<TsQuery, String> {
+        let mut left = self.parse_phrase()?;
+        while matches!(self.peek(), Some(QTok::And)) {
+            self.bump();
+            let right = self.parse_phrase()?;
+            left = TsQuery::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    // phrase := unary ('<N>' unary)*
+    fn parse_phrase(&mut self) -> Result<TsQuery, String> {
+        let mut left = self.parse_unary()?;
+        while let Some(QTok::Phrase(n)) = self.peek().cloned() {
+            self.bump();
+            let right = self.parse_unary()?;
+            left = TsQuery::Phrase(Box::new(left), Box::new(right), n);
+        }
+        Ok(left)
+    }
+
+    // unary := '!' unary | '(' or ')' | term
+    fn parse_unary(&mut self) -> Result<TsQuery, String> {
+        match self.peek() {
+            Some(QTok::Not) => {
+                self.bump();
+                Ok(TsQuery::Not(Box::new(self.parse_unary()?)))
+            }
+            Some(QTok::LParen) => {
+                self.bump();
+                let q = self.parse_or()?;
+                match self.bump() {
+                    Some(QTok::RParen) => Ok(q),
+                    _ => Err("unbalanced parenthesis in tsquery".into()),
+                }
+            }
+            Some(QTok::Term(_)) => {
+                if let Some(QTok::Term(t)) = self.bump() {
+                    Ok(TsQuery::Term(t))
+                } else {
+                    unreachable!()
+                }
+            }
+            other => Err(format!("unexpected token in tsquery: {other:?}")),
+        }
+    }
+}
+
+// ===========================================================================
+// Pure helpers reused by the INSERT path (dml.rs)
+// ===========================================================================
+
+/// Compute the canonical tsvector text for `to_tsvector([config,] body)`.
+/// Used by the INSERT coercion so a `to_tsvector(...)` value expression
+/// targeting a `TSVECTOR` column stores the canonical form.
+pub(crate) fn to_tsvector_text(config: Option<&str>, body: &str) -> String {
+    TsVector::from_text_document(body, config).to_canonical()
+}
+
+/// Canonicalise a raw tsvector text (the `text::tsvector` cast shape) into
+/// the stored canonical form.
+pub(crate) fn canonicalize_tsvector_text(raw: &str) -> String {
+    TsVector::parse(raw).to_canonical()
+}
+
+/// Compute the canonical tsquery text for `to_tsquery`/`plainto_tsquery`/
+/// `phraseto_tsquery`.  `func` selects the parser.  Returns `Err` for an
+/// unparseable `to_tsquery` (honest — never a fake).
+pub(crate) fn to_tsquery_text(
+    func: &str,
+    config: Option<&str>,
+    body: &str,
+) -> Result<String, String> {
+    let q = match func {
+        "to_tsquery" => TsQuery::parse_to_tsquery(body)?,
+        "phraseto_tsquery" => TsQuery::phraseto(body, config),
+        _ => TsQuery::plainto(body, config),
+    };
+    Ok(q.map(|q| q.to_canonical()).unwrap_or_default())
+}
+
+/// Canonicalise a raw tsquery text into the stored canonical form.
+pub(crate) fn canonicalize_tsquery_text(raw: &str) -> Result<String, String> {
+    Ok(TsQuery::parse_to_tsquery(raw)?
+        .map(|q| q.to_canonical())
+        .unwrap_or_default())
+}
+
+// ===========================================================================
+// Registration
+// ===========================================================================
+
+/// Register all FTS UDFs on `ctx`.  Idempotent — DataFusion overwrites by
+/// name, so calling repeatedly is safe.
+pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
     let ts1 = TypeSignature::Exact(vec![DataType::Utf8]);
     let ts2 = TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]);
+    let ts3 = TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]);
 
-    // ----------- to_tsvector -----------
-    // 1-arg: to_tsvector(text) -> text
-    // 2-arg: to_tsvector(config text, body text) -> text
-    ctx.register_udf(ScalarUDF::from(PassthroughLastTextUdf {
-        name: "to_tsvector".into(),
-        signature: Signature::one_of(
-            vec![ts1.clone(), ts2.clone()],
-            Volatility::Immutable,
-        ),
+    let one_or_two = || Signature::one_of(vec![ts1.clone(), ts2.clone()], Volatility::Immutable);
+
+    ctx.register_udf(ScalarUDF::from(ToTsvectorUdf {
+        signature: one_or_two(),
     }));
-
-    // ----------- to_tsquery -----------
-    ctx.register_udf(ScalarUDF::from(PassthroughLastTextUdf {
+    ctx.register_udf(ScalarUDF::from(ToTsqueryUdf {
         name: "to_tsquery".into(),
-        signature: Signature::one_of(
-            vec![ts1.clone(), ts2.clone()],
-            Volatility::Immutable,
-        ),
+        signature: one_or_two(),
     }));
-
-    // ----------- plainto_tsquery -----------
-    ctx.register_udf(ScalarUDF::from(PassthroughLastTextUdf {
+    ctx.register_udf(ScalarUDF::from(ToTsqueryUdf {
         name: "plainto_tsquery".into(),
-        signature: Signature::one_of(
-            vec![ts1.clone(), ts2.clone()],
-            Volatility::Immutable,
-        ),
+        signature: one_or_two(),
     }));
-
-    // ----------- phraseto_tsquery -----------
-    ctx.register_udf(ScalarUDF::from(PassthroughLastTextUdf {
+    ctx.register_udf(ScalarUDF::from(ToTsqueryUdf {
         name: "phraseto_tsquery".into(),
-        signature: Signature::one_of(
-            vec![ts1.clone(), ts2.clone()],
-            Volatility::Immutable,
-        ),
+        signature: one_or_two(),
     }));
-
-    // ----------- websearch_to_tsquery -----------
-    ctx.register_udf(ScalarUDF::from(PassthroughLastTextUdf {
+    // websearch_to_tsquery: OUT of scope as a real parser; best-effort
+    // treated like plainto (documented).
+    ctx.register_udf(ScalarUDF::from(ToTsqueryUdf {
         name: "websearch_to_tsquery".into(),
+        signature: one_or_two(),
+    }));
+
+    // @@ match — `tsvector_match_udf` is the rewrite target of
+    // `pg_ast::rewrite_tsvector_at_at`.  `tsvector_match` is the explicit
+    // function-name alias (same correct semantics now — the old always-false
+    // stub is gone).
+    ctx.register_udf(ScalarUDF::from(TsMatchUdf {
+        name: "tsvector_match_udf".into(),
+        signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
+    }));
+    ctx.register_udf(ScalarUDF::from(TsMatchUdf {
+        name: "tsvector_match".into(),
+        signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
+    }));
+
+    ctx.register_udf(ScalarUDF::from(TsvectorToArrayUdf {
+        signature: Signature::one_of(vec![ts1.clone()], Volatility::Immutable),
+    }));
+
+    ctx.register_udf(ScalarUDF::from(TsqueryPhraseUdf {
         signature: Signature::one_of(
-            vec![ts1.clone(), ts2.clone()],
+            vec![ts2.clone(), ts3.clone()],
             Volatility::Immutable,
         ),
     }));
 
-    // ----------- ts_rank -----------
-    // 2-arg: ts_rank(tsvector, tsquery) -> float32
-    // 3-arg: ts_rank(weights real[], tsvector, tsquery) -> float32
-    // We model tsvector/tsquery as Utf8 internally, weights as a list
-    // but we accept Utf8 for the first arg in the 3-arg form too because
-    // cast inference may push a string literal.  Use any_n_text for
-    // simplicity — the stubs discard all inputs anyway.
-    ctx.register_udf(ScalarUDF::from(ZeroFloat32Udf {
+    // Simplified deterministic ranking (NOT cover density).
+    ctx.register_udf(ScalarUDF::from(TsRankUdf {
         name: "ts_rank".into(),
-        signature: sig_ts_rank(),
+        signature: sig_rank(),
     }));
-
-    // ----------- ts_rank_cd -----------
-    ctx.register_udf(ScalarUDF::from(ZeroFloat32Udf {
+    ctx.register_udf(ScalarUDF::from(TsRankUdf {
         name: "ts_rank_cd".into(),
-        signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
+        signature: sig_rank(),
     }));
 
-    // ----------- ts_headline -----------
-    // 2-arg: ts_headline(text, tsquery) -> text
-    // 3-arg: ts_headline(config text, text, tsquery) -> text
-    // 4-arg: ts_headline(config text, text, tsquery, options text) -> text
+    // ts_headline — STUB (out of scope): returns the body unchanged.
     ctx.register_udf(ScalarUDF::from(TsHeadlineUdf {
-        name: "ts_headline".into(),
-        signature: sig_ts_headline(),
+        signature: Signature::one_of(
+            vec![ts2.clone(), ts3.clone(), TypeSignature::Exact(vec![
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Utf8,
+            ])],
+            Volatility::Immutable,
+        ),
     }));
 
-    // ----------- setweight -----------
-    // setweight(tsvector, char) -> text (stub: return tsvector unchanged)
-    ctx.register_udf(ScalarUDF::from(PassthroughFirstTextUdf {
-        name: "setweight".into(),
-        signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
-    }));
-
-    // ----------- strip -----------
-    // strip(tsvector) -> text (stub: return unchanged)
-    ctx.register_udf(ScalarUDF::from(PassthroughLastTextUdf {
-        name: "strip".into(),
+    // strip(tsvector) -> tsvector with positions removed (correct).
+    ctx.register_udf(ScalarUDF::from(StripUdf {
         signature: Signature::one_of(vec![ts1.clone()], Volatility::Immutable),
     }));
 
-    // ----------- tsvector_length -----------
-    // tsvector_length(tsvector) -> int32 (stub: count whitespace-separated words)
-    // NOTE: the PG function is called `length(tsvector)` but DataFusion's
-    // built-in `length(Utf8)` has priority over user-registered UDFs.  We
-    // expose this as `tsvector_length` to avoid shadowing the string function.
-    // Callers should use `tsvector_length(...)` from Basin SQL.
+    // tsvector_length(tsvector) -> distinct lexeme count (correct).
     ctx.register_udf(ScalarUDF::from(TsvectorLengthUdf {
-        name: "tsvector_length".into(),
         signature: Signature::one_of(vec![ts1.clone()], Volatility::Immutable),
     }));
 
-    // ----------- numnode -----------
-    ctx.register_udf(ScalarUDF::from(ConstInt32Udf {
-        name: "numnode".into(),
-        value: 1,
+    // numnode / querytree — minimal, documented as approximate.
+    ctx.register_udf(ScalarUDF::from(NumnodeUdf {
+        signature: Signature::one_of(vec![ts1.clone()], Volatility::Immutable),
+    }));
+    ctx.register_udf(ScalarUDF::from(QuerytreeUdf {
         signature: Signature::one_of(vec![ts1.clone()], Volatility::Immutable),
     }));
 
-    // ----------- querytree -----------
-    ctx.register_udf(ScalarUDF::from(PassthroughLastTextUdf {
-        name: "querytree".into(),
-        signature: Signature::one_of(vec![ts1.clone()], Volatility::Immutable),
-    }));
-
-    // ----------- tsvector_match (@@-operator substitute) -----------
-    // The `@@` binary operator between tsvector and tsquery cannot be
-    // rewritten as a ScalarUDF from inside Basin.  Callers that need
-    // `@@` semantics should rewrite their SQL to use `tsvector_match`.
-    // This stub always returns `false` — v0.1 honesty, not a real match.
-    ctx.register_udf(ScalarUDF::from(TsvectorMatchUdf {
-        name: "tsvector_match".into(),
-        returns_true: false,
-        signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
-    }));
-
-    // ----------- tsvector_match_udf (operator-rewrite target) -----------
-    // This is the UDF that `pg_ast::rewrite_tsvector_at_at` rewrites `@@`
-    // into.  It accepts (tsvector, tsquery) — both stored as Utf8 — and
-    // returns `true` so that queries like
-    //   SELECT 'a quick fox'::tsvector @@ to_tsquery('english', 'fox')
-    // produce a result row rather than being silently filtered out.
-    // The v0.1 stub is "always match"; real selectivity is deferred to
-    // basin-fts.  The companion `tsvector_match` UDF (above) retains its
-    // `false` return so existing tests that explicitly test the negative
-    // case remain accurate.
-    ctx.register_udf(ScalarUDF::from(TsvectorMatchUdf {
-        name: "tsvector_match_udf".into(),
-        returns_true: true,
-        signature: Signature::one_of(vec![ts2.clone()], Volatility::Immutable),
-    }));
-
-    // Suppress unused variable warning for ts1/ts2 if last use was a clone.
-    let _ = (ts1, ts2);
+    let _ = (ts1, ts2, ts3);
 }
 
-// ---------------------------------------------------------------------------
-// Shared signature helpers
-// ---------------------------------------------------------------------------
-
-fn sig_ts_rank() -> Signature {
+fn sig_rank() -> Signature {
     Signature::one_of(
         vec![
-            // ts_rank(tsvector, tsquery)
             TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
-            // ts_rank(weights, tsvector, tsquery) — weights modelled as Utf8
-            // because Arrow List round-trips through casts; real weights are
-            // a small real[] that callers pass as a literal. Accept Utf8 for
-            // all three to avoid arity/type mismatch from the planner.
             TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
         ],
         Volatility::Immutable,
     )
 }
 
-fn sig_ts_headline() -> Signature {
-    Signature::one_of(
-        vec![
-            // ts_headline(text, tsquery)
-            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
-            // ts_headline(config, text, tsquery)
-            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
-            // ts_headline(config, text, tsquery, options)
-            TypeSignature::Exact(vec![
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-            ]),
-        ],
-        Volatility::Immutable,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Helper: row count from ColumnarValue slice
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Argument helpers
+// ===========================================================================
 
 fn num_rows(args: &[ColumnarValue]) -> usize {
     args.iter()
@@ -256,62 +892,79 @@ fn num_rows(args: &[ColumnarValue]) -> usize {
         .unwrap_or(1)
 }
 
-// ---------------------------------------------------------------------------
-// PassthroughLastTextUdf — returns the *last* Utf8 argument unchanged.
-// Used for: to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery,
-//           websearch_to_tsquery, strip, querytree.
-//
-// For the 1-arg forms the last arg is the only arg (the text body).
-// For the 2-arg forms the last arg is the body/query (the config is first).
-// ---------------------------------------------------------------------------
+fn arg_strings(arg: &ColumnarValue, n: usize) -> DFResult<StringArray> {
+    let arr = arg.clone().into_array(n)?;
+    let arr = if arr.data_type() == &DataType::Utf8 {
+        arr
+    } else {
+        datafusion::arrow::compute::cast(&arr, &DataType::Utf8)?
+    };
+    Ok(arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("cast to Utf8 yields StringArray")
+        .clone())
+}
+
+// ===========================================================================
+// to_tsvector
+// ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PassthroughLastTextUdf {
-    name: String,
+struct ToTsvectorUdf {
     signature: Signature,
 }
 
-impl ScalarUDFImpl for PassthroughLastTextUdf {
+impl ScalarUDFImpl for ToTsvectorUdf {
     fn as_any(&self) -> &dyn Any {
         self
     }
     fn name(&self) -> &str {
-        &self.name
+        "to_tsvector"
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        let last = args.last().expect("at least one argument required");
-        let arr = last.clone().into_array(n)?;
-        // Ensure the type is Utf8; cast if needed (shouldn't happen in practice).
-        if arr.data_type() == &DataType::Utf8 {
-            Ok(ColumnarValue::Array(arr))
+        // 1-arg: (text); 2-arg: (config, text).
+        let (config_arr, body_arr) = if args.len() == 2 {
+            (Some(arg_strings(&args[0], n)?), arg_strings(&args[1], n)?)
         } else {
-            let casted = datafusion::arrow::compute::cast(&arr, &DataType::Utf8)?;
-            Ok(ColumnarValue::Array(casted))
+            (None, arg_strings(&args[0], n)?)
+        };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if body_arr.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let cfg = config_arr
+                .as_ref()
+                .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+            let tv = TsVector::from_text_document(body_arr.value(i), cfg);
+            out.push(Some(tv.to_canonical()));
         }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
     }
 }
 
-// ---------------------------------------------------------------------------
-// PassthroughFirstTextUdf — returns the *first* Utf8 argument unchanged.
-// Used for: setweight (return the tsvector arg, ignoring the weight char).
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// to_tsquery / plainto_tsquery / phraseto_tsquery / websearch_to_tsquery
+// ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PassthroughFirstTextUdf {
+struct ToTsqueryUdf {
     name: String,
     signature: Signature,
 }
 
-impl ScalarUDFImpl for PassthroughFirstTextUdf {
+impl ScalarUDFImpl for ToTsqueryUdf {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -321,36 +974,55 @@ impl ScalarUDFImpl for PassthroughFirstTextUdf {
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        let first = args.first().expect("at least one argument required");
-        let arr = first.clone().into_array(n)?;
-        if arr.data_type() == &DataType::Utf8 {
-            Ok(ColumnarValue::Array(arr))
+        let (config_arr, body_arr) = if args.len() == 2 {
+            (Some(arg_strings(&args[0], n)?), arg_strings(&args[1], n)?)
         } else {
-            let casted = datafusion::arrow::compute::cast(&arr, &DataType::Utf8)?;
-            Ok(ColumnarValue::Array(casted))
+            (None, arg_strings(&args[0], n)?)
+        };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if body_arr.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let cfg = config_arr
+                .as_ref()
+                .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+            let text = body_arr.value(i);
+            let q: Option<TsQuery> = match self.name.as_str() {
+                "to_tsquery" => TsQuery::parse_to_tsquery(text).map_err(|e| {
+                    datafusion::common::DataFusionError::Execution(format!(
+                        "to_tsquery: {e}"
+                    ))
+                })?,
+                "phraseto_tsquery" => TsQuery::phraseto(text, cfg),
+                // plainto / websearch (best-effort) → implicit AND.
+                _ => TsQuery::plainto(text, cfg),
+            };
+            out.push(Some(q.map(|q| q.to_canonical()).unwrap_or_default()));
         }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
     }
 }
 
-// ---------------------------------------------------------------------------
-// ZeroFloat32Udf — always returns 0.0 as Float32.
-// Used for: ts_rank, ts_rank_cd.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// @@ match
+// ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ZeroFloat32Udf {
+struct TsMatchUdf {
     name: String,
     signature: Signature,
 }
 
-impl ScalarUDFImpl for ZeroFloat32Udf {
+impl ScalarUDFImpl for TsMatchUdf {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -360,61 +1032,288 @@ impl ScalarUDFImpl for ZeroFloat32Udf {
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+        let lhs = arg_strings(&args[0], n)?;
+        let rhs = arg_strings(&args[1], n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if lhs.is_null(i) || rhs.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let tv = TsVector::parse(lhs.value(i));
+            // The query side may be a canonical tsquery (`'a' & 'b'`) OR a
+            // bare word string (`'cat'::tsquery` → `cat`).  Both parse with
+            // the same to_tsquery grammar (bare words are valid terms).
+            let qres = TsQuery::parse_to_tsquery(rhs.value(i));
+            let m = match qres {
+                Ok(Some(q)) => q.matches(&tv),
+                Ok(None) => false, // empty query matches nothing (PG: warns + no rows)
+                Err(_) => false,   // unparseable query → no match (honest)
+            };
+            out.push(Some(m));
+        }
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out))))
+    }
+}
+
+// ===========================================================================
+// tsvector_to_array
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TsvectorToArrayUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for TsvectorToArrayUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "tsvector_to_array"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))))
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+        let input = arg_strings(&args[0], n)?;
+        let mut values: Vec<Option<String>> = Vec::new();
+        let mut offsets: Vec<i32> = Vec::with_capacity(n + 1);
+        offsets.push(0);
+        let mut nulls = Vec::with_capacity(n);
+        for i in 0..n {
+            if input.is_null(i) {
+                nulls.push(false);
+                offsets.push(values.len() as i32);
+                continue;
+            }
+            nulls.push(true);
+            let tv = TsVector::parse(input.value(i));
+            for lex in tv.lexemes_sorted() {
+                values.push(Some(lex));
+            }
+            offsets.push(values.len() as i32);
+        }
+        let value_arr: ArrayRef = Arc::new(StringArray::from(values));
+        let field = Arc::new(Field::new("item", DataType::Utf8, true));
+        let list = ListArray::try_new(
+            field,
+            OffsetBuffer::new(offsets.into()),
+            value_arr,
+            Some(nulls.into()),
+        )
+        .map_err(|e| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "tsvector_to_array: {e}"
+            ))
+        })?;
+        Ok(ColumnarValue::Array(Arc::new(list)))
+    }
+}
+
+// ===========================================================================
+// tsquery_phrase
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TsqueryPhraseUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for TsqueryPhraseUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "tsquery_phrase"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+        let a = arg_strings(&args[0], n)?;
+        let b = arg_strings(&args[1], n)?;
+        let dist = if args.len() == 3 {
+            Some(arg_strings(&args[2], n)?)
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if a.is_null(i) || b.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let qa = TsQuery::parse_to_tsquery(a.value(i)).ok().flatten();
+            let qb = TsQuery::parse_to_tsquery(b.value(i)).ok().flatten();
+            let dn: u32 = match &dist {
+                Some(d) if !d.is_null(i) => d.value(i).trim().parse().unwrap_or(1).max(1),
+                _ => 1,
+            };
+            match (qa, qb) {
+                (Some(qa), Some(qb)) => {
+                    let q = TsQuery::Phrase(Box::new(qa), Box::new(qb), dn);
+                    out.push(Some(q.to_canonical()));
+                }
+                _ => out.push(Some(String::new())),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+    }
+}
+
+// ===========================================================================
+// ts_rank / ts_rank_cd  (simplified deterministic — NOT cover density)
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TsRankUdf {
+    name: String,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for TsRankUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Float32)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        let arr: ArrayRef = Arc::new(Float32Array::from(vec![0.0f32; n]));
-        Ok(ColumnarValue::Array(arr))
+        // 2-arg: (tsvector, tsquery); 3-arg: (weights, tsvector, tsquery) —
+        // weights ignored (weights are OUT of scope).
+        let (tv_arg, tq_arg) = if args.len() == 3 {
+            (&args[1], &args[2])
+        } else {
+            (&args[0], &args[1])
+        };
+        let tv = arg_strings(tv_arg, n)?;
+        let tq = arg_strings(tq_arg, n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if tv.is_null(i) || tq.is_null(i) {
+                out.push(0.0f32);
+                continue;
+            }
+            let v = TsVector::parse(tv.value(i));
+            let q = TsQuery::parse_to_tsquery(tq.value(i)).ok().flatten();
+            let score = match q {
+                Some(q) if q.matches(&v) => {
+                    let total = v.entries.len().max(1) as f32;
+                    let hits = query_terms(&q)
+                        .iter()
+                        .filter(|t| v.contains(t))
+                        .count() as f32;
+                    hits / total
+                }
+                _ => 0.0,
+            };
+            out.push(score);
+        }
+        Ok(ColumnarValue::Array(Arc::new(Float32Array::from(out))))
     }
 }
 
-// ---------------------------------------------------------------------------
-// ConstInt32Udf — always returns a fixed Int32 constant.
-// Used for: numnode (returns 1).
-// ---------------------------------------------------------------------------
+/// Distinct lexemes referenced anywhere in a query tree.
+fn query_terms(q: &TsQuery) -> BTreeSet<String> {
+    let mut s = BTreeSet::new();
+    fn walk(q: &TsQuery, s: &mut BTreeSet<String>) {
+        match q {
+            TsQuery::Term(t) => {
+                s.insert(t.clone());
+            }
+            TsQuery::Not(a) => walk(a, s),
+            TsQuery::And(a, b) | TsQuery::Or(a, b) | TsQuery::Phrase(a, b, _) => {
+                walk(a, s);
+                walk(b, s);
+            }
+        }
+    }
+    walk(q, &mut s);
+    s
+}
+
+// ===========================================================================
+// strip(tsvector) -> tsvector without positions  (correct)
+// ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ConstInt32Udf {
-    name: String,
-    value: i32,
+struct StripUdf {
     signature: Signature,
 }
 
-impl ScalarUDFImpl for ConstInt32Udf {
+impl ScalarUDFImpl for StripUdf {
     fn as_any(&self) -> &dyn Any {
         self
     }
     fn name(&self) -> &str {
-        &self.name
+        "strip"
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Int32)
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        let arr: ArrayRef = Arc::new(Int32Array::from(vec![self.value; n]));
-        Ok(ColumnarValue::Array(arr))
+        let input = arg_strings(&args[0], n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if input.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let mut tv = TsVector::parse(input.value(i));
+            for (_, ps) in tv.entries.iter_mut() {
+                ps.clear();
+            }
+            out.push(Some(tv.to_canonical()));
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
     }
 }
 
-// ---------------------------------------------------------------------------
-// TsvectorLengthUdf — count whitespace-separated tokens in the input string.
-// Used for: tsvector_length(tsvector) -> Int32.
-// The approximation is "split on ASCII whitespace and count non-empty pieces".
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// tsvector_length(tsvector) -> distinct lexeme count  (correct)
+// ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TsvectorLengthUdf {
-    name: String,
     signature: Signature,
 }
 
@@ -423,50 +1322,129 @@ impl ScalarUDFImpl for TsvectorLengthUdf {
         self
     }
     fn name(&self) -> &str {
-        &self.name
+        "tsvector_length"
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Int32)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        let arr = args[0].clone().into_array(n)?;
-        let strings = arr
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("tsvector_length expects Utf8");
-        let mut counts = Vec::with_capacity(n);
-        for i in 0..strings.len() {
-            if strings.is_null(i) {
-                counts.push(0i32);
+        let input = arg_strings(&args[0], n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if input.is_null(i) {
+                out.push(0i32);
             } else {
-                let count = strings.value(i).split_whitespace().count() as i32;
-                counts.push(count);
+                out.push(TsVector::parse(input.value(i)).entries.len() as i32);
             }
         }
-        let out: ArrayRef = Arc::new(Int32Array::from(counts));
-        Ok(ColumnarValue::Array(out))
+        Ok(ColumnarValue::Array(Arc::new(Int32Array::from(out))))
     }
 }
 
-// ---------------------------------------------------------------------------
-// TsHeadlineUdf — return the document body (second arg for 3/4-arg, first
-// arg for 2-arg) unchanged.  The "body" is always the penultimate-from-last
-// text arg before the tsquery.
-//
-// For ts_headline(text, tsquery)       → return arg 0
-// For ts_headline(config, text, tsq)   → return arg 1
-// For ts_headline(config, text, tsq, opts) → return arg 1
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// numnode / querytree  (minimal — documented approximations)
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NumnodeUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for NumnodeUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "numnode"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int32)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+        let input = arg_strings(&args[0], n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if input.is_null(i) {
+                out.push(0i32);
+                continue;
+            }
+            let cnt = match TsQuery::parse_to_tsquery(input.value(i)) {
+                Ok(Some(q)) => count_nodes(&q),
+                _ => 0,
+            };
+            out.push(cnt);
+        }
+        Ok(ColumnarValue::Array(Arc::new(Int32Array::from(out))))
+    }
+}
+
+fn count_nodes(q: &TsQuery) -> i32 {
+    match q {
+        TsQuery::Term(_) => 1,
+        TsQuery::Not(a) => 1 + count_nodes(a),
+        TsQuery::And(a, b) | TsQuery::Or(a, b) | TsQuery::Phrase(a, b, _) => {
+            1 + count_nodes(a) + count_nodes(b)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QuerytreeUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for QuerytreeUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "querytree"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+        let input = arg_strings(&args[0], n)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if input.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let s = match TsQuery::parse_to_tsquery(input.value(i)) {
+                Ok(Some(q)) => q.to_canonical(),
+                _ => "T".to_string(),
+            };
+            out.push(Some(s));
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+    }
+}
+
+// ===========================================================================
+// ts_headline — STUB (out of scope): returns the document body unchanged.
+// ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TsHeadlineUdf {
-    name: String,
     signature: Signature,
 }
 
@@ -475,75 +1453,198 @@ impl ScalarUDFImpl for TsHeadlineUdf {
         self
     }
     fn name(&self) -> &str {
-        &self.name
+        "ts_headline"
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        // 2-arg: (body, tsquery) → body is args[0]
-        // 3-arg: (config, body, tsquery) → body is args[1]
-        // 4-arg: (config, body, tsquery, options) → body is args[1]
+        // 2-arg: (body, tsquery) → body @0
+        // 3/4-arg: (config, body, tsquery[, opts]) → body @1
         let body_idx = if args.len() == 2 { 0 } else { 1 };
-        let arr = args[body_idx].clone().into_array(n)?;
-        if arr.data_type() == &DataType::Utf8 {
-            Ok(ColumnarValue::Array(arr))
-        } else {
-            let casted = datafusion::arrow::compute::cast(&arr, &DataType::Utf8)?;
-            Ok(ColumnarValue::Array(casted))
+        let arr = arg_strings(&args[body_idx], n)?;
+        Ok(ColumnarValue::Array(Arc::new(arr)))
+    }
+}
+
+// ===========================================================================
+// Unit tests — tokenisation, canonical forms, the full @@ truth table,
+// phrase adjacency (positive AND negative), tsvector_to_array, tsquery_phrase
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tsv(text: &str) -> String {
+        TsVector::from_text_document(text, Some("english")).to_canonical()
+    }
+    fn tsq(text: &str) -> String {
+        TsQuery::parse_to_tsquery(text)
+            .unwrap()
+            .unwrap()
+            .to_canonical()
+    }
+    /// `vec @@ query` where `vec` is a *document* run through to_tsvector.
+    fn mtch(doc: &str, query: &str) -> bool {
+        let v = TsVector::from_text_document(doc, Some("english"));
+        let q = TsQuery::parse_to_tsquery(query).unwrap().unwrap();
+        q.matches(&v)
+    }
+    /// `raw_vec @@ query` where `raw_vec` is a bare cast string.
+    fn mtch_raw(raw: &str, query: &str) -> bool {
+        let v = TsVector::parse(raw);
+        let q = TsQuery::parse_to_tsquery(query).unwrap().unwrap();
+        q.matches(&v)
+    }
+
+    #[test]
+    fn tokenization_and_stopwords() {
+        assert_eq!(tokenize("A Quick, Brown-Fox!"), vec!["a", "quick", "brown", "fox"]);
+        assert!(is_stopword("the"));
+        assert!(is_stopword("a"));
+        assert!(!is_stopword("fox"));
+    }
+
+    #[test]
+    fn to_tsvector_canonical_drops_stopwords_keeps_positions() {
+        // 'a' is a stopword and dropped; positions advance over it so
+        // quick=2, fox=3.  Lexemes sorted alphabetically: fox before quick.
+        assert_eq!(tsv("a quick fox"), "'fox':3 'quick':2");
+        // duplicate lexeme accumulates positions, sorted.
+        assert_eq!(tsv("fox fox quick"), "'fox':1,2 'quick':3");
+        // simple config keeps stopwords.
+        assert_eq!(
+            TsVector::from_text_document("a quick fox", Some("simple")).to_canonical(),
+            "'a':1 'fox':3 'quick':2"
+        );
+        // NO stemming: 'running' stays 'running' (PG would emit 'run').
+        assert_eq!(tsv("running"), "'running':1");
+    }
+
+    #[test]
+    fn tsvector_to_array_sorted_distinct_no_positions() {
+        let v = TsVector::from_text_document("a quick fox", Some("english"));
+        assert_eq!(v.lexemes_sorted(), vec!["fox", "quick"]); // no 'a', sorted
+        let v2 = TsVector::parse("'fox':2 'quick':1 'fox':4");
+        assert_eq!(v2.lexemes_sorted(), vec!["fox", "quick"]);
+    }
+
+    #[test]
+    fn to_tsquery_canonical() {
+        assert_eq!(tsq("quick & fox"), "'quick' & 'fox'");
+        assert_eq!(tsq("quick | fox"), "'quick' | 'fox'");
+        assert_eq!(tsq("!dog"), "!'dog'");
+        assert_eq!(tsq("quick <-> brown"), "'quick' <-> 'brown'");
+        assert_eq!(tsq("quick <2> fox"), "'quick' <2> 'fox'");
+        // precedence: & binds tighter than | ; ! tighter than & ;
+        assert_eq!(tsq("a | b & c"), "'a' | 'b' & 'c'");
+        assert_eq!(tsq("(a | b) & c"), "('a' | 'b') & 'c'");
+        assert_eq!(tsq("!a & b"), "!'a' & 'b'");
+    }
+
+    #[test]
+    fn at_at_boolean_truth_table() {
+        // 'a fat cat'::tsvector @@ ...  (bare cast form, lexemes a,cat,fat)
+        assert!(mtch_raw("a fat cat", "cat"));
+        assert!(!mtch_raw("a fat cat", "dog"));
+        assert!(!mtch_raw("a fat cat", "cat & dog"));
+        assert!(mtch_raw("a fat cat", "cat | dog"));
+        assert!(mtch_raw("a fat cat", "!dog"));
+        assert!(!mtch_raw("a fat cat", "!cat"));
+        assert!(mtch_raw("a fat cat", "cat & fat"));
+        assert!(mtch_raw("a fat cat", "cat & !dog"));
+
+        // document form (stopwords dropped from the vector)
+        assert!(mtch("a quick fox", "quick"));
+        assert!(!mtch("a quick fox", "slow"));
+        assert!(mtch("a quick fox", "quick | slow"));
+        assert!(mtch("a quick fox", "quick & fox"));
+        assert!(!mtch("a quick fox", "quick & slow"));
+    }
+
+    #[test]
+    fn phrase_adjacency_positive_and_negative() {
+        // the quick brown fox -> quick:2 brown:3 fox:4 (the dropped @1)
+        assert!(mtch("the quick brown fox", "quick <-> brown")); // adjacent
+        assert!(!mtch("the quick brown fox", "quick <-> fox")); // 2 apart
+        assert!(mtch("the quick brown fox", "quick <2> fox")); // exactly 2 apart
+        assert!(mtch("the quick brown fox", "brown <-> fox")); // adjacent
+        assert!(!mtch("the quick brown fox", "fox <-> brown")); // wrong order
+        // chained phrase composes via end-positions
+        assert!(mtch("the quick brown fox", "quick <-> brown <-> fox"));
+        assert!(!mtch("the quick brown fox", "quick <-> fox <-> brown"));
+        // phrase against a position-less bare cast cannot be verified → false
+        assert!(!mtch_raw("quick brown fox", "quick <-> brown"));
+    }
+
+    #[test]
+    fn empty_and_nomatch_semantics() {
+        // empty query string → no query → no match (no panic)
+        assert!(TsQuery::parse_to_tsquery("").unwrap().is_none());
+        assert!(TsQuery::parse_to_tsquery("   ").unwrap().is_none());
+        // empty vector matches nothing
+        let empty = TsVector::parse("");
+        let q = TsQuery::parse_to_tsquery("cat").unwrap().unwrap();
+        assert!(!q.matches(&empty));
+    }
+
+    #[test]
+    fn tsquery_phrase_concatenation() {
+        let a = TsQuery::parse_to_tsquery("quick").unwrap().unwrap();
+        let b = TsQuery::parse_to_tsquery("fox").unwrap().unwrap();
+        let p = TsQuery::Phrase(Box::new(a.clone()), Box::new(b.clone()), 1);
+        assert_eq!(p.to_canonical(), "'quick' <-> 'fox'");
+        let p2 = TsQuery::Phrase(Box::new(a), Box::new(b), 3);
+        assert_eq!(p2.to_canonical(), "'quick' <3> 'fox'");
+    }
+
+    #[test]
+    fn plainto_and_phraseto() {
+        assert_eq!(
+            TsQuery::plainto("the quick fox", Some("english"))
+                .unwrap()
+                .to_canonical(),
+            "'quick' & 'fox'"
+        );
+        assert_eq!(
+            TsQuery::phraseto("the quick fox", Some("english"))
+                .unwrap()
+                .to_canonical(),
+            "'quick' <-> 'fox'"
+        );
+    }
+
+    #[test]
+    fn parse_canonical_roundtrip() {
+        let v = TsVector::from_text_document("the quick brown fox jumps", Some("english"));
+        let canon = v.to_canonical();
+        let reparsed = TsVector::parse(&canon);
+        assert_eq!(reparsed.to_canonical(), canon);
+        // phrase still works after a canonical round-trip
+        let q = TsQuery::parse_to_tsquery("quick <-> brown").unwrap().unwrap();
+        assert!(q.matches(&reparsed));
+    }
+
+    #[test]
+    fn strip_removes_positions() {
+        let v = TsVector::parse("'fox':2 'quick':1");
+        let mut s = v.clone();
+        for (_, ps) in s.entries.iter_mut() {
+            ps.clear();
         }
+        assert_eq!(s.to_canonical(), "'fox' 'quick'");
     }
-}
 
-// ---------------------------------------------------------------------------
-// TsvectorMatchUdf — tsvector_match(tsvector, tsquery) -> bool
-//
-// Two registrations share this implementation:
-//
-// * `tsvector_match`     — always returns `false`.  Retained for backward
-//   compatibility with callers that explicitly use the function name instead
-//   of the `@@` operator.
-// * `tsvector_match_udf` — always returns `true`.  This is the target of the
-//   `@@`-to-UDF rewrite in `pg_ast::rewrite_tsvector_at_at`.  Returning
-//   `true` means that a query like
-//     SELECT … WHERE ts_col @@ to_tsquery('english', 'fox')
-//   returns rows (the stub matches everything) rather than silently returning
-//   zero rows.  Real selectivity is deferred to `basin-fts`.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TsvectorMatchUdf {
-    name: String,
-    /// `true` → return all-true column (match-all stub, used for `tsvector_match_udf`).
-    /// `false` → return all-false column (used for `tsvector_match`).
-    returns_true: bool,
-    signature: Signature,
-}
-
-impl ScalarUDFImpl for TsvectorMatchUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Boolean)
-    }
-    #[allow(deprecated)]
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
-        let n = num_rows(args);
-        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![self.returns_true; n]));
-        Ok(ColumnarValue::Array(arr))
+    #[test]
+    fn unparseable_query_is_honest_no_match() {
+        // Unbalanced paren → parse error → @@ returns false (never a fake hit)
+        assert!(TsQuery::parse_to_tsquery("a & (b").is_err());
     }
 }

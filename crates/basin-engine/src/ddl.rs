@@ -131,12 +131,16 @@ fn basin_type_marker_for(sql: &sqlparser::ast::DataType) -> Option<&'static str>
 /// downstream layers to advertise PG OID 3614.
 fn is_tsvector_sql(sql: &sqlparser::ast::DataType) -> bool {
     use sqlparser::ast::DataType as SqlDataType;
-    if let SqlDataType::Custom(name, modifiers) = sql {
-        name.0.len() == 1
-            && name.0[0].id_val().eq_ignore_ascii_case("tsvector")
-            && modifiers.is_empty()
-    } else {
-        false
+    match sql {
+        // sqlparser 0.61 dedicated variant.
+        SqlDataType::TsVector => true,
+        // Legacy `Custom` form (older sqlparser / odd dialects).
+        SqlDataType::Custom(name, modifiers) => {
+            name.0.len() == 1
+                && name.0[0].id_val().eq_ignore_ascii_case("tsvector")
+                && modifiers.is_empty()
+        }
+        _ => false,
     }
 }
 
@@ -145,12 +149,16 @@ fn is_tsvector_sql(sql: &sqlparser::ast::DataType) -> bool {
 /// downstream layers to advertise PG OID 3615.
 fn is_tsquery_sql(sql: &sqlparser::ast::DataType) -> bool {
     use sqlparser::ast::DataType as SqlDataType;
-    if let SqlDataType::Custom(name, modifiers) = sql {
-        name.0.len() == 1
-            && name.0[0].id_val().eq_ignore_ascii_case("tsquery")
-            && modifiers.is_empty()
-    } else {
-        false
+    match sql {
+        // sqlparser 0.61 dedicated variant.
+        SqlDataType::TsQuery => true,
+        // Legacy `Custom` form (older sqlparser / odd dialects).
+        SqlDataType::Custom(name, modifiers) => {
+            name.0.len() == 1
+                && name.0[0].id_val().eq_ignore_ascii_case("tsquery")
+                && modifiers.is_empty()
+        }
+        _ => false,
     }
 }
 

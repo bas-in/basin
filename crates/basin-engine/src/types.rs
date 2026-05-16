@@ -167,6 +167,19 @@ pub(crate) fn field_is_money(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_MONEY)
 }
 
+/// Returns `true` if `field` carries the `TSVECTOR` metadata marker. The
+/// underlying Arrow type is `Utf8` holding the canonical tsvector text form
+/// (see `fts_udf`); the marker lets the INSERT path evaluate a
+/// `to_tsvector(...)` expression into that canonical form.
+pub(crate) fn field_is_tsvector(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_TSVECTOR)
+}
+
+/// Returns `true` if `field` carries the `TSQUERY` metadata marker.
+pub(crate) fn field_is_tsquery(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_TSQUERY)
+}
+
 /// Returns `true` if `field` is a BIT(n) column (fixed-length bit string).
 /// Checks that the `BASIN_TYPE` value starts with `"BIT("`.
 pub(crate) fn field_is_bit(field: &arrow_schema::Field) -> bool {
@@ -495,22 +508,23 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             Ok(DataType::FixedSizeBinary(16))
         }
 
-        // TSVECTOR / TSQUERY. PG full-text search types.  Basin v0.1 stores
-        // them as plain `Utf8` — no real tokenisation.  The `BASIN_TYPE`
-        // marker (set in `ddl::schema_from_columns`) distinguishes these
-        // columns from ordinary TEXT so DDL can round-trip faithfully.
-        // sqlparser 0.52 has no dedicated AST variant; both keywords arrive
-        // in the `Custom` catch-all.
+        // TSVECTOR / TSQUERY. PG full-text search types — see the bounded
+        // FTS subset in `fts_udf`.  Both are stored as plain `Utf8` holding
+        // the *canonical text form* of the vector / query (e.g.
+        // `'fox':2 'quick':1` for a tsvector, `'quick' & 'fox'` for a
+        // tsquery).  The `BASIN_TYPE` marker (set in
+        // `ddl::schema_from_columns`) distinguishes these columns from
+        // ordinary TEXT so DDL round-trips faithfully and the pgwire encoder
+        // can advertise OID 3614 / 3615.
+        //
+        // sqlparser 0.61 has dedicated `TsVector` / `TsQuery` AST variants
+        // (older versions routed these through `Custom`).  We accept both the
+        // dedicated variants and the legacy `Custom` form for robustness.
+        SqlDataType::TsVector | SqlDataType::TsQuery => Ok(DataType::Utf8),
         SqlDataType::Custom(name, modifiers)
             if name.0.len() == 1
-                && name.0[0].id_val().eq_ignore_ascii_case("tsvector")
-                && modifiers.is_empty() =>
-        {
-            Ok(DataType::Utf8)
-        }
-        SqlDataType::Custom(name, modifiers)
-            if name.0.len() == 1
-                && name.0[0].id_val().eq_ignore_ascii_case("tsquery")
+                && (name.0[0].id_val().eq_ignore_ascii_case("tsvector")
+                    || name.0[0].id_val().eq_ignore_ascii_case("tsquery"))
                 && modifiers.is_empty() =>
         {
             Ok(DataType::Utf8)
@@ -596,27 +610,9 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
         sql if is_daterange_sql(sql) => Ok(DataType::Utf8),
         sql if is_tsrange_sql(sql) => Ok(DataType::Utf8),
         sql if is_tstzrange_sql(sql) => Ok(DataType::Utf8),
-        // TSVECTOR — full-text search document type. Rides on `Utf8`
-        // with `BASIN_TYPE=TSVECTOR` field metadata (set by
-        // `ddl::schema_from_columns`). No real inverted index for now;
-        // the FTS UDF stubs echo the text value.
-        SqlDataType::Custom(name, modifiers)
-            if name.0.len() == 1
-                && name.0[0].id_val().eq_ignore_ascii_case("tsvector")
-                && modifiers.is_empty() =>
-        {
-            Ok(DataType::Utf8)
-        }
-
-        // TSQUERY — full-text search query type. Same physical type as
-        // TSVECTOR; distinguished only by the `BASIN_TYPE=TSQUERY` marker.
-        SqlDataType::Custom(name, modifiers)
-            if name.0.len() == 1
-                && name.0[0].id_val().eq_ignore_ascii_case("tsquery")
-                && modifiers.is_empty() =>
-        {
-            Ok(DataType::Utf8)
-        }
+        // (TSVECTOR / TSQUERY handled earlier via the dedicated
+        // `SqlDataType::TsVector` / `TsQuery` variants + legacy `Custom`
+        // fallback.)
 
         // sqlparser's Postgres dialect parses unknown parameterised types
         // (e.g. `vector(N)`) as `Custom`. We recognise the `vector(N)` form
