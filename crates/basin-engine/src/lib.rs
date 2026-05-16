@@ -1986,4 +1986,163 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+
+    // ── DDL correctness: CREATE TABLE IF NOT EXISTS (task #49 Part A) ──────────
+
+    /// CREATE TABLE IF NOT EXISTS on a non-existent table must create it normally.
+    #[tokio::test]
+    async fn create_table_if_not_exists_creates_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        let res = sess
+            .execute("CREATE TABLE IF NOT EXISTS new_tbl (id BIGINT NOT NULL)")
+            .await
+            .expect("CREATE TABLE IF NOT EXISTS must succeed on a new table");
+        assert!(
+            matches!(res, ExecResult::Empty { ref tag } if tag == "CREATE TABLE"),
+            "expected CREATE TABLE tag, got {res:?}"
+        );
+
+        // Confirm the table exists by inserting and selecting.
+        sess.execute("INSERT INTO new_tbl VALUES (1)").await.unwrap();
+        let rows = sess.execute("SELECT id FROM new_tbl").await.unwrap();
+        if let ExecResult::Rows { batches, .. } = rows {
+            let vals = col_i64(&batches, "id");
+            assert_eq!(vals, vec![1]);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    /// CREATE TABLE IF NOT EXISTS on an existing table must succeed (no-op, no error).
+    /// This is the PG-correct behavior; the bug was that the if_not_exists flag was
+    /// ignored and the catalog "already exists" error propagated.
+    #[tokio::test]
+    async fn create_table_if_not_exists_noop_when_exists() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE existing_t (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO existing_t VALUES (99)")
+            .await
+            .unwrap();
+
+        // Must NOT error; IF NOT EXISTS suppresses the "already exists" catalog error.
+        let res = sess
+            .execute("CREATE TABLE IF NOT EXISTS existing_t (id BIGINT NOT NULL)")
+            .await
+            .expect(
+                "CREATE TABLE IF NOT EXISTS must be a no-op when table already exists, not error",
+            );
+        assert!(
+            matches!(res, ExecResult::Empty { ref tag } if tag == "CREATE TABLE"),
+            "expected CREATE TABLE tag, got {res:?}"
+        );
+
+        // Existing data must be intact — the no-op must not truncate the table.
+        let rows = sess
+            .execute("SELECT id FROM existing_t")
+            .await
+            .unwrap();
+        if let ExecResult::Rows { batches, .. } = rows {
+            let vals = col_i64(&batches, "id");
+            assert_eq!(vals, vec![99], "existing row must survive IF NOT EXISTS no-op");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    /// CREATE TABLE without IF NOT EXISTS on an existing table must still error.
+    #[tokio::test]
+    async fn create_table_without_if_not_exists_errors_when_exists() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE dup_t (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        let err = sess
+            .execute("CREATE TABLE dup_t (id BIGINT NOT NULL)")
+            .await
+            .expect_err("CREATE TABLE (no IF NOT EXISTS) must error when table already exists");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists") || msg.contains("Catalog"),
+            "error must mention 'already exists', got: {msg}"
+        );
+    }
+
+    // ── DDL correctness: DROP TABLE (task #49 Part B) ──────────────────────────
+
+    /// DROP TABLE on an existing table must remove it from the catalog.
+    #[tokio::test]
+    async fn drop_table_removes_existing_table() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE droppable (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO droppable VALUES (7)")
+            .await
+            .unwrap();
+
+        let res = sess
+            .execute("DROP TABLE droppable")
+            .await
+            .expect("DROP TABLE must succeed on an existing table");
+        assert!(
+            matches!(res, ExecResult::Empty { ref tag } if tag == "DROP TABLE"),
+            "expected DROP TABLE tag, got {res:?}"
+        );
+
+        // The table must be gone — a subsequent CREATE TABLE (same name, no IF NOT EXISTS)
+        // must succeed, proving the catalog entry was removed.
+        sess.execute("CREATE TABLE droppable (id BIGINT NOT NULL)")
+            .await
+            .expect("CREATE TABLE must succeed after DROP TABLE removed the previous table");
+    }
+
+    /// DROP TABLE IF EXISTS on a missing table must succeed (no-op).
+    #[tokio::test]
+    async fn drop_table_if_exists_noop_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        let res = sess
+            .execute("DROP TABLE IF EXISTS no_such_table")
+            .await
+            .expect("DROP TABLE IF EXISTS must be a no-op when table does not exist");
+        assert!(
+            matches!(res, ExecResult::Empty { ref tag } if tag == "DROP TABLE"),
+            "expected DROP TABLE tag, got {res:?}"
+        );
+    }
+
+    /// DROP TABLE without IF EXISTS on a missing table must error.
+    #[tokio::test]
+    async fn drop_table_errors_when_absent_without_if_exists() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        let err = sess
+            .execute("DROP TABLE ghost_table")
+            .await
+            .expect_err("DROP TABLE (no IF EXISTS) must error when table does not exist");
+        let msg = err.to_string();
+        // The catalog returns NotFound for a missing table.
+        assert!(
+            msg.contains("not found") || msg.contains("NotFound") || msg.contains("ghost_table"),
+            "error must indicate table not found, got: {msg}"
+        );
+    }
 }

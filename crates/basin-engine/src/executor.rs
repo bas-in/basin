@@ -898,6 +898,12 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             });
             crate::explain::exec_explain(sess, analyze, verbose, format, options, statement).await
         }
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Table,
+            if_exists,
+            names,
+            ..
+        } => exec_drop_table(sess, if_exists, names).await,
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     }
 }
@@ -1137,11 +1143,27 @@ async fn exec_create_table(
         }
     }
 
-    sess.engine
+    // If IF NOT EXISTS is set and the table already exists, return success
+    // (no-op). The catalog signals "already exists" as BasinError::Catalog;
+    // we only suppress that specific variant — unrelated catalog errors still
+    // propagate. Without IF NOT EXISTS the error is always fatal.
+    match sess
+        .engine
         .config()
         .catalog
         .create_table(&sess.project, &table, &schema)
-        .await?;
+        .await
+    {
+        Ok(_metadata) => {}
+        Err(BasinError::Catalog(_)) if ct.if_not_exists => {
+            // Table already exists and IF NOT EXISTS was specified — PG
+            // behavior: succeed silently (no error, no row change).
+            return Ok(ExecResult::Empty {
+                tag: "CREATE TABLE".into(),
+            });
+        }
+        Err(e) => return Err(e),
+    }
 
     // Register implicit sequences promised by `SERIAL` / `BIGSERIAL` /
     // `SMALLSERIAL` columns. PG would auto-create these inline with the
@@ -1208,6 +1230,50 @@ async fn exec_create_table(
 
     Ok(ExecResult::Empty {
         tag: "CREATE TABLE".into(),
+    })
+}
+
+/// `DROP TABLE [IF EXISTS] <name> [, ...]`
+///
+/// Removes each named table from the catalog. If `if_exists` is true, a
+/// missing table is silently ignored (PG behavior). Without IF EXISTS an
+/// absent table returns a `NotFound` error.
+///
+/// Note: only catalog metadata is removed. Underlying object-store data is
+/// left in place for time-travel / point-in-time-restore (same policy as the
+/// catalog's `drop_table` contract).
+async fn exec_drop_table(
+    sess: &ProjectSession,
+    if_exists: bool,
+    names: Vec<sqlparser::ast::ObjectName>,
+) -> Result<ExecResult> {
+    for name in names {
+        let n = single_part_name(&name)?;
+        let table = TableName::new(n)?;
+        match sess
+            .engine
+            .config()
+            .catalog
+            .drop_table(&sess.project, &table)
+            .await
+        {
+            Ok(()) => {
+                // Deregister the table from the DataFusion catalog view so
+                // subsequent queries in the same session don't see a stale
+                // listing. Errors here are best-effort — the catalog drop
+                // already succeeded; a stale DataFusion entry for a dropped
+                // table is harmless for the next request (which opens a new
+                // session).
+                let _ = sess.ctx.deregister_table(table.as_str());
+            }
+            Err(BasinError::NotFound(_)) if if_exists => {
+                // IF EXISTS — silently ignore missing tables.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(ExecResult::Empty {
+        tag: "DROP TABLE".into(),
     })
 }
 
