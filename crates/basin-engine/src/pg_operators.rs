@@ -1527,6 +1527,776 @@ pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// LATERAL subquery rewrites
+// ---------------------------------------------------------------------------
+
+/// Rewrite uncorrelated `LATERAL (subquery)` → `(subquery)`.
+///
+/// When the LATERAL body has zero references to columns of the outer FROM
+/// tables, `LATERAL (subq)` is semantically identical to a plain join.
+/// Stripping the LATERAL keyword lets DataFusion plan it as a regular
+/// cross/inner join without needing the (unimplemented) correlated-lateral
+/// physical operator.
+///
+/// ## Detection heuristic
+///
+/// After locating the LATERAL keyword and its matching parenthesised subquery,
+/// we collect all outer table names/aliases visible in the FROM clause before
+/// the LATERAL keyword (simple identifier scanning, not a full AST). We then
+/// check whether the subquery body contains any `outer_name.something` dotted
+/// reference — a reliable signal that the subquery references an outer column.
+/// If no such dotted reference exists and the subquery body contains none of
+/// the outer aliases as bare words followed by `.`, the subquery is treated as
+/// uncorrelated and LATERAL is stripped.
+///
+/// ## Limits (not rewritten — left for DataFusion upstream)
+///
+/// - Any LATERAL whose body contains a `outer_alias.col` reference is left
+///   untouched; DataFusion 53 has no physical plan support for correlated
+///   lateral subqueries (`OuterReferenceColumn` paths fail at execution).
+/// - `LATERAL <fn>(...)` table-function forms other than `unnest` (handled by
+///   `rewrite_lateral_unnest`) are left untouched.
+/// - Nested LATERAL (LATERAL inside another LATERAL subquery) is not handled.
+pub(crate) fn rewrite_lateral_uncorrelated(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("lateral") { return sql.to_string(); }
+
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        // Find `lateral` keyword (case-insensitive).
+        let Some(rel) = lower[search_from..].find("lateral") else { break; };
+        let lat_start = search_from + rel;
+        let lat_end = lat_start + 7; // len("lateral")
+        let bytes = s.as_bytes();
+
+        // Word boundary before LATERAL.
+        let pre_ok = lat_start == 0 || !bytes[lat_start - 1].is_ascii_alphanumeric();
+        // Word boundary after LATERAL: must be whitespace or `(`.
+        let post_ok = lat_end >= s.len()
+            || bytes[lat_end].is_ascii_whitespace()
+            || bytes[lat_end] == b'(';
+        if !pre_ok || !post_ok {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Skip whitespace after LATERAL.
+        let mut j = lat_end;
+        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+
+        // Only handle LATERAL (subquery) form — not LATERAL function_call().
+        if j >= s.len() || bytes[j] != b'(' {
+            search_from = lat_end;
+            continue;
+        }
+        let paren_start = j;
+
+        // Find the matching `)`.
+        let Some(paren_end) = find_matching_close_paren(&s, paren_start) else {
+            search_from = lat_end;
+            continue;
+        };
+
+        let body = &s[paren_start + 1..paren_end];
+        let body_lower = body.to_ascii_lowercase();
+
+        // Must be a SELECT subquery.
+        if !body_lower.trim_start().starts_with("select") {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Collect outer table names/aliases from the FROM list text that
+        // precedes this LATERAL keyword. We look for simple `FROM t` / `FROM t
+        // [AS] alias` / `t JOIN ...` patterns in the text to the left of `lat_start`.
+        let outer_text = &s[..lat_start];
+        let outer_names = collect_outer_table_names(outer_text);
+
+        // Check if the subquery body references any outer table via a
+        // `outer_name.something` dotted pattern.
+        let correlated = outer_names.iter().any(|name| {
+            let pat = format!("{name}.");
+            body_lower.contains(&pat)
+        });
+
+        if correlated {
+            // Leave correlated LATERAL intact — DataFusion upstream limitation.
+            search_from = lat_end;
+            continue;
+        }
+
+        // Uncorrelated: strip `LATERAL ` (from lat_start to paren_start, keeping the `(`).
+        s.replace_range(lat_start..paren_start, "");
+        // Continue searching from where we stripped.
+        search_from = lat_start;
+    }
+    s
+}
+
+/// Collect table name/alias tokens from the FROM-clause text preceding the
+/// LATERAL keyword. Returns lowercase identifier strings.
+///
+/// Heuristic: scan for `FROM ident [AS ident]` and `JOIN ident [AS ident]`
+/// patterns. This is intentionally conservative — false negatives (not
+/// detecting an outer name) cause us to incorrectly strip a correlated LATERAL,
+/// which would produce a wrong result. False positives (detecting a name that
+/// isn't really outer) cause us to conservatively leave a LATERAL that we
+/// could have stripped — safe, just misses an optimisation.
+fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
+    let lower = outer_text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut names = Vec::new();
+    let mut i = 0usize;
+
+    while i < lower.len() {
+        // Skip string literals.
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < lower.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                    i += 1; break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < lower.len() && bytes[i] != b'"' { i += 1; }
+            if i < lower.len() { i += 1; }
+            continue;
+        }
+
+        // Look for `from ` or `join ` keyword.
+        let slice = &lower[i..];
+        let kw_len = if slice.starts_with("from ") || slice.starts_with("from\t") || slice.starts_with("from\n") {
+            5
+        } else if slice.starts_with("join ") || slice.starts_with("join\t") || slice.starts_with("join\n") {
+            5
+        } else {
+            i += 1;
+            continue;
+        };
+
+        // Word boundary before keyword.
+        let pre_ok = i == 0 || {
+            let prev = bytes[i - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_'
+        };
+        if !pre_ok {
+            i += kw_len;
+            continue;
+        }
+
+        // Skip whitespace after keyword.
+        let mut j = i + kw_len;
+        while j < lower.len() && lower.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        // Skip over `(` (subquery in FROM — not a table name).
+        if j < lower.len() && lower.as_bytes()[j] == b'(' {
+            i = j + 1;
+            continue;
+        }
+        // Extract the identifier (table name).
+        let id_start = j;
+        while j < lower.len() && (lower.as_bytes()[j].is_ascii_alphanumeric() || lower.as_bytes()[j] == b'_') {
+            j += 1;
+        }
+        if j > id_start {
+            let table_name = lower[id_start..j].to_string();
+            // Skip known SQL keywords that appear after FROM/JOIN.
+            if !matches!(table_name.as_str(), "select" | "with" | "lateral" | "only" | "values") {
+                names.push(table_name.clone());
+            }
+            // Check for optional `AS alias` or bare alias after the table name.
+            let mut k = j;
+            while k < lower.len() && lower.as_bytes()[k].is_ascii_whitespace() { k += 1; }
+            if lower[k..].starts_with("as ") || lower[k..].starts_with("as\t") {
+                k += 3;
+                while k < lower.len() && lower.as_bytes()[k].is_ascii_whitespace() { k += 1; }
+                let alias_start = k;
+                while k < lower.len() && (lower.as_bytes()[k].is_ascii_alphanumeric() || lower.as_bytes()[k] == b'_') {
+                    k += 1;
+                }
+                if k > alias_start {
+                    names.push(lower[alias_start..k].to_string());
+                }
+            } else if k < lower.len()
+                && lower.as_bytes()[k].is_ascii_alphabetic()
+                && !lower[k..].starts_with("on ")
+                && !lower[k..].starts_with("where ")
+                && !lower[k..].starts_with("inner ")
+                && !lower[k..].starts_with("left ")
+                && !lower[k..].starts_with("right ")
+                && !lower[k..].starts_with("full ")
+                && !lower[k..].starts_with("cross ")
+                && !lower[k..].starts_with("join ")
+            {
+                let alias_start = k;
+                let mut kk = k;
+                while kk < lower.len() && (lower.as_bytes()[kk].is_ascii_alphanumeric() || lower.as_bytes()[kk] == b'_') {
+                    kk += 1;
+                }
+                if kk > alias_start {
+                    let alias = lower[alias_start..kk].to_string();
+                    if !matches!(alias.as_str(), "on" | "where" | "inner" | "left" | "right" | "full" | "cross" | "join" | "natural" | "using" | "set") {
+                        names.push(alias);
+                    }
+                }
+            }
+        }
+        i += kw_len;
+    }
+    names
+}
+
+/// Rewrite the common ORM nested-read LATERAL pattern:
+///
+/// ```sql
+/// LEFT JOIN LATERAL (
+///   SELECT agg_expr [AS alias] [, agg_expr2 [AS alias2], ...]
+///   FROM child_table [AS child_alias]
+///   WHERE child_alias.fk_col = outer_alias.pk_col
+///   [ORDER BY ... / LIMIT ...]   -- ONLY if no ORDER BY or LIMIT present
+/// ) sub_alias ON true
+/// ```
+///
+/// into:
+///
+/// ```sql
+/// LEFT JOIN (
+///   SELECT child_alias.fk_col, agg_expr [AS alias] [, ...]
+///   FROM child_table [AS child_alias]
+///   GROUP BY child_alias.fk_col
+/// ) sub_alias ON sub_alias.fk_col = outer_alias.pk_col
+/// ```
+///
+/// ## Preconditions checked before rewriting
+///
+/// 1. Must be `LEFT JOIN LATERAL` (not INNER JOIN, CROSS JOIN, comma-join).
+/// 2. The join condition must be `ON true` (case-insensitive).
+/// 3. The subquery body must start with `SELECT`.
+/// 4. The subquery body must have exactly ONE FROM table (a bare table name,
+///    optionally aliased).
+/// 5. The WHERE clause must contain exactly ONE `child_ref.col = outer_ref.col`
+///    predicate (or `outer_ref.col = child_ref.col` — either order).
+///    "child_ref" is identified as the name that matches the child table
+///    name or alias; "outer_ref" is the other side.
+/// 6. ALL projection items must be aggregate function calls (json_agg, array_agg,
+///    jsonb_agg, count, sum, avg, min, max, bool_and, bool_or, string_agg, …).
+///    Mixed projections (any non-aggregate column refs) are NOT rewritten.
+/// 7. No ORDER BY or LIMIT inside the subquery — such constraints cannot be
+///    preserved after pre-aggregation and would change results.
+///
+/// ## Correctness invariants
+///
+/// - Parent with zero matching children → `LEFT JOIN` preserves the parent row
+///   with `NULL` for all subquery columns (including the agg column). This is
+///   correct because `json_agg` over an empty input in PG returns NULL, and the
+///   rewritten LEFT JOIN propagates NULL from the grouped subquery when no
+///   matching child row exists.
+/// - Multiple parents, mixed child counts → each parent gets its own aggregated
+///   result from the pre-grouped subquery.
+///
+/// ## Limits (NOT rewritten — honest upstream defer)
+///
+/// - ORDER BY or LIMIT inside the subquery → deferred (wrong results if rewritten).
+/// - Non-aggregate column refs in projection → deferred (semantics differ from
+///   aggregating).
+/// - Multiple correlation predicates in WHERE → deferred (complex join condition).
+/// - Multiple FROM tables inside the subquery → deferred.
+/// - INNER/CROSS/comma LATERAL → deferred (different null semantics).
+/// - Arbitrary correlated LATERAL (generate_series(1, t.id), multi-table body,
+///   etc.) → DataFusion upstream limitation; left failing with original error.
+pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
+    let lower_check = sql.to_ascii_lowercase();
+    if !lower_check.contains("lateral") { return sql.to_string(); }
+
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        // Look for `left join lateral` sequence.
+        let Some(rel) = lower[search_from..].find("left join lateral") else { break; };
+        let ljl_start = search_from + rel;
+        let ljl_end = ljl_start + 17; // len("left join lateral")
+        let bytes = s.as_bytes();
+
+        // Word boundary before.
+        let pre_ok = ljl_start == 0 || !bytes[ljl_start - 1].is_ascii_alphanumeric();
+        // Word boundary after "lateral": whitespace or `(`.
+        let post_ok = ljl_end >= s.len()
+            || bytes[ljl_end].is_ascii_whitespace()
+            || bytes[ljl_end] == b'(';
+        if !pre_ok || !post_ok {
+            search_from = ljl_end;
+            continue;
+        }
+
+        // Skip whitespace after `lateral`.
+        let mut j = ljl_end;
+        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || bytes[j] != b'(' {
+            search_from = ljl_end;
+            continue;
+        }
+        let paren_start = j;
+        let Some(paren_end) = find_matching_close_paren(&s, paren_start) else {
+            search_from = ljl_end;
+            continue;
+        };
+
+        let body = s[paren_start + 1..paren_end].trim().to_string();
+        let body_lower = body.to_ascii_lowercase();
+
+        // Must be a SELECT subquery.
+        if !body_lower.trim_start().starts_with("select") {
+            search_from = ljl_end;
+            continue;
+        }
+
+        // Reject if subquery contains ORDER BY or LIMIT — can't safely pre-agg.
+        if body_lower.contains("order by") || body_lower.contains("limit") {
+            search_from = ljl_end;
+            continue;
+        }
+
+        // Parse the subquery: find the SELECT projection, FROM table, WHERE clause.
+        let after_select = body_lower.trim_start();
+        let sel_body_offset = if after_select.starts_with("select ") || after_select.starts_with("select\t") {
+            7
+        } else {
+            search_from = ljl_end;
+            continue;
+        };
+
+        // Find FROM keyword at depth 0.
+        let Some(from_pos) = find_from_at_depth0(&body_lower, sel_body_offset) else {
+            search_from = ljl_end;
+            continue;
+        };
+
+        let proj_str = body[sel_body_offset..from_pos].trim(); // original case
+        let proj_lower = proj_str.to_ascii_lowercase();
+
+        // Find WHERE keyword after FROM at depth 0.
+        let after_from_offset = from_pos + 5; // skip "from "
+        let where_pos_opt = find_keyword_at_depth0(&body_lower, "where", after_from_offset);
+
+        // Extract child table (FROM clause: everything between FROM and WHERE/end).
+        let child_clause = if let Some(wp) = where_pos_opt {
+            body[after_from_offset..wp].trim().to_string()
+        } else {
+            // No WHERE → no correlation → not the ORM pattern.
+            search_from = ljl_end;
+            continue;
+        };
+
+        // Parse child table name and optional alias. Only allow a single
+        // simple table reference (no subqueries, no JOINs inside).
+        let (child_table, child_alias) = match parse_simple_table_ref(&child_clause) {
+            Some(pair) => pair,
+            None => {
+                search_from = ljl_end;
+                continue;
+            }
+        };
+
+        // Extract the WHERE clause body (between WHERE and end of body).
+        let where_body = body[where_pos_opt.unwrap() + 6..].trim(); // skip "where "
+        let where_body_lower = where_body.to_ascii_lowercase();
+
+        // Parse exactly one correlation predicate: `child_ref.fk = outer_ref.pk`
+        // or `outer_ref.pk = child_ref.fk`. We do NOT rewrite if there are
+        // additional predicates (AND, OR) beyond the single correlation.
+        let corr = match parse_single_correlation_predicate(
+            where_body,
+            &where_body_lower,
+            &child_alias,
+            &child_table,
+        ) {
+            Some(c) => c,
+            None => {
+                search_from = ljl_end;
+                continue;
+            }
+        };
+
+        // Validate that ALL projection items are aggregate function calls.
+        if !all_projections_are_aggregates(&proj_lower) {
+            search_from = ljl_end;
+            continue;
+        }
+
+        // Find the subquery alias after the closing `)`.
+        // Skip whitespace.
+        let mut after_paren = paren_end + 1;
+        while after_paren < s.len() && bytes[after_paren].is_ascii_whitespace() {
+            after_paren += 1;
+        }
+        // Optional `AS` before alias.
+        let mut alias_start = after_paren;
+        if lower[after_paren..].starts_with("as ") || lower[after_paren..].starts_with("as\t") {
+            alias_start = after_paren + 3;
+            while alias_start < s.len() && bytes[alias_start].is_ascii_whitespace() {
+                alias_start += 1;
+            }
+        }
+        let mut alias_end = alias_start;
+        while alias_end < s.len() && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_') {
+            alias_end += 1;
+        }
+        if alias_end == alias_start {
+            // No subquery alias — can't build the ON clause without it.
+            search_from = ljl_end;
+            continue;
+        }
+        let sub_alias = s[alias_start..alias_end].to_string();
+
+        // Find `ON true` after the alias.
+        let mut on_start = alias_end;
+        while on_start < s.len() && bytes[on_start].is_ascii_whitespace() { on_start += 1; }
+        if !lower[on_start..].starts_with("on ") && !lower[on_start..].starts_with("on\t") {
+            search_from = ljl_end;
+            continue;
+        }
+        let on_kw_end = on_start + 3;
+        let mut on_val_start = on_kw_end;
+        while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() { on_val_start += 1; }
+        // Must be `ON true`.
+        let on_lower = lower[on_val_start..].trim_start();
+        if !on_lower.starts_with("true") {
+            search_from = ljl_end;
+            continue;
+        }
+        let on_true_end = on_val_start + 4;
+        // Word boundary after `true`.
+        let on_post_ok = on_true_end >= s.len() || {
+            let b = bytes[on_true_end];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        if !on_post_ok {
+            search_from = ljl_end;
+            continue;
+        }
+
+        // All preconditions satisfied. Build the rewritten SQL.
+        //
+        // Original: LEFT JOIN LATERAL (SELECT proj FROM child [AS calias] WHERE child.fk = outer.pk) sub ON true
+        // Rewrite:  LEFT JOIN (SELECT child.fk, proj FROM child [AS calias] GROUP BY child.fk) sub ON sub.fk = outer.pk
+        //
+        // The fk_col comes from the corr.child_col; pk side is corr.outer_ref (e.g. "parent.id").
+        let fk_ref = format!("{}.{}", child_alias, corr.child_col);
+        let child_decl = if child_table != child_alias {
+            format!("{} AS {}", child_table, child_alias)
+        } else {
+            child_table.clone()
+        };
+        let new_body = format!(
+            "SELECT {fk_ref}, {proj_str} FROM {child_decl} GROUP BY {fk_ref}",
+        );
+        let new_on = format!("{sub_alias}.{} = {}", corr.child_col, corr.outer_ref);
+        let replacement = format!(
+            "LEFT JOIN ({new_body}) {sub_alias} ON {new_on}",
+        );
+
+        // Replace from `left join lateral` start through `on true` end.
+        s.replace_range(ljl_start..on_true_end, &replacement);
+        search_from = ljl_start + replacement.len();
+    }
+    s
+}
+
+/// Result of parsing a single correlation predicate from the LATERAL WHERE clause.
+struct CorrPredicate {
+    /// The child-side column name (unqualified) used as the FK.
+    child_col: String,
+    /// The full outer reference string, e.g. `parent.id`.
+    outer_ref: String,
+}
+
+/// Parse exactly one `child_ref.col = outer_ref.col` (or flipped) equality
+/// predicate from `where_body`. Returns `None` if:
+/// - The clause contains AND/OR operators (multiple predicates).
+/// - The clause does not match the `a.b = c.d` pattern.
+/// - Neither side matches the child table name or alias.
+fn parse_single_correlation_predicate(
+    where_body: &str,
+    where_lower: &str,
+    child_alias: &str,
+    child_table: &str,
+) -> Option<CorrPredicate> {
+    // Reject anything with AND or OR — we only handle single predicate.
+    if where_lower.contains(" and ") || where_lower.contains(" or ") {
+        return None;
+    }
+    // Find `=` sign (not inside parens, not `!=`, `<=`, `>=`).
+    let bytes = where_lower.as_bytes();
+    let eq_pos = find_bare_eq(where_lower)?;
+
+    let lhs = where_body[..eq_pos].trim();
+    let rhs = where_body[eq_pos + 1..].trim();
+    let lhs_lower = lhs.to_ascii_lowercase();
+    let rhs_lower = rhs.to_ascii_lowercase();
+
+    // Both sides must be `table.column` form.
+    let (lhs_tbl, lhs_col) = parse_dotted_ref(&lhs_lower)?;
+    let (rhs_tbl, rhs_col) = parse_dotted_ref(&rhs_lower)?;
+
+    // Determine which side is child.
+    let child_matches_lhs = lhs_tbl == child_alias || lhs_tbl == child_table;
+    let child_matches_rhs = rhs_tbl == child_alias || rhs_tbl == child_table;
+
+    if child_matches_lhs && !child_matches_rhs {
+        Some(CorrPredicate {
+            child_col: lhs_col.to_string(),
+            outer_ref: rhs.to_string(),
+        })
+    } else if child_matches_rhs && !child_matches_lhs {
+        Some(CorrPredicate {
+            child_col: rhs_col.to_string(),
+            outer_ref: lhs.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Find a bare `=` at depth 0 that is not part of `!=`, `<=`, `>=`.
+fn find_bare_eq(lower: &str) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while i < lower.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < lower.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+            }
+            b'=' => {
+                // Not `!=`, `<=`, `>=`.
+                let prev_ok = i == 0 || (bytes[i - 1] != b'!' && bytes[i - 1] != b'<' && bytes[i - 1] != b'>');
+                let next_ok = i + 1 >= lower.len() || bytes[i + 1] != b'>';
+                if prev_ok && next_ok {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse `table.column` and return `(table, column)`.
+fn parse_dotted_ref(s: &str) -> Option<(&str, &str)> {
+    let dot = s.find('.')?;
+    let tbl = s[..dot].trim();
+    let col = s[dot + 1..].trim();
+    if tbl.is_empty() || col.is_empty() { return None; }
+    // Column must not contain further dots or spaces (simple identifier).
+    if col.contains('.') || col.contains(' ') { return None; }
+    Some((tbl, col))
+}
+
+/// Parse a simple table reference: `table_name [AS alias]` or `table_name alias`.
+/// Returns `(table_name, alias)`. The alias defaults to the table name if absent.
+/// Returns `None` if the clause appears to contain a subquery or JOIN.
+fn parse_simple_table_ref(clause: &str) -> Option<(String, String)> {
+    let lower = clause.to_ascii_lowercase();
+    // Reject subqueries, JOINs.
+    if lower.contains('(')
+        || lower.contains("join")
+        || lower.contains(',')
+    {
+        return None;
+    }
+    let bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while i < lower.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    let name_start = i;
+    while i < lower.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') { i += 1; }
+    if i == name_start { return None; }
+    let table_name = lower[name_start..i].to_string();
+
+    // Skip whitespace.
+    while i < lower.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    // Optional `AS`.
+    if lower[i..].starts_with("as ") || lower[i..].starts_with("as\t") {
+        i += 3;
+        while i < lower.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    }
+    let alias_start = i;
+    while i < lower.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+    let alias = if i > alias_start {
+        lower[alias_start..i].to_string()
+    } else {
+        table_name.clone()
+    };
+    Some((table_name, alias))
+}
+
+/// Check whether all comma-separated projection items are aggregate function calls.
+///
+/// Recognised aggregates: `json_agg`, `jsonb_agg`, `array_agg`, `count`,
+/// `sum`, `avg`, `min`, `max`, `bool_and`, `bool_or`, `string_agg`,
+/// `array_to_string`, `every`, `variance`, `stddev`, `var_pop`, `var_samp`,
+/// `stddev_pop`, `stddev_samp`.
+///
+/// Each projection item is: `agg_fn(...)  [ORDER BY ...]  [AS alias]`.
+/// A lone `*` (SELECT *) is rejected — not an aggregate.
+fn all_projections_are_aggregates(proj_lower: &str) -> bool {
+    const AGG_NAMES: &[&str] = &[
+        "json_agg", "jsonb_agg", "array_agg", "count", "sum", "avg", "min",
+        "max", "bool_and", "bool_or", "string_agg", "array_to_string",
+        "every", "variance", "stddev", "var_pop", "var_samp",
+        "stddev_pop", "stddev_samp",
+    ];
+    // Split projection at depth-0 commas.
+    let items = split_at_depth0_commas(proj_lower);
+    if items.is_empty() { return false; }
+    for item in &items {
+        let trimmed = item.trim();
+        // Strip trailing `AS alias`.
+        let expr = strip_trailing_alias(trimmed);
+        let expr = expr.trim();
+        // Check if it starts with one of the known aggregate names followed by `(`.
+        let is_agg = AGG_NAMES.iter().any(|&name| {
+            if let Some(rest) = expr.strip_prefix(name) {
+                let after = rest.trim_start();
+                after.starts_with('(')
+            } else {
+                false
+            }
+        });
+        if !is_agg { return false; }
+    }
+    true
+}
+
+/// Split `s` at depth-0 commas (i.e., commas outside parentheses).
+fn split_at_depth0_commas(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => { if depth > 0 { depth -= 1; } }
+            b'\'' => {
+                i += 1;
+                while i < s.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < s.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Strip a trailing `AS identifier` alias from a projection expression.
+/// Only strips when `AS ident` appears at the very end outside parentheses.
+fn strip_trailing_alias(s: &str) -> &str {
+    // Find the last occurrence of ` as ` or ` AS ` at depth 0.
+    let lower = s.to_ascii_lowercase();
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut last_as: Option<usize> = None;
+    let mut i = 0usize;
+    while i < lower.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => { if depth > 0 { depth -= 1; } }
+            b'\'' => {
+                i += 1;
+                while i < lower.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {
+                if depth == 0 && lower[i..].starts_with(" as ") {
+                    last_as = Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    if let Some(pos) = last_as {
+        // Verify the identifier after `AS` is simple (no spaces, no parens).
+        let after_as = s[pos + 4..].trim();
+        if !after_as.is_empty()
+            && !after_as.contains(' ')
+            && !after_as.contains('(')
+        {
+            return &s[..pos];
+        }
+    }
+    s
+}
+
+/// Find a keyword at depth 0 in `lower` starting from `offset`.
+fn find_keyword_at_depth0(lower: &str, keyword: &str, offset: usize) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let klen = keyword.len();
+    let mut depth = 0i32;
+    let mut i = offset;
+    while i < lower.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => { if depth > 0 { depth -= 1; } }
+            b'\'' => {
+                i += 1;
+                while i < lower.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        i += 1; break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {
+                if depth == 0 && lower[i..].starts_with(keyword) {
+                    let pre_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                    let after = i + klen;
+                    let post_ok = after >= lower.len() || !bytes[after].is_ascii_alphanumeric();
+                    if pre_ok && post_ok { return Some(i); }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Bitwise operator rewrites
 // ---------------------------------------------------------------------------
 
@@ -2958,6 +3728,116 @@ mod tests {
         let sql = "SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub";
         let out = rewrite_lateral_unnest(sql);
         assert_eq!(out, sql, "LATERAL subquery must be unchanged: {out}");
+    }
+
+    // ── Uncorrelated LATERAL strip ───────────────────────────────────────────
+
+    #[test]
+    fn lateral_uncorrelated_comma_join_stripped() {
+        // No outer column reference → strip LATERAL.
+        let sql = "SELECT t.id, sub.c FROM t, LATERAL (SELECT 42 AS c) sub";
+        let out = rewrite_lateral_uncorrelated(sql);
+        assert!(!out.to_ascii_lowercase().contains("lateral"), "LATERAL should be stripped: {out}");
+        assert!(out.contains("(SELECT 42 AS c)"), "subquery body must remain: {out}");
+    }
+
+    #[test]
+    fn lateral_uncorrelated_left_join_stripped() {
+        // Uncorrelated LEFT JOIN LATERAL — strip LATERAL.
+        let sql = "SELECT t.id FROM t LEFT JOIN LATERAL (SELECT 1 AS n) sub ON true";
+        let out = rewrite_lateral_uncorrelated(sql);
+        assert!(!out.to_ascii_lowercase().contains("lateral"), "LATERAL should be stripped: {out}");
+        assert!(out.contains("(SELECT 1 AS n)"), "subquery body must remain: {out}");
+    }
+
+    #[test]
+    fn lateral_correlated_subquery_preserved() {
+        // Correlated (references t.id) → must NOT strip LATERAL.
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true";
+        let out = rewrite_lateral_uncorrelated(sql);
+        assert!(out.to_ascii_lowercase().contains("lateral"), "correlated LATERAL must be preserved: {out}");
+    }
+
+    #[test]
+    fn lateral_correlated_comma_join_preserved() {
+        // Correlated comma-LATERAL — must NOT strip.
+        let sql = "SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub";
+        let out = rewrite_lateral_uncorrelated(sql);
+        assert!(out.to_ascii_lowercase().contains("lateral"), "correlated LATERAL must be preserved: {out}");
+    }
+
+    #[test]
+    fn lateral_uncorrelated_no_outer_tables() {
+        // No outer table at all (degenerate FROM, unlikely but safe).
+        let sql = "SELECT sub.x FROM LATERAL (SELECT 5 AS x) sub";
+        let out = rewrite_lateral_uncorrelated(sql);
+        // No outer names detected → treated as uncorrelated → LATERAL stripped.
+        assert!(!out.to_ascii_lowercase().contains("lateral"), "should strip: {out}");
+    }
+
+    // ── Nested-aggregate ORM LATERAL rewrite ────────────────────────────────
+
+    #[test]
+    fn lateral_nested_agg_json_agg_rewrites() {
+        // Drizzle/Prisma pattern: json_agg correlated by FK.
+        let sql = "SELECT u.id, agg.posts FROM users u LEFT JOIN LATERAL (SELECT json_agg(p.title) AS posts FROM posts p WHERE p.author_id = u.id) agg ON true ORDER BY u.id";
+        let out = rewrite_lateral_nested_agg(&sql);
+        let out_lower = out.to_ascii_lowercase();
+        // Must not contain LATERAL any more.
+        assert!(!out_lower.contains("lateral"), "LATERAL should be rewritten: {out}");
+        // Must contain a GROUP BY on the FK column.
+        assert!(out_lower.contains("group by"), "must have GROUP BY: {out}");
+        // The ON condition must reference the subquery alias.
+        assert!(out_lower.contains("on agg."), "ON clause must reference sub alias: {out}");
+        // Original ON true must be gone.
+        assert!(!out_lower.contains("on true"), "ON true must be replaced: {out}");
+    }
+
+    #[test]
+    fn lateral_nested_agg_count_rewrites() {
+        // count(*) correlation.
+        let sql = "SELECT p.id, cnt.c FROM parents p LEFT JOIN LATERAL (SELECT count(*) AS c FROM children ch WHERE ch.parent_id = p.id) cnt ON true";
+        let out = rewrite_lateral_nested_agg(&sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL gone: {out}");
+        assert!(out_lower.contains("group by"), "GROUP BY present: {out}");
+    }
+
+    #[test]
+    fn lateral_nested_agg_order_by_not_rewritten() {
+        // ORDER BY inside subquery → must NOT rewrite (result would be wrong).
+        let sql = "SELECT u.id FROM users u LEFT JOIN LATERAL (SELECT json_agg(p.title ORDER BY p.id) AS posts FROM posts p WHERE p.author_id = u.id) agg ON true";
+        let out = rewrite_lateral_nested_agg(&sql);
+        let out_lower = out.to_ascii_lowercase();
+        // Must be left untouched (still has LATERAL).
+        assert!(out_lower.contains("lateral"), "ORDER BY inside must prevent rewrite: {out}");
+    }
+
+    #[test]
+    fn lateral_nested_agg_non_aggregate_proj_not_rewritten() {
+        // Non-aggregate projection (bare `id`) → must NOT rewrite.
+        let sql = "SELECT t.id FROM t LEFT JOIN LATERAL (SELECT u.id FROM u WHERE u.id = t.id) sub ON true";
+        let out = rewrite_lateral_nested_agg(&sql);
+        assert!(out.to_ascii_lowercase().contains("lateral"), "non-aggregate projection must not be rewritten: {out}");
+    }
+
+    #[test]
+    fn lateral_nested_agg_not_on_true_not_rewritten() {
+        // JOIN condition is not `ON true` → must NOT rewrite.
+        let sql = "SELECT t.id FROM t LEFT JOIN LATERAL (SELECT count(*) AS c FROM u WHERE u.tid = t.id) sub ON sub.c > 0";
+        let out = rewrite_lateral_nested_agg(&sql);
+        assert!(out.to_ascii_lowercase().contains("lateral"), "non-ON-true must not be rewritten: {out}");
+    }
+
+    #[test]
+    fn lateral_non_rewritable_correlated_still_fails_path() {
+        // Arbitrary correlated LATERAL (not agg, not uncorrelated) is left intact.
+        // Both rewriters should leave it untouched.
+        let sql = "SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true";
+        let out1 = rewrite_lateral_uncorrelated(sql);
+        let out2 = rewrite_lateral_nested_agg(&out1);
+        // Still has LATERAL — will fail at DataFusion physical plan (upstream limitation).
+        assert!(out2.to_ascii_lowercase().contains("lateral"), "non-rewritable correlated LATERAL must remain: {out2}");
     }
 
     // ── WITH RECURSIVE column alias rewriter ────────────────────────────────

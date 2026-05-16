@@ -425,6 +425,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // TableFactor::UNNEST (handled by DataFusion) instead of
     // TableFactor::Function { lateral: true } (not a registered table fn).
     let rewritten = crate::pg_operators::rewrite_lateral_unnest(&rewritten);
+    // Rewrite uncorrelated `LATERAL (subquery)` → `(subquery)`.  When the
+    // subquery body has zero references to outer FROM columns, LATERAL is
+    // semantically identical to a plain join.  Stripping it lets DataFusion
+    // plan it without needing the (unimplemented) correlated-lateral physical
+    // operator.  Correlated LATERAL is left untouched (DataFusion upstream
+    // limitation: physical plan does not support OuterReferenceColumn paths).
+    let rewritten = crate::pg_operators::rewrite_lateral_uncorrelated(&rewritten);
+    // Rewrite the common ORM nested-read pattern:
+    //   `LEFT JOIN LATERAL (SELECT agg(...) FROM child WHERE child.fk=outer.pk) sub ON true`
+    // → `LEFT JOIN (SELECT child.fk, agg(...) FROM child GROUP BY child.fk) sub ON sub.fk=outer.pk`
+    // Only fires when ALL projection items are aggregate functions and there is
+    // exactly ONE correlation predicate.  ORDER BY / LIMIT inside the subquery,
+    // non-aggregate projections, or multiple correlation predicates cause the
+    // rewriter to defer (leaving the query to fail with the upstream error).
+    let rewritten = crate::pg_operators::rewrite_lateral_nested_agg(&rewritten);
     // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
     let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
     // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.
