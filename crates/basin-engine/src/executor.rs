@@ -393,6 +393,16 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // `make_array(1,2,3)` before the array-operator pass sees them.
     let rewritten = crate::pg_operators::rewrite_pg_array_literal_casts(&rewritten);
     let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
+    // Rewrite `B'1010'` (bit-string literals) to plain string literals `'1010'`
+    // before sqlparser/DataFusion sees them. DataFusion 53 does not handle
+    // sqlparser's `SingleQuotedByteStringLiteral` value variant.
+    let rewritten = crate::pg_operators::rewrite_bit_string_literal(&rewritten);
+    // Rewrite `'...'::UUID` to `'...'::VARCHAR` — DataFusion 53 does not
+    // implement the UUID SQL type in CAST expressions.
+    let rewritten = crate::pg_operators::rewrite_uuid_cast(&rewritten);
+    // Rewrite `'HH:MM:SS'::INTERVAL` to `'N seconds'::INTERVAL` — Arrow's
+    // interval parser does not accept the PG HH:MM:SS shorthand form.
+    let rewritten = crate::pg_operators::rewrite_interval_hms_cast(&rewritten);
     // Rewrite PG bitwise operators that DataFusion's GenericDialect doesn't
     // understand: `A # B` (XOR) → `A ^ B`; `~expr` (unary NOT) →
     // `(-1 ^ (expr))`.

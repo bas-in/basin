@@ -2145,4 +2145,130 @@ mod tests {
             "error must indicate table not found, got: {msg}"
         );
     }
+
+    // ── Cast / literal correctness tests (formerly planner-rejected) ─────────
+
+    /// `SELECT 1::TEXT` — cast integer to text. DataFusion returns StringView;
+    /// the df→ws bridge maps it to Utf8. Result must be the string "1".
+    #[tokio::test]
+    async fn cast_int_to_text_pgstyle() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let res = sess.execute("SELECT 1::TEXT").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 1);
+                let col = col_string(&batches, "Int64(1)");
+                assert_eq!(col, vec!["1".to_string()]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// `SELECT CAST(1 AS TEXT)` — same cast via CAST() syntax.
+    #[tokio::test]
+    async fn cast_int_to_text_cast_syntax() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let res = sess.execute("SELECT CAST(1 AS TEXT)").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 1);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// `SELECT '12:00:00'::TIME` — cast text to Time64. The df→ws bridge
+    /// must now translate the Time64 array without error.
+    #[tokio::test]
+    async fn cast_text_to_time() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let res = sess.execute("SELECT '12:00:00'::TIME").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, schema } => {
+                assert_eq!(total_rows(&batches), 1);
+                // The column type must be Time64.
+                let field = schema.field(0);
+                assert!(
+                    matches!(field.data_type(), arrow_schema::DataType::Time64(_)),
+                    "expected Time64, got {:?}",
+                    field.data_type()
+                );
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// `SELECT '00:01:00'::INTERVAL` — HH:MM:SS literal cast to interval.
+    /// Arrow requires the verbose form; the rewriter converts to `'60 seconds'`.
+    #[tokio::test]
+    async fn cast_hms_to_interval() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let res = sess.execute("SELECT '00:01:00'::INTERVAL").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, schema } => {
+                assert_eq!(total_rows(&batches), 1);
+                // Column type must be an Interval variant.
+                let field = schema.field(0);
+                assert!(
+                    matches!(field.data_type(), arrow_schema::DataType::Interval(_)),
+                    "expected Interval, got {:?}",
+                    field.data_type()
+                );
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// `SELECT 'uuid-str'::UUID` — rewritten to `::VARCHAR`; returns text.
+    #[tokio::test]
+    async fn cast_text_to_uuid() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let uuid_str = "a6c5e8f0-1234-5678-abcd-000000000000";
+        let sql = format!("SELECT '{uuid_str}'::UUID");
+        let res = sess.execute(&sql).await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 1);
+                // The value should be the UUID string.
+                let col = batches[0].column(0);
+                let s = col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("expected StringArray for UUID result");
+                assert_eq!(s.value(0), uuid_str);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// `SELECT B'1010'` — bit-string literal rewritten to plain string `'1010'`.
+    #[tokio::test]
+    async fn bit_string_literal_select() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let res = sess.execute("SELECT B'1010'").await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 1);
+                let col = batches[0].column(0);
+                let s = col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("expected StringArray for bit-string result");
+                assert_eq!(s.value(0), "1010");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
 }

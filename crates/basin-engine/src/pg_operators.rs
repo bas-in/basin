@@ -1717,6 +1717,218 @@ fn rewrite_cte_keyword(sql: &str, needle_lower: &str, replacement: &str) -> Stri
 }
 
 // ---------------------------------------------------------------------------
+// UUID cast rewriter
+// ---------------------------------------------------------------------------
+
+/// Rewrite `'...'::UUID` (and `'...'::uuid`) to `'...'::VARCHAR` before
+/// DataFusion sees the SQL. DataFusion 53 does not support the SQL `UUID`
+/// type in CAST expressions (`not_impl_err!("Unsupported SQL type UUID")`).
+///
+/// Basin stores UUID column values as `FixedSizeBinary(16)`, but a standalone
+/// literal `'str'::UUID` in a SELECT is best returned as its text form, which
+/// is what `::VARCHAR` gives us. The pgwire layer renders it as text anyway,
+/// so the client sees the correctly hyphenated UUID string.
+///
+/// The rewrite is case-insensitive for the `::UUID` suffix.
+pub(crate) fn rewrite_uuid_cast(sql: &str) -> String {
+    // Simple case-insensitive suffix substitution: `::UUID` → `::VARCHAR`.
+    // We only replace the literal `::UUID` suffix (no modifier).
+    let lower = sql.to_ascii_lowercase();
+    let mut out = sql.to_string();
+    // Scan for `::uuid` occurrences (case-insensitive) and replace with
+    // `::VARCHAR`. We go right-to-left so byte positions stay valid.
+    let mut positions: Vec<usize> = Vec::new();
+    let mut start = 0usize;
+    while let Some(pos) = lower[start..].find("::uuid") {
+        let abs = start + pos;
+        // Only replace if the character after `::uuid` is NOT alphanumeric or `_`
+        // (so `::uuidarray` isn't mangled).
+        let end_pos = abs + 6; // len("::uuid") == 6
+        let next_is_ident = out.as_bytes().get(end_pos).map(|&c| c.is_ascii_alphanumeric() || c == b'_').unwrap_or(false);
+        if !next_is_ident {
+            positions.push(abs);
+        }
+        start = abs + 6;
+    }
+    for pos in positions.into_iter().rev() {
+        out.replace_range(pos..pos + 6, "::VARCHAR");
+    }
+    out
+}
+
+// Bit-string literal rewriter
+// ---------------------------------------------------------------------------
+
+/// Rewrite PostgreSQL bit-string literals `B'bits'` to plain string literals
+/// `'bits'` before DataFusion sees the SQL.
+///
+/// sqlparser 0.52 parses `B'1010'` as `Value::SingleQuotedByteStringLiteral`
+/// and DataFusion 53 does not handle that value variant, failing with
+/// `"Unsupported Value 'SingleQuotedByteStringLiteral'"`.
+///
+/// Postgres `B'...'` is a bit-string constant — a sequence of `0`/`1`
+/// characters. `SELECT B'1010'` returns the text `'1010'` in PG's default
+/// representation, so returning the bare string is semantically correct.
+///
+/// The rewriter detects `B'...'` only when `B` appears **outside** any
+/// existing single-quoted string context (e.g. `'B'` is left as-is).
+pub(crate) fn rewrite_bit_string_literal(sql: &str) -> String {
+    // Use a character-level scan that correctly handles multi-byte UTF-8 and
+    // tracks whether we're inside a single-quoted string literal.
+    let chars: Vec<char> = sql.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < n {
+        // If inside a single-quoted string, consume it character-by-character
+        // without trying to detect `B'`. PG uses `''` escaping inside strings.
+        if chars[i] == '\'' {
+            out.push('\'');
+            i += 1;
+            // Consume string content until closing `'`, handling `''` escape.
+            while i < n {
+                if chars[i] == '\'' {
+                    out.push('\'');
+                    i += 1;
+                    if i < n && chars[i] == '\'' {
+                        // Escaped quote `''` — continue the string.
+                        out.push('\'');
+                        i += 1;
+                    } else {
+                        // End of string.
+                        break;
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Detect `B'bits'` — only when B is outside a quoted string.
+        // A bit-string literal starts with an uppercase `B` followed immediately
+        // by a single quote. Bit strings only contain `0`/`1`, so no quoting
+        // can occur inside them; we scan until the closing `'`.
+        if chars[i] == 'B' && i + 1 < n && chars[i + 1] == '\'' {
+            i += 2; // skip `B` and opening `'`
+            let mut bits = String::new();
+            while i < n && chars[i] != '\'' {
+                bits.push(chars[i]);
+                i += 1;
+            }
+            if i < n { i += 1; } // skip closing `'`
+            // Emit as plain single-quoted string.
+            out.push('\'');
+            out.push_str(&bits);
+            out.push('\'');
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+// Interval HH:MM:SS cast rewriter
+// ---------------------------------------------------------------------------
+
+/// Rewrite `'HH:MM:SS'::INTERVAL` (and lowercase `::interval`) to
+/// `'N seconds'::INTERVAL` so Arrow's interval parser can handle it.
+///
+/// Postgres accepts time-like shorthand for intervals, e.g.
+/// `'00:01:00'::INTERVAL` means 1 minute. Arrow's `parse_interval_month_day_nano`
+/// only understands the verbose form (`'1 minute'`, `'60 seconds'`, etc.), so
+/// DataFusion's `simplify_expressions` optimizer rule fails on the short form.
+///
+/// The rewriter detects `'H:MM:SS'` / `'HH:MM:SS'` patterns and converts
+/// them to the equivalent number of seconds. Non-matching interval strings
+/// (like `'1 hour 30 minutes'`) pass through unchanged.
+pub(crate) fn rewrite_interval_hms_cast(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0usize;
+    while i < n {
+        // Look for an opening single-quote — the start of a string literal.
+        if bytes[i] != b'\'' {
+            // Not a quote: push the char (must be ASCII since we're byte-scanning).
+            // Use char-based push to handle UTF-8 correctly.
+            let c = sql[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+
+        // Scan the quoted string content.
+        let str_start = i; // byte offset of opening `'`
+        i += 1;            // skip opening `'`
+        let content_start = i;
+
+        // Find closing `'`, handling `''` PG escape inside the string.
+        while i < n {
+            if bytes[i] == b'\'' {
+                if i + 1 < n && bytes[i + 1] == b'\'' {
+                    i += 2; // skip `''` escape
+                } else {
+                    break; // found unescaped closing `'`
+                }
+            } else {
+                i += 1;
+            }
+        }
+        // i points at closing `'` (or n if unterminated — shouldn't happen in valid SQL).
+        let content = &sql[content_start..i];
+        let str_end_inclusive = if i < n { i + 1 } else { n }; // one past closing `'`
+        if i < n { i += 1; } // skip closing `'`
+
+        // Check if what follows (in original position i) is `::interval`.
+        let suffix_lower = &lower[i..];
+        let is_interval_cast = suffix_lower.starts_with("::interval")
+            && !suffix_lower[10..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+
+        if !is_interval_cast {
+            // Not an interval cast — emit the string token literally.
+            out.push_str(&sql[str_start..str_end_inclusive]);
+            continue;
+        }
+
+        // Try to parse content as HH:MM:SS or H:MM:SS.
+        if let Some(total_secs) = parse_hms_interval(content) {
+            // Rewrite to `'N seconds'::INTERVAL`.
+            out.push('\'');
+            out.push_str(&total_secs.to_string());
+            out.push_str(" seconds'");
+            // Consume the `::interval` suffix (preserve the original case of `INTERVAL`).
+            out.push_str(&sql[i..i + 10]);
+            i += 10;
+        } else {
+            // Not an HH:MM:SS string — emit unchanged.
+            out.push_str(&sql[str_start..str_end_inclusive]);
+        }
+    }
+    out
+}
+
+/// Parse `"HH:MM:SS"` or `"H:MM:SS"` (integer components) into total seconds.
+/// Returns `None` if the string doesn't match.
+fn parse_hms_interval(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.trim().splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let sec: i64 = parts[2].parse().ok()?;
+    // Reject anything that doesn't look like valid hms (e.g. negative parts).
+    if h < 0 || m < 0 || m >= 60 || sec < 0 || sec >= 60 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + sec)
+}
+
 // PG array-literal cast rewriter
 // ---------------------------------------------------------------------------
 
@@ -1921,6 +2133,80 @@ mod tests {
         let sql = "SELECT * FROM t WHERE x BETWEEN 1 AND 10";
         let out = rewrite_between_symmetric(sql);
         // Plain BETWEEN must not be touched.
+        assert_eq!(out, sql);
+    }
+
+    // ── UUID cast rewriter ──────────────────────────────────────────────────
+
+    #[test]
+    fn uuid_cast_rewrite_basic() {
+        let sql = "SELECT 'a6c5e8f0-1234-5678-abcd-000000000000'::UUID";
+        let out = rewrite_uuid_cast(sql);
+        assert!(out.contains("::VARCHAR") || out.contains("::varchar"), "got: {out}");
+        assert!(!out.to_uppercase().contains("::UUID"), "UUID should be gone: {out}");
+    }
+
+    #[test]
+    fn uuid_cast_rewrite_case_insensitive() {
+        let sql = "SELECT 'a6c5e8f0-1234-5678-abcd-000000000000'::uuid";
+        let out = rewrite_uuid_cast(sql);
+        assert!(!out.to_uppercase().contains("::UUID"), "uuid should be gone: {out}");
+    }
+
+    #[test]
+    fn uuid_cast_passthrough_no_cast() {
+        let sql = "SELECT 'hello world'";
+        let out = rewrite_uuid_cast(sql);
+        assert_eq!(out, sql);
+    }
+
+    // ── Bit-string literal rewriter ─────────────────────────────────────────
+
+    #[test]
+    fn bit_string_rewrite_basic() {
+        let sql = "SELECT B'1010'";
+        let out = rewrite_bit_string_literal(sql);
+        assert_eq!(out, "SELECT '1010'");
+    }
+
+    #[test]
+    fn bit_string_passthrough_b_inside_string() {
+        // `'B'` is a string literal containing the letter B — must NOT be rewritten.
+        let sql = "UPDATE t SET name = 'B' WHERE id = 2";
+        let out = rewrite_bit_string_literal(sql);
+        assert_eq!(out, sql, "string containing 'B' must not be rewritten");
+    }
+
+    #[test]
+    fn bit_string_passthrough_no_b() {
+        let sql = "SELECT 'hello'";
+        let out = rewrite_bit_string_literal(sql);
+        assert_eq!(out, sql);
+    }
+
+    // ── Interval HH:MM:SS rewriter ──────────────────────────────────────────
+
+    #[test]
+    fn interval_hms_rewrite_basic() {
+        let sql = "SELECT '00:01:00'::INTERVAL";
+        let out = rewrite_interval_hms_cast(sql);
+        // 0*3600 + 1*60 + 0 = 60 seconds
+        assert!(out.contains("'60 seconds'") || out.contains("'60 second'"), "got: {out}");
+    }
+
+    #[test]
+    fn interval_hms_rewrite_hours_mins_secs() {
+        let sql = "SELECT '01:30:15'::interval";
+        let out = rewrite_interval_hms_cast(sql);
+        // 1*3600 + 30*60 + 15 = 5415 seconds
+        assert!(out.contains("'5415 seconds'") || out.contains("'5415 second'"), "got: {out}");
+    }
+
+    #[test]
+    fn interval_hms_passthrough_non_hms_interval() {
+        // Postgres standard format — must pass through unchanged.
+        let sql = "SELECT '1 hour'::INTERVAL";
+        let out = rewrite_interval_hms_cast(sql);
         assert_eq!(out, sql);
     }
 

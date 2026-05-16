@@ -1291,6 +1291,69 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 );
                 Arc::new(arr)
             }
+            // ── Time64: time-of-day (microsecond or nanosecond precision) ──────
+            // DataFusion emits Time64(Nanosecond) for `::TIME` casts. Walk the
+            // underlying i64 buffer and rebuild on the workspace side. Both
+            // Time64(Microsecond) and Time64(Nanosecond) ride on PrimitiveArray<i64>
+            // with identical encoding; we preserve the time unit exactly so
+            // downstream pgwire encoding sees the right tick scale.
+            ws_schema::DataType::Time64(ws_unit) => {
+                use arrow_array::types::{
+                    Time64MicrosecondType as WsTime64Micros,
+                    Time64NanosecondType as WsTime64Nanos,
+                };
+                use datafusion::arrow::array::Time64MicrosecondArray as DfTime64Micros;
+                use datafusion::arrow::array::Time64NanosecondArray as DfTime64Nanos;
+                let vals: Vec<Option<i64>> = match ws_unit {
+                    WsTimeUnit::Microsecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<DfTime64Micros>()
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected Time64MicrosecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    WsTimeUnit::Nanosecond => {
+                        let s = src
+                            .as_any()
+                            .downcast_ref::<DfTime64Nanos>()
+                            .ok_or_else(|| {
+                                BasinError::internal(format!(
+                                    "expected Time64NanosecondArray for {}",
+                                    field.name()
+                                ))
+                            })?;
+                        (0..s.len())
+                            .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
+                            .collect()
+                    }
+                    _ => {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "Time64 unit {:?} not supported in df→ws bridge",
+                            ws_unit
+                        )));
+                    }
+                };
+                let dt = ws_schema::DataType::Time64(*ws_unit);
+                let arr: Arc<dyn ws_array::Array> = match ws_unit {
+                    WsTimeUnit::Microsecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsTime64Micros>::from(vals)
+                            .with_data_type(dt),
+                    ),
+                    WsTimeUnit::Nanosecond => Arc::new(
+                        ws_array::PrimitiveArray::<WsTime64Nanos>::from(vals)
+                            .with_data_type(dt),
+                    ),
+                    _ => unreachable!("filtered above"),
+                };
+                arr
+            }
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "cannot translate column {} of type {other:?}",
