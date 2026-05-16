@@ -407,10 +407,24 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // understand: `A # B` (XOR) → `A ^ B`; `~expr` (unary NOT) →
     // `(-1 ^ (expr))`.
     let rewritten = crate::pg_operators::rewrite_pg_bitwise_operators(&rewritten);
+    // Rewrite `expr = ANY(ARRAY[...])` / `= SOME(ARRAY[...])` → `expr IN (...)`.
+    // DataFusion cannot plan the ARRAY-literal form of ANY/SOME; `IN` is the
+    // exact PG equivalent for equality quantification over an inline array.
+    // Also handles `<> ANY(ARRAY[...])` → `NOT IN (...)`.
+    // This must run BEFORE the subquery ANY rewriter so the subquery rewriter
+    // only sees subquery forms.
+    let rewritten = crate::pg_operators::rewrite_any_array(&rewritten);
+    // Rewrite `expr OP ALL(ARRAY[...])` to a VALUES subquery so the existing
+    // all-subquery rewriter can reduce it to a scalar aggregate comparison.
+    let rewritten = crate::pg_operators::rewrite_all_array(&rewritten);
     // Rewrite `= ANY (subquery)` / `= SOME (subquery)` → `IN (subquery)`.
     // DataFusion's ANY subquery planner has type-coercion issues; the IN form
     // is equivalent for equality comparisons and works reliably.
     let rewritten = crate::pg_operators::rewrite_any_some_subquery(&rewritten);
+    // Rewrite `LATERAL unnest(...)` → `unnest(...)` so sqlparser sees
+    // TableFactor::UNNEST (handled by DataFusion) instead of
+    // TableFactor::Function { lateral: true } (not a registered table fn).
+    let rewritten = crate::pg_operators::rewrite_lateral_unnest(&rewritten);
     // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
     let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
     // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.

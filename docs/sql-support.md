@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778931054 (Unix epoch)
-SQL fragments tested: 697 total / 1772 green (across all three configurations).
+Last run: 1778932487 (Unix epoch)
+SQL fragments tested: 697 total / 1806 green (across all three configurations).
 
 ## Configurations
 
@@ -285,14 +285,14 @@ SQL fragments tested: 697 total / 1772 green (across all three configurations).
 | `SELECT unnest(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM unnest(ARRAY[1,2,3]) WITH ORDINALITY` | 🚫 | 🚫 | 🚫 | internal: plan: This feature is not implemented: UNNEST with ordinality is no… |
 | `SELECT generate_subscripts(ARRAY[10,20,30], 1)` | ✅ | ✅ | ✅ |  |
-| `SELECT ARRAY[1,2] @> ARRAY[1]` | 🛠 | 🛠 | ✅ | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
+| `SELECT ARRAY[1,2] @> ARRAY[1]` | 🛠 | ✅ | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
 | `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
 | `SELECT ARRAY[1,2] \|\| ARRAY[3,4]` | ✅ | ✅ | ✅ |  |
 | `SELECT cardinality(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT array_fill(0, ARRAY[3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'array_fill'. Did you… |
 | `SELECT array_fill(0, ARRAY[2,3])` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'array_fill'. Did you… |
-| `SELECT 2 = ANY(ARRAY[1,2,3])` | 🛠 | 🛠 | 🛠 | internal: execute: type_coercion caused by Error during planning: Can not fin… |
-| `SELECT 5 > ALL(ARRAY[1,2,3])` | 🛠 | 🛠 | 🛠 | internal: plan: This feature is not implemented: ALL only supports subquery c… |
+| `SELECT 2 = ANY(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
+| `SELECT 5 > ALL(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT array_positions(ARRAY[1,2,1,3], 1)` | ✅ | ✅ | ✅ |  |
 | `SELECT array_dims(ARRAY[1,2,3])` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM unnest(ARRAY['a','b'], ARRAY[1,2]) AS t(letter, num)` | ✅ | ✅ | ✅ |  |
@@ -341,7 +341,7 @@ SQL fragments tested: 697 total / 1772 green (across all three configurations).
 | `SELECT transaction_timestamp()` | ✅ | ✅ | ✅ |  |
 | `SELECT localtime` | ✅ | ✅ | ✅ |  |
 | `SELECT localtimestamp` | ✅ | ✅ | ✅ |  |
-| `SELECT timeofday()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'timeofday'. Did you … |
+| `SELECT timeofday()` | ✅ | ✅ | ✅ |  |
 | `SELECT TO_DATE('2024-01-15', 'YYYY-MM-DD')` | ✅ | ✅ | ✅ |  |
 | `SELECT TO_NUMBER('12345.67', '99999.99')` | ✅ | ✅ | ✅ |  |
 | `SELECT date_bin('1 hour'::interval, NOW(), '2000-01-01'::timestamptz)` | ✅ | ✅ | ✅ |  |
@@ -417,7 +417,7 @@ SQL fragments tested: 697 total / 1772 green (across all three configurations).
 | `SELECT PI()` | ✅ | ✅ | ✅ |  |
 | `SELECT SIGN(-5)` | ✅ | ✅ | ✅ |  |
 | `SELECT RANDOM()` | ✅ | ✅ | ✅ |  |
-| `SELECT DIV(10, 3)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'div'. Did you mean '… |
+| `SELECT DIV(10, 3)` | ✅ | ✅ | ✅ |  |
 | `SELECT FACTORIAL(5)` | ✅ | ✅ | ✅ |  |
 | `SELECT GCD(12, 8)` | ✅ | ✅ | ✅ |  |
 | `SELECT LCM(4, 6)` | ✅ | ✅ | ✅ |  |
@@ -502,13 +502,13 @@ SQL fragments tested: 697 total / 1772 green (across all three configurations).
 | `SELECT pg_column_size('hello')` | ✅ | ✅ | ✅ |  |
 | `SELECT version()` | ✅ | ✅ | ✅ |  |
 | `SELECT current_schema()` | ✅ | ✅ | ✅ |  |
-| `SELECT current_database()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'current_database'. D… |
+| `SELECT current_database()` | ✅ | ✅ | ✅ |  |
 | `SELECT current_schemas(false)` | ✅ | ✅ | ✅ |  |
-| `SELECT current_setting('search_path')` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'current_setting'. Di… |
-| `SELECT set_config('search_path', 'public', false)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'set_config'. Did you… |
-| `SELECT pg_postmaster_start_time()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_postmaster_start_… |
-| `SELECT pg_backend_pid()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_backend_pid'. Did… |
-| `SELECT pg_is_in_recovery()` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Invalid function 'pg_is_in_recovery'. … |
+| `SELECT current_setting('search_path')` | ✅ | ✅ | ✅ |  |
+| `SELECT set_config('search_path', 'public', false)` | ✅ | ✅ | ✅ |  |
+| `SELECT pg_postmaster_start_time()` | ✅ | ✅ | ✅ |  |
+| `SELECT pg_backend_pid()` | ✅ | ✅ | ✅ |  |
+| `SELECT pg_is_in_recovery()` | ✅ | ✅ | ✅ |  |
 
 ## PG/Operators
 
@@ -527,8 +527,8 @@ SQL fragments tested: 697 total / 1772 green (across all three configurations).
 | `SELECT * FROM t WHERE name ~* '^A'` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE name !~* '^Z'` | ✅ | ✅ | ✅ |  |
 | `SELECT ARRAY[1,2] \|\| ARRAY[3,4]` | ✅ | ✅ | ✅ |  |
-| `SELECT ARRAY[1,2,3] @> ARRAY[1,2]` | 🛠 | 🛠 | ✅ | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
-| `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
+| `SELECT ARRAY[1,2,3] @> ARRAY[1,2]` | 🛠 | ✅ | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
+| `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]` | 🛠 | ✅ | 🛠 | internal: plan: Error during planning: Failed to coerce arguments to satisfy … |
 | `SELECT ARRAY[1,2] && ARRAY[2,3]` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id = ANY (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id > ALL (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
@@ -669,7 +669,7 @@ SQL fragments tested: 697 total / 1772 green (across all three configurations).
 | `SELECT t.id, (SELECT COUNT(*) FROM u WHERE u.id = t.id) AS cnt FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Argument #2 must be an INTEGER or NULL… |
 | `SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
-| `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'unnest' not found |
+| `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | ✅ | ✅ | ✅ |  |
 | `SELECT t.id, sub.* FROM t, LATERAL jsonb_each('{"a":1}'::jsonb) sub` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: table function 'jsonb_each' not found |
 | `SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true` | 🛠 | 🛠 | 🛠 | internal: execute: This feature is not implemented: Physical plan does not su… |
 

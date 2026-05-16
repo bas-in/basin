@@ -1226,6 +1226,295 @@ fn rewrite_quantified_op(sql: &str, op_kw: &str, new_op: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// ANY/ALL with ARRAY literal rewrites
+// ---------------------------------------------------------------------------
+
+/// Rewrite `expr = ANY(ARRAY[a,b,c])` (and `= SOME`) to `expr IN (a,b,c)`.
+///
+/// DataFusion cannot plan `= ANY(ARRAY[...])` — its coercion path only works
+/// with subqueries. The PG semantics are identical to an `IN` list, so we
+/// simply strip the `ARRAY[` / `]` wrapper and replace `= ANY` with `IN`.
+///
+/// Also handles `<> ANY(ARRAY[...])` / `!= ANY(ARRAY[...])` → `NOT IN (...)`.
+pub(crate) fn rewrite_any_array(sql: &str) -> String {
+    let mut s = rewrite_one_any_array(sql, "= any", false);
+    s = rewrite_one_any_array(&s, "= some", false);
+    s = rewrite_one_any_array(&s, "<> any", true);
+    s = rewrite_one_any_array(&s, "!= any", true);
+    s
+}
+
+fn rewrite_one_any_array(sql: &str, op_lower: &str, negate: bool) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + op_lower.len();
+        let bytes = s.as_bytes();
+
+        // Word boundary after (must be followed by `(` or whitespace).
+        let post_ok = kw_end >= s.len() || {
+            let b = bytes[kw_end];
+            b == b'(' || b == b' ' || b == b'\t' || b == b'\n'
+        };
+        if !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+        // Word boundary before the operator.
+        let pre_ok = kw_start == 0 || {
+            let prev = bytes[kw_start - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'>' && prev != b'<' && prev != b'!'
+        };
+        if !pre_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Skip whitespace after the keyword and find `(`.
+        let mut j = kw_end;
+        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || bytes[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Find the matching `)` of the outer parens.
+        let Some(outer_end) = find_matching_close_paren(&s, j) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        let inner = s[j + 1..outer_end].trim();
+
+        // Must be `ARRAY[...]` form (case-insensitive).
+        let inner_lower = inner.to_ascii_lowercase();
+        let arr_content = if inner_lower.starts_with("array[") {
+            // Find matching `]` of the ARRAY constructor.
+            let bracket_start = inner.find('[').unwrap();
+            let Some(bracket_end) = find_matching_close_bracket(inner, bracket_start) else {
+                search_from = kw_end;
+                continue;
+            };
+            &inner[bracket_start + 1..bracket_end]
+        } else {
+            // Not an ARRAY literal — leave for the subquery rewriter.
+            search_from = kw_end;
+            continue;
+        };
+
+        let replacement = if negate {
+            format!("NOT IN ({arr_content})")
+        } else {
+            format!("IN ({arr_content})")
+        };
+        s.replace_range(kw_start..outer_end + 1, &replacement);
+        search_from = kw_start + replacement.len();
+    }
+    s
+}
+
+/// Rewrite `expr OP ALL(ARRAY[a,b,c])` to a scalar comparison using
+/// `array_max` / `array_min` (DataFusion built-ins).
+///
+/// PG semantics: `x OP ALL(values)` holds when the comparison holds for
+/// every element, which is equivalent to comparing against the aggregate:
+///
+/// | operator | aggregate |
+/// |----------|-----------|
+/// | `>`      | `array_max` (x > every ↔ x > max) |
+/// | `>=`     | `array_max` (x >= every ↔ x >= max) |
+/// | `<`      | `array_min` (x < every ↔ x < min) |
+/// | `<=`     | `array_min` (x <= every ↔ x <= min) |
+///
+/// `<> ALL` / `!= ALL` falls through to the existing `rewrite_all_subquery`
+/// path which converts them to `NOT IN` — not touched here.
+/// `= ALL` is left unhandled (rare; semantics require both min = max = x).
+pub(crate) fn rewrite_all_array(sql: &str) -> String {
+    // Pairs: (op_lower_including_all, array_aggregate_fn)
+    // Longer operators first to avoid `>= all` being eaten by `> all`.
+    const OPS: &[(&str, &str)] = &[
+        (">= all", "array_max"),
+        ("<= all", "array_min"),
+        ("> all",  "array_max"),
+        ("< all",  "array_min"),
+    ];
+    let mut s = sql.to_string();
+    for (op, agg) in OPS {
+        s = rewrite_one_all_array(&s, op, agg);
+    }
+    s
+}
+
+fn rewrite_one_all_array(sql: &str, op_lower: &str, agg_fn: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + op_lower.len();
+        let bytes = s.as_bytes();
+
+        // Word boundary after (must be followed by `(` or whitespace).
+        let post_ok = kw_end >= s.len() || {
+            let b = bytes[kw_end];
+            b == b'(' || b == b' ' || b == b'\t' || b == b'\n'
+        };
+        if !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+        // Word boundary before the first char of op_lower: e.g. for `> all`
+        // the char before `>` must not be alphanumeric or `_`.
+        let pre_ok = kw_start == 0 || {
+            let prev = bytes[kw_start - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_'
+        };
+        if !pre_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Skip whitespace and find `(`.
+        let mut j = kw_end;
+        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        if j >= s.len() || bytes[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+
+        let Some(outer_end) = find_matching_close_paren(&s, j) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        let inner = s[j + 1..outer_end].trim().to_string();
+        let inner_lower = inner.to_ascii_lowercase();
+
+        // Must be `ARRAY[...]` — not a subquery (subquery handled separately).
+        if inner_lower.starts_with("select ") || !inner_lower.starts_with("array[") {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Build replacement: `op_str array_max(ARRAY[...])`.
+        // Strip " all" from op_lower to get the bare comparison operator.
+        let op_str = op_lower[..op_lower.len() - 4].trim(); // strip " all"
+        let replacement = format!("{op_str} {agg_fn}({inner})");
+        s.replace_range(kw_start..outer_end + 1, &replacement);
+        search_from = kw_start + replacement.len();
+    }
+    s
+}
+
+/// Find the matching `]` for the `[` at `start` in `s`.
+fn find_matching_close_bracket(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'[') { return None; }
+    let mut depth = 1i32;
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 { return Some(i); }
+            }
+            b'\'' => {
+                // Skip string literals.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Rewrite `LATERAL unnest(...)` → `unnest(...)` so that sqlparser parses the
+/// form as `TableFactor::UNNEST` (handled by DataFusion) rather than
+/// `TableFactor::Function { lateral: true }` (which DataFusion can't plan
+/// because `unnest` is not a registered table-function name).
+///
+/// Only fires when `LATERAL` is immediately followed by `unnest` (case-
+/// insensitive, any whitespace). Other `LATERAL` uses (subqueries, other
+/// functions) are left untouched.
+pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("lateral") { return sql.to_string(); }
+
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < sql.len() {
+        // Skip string literals.
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < sql.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < sql.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < sql.len() && bytes[i] != b'"' { i += 1; }
+            if i < sql.len() { i += 1; }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Check for `LATERAL` keyword (case-insensitive, word boundary).
+        let lower_slice = &lower[i..];
+        if lower_slice.starts_with("lateral") {
+            let lat_end = i + 7; // len("lateral")
+            // Word boundary before.
+            let pre_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            // Word boundary after: must be whitespace or end-of-string.
+            let post_ok = lat_end >= sql.len() || !bytes[lat_end].is_ascii_alphanumeric();
+            if pre_ok && post_ok {
+                // Skip whitespace after LATERAL.
+                let mut j = lat_end;
+                while j < sql.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+                // Check if what follows is `unnest` (case-insensitive, word boundary).
+                if j < sql.len() && lower[j..].starts_with("unnest") {
+                    let u_end = j + 6; // len("unnest")
+                    let post_u = u_end >= sql.len()
+                        || !bytes[u_end].is_ascii_alphanumeric()
+                        || bytes[u_end] == b'(';
+                    if post_u {
+                        // Drop the "LATERAL " prefix; continue from the "unnest".
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Bitwise operator rewrites
 // ---------------------------------------------------------------------------
 
@@ -2241,5 +2530,102 @@ mod tests {
         let out = rewrite_array_operators(sql);
         // Should not introduce arrays_overlap.
         assert!(!out.contains("arrays_overlap"), "should not rewrite plain cols: {out}");
+    }
+
+    // ── = ANY(ARRAY[...]) rewriter ──────────────────────────────────────────
+
+    #[test]
+    fn any_array_eq_basic() {
+        let sql = "SELECT 2 = ANY(ARRAY[1,2,3])";
+        let out = rewrite_any_array(sql);
+        assert_eq!(out, "SELECT 2 IN (1,2,3)", "got: {out}");
+    }
+
+    #[test]
+    fn any_array_eq_spaces() {
+        let sql = "SELECT 2 = ANY ( ARRAY[1,2,3] )";
+        let out = rewrite_any_array(sql);
+        assert!(out.contains("IN ("), "got: {out}");
+        assert!(!out.contains("ANY"), "ANY should be gone: {out}");
+    }
+
+    #[test]
+    fn any_array_neq_to_not_in() {
+        let sql = "SELECT 5 <> ANY(ARRAY[1,2,3])";
+        let out = rewrite_any_array(sql);
+        assert!(out.contains("NOT IN ("), "got: {out}");
+    }
+
+    #[test]
+    fn any_array_no_rewrite_subquery() {
+        // Subquery form must not be touched by rewrite_any_array.
+        let sql = "SELECT id = ANY(SELECT id FROM t)";
+        let out = rewrite_any_array(sql);
+        assert_eq!(out, sql, "subquery form must be unchanged: {out}");
+    }
+
+    // ── > ALL(ARRAY[...]) rewriter ──────────────────────────────────────────
+
+    #[test]
+    fn all_array_gt_to_array_max() {
+        let sql = "SELECT 5 > ALL(ARRAY[1,2,3])";
+        let out = rewrite_all_array(sql);
+        assert_eq!(out, "SELECT 5 > array_max(ARRAY[1,2,3])", "got: {out}");
+    }
+
+    #[test]
+    fn all_array_lt_to_array_min() {
+        let sql = "SELECT 1 < ALL(ARRAY[2,3,4])";
+        let out = rewrite_all_array(sql);
+        assert_eq!(out, "SELECT 1 < array_min(ARRAY[2,3,4])", "got: {out}");
+    }
+
+    #[test]
+    fn all_array_gte_to_array_max() {
+        let sql = "SELECT 5 >= ALL(ARRAY[1,2,3])";
+        let out = rewrite_all_array(sql);
+        assert_eq!(out, "SELECT 5 >= array_max(ARRAY[1,2,3])", "got: {out}");
+    }
+
+    #[test]
+    fn all_array_no_rewrite_subquery() {
+        // Subquery form must not be touched by rewrite_all_array.
+        let sql = "SELECT id > ALL(SELECT id FROM t)";
+        let out = rewrite_all_array(sql);
+        assert_eq!(out, sql, "subquery form must be unchanged: {out}");
+    }
+
+    // ── LATERAL unnest rewriter ─────────────────────────────────────────────
+
+    #[test]
+    fn lateral_unnest_stripped() {
+        let sql = "SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag";
+        let out = rewrite_lateral_unnest(sql);
+        assert!(!out.contains("LATERAL"), "LATERAL should be gone: {out}");
+        assert!(out.contains("unnest("), "unnest should remain: {out}");
+    }
+
+    #[test]
+    fn lateral_unnest_case_insensitive() {
+        let sql = "SELECT * FROM t, lateral UNNEST(ARRAY[1,2,3]) tag";
+        let out = rewrite_lateral_unnest(sql);
+        assert!(!out.to_ascii_lowercase().contains("lateral unnest"), "LATERAL should be gone: {out}");
+        assert!(out.to_ascii_lowercase().contains("unnest("), "unnest should remain: {out}");
+    }
+
+    #[test]
+    fn lateral_non_unnest_preserved() {
+        // LATERAL with non-unnest function must NOT be stripped.
+        let sql = "SELECT * FROM t, LATERAL jsonb_each('{\"a\":1}'::jsonb) j";
+        let out = rewrite_lateral_unnest(sql);
+        assert_eq!(out, sql, "non-unnest LATERAL must be unchanged: {out}");
+    }
+
+    #[test]
+    fn lateral_subquery_preserved() {
+        // LATERAL subquery form must NOT be stripped.
+        let sql = "SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub";
+        let out = rewrite_lateral_unnest(sql);
+        assert_eq!(out, sql, "LATERAL subquery must be unchanged: {out}");
     }
 }

@@ -41,8 +41,8 @@ use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveTime, Timelike, Utc};
 use datafusion::arrow::array::{
-    Array, Float64Array, Int32Array, Int64Array, StringArray,
-    StringBuilder, TimestampMicrosecondBuilder,
+    Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    StringArray, StringBuilder, TimestampMicrosecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{exec_err, Result as DFResult};
@@ -50,6 +50,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
 
 // ---------------------------------------------------------------------------
 // Public registration entry point
@@ -248,6 +249,76 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ToNumberUdf {
         signature: Signature::exact(
             vec![DataType::Utf8, DataType::Utf8],
+            Volatility::Immutable,
+        ),
+    }));
+
+    // ── current_database() → TEXT ────────────────────────────────────────────
+    // Returns the current database name. Basin uses "postgres" as the default.
+    ctx.register_udf(ScalarUDF::from(ConstTextUdf::new(
+        "current_database",
+        "postgres",
+    )));
+
+    // ── current_setting(name [, missing_ok]) → TEXT ──────────────────────────
+    // Returns GUC setting. Stub returns empty string for any setting name.
+    ctx.register_udf(ScalarUDF::from(CurrentSettingUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Boolean]),
+            ],
+            Volatility::Volatile,
+        ),
+    }));
+
+    // ── set_config(name, value, is_local) → TEXT ─────────────────────────────
+    // Sets a GUC setting. Stub returns the value argument unchanged.
+    ctx.register_udf(ScalarUDF::from(SetConfigUdf {
+        signature: Signature::exact(
+            vec![DataType::Utf8, DataType::Utf8, DataType::Boolean],
+            Volatility::Volatile,
+        ),
+    }));
+
+    // ── pg_backend_pid() → INT4 ───────────────────────────────────────────────
+    // Returns the PID of the backend process. Stub returns 0.
+    ctx.register_udf(ScalarUDF::from(ConstInt32Udf::new("pg_backend_pid", 0)));
+
+    // ── pg_postmaster_start_time() → TIMESTAMPTZ ─────────────────────────────
+    // Returns the server start time. Stub returns now() (Timestamp microseconds UTC).
+    ctx.register_udf(ScalarUDF::from(NowStubUdf {
+        name: "pg_postmaster_start_time".to_string(),
+        signature: Signature::nullary(Volatility::Volatile),
+    }));
+
+    // ── pg_is_in_recovery() → BOOL ───────────────────────────────────────────
+    // Returns false — Basin is always primary / not a replica.
+    ctx.register_udf(ScalarUDF::from(ConstBoolUdf::new(
+        "pg_is_in_recovery",
+        false,
+    )));
+
+    // ── timeofday() → TEXT ───────────────────────────────────────────────────
+    // PG returns a human-readable timestamp string. Stub returns a fixed format
+    // timestamp matching PG's output (e.g. "Thu Jan 01 00:00:00.000000 2026 UTC").
+    ctx.register_udf(ScalarUDF::from(TimeofdayUdf {
+        signature: Signature::nullary(Volatility::Volatile),
+    }));
+
+    // ── div(a, b) → same integer type ───────────────────────────────────────
+    // PG's integer division (truncates toward zero, like Rust `a / b`).
+    // DataFusion's `/` operator returns floored division for integers in some
+    // contexts; `div(a, b)` is PG's explicit integer-quotient function.
+    ctx.register_udf(ScalarUDF::from(DivUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32]),
+                TypeSignature::Exact(vec![DataType::Int16, DataType::Int16]),
+                TypeSignature::Exact(vec![DataType::Float64, DataType::Float64]),
+                TypeSignature::Exact(vec![DataType::Float32, DataType::Float32]),
+            ],
             Volatility::Immutable,
         ),
     }));
@@ -856,6 +927,311 @@ impl ScalarUDFImpl for ToNumberUdf {
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConstTextUdf — returns a fixed TEXT string regardless of input
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ConstTextUdf {
+    fn_name: &'static str,
+    value: &'static str,
+    signature: Signature,
+}
+
+impl ConstTextUdf {
+    fn new(fn_name: &'static str, value: &'static str) -> Self {
+        Self {
+            fn_name,
+            value,
+            signature: Signature::nullary(Volatility::Stable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ConstTextUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { self.fn_name }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            self.value.to_string(),
+        ))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConstInt32Udf — returns a fixed INT32 value regardless of input
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ConstInt32Udf {
+    fn_name: &'static str,
+    value: i32,
+    signature: Signature,
+}
+
+impl ConstInt32Udf {
+    fn new(fn_name: &'static str, value: i32) -> Self {
+        Self {
+            fn_name,
+            value,
+            signature: Signature::nullary(Volatility::Stable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ConstInt32Udf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { self.fn_name }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int32)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(self.value))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConstBoolUdf — returns a fixed BOOL value regardless of input
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ConstBoolUdf {
+    fn_name: &'static str,
+    value: bool,
+    signature: Signature,
+}
+
+impl ConstBoolUdf {
+    fn new(fn_name: &'static str, value: bool) -> Self {
+        Self {
+            fn_name,
+            value,
+            signature: Signature::nullary(Volatility::Stable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ConstBoolUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { self.fn_name }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(self.value))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// current_setting(name [, missing_ok]) → TEXT
+// Returns the current value of the named GUC parameter. Stub returns "".
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CurrentSettingUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for CurrentSettingUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "current_setting" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.args.iter()
+            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
+            .max()
+            .unwrap_or(1);
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(
+            vec![""; n],
+        ))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// set_config(name, value, is_local) → TEXT
+// Sets a configuration parameter. Stub returns the value argument unchanged.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SetConfigUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SetConfigUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "set_config" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Return the second argument (the value).
+        if args.args.len() < 2 {
+            return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(String::new()))));
+        }
+        Ok(args.args[1].clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// timeofday() → TEXT
+// Returns the current wall-clock time as a PG-formatted text string.
+// PG format example: "Thu Jan 01 00:00:00.000000 2026 UTC"
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TimeofdayUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for TimeofdayUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "timeofday" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let now = Utc::now();
+        // Format as PG-compatible: "Thu Jan 01 00:00:00.000000 2026 UTC"
+        let formatted = now.format("%a %b %d %H:%M:%S%.6f %Y UTC").to_string();
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(formatted))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// div(a, b) → same integer type (truncated integer division)
+// PG: div(9, 4) = 2  (truncates toward zero, same as Rust integer division)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct DivUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for DivUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "div" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        if arg_types.is_empty() {
+            return Ok(DataType::Int64);
+        }
+        Ok(arg_types[0].clone())
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        if args.len() != 2 {
+            return exec_err!("div expects 2 arguments, got {}", args.len());
+        }
+        let n = args.iter()
+            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
+            .max()
+            .unwrap_or(1);
+        let a = args[0].clone().into_array(n)?;
+        let b = args[1].clone().into_array(n)?;
+
+        // Dispatch on type.
+        if let (Some(av), Some(bv)) = (
+            a.as_any().downcast_ref::<Int64Array>(),
+            b.as_any().downcast_ref::<Int64Array>(),
+        ) {
+            let mut out = Int64Array::builder(n);
+            for i in 0..n {
+                if av.is_null(i) || bv.is_null(i) {
+                    out.append_null();
+                } else if bv.value(i) == 0 {
+                    return exec_err!("div: division by zero");
+                } else {
+                    out.append_value(av.value(i) / bv.value(i));
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+        }
+        if let (Some(av), Some(bv)) = (
+            a.as_any().downcast_ref::<Int32Array>(),
+            b.as_any().downcast_ref::<Int32Array>(),
+        ) {
+            let mut out = Int32Array::builder(n);
+            for i in 0..n {
+                if av.is_null(i) || bv.is_null(i) {
+                    out.append_null();
+                } else if bv.value(i) == 0 {
+                    return exec_err!("div: division by zero");
+                } else {
+                    out.append_value(av.value(i) / bv.value(i));
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+        }
+        if let (Some(av), Some(bv)) = (
+            a.as_any().downcast_ref::<Int16Array>(),
+            b.as_any().downcast_ref::<Int16Array>(),
+        ) {
+            let mut out = Int16Array::builder(n);
+            for i in 0..n {
+                if av.is_null(i) || bv.is_null(i) {
+                    out.append_null();
+                } else if bv.value(i) == 0 {
+                    return exec_err!("div: division by zero");
+                } else {
+                    out.append_value(av.value(i) / bv.value(i));
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+        }
+        if let (Some(av), Some(bv)) = (
+            a.as_any().downcast_ref::<Float64Array>(),
+            b.as_any().downcast_ref::<Float64Array>(),
+        ) {
+            let mut out = Float64Array::builder(n);
+            for i in 0..n {
+                if av.is_null(i) || bv.is_null(i) {
+                    out.append_null();
+                } else if bv.value(i) == 0.0 {
+                    return exec_err!("div: division by zero");
+                } else {
+                    out.append_value((av.value(i) / bv.value(i)).trunc());
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+        }
+        if let (Some(av), Some(bv)) = (
+            a.as_any().downcast_ref::<Float32Array>(),
+            b.as_any().downcast_ref::<Float32Array>(),
+        ) {
+            let mut out = Float32Array::builder(n);
+            for i in 0..n {
+                if av.is_null(i) || bv.is_null(i) {
+                    out.append_null();
+                } else if bv.value(i) == 0.0 {
+                    return exec_err!("div: division by zero");
+                } else {
+                    out.append_value((av.value(i) / bv.value(i)).trunc());
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+        }
+        exec_err!("div: unsupported argument types")
     }
 }
 
