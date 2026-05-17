@@ -1,0 +1,32 @@
+# Basin 3-way cloud benchmark configuration.
+#
+# Copy to `.basin-three-way.toml` (which is gitignored) and fill in the
+# three DSNs that the harness needs.  The harness in
+# `benchmark/three_way/run_three_way.sh` loads this file at startup; if
+# the file is absent it falls back to environment variables
+# (NEON_DATABASE_URL / SUPABASE_DATABASE_URL / BASIN_DATABASE_URL / REGION_LABEL).
+#
+# Lookup order:
+#   1. $BASIN_THREE_WAY_CONFIG=<path>
+#   2. ./.basin-three-way.toml         (project-local, recommended)
+#   3. else: environment variables
+#   4. else: harness errors with a clear "missing required input" message
+#
+# NEVER commit `.basin-three-way.toml` — it contains live credentials.
+# The example file (this one) is safe to commit because it has no real values.
+
+# Frankfurt-region Postgres endpoints (or any region — REGION_LABEL is just
+# a tag used in the output filenames and report).
+[endpoints]
+neon     = "postgres://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+supabase = "postgres://postgres.[ref]:pass@aws-0-eu-central-1.pooler.supabase.com:6543/postgres?sslmode=require"
+basin    = "postgres://user:pass@basin-engine-main.fly.dev:5432/db?sslmode=disable"
+
+# Optional region label written into output filenames + the results header.
+# Defaults to "fra" if omitted.
+region_label = "fra"
+
+# Optional benchmark sizing knobs.
+# row_count = 100000   # rows per endpoint (default 100000)
+# iterations = 10      # query repetitions for p50/p95 (default 10)
+# out_dir = "./benchmark/three_way/out"  # output directory

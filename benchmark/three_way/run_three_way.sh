@@ -140,6 +140,74 @@ run_sql_file_with_subs() {
         -f "${sql_file}" 2>/dev/null
 }
 
+# ---------- TOML config loader ----------------------------------------------
+#
+# Load a TOML config if present and export the standard env-var names from it.
+# Already-exported environment variables WIN — the TOML is fallback, so users
+# can override one value via `NEON_DATABASE_URL=... ./run_three_way.sh` without
+# editing the file.
+#
+# Lookup order:
+#   1. $BASIN_THREE_WAY_CONFIG=<path>
+#   2. ./.basin-three-way.toml         (relative to the script's repo root)
+#   3. else: pure env-var path
+#
+# Expected TOML shape (mirrors .basin-three-way.example.toml):
+#   [endpoints]
+#   neon         = "postgres://..."
+#   supabase     = "postgres://..."
+#   basin        = "postgres://..."
+#   region_label = "fra"
+#   row_count    = 100000   # optional
+#   iterations   = 10       # optional
+#   out_dir      = "..."    # optional
+#
+# Parsed via python3 stdlib (tomllib on 3.11+, tomli on older). If python3
+# is unavailable, we silently skip the TOML and rely on env vars.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+THREE_WAY_CFG="${BASIN_THREE_WAY_CONFIG:-${REPO_ROOT}/.basin-three-way.toml}"
+
+if [[ -f "${THREE_WAY_CFG}" ]] && command -v python3 >/dev/null 2>&1; then
+    log "Loading 3-way config from: ${THREE_WAY_CFG}"
+    # Read each key; export ONLY if the corresponding env var is empty.
+    # python prints `KEY\tVALUE` lines on stdout; empty value = skip.
+    while IFS=$'\t' read -r key value; do
+        [[ -z "${key}" ]] && continue
+        # Respect pre-existing env var.
+        if [[ -z "${!key:-}" ]]; then
+            export "${key}=${value}"
+        fi
+    done < <(python3 - "${THREE_WAY_CFG}" <<'PY' 2>/dev/null
+import sys
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore
+    except ImportError:
+        sys.exit(0)
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    sys.exit(0)
+ep = cfg.get("endpoints", {}) or {}
+def emit(k, v):
+    if v is None:
+        return
+    print(f"{k}\t{v}")
+emit("NEON_DATABASE_URL",     ep.get("neon"))
+emit("SUPABASE_DATABASE_URL", ep.get("supabase"))
+emit("BASIN_DATABASE_URL",    ep.get("basin"))
+emit("REGION_LABEL",          ep.get("region_label"))
+emit("ROW_COUNT",             ep.get("row_count"))
+emit("ITERATIONS",            ep.get("iterations"))
+emit("OUT_DIR",               ep.get("out_dir"))
+PY
+    )
+fi
+
 # ---------- input validation -------------------------------------------------
 
 MISSING_VARS=()
@@ -154,12 +222,19 @@ if [[ ${#MISSING_VARS[@]} -gt 0 ]]; then
         log "  - ${v}"
     done
     log ""
-    log "Set all four variables before running.  Example:"
-    log "  export NEON_DATABASE_URL='postgres://user:pass@host/db'"
-    log "  export SUPABASE_DATABASE_URL='postgres://user:pass@host/db'"
-    log "  export BASIN_DATABASE_URL='postgres://user:pass@host/db'"
-    log "  export REGION_LABEL=fra"
-    log "  ./benchmark/three_way/run_three_way.sh"
+    log "Set all four values before running.  Two options:"
+    log ""
+    log "  Option A — TOML config (preferred, persists across runs):"
+    log "    cp .basin-three-way.example.toml .basin-three-way.toml"
+    log "    \$EDITOR .basin-three-way.toml   # fill in the three DSNs"
+    log "    ./benchmark/three_way/run_three_way.sh"
+    log ""
+    log "  Option B — environment variables:"
+    log "    export NEON_DATABASE_URL='postgres://user:pass@host/db'"
+    log "    export SUPABASE_DATABASE_URL='postgres://user:pass@host/db'"
+    log "    export BASIN_DATABASE_URL='postgres://user:pass@host/db'"
+    log "    export REGION_LABEL=fra"
+    log "    ./benchmark/three_way/run_three_way.sh"
     exit 1
 fi
 

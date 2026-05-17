@@ -15,6 +15,10 @@ Cargo.lock.bak
 .basin-test.toml
 basin-test.toml
 
+# 3-way cloud benchmark config — contains real Neon/Supabase/Basin Cloud DSNs.
+# NEVER commit. The example template lives at .basin-three-way.example.toml.
+.basin-three-way.toml
+
 .basin-local-s3-data
 .basin-local-s3.pid
 .basin-local-s3.log

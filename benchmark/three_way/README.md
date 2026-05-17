@@ -59,7 +59,33 @@ The harness cannot verify that endpoints are actually in Frankfurt — it stamps
 for region co-location.  Cross-region measurements will be artificially inflated
 by inter-region latency and are not a fair comparison.
 
-### Step 2 — set environment variables
+### Step 2 — supply credentials (TOML config OR env vars)
+
+**Option A — TOML config (recommended, persists across runs):**
+
+```sh
+cp .basin-three-way.example.toml .basin-three-way.toml
+$EDITOR .basin-three-way.toml   # fill in the three DSNs
+```
+
+The file is gitignored.  The harness loads it automatically from the repo
+root (override via `BASIN_THREE_WAY_CONFIG=/path/to/cfg.toml`).  Format:
+
+```toml
+[endpoints]
+neon         = "postgres://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+supabase     = "postgres://postgres.[ref]:pass@aws-0-eu-central-1.pooler.supabase.com:6543/postgres?sslmode=require"
+basin        = "postgres://user:pass@basin-engine-main.fly.dev:5432/db?sslmode=disable"
+region_label = "fra"
+# row_count   = 100000   # optional
+# iterations  = 10       # optional
+# out_dir     = "..."    # optional
+```
+
+Requires Python 3.11+ (stdlib `tomllib`) or `tomli` on older Python — if
+neither is installed, the TOML is silently skipped and env vars are used.
+
+**Option B — environment variables (no file on disk):**
 
 ```sh
 export NEON_DATABASE_URL='postgres://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb'
@@ -68,7 +94,7 @@ export BASIN_DATABASE_URL='postgres://user:pass@basin-cloud-fra.fly.dev:5432/db'
 export REGION_LABEL=fra
 ```
 
-Optional tuning:
+Optional tuning (either TOML or env):
 
 ```sh
 export ROW_COUNT=100000   # rows to insert (default: 100000)
@@ -76,8 +102,13 @@ export ITERATIONS=10      # query repetitions for p50/p95 (default: 10)
 export OUT_DIR=/path/to/output   # where to write JSON (default: ./benchmark/three_way/out/)
 ```
 
-**Never** pass credentials as positional arguments or in `.env` files.  The
-harness reads only the four env vars listed above.
+**Precedence:** explicit env vars override TOML values.  This lets you point
+at a one-off endpoint via `NEON_DATABASE_URL=... ./run_three_way.sh` without
+editing the file.
+
+**Never** commit `.basin-three-way.toml` — it contains live credentials.
+Only `.basin-three-way.example.toml` (placeholder values) is committed.
+The harness does NOT read `.env` / `.env.*` files of any kind.
 
 ### Step 3 — dry run (recommended first)
 
