@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, QualifiedTableName, Result, SchemaName, TableName, ProjectId};
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::instrument;
@@ -94,7 +94,10 @@ impl TableState {
     }
 }
 
-type TableMap = HashMap<(ProjectId, TableName), Arc<Mutex<TableState>>>;
+/// Internal storage key. All table operations are keyed by
+/// `(ProjectId, QualifiedTableName)` so the same table name in different
+/// schemas does not collide.
+type TableMap = HashMap<(ProjectId, QualifiedTableName), Arc<Mutex<TableState>>>;
 
 /// In-memory implementation of [`Catalog`]. Cheap to clone via `Arc`.
 ///
@@ -149,6 +152,10 @@ pub struct InMemoryCatalog {
     /// Per-project plain-view definitions (`CREATE VIEW … AS SELECT …`).
     /// Same shape as `sql_functions`: keyed by `(ProjectId, lower-name)`.
     views: Mutex<HashMap<(ProjectId, String), ViewDef>>,
+    /// Per-project schema set. `public` is always pre-seeded on
+    /// `create_namespace`. Used by `list_schemas`, `create_schema`, and
+    /// `drop_schema`.
+    schemas: Mutex<HashMap<ProjectId, HashSet<SchemaName>>>,
 }
 
 /// Aggregate reactor state. The seq counter assigns each newly-
@@ -191,6 +198,7 @@ impl InMemoryCatalog {
             procedures: Mutex::new(HashMap::new()),
             project_storage_config: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
+            schemas: Mutex::new(HashMap::new()),
         }
     }
 
@@ -199,12 +207,22 @@ impl InMemoryCatalog {
         project: &ProjectId,
         table: &TableName,
     ) -> Result<Arc<Mutex<TableState>>> {
-        let key = (*project, table.clone());
+        // Back-compat helper: looks up the table in the `public` schema.
+        self.get_table_qualified(project, &QualifiedTableName::in_public(table.clone()))
+            .await
+    }
+
+    async fn get_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<Arc<Mutex<TableState>>> {
+        let key = (*project, qtable.clone());
         let guard = self.tables.lock().await;
         guard
             .get(&key)
             .cloned()
-            .ok_or_else(|| BasinError::not_found(format!("{project}/{table}")))
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{qtable}")))
     }
 
     fn build_metadata(project: &ProjectId, table: &TableName, state: &TableState) -> TableMetadata {
@@ -245,6 +263,14 @@ impl Catalog for InMemoryCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
         self.namespaces.lock().await.insert(*project);
+        // Pre-seed the `public` schema so `list_schemas` always returns at
+        // least `["public"]` for any project that has been initialized.
+        self.schemas
+            .lock()
+            .await
+            .entry(*project)
+            .or_insert_with(HashSet::new)
+            .insert(SchemaName::public());
         Ok(())
     }
 
@@ -255,38 +281,22 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         schema: &Schema,
     ) -> Result<TableMetadata> {
-        // Auto-create the namespace on first table; the dedicated
-        // `create_namespace` call is for callers that want the explicit step.
-        self.namespaces.lock().await.insert(*project);
-
-        let key = (*project, table.clone());
-        let mut tables = self.tables.lock().await;
-        if tables.contains_key(&key) {
-            return Err(BasinError::catalog(format!(
-                "table {project}/{table} already exists"
-            )));
-        }
-        let state = TableState::genesis(Arc::new(schema.clone()));
-        let meta = Self::build_metadata(project, table, &state);
-        tables.insert(key, Arc::new(Mutex::new(state)));
-        Ok(meta)
+        // Old API: always creates in the public schema.
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.create_table_qualified(project, &qtable, Arc::new(schema.clone()))
+            .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata> {
-        let state = self.get_table(project, table).await?;
-        let guard = state.lock().await;
-        Ok(Self::build_metadata(project, table, &guard))
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.load_table_qualified(project, &qtable).await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
-        let key = (*project, table.clone());
-        let mut tables = self.tables.lock().await;
-        tables
-            .remove(&key)
-            .ok_or_else(|| BasinError::not_found(format!("{project}/{table}")))?;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.drop_table_qualified(project, &qtable).await
     }
 
     #[instrument(skip(self), fields(project = %project, old = %old, new = %new))]
@@ -296,37 +306,20 @@ impl Catalog for InMemoryCatalog {
         old: &TableName,
         new: &TableName,
     ) -> Result<()> {
-        let old_key = (*project, old.clone());
-        let new_key = (*project, new.clone());
-        let mut tables = self.tables.lock().await;
-        if tables.contains_key(&new_key) {
-            return Err(BasinError::catalog(format!(
-                "rename_table: target {project}/{new} already exists"
-            )));
-        }
-        // Look up the old entry and *alias* the new key to its Arc.
-        // Two keys end up pointing at the same TableState so the
-        // engine's session-level refresh_table call — which the
-        // caller may issue against either name — finds a live row
-        // either way. This is the v0.1 trade-off: the old name
-        // stays as a synonym until an explicit DROP. v0.2 will
-        // tombstone the old key via a separate alias map so the
-        // legacy name disappears from `SHOW TABLES`.
-        let entry = tables
-            .get(&old_key)
-            .cloned()
-            .ok_or_else(|| BasinError::not_found(format!("{project}/{old}")))?;
-        tables.insert(new_key, entry);
-        Ok(())
+        let qold = QualifiedTableName::in_public(old.clone());
+        let qnew = QualifiedTableName::in_public(new.clone());
+        self.rename_table_qualified(project, &qold, &qnew).await
     }
 
     #[instrument(skip(self), fields(project = %project))]
     async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>> {
+        // Back-compat: return only the bare table names from the public schema.
         let tables = self.tables.lock().await;
+        let public = SchemaName::public();
         let mut out: Vec<TableName> = tables
             .keys()
-            .filter(|(t, _)| t == project)
-            .map(|(_, name)| name.clone())
+            .filter(|(t, qtable)| t == project && qtable.schema == public)
+            .map(|(_, qtable)| qtable.name.clone())
             .collect();
         out.sort();
         Ok(out)
@@ -355,6 +348,8 @@ impl Catalog for InMemoryCatalog {
         procs.retain(|(t, _), _| t != project);
         let mut storage_cfg = self.project_storage_config.lock().await;
         storage_cfg.remove(project);
+        let mut schemas = self.schemas.lock().await;
+        schemas.remove(project);
         Ok(())
     }
 
@@ -369,7 +364,7 @@ impl Catalog for InMemoryCatalog {
             let tables = self.tables.lock().await;
             tables
                 .iter()
-                .filter(|((t, _), _)| t == project)
+                .filter(|((proj, _), _)| proj == project)
                 .map(|(_, state)| state.clone())
                 .collect()
         };
@@ -399,39 +394,9 @@ impl Catalog for InMemoryCatalog {
         expected_snapshot: SnapshotId,
         files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-
-        if state.current != expected_snapshot {
-            return Err(BasinError::CommitConflict(format!(
-                "{project}/{table}: expected snapshot {expected_snapshot}, current is {}",
-                state.current
-            )));
-        }
-
-        let added_files = files.len() as u64;
-        let added_rows: u64 = files.iter().map(|f| f.row_count).sum();
-        let added_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
-
-        let parent = state.current;
-        let new_id = parent.next();
-        let snap = Snapshot {
-            id: new_id,
-            parent: Some(parent),
-            committed_at: Utc::now(),
-            data_files: files,
-            removed_paths: vec![],
-            summary: SnapshotSummary {
-                operation: SnapshotOperation::Append,
-                added_files,
-                added_rows,
-                added_bytes,
-                removed_files: 0,
-            },
-        };
-        state.snapshots.push(snap);
-        state.current = new_id;
-        Ok(Self::build_metadata(project, table, &state))
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.append_data_files_qualified(project, &qtable, expected_snapshot, files)
+            .await
     }
 
     #[instrument(
@@ -452,53 +417,21 @@ impl Catalog for InMemoryCatalog {
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-
-        if state.current != expected_snapshot {
-            return Err(BasinError::CommitConflict(format!(
-                "{project}/{table}: expected snapshot {expected_snapshot}, current is {}",
-                state.current
-            )));
-        }
-
-        let parent = state.current;
-        let added_files_count = added_files.len() as u64;
-        let added_rows: u64 = added_files.iter().map(|f| f.row_count).sum();
-        let added_bytes: u64 = added_files.iter().map(|f| f.size_bytes).sum();
-        let removed_files_count = removed_paths.len() as u64;
-
-        // Per-snapshot data_files records the delta (new files written by this
-        // commit). removed_paths records the object-store paths that were
-        // logically removed so live_data_files() can reconstruct the exact live
-        // set at any snapshot without a directory scan. The engine physically
-        // deletes these files; the catalog keeps the path list for PITR
-        // correctness.
-        let new_id = parent.next();
-        let snap = Snapshot {
-            id: new_id,
-            parent: Some(parent),
-            committed_at: Utc::now(),
-            data_files: added_files,
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.replace_data_files_qualified(
+            project,
+            &qtable,
+            expected_snapshot,
             removed_paths,
-            summary: SnapshotSummary {
-                operation: SnapshotOperation::Replace,
-                added_files: added_files_count,
-                added_rows,
-                added_bytes,
-                removed_files: removed_files_count,
-            },
-        };
-        state.snapshots.push(snap);
-        state.current = new_id;
-        Ok(Self::build_metadata(project, table, &state))
+            added_files,
+        )
+        .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn list_snapshots(&self, project: &ProjectId, table: &TableName) -> Result<Vec<Snapshot>> {
-        let state = self.get_table(project, table).await?;
-        let guard = state.lock().await;
-        Ok(guard.snapshots.clone())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.list_snapshots_qualified(project, &qtable).await
     }
 
     #[instrument(skip(self), fields(project = %project, src = %src_table, dst = %dst_table))]
@@ -508,46 +441,9 @@ impl Catalog for InMemoryCatalog {
         src_table: &TableName,
         dst_table: &TableName,
     ) -> Result<TableMetadata> {
-        // Read source state then drop the per-table guard before grabbing
-        // the table-map guard for the insert.
-        let cloned_state = {
-            let src_arc = self.get_table(project, src_table).await?;
-            let src = src_arc.lock().await;
-            TableState {
-                schema: src.schema.clone(),
-                current: src.current,
-                snapshots: src.snapshots.clone(),
-                partition_spec: src.partition_spec.clone(),
-                rls_enabled: src.rls_enabled,
-                policies: src.policies.clone(),
-                cold_after_seconds: src.cold_after_seconds,
-                cold_age_column: src.cold_age_column.clone(),
-                bloom_filter_columns: src.bloom_filter_columns.clone(),
-                row_group_rows: src.row_group_rows,
-                continuous_aggregate: src.continuous_aggregate.clone(),
-                cluster_columns: src.cluster_columns.clone(),
-                home_region: src.home_region.clone(),
-                indexes: src.indexes.clone(),
-                pk_columns: src.pk_columns.clone(),
-                check_constraints: src.check_constraints.clone(),
-                foreign_keys: src.foreign_keys.clone(),
-                unique_constraints: src.unique_constraints.clone(),
-            }
-        };
-
-        let dst_key = (*project, dst_table.clone());
-        let mut tables = self.tables.lock().await;
-        if tables.contains_key(&dst_key) {
-            return Err(BasinError::catalog(format!(
-                "fork_table: {project}/{dst_table} already exists",
-            )));
-        }
-        let dst_arc = Arc::new(Mutex::new(cloned_state));
-        tables.insert(dst_key, dst_arc.clone());
-        drop(tables);
-
-        let dst = dst_arc.lock().await;
-        Ok(Self::build_metadata(project, dst_table, &dst))
+        let qsrc = QualifiedTableName::in_public(src_table.clone());
+        let qdst = QualifiedTableName::in_public(dst_table.clone());
+        self.fork_table_qualified(project, &qsrc, &qdst).await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table, snapshot = %snapshot_id))]
@@ -557,21 +453,9 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         snapshot_id: SnapshotId,
     ) -> Result<TableMetadata> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-
-        if !state.snapshots.iter().any(|s| s.id == snapshot_id) {
-            return Err(BasinError::not_found(format!(
-                "{project}/{table}: snapshot {snapshot_id} not in history",
-            )));
-        }
-
-        // Destructive truncate: drop every snapshot strictly newer than
-        // the target. v0.2 will add a non-destructive branch variant.
-        state.snapshots.retain(|s| s.id <= snapshot_id);
-        state.current = snapshot_id;
-
-        Ok(Self::build_metadata(project, table, &state))
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.rollback_to_snapshot_qualified(project, &qtable, snapshot_id)
+            .await
     }
 
     #[instrument(skip(self, spec), fields(project = %project, table = %table))]
@@ -581,10 +465,8 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         spec: PartitionSpec,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.partition_spec = spec;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_partition_spec_qualified(project, &qtable, spec).await
     }
 
     #[instrument(skip(self, policies), fields(project = %project, table = %table))]
@@ -595,11 +477,8 @@ impl Catalog for InMemoryCatalog {
         rls_enabled: bool,
         policies: Vec<Policy>,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.rls_enabled = rls_enabled;
-        state.policies = policies;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_rls_state_qualified(project, &qtable, rls_enabled, policies).await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -610,11 +489,8 @@ impl Catalog for InMemoryCatalog {
         cold_after_seconds: Option<u64>,
         cold_age_column: Option<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.cold_after_seconds = cold_after_seconds;
-        state.cold_age_column = cold_age_column;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_tier_policy_qualified(project, &qtable, cold_after_seconds, cold_age_column).await
     }
 
     #[instrument(skip(self, columns), fields(project = %project, table = %table, n = columns.len()))]
@@ -624,10 +500,8 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.bloom_filter_columns = columns;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_bloom_filter_columns_qualified(project, &qtable, columns).await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -637,18 +511,14 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         rows: Option<usize>,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.row_group_rows = rows;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_row_group_rows_qualified(project, &qtable, rows).await
     }
 
     #[instrument(skip(self, schema), fields(project = %project, table = %table))]
     async fn set_schema(&self, project: &ProjectId, table: &TableName, schema: Schema) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.schema = Arc::new(schema);
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_schema_qualified(project, &qtable, schema).await
     }
 
     #[instrument(skip(self, def), fields(project = %project, table = %table))]
@@ -658,10 +528,8 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         def: Option<CvDef>,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.continuous_aggregate = def;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_continuous_aggregate_qualified(project, &qtable, def).await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -671,10 +539,8 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.cluster_columns = columns;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_cluster_columns_qualified(project, &qtable, columns).await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -684,10 +550,8 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         region: Option<String>,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        state.home_region = region;
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.set_home_region_qualified(project, &qtable, region).await
     }
 
     #[instrument(skip(self, check_constraints, foreign_keys), fields(project = %project, table = %table))]
@@ -720,6 +584,7 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
+
     #[instrument(skip(self, columns), fields(project = %project, table = %table, name = %name))]
     async fn create_index(
         &self,
@@ -729,49 +594,15 @@ impl Catalog for InMemoryCatalog {
         columns: &[String],
         if_not_exists: bool,
     ) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        if columns.is_empty() {
-            return Err(BasinError::InvalidSchema(
-                "create_index: column list cannot be empty".into(),
-            ));
-        }
-        // Reject indexes on unknown columns up front: a lookup against a
-        // missing column would silently always return empty results.
-        for col in columns {
-            if state.schema.field_with_name(col).is_err() {
-                return Err(BasinError::InvalidSchema(format!(
-                    "create_index: column {col:?} not in table {project}/{table} schema"
-                )));
-            }
-        }
-        if state.indexes.iter().any(|i| i.name == name) {
-            if if_not_exists {
-                return Ok(());
-            }
-            return Err(BasinError::catalog(format!(
-                "create_index: {project}/{table}: index {name:?} already exists"
-            )));
-        }
-        state.indexes.push(SecondaryIndex {
-            name: name.to_string(),
-            columns: columns.to_vec(),
-        });
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.create_index_qualified(project, &qtable, name, columns, if_not_exists)
+            .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
     async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
-        let state_arc = self.get_table(project, table).await?;
-        let mut state = state_arc.lock().await;
-        let before = state.indexes.len();
-        state.indexes.retain(|i| i.name != name);
-        if state.indexes.len() == before {
-            return Err(BasinError::not_found(format!(
-                "{project}/{table}: index {name:?}"
-            )));
-        }
-        Ok(())
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.drop_index_qualified(project, &qtable, name).await
     }
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
@@ -1254,6 +1085,517 @@ impl Catalog for InMemoryCatalog {
             .map(|(_, v)| v.clone())
             .collect()
     }
+
+    // -----------------------------------------------------------------------
+    // Phase A.2 overrides: schema-qualified operations
+    //
+    // InMemoryCatalog provides real multi-schema semantics. All `*_qualified`
+    // methods operate directly on the `(ProjectId, QualifiedTableName)` key,
+    // while the old `*_table` / `*_data_files` methods are kept as thin
+    // wrappers that default to the public schema (done above in the old-method
+    // overrides).
+    // -----------------------------------------------------------------------
+
+    async fn create_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<TableMetadata> {
+        // Auto-create the namespace on first table; the dedicated
+        // `create_namespace` call is for callers that want the explicit step.
+        self.namespaces.lock().await.insert(*project);
+        // Ensure the schema exists in the schema-set. If it doesn't exist yet
+        // we auto-create it here (matches PG behaviour where schemas can be
+        // implicitly created by a `CREATE TABLE schema.t`).
+        self.schemas
+            .lock()
+            .await
+            .entry(*project)
+            .or_insert_with(HashSet::new)
+            .insert(qtable.schema.clone());
+
+        let key = (*project, qtable.clone());
+        let mut tables = self.tables.lock().await;
+        if tables.contains_key(&key) {
+            return Err(BasinError::catalog(format!(
+                "table {project}/{qtable} already exists"
+            )));
+        }
+        let state = TableState::genesis(schema);
+        let meta = Self::build_metadata(project, &qtable.name, &state);
+        tables.insert(key, Arc::new(Mutex::new(state)));
+        Ok(meta)
+    }
+
+    async fn load_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        let state = self.get_table_qualified(project, qtable).await?;
+        let guard = state.lock().await;
+        Ok(Self::build_metadata(project, &qtable.name, &guard))
+    }
+
+    async fn drop_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<()> {
+        let key = (*project, qtable.clone());
+        let mut tables = self.tables.lock().await;
+        tables
+            .remove(&key)
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{qtable}")))?;
+        Ok(())
+    }
+
+    async fn rename_table_qualified(
+        &self,
+        project: &ProjectId,
+        old: &QualifiedTableName,
+        new: &QualifiedTableName,
+    ) -> Result<()> {
+        let old_key = (*project, old.clone());
+        let new_key = (*project, new.clone());
+        let mut tables = self.tables.lock().await;
+        if tables.contains_key(&new_key) {
+            return Err(BasinError::catalog(format!(
+                "rename_table: target {project}/{new} already exists"
+            )));
+        }
+        // Look up the old entry and *alias* the new key to its Arc.
+        // v0.1 trade-off: the old name stays as a synonym until DROP.
+        let entry = tables
+            .get(&old_key)
+            .cloned()
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{old}")))?;
+        tables.insert(new_key, entry);
+        Ok(())
+    }
+
+    async fn list_tables_qualified(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<QualifiedTableName>> {
+        let tables = self.tables.lock().await;
+        let mut out: Vec<QualifiedTableName> = tables
+            .keys()
+            .filter(|(p, _)| p == project)
+            .map(|(_, qtable)| qtable.clone())
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn append_data_files_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        expected_snapshot: SnapshotId,
+        files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+
+        if state.current != expected_snapshot {
+            return Err(BasinError::CommitConflict(format!(
+                "{project}/{qtable}: expected snapshot {expected_snapshot}, current is {}",
+                state.current
+            )));
+        }
+
+        let added_files = files.len() as u64;
+        let added_rows: u64 = files.iter().map(|f| f.row_count).sum();
+        let added_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
+
+        let parent = state.current;
+        let new_id = parent.next();
+        let snap = Snapshot {
+            id: new_id,
+            parent: Some(parent),
+            committed_at: Utc::now(),
+            data_files: files,
+            removed_paths: vec![],
+            summary: SnapshotSummary {
+                operation: SnapshotOperation::Append,
+                added_files,
+                added_rows,
+                added_bytes,
+                removed_files: 0,
+            },
+        };
+        state.snapshots.push(snap);
+        state.current = new_id;
+        Ok(Self::build_metadata(project, &qtable.name, &state))
+    }
+
+    async fn replace_data_files_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+
+        if state.current != expected_snapshot {
+            return Err(BasinError::CommitConflict(format!(
+                "{project}/{qtable}: expected snapshot {expected_snapshot}, current is {}",
+                state.current
+            )));
+        }
+
+        let parent = state.current;
+        let added_files_count = added_files.len() as u64;
+        let added_rows: u64 = added_files.iter().map(|f| f.row_count).sum();
+        let added_bytes: u64 = added_files.iter().map(|f| f.size_bytes).sum();
+        let removed_files_count = removed_paths.len() as u64;
+
+        let new_id = parent.next();
+        let snap = Snapshot {
+            id: new_id,
+            parent: Some(parent),
+            committed_at: Utc::now(),
+            data_files: added_files,
+            removed_paths,
+            summary: SnapshotSummary {
+                operation: SnapshotOperation::Replace,
+                added_files: added_files_count,
+                added_rows,
+                added_bytes,
+                removed_files: removed_files_count,
+            },
+        };
+        state.snapshots.push(snap);
+        state.current = new_id;
+        Ok(Self::build_metadata(project, &qtable.name, &state))
+    }
+
+    async fn list_snapshots_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<Vec<Snapshot>> {
+        let state = self.get_table_qualified(project, qtable).await?;
+        let guard = state.lock().await;
+        Ok(guard.snapshots.clone())
+    }
+
+    async fn fork_table_qualified(
+        &self,
+        project: &ProjectId,
+        src: &QualifiedTableName,
+        dst: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        // Read source state then drop the per-table guard before grabbing
+        // the table-map guard for the insert.
+        let cloned_state = {
+            let src_arc = self.get_table_qualified(project, src).await?;
+            let s = src_arc.lock().await;
+            TableState {
+                schema: s.schema.clone(),
+                current: s.current,
+                snapshots: s.snapshots.clone(),
+                partition_spec: s.partition_spec.clone(),
+                rls_enabled: s.rls_enabled,
+                policies: s.policies.clone(),
+                cold_after_seconds: s.cold_after_seconds,
+                cold_age_column: s.cold_age_column.clone(),
+                bloom_filter_columns: s.bloom_filter_columns.clone(),
+                row_group_rows: s.row_group_rows,
+                continuous_aggregate: s.continuous_aggregate.clone(),
+                cluster_columns: s.cluster_columns.clone(),
+                home_region: s.home_region.clone(),
+                indexes: s.indexes.clone(),
+                pk_columns: s.pk_columns.clone(),
+                check_constraints: s.check_constraints.clone(),
+                foreign_keys: s.foreign_keys.clone(),
+                unique_constraints: s.unique_constraints.clone(),
+            }
+        };
+
+        let dst_key = (*project, dst.clone());
+        let mut tables = self.tables.lock().await;
+        if tables.contains_key(&dst_key) {
+            return Err(BasinError::catalog(format!(
+                "fork_table: {project}/{dst} already exists",
+            )));
+        }
+        let dst_arc = Arc::new(Mutex::new(cloned_state));
+        tables.insert(dst_key, dst_arc.clone());
+        drop(tables);
+
+        let dst_state = dst_arc.lock().await;
+        Ok(Self::build_metadata(project, &dst.name, &dst_state))
+    }
+
+    async fn rollback_to_snapshot_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        snapshot_id: SnapshotId,
+    ) -> Result<TableMetadata> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+
+        if !state.snapshots.iter().any(|s| s.id == snapshot_id) {
+            return Err(BasinError::not_found(format!(
+                "{project}/{qtable}: snapshot {snapshot_id} not in history",
+            )));
+        }
+
+        state.snapshots.retain(|s| s.id <= snapshot_id);
+        state.current = snapshot_id;
+
+        Ok(Self::build_metadata(project, &qtable.name, &state))
+    }
+
+    async fn set_partition_spec_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        spec: PartitionSpec,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.partition_spec = spec;
+        Ok(())
+    }
+
+    async fn set_rls_state_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        rls_enabled: bool,
+        policies: Vec<Policy>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.rls_enabled = rls_enabled;
+        state.policies = policies;
+        Ok(())
+    }
+
+    async fn set_tier_policy_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        cold_after_seconds: Option<u64>,
+        cold_age_column: Option<String>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.cold_after_seconds = cold_after_seconds;
+        state.cold_age_column = cold_age_column;
+        Ok(())
+    }
+
+    async fn set_bloom_filter_columns_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.bloom_filter_columns = columns;
+        Ok(())
+    }
+
+    async fn set_row_group_rows_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        rows: Option<usize>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.row_group_rows = rows;
+        Ok(())
+    }
+
+    async fn set_schema_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: arrow_schema::Schema,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.schema = Arc::new(schema);
+        Ok(())
+    }
+
+    async fn set_continuous_aggregate_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        def: Option<crate::metadata::CvDef>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.continuous_aggregate = def;
+        Ok(())
+    }
+
+    async fn set_cluster_columns_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.cluster_columns = columns;
+        Ok(())
+    }
+
+    async fn set_home_region_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        region: Option<String>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.home_region = region;
+        Ok(())
+    }
+
+    async fn create_index_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        if columns.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "create_index: column list cannot be empty".into(),
+            ));
+        }
+        for col in columns {
+            if state.schema.field_with_name(col).is_err() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "create_index: column {col:?} not in table {project}/{qtable} schema"
+                )));
+            }
+        }
+        if state.indexes.iter().any(|i| i.name == name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(BasinError::catalog(format!(
+                "create_index: {project}/{qtable}: index {name:?} already exists"
+            )));
+        }
+        state.indexes.push(SecondaryIndex {
+            name: name.to_string(),
+            columns: columns.to_vec(),
+        });
+        Ok(())
+    }
+
+    async fn drop_index_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        let before = state.indexes.len();
+        state.indexes.retain(|i| i.name != name);
+        if state.indexes.len() == before {
+            return Err(BasinError::not_found(format!(
+                "{project}/{qtable}: index {name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema-level operations
+    // -----------------------------------------------------------------------
+
+    async fn list_schemas(&self, project: &ProjectId) -> Result<Vec<SchemaName>> {
+        let schemas = self.schemas.lock().await;
+        let mut out: Vec<SchemaName> = schemas
+            .get(project)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn create_schema(&self, project: &ProjectId, schema: &SchemaName) -> Result<()> {
+        self.schemas
+            .lock()
+            .await
+            .entry(*project)
+            .or_insert_with(HashSet::new)
+            .insert(schema.clone());
+        Ok(())
+    }
+
+    async fn drop_schema(
+        &self,
+        project: &ProjectId,
+        schema: &SchemaName,
+        cascade: bool,
+    ) -> Result<()> {
+        if schema == &SchemaName::public() {
+            return Err(BasinError::catalog("cannot drop the public schema"));
+        }
+        // Check whether the schema exists at all.
+        {
+            let schemas = self.schemas.lock().await;
+            if !schemas
+                .get(project)
+                .map(|s| s.contains(schema))
+                .unwrap_or(false)
+            {
+                return Err(BasinError::not_found(format!(
+                    "{project}: schema {schema:?}"
+                )));
+            }
+        }
+        // Collect tables in this schema.
+        let tables_in_schema: Vec<QualifiedTableName> = {
+            let tables = self.tables.lock().await;
+            tables
+                .keys()
+                .filter(|(p, qt)| p == project && &qt.schema == schema)
+                .map(|(_, qt)| qt.clone())
+                .collect()
+        };
+        if !cascade && !tables_in_schema.is_empty() {
+            return Err(BasinError::catalog(format!(
+                "cannot drop schema {schema}: {} table(s) still exist (use CASCADE to drop them)",
+                tables_in_schema.len()
+            )));
+        }
+        // CASCADE: drop all tables.
+        if cascade {
+            let mut tables = self.tables.lock().await;
+            for qt in &tables_in_schema {
+                tables.remove(&(*project, qt.clone()));
+            }
+        }
+        // Remove the schema itself.
+        let mut schemas = self.schemas.lock().await;
+        if let Some(set) = schemas.get_mut(project) {
+            set.remove(schema);
+        }
+        Ok(())
+    }
 }
 
 impl InMemoryCatalog {
@@ -1276,20 +1618,20 @@ impl InMemoryCatalog {
         };
         // Snapshot the per-table handles so we don't hold the
         // top-level table-map lock while inspecting each one's schema.
-        let handles: Vec<(TableName, Arc<Mutex<TableState>>)> = {
+        let handles: Vec<(QualifiedTableName, Arc<Mutex<TableState>>)> = {
             let tables = self.tables.lock().await;
             tables
                 .iter()
                 .filter(|((t, _), _)| t == project)
-                .map(|((_, name), state)| (name.clone(), state.clone()))
+                .map(|((_, qtable), state)| (qtable.clone(), state.clone()))
                 .collect()
         };
         let mut out = Vec::new();
-        for (table, state) in handles {
+        for (qtable, state) in handles {
             let guard = state.lock().await;
             for f in guard.schema.fields() {
                 if f.metadata().get(key).map(|s| s.as_str()) == Some(type_name) {
-                    out.push(format!("{table}.{}", f.name()));
+                    out.push(format!("{qtable}.{}", f.name()));
                 }
             }
         }
@@ -1365,7 +1707,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{BasinError, TableName, ProjectId};
+    use basin_common::{BasinError, QualifiedTableName, SchemaName, TableName, ProjectId};
 
     use super::*;
 
@@ -2324,5 +2666,355 @@ mod tests {
         paths.sort();
         // old1 removed, new1 added, old2 retained.
         assert_eq!(paths, vec!["new1.parquet", "old2.parquet"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase A.2 (#118): multi-schema isolation tests
+    // -----------------------------------------------------------------------
+
+    fn qtable(schema: &str, table: &str) -> QualifiedTableName {
+        QualifiedTableName::new(
+            SchemaName::new(schema).unwrap(),
+            TableName::new(table).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn schema_qualified_create_and_load() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let qt = qtable("analytics", "events");
+        let meta = cat
+            .create_table_qualified(&p, &qt, Arc::new(schema()))
+            .await
+            .unwrap();
+        assert_eq!(meta.table, qt.name);
+
+        let loaded = cat.load_table_qualified(&p, &qt).await.unwrap();
+        assert_eq!(loaded.table, qt.name);
+    }
+
+    #[tokio::test]
+    async fn same_table_name_different_schemas_do_not_collide() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let pub_qt = QualifiedTableName::in_public(TableName::new("orders").unwrap());
+        let priv_qt = qtable("private", "orders");
+
+        cat.create_table_qualified(&p, &pub_qt, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&p, &priv_qt, Arc::new(schema()))
+            .await
+            .unwrap();
+
+        // They are independent entries.
+        let pub_meta = cat.load_table_qualified(&p, &pub_qt).await.unwrap();
+        let priv_meta = cat.load_table_qualified(&p, &priv_qt).await.unwrap();
+        assert_eq!(pub_meta.table, pub_qt.name);
+        assert_eq!(priv_meta.table, priv_qt.name);
+
+        // Append to public does not affect private.
+        cat.append_data_files_qualified(
+            &p,
+            &pub_qt,
+            SnapshotId::GENESIS,
+            vec![file("data.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+        let priv_reloaded = cat.load_table_qualified(&p, &priv_qt).await.unwrap();
+        assert_eq!(priv_reloaded.current_snapshot, SnapshotId::GENESIS);
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_qualified_table_returns_catalog_error() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let qt = qtable("reporting", "summary");
+
+        cat.create_table_qualified(&p, &qt, Arc::new(schema()))
+            .await
+            .unwrap();
+        let err = cat
+            .create_table_qualified(&p, &qt, Arc::new(schema()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn drop_table_qualified_removes_only_target_schema() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+
+        let pub_qt = QualifiedTableName::in_public(TableName::new("logs").unwrap());
+        let other_qt = qtable("other", "logs");
+
+        cat.create_table_qualified(&p, &pub_qt, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&p, &other_qt, Arc::new(schema()))
+            .await
+            .unwrap();
+
+        cat.drop_table_qualified(&p, &pub_qt).await.unwrap();
+
+        // public.logs gone
+        let err = cat.load_table_qualified(&p, &pub_qt).await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+
+        // other.logs still there
+        cat.load_table_qualified(&p, &other_qt).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_tables_qualified_returns_all_schemas() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+
+        let qt1 = qtable("alpha", "t1");
+        let qt2 = qtable("beta", "t2");
+        let qt3 = QualifiedTableName::in_public(TableName::new("t3").unwrap());
+
+        cat.create_table_qualified(&p, &qt1, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&p, &qt2, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&p, &qt3, Arc::new(schema()))
+            .await
+            .unwrap();
+
+        let mut all = cat.list_tables_qualified(&p).await.unwrap();
+        all.sort();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().any(|q| q.schema.as_str() == "alpha"));
+        assert!(all.iter().any(|q| q.schema.as_str() == "beta"));
+        assert!(all.iter().any(|q| q.schema.as_str() == "public"));
+    }
+
+    #[tokio::test]
+    async fn list_tables_back_compat_returns_only_public() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+
+        let pub_qt = QualifiedTableName::in_public(TableName::new("public_table").unwrap());
+        let priv_qt = qtable("private", "private_table");
+
+        cat.create_table_qualified(&p, &pub_qt, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&p, &priv_qt, Arc::new(schema()))
+            .await
+            .unwrap();
+
+        // Old list_tables returns only public-schema tables.
+        let names = cat.list_tables(&p).await.unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_str(), "public_table");
+    }
+
+    #[tokio::test]
+    async fn list_schemas_returns_public_by_default() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let schemas = cat.list_schemas(&p).await.unwrap();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].as_str(), "public");
+    }
+
+    #[tokio::test]
+    async fn create_and_list_schemas() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        cat.create_schema(&p, &SchemaName::new("analytics").unwrap())
+            .await
+            .unwrap();
+        cat.create_schema(&p, &SchemaName::new("staging").unwrap())
+            .await
+            .unwrap();
+
+        let mut schemas = cat.list_schemas(&p).await.unwrap();
+        schemas.sort();
+        let names: Vec<&str> = schemas.iter().map(|s| s.as_str()).collect();
+        assert!(names.contains(&"analytics"));
+        assert!(names.contains(&"staging"));
+        assert!(names.contains(&"public"));
+    }
+
+    #[tokio::test]
+    async fn drop_schema_restrict_fails_when_tables_exist() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+        cat.create_schema(&p, &SchemaName::new("reporting").unwrap())
+            .await
+            .unwrap();
+
+        let qt = qtable("reporting", "summary");
+        cat.create_table_qualified(&p, &qt, Arc::new(schema()))
+            .await
+            .unwrap();
+
+        let err = cat
+            .drop_schema(&p, &SchemaName::new("reporting").unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn drop_schema_cascade_removes_tables() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+        cat.create_schema(&p, &SchemaName::new("staging").unwrap())
+            .await
+            .unwrap();
+
+        let qt1 = qtable("staging", "t1");
+        let qt2 = qtable("staging", "t2");
+        cat.create_table_qualified(&p, &qt1, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&p, &qt2, Arc::new(schema()))
+            .await
+            .unwrap();
+
+        cat.drop_schema(&p, &SchemaName::new("staging").unwrap(), true)
+            .await
+            .unwrap();
+
+        // Both tables gone.
+        assert!(matches!(
+            cat.load_table_qualified(&p, &qt1).await.unwrap_err(),
+            BasinError::NotFound(_)
+        ));
+        assert!(matches!(
+            cat.load_table_qualified(&p, &qt2).await.unwrap_err(),
+            BasinError::NotFound(_)
+        ));
+
+        // Schema itself gone.
+        let schemas = cat.list_schemas(&p).await.unwrap();
+        assert!(!schemas.iter().any(|s| s.as_str() == "staging"));
+    }
+
+    #[tokio::test]
+    async fn drop_public_schema_is_rejected() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let err = cat
+            .drop_schema(&p, &SchemaName::public(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::Catalog(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn drop_nonexistent_schema_returns_not_found() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let err = cat
+            .drop_schema(&p, &SchemaName::new("ghost").unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rename_table_qualified_across_schemas() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+
+        let src = QualifiedTableName::in_public(TableName::new("orders").unwrap());
+        let dst = qtable("archive", "old_orders");
+
+        cat.create_table_qualified(&p, &src, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.rename_table_qualified(&p, &src, &dst).await.unwrap();
+
+        // dst accessible (aliased to same state)
+        cat.load_table_qualified(&p, &dst).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_table_qualified_cross_schema() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+
+        let src = QualifiedTableName::in_public(TableName::new("events").unwrap());
+        let dst = qtable("mirror", "events");
+
+        cat.create_table_qualified(&p, &src, Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.append_data_files_qualified(
+            &p,
+            &src,
+            SnapshotId::GENESIS,
+            vec![file("e.parquet", 5, 50)],
+        )
+        .await
+        .unwrap();
+
+        let dst_meta = cat.fork_table_qualified(&p, &src, &dst).await.unwrap();
+        // Fork inherits source snapshot state.
+        assert_eq!(dst_meta.current_snapshot, SnapshotId(1));
+
+        // Subsequent write to src does not affect dst.
+        cat.append_data_files_qualified(
+            &p,
+            &src,
+            SnapshotId(1),
+            vec![file("e2.parquet", 3, 30)],
+        )
+        .await
+        .unwrap();
+        let dst_reloaded = cat.load_table_qualified(&p, &dst).await.unwrap();
+        assert_eq!(dst_reloaded.current_snapshot, SnapshotId(1));
+    }
+
+    #[tokio::test]
+    async fn old_api_still_works_after_qualified_create() {
+        // Regression: old `create_table` / `load_table` / `drop_table` must
+        // continue to work against the public schema even after the internal
+        // storage migrated to QualifiedTableName keys.
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let tbl = TableName::new("legacy").unwrap();
+
+        cat.create_namespace(&p).await.unwrap();
+        cat.create_table(&p, &tbl, &schema()).await.unwrap();
+        let meta = cat.load_table(&p, &tbl).await.unwrap();
+        assert_eq!(meta.table, tbl);
+        cat.append_data_files(
+            &p,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("l.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
+        cat.drop_table(&p, &tbl).await.unwrap();
+        assert!(matches!(
+            cat.load_table(&p, &tbl).await.unwrap_err(),
+            BasinError::NotFound(_)
+        ));
     }
 }

@@ -40,8 +40,10 @@ mod snapshot;
 mod project_storage_config;
 mod views;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use basin_common::{ChangeOp, Result, TableName, ProjectId};
+use basin_common::{ChangeOp, QualifiedTableName, Result, SchemaName, TableName, ProjectId};
 
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
@@ -628,6 +630,438 @@ pub trait Catalog: Send + Sync {
         let _ = (project, table, name);
         Err(basin_common::BasinError::Internal(
             "drop_index not implemented for this catalog backend".into(),
+        ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase A.2 (#116 / #118): schema-qualified API
+    //
+    // BRIDGING STRATEGY (chosen: "default-impl wrappers on new methods"):
+    //   - Old `*_table` / `*_data_files` / etc. methods are KEPT as required
+    //     methods so PostgresCatalog (which implements them today) continues to
+    //     compile without changes.
+    //   - New `*_qualified` methods have DEFAULT implementations that delegate
+    //     to the old method for the `public` schema, and return
+    //     `FeatureNotSupported` for any other schema. This means:
+    //       * PostgresCatalog inherits the defaults — works for public schema,
+    //         honest error for non-public. #119 will override them properly.
+    //       * InMemoryCatalog OVERRIDES every `*_qualified` method with a real
+    //         schema-aware implementation (its internal storage is keyed by
+    //         `QualifiedTableName`).
+    //       * Downstream callers (basin-engine, basin-storage) that currently
+    //         use the old `&TableName` API continue to compile unchanged; they
+    //         can migrate to `*_qualified` in future phases (#120-#122).
+    // -----------------------------------------------------------------------
+
+    /// Schema-qualified variant of [`Catalog::create_table`].
+    ///
+    /// Creates a new empty table inside the given schema. The default
+    /// implementation forwards to the old `create_table` for the `public`
+    /// schema and returns [`basin_common::BasinError::FeatureNotSupported`] for
+    /// any other schema (honest error until #119 lands the Postgres impl).
+    async fn create_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<TableMetadata> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.create_table(project, &qtable.name, schema.as_ref()).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::load_table`].
+    async fn load_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.load_table(project, &qtable.name).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::drop_table`].
+    async fn drop_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.drop_table(project, &qtable.name).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::rename_table`].
+    async fn rename_table_qualified(
+        &self,
+        project: &ProjectId,
+        old: &QualifiedTableName,
+        new: &QualifiedTableName,
+    ) -> Result<()> {
+        if old.schema != SchemaName::public() || new.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl"
+            )));
+        }
+        self.rename_table(project, &old.name, &new.name).await
+    }
+
+    /// List all tables across all schemas for `project`. Returns
+    /// [`QualifiedTableName`] entries. The old [`Catalog::list_tables`] method
+    /// continues to return only public-schema tables (for back-compat). Use
+    /// this method when schema-aware enumeration is needed.
+    async fn list_tables_qualified(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<QualifiedTableName>> {
+        // Default: wrap every TableName from list_tables as public-schema.
+        let names = self.list_tables(project).await?;
+        Ok(names
+            .into_iter()
+            .map(QualifiedTableName::in_public)
+            .collect())
+    }
+
+    /// Schema-qualified variant of [`Catalog::append_data_files`].
+    async fn append_data_files_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        expected_snapshot: SnapshotId,
+        files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.append_data_files(project, &qtable.name, expected_snapshot, files)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::replace_data_files`].
+    async fn replace_data_files_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.replace_data_files(
+            project,
+            &qtable.name,
+            expected_snapshot,
+            removed_paths,
+            added_files,
+        )
+        .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::list_snapshots`].
+    async fn list_snapshots_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<Vec<Snapshot>> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.list_snapshots(project, &qtable.name).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::fork_table`].
+    async fn fork_table_qualified(
+        &self,
+        project: &ProjectId,
+        src: &QualifiedTableName,
+        dst: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        if src.schema != SchemaName::public() || dst.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl"
+            )));
+        }
+        self.fork_table(project, &src.name, &dst.name).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::rollback_to_snapshot`].
+    async fn rollback_to_snapshot_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        snapshot_id: SnapshotId,
+    ) -> Result<TableMetadata> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.rollback_to_snapshot(project, &qtable.name, snapshot_id)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_partition_spec`].
+    async fn set_partition_spec_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        spec: PartitionSpec,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_partition_spec(project, &qtable.name, spec).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_rls_state`].
+    async fn set_rls_state_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        rls_enabled: bool,
+        policies: Vec<Policy>,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_rls_state(project, &qtable.name, rls_enabled, policies)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_tier_policy`].
+    async fn set_tier_policy_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        cold_after_seconds: Option<u64>,
+        cold_age_column: Option<String>,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_tier_policy(project, &qtable.name, cold_after_seconds, cold_age_column)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_bloom_filter_columns`].
+    async fn set_bloom_filter_columns_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_bloom_filter_columns(project, &qtable.name, columns)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_row_group_rows`].
+    async fn set_row_group_rows_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        rows: Option<usize>,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_row_group_rows(project, &qtable.name, rows).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_schema`].
+    async fn set_schema_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: arrow_schema::Schema,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_schema(project, &qtable.name, schema).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_continuous_aggregate`].
+    async fn set_continuous_aggregate_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        def: Option<metadata::CvDef>,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_continuous_aggregate(project, &qtable.name, def)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_cluster_columns`].
+    async fn set_cluster_columns_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_cluster_columns(project, &qtable.name, columns)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::set_home_region`].
+    async fn set_home_region_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        region: Option<String>,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.set_home_region(project, &qtable.name, region).await
+    }
+
+    /// Schema-qualified variant of [`Catalog::create_index`].
+    async fn create_index_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.create_index(project, &qtable.name, name, columns, if_not_exists)
+            .await
+    }
+
+    /// Schema-qualified variant of [`Catalog::drop_index`].
+    async fn drop_index_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+    ) -> Result<()> {
+        if qtable.schema != SchemaName::public() {
+            return Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "non-public schema not yet supported in this catalog impl: {}",
+                qtable.schema
+            )));
+        }
+        self.drop_index(project, &qtable.name, name).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema-level operations (new in #118)
+    // -----------------------------------------------------------------------
+
+    /// List all schemas that exist for `project`. The `public` schema always
+    /// exists after the first `create_namespace` call. Default impl returns
+    /// `[SchemaName::public()]` so existing backends that don't support
+    /// multi-schema still satisfy callers that iterate schemas.
+    async fn list_schemas(&self, project: &ProjectId) -> Result<Vec<SchemaName>> {
+        let _ = project;
+        Ok(vec![SchemaName::public()])
+    }
+
+    /// Create a new schema under `project`. Idempotent — creating `public`
+    /// again is a no-op. Default impl returns
+    /// [`basin_common::BasinError::FeatureNotSupported`] for any schema other
+    /// than `public`; backends that support multi-schema override this.
+    async fn create_schema(
+        &self,
+        project: &ProjectId,
+        schema: &SchemaName,
+    ) -> Result<()> {
+        if schema == &SchemaName::public() {
+            return Ok(());
+        }
+        let _ = (project, schema);
+        Err(basin_common::BasinError::FeatureNotSupported(
+            "non-public schemas not yet supported in this catalog impl".into(),
+        ))
+    }
+
+    /// Drop a schema under `project`.
+    ///
+    /// `cascade = false` (RESTRICT): returns
+    /// [`basin_common::BasinError::Catalog`] if any tables remain in the schema.
+    /// `cascade = true`: drops all tables in the schema first.
+    ///
+    /// Dropping the `public` schema always returns
+    /// [`basin_common::BasinError::Catalog`] — the public schema is permanent.
+    ///
+    /// Default impl returns [`basin_common::BasinError::FeatureNotSupported`];
+    /// backends that support multi-schema override this.
+    async fn drop_schema(
+        &self,
+        project: &ProjectId,
+        schema: &SchemaName,
+        cascade: bool,
+    ) -> Result<()> {
+        let _ = (project, schema, cascade);
+        Err(basin_common::BasinError::FeatureNotSupported(
+            "non-public schemas not yet supported in this catalog impl".into(),
         ))
     }
 
