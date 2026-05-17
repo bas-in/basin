@@ -593,6 +593,7 @@ mod procedure_ddl;
 pub mod reactor_ddl;
 mod reactor_sink;
 mod range_udf;
+mod regex_udf;
 mod rls;
 mod schema_ddl;
 mod select_advanced;
