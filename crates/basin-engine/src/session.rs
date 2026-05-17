@@ -79,6 +79,7 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     crate::inet_udf::register_inet_udfs(&ctx);
     crate::datetime_more_udf::register_datetime_more_udfs(&ctx);
     crate::string_more_udf::register_string_more_udfs(&ctx);
+    crate::regex_udf::register_regex_udfs(&ctx);
     crate::datetime_extras::register_datetime_extras(&ctx);
     let state = ctx.state();
     StatelessUdfCache {

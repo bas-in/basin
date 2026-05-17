@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1779038407 (Unix epoch)
-SQL fragments tested: 697 total / 1929 green (across all three configurations).
+Last run: 1779054718 (Unix epoch)
+SQL fragments tested: 697 total / 1911 green (across all three configurations).
 
 ## Configurations
 
@@ -82,7 +82,7 @@ SQL fragments tested: 697 total / 1929 green (across all three configurations).
 | `CREATE MATERIALIZED VIEW mv AS SELECT * FROM t` | ✅ | ✅ | ✅ |  |
 | `REFRESH MATERIALIZED VIEW mv` | ✅ | ✅ | ✅ |  |
 | `DROP MATERIALIZED VIEW mv` | ✅ | ✅ | ✅ |  |
-| `CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
+| `CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fn()` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TRIGGER is not supported (SQLSTATE 0A000): Basi… |
 | `CREATE POLICY p ON t USING (id = 1)` | ✅ | ✅ | ✅ |  |
 | `DROP POLICY p ON t` | ✅ | ✅ | ✅ |  |
 | `COMMENT ON TABLE t IS 'x'` | ✅ | ✅ | ✅ |  |
@@ -101,11 +101,11 @@ SQL fragments tested: 697 total / 1929 green (across all three configurations).
 | `CREATE FOREIGN TABLE ft (id INT) SERVER myserver` | ✅ | ✅ | ✅ |  |
 | `ALTER VIEW v AS SELECT id FROM t` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: ALTER VIEW v AS SELECT id FROM t |
 | `CREATE OR REPLACE VIEW v AS SELECT id FROM t` | ✅ | ✅ | ✅ |  |
-| `DROP TRIGGER trg ON t` | ✅ | ✅ | ✅ |  |
-| `CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW WHEN (NEW.id <> OLD.id) EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
-| `CREATE TRIGGER trg INSTEAD OF DELETE ON vv FOR EACH ROW EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
-| `CREATE TRIGGER trg AFTER INSERT ON t REFERENCING NEW TABLE AS new_t FOR EACH STATEMENT EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
-| `CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn()` | ✅ | ✅ | ✅ |  |
+| `DROP TRIGGER trg ON t` | 🚫 | 🚫 | 🚫 | setup failed: feature not supported: CREATE TRIGGER is not supported (SQLSTAT… |
+| `CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW WHEN (NEW.id <> OLD.id) EXECUTE FUNCTION fn()` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TRIGGER is not supported (SQLSTATE 0A000): Basi… |
+| `CREATE TRIGGER trg INSTEAD OF DELETE ON vv FOR EACH ROW EXECUTE FUNCTION fn()` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TRIGGER is not supported (SQLSTATE 0A000): Basi… |
+| `CREATE TRIGGER trg AFTER INSERT ON t REFERENCING NEW TABLE AS new_t FOR EACH STATEMENT EXECUTE FUNCTION fn()` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE TRIGGER is not supported (SQLSTATE 0A000): Basi… |
+| `CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn()` | 🚫 | 🚫 | 🚫 | feature not supported: CREATE CONSTRAINT TRIGGER is not supported (SQLSTATE 0… |
 | `CREATE COLLATION my_collation (LOCALE = 'en-US')` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: an object type after CREAT… |
 
 ## DDL/Tables

@@ -36,34 +36,14 @@
 //!
 //! The `rewrite_substring_regex` function in this module converts the SQL
 //! syntax `SUBSTRING(x FROM 'regex')` to a plain function call
-//! `substring_regex(x, 'regex')`.  Two call sites must be added before the
-//! syntax sugar works end-to-end:
+//! `substring_regex(x, 'regex')`. Wiring is in place at two sites:
 //!
-//! ### 1. UDF registration — `crates/basin-engine/src/session.rs`
-//!
-//! In `build_stateless_udf_cache()` (around line 75), add:
-//! ```rust
-//! crate::regex_udf::register_regex_udfs(&ctx);
-//! ```
-//! The same line should also be added in the two per-session fallback
-//! registration blocks (around lines 1116 and 1137 where
-//! `register_range_udfs` is called a second and third time).
-//!
-//! ### 2. Pre-parse text rewrite — `crates/basin-engine/src/executor.rs`
-//!
-//! In `execute_select` (around line 650, after the `rewrite_range_casts`
-//! call), add:
-//! ```rust
-//! let rewritten = crate::regex_udf::rewrite_substring_regex(&rewritten);
-//! ```
-//! This converts `SUBSTRING(x FROM 'pat')` to `substring_regex(x, 'pat')`
-//! before sqlparser sees the SQL.  The built-in DataFusion `substring` UDF
-//! expects `(text, start_int, length_int)` and rejects `(text, regex_text)`,
-//! so the rewrite must happen at text level rather than post-parse.
-//!
-//! Until those two wiring lines land, the UDF is callable via its internal
-//! name `substring_regex(text, pattern)` and the matrix fragment
-//! `SELECT SUBSTRING('abcdef' FROM '[a-c]+')` stays 📜.
+//! - UDF registration: `register_regex_udfs` is called from
+//!   `session::build_stateless_udf_cache()`.
+//! - Pre-parse text rewrite: `rewrite_substring_regex` is applied in the
+//!   `executor.rs` rewrite chain (the built-in DataFusion `substring`
+//!   expects `(text, start_int, length_int)` and rejects
+//!   `(text, regex_text)`, so the rewrite must happen at text level).
 
 use std::any::Any;
 use std::sync::Arc;
