@@ -137,10 +137,12 @@ async fn txn_nested_savepoints_lifecycle() {
     // In auto-commit mode all inserts have already been committed individually.
     // ROLLBACK TO SAVEPOINT is accepted but does not undo prior auto-commits.
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-    // Auto-commit model: all 4 inserts are durable regardless of savepoint state.
+    // Real PG: ROLLBACK TO sp1 undoes rows 3 (inserted after SAVEPOINT sp1
+    // was captured). Row 4 was inserted AFTER the ROLLBACK TO sp1, so it
+    // survived. Only rows 1 (pre-sp1) and 4 (post-rollback-to) remain.
     assert_eq!(
-        n, 4,
-        "auto-commit model: all 4 rows must be visible; savepoint rollback is a no-op"
+        n, 2,
+        "real PG: ROLLBACK TO sp1 undoes rows 3 (after sp1); rows 1 and 4 survive"
     );
     println!("[txn] nested savepoints lifecycle: {n} rows");
 }
@@ -187,8 +189,8 @@ async fn txn_rollback_to_savepoint_then_continue() {
     sess.execute("COMMIT").await.expect("COMMIT");
 
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-    // Both inserts went through (auto-commit: rollback was no-op).
-    assert_eq!(n, 2, "session must be usable after ROLLBACK TO SAVEPOINT");
+    // Real PG: ROLLBACK TO SAVEPOINT sp_before undoes INSERT 10; only INSERT 20 survives.
+    assert_eq!(n, 1, "real PG: ROLLBACK TO sp_before undoes INSERT 10; only INSERT 20 survives");
 }
 
 /// COMMIT after ROLLBACK: COMMIT following a bare ROLLBACK must not error
@@ -243,11 +245,11 @@ async fn txn_abort_on_error_then_rollback() {
         .await
         .expect("ROLLBACK after error must not itself error");
 
-    // Auto-commit: the two successful inserts are already durable.
+    // Real PG: ROLLBACK after error undoes both prior inserts in the same txn.
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
     assert_eq!(
-        n, 2,
-        "auto-commit: the 2 successful inserts survive; the errored one never landed"
+        n, 0,
+        "real PG: ROLLBACK after error undoes both prior inserts (all 3 deferred; all rolled back)"
     );
     println!("[txn] abort-on-error then ROLLBACK: {n} rows");
 }

@@ -81,14 +81,30 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 return crate::truncate::exec_truncate(sess, &tree).await;
             }
 
+            // ── Aborted-state guard (SQLSTATE 25P02) ──────────────────────────
+            // When a statement failed inside an active transaction the session
+            // enters the "aborted" state.  Every subsequent statement except
+            // ROLLBACK (full or to-savepoint) is rejected until the client
+            // issues ROLLBACK to reset the session.
+            if crate::session::tx_is_aborted(&sess.state) {
+                // ROLLBACK and ROLLBACK TO SAVEPOINT are the only exit paths.
+                let is_rollback_kind = matches!(
+                    kind,
+                    crate::pg_ast::StmtKind::Rollback
+                );
+                if !is_rollback_kind {
+                    return Err(basin_common::BasinError::InvalidSchema(
+                        "ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)".into()
+                    ));
+                }
+            }
+
             // Transaction control — intercept before noop_accept so TxState
-            // is updated on every BEGIN / COMMIT / ROLLBACK. Behavior is still
-            // auto-commit (no DML path consults tx_state yet — Step 3+ of
-            // #83), but the flag and snapshot heads are now tracked.
+            // is updated on every BEGIN / COMMIT / ROLLBACK / SAVEPOINT.
             match kind {
                 crate::pg_ast::StmtKind::BeginTransaction => {
-                    // Snapshot the current catalog heads into TxState so a
-                    // future real ROLLBACK can restore them.
+                    // Snapshot the current catalog heads into TxState so that
+                    // ROLLBACK can restore them.
                     let current_snapshots = sess
                         .state
                         .snapshots
@@ -99,14 +115,138 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     return Ok(ExecResult::Empty { tag: "BEGIN".into() });
                 }
                 crate::pg_ast::StmtKind::Commit => {
-                    crate::session::tx_commit(&sess.state);
+                    // Flush pending files to the catalog (real COMMIT).
+                    let pending = crate::session::tx_commit(&sess.state);
+                    if !pending.is_empty() {
+                        for (table, files) in &pending {
+                            // Load the current snapshot id for this table.
+                            let snap = {
+                                let snaps = sess.state.snapshots.lock().await;
+                                snaps.get(table).copied().unwrap_or(basin_catalog::SnapshotId(0))
+                            };
+                            match commit_with_retry(sess, table, snap, files.clone()).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    // If catalog append fails, return error.
+                                    // The pending map was already drained from
+                                    // TxState; the session is now in a dirty
+                                    // state (files written but not catalogued).
+                                    // Best-effort: mark aborted — client must ROLLBACK.
+                                    crate::session::tx_set_aborted(&sess.state);
+                                    return Err(e);
+                                }
+                            }
+                            // Refresh the session's DataFusion context so
+                            // the committed files are visible via catalog.
+                            let _ = refresh_table(
+                                &sess.engine,
+                                &sess.project,
+                                &sess.ctx,
+                                &sess.state,
+                                table,
+                            ).await;
+                        }
+                    }
                     return Ok(ExecResult::Empty { tag: "COMMIT".into() });
                 }
                 crate::pg_ast::StmtKind::Rollback => {
-                    crate::session::tx_rollback(&sess.state);
-                    return Ok(ExecResult::Empty {
-                        tag: "ROLLBACK".into(),
-                    });
+                    // Distinguish bare ROLLBACK from ROLLBACK TO SAVEPOINT.
+                    let sql_upper = raw_sql.trim().to_ascii_uppercase();
+                    if sql_upper.contains("TO") && sql_upper.contains("SAVEPOINT") {
+                        // ROLLBACK TO SAVEPOINT <name>
+                        let sp_name = extract_savepoint_name(raw_sql, "rollback_to");
+                        match sp_name {
+                            Some(name) => {
+                                match crate::session::tx_rollback_to_savepoint(&sess.state, &name) {
+                                    Ok((abandoned, snapshots)) => {
+                                        // Delete abandoned files (best-effort).
+                                        for (_, files) in &abandoned {
+                                            for f in files {
+                                                let path = object_store::path::Path::from(f.path.as_str());
+                                                let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
+                                            }
+                                        }
+                                        // Refresh DataFusion ctx for affected tables.
+                                        let touched = crate::session::tx_touched_tables(&sess.state);
+                                        for table in &touched {
+                                            let pending = crate::session::tx_pending_files_for(&sess.state, table);
+                                            let _ = crate::session::refresh_table_with_extra(
+                                                &sess.engine,
+                                                &sess.project,
+                                                &sess.ctx,
+                                                &sess.state,
+                                                table,
+                                                &pending,
+                                            ).await;
+                                        }
+                                        // Tables where all pending files were abandoned:
+                                        // restore to pre-tx catalog view.
+                                        for table in abandoned.keys() {
+                                            if !touched.contains(table) {
+                                                if let Some(snap) = snapshots.get(table) {
+                                                    let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap).await;
+                                                }
+                                                let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
+                                            }
+                                        }
+                                        return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            None => {
+                                return Err(basin_common::BasinError::internal(
+                                    "ROLLBACK TO SAVEPOINT: missing savepoint name"
+                                ));
+                            }
+                        }
+                    } else {
+                        // Bare ROLLBACK — undo everything.
+                        let (pending, snapshots) = crate::session::tx_rollback(&sess.state);
+                        // Delete pending (not-yet-committed) files best-effort.
+                        for (_, files) in &pending {
+                            for f in files {
+                                let path = object_store::path::Path::from(f.path.as_str());
+                                let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
+                            }
+                        }
+                        // Restore catalog snapshot for each touched table.
+                        for (table, snap_id) in &snapshots {
+                            let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap_id).await;
+                            let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
+                        }
+                        return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
+                    }
+                }
+                crate::pg_ast::StmtKind::Savepoint => {
+                    // Distinguish SAVEPOINT <name> from RELEASE SAVEPOINT <name>.
+                    let sql_upper = raw_sql.trim().to_ascii_uppercase();
+                    if sql_upper.starts_with("RELEASE") {
+                        // RELEASE SAVEPOINT <name>
+                        let sp_name = extract_savepoint_name(raw_sql, "release");
+                        match sp_name {
+                            Some(name) => {
+                                if crate::session::tx_is_active(&sess.state) {
+                                    // Ignore errors for unknown savepoint names
+                                    // in non-active sessions.
+                                    let _ = crate::session::tx_release_savepoint(&sess.state, &name);
+                                }
+                                return Ok(ExecResult::Empty { tag: "RELEASE".into() });
+                            }
+                            None => {
+                                return Ok(ExecResult::Empty { tag: "RELEASE".into() });
+                            }
+                        }
+                    } else {
+                        // SAVEPOINT <name>
+                        let sp_name = extract_savepoint_name(raw_sql, "savepoint");
+                        if let Some(name) = sp_name {
+                            if crate::session::tx_is_active(&sess.state) {
+                                crate::session::tx_push_savepoint(&sess.state, name);
+                            }
+                        }
+                        return Ok(ExecResult::Empty { tag: "SAVEPOINT".into() });
+                    }
                 }
                 _ => {}
             }
@@ -678,7 +818,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return exec_rls_ddl(sess, rls_ddl).await;
     }
 
-    match stmt {
+    let result = match stmt {
         Statement::CreateTable(ct) => exec_create_table(sess, ct, cluster_columns, lifecycle).await,
         Statement::CreateIndex(ci) => exec_create_index(sess, ci).await,
         Statement::Drop {
@@ -1009,7 +1149,16 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             ..
         } => exec_drop_table(sess, if_exists, names).await,
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
+    };
+
+    // ── Error-in-txn → aborted state ────────────────────────────────────
+    // If any statement fails while inside an active transaction, mark the
+    // transaction as aborted.  Subsequent statements (except ROLLBACK) will
+    // receive SQLSTATE 25P02 until the client issues ROLLBACK.
+    if result.is_err() && crate::session::tx_is_active(&sess.state) {
+        crate::session::tx_set_aborted(&sess.state);
     }
+    result
 }
 
 /// Execute a `VectorSearchPlan` produced by `vector_planner`. Calls
@@ -1880,12 +2029,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
 
     // Legacy synchronous path (no shard configured).
     //
-    // Order: write parquet → refresh listing table → dispatch pre-commit
-    // → commit catalog. This lets pre-commit reactors (5.11.C2 constraint
-    // reactors in particular) see the in-flight row when they evaluate
-    // their predicates against the table. If a reactor rejects, we delete
-    // the orphan parquet file and re-refresh so the failure is invisible
-    // to subsequent queries.
+    // Order: write parquet → (if in txn: defer to pending_files + refresh
+    // with extra; else: dispatch pre-commit → commit catalog → refresh).
     let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
 
     let opts = write_options_for(&meta);
@@ -1903,6 +2048,37 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         column_stats: df.column_stats.clone(),
     };
 
+    // ── Transaction-deferred path ────────────────────────────────────────
+    // When inside an explicit transaction, defer catalog commit.  The file
+    // has been written to storage; add it to the session's pending list and
+    // register it with DataFusion so within-tx SELECTs can see it.
+    if crate::session::tx_is_active(&sess.state) {
+        crate::session::tx_push_pending_file(&sess.state, &table, file_ref);
+        let pending = crate::session::tx_pending_files_for(&sess.state, &table);
+        if let Err(e) = crate::session::refresh_table_with_extra(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            &table,
+            &pending,
+        ).await {
+            // If refresh fails, mark the txn aborted and propagate.
+            crate::session::tx_set_aborted(&sess.state);
+            return Err(e);
+        }
+        if ins.returning.is_some() {
+            return Ok(ExecResult::Rows {
+                schema: batch.schema(),
+                batches: vec![batch],
+            });
+        }
+        return Ok(ExecResult::Empty {
+            tag: format!("INSERT 0 {row_count}"),
+        });
+    }
+
+    // ── Auto-commit path ─────────────────────────────────────────────────
     // Refresh the listing table now so reactor-bodied SELECTs see the
     // new row. Then dispatch pre-commit; on error, roll back by deleting
     // the orphan file (the catalog snapshot is unchanged at this point,
@@ -3224,15 +3400,31 @@ async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) ->
             .catalog
             .list_tables(&sess.project)
             .await?;
+        let in_tx = crate::session::tx_is_active(&sess.state);
         for table in &tables {
-            crate::session::refresh_table(
-                &sess.engine,
-                &sess.project,
-                &sess.ctx,
-                &sess.state,
-                table,
-            )
-            .await?;
+            if in_tx {
+                // Within a transaction: include pending (not-yet-committed)
+                // files so reads can see within-tx writes.
+                let pending = crate::session::tx_pending_files_for(&sess.state, table);
+                crate::session::refresh_table_with_extra(
+                    &sess.engine,
+                    &sess.project,
+                    &sess.ctx,
+                    &sess.state,
+                    table,
+                    &pending,
+                )
+                .await?;
+            } else {
+                crate::session::refresh_table(
+                    &sess.engine,
+                    &sess.project,
+                    &sess.ctx,
+                    &sess.state,
+                    table,
+                )
+                .await?;
+            }
         }
     }
 
@@ -3309,7 +3501,28 @@ async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) ->
         df = apply_soft_delete_to_select(sess, sql, df).await?;
     }
     let df_schema = df.schema().inner().clone();
-    let ws_schema = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
+    // Build the WS schema and annotate any json_agg / jsonb_agg result columns
+    // with BASIN_TYPE=JSONB so the pgwire layer advertises OID 3802 (JSONB).
+    // DataFusion strips the `return_field` metadata when wrapping an aggregate
+    // in a scalar correlated subquery or through join projection; the annotation
+    // pass recovers it by scanning the SQL text for json_agg occurrences and
+    // matching their aliases against the result schema field names.
+    let ws_schema = {
+        let raw = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
+        // Debug: log field names and metadata for json_agg queries.
+        let lower_for_debug = sql_for_df.to_ascii_lowercase();
+        if lower_for_debug.contains("json_agg(") || lower_for_debug.contains("jsonb_agg(") {
+            for f in raw.fields() {
+                tracing::debug!(
+                    name = f.name(),
+                    data_type = ?f.data_type(),
+                    metadata = ?f.metadata(),
+                    "exec_select schema field for json_agg query"
+                );
+            }
+        }
+        annotate_json_agg_columns(&raw, sql_for_df)
+    };
 
     // Change C: when the shard is wired in we know there are large per-project
     // tails on the same runtime. Move the DataFusion executor onto the
@@ -3876,6 +4089,218 @@ fn match_alter_column_identity(sql: &str) -> bool {
 // json_agg(t) whole-row expansion
 // ---------------------------------------------------------------------------
 
+/// Annotate any field in `ws_schema` that originated from a `json_agg` or
+/// `jsonb_agg` expression in the SQL with `BASIN_TYPE=JSONB` metadata.
+///
+/// DataFusion's planner returns the UDAF result as a plain `Utf8` column
+/// without the JSONB metadata in two cases where `return_field` alone is
+/// insufficient:
+///
+/// 1. **Scalar correlated subquery** — `(SELECT json_agg(x) FROM t WHERE …) AS alias`:
+///    the outer column gets type `Utf8` from the subquery schema's `field(0).data_type()`,
+///    stripping the metadata.
+/// 2. **Join over a pre-aggregated subquery** — after the LATERAL rewrite the
+///    `json_agg` column lives in an inner SELECT; the outer query projects it
+///    by alias through the join, and DataFusion may lose the metadata.
+///
+/// This function scans the SQL text (case-insensitively) for every `json_agg`
+/// / `jsonb_agg` occurrence and collects the alias of the enclosing projection
+/// item.  Any `Utf8` field in `ws_schema` whose name matches a collected alias
+/// is re-annotated with `BASIN_TYPE=JSONB`.
+///
+/// This is best-effort and conservative: only fields whose name appears
+/// explicitly in the alias list are changed.  If a field is already annotated
+/// (e.g. from `return_field` for direct GROUP BY aggregates) the function is
+/// idempotent.
+pub(crate) fn annotate_json_agg_columns(
+    ws_schema: &Arc<Schema>,
+    sql: &str,
+) -> Arc<Schema> {
+    // Fast exit if no json_agg / jsonb_agg in the SQL.
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("json_agg(") && !lower.contains("jsonb_agg(") {
+        return Arc::clone(ws_schema);
+    }
+
+    // Collect aliases of projection items that contain json_agg / jsonb_agg.
+    let json_aliases = collect_json_agg_aliases(&lower);
+    if json_aliases.is_empty() {
+        return Arc::clone(ws_schema);
+    }
+
+    // Rebuild the schema, annotating matching Utf8 fields.
+    let mut changed = false;
+    let new_fields: Vec<Field> = ws_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let f = f.as_ref();
+            if f.data_type() == &DataType::Utf8
+                && json_aliases.contains(&f.name().to_ascii_lowercase())
+                && !crate::types::field_is_jsonb(f)
+            {
+                changed = true;
+                let mut meta = f.metadata().clone();
+                meta.insert(
+                    crate::types::BASIN_TYPE_KEY.to_string(),
+                    crate::types::BASIN_TYPE_JSONB.to_string(),
+                );
+                f.clone().with_metadata(meta)
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+
+    if changed {
+        Arc::new(Schema::new(new_fields))
+    } else {
+        Arc::clone(ws_schema)
+    }
+}
+
+/// Scan the (lowercase) SQL string and collect the aliases of all SELECT
+/// projection items that contain a `json_agg(` or `jsonb_agg(` call.
+///
+/// Algorithm: for each occurrence of `json_agg(` or `jsonb_agg(` in the SQL,
+/// we look at the surrounding projection context by:
+/// 1. Finding the depth-0 comma or the surrounding context that delimits the
+///    projection item.
+/// 2. Scanning forward from the closing `)` of the agg call for `as <alias>`
+///    or a bare identifier used as the alias.
+///
+/// This is intentionally conservative: if we cannot determine an alias we
+/// leave it empty (no annotation).  False positives (annotating non-JSON
+/// columns) are impossible because we only annotate aliases that explicitly
+/// appear after a json_agg call.
+fn collect_json_agg_aliases(lower_sql: &str) -> std::collections::HashSet<String> {
+    let bytes = lower_sql.as_bytes();
+    let len = bytes.len();
+    let mut aliases = std::collections::HashSet::new();
+    let mut pos = 0usize;
+
+    loop {
+        // Find the next json_agg( or jsonb_agg( occurrence.
+        let hit = {
+            let j = lower_sql[pos..].find("json_agg(");
+            let jb = lower_sql[pos..].find("jsonb_agg(");
+            match (j, jb) {
+                (Some(a), Some(b)) if a <= b => Some((pos + a, 8usize)), // json_agg
+                (Some(a), None) => Some((pos + a, 8usize)),
+                (_, Some(b)) => Some((pos + b, 9usize)), // jsonb_agg
+                (None, None) => None,
+            }
+        };
+        let (agg_start, fn_len) = match hit {
+            Some(h) => h,
+            None => break,
+        };
+
+        // Word boundary before: must not be alphanumeric or `_`.
+        if agg_start > 0 {
+            let prev = bytes[agg_start - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                pos = agg_start + 1;
+                continue;
+            }
+        }
+
+        // Find the matching `)` for the agg function call.
+        let paren_open = agg_start + fn_len; // points at `(`
+        let Some(paren_close) = find_matching_paren_in_sql(lower_sql, paren_open) else {
+            pos = agg_start + 1;
+            continue;
+        };
+
+        // After the closing `)` of the agg call, skip whitespace and check for
+        // optional `AS alias` or bare `alias`.  Also handle the case where the
+        // agg is the last part of a scalar subquery `)` followed by `) AS alias`.
+        let mut after = paren_close + 1;
+        // Skip closing parens (scalar subquery wrappers) and whitespace.
+        while after < len && (bytes[after] == b')' || bytes[after].is_ascii_whitespace()) {
+            after += 1;
+        }
+        // Optional `AS` keyword.
+        if after + 2 <= len && &lower_sql[after..after + 2] == "as" {
+            let after_as = after + 2;
+            if after_as < len && bytes[after_as].is_ascii_whitespace() {
+                after = after_as + 1;
+                while after < len && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+            } else {
+                // `as` not followed by whitespace — not the AS keyword.
+            }
+        }
+        // Read the alias identifier.
+        let alias_start = after;
+        let mut alias_end = alias_start;
+        while alias_end < len
+            && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_')
+        {
+            alias_end += 1;
+        }
+        if alias_end > alias_start {
+            let alias = lower_sql[alias_start..alias_end].to_string();
+            // Filter out SQL keywords that can follow a function call but
+            // are not aliases: FROM, WHERE, ORDER, GROUP, HAVING, LIMIT,
+            // OFFSET, ON, AND, OR, NOT, NULL, AS, THEN, ELSE, END.
+            const NOT_ALIAS: &[&str] = &[
+                "from", "where", "order", "group", "having", "limit", "offset",
+                "on", "and", "or", "not", "null", "as", "then", "else", "end",
+                "inner", "left", "right", "join", "cross", "lateral", "union",
+                "intersect", "except", "returning", "into",
+            ];
+            if !NOT_ALIAS.contains(&alias.as_str()) {
+                aliases.insert(alias);
+            }
+        }
+
+        pos = paren_close + 1;
+    }
+
+    aliases
+}
+
+/// Find the matching `)` for the `(` at `open_paren` in `sql`, handling
+/// nested parens and single-quoted strings.  Returns `None` if malformed.
+fn find_matching_paren_in_sql(sql: &str, open_paren: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    if open_paren >= len || bytes[open_paren] != b'(' {
+        return None;
+    }
+    let mut depth = 1i32;
+    let mut i = open_paren + 1;
+    while i < len {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Rewrite `json_agg(<table_name>)` / `jsonb_agg(<table_name>)` (and their
 /// `JSON_AGG` / `JSONB_AGG` uppercase forms) where the bare identifier
 /// `<table_name>` refers to a relation visible in the `FROM` clause.
@@ -4066,6 +4491,59 @@ pub(crate) async fn rewrite_json_agg_whole_row(
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Savepoint name extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the savepoint name from a `SAVEPOINT <name>`, `RELEASE SAVEPOINT
+/// <name>`, or `ROLLBACK TO SAVEPOINT <name>` statement.
+///
+/// `mode` is one of `"savepoint"`, `"release"`, or `"rollback_to"`.
+/// Returns `None` if the name cannot be determined.
+fn extract_savepoint_name(sql: &str, mode: &str) -> Option<String> {
+    let upper = sql.trim().to_ascii_uppercase();
+    let rest = match mode {
+        "savepoint" => upper.strip_prefix("SAVEPOINT")?,
+        "release" => {
+            let r = upper.strip_prefix("RELEASE")?;
+            let r = r.trim();
+            r.strip_prefix("SAVEPOINT").unwrap_or(r)
+        }
+        "rollback_to" => {
+            let r = upper.strip_prefix("ROLLBACK")?;
+            let r = r.trim();
+            let r = if let Some(x) = r.strip_prefix("TO") { x } else { return None; };
+            let r = r.trim();
+            r.strip_prefix("SAVEPOINT").unwrap_or(r)
+        }
+        _ => return None,
+    };
+    // The name is the trimmed remainder; strip any trailing semicolon.
+    let name_upper = rest.trim().trim_end_matches(';');
+    if name_upper.is_empty() {
+        return None;
+    }
+    // Find the same token in the original (case-preserving) SQL.
+    // Strategy: tokenise on whitespace and semicolons, find the token
+    // at the corresponding position.
+    let tokens: Vec<&str> = sql
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Keywords to skip over (case-insensitive).
+    let skip: &[&str] = match mode {
+        "savepoint" => &["SAVEPOINT"],
+        "release" => &["RELEASE", "SAVEPOINT"],
+        "rollback_to" => &["ROLLBACK", "TO", "SAVEPOINT"],
+        _ => &[],
+    };
+    let name_token = tokens
+        .iter()
+        .skip_while(|t| skip.iter().any(|k| t.eq_ignore_ascii_case(k)))
+        .next()?;
+    Some(name_token.trim_end_matches(';').to_string())
 }
 
 // ---------------------------------------------------------------------------

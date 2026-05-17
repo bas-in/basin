@@ -839,7 +839,6 @@ async fn transaction_commit_visibility_and_savepoint() {
 /// (transaction-rollback over-restores rows / MVCC). Every ORM's
 /// retry-on-conflict path requires this guarantee — flip when MVCC ships.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (ROLLBACK isolation) — gated on engine bug #41 (auto-commit / MVCC gap); un-ignore when landed"]
 async fn transaction_rollback_isolation() {
     let server = start_server().await;
     let mut client = connect(server.addr).await;

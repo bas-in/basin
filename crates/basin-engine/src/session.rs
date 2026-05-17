@@ -96,42 +96,57 @@ pub(crate) enum OverridingKind {
     User,
 }
 
+/// A single savepoint frame — captures the per-table pending-file watermark
+/// at the moment `SAVEPOINT <name>` was issued.  Rolling back to this
+/// savepoint discards all files appended after the watermark.
+#[derive(Debug)]
+pub(crate) struct SavepointFrame {
+    /// Name of the savepoint (case-sensitive, per PG).
+    pub(crate) name: String,
+    /// For each table touched *before* this savepoint, how many pending files
+    /// existed at savepoint time. Files at or beyond this index are the ones
+    /// that would be rolled back if we `ROLLBACK TO <name>`.
+    pub(crate) file_offsets: HashMap<TableName, usize>,
+}
+
+impl SavepointFrame {
+    /// Clone the `file_offsets` map for use during rollback-to-savepoint.
+    fn clone_offsets(&self) -> HashMap<TableName, usize> {
+        self.file_offsets.clone()
+    }
+}
+
 /// Per-session transaction state — tracks whether a `BEGIN` has been issued
 /// and records catalog-snapshot heads captured at `BEGIN` time.
 ///
-/// ## Role in the overall transaction model
+/// ## Role in the overall transaction model (Step 3+, issue #83)
 ///
-/// This struct is **plumbing only** (Steps 1–2 of issue #83). The `active`
-/// flag is set by `BEGIN` and cleared by `COMMIT` / `ROLLBACK`, and
-/// `pre_tx_snapshots` captures the catalog heads at `BEGIN` time so that a
-/// future real `ROLLBACK` can restore them. Neither field is *consulted* by
-/// any DML path yet — INSERT / UPDATE / DELETE still commit immediately
-/// (auto-commit semantics preserved). The remaining step (Step 3+) that
-/// defers catalog commits when `active == true` requires a lockstep flip of
-/// three pinned integration tests in `coverage_txn_schema.rs` and must be
-/// approved by the user before proceeding.
-///
-/// ## Fields
-///
-/// * `active` — `true` between a `BEGIN` and the matching `COMMIT`/`ROLLBACK`.
-///   Currently unused by DML; only set/cleared.
-/// * `pre_tx_snapshots` — snapshot IDs captured from `SessionState::snapshots`
-///   at `BEGIN` time. When Step 3 lands, `ROLLBACK` will use these to restore
-///   catalog heads. Currently unused by any rollback logic.
-/// * `pending_files` — reserved for Step 3: files written during the open
-///   transaction that have NOT yet been committed to the catalog. Currently
-///   always empty; populated and drained by the Step 3 INSERT deferral.
+/// * `active` — set by `BEGIN`, cleared by `COMMIT`/`ROLLBACK`.
+/// * `aborted` — set when any statement fails *inside* an active txn.  Only
+///   `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) clears it.  Every statement
+///   except those two returns SQLSTATE 25P02 while `aborted` is true.
+/// * `pre_tx_snapshots` — catalog snapshot IDs at `BEGIN` time.  `ROLLBACK`
+///   uses these to restore the catalog read-view to the pre-txn state.
+/// * `pending_files` — data files written during the txn that have NOT yet
+///   been committed to the catalog.  `COMMIT` flushes them; `ROLLBACK`
+///   deletes them.
+/// * `savepoints` — stack of `SavepointFrame`s recording per-table file
+///   watermarks for `ROLLBACK TO SAVEPOINT`.
 #[derive(Debug, Default)]
 pub(crate) struct TxState {
     /// `true` between `BEGIN` and the matching `COMMIT` / `ROLLBACK`.
     pub(crate) active: bool,
+    /// `true` when a statement inside an active txn has errored.  Cleared
+    /// only by `ROLLBACK`.
+    pub(crate) aborted: bool,
     /// Snapshot IDs of tables as they appeared when `BEGIN` was issued.
-    /// Used by a future `ROLLBACK` to restore catalog heads.
+    /// Used by `ROLLBACK` to restore catalog heads.
     pub(crate) pre_tx_snapshots: HashMap<TableName, SnapshotId>,
     /// Data files written during the open transaction that have not yet
-    /// been committed to the catalog. Populated by Step 3 INSERT deferral
-    /// (not yet implemented).
+    /// been committed to the catalog.
     pub(crate) pending_files: HashMap<TableName, Vec<DataFileRef>>,
+    /// Savepoint stack.  Innermost (most-recently-created) frame is last.
+    pub(crate) savepoints: Vec<SavepointFrame>,
 }
 
 /// Per-session mutable state. The `SessionContext` itself is `Send + Sync`
@@ -202,13 +217,10 @@ impl SessionState {
 }
 
 /// Mark the start of an explicit transaction. Snapshots the current
-/// per-table snapshot-id map into `TxState::pre_tx_snapshots` so that a
-/// future real `ROLLBACK` implementation can restore the catalog heads.
-/// Idempotent if called while already active (matches PG behaviour for
-/// `WARNING: there is already a transaction in progress`).
-///
-/// Currently: sets `active = true` and copies snapshot heads. No DML path
-/// consults `active` yet — auto-commit semantics are fully preserved.
+/// per-table snapshot-id map into `TxState::pre_tx_snapshots` so that
+/// `ROLLBACK` can restore the catalog heads.  Idempotent if called while
+/// already active (matches PG behaviour for `WARNING: there is already a
+/// transaction in progress`).  Resets `aborted` and the savepoint stack.
 pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableName, SnapshotId>) {
     let mut tx = state
         .tx_state
@@ -218,37 +230,46 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
     // WARNING: there is already a transaction in progress).
     if !tx.active {
         tx.active = true;
+        tx.aborted = false;
         tx.pre_tx_snapshots = current_snapshots;
         tx.pending_files.clear();
+        tx.savepoints.clear();
     }
 }
 
-/// Mark the end of an explicit transaction with `COMMIT`. Clears `active`,
-/// drops the saved snapshot heads, and drops any (currently empty) pending
-/// files list. Auto-commit semantics: all DML already committed individually
-/// so there is nothing to flush.
-pub(crate) fn tx_commit(state: &SessionState) {
+/// Mark the end of an explicit transaction with `COMMIT`. Returns the
+/// pending files map so the executor can flush them to the catalog.
+/// Clears all txn state afterwards.
+pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFileRef>> {
     let mut tx = state
         .tx_state
         .lock()
         .expect("tx_state lock poisoned");
+    let pending = std::mem::take(&mut tx.pending_files);
     tx.active = false;
+    tx.aborted = false;
     tx.pre_tx_snapshots.clear();
-    tx.pending_files.clear();
+    tx.savepoints.clear();
+    pending
 }
 
-/// Mark the end of an explicit transaction with `ROLLBACK`. Clears `active`
-/// and drops saved state. Auto-commit semantics: the DML is already durable
-/// so no catalog restoration happens here. Step 3+ will use
-/// `pre_tx_snapshots` and `pending_files` to actually undo writes.
-pub(crate) fn tx_rollback(state: &SessionState) {
+/// Mark the end of an explicit transaction with `ROLLBACK`. Returns the
+/// pending files (so the executor can delete them from storage) and the
+/// pre-transaction snapshot heads (so the executor can restore catalog
+/// read-views).  Clears all txn state.
+pub(crate) fn tx_rollback(
+    state: &SessionState,
+) -> (HashMap<TableName, Vec<DataFileRef>>, HashMap<TableName, SnapshotId>) {
     let mut tx = state
         .tx_state
         .lock()
         .expect("tx_state lock poisoned");
+    let pending = std::mem::take(&mut tx.pending_files);
+    let snapshots = std::mem::take(&mut tx.pre_tx_snapshots);
     tx.active = false;
-    tx.pre_tx_snapshots.clear();
-    tx.pending_files.clear();
+    tx.aborted = false;
+    tx.savepoints.clear();
+    (pending, snapshots)
 }
 
 /// Returns `true` if an explicit `BEGIN` has been issued and neither
@@ -259,6 +280,149 @@ pub(crate) fn tx_is_active(state: &SessionState) -> bool {
         .lock()
         .expect("tx_state lock poisoned")
         .active
+}
+
+/// Returns `true` if the current transaction is in the aborted state
+/// (a statement failed inside the txn and only `ROLLBACK` can recover).
+pub(crate) fn tx_is_aborted(state: &SessionState) -> bool {
+    state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned")
+        .aborted
+}
+
+/// Set the aborted flag on the current transaction. Called whenever any
+/// statement fails while `tx_is_active` is true.
+pub(crate) fn tx_set_aborted(state: &SessionState) {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    tx.aborted = true;
+}
+
+/// Append a pending data file for `table` during an active transaction.
+/// The file is visible only to this session until `COMMIT`.
+pub(crate) fn tx_push_pending_file(state: &SessionState, table: &TableName, file: DataFileRef) {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    tx.pending_files
+        .entry(table.clone())
+        .or_default()
+        .push(file);
+}
+
+/// Create a new savepoint with `name`, recording the current pending-file
+/// watermark for every touched table.
+pub(crate) fn tx_push_savepoint(state: &SessionState, name: String) {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    let offsets: HashMap<TableName, usize> = tx
+        .pending_files
+        .iter()
+        .map(|(t, v)| (t.clone(), v.len()))
+        .collect();
+    tx.savepoints.push(SavepointFrame { name, file_offsets: offsets });
+}
+
+/// Release the named savepoint (PG: RELEASE SAVEPOINT <name>).
+/// The writes that happened after it remain pending. Returns `Err` if
+/// the savepoint name is not found.
+pub(crate) fn tx_release_savepoint(state: &SessionState, name: &str) -> Result<()> {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    // Find the last frame with this name (PG allows name reuse; RELEASE
+    // removes the most-recently-created one with that name).
+    let pos = tx.savepoints.iter().rposition(|f| f.name == name);
+    match pos {
+        Some(i) => {
+            tx.savepoints.remove(i);
+            Ok(())
+        }
+        None => Err(BasinError::InvalidSchema(format!(
+            "savepoint \"{name}\" does not exist"
+        ))),
+    }
+}
+
+/// Roll back to the named savepoint. Removes the named frame and all frames
+/// created after it. Returns the abandoned pending files (tail beyond each
+/// saved offset per table) so the executor can delete them from storage.
+/// Also returns the pre-tx snapshot map (for restoring tables that now have
+/// zero pending files after truncation, so reads can see the pre-tx state).
+pub(crate) fn tx_rollback_to_savepoint(
+    state: &SessionState,
+    name: &str,
+) -> Result<(HashMap<TableName, Vec<DataFileRef>>, HashMap<TableName, SnapshotId>)> {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    // Find the savepoint frame.
+    let pos = tx.savepoints.iter().rposition(|f| f.name == name);
+    let pos = match pos {
+        Some(i) => i,
+        None => {
+            return Err(BasinError::InvalidSchema(format!(
+                "savepoint \"{name}\" does not exist"
+            )))
+        }
+    };
+    // Pop all frames at or after the target.
+    let target_frame = tx.savepoints[pos].clone_offsets();
+    tx.savepoints.truncate(pos);
+
+    // Collect the abandoned tail for each table.
+    let mut abandoned: HashMap<TableName, Vec<DataFileRef>> = HashMap::new();
+    for (table, files) in tx.pending_files.iter_mut() {
+        let offset = target_frame.get(table).copied().unwrap_or(0);
+        if files.len() > offset {
+            let tail: Vec<DataFileRef> = files.drain(offset..).collect();
+            abandoned.insert(table.clone(), tail);
+        }
+    }
+    // Remove tables that now have zero pending files.
+    tx.pending_files.retain(|_, v| !v.is_empty());
+
+    // Clear aborted state — ROLLBACK TO SAVEPOINT recovers the txn.
+    tx.aborted = false;
+
+    let snapshots = tx.pre_tx_snapshots.clone();
+    Ok((abandoned, snapshots))
+}
+
+/// Returns the current pending files for `table` (for within-tx reads).
+pub(crate) fn tx_pending_files_for(
+    state: &SessionState,
+    table: &TableName,
+) -> Vec<DataFileRef> {
+    state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned")
+        .pending_files
+        .get(table)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Returns all tables that have pending files.
+pub(crate) fn tx_touched_tables(state: &SessionState) -> Vec<TableName> {
+    state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned")
+        .pending_files
+        .keys()
+        .cloned()
+        .collect()
 }
 
 /// Stash the OVERRIDING kind extracted from the current INSERT
@@ -489,6 +653,65 @@ pub(crate) async fn refresh_table(
     Ok(())
 }
 
+/// Like [`refresh_table`] but also includes `extra_files` in the listing.
+///
+/// Used during an active transaction to give within-transaction reads
+/// visibility into pending (not-yet-committed) data files.  The extra files
+/// are appended to the catalog's `live_data_files()` set; they are visible
+/// only to this session's `SessionContext` and never touch the catalog.
+pub(crate) async fn refresh_table_with_extra(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    state: &Arc<SessionState>,
+    table: &TableName,
+    extra_files: &[DataFileRef],
+) -> Result<()> {
+    if extra_files.is_empty() {
+        // No pending files: delegate to the regular path.
+        return refresh_table(engine, project, ctx, state, table).await;
+    }
+
+    let meta = engine.config().catalog.load_table(project, table).await?;
+    let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
+    let _ = ctx.deregister_table(table.as_str());
+
+    // Combine catalog live files + pending (in-tx) files.
+    let mut all_files: Vec<DataFileRef> = meta.live_data_files();
+    all_files.extend_from_slice(extra_files);
+
+    let listing_options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+    let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(all_files.len());
+    for f in &all_files {
+        let mut s = String::from(BASIN_URL_BASE);
+        s.push_str(&f.path);
+        let url = ListingTableUrl::parse(&s)
+            .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
+        urls.push(url);
+    }
+    let cfg = ListingTableConfig::new_with_multi_paths(urls)
+        .with_listing_options(listing_options)
+        .with_schema(df_schema);
+    let provider = ListingTable::try_new(cfg)
+        .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
+    ctx.register_table(table.as_str(), Arc::new(provider))
+        .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
+
+    state
+        .snapshots
+        .lock()
+        .await
+        .insert(table.clone(), meta.current_snapshot);
+
+    if meta.partition_spec.is_partitioned() {
+        state
+            .has_partitioned_table
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    Ok(())
+}
 
 /// Inspect `sql` for tables with [`PartitionSpec::RangeMonthly`] and, if the
 /// query's WHERE clause restricts the partition column to a sub-range of the
@@ -972,18 +1195,24 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // TxState plumbing unit tests (Steps 1-2 of issue #83)
+    // TxState unit tests — Step 3 (issue #83)
     //
-    // These tests verify that BEGIN/COMMIT/ROLLBACK correctly flip
-    // TxState::active and populate / clear pre_tx_snapshots. They do NOT
-    // require any I/O or a real catalog — SessionState::new() is enough.
-    //
-    // Auto-commit semantics are PRESERVED: no DML path reads TxState::active
-    // yet. These tests only prove the flag and snapshot heads are tracked.
+    // Tests cover: BEGIN/COMMIT/ROLLBACK flag semantics, pending_files push
+    // and flush, savepoint stack push/pop/rollback-to, aborted state, and
+    // error-clears-on-rollback. All run synchronously — no I/O required.
     // -------------------------------------------------------------------------
 
     fn make_test_session_state() -> SessionState {
         SessionState::new()
+    }
+
+    fn make_file_ref(path: &str) -> basin_catalog::DataFileRef {
+        basin_catalog::DataFileRef {
+            path: path.to_string(),
+            size_bytes: 100,
+            row_count: 1,
+            column_stats: std::collections::BTreeMap::new(),
+        }
     }
 
     /// Initially inactive: a fresh session has no open transaction.
@@ -993,6 +1222,10 @@ mod tests {
         assert!(
             !tx_is_active(&state),
             "TxState must be inactive on a fresh session"
+        );
+        assert!(
+            !tx_is_aborted(&state),
+            "TxState must not be aborted on a fresh session"
         );
     }
 
@@ -1008,6 +1241,7 @@ mod tests {
         tx_begin(&state, heads.clone());
 
         assert!(tx_is_active(&state), "tx_begin must set active = true");
+        assert!(!tx_is_aborted(&state), "aborted must be false after BEGIN");
 
         let tx = state.tx_state.lock().expect("lock");
         assert_eq!(
@@ -1017,13 +1251,14 @@ mod tests {
         );
         assert!(
             tx.pending_files.is_empty(),
-            "pending_files must be empty after tx_begin (Step 3 not yet implemented)"
+            "pending_files must be empty after tx_begin"
         );
+        assert!(tx.savepoints.is_empty(), "savepoints empty after BEGIN");
     }
 
-    /// COMMIT clears the active flag and drops snapshot heads.
+    /// COMMIT clears the active flag and returns pending files.
     #[test]
-    fn tx_commit_clears_state() {
+    fn tx_commit_clears_state_and_returns_pending() {
         let state = make_test_session_state();
 
         let mut heads = HashMap::new();
@@ -1031,29 +1266,29 @@ mod tests {
         heads.insert(table.clone(), basin_catalog::SnapshotId(7));
         tx_begin(&state, heads);
 
-        assert!(tx_is_active(&state), "precondition: active after BEGIN");
+        // Push a pending file.
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/events/data/f1.parquet"));
 
-        tx_commit(&state);
+        let pending = tx_commit(&state);
 
-        assert!(
-            !tx_is_active(&state),
-            "tx_commit must set active = false"
+        assert!(!tx_is_active(&state), "tx_commit must set active = false");
+        assert!(!tx_is_aborted(&state), "aborted cleared by COMMIT");
+
+        assert_eq!(pending.len(), 1, "COMMIT returns 1 table's pending files");
+        assert_eq!(
+            pending.get(&table).map(|v| v.len()),
+            Some(1),
+            "pending files returned for table"
         );
 
         let tx = state.tx_state.lock().expect("lock");
-        assert!(
-            tx.pre_tx_snapshots.is_empty(),
-            "tx_commit must clear pre_tx_snapshots"
-        );
-        assert!(
-            tx.pending_files.is_empty(),
-            "tx_commit must clear pending_files"
-        );
+        assert!(tx.pre_tx_snapshots.is_empty(), "tx_commit must clear pre_tx_snapshots");
+        assert!(tx.pending_files.is_empty(), "pending_files cleared inside TxState");
     }
 
-    /// ROLLBACK clears the active flag and drops snapshot heads.
+    /// ROLLBACK clears the active flag and returns pending files + snapshots.
     #[test]
-    fn tx_rollback_clears_state() {
+    fn tx_rollback_clears_state_and_returns_data() {
         let state = make_test_session_state();
 
         let mut heads = HashMap::new();
@@ -1061,41 +1296,33 @@ mod tests {
         heads.insert(table.clone(), basin_catalog::SnapshotId(99));
         tx_begin(&state, heads);
 
-        assert!(tx_is_active(&state), "precondition: active after BEGIN");
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/logs/data/f1.parquet"));
 
-        tx_rollback(&state);
+        let (pending, snapshots) = tx_rollback(&state);
 
-        assert!(
-            !tx_is_active(&state),
-            "tx_rollback must set active = false"
-        );
+        assert!(!tx_is_active(&state), "tx_rollback must set active = false");
+        assert!(!tx_is_aborted(&state), "aborted cleared by ROLLBACK");
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(snapshots.get(&table), Some(&basin_catalog::SnapshotId(99)));
 
         let tx = state.tx_state.lock().expect("lock");
-        assert!(
-            tx.pre_tx_snapshots.is_empty(),
-            "tx_rollback must clear pre_tx_snapshots"
-        );
-        assert!(
-            tx.pending_files.is_empty(),
-            "tx_rollback must clear pending_files"
-        );
+        assert!(tx.pre_tx_snapshots.is_empty());
+        assert!(tx.pending_files.is_empty());
     }
 
     /// Idempotent BEGIN: calling tx_begin while already active must not
-    /// overwrite the existing snapshot heads (mirrors PG's WARNING: there
-    /// is already a transaction in progress — the transaction continues).
+    /// overwrite the existing snapshot heads.
     #[test]
     fn tx_begin_idempotent_preserves_first_snapshots() {
         let state = make_test_session_state();
 
         let table = TableName::new("items").expect("valid table name");
 
-        // First BEGIN: capture snapshot 1.
         let mut heads1 = HashMap::new();
         heads1.insert(table.clone(), basin_catalog::SnapshotId(1));
         tx_begin(&state, heads1);
 
-        // Second BEGIN: would capture snapshot 2, but must be ignored.
         let mut heads2 = HashMap::new();
         heads2.insert(table.clone(), basin_catalog::SnapshotId(2));
         tx_begin(&state, heads2);
@@ -1116,10 +1343,9 @@ mod tests {
         tx_begin(&state, HashMap::new());
         assert!(tx_is_active(&state));
 
-        tx_commit(&state);
+        let _ = tx_commit(&state);
         assert!(!tx_is_active(&state));
 
-        // A second transaction in the same session must be allowed.
         tx_begin(&state, HashMap::new());
         assert!(
             tx_is_active(&state),
@@ -1127,13 +1353,11 @@ mod tests {
         );
     }
 
-    /// ROLLBACK without a preceding BEGIN: must not panic (matches PG's
-    /// WARNING: there is no transaction in progress).
+    /// ROLLBACK without a preceding BEGIN: must not panic.
     #[test]
     fn tx_rollback_without_begin_no_panic() {
         let state = make_test_session_state();
-        // Must not panic.
-        tx_rollback(&state);
+        let _ = tx_rollback(&state);
         assert!(!tx_is_active(&state));
     }
 
@@ -1141,8 +1365,153 @@ mod tests {
     #[test]
     fn tx_commit_without_begin_no_panic() {
         let state = make_test_session_state();
-        // Must not panic.
-        tx_commit(&state);
+        let _ = tx_commit(&state);
         assert!(!tx_is_active(&state));
+    }
+
+    /// Aborted state: set and check.
+    #[test]
+    fn tx_aborted_state_set_and_check() {
+        let state = make_test_session_state();
+        tx_begin(&state, HashMap::new());
+        assert!(!tx_is_aborted(&state));
+        tx_set_aborted(&state);
+        assert!(tx_is_aborted(&state));
+        // ROLLBACK clears aborted.
+        let _ = tx_rollback(&state);
+        assert!(!tx_is_aborted(&state));
+    }
+
+    /// Pending files: push, read, commit returns them.
+    #[test]
+    fn tx_pending_files_push_and_flush() {
+        let state = make_test_session_state();
+        let table = TableName::new("t").unwrap();
+        tx_begin(&state, HashMap::new());
+
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
+
+        let files = tx_pending_files_for(&state, &table);
+        assert_eq!(files.len(), 2);
+
+        let pending = tx_commit(&state);
+        assert_eq!(pending.get(&table).map(|v| v.len()), Some(2));
+    }
+
+    /// Savepoint push: watermarks recorded correctly.
+    #[test]
+    fn tx_savepoint_push_records_watermarks() {
+        let state = make_test_session_state();
+        let table = TableName::new("t").unwrap();
+        tx_begin(&state, HashMap::new());
+
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
+        tx_push_savepoint(&state, "sp1".to_string());
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
+
+        // Two files in pending.
+        let files = tx_pending_files_for(&state, &table);
+        assert_eq!(files.len(), 2);
+
+        let tx = state.tx_state.lock().unwrap();
+        assert_eq!(tx.savepoints.len(), 1);
+        assert_eq!(tx.savepoints[0].name, "sp1");
+        assert_eq!(tx.savepoints[0].file_offsets.get(&table), Some(&1usize));
+    }
+
+    /// ROLLBACK TO SAVEPOINT: abandons files after the watermark.
+    #[test]
+    fn tx_rollback_to_savepoint_discards_tail() {
+        let state = make_test_session_state();
+        let table = TableName::new("t").unwrap();
+        tx_begin(&state, HashMap::new());
+
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
+        tx_push_savepoint(&state, "sp1".to_string());
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/c.parquet"));
+
+        // 3 files total; sp1 recorded offset=1.
+        let (abandoned, _) = tx_rollback_to_savepoint(&state, "sp1").unwrap();
+        let tail = abandoned.get(&table).unwrap();
+        assert_eq!(tail.len(), 2, "two files after sp1 must be abandoned");
+        assert!(tail.iter().any(|f| f.path.ends_with("b.parquet")));
+        assert!(tail.iter().any(|f| f.path.ends_with("c.parquet")));
+
+        // Only 1 file remains in pending.
+        let remaining = tx_pending_files_for(&state, &table);
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].path.ends_with("a.parquet"));
+    }
+
+    /// RELEASE SAVEPOINT: removes the frame, writes stay in pending.
+    #[test]
+    fn tx_release_savepoint_removes_frame() {
+        let state = make_test_session_state();
+        let table = TableName::new("t").unwrap();
+        tx_begin(&state, HashMap::new());
+
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
+        tx_push_savepoint(&state, "sp1".to_string());
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
+
+        tx_release_savepoint(&state, "sp1").unwrap();
+
+        // Frame gone, both files remain pending.
+        let tx = state.tx_state.lock().unwrap();
+        assert!(tx.savepoints.is_empty(), "frame must be removed by RELEASE");
+        assert_eq!(tx.pending_files.get(&table).map(|v| v.len()), Some(2));
+    }
+
+    /// RELEASE of unknown savepoint returns Err.
+    #[test]
+    fn tx_release_unknown_savepoint_errors() {
+        let state = make_test_session_state();
+        tx_begin(&state, HashMap::new());
+        let result = tx_release_savepoint(&state, "no_such");
+        assert!(result.is_err());
+    }
+
+    /// ROLLBACK TO unknown savepoint returns Err.
+    #[test]
+    fn tx_rollback_to_unknown_savepoint_errors() {
+        let state = make_test_session_state();
+        tx_begin(&state, HashMap::new());
+        let result = tx_rollback_to_savepoint(&state, "no_such");
+        assert!(result.is_err());
+    }
+
+    /// ROLLBACK TO SAVEPOINT clears the aborted flag.
+    #[test]
+    fn tx_rollback_to_savepoint_clears_aborted() {
+        let state = make_test_session_state();
+        tx_begin(&state, HashMap::new());
+        tx_push_savepoint(&state, "sp".to_string());
+        tx_set_aborted(&state);
+        assert!(tx_is_aborted(&state));
+        let _ = tx_rollback_to_savepoint(&state, "sp").unwrap();
+        assert!(!tx_is_aborted(&state), "ROLLBACK TO SAVEPOINT must clear aborted");
+    }
+
+    /// COMMIT after BEGIN returns the pending files and leaves state clean.
+    #[test]
+    fn tx_commit_after_begin_clean_state() {
+        let state = make_test_session_state();
+        let table = TableName::new("u").unwrap();
+        let mut heads = HashMap::new();
+        heads.insert(table.clone(), basin_catalog::SnapshotId(5));
+        tx_begin(&state, heads);
+
+        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/u/data/x.parquet"));
+        let pending = tx_commit(&state);
+        assert_eq!(pending.get(&table).map(|v| v.len()), Some(1));
+
+        // State is fully cleared.
+        assert!(!tx_is_active(&state));
+        let tx = state.tx_state.lock().unwrap();
+        assert!(tx.pending_files.is_empty());
+        assert!(tx.pre_tx_snapshots.is_empty());
+        assert!(tx.savepoints.is_empty());
     }
 }
