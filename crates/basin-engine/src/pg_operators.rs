@@ -1901,8 +1901,23 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
             continue;
         }
 
-        // Reject if subquery contains ORDER BY or LIMIT — can't safely pre-agg.
-        if body_lower.contains("order by") || body_lower.contains("limit") {
+        // Reject if the subquery has a top-level ORDER BY or LIMIT clause —
+        // those cannot be safely preserved after the GROUP BY pre-aggregation
+        // rewrite.  We check at depth-0 only: an ORDER BY that is *inside* an
+        // aggregate function argument (e.g. `json_agg(x ORDER BY y)`) sits at
+        // depth ≥ 1 and is correctly handled by DataFusion's aggregate planner,
+        // so it must NOT prevent the rewrite.
+        let has_top_level_order_by = find_keyword_at_depth0(&body_lower, "order", 0)
+            .map(|p| {
+                // Confirm it's "order by" — the word after "order" must be "by".
+                let after = p + 5; // len("order")
+                let rest = body_lower[after..].trim_start();
+                rest.starts_with("by")
+                    && rest.as_bytes().get(2).map_or(true, |b| !b.is_ascii_alphanumeric())
+            })
+            .unwrap_or(false);
+        let has_top_level_limit = find_keyword_at_depth0(&body_lower, "limit", 0).is_some();
+        if has_top_level_order_by || has_top_level_limit {
             search_from = ljl_end;
             continue;
         }
@@ -4710,13 +4725,30 @@ mod tests {
     }
 
     #[test]
-    fn lateral_nested_agg_order_by_not_rewritten() {
-        // ORDER BY inside subquery → must NOT rewrite (result would be wrong).
+    fn lateral_nested_agg_order_by_inside_agg_still_rewrites() {
+        // ORDER BY **inside** an aggregate call (e.g. `json_agg(x ORDER BY y)`)
+        // is depth-1, not a top-level subquery ORDER BY clause.
+        // The rewrite MUST proceed: the aggregate's own ORDER BY is preserved
+        // in the rewritten GROUP BY subquery.
         let sql = "SELECT u.id FROM users u LEFT JOIN LATERAL (SELECT json_agg(p.title ORDER BY p.id) AS posts FROM posts p WHERE p.author_id = u.id) agg ON true";
         let out = rewrite_lateral_nested_agg(&sql);
         let out_lower = out.to_ascii_lowercase();
+        // LATERAL must be gone — the rewrite happened.
+        assert!(!out_lower.contains("lateral"), "ORDER BY inside agg must not prevent rewrite: {out}");
+        // The aggregate's ORDER BY is preserved inside the rewritten subquery.
+        assert!(out_lower.contains("order by"), "aggregate ORDER BY must be preserved after rewrite: {out}");
+        assert!(out_lower.contains("group by"), "GROUP BY must be present after rewrite: {out}");
+    }
+
+    #[test]
+    fn lateral_nested_agg_top_level_order_by_not_rewritten() {
+        // A true top-level ORDER BY clause in the subquery (depth 0) must still
+        // prevent the rewrite, because it cannot be preserved in the GROUP BY form.
+        let sql = "SELECT u.id FROM users u LEFT JOIN LATERAL (SELECT json_agg(p.title) AS posts FROM posts p WHERE p.author_id = u.id ORDER BY p.id) agg ON true";
+        let out = rewrite_lateral_nested_agg(&sql);
+        let out_lower = out.to_ascii_lowercase();
         // Must be left untouched (still has LATERAL).
-        assert!(out_lower.contains("lateral"), "ORDER BY inside must prevent rewrite: {out}");
+        assert!(out_lower.contains("lateral"), "top-level ORDER BY must prevent rewrite: {out}");
     }
 
     #[test]

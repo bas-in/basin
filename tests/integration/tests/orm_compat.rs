@@ -880,7 +880,6 @@ async fn transaction_rollback_isolation() {
 /// Gated on #55 (`json_agg(t)` over a correlated subquery returning a typed
 /// row). Asserts the *correct* JSON shape; flips to a guard when #55 lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (Prisma nested read) — gated on JSON_AGG fix #55; un-ignore when landed"]
 async fn prisma_nested_read_json_agg_correlated_subquery() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -923,7 +922,6 @@ async fn prisma_nested_read_json_agg_correlated_subquery() {
 ///
 /// Gated on #58 (correlated LATERAL) + #55 (json_agg). Asserts correct shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (Drizzle/Prisma LATERAL nested read) — gated on LATERAL #58 + JSON_AGG #55; un-ignore when landed"]
 async fn drizzle_left_join_lateral_json_agg() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -964,7 +962,6 @@ async fn drizzle_left_join_lateral_json_agg() {
 ///
 /// Gated on #56 (correlated-subquery DELETE/UPDATE). Asserts correct effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (correlated DELETE/UPDATE) — gated on fix #56; un-ignore when landed"]
 async fn correlated_delete_and_update() {
     let server = start_server().await;
     let client = connect(server.addr).await;
@@ -1016,7 +1013,6 @@ async fn correlated_delete_and_update() {
 ///
 /// Gated on #57 (data-modifying CTE). Asserts correct visibility + persistence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ORM pattern (data-modifying CTE) — gated on fix #57; un-ignore when landed"]
 async fn data_modifying_cte_insert_returning_then_select() {
     let server = start_server().await;
     let client = connect(server.addr).await;

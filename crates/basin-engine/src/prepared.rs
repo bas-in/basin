@@ -31,6 +31,7 @@
 //! - NULL: literal `NULL`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 
 use arrow_schema::{DataType, Field};
@@ -41,6 +42,7 @@ use sqlparser::ast::{
     SelectItem, SetExpr, Statement, TableFactor, Value,
 };
 use sqlparser::ast::DataType as SqlDataType;
+use arrow_schema::Schema;
 use arrow_schema::TimeUnit;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -329,13 +331,16 @@ async fn infer_param_types(
                         let schema = (*meta.schema).clone();
                         infer_assignments(&assignments, &schema, out, is_jsonb_out, is_uuid_out);
                         if let Some(pred) = &selection {
-                            walk_pred(
+                            let outer_tables = vec![(tn.as_str().to_owned(), schema)];
+                            walk_pred_with_subqueries(
+                                sess,
                                 pred,
-                                &[(tn.as_str().to_owned(), schema)],
+                                &outer_tables,
                                 out,
                                 is_jsonb_out,
                                 is_uuid_out,
-                            );
+                            )
+                            .await;
                         }
                     }
                 }
@@ -359,13 +364,16 @@ async fn infer_param_types(
                         {
                             let schema = (*meta.schema).clone();
                             if let Some(pred) = &del.selection {
-                                walk_pred(
+                                let outer_tables = vec![(tn.as_str().to_owned(), schema)];
+                                walk_pred_with_subqueries(
+                                    sess,
                                     pred,
-                                    &[(tn.as_str().to_owned(), schema)],
+                                    &outer_tables,
                                     out,
                                     is_jsonb_out,
                                     is_uuid_out,
-                                );
+                                )
+                                .await;
                             }
                         }
                     }
@@ -589,6 +597,9 @@ fn pin_cast_placeholder(expr: &Expr, out: &mut [DataType], is_uuid_out: &mut [bo
 /// can resolve to a column type. JSONB / UUID metadata flags are propagated
 /// for the SELECT WHERE side so prepared `WHERE id = $1` over a UUID column
 /// surfaces OID 2950 / 3802 instead of the BYTEA / TEXT default.
+///
+/// Also handles `WITH … DML_CTE … SELECT` queries: for each CTE whose body
+/// is an INSERT, the INSERT VALUES columns are typed against the target table.
 async fn walk_select_for_predicates(
     sess: &ProjectSession,
     q: &Query,
@@ -596,6 +607,68 @@ async fn walk_select_for_predicates(
     is_jsonb_out: &mut [bool],
     is_uuid_out: &mut [bool],
 ) -> Result<()> {
+    // ── DML CTE bodies ────────────────────────────────────────────────────────
+    // `WITH ins AS (INSERT INTO t (c1, c2) VALUES ($1, $2) RETURNING …) SELECT …`
+    // The outer query body is a plain SELECT; the INSERT lives in the CTE.
+    // Walk each CTE's body: for INSERT, apply the same column-order inference
+    // as the top-level INSERT handler.
+    if let Some(ref with) = q.with {
+        for cte in &with.cte_tables {
+            if let SetExpr::Insert(Statement::Insert(ins)) = cte.query.body.as_ref() {
+                // Best-effort: ignore errors (table may not exist yet, etc.).
+                if let Ok(table_name) = crate::pg_ast::insert_object_name(ins)
+                    .and_then(|n| name_to_table(n))
+                {
+                    if let Ok(meta) = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.project, &table_name)
+                        .await
+                    {
+                        let col_order: Vec<String> = if !ins.columns.is_empty() {
+                            ins.columns.iter().map(|c| c.value.clone()).collect()
+                        } else {
+                            meta.schema
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().clone())
+                                .collect()
+                        };
+                        if let Some(ref source) = ins.source {
+                            if let SetExpr::Values(v) = source.body.as_ref() {
+                                for row in &v.rows {
+                                    for (i, expr) in row.iter().enumerate() {
+                                        if let Some(n) = placeholder_index(expr) {
+                                            if let Some(col_name) = col_order.get(i) {
+                                                if let Some(field) =
+                                                    column_field(meta.schema.as_ref(), col_name)
+                                                {
+                                                    if let Some(slot) = out.get_mut(n - 1) {
+                                                        *slot = field.data_type().clone();
+                                                    }
+                                                    if field_is_jsonb(field) {
+                                                        if let Some(s) = is_jsonb_out.get_mut(n - 1) {
+                                                            *s = true;
+                                                        }
+                                                    } else if field_is_uuid(field) {
+                                                        if let Some(s) = is_uuid_out.get_mut(n - 1) {
+                                                            *s = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let select = match q.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Ok(()),
@@ -635,7 +708,7 @@ async fn walk_select_for_predicates(
     walk_projection_for_casts(&select.projection, out, is_uuid_out);
 
     if let Some(pred) = &select.selection {
-        walk_pred(pred, &tables, out, is_jsonb_out, is_uuid_out);
+        walk_pred_with_subqueries(sess, pred, &tables, out, is_jsonb_out, is_uuid_out).await;
     }
 
     // LIMIT $N and OFFSET $N — Postgres types these as int8 (BIGINT). Drivers
@@ -658,6 +731,125 @@ async fn walk_select_for_predicates(
         }
     }
     Ok(())
+}
+
+/// Async variant of [`walk_pred`] that recurses into `EXISTS (subquery)` and
+/// `col IN (subquery)` bodies.  For each subquery, the function loads the
+/// subquery's own FROM-clause tables from the catalog and passes the combined
+/// outer + subquery table set into a recursive call, enabling placeholder slots
+/// like `$1` in `WHERE EXISTS (SELECT 1 FROM t WHERE t.col < $1)` to be typed
+/// against `t.col`.
+///
+/// Falls back to the synchronous `walk_pred` for all expression shapes that
+/// do not contain subqueries.
+async fn walk_pred_with_subqueries(
+    sess: &ProjectSession,
+    expr: &Expr,
+    tables: &[(String, Schema)],
+    out: &mut [DataType],
+    is_jsonb_out: &mut [bool],
+    is_uuid_out: &mut [bool],
+) {
+    match expr {
+        // Recurse into AND / OR compound predicates.
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And | BinaryOperator::Or,
+            right,
+        } => {
+            // Box the future to avoid infinitely-sized recursive types.
+            Box::pin(walk_pred_with_subqueries(
+                sess, left, tables, out, is_jsonb_out, is_uuid_out,
+            ))
+            .await;
+            Box::pin(walk_pred_with_subqueries(
+                sess, right, tables, out, is_jsonb_out, is_uuid_out,
+            ))
+            .await;
+        }
+        // EXISTS (subquery) / NOT EXISTS — load the subquery's FROM tables and
+        // recurse into its WHERE clause.
+        Expr::Exists { subquery, .. } => {
+            let sub_tables = load_query_from_tables(sess, subquery).await;
+            let combined: Vec<(String, Schema)> = tables
+                .iter()
+                .cloned()
+                .chain(sub_tables)
+                .collect();
+            if let SetExpr::Select(sel) = subquery.body.as_ref() {
+                if let Some(pred) = &sel.selection {
+                    Box::pin(walk_pred_with_subqueries(
+                        sess,
+                        pred,
+                        &combined,
+                        out,
+                        is_jsonb_out,
+                        is_uuid_out,
+                    ))
+                    .await;
+                }
+            }
+        }
+        // col IN (subquery) — load the subquery's FROM tables and recurse into
+        // its WHERE clause.
+        Expr::InSubquery { subquery, .. } => {
+            let sub_tables = load_query_from_tables(sess, subquery).await;
+            let combined: Vec<(String, Schema)> = tables
+                .iter()
+                .cloned()
+                .chain(sub_tables)
+                .collect();
+            if let SetExpr::Select(sel) = subquery.body.as_ref() {
+                if let Some(pred) = &sel.selection {
+                    Box::pin(walk_pred_with_subqueries(
+                        sess,
+                        pred,
+                        &combined,
+                        out,
+                        is_jsonb_out,
+                        is_uuid_out,
+                    ))
+                    .await;
+                }
+            }
+        }
+        // For all other expression shapes, fall back to the synchronous walker.
+        other => walk_pred(other, tables, out, is_jsonb_out, is_uuid_out),
+    }
+}
+
+/// Load the `(label, Schema)` pairs for every direct `Table` factor in a
+/// query's FROM clause.  Used to resolve placeholder types inside subqueries.
+/// Errors are silently ignored — this is best-effort inference.
+async fn load_query_from_tables(
+    sess: &ProjectSession,
+    query: &Query,
+) -> Vec<(String, Schema)> {
+    let mut result = Vec::new();
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return result,
+    };
+    for twj in &select.from {
+        if let TableFactor::Table { name, alias, .. } = &twj.relation {
+            if let Ok(tn) = name_to_table(name) {
+                if let Ok(meta) = sess
+                    .engine
+                    .config()
+                    .catalog
+                    .load_table(&sess.project, &tn)
+                    .await
+                {
+                    let label = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| tn.as_str().to_owned());
+                    result.push((label, (*meta.schema).clone()));
+                }
+            }
+        }
+    }
+    result
 }
 
 fn walk_pred(
@@ -1088,21 +1280,213 @@ fn substitute_for_probe(sql: &str, param_types: &[DataType]) -> String {
 }
 
 async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
-    // Only SELECT can yield a row description ahead of execute; for anything
-    // else we return no columns and the caller falls back.
+    // Only SELECT (and WITH ... SELECT) can yield a row description ahead of
+    // execute; for anything else we return no columns and the caller falls back.
     let trimmed = sql.trim_start().to_ascii_uppercase();
-    if !trimmed.starts_with("SELECT") {
+    if !trimmed.starts_with("SELECT") && !trimmed.starts_with("WITH") {
         return Ok(Vec::new());
     }
 
-    let logical = sess
-        .ctx
-        .sql(sql)
-        .await
-        .map_err(|e| BasinError::internal(format!("plan: {e}")))?;
-    let df_schema = logical.schema().inner().clone();
-    let ws_schema = crate::convert::schema_df_to_ws(df_schema.as_ref())?;
+    // Apply the same SELECT-path text rewrites that `execute()` applies, so
+    // that DataFusion can plan SQL forms it wouldn't accept verbatim (e.g.
+    // LATERAL aggregate patterns rewritten to GROUP BY joins).
+    let rewritten = crate::pg_operators::rewrite_lateral_nested_agg(sql);
+    let rewritten = crate::pg_operators::rewrite_lateral_uncorrelated(&rewritten);
+    let probe_sql = &rewritten;
+
+    // Try planning the (possibly rewritten) SQL directly. This handles plain
+    // SELECTs and WITH-pure-SELECT CTEs.
+    let plan_result = sess.ctx.sql(probe_sql).await;
+
+    let ws_schema = match plan_result {
+        Ok(logical) => {
+            let df_schema = logical.schema().inner().clone();
+            Arc::new(crate::convert::schema_df_to_ws(df_schema.as_ref())?)
+        }
+        Err(_) => {
+            // Direct planning failed. Try the DML-CTE special path: for
+            // `WITH cte AS (INSERT/UPDATE/DELETE ... RETURNING ...) SELECT ...`
+            // we synthesize a MemTable from the RETURNING columns and probe
+            // just the outer SELECT so the RowDescription is correct at
+            // Describe time.
+            if let Some(fields) = probe_dml_cte_schema(sess, probe_sql).await {
+                Arc::new(Schema::new(fields))
+            } else {
+                // Unplannable form — fall back to no columns; the schema will
+                // be discovered at execute time.
+                return Ok(Vec::new());
+            }
+        }
+    };
+
+    // Annotate json_agg / jsonb_agg result columns with BASIN_TYPE=JSONB so the
+    // RowDescription sent at Describe time advertises OID 3802 (JSONB) rather than
+    // TEXT. This is required for drivers that use the Describe-time RowDescription
+    // to choose the correct wire deserializer (tokio-postgres, psycopg3, etc.).
+    let ws_schema = crate::executor::annotate_json_agg_columns(&ws_schema, probe_sql);
     Ok(ws_schema.fields().iter().map(|f| (**f).clone()).collect())
+}
+
+/// Synthesise the output schema for a data-modifying CTE
+/// `WITH cte AS (INSERT/UPDATE/DELETE … RETURNING …) SELECT …` at prepare
+/// time.  DataFusion cannot plan the INSERT/UPDATE/DELETE body, but we can:
+///
+/// 1. Parse the statement to find DML CTEs with RETURNING clauses.
+/// 2. Determine the RETURNING column types from the catalog.
+/// 3. Register a temporary MemTable for each such CTE.
+/// 4. Plan just the outer SELECT body to get its schema.
+/// 5. Deregister the temporary tables before returning.
+///
+/// Returns `None` if the SQL cannot be parsed or the required catalog tables
+/// are not found (falls back to 0-column RowDescription, safe degradation).
+async fn probe_dml_cte_schema(sess: &ProjectSession, sql: &str) -> Option<Vec<Field>> {
+    use datafusion::arrow::datatypes as dfa;
+    use datafusion::datasource::memory::MemTable;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = PostgreSqlDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    let stmt = stmts.into_iter().next()?;
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return None,
+    };
+    let with = query.with.as_ref()?;
+    if !with.cte_tables.iter().any(|cte| {
+        matches!(
+            cte.query.body.as_ref(),
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_)
+        )
+    }) {
+        return None;
+    }
+
+    let mut registered: Vec<String> = Vec::new();
+
+    for cte in &with.cte_tables {
+        let cte_name = cte.alias.name.value.clone();
+        // Only handle INSERT-RETURNING CTEs for now.
+        let ins = match cte.query.body.as_ref() {
+            SetExpr::Insert(Statement::Insert(s)) => s,
+            _ => continue,
+        };
+
+        // Determine the RETURNING columns: explicit list or default to all table columns.
+        let returning = ins.returning.as_deref().unwrap_or(&[]);
+        let table_name = match crate::pg_ast::insert_object_name(ins)
+            .and_then(|n| name_to_table(n))
+        {
+            Ok(tn) => tn,
+            Err(_) => continue,
+        };
+        let meta = match sess
+            .engine
+            .config()
+            .catalog
+            .load_table(&sess.project, &table_name)
+            .await
+        {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Build the MemTable schema from RETURNING columns.
+        let df_fields: Vec<dfa::FieldRef> = if returning.is_empty() {
+            // No RETURNING clause — treat as 0-column result.
+            vec![]
+        } else {
+            let mut fields = Vec::new();
+            for sel in returning {
+                match sel {
+                    SelectItem::Wildcard(_) => {
+                        // RETURNING * — all table columns.
+                        for f in meta.schema.fields() {
+                            let ws_dt = crate::convert::schema_df_to_ws(
+                                &Schema::new(vec![f.as_ref().clone()])
+                            )
+                            .ok()
+                            .and_then(|s| s.fields().first().map(|f2| f2.data_type().clone()));
+                            if let Some(_dt) = ws_dt {
+                                // Convert ws field → df field for MemTable.
+                                if let Ok(df_schema) = crate::convert::schema_ws_to_df(&Schema::new(vec![f.as_ref().clone()])) {
+                                    if let Some(df_f) = df_schema.fields().first() {
+                                        fields.push(Arc::clone(df_f));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
+                        if let Some(f) = column_field(meta.schema.as_ref(), &id.value) {
+                            if let Ok(df_schema) = crate::convert::schema_ws_to_df(
+                                &Schema::new(vec![f.clone()])
+                            ) {
+                                if let Some(df_f) = df_schema.fields().first() {
+                                    fields.push(Arc::clone(df_f));
+                                }
+                            }
+                        }
+                    }
+                    SelectItem::ExprWithAlias { expr: Expr::Identifier(id), alias } => {
+                        if let Some(f) = column_field(meta.schema.as_ref(), &id.value) {
+                            if let Ok(df_schema) = crate::convert::schema_ws_to_df(
+                                &Schema::new(vec![f.clone()])
+                            ) {
+                                if let Some(df_f) = df_schema.fields().first() {
+                                    // Rename the field to the alias.
+                                    let renamed = dfa::Field::new(
+                                        &alias.value,
+                                        df_f.data_type().clone(),
+                                        df_f.is_nullable(),
+                                    );
+                                    fields.push(Arc::new(renamed));
+                                }
+                            }
+                        }
+                    }
+                    _ => {} // Complex expressions — skip for now.
+                }
+            }
+            fields
+        };
+
+        if df_fields.is_empty() {
+            continue;
+        }
+
+        let df_schema = Arc::new(dfa::Schema::new(df_fields));
+        // Register an empty MemTable so DataFusion can plan the outer SELECT.
+        let provider = MemTable::try_new(df_schema, vec![vec![]]).ok()?;
+        // Deregister any existing table with this name first.
+        let _ = sess.ctx.deregister_table(&cte_name);
+        sess.ctx.register_table(&cte_name, Arc::new(provider)).ok()?;
+        registered.push(cte_name);
+    }
+
+    if registered.is_empty() {
+        // Clean up and give up.
+        return None;
+    }
+
+    // Build the outer SELECT SQL (body without DML CTEs).
+    let outer_sql = query.body.to_string();
+    let result = match sess.ctx.sql(&outer_sql).await {
+        Ok(logical) => {
+            let df_schema = logical.schema().inner().clone();
+            crate::convert::schema_df_to_ws(df_schema.as_ref()).ok().map(|ws| {
+                ws.fields().iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>()
+            })
+        }
+        Err(_) => None,
+    };
+
+    // Deregister temp tables.
+    for name in &registered {
+        let _ = sess.ctx.deregister_table(name);
+    }
+
+    result
 }
 
 #[cfg(test)]

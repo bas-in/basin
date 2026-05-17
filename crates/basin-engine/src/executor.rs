@@ -648,6 +648,11 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // because Basin stores range values as plain Utf8; the cast suffix confuses
     // DataFusion's planner which doesn't know these custom types.
     let rewritten = crate::range_udf::rewrite_range_casts(&rewritten);
+    // Rewrite `SUBSTRING(<expr> FROM '<regex>')` (single-quoted-string FROM
+    // argument, not numeric) into `substring_regex(<expr>, '<regex>')` so the
+    // POSIX-regex form (PG-style) routes to the regex UDF. Numeric `SUBSTRING
+    // FROM int FOR int` continues to use DataFusion's built-in.
+    let rewritten = crate::regex_udf::rewrite_substring_regex(&rewritten);
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
     // Float64 with sub-second precision (PG's `extract(second ...)` shape).
     // Other EXTRACT fields fall through to DataFusion's `date_part`.
@@ -2079,11 +2084,32 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     }
 
     // ── Auto-commit path ─────────────────────────────────────────────────
-    // Refresh the listing table now so reactor-bodied SELECTs see the
-    // new row. Then dispatch pre-commit; on error, roll back by deleting
-    // the orphan file (the catalog snapshot is unchanged at this point,
-    // so cleanup is just removing the orphan parquet).
-    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
+    // Register the just-written (not-yet-catalogued) file as an "extra" so
+    // that reactor-bodied SELECTs fired during pre-commit can see the new
+    // row. This mirrors the in-tx `refresh_table_with_extra` approach from
+    // #92: the file is already durable in storage; we simply expose it to
+    // DataFusion's planner before the catalog snapshot advances.  Without
+    // this, pre-commit hooks would query a ListingTable that does not yet
+    // include the new file (it wasn't in the catalog at file-write time).
+    //
+    // This also fixes per-statement read-your-own-writes in auto-commit
+    // mode: the next SELECT on this session will call exec_select which
+    // refreshes all tables; at that point the catalog has been committed,
+    // so refresh_table (without extra) will see the new file naturally.
+    if let Err(e) = crate::session::refresh_table_with_extra(
+        &sess.engine,
+        &sess.project,
+        &sess.ctx,
+        &sess.state,
+        &table,
+        std::slice::from_ref(&file_ref),
+    ).await {
+        // Refresh failure before commit means the orphan file in storage
+        // should be cleaned up.  Catalog snapshot is unchanged so no
+        // catalog rollback is needed.
+        let _ = sess.engine.config().storage.delete_file(&sess.project, &df.path).await;
+        return Err(e);
+    }
     if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
         let _ = sess
             .engine
@@ -2098,6 +2124,10 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
 
+    // Post-commit: re-register the table from the now-authoritative catalog
+    // snapshot (no extra files).  This ensures the DataFusion provider
+    // reflects exactly the committed state and no longer carries the
+    // pre-commit "extra" file reference.
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 
@@ -2320,7 +2350,20 @@ async fn exec_insert_select(
         column_stats: written.column_stats.clone(),
     };
 
-    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
+    // Pre-commit: expose the new file to DataFusion so reactor hooks can
+    // see it.  Mirror the auto-commit VALUES path: use refresh_table_with_extra
+    // so the file is visible before the catalog snapshot advances.
+    if let Err(e) = crate::session::refresh_table_with_extra(
+        &sess.engine,
+        &sess.project,
+        &sess.ctx,
+        &sess.state,
+        table,
+        std::slice::from_ref(&file_ref),
+    ).await {
+        let _ = sess.engine.config().storage.delete_file(&sess.project, &written.path).await;
+        return Err(e);
+    }
     if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
         let _ = sess
             .engine
@@ -2454,7 +2497,16 @@ async fn exec_insert_default_values(
         column_stats: df.column_stats.clone(),
     };
 
-    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
+    // Pre-commit: register the new file as "extra" so reactor hooks see it
+    // before the catalog snapshot advances (mirrors the VALUES path fix).
+    crate::session::refresh_table_with_extra(
+        &sess.engine,
+        &sess.project,
+        &sess.ctx,
+        &sess.state,
+        &table,
+        std::slice::from_ref(&file_ref),
+    ).await?;
     dispatch_pre_commit(&sess.engine, &events).await?;
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
@@ -3509,18 +3561,6 @@ async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) ->
     // matching their aliases against the result schema field names.
     let ws_schema = {
         let raw = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
-        // Debug: log field names and metadata for json_agg queries.
-        let lower_for_debug = sql_for_df.to_ascii_lowercase();
-        if lower_for_debug.contains("json_agg(") || lower_for_debug.contains("jsonb_agg(") {
-            for f in raw.fields() {
-                tracing::debug!(
-                    name = f.name(),
-                    data_type = ?f.data_type(),
-                    metadata = ?f.metadata(),
-                    "exec_select schema field for json_agg query"
-                );
-            }
-        }
         annotate_json_agg_columns(&raw, sql_for_df)
     };
 
@@ -5191,5 +5231,124 @@ mod recursive_cte_exec_tests {
             "root->child->child->child".to_string(),
         ];
         assert_eq!(vals, expected, "string hierarchy paths must match");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-commit read-your-own-writes (RYOW) — lib unit tests (#105)
+// ---------------------------------------------------------------------------
+// These tests use the full Engine + InMemoryCatalog + LocalFileSystem stack so
+// they exercise the real exec_insert → catalog → exec_select pipeline.  They
+// are deliberately placed in the `executor` lib so they run with
+// `cargo test -p basin-engine --lib` and count toward the lib-test baseline.
+#[cfg(test)]
+mod auto_commit_ryow_tests {
+    use std::sync::Arc;
+
+    use arrow_array::Int64Array;
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig { storage, catalog, shard: None })
+    }
+
+    fn count_from_result(res: ExecResult) -> i64 {
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            ExecResult::Empty { tag } => panic!("expected Rows, got Empty({tag})"),
+        };
+        let b = batches.first().expect("no batch returned");
+        b.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column must be Int64")
+            .value(0)
+    }
+
+    /// Each auto-commit INSERT must be immediately visible to the next SELECT
+    /// on the same session.  Pins the fix for #105 (refresh_table_with_extra
+    /// in the auto-commit path).
+    #[tokio::test]
+    async fn insert_values_ryow_per_statement() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+
+        sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
+        let n1 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n1, 1, "row 1 must be visible immediately after first INSERT");
+
+        sess.execute("INSERT INTO t VALUES (2)").await.unwrap();
+        let n2 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n2, 2, "row 2 must be visible immediately after second INSERT");
+
+        sess.execute("INSERT INTO t VALUES (3)").await.unwrap();
+        let n3 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n3, 3, "row 3 must be visible immediately after third INSERT");
+    }
+
+    /// Multi-row INSERT: all rows in a single statement must be visible to the
+    /// immediately-following SELECT.
+    #[tokio::test]
+    async fn insert_multi_row_ryow() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+
+        sess.execute("INSERT INTO t VALUES (10), (20), (30)").await.unwrap();
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 3, "all 3 rows from multi-row INSERT must be visible immediately");
+    }
+
+    /// INSERT … RETURNING: the returned row must also appear in a subsequent
+    /// SELECT on the same session.
+    #[tokio::test]
+    async fn insert_returning_ryow() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+
+        // First INSERT: verify it's visible.
+        sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
+        let n1 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n1, 1, "first INSERT must be visible before RETURNING INSERT");
+
+        // INSERT RETURNING: the returned id must match, and the subsequent
+        // COUNT must reflect both rows.
+        let ret = sess.execute("INSERT INTO t VALUES (2) RETURNING id").await.unwrap();
+        let returned_id = match ret {
+            ExecResult::Rows { batches, .. } => {
+                let b = batches.first().expect("RETURNING must produce a batch");
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column must be Int64")
+                    .value(0)
+            }
+            ExecResult::Empty { tag } => panic!("INSERT RETURNING produced Empty({tag})"),
+        };
+        assert_eq!(returned_id, 2, "RETURNING must echo inserted id");
+
+        let n2 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n2, 2, "both rows must be visible after INSERT RETURNING");
     }
 }

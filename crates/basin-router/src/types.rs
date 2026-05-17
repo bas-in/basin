@@ -313,10 +313,21 @@ fn encode_value_binary(
     // as plain text would *also* be tolerated by lenient drivers but trips
     // strict ones (notably `tokio-postgres` 0.7+). We pay one byte to be
     // correct here.
-    if is_jsonb && matches!(col.data_type(), DataType::LargeBinary | DataType::Binary) {
+    //
+    // Two storage shapes map to the JSONB logical type:
+    // - `LargeBinary` / `Binary`: canonical JSONB storage (coerced at ingest via
+    //   `coerce_jsonb`). Bytes are already canonical-form JSON text.
+    // - `Utf8` / `LargeUtf8`: result of `json_agg` / `jsonb_agg` UDAFs, which
+    //   accumulate JSON text as Utf8. Apply the same 0x01 prefix so drivers see
+    //   valid binary JSONB.
+    if is_jsonb && matches!(col.data_type(),
+        DataType::LargeBinary | DataType::Binary | DataType::Utf8 | DataType::LargeUtf8)
+    {
         let bytes: &[u8] = match col.data_type() {
             DataType::LargeBinary => col.as_binary::<i64>().value(idx),
             DataType::Binary => col.as_binary::<i32>().value(idx),
+            DataType::Utf8 => col.as_string::<i32>().value(idx).as_bytes(),
+            DataType::LargeUtf8 => col.as_string::<i64>().value(idx).as_bytes(),
             _ => unreachable!(),
         };
         buf.put_i32((bytes.len() as i32) + 1);

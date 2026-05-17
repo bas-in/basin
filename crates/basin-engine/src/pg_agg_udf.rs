@@ -26,13 +26,14 @@
 //! is handled at the pgwire layer, not here.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, LargeBinaryArray, ListArray, StringArray, StructArray,
 };
 use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use datafusion::arrow::datatypes::{DataType, Field};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{exec_err, plan_err, Result as DFResult};
@@ -42,6 +43,20 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use serde_json::Value as JValue;
+
+/// Build a `Field` with `BASIN_TYPE=JSONB` metadata so that the pgwire layer
+/// emits OID 3802 (JSONB) for `json_agg` / `jsonb_agg` result columns.
+/// `tokio-postgres` (and every other PG driver) uses the OID to pick the
+/// right deserializer; without this marker the column is advertised as TEXT
+/// and the client refuses to deserialize it as `serde_json::Value`.
+fn json_agg_return_field(name: &str) -> FieldRef {
+    let mut meta = HashMap::new();
+    meta.insert(
+        crate::types::BASIN_TYPE_KEY.to_string(),
+        crate::types::BASIN_TYPE_JSONB.to_string(),
+    );
+    Arc::new(Field::new(name, DataType::Utf8, true).with_metadata(meta))
+}
 
 // ── json_agg ──────────────────────────────────────────────────────────────────
 
@@ -78,6 +93,13 @@ impl AggregateUDFImpl for JsonAggUdaf {
 
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
+    }
+
+    /// Override `return_field` to attach `BASIN_TYPE=JSONB` metadata so the
+    /// pgwire router advertises OID 3802 for this column, enabling clients to
+    /// deserialize the result as a JSON value instead of plain text.
+    fn return_field(&self, _arg_fields: &[FieldRef]) -> DFResult<FieldRef> {
+        Ok(json_agg_return_field(self.name))
     }
 
     fn accumulator(&self, _args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
@@ -185,6 +207,11 @@ impl AggregateUDFImpl for JsonObjectAggUdaf {
 
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
+    }
+
+    /// Attach `BASIN_TYPE=JSONB` metadata so the pgwire layer emits OID 3802.
+    fn return_field(&self, _arg_fields: &[FieldRef]) -> DFResult<FieldRef> {
+        Ok(json_agg_return_field(self.name))
     }
 
     fn accumulator(&self, _args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
