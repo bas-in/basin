@@ -40,7 +40,9 @@
 //! - Merge-on-read deletion vectors / position deletes. CoW is a fine
 //!   default; MoR is a future optimisation.
 //! - Multi-table UPDATE/DELETE, ORDER BY, LIMIT.
-//! - Scalar subqueries on the SET RHS (e.g. `SET x = (SELECT MAX(y) FROM u)`).
+//! - Correlated scalar subqueries on the SET RHS
+//!   (e.g. `SET x = (SELECT u.v FROM u WHERE u.id = t.id)`). Non-correlated
+//!   scalar subqueries are supported since #106.
 //! - Subquery / function-call WHERE.
 
 use std::sync::Arc;
@@ -124,6 +126,76 @@ pub(crate) async fn resolve_subqueries_in_expr(
                 list,
                 negated,
             })
+        }
+        // Scalar subquery in expression position: `(SELECT MAX(id) FROM u)`.
+        // Materialise the sub-SELECT, enforce PG's ≤1-row / 1-column
+        // constraint, and substitute a plain literal (or NULL) in place of the
+        // subquery node so the downstream SET/predicate machinery never sees
+        // the subquery at all.
+        //
+        // Semantics (PostgreSQL-compatible):
+        //   - 0 rows  → NULL
+        //   - 1 row   → the single cell value as a literal
+        //   - >1 rows → error (SQLSTATE 21000)
+        //
+        // This handles NON-CORRELATED scalar subqueries only — the subquery is
+        // executed once against the current session context. Correlated scalar
+        // subqueries (`SET v = (SELECT u.v FROM u WHERE u.id = t.id)`) require
+        // per-outer-row sub-execution and are deferred as a follow-up.
+        Expr::Subquery(subquery) => {
+            let sql = subquery.to_string();
+            let df = sess.ctx.sql(&sql).await.map_err(|e| {
+                BasinError::internal(format!("scalar subquery – plan failed: {e}"))
+            })?;
+            let df_batches = df.collect().await.map_err(|e| {
+                BasinError::internal(format!("scalar subquery – execute failed: {e}"))
+            })?;
+            // Count total rows across batches to enforce the ≤1-row constraint.
+            // Collect rows into at most 2 for the check.
+            let mut total_rows = 0usize;
+            let mut first_row_batch_idx: Option<usize> = None;
+            for (bi, b) in df_batches.iter().enumerate() {
+                if b.num_rows() > 0 && first_row_batch_idx.is_none() {
+                    first_row_batch_idx = Some(bi);
+                }
+                total_rows += b.num_rows();
+                if total_rows > 1 {
+                    return Err(BasinError::InvalidSchema(
+                        "more than one row returned by a subquery used as an expression"
+                            .to_string(),
+                    ));
+                }
+            }
+            if total_rows == 0 {
+                // 0 rows → NULL (PG semantics).
+                return Ok(Expr::Value(ValueWithSpan {
+                    value: Value::Null,
+                    span: sqlparser::tokenizer::Span::empty(),
+                }));
+            }
+            // Exactly 1 row — extract the single cell.
+            let bi = first_row_batch_idx.unwrap();
+            let df_batch = &df_batches[bi];
+            if df_batch.num_columns() == 0 {
+                return Ok(Expr::Value(ValueWithSpan {
+                    value: Value::Null,
+                    span: sqlparser::tokenizer::Span::empty(),
+                }));
+            }
+            let batch = crate::convert::batch_df_to_ws(df_batch)?;
+            let col = batch.column(0);
+            // Find the actual row index inside this batch (skip leading empty
+            // batches by scanning for the first batch with rows).
+            // Since total_rows==1 and first_row_batch_idx points here, there
+            // is exactly one row in this batch — it must be at index 0.
+            let row_idx = 0usize;
+            if col.is_null(row_idx) {
+                return Ok(Expr::Value(ValueWithSpan {
+                    value: Value::Null,
+                    span: sqlparser::tokenizer::Span::empty(),
+                }));
+            }
+            arrow_col_value_to_expr(col.as_ref(), row_idx)
         }
         // Combinators: recurse into children.
         Expr::BinaryOp { left, op, right } => {
@@ -302,7 +374,11 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
                     "multi-table DELETE not supported".into(),
                 ));
             }
-            return exec_delete_via_df_rowset(sess, &table, sel).await;
+            // Pass through any alias on the DELETE target table so DataFusion
+            // can resolve alias-qualified column references in the WHERE clause
+            // (e.g. `DELETE FROM posts p WHERE EXISTS (... WHERE p.author_id = ...)`).
+            let table_alias = delete_table_alias(&delete);
+            return exec_delete_via_df_rowset(sess, &table, table_alias.as_deref(), sel).await;
         }
     }
 
@@ -657,6 +733,21 @@ pub(crate) async fn exec_update(
     let selection = match selection {
         None => None,
         Some(e) => Some(resolve_subqueries_in_expr(sess, e).await?),
+    };
+
+    // Resolve scalar subqueries on the SET RHS before parse_assignments so
+    // each `(SELECT …)` becomes a plain literal. This must happen before
+    // pre_mutation_flush so the subquery SELECT sees the committed state.
+    // Only non-correlated scalar subqueries are resolved here; correlated
+    // subqueries (referencing outer table columns) are deferred.
+    let assignments = {
+        let mut resolved = assignments;
+        for a in &mut resolved {
+            if contains_subquery(&a.value) {
+                a.value = resolve_subqueries_in_expr(sess, a.value.clone()).await?;
+            }
+        }
+        resolved
     };
 
     pre_mutation_flush(sess).await?;
@@ -1296,6 +1387,7 @@ async fn exec_update_from(
 async fn exec_delete_via_df_rowset(
     sess: &ProjectSession,
     table: &TableName,
+    table_alias: Option<&str>,
     selection: &Expr,
 ) -> Result<ExecResult> {
     let meta = sess
@@ -1305,23 +1397,32 @@ async fn exec_delete_via_df_rowset(
         .load_table(&sess.project, table)
         .await?;
     let table_str = table.as_str();
+    // When the original DELETE used a table alias (e.g. `DELETE FROM posts p WHERE p.col = …`),
+    // we must include the alias in the FROM clause of the synthesised SELECT so DataFusion
+    // can resolve alias-qualified references in the WHERE predicate.
+    let from_clause = match table_alias {
+        Some(alias) if alias != table_str => format!("{table_str} {alias}"),
+        _ => table_str.to_string(),
+    };
+    // The qualifier to use in SELECT projections: prefer the alias if present.
+    let qualifier = table_alias.unwrap_or(table_str);
 
     if !meta.pk_columns.is_empty() {
         // --- PK path: get matching row PKs, re-issue plain DELETE ---
         let pk = &meta.pk_columns;
 
-        // Build: SELECT t.pk1, t.pk2, … FROM t WHERE <selection>
+        // Build: SELECT t.pk1, t.pk2, … FROM t [AS alias] WHERE <selection>
         // The table qualifier prevents ambiguity when the subquery also
         // references `t`.
         let pk_proj: Vec<String> = pk
             .iter()
-            .map(|c| format!("{table_str}.{c}"))
+            .map(|c| format!("{qualifier}.{c}"))
             .collect();
 
         let rowset_sql = format!(
-            "SELECT {proj} FROM {tbl} WHERE {pred}",
+            "SELECT {proj} FROM {from_clause} WHERE {pred}",
             proj = pk_proj.join(", "),
-            tbl = table_str,
+            from_clause = from_clause,
             pred = selection,
         );
 
@@ -1358,8 +1459,8 @@ async fn exec_delete_via_df_rowset(
     // We select all columns; DataFusion still decorrelates the EXISTS
     // inside `NOT (EXISTS(...))`.
     let keep_sql = format!(
-        "SELECT * FROM {tbl} WHERE NOT ({pred})",
-        tbl = table_str,
+        "SELECT * FROM {from_clause} WHERE NOT ({pred})",
+        from_clause = from_clause,
         pred = selection,
     );
 
@@ -2640,14 +2741,11 @@ fn parse_assignments(
         let rhs = match try_literal_to_scalar(&a.value, &dt, &col_name)? {
             Some(scalar) => AssignmentRhs::Scalar(scalar),
             None => {
-                // Reject scalar subqueries until we wire WHERE-subquery
-                // support too — running them through DataFusion would
-                // hang at planning since the temp table is local.
-                if contains_subquery(&a.value) {
-                    return Err(BasinError::InvalidSchema(format!(
-                        "UPDATE SET {col_name}: scalar subquery on RHS not supported in v0.1"
-                    )));
-                }
+                // Scalar subqueries on the SET RHS are resolved to literals
+                // before `parse_assignments` is called (see the pre-flush
+                // resolution loop in exec_update). If a subquery node somehow
+                // survives to this point it is correlated or unsupported — let
+                // the DataFusion expression path surface a helpful error.
                 AssignmentRhs::Expr(a.value.to_string())
             }
         };
@@ -3047,13 +3145,17 @@ fn single_table_from_delete(d: &Delete) -> Result<TableName> {
     }
     let name = match &twj.relation {
         TableFactor::Table {
-            name, alias, args, ..
+            name, args, ..
         } => {
-            if alias.is_some() || args.is_some() {
+            if args.is_some() {
                 return Err(BasinError::InvalidSchema(
                     "DELETE target must be a bare table name".into(),
                 ));
             }
+            // Aliases are permitted: `DELETE FROM posts p WHERE p.col = ...`
+            // The base table name is what we use for the actual delete; the
+            // alias is used in the WHERE clause predicate and is passed through
+            // to DataFusion via the SQL we construct in exec_delete_via_df_rowset.
             single_part_name(name)?.to_string()
         }
         _ => {
@@ -3063,6 +3165,20 @@ fn single_table_from_delete(d: &Delete) -> Result<TableName> {
         }
     };
     TableName::new(name)
+}
+
+/// Extract the optional alias from a DELETE statement's FROM clause.
+/// Returns the alias string if present, otherwise None.
+fn delete_table_alias(d: &Delete) -> Option<String> {
+    let tables = match &d.from {
+        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+    };
+    let twj = tables.first()?;
+    if let TableFactor::Table { alias, .. } = &twj.relation {
+        alias.as_ref().map(|a| a.name.value.clone())
+    } else {
+        None
+    }
 }
 
 fn single_part_name(name: &ObjectName) -> Result<&str> {
@@ -3544,6 +3660,103 @@ mod tests {
         assert!(
             matches!(sv, ScalarValue::Float64(v) if (v - 1.5).abs() < 1e-6),
             "Float32 col literal → Float64(1.5), got {sv:?}"
+        );
+    }
+
+    // ── scalar subquery resolution (#106) ────────────────────────────────────
+    //
+    // Unit tests that verify the helper utilities used by the new
+    // `Expr::Subquery` arm in `resolve_subqueries_in_expr`.  The full
+    // end-to-end path (executing a real sub-SELECT and substituting the result
+    // into a SET assignment) is covered by the integration-test matrix; here
+    // we verify the smaller building blocks that are independently testable.
+
+    /// `contains_subquery` detects `Expr::Subquery` nodes.
+    #[test]
+    fn contains_subquery_detects_subquery_expr() {
+        // Build a synthetic `Expr::Subquery(...)` via sqlparser to be sure we
+        // match the right variant.  Parse `(SELECT 1)` as an expression — the
+        // parser produces `Expr::Subquery(_)` for a standalone scalar subquery
+        // in expression position.
+        let expr = parse_expr("(SELECT 1)");
+        assert!(
+            contains_subquery(&expr),
+            "Expr::Subquery should be detected by contains_subquery"
+        );
+    }
+
+    /// `contains_subquery` returns false for plain literals and identifiers.
+    #[test]
+    fn contains_subquery_ignores_plain_literal() {
+        let expr = parse_expr("42");
+        assert!(
+            !contains_subquery(&expr),
+            "plain Number literal should not count as subquery"
+        );
+    }
+
+    /// `contains_subquery` returns false for arithmetic expressions without
+    /// subqueries.
+    #[test]
+    fn contains_subquery_ignores_arithmetic() {
+        let expr = parse_expr("id + 1");
+        assert!(
+            !contains_subquery(&expr),
+            "arithmetic expr should not count as subquery"
+        );
+    }
+
+    /// `arrow_col_value_to_expr` handles the Utf8 (VARCHAR/TEXT) type —
+    /// required for `SET name = (SELECT MAX(name) FROM u)` style queries.
+    #[test]
+    fn arrow_col_value_to_expr_utf8_string() {
+        use arrow_array::StringArray;
+        let arr = StringArray::from(vec!["hello"]);
+        let expr = arrow_col_value_to_expr(&arr, 0).expect("Utf8 must not error");
+        match expr {
+            Expr::Value(ref v) => {
+                let ValueWithSpan {
+                    value: Value::SingleQuotedString(ref s),
+                    ..
+                } = *v
+                else {
+                    panic!("expected SingleQuotedString, got {expr:?}");
+                };
+                assert_eq!(s, "hello");
+            }
+            other => panic!("expected Value(SingleQuotedString), got {other:?}"),
+        }
+    }
+
+    /// `arrow_col_value_to_expr` handles Boolean — required for
+    /// `SET active = (SELECT bool_col FROM u LIMIT 1)`.
+    #[test]
+    fn arrow_col_value_to_expr_boolean_true() {
+        use arrow_array::BooleanArray;
+        let arr = BooleanArray::from(vec![true]);
+        let expr = arrow_col_value_to_expr(&arr, 0).expect("Boolean must not error");
+        match expr {
+            Expr::Value(ref v) => {
+                let ValueWithSpan {
+                    value: Value::Boolean(b),
+                    ..
+                } = *v
+                else {
+                    panic!("expected Boolean literal, got {expr:?}");
+                };
+                assert!(b);
+            }
+            other => panic!("expected Value(Boolean), got {other:?}"),
+        }
+    }
+
+    /// `contains_subquery` recursively detects subqueries inside `IN (SELECT …)`.
+    #[test]
+    fn contains_subquery_detects_in_subquery() {
+        let expr = parse_expr("id IN (SELECT id FROM u)");
+        assert!(
+            contains_subquery(&expr),
+            "Expr::InSubquery should be detected by contains_subquery"
         );
     }
 }

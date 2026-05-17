@@ -2,7 +2,7 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1779033334 (Unix epoch)
+Last run: 1779038407 (Unix epoch)
 SQL fragments tested: 697 total / 1929 green (across all three configurations).
 
 ## Configurations
@@ -183,7 +183,7 @@ SQL fragments tested: 697 total / 1929 green (across all three configurations).
 | `UPDATE t SET id = 1` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 1 WHERE id = 99` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = id + 1` | ✅ | ✅ | ✅ |  |
-| `UPDATE t SET id = (SELECT MAX(id) FROM u)` | 🚫 | 🚫 | 🚫 | invalid schema: UPDATE SET id: scalar subquery on RHS not supported in v0.1 |
+| `UPDATE t SET id = (SELECT MAX(id) FROM u)` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 1 FROM u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 1 RETURNING id` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 1 WHERE id IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
@@ -191,12 +191,12 @@ SQL fragments tested: 697 total / 1929 green (across all three configurations).
 | `DELETE FROM t WHERE id = 1` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t USING u WHERE t.id = u.id` | ✅ | ✅ | ✅ |  |
 | `DELETE FROM t RETURNING id` | ✅ | ✅ | ✅ |  |
-| `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET id = u.id WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | ✅ | ✅ | ✅ |  |
+| `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET id = u.id WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: MERGE INTO t USING u ON t.id = u.id WHEN MATCHE… |
 | `COPY t FROM STDIN` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: ;, found: EOF |
 | `COPY t TO STDOUT` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: COPY t TO STDOUT |
 | `INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE t.id > 0` | ✅ | ✅ | ✅ |  |
-| `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.id > 0 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | ✅ | ✅ | ✅ |  |
+| `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.id > 0 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (u.id)` | 🚫 | 🚫 | 🚫 | internal: unsupported in PoC: MERGE INTO t USING u ON t.id = u.id WHEN MATCHE… |
 | `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
 | `UPDATE t SET id = 99 WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)` | ✅ | ✅ | ✅ |  |
@@ -453,7 +453,7 @@ SQL fragments tested: 697 total / 1929 green (across all three configurations).
 | `SELECT sha256('abc'::bytea)` | ✅ | ✅ | ✅ |  |
 | `SELECT starts_with('abcdef', 'abc')` | ✅ | ✅ | ✅ |  |
 | `SELECT ends_with('abcdef', 'def')` | ✅ | ✅ | ✅ |  |
-| `SELECT SUBSTRING('abcdef' FROM '[a-c]+')` | 📜 | 📜 | 📜 | internal: plan: Error during planning: Internal error: Function 'substr' fail… |
+| `SELECT SUBSTRING('abcdef' FROM '[a-c]+')` | ✅ | ✅ | ✅ |  |
 | `SELECT SUBSTRING('abc' FROM 2)` | ✅ | ✅ | ✅ |  |
 | `SELECT concat('a', 'b', 'c')` | ✅ | ✅ | ✅ |  |
 | `SELECT concat_ws(',', 'a', 'b', 'c')` | ✅ | ✅ | ✅ |  |
