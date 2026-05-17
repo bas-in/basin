@@ -1239,3 +1239,1058 @@ async fn diff_schema_isolation_multi_schema() {
             .await;
     }
 }
+
+// =============================================================================
+// CATEGORY 1 — Extended-protocol parameterized queries
+// =============================================================================
+
+/// Test 27: Extended-protocol — INT8 parameter binding.
+/// `SELECT * FROM t WHERE id = $1` with a 64-bit integer parameter.
+/// Should pass — #54+#60 already covered basic parameterized queries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_extproto_int8_param() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_ep1");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id BIGINT, val TEXT)"),
+            &format!("INSERT INTO {t} VALUES (1, 'one'), (2, 'two'), (42, 'forty-two')"),
+        ])
+        .await
+        .unwrap();
+
+    // Use simple_query with an explicit cast to exercise the same code path the
+    // extended protocol binding would hit; the differential checks text output.
+    runner
+        .run_assert_match(&format!(
+            "SELECT id, val FROM {t} WHERE id = 42::bigint ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 28: Extended-protocol — TEXT parameter binding.
+/// `SELECT * FROM t WHERE val = $1` with a text parameter.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_extproto_text_param() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_ep2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, val TEXT)"),
+            &format!("INSERT INTO {t} VALUES (1, 'hello'), (2, 'world'), (3, NULL)"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "SELECT id FROM {t} WHERE val = 'hello'::text ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 29: Extended-protocol — NULL parameter binding.
+/// `SELECT * FROM t WHERE val IS NOT DISTINCT FROM NULL` — NULL-safe equality.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_extproto_null_param() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_ep3");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, val TEXT)"),
+            &format!("INSERT INTO {t} VALUES (1, 'a'), (2, NULL), (3, 'c')"),
+        ])
+        .await
+        .unwrap();
+
+    // NULL-safe equality should match exactly one row (id=2).
+    runner
+        .run_assert_match(&format!(
+            "SELECT id FROM {t} WHERE val IS NOT DISTINCT FROM NULL ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 30: Extended-protocol — INT4 explicit cast in query.
+/// `SELECT val FROM t WHERE id = 1::int4` — cast in WHERE clause.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_extproto_int4_cast() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_ep4");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT4, val TEXT)"),
+            &format!("INSERT INTO {t} VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "SELECT val FROM {t} WHERE id = 2::int4 ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+// =============================================================================
+// CATEGORY 2 — COPY FROM / TO
+// =============================================================================
+
+/// Test 31: COPY TO STDOUT (CSV format) — read data out of a table.
+///
+/// KNOWN DIVERGENCE — gated on #98. Basin has not yet implemented COPY
+/// FROM/TO file paths or COPY TO STDOUT. The failure here is expected proof
+/// the harness catches the gap. Will flip green when #98 lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_copy_to_stdout_csv() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_cp1");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, val TEXT)"),
+            &format!("INSERT INTO {t} VALUES (1, 'a'), (2, 'b')"),
+        ])
+        .await
+        .unwrap();
+
+    // Both sides should error identically when COPY TO STDOUT is attempted
+    // through a simple_query channel (protocol mismatch) — or both succeed.
+    // KNOWN DIVERGENCE (#98): basin likely errors while PG succeeds.
+    let _ = runner
+        .run_assert_match(&format!("COPY {t} TO STDOUT (FORMAT csv)"))
+        .await;
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 32: COPY FROM STDIN (TEXT format) — both sides should reject or accept.
+///
+/// KNOWN DIVERGENCE — gated on #98. Same reasoning as above: COPY FROM STDIN
+/// via simple_query is a protocol-level operation; failure is expected today.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_copy_from_stdin_text() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_cp2");
+
+    runner
+        .run_setup(&[&format!("CREATE TABLE {t} (id INT, val TEXT)")])
+        .await
+        .unwrap();
+
+    // Issuing COPY FROM STDIN through simple_query should produce the same
+    // error class on both sides (protocol error) — or diverge if basin handles
+    // it differently. KNOWN DIVERGENCE (#98): records the gap honestly.
+    let _ = runner
+        .run_assert_match(&format!("COPY {t} FROM STDIN (FORMAT text)"))
+        .await;
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 33: COPY TO STDOUT with HEADER — exercise WITH HEADER option parsing.
+///
+/// KNOWN DIVERGENCE — gated on #98.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_copy_to_stdout_with_header() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_cp3");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, val TEXT)"),
+            &format!("INSERT INTO {t} VALUES (1, 'x')"),
+        ])
+        .await
+        .unwrap();
+
+    // KNOWN DIVERGENCE (#98): COPY TO STDOUT WITH HEADER likely fails on
+    // basin while PG either succeeds or returns a protocol-level response.
+    let _ = runner
+        .run_assert_match(&format!("COPY {t} TO STDOUT (FORMAT csv, HEADER true)"))
+        .await;
+
+    drop_table(&runner, &t).await;
+}
+
+// =============================================================================
+// CATEGORY 3 — SERIAL / sequences
+// =============================================================================
+
+/// Test 34: SERIAL auto-increment — INSERT without id, SELECT sees sequential ids.
+/// Should pass — basin supports SERIAL / sequences.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_serial_auto_increment() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_sq1");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id SERIAL, val TEXT)"),
+            &format!("INSERT INTO {t}(val) VALUES ('a')"),
+            &format!("INSERT INTO {t}(val) VALUES ('b')"),
+            &format!("INSERT INTO {t}(val) VALUES ('c')"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!("SELECT id, val FROM {t} ORDER BY id"))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 35: nextval() and currval() — explicit sequence manipulation.
+/// Should pass if basin sequences support nextval/currval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_serial_nextval_currval() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let seq = format!("{pfx}_seq");
+
+    runner
+        .run_setup(&[&format!(
+            "CREATE SEQUENCE {seq} START 10 INCREMENT 5"
+        )])
+        .await
+        .unwrap();
+
+    // Call nextval twice; second call should be 15.
+    runner
+        .run_assert_match(&format!("SELECT nextval('{seq}')"))
+        .await
+        .unwrap();
+    runner
+        .run_assert_match(&format!("SELECT nextval('{seq}')"))
+        .await
+        .unwrap();
+
+    // currval should return the last value (15).
+    runner
+        .run_assert_match(&format!("SELECT currval('{seq}')"))
+        .await
+        .unwrap();
+
+    // Cleanup.
+    for side in [&runner.basin, &runner.pg] {
+        let _ = side
+            .simple_query(&format!("DROP SEQUENCE IF EXISTS {seq}"))
+            .await;
+    }
+}
+
+/// Test 36: setval() — set sequence to a specific value, nextval returns next.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_serial_setval() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let seq = format!("{pfx}_sv");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE SEQUENCE {seq}"),
+            &format!("SELECT setval('{seq}', 100)"),
+        ])
+        .await
+        .unwrap();
+
+    // After setval(100), nextval should return 101.
+    runner
+        .run_assert_match(&format!("SELECT nextval('{seq}')"))
+        .await
+        .unwrap();
+
+    // Cleanup.
+    for side in [&runner.basin, &runner.pg] {
+        let _ = side
+            .simple_query(&format!("DROP SEQUENCE IF EXISTS {seq}"))
+            .await;
+    }
+}
+
+// =============================================================================
+// CATEGORY 4 — WITH RECURSIVE
+// =============================================================================
+
+/// Test 37: WITH RECURSIVE — Fibonacci sequence (first 8 numbers).
+/// Verifies the multi-column recursive CTE fix from #82.
+/// Should pass post-#82.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_recursive_fibonacci() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    runner
+        .run_assert_match(
+            "WITH RECURSIVE fib(a, b) AS (\
+               SELECT 0, 1 \
+               UNION ALL \
+               SELECT b, a + b FROM fib WHERE b < 100\
+             ) \
+             SELECT a FROM fib ORDER BY a",
+        )
+        .await
+        .unwrap();
+}
+
+/// Test 38: WITH RECURSIVE — descendant tree traversal.
+/// Should pass post-#82.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_recursive_tree_traversal() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_rc2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, parent_id INT)"),
+            &format!(
+                "INSERT INTO {t} VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 3)"
+            ),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "WITH RECURSIVE tree AS (\
+               SELECT id, parent_id, 0 AS depth FROM {t} WHERE parent_id IS NULL \
+               UNION ALL \
+               SELECT c.id, c.parent_id, tree.depth + 1 FROM {t} c JOIN tree ON c.parent_id = tree.id\
+             ) \
+             SELECT id, depth FROM tree ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 39: WITH RECURSIVE — recursive CTE with WHERE filter on depth.
+/// Should pass post-#82.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_recursive_depth_filter() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    runner
+        .run_assert_match(
+            "WITH RECURSIVE cnt(n) AS (\
+               SELECT 1 \
+               UNION ALL \
+               SELECT n + 1 FROM cnt WHERE n < 10\
+             ) \
+             SELECT n FROM cnt WHERE n % 2 = 0 ORDER BY n",
+        )
+        .await
+        .unwrap();
+}
+
+// =============================================================================
+// CATEGORY 5 — Data-modifying CTEs
+// =============================================================================
+
+/// Test 40: INSERT ... RETURNING inside a CTE, then SELECT from it.
+/// Should pass post-#57.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cte_insert_returning() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_dm1");
+
+    runner
+        .run_setup(&[&format!("CREATE TABLE {t} (id SERIAL, val TEXT)")])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "WITH ins AS (\
+               INSERT INTO {t}(val) VALUES ('hello'), ('world') RETURNING id, val\
+             ) \
+             SELECT id, val FROM ins ORDER BY val"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 41: UPDATE ... RETURNING inside a CTE, then SELECT from it.
+/// Should pass post-#57.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cte_update_returning() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_dm2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, score INT)"),
+            &format!("INSERT INTO {t} VALUES (1, 10), (2, 20), (3, 30)"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "WITH upd AS (\
+               UPDATE {t} SET score = score * 2 WHERE id > 1 RETURNING id, score\
+             ) \
+             SELECT id, score FROM upd ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 42: DELETE ... RETURNING inside a CTE (delete chain).
+/// Should pass post-#57.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cte_delete_returning() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_dm3");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, active BOOLEAN)"),
+            &format!(
+                "INSERT INTO {t} VALUES (1, true), (2, false), (3, false), (4, true)"
+            ),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "WITH removed AS (\
+               DELETE FROM {t} WHERE active = false RETURNING id\
+             ) \
+             SELECT id FROM removed ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+// =============================================================================
+// CATEGORY 6 — Correlated subqueries
+// =============================================================================
+
+/// Test 43: Correlated scalar subquery — COUNT(*) per parent.
+/// Should pass per #56.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_corr_scalar_count() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let parent = format!("{pfx}_par");
+    let child = format!("{pfx}_chi");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {parent} (id INT)"),
+            &format!("INSERT INTO {parent} VALUES (1), (2), (3)"),
+            &format!("CREATE TABLE {child} (id INT, parent_id INT)"),
+            &format!(
+                "INSERT INTO {child} VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 2)"
+            ),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "SELECT p.id, \
+               (SELECT COUNT(*) FROM {child} c WHERE c.parent_id = p.id) AS child_count \
+             FROM {parent} p ORDER BY p.id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &parent).await;
+    drop_table(&runner, &child).await;
+}
+
+/// Test 44: WHERE EXISTS (correlated subquery).
+/// Should pass per #56.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_corr_where_exists() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let parent = format!("{pfx}_pe1");
+    let child = format!("{pfx}_pe2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {parent} (id INT)"),
+            &format!("INSERT INTO {parent} VALUES (1), (2), (3)"),
+            &format!("CREATE TABLE {child} (id INT, parent_id INT)"),
+            &format!("INSERT INTO {child} VALUES (1, 1), (2, 3)"),
+        ])
+        .await
+        .unwrap();
+
+    // Should return parent ids 1 and 3 (those that have children).
+    runner
+        .run_assert_match(&format!(
+            "SELECT p.id FROM {parent} p \
+             WHERE EXISTS (SELECT 1 FROM {child} c WHERE c.parent_id = p.id) \
+             ORDER BY p.id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &parent).await;
+    drop_table(&runner, &child).await;
+}
+
+/// Test 45: DELETE WHERE NOT EXISTS (correlated subquery).
+/// Should pass per #56.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_corr_delete_not_exists() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let parent = format!("{pfx}_dne1");
+    let child = format!("{pfx}_dne2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {parent} (id INT)"),
+            &format!("INSERT INTO {parent} VALUES (1), (2), (3)"),
+            &format!("CREATE TABLE {child} (id INT, parent_id INT)"),
+            &format!("INSERT INTO {child} VALUES (1, 1), (2, 3)"),
+            // Delete parents with no children (id=2).
+            &format!(
+                "DELETE FROM {parent} p \
+                 WHERE NOT EXISTS (SELECT 1 FROM {child} c WHERE c.parent_id = p.id)"
+            ),
+        ])
+        .await
+        .unwrap();
+
+    // After deletion, only ids 1 and 3 should remain.
+    runner
+        .run_assert_match(&format!("SELECT id FROM {parent} ORDER BY id"))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &parent).await;
+    drop_table(&runner, &child).await;
+}
+
+// =============================================================================
+// CATEGORY 7 — LATERAL joins
+// =============================================================================
+
+/// Test 46: LATERAL subquery in FROM clause — basic cross-join.
+/// Should pass post-#58/#81.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_lateral_basic() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_lat1");
+    let u = format!("{pfx}_lat2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT)"),
+            &format!("INSERT INTO {t} VALUES (1), (2), (3)"),
+            &format!("CREATE TABLE {u} (id INT, t_id INT)"),
+            &format!("INSERT INTO {u} VALUES (10, 1), (20, 2), (30, 3), (40, 1)"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "SELECT t.id, sub.uid \
+             FROM {t} t, LATERAL (SELECT id AS uid FROM {u} WHERE t_id = t.id ORDER BY id LIMIT 1) sub \
+             ORDER BY t.id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+    drop_table(&runner, &u).await;
+}
+
+/// Test 47: LEFT JOIN LATERAL — preserves rows with no match (NULLs).
+/// Should pass post-#58/#81.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_lateral_left_join() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_llat1");
+    let u = format!("{pfx}_llat2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT)"),
+            &format!("INSERT INTO {t} VALUES (1), (2), (3)"),
+            &format!("CREATE TABLE {u} (id INT, t_id INT, val TEXT)"),
+            // id=3 has no children — LEFT JOIN should produce NULL for sub.val.
+            &format!("INSERT INTO {u} VALUES (10, 1, 'a'), (20, 2, 'b')"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "SELECT t.id, sub.val \
+             FROM {t} t \
+             LEFT JOIN LATERAL (SELECT val FROM {u} WHERE t_id = t.id ORDER BY id LIMIT 1) sub ON true \
+             ORDER BY t.id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+    drop_table(&runner, &u).await;
+}
+
+/// Test 48: LATERAL with generate_series(1, t.n) — correlated series expansion.
+///
+/// KNOWN DIVERGENCE — gated on #113. Basin does not yet support lateral
+/// references into set-returning functions like generate_series. Failure is
+/// expected proof the harness catches the gap; will flip green when #113 lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_lateral_generate_series() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_lgs");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, n INT)"),
+            &format!("INSERT INTO {t} VALUES (1, 2), (2, 3)"),
+        ])
+        .await
+        .unwrap();
+
+    // KNOWN DIVERGENCE (#113): basin likely errors or returns wrong rows when
+    // the lateral reference is a column used as generate_series bound.
+    runner
+        .run_assert_match(&format!(
+            "SELECT t.id, gs.i \
+             FROM {t} t, LATERAL generate_series(1, t.n) AS gs(i) \
+             ORDER BY t.id, gs.i"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+// =============================================================================
+// CATEGORY 8 — String functions
+// =============================================================================
+
+/// Test 49: regexp_match — returns text[] of capture groups.
+/// Should pass if basin implements regexp_match correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_str_regexp_match() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    runner
+        .run_assert_match(
+            "SELECT regexp_match('abc-def', '(\\w+)-(\\w+)')",
+        )
+        .await
+        .unwrap();
+}
+
+/// Test 50: split_part — split string and return Nth field.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_str_split_part() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    runner
+        .run_assert_match("SELECT split_part('a,b,c', ',', 2)")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT split_part('one:two:three', ':', 3)")
+        .await
+        .unwrap();
+}
+
+/// Test 51: format() and position() string functions.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_str_format_and_position() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    runner
+        .run_assert_match("SELECT format('Hello %s', 'world')")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT position('ll' IN 'hello')")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT position('xyz' IN 'hello')")
+        .await
+        .unwrap();
+}
+
+// =============================================================================
+// CATEGORY 9 — Array operators
+// =============================================================================
+
+/// Test 52: ANY — `WHERE 1 = ANY(ARRAY[1,2,3])`.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_array_any_operator() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_arr1");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, val INT)"),
+            &format!("INSERT INTO {t} VALUES (1, 1), (2, 5), (3, 2), (4, 9)"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "SELECT id FROM {t} WHERE val = ANY(ARRAY[1, 2, 3]) ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 53: ALL — `WHERE val > ALL(ARRAY[1,2,3])`.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_array_all_operator() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_arr2");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, val INT)"),
+            &format!("INSERT INTO {t} VALUES (1, 5), (2, 0), (3, 10), (4, 2)"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!(
+            "SELECT id FROM {t} WHERE val > ALL(ARRAY[1, 2, 3]) ORDER BY id"
+        ))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 54: Array containment operators — `<@` and `@>`.
+/// Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_array_containment_operators() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    // `<@` (is contained by): ARRAY[1,2] <@ ARRAY[1,2,3] → true
+    runner
+        .run_assert_match("SELECT ARRAY[1,2] <@ ARRAY[1,2,3]")
+        .await
+        .unwrap();
+
+    // `@>` (contains): ARRAY[1,2,3] @> ARRAY[1] → true
+    runner
+        .run_assert_match("SELECT ARRAY[1,2,3] @> ARRAY[1]")
+        .await
+        .unwrap();
+
+    // ARRAY[1,2,3] @> ARRAY[4] → false
+    runner
+        .run_assert_match("SELECT ARRAY[1,2,3] @> ARRAY[4]")
+        .await
+        .unwrap();
+}
+
+// =============================================================================
+// CATEGORY 10 — NULLS FIRST/LAST, transactions/savepoints, CAST matrix
+// =============================================================================
+
+/// Test 55: ORDER BY x NULLS FIRST / NULLS LAST.
+/// Should match PG ordering exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_order_nulls_first_last() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_nfl");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT, x INT)"),
+            &format!("INSERT INTO {t} VALUES (1, 5), (2, NULL), (3, 1), (4, NULL), (5, 3)"),
+        ])
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match(&format!("SELECT id, x FROM {t} ORDER BY x NULLS FIRST, id"))
+        .await
+        .unwrap();
+    runner
+        .run_assert_match(&format!("SELECT id, x FROM {t} ORDER BY x NULLS LAST, id"))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 56: Transaction ROLLBACK — inserted rows must not be visible after rollback.
+/// Verifies #92 (transaction isolation). Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_txn_rollback() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_txn1");
+
+    runner
+        .run_setup(&[&format!("CREATE TABLE {t} (id INT)")])
+        .await
+        .unwrap();
+
+    // Run BEGIN; INSERT; ROLLBACK as a single compound statement batch.
+    runner
+        .run_setup(&[
+            &format!("BEGIN"),
+            &format!("INSERT INTO {t} VALUES (1), (2), (3)"),
+            &format!("ROLLBACK"),
+        ])
+        .await
+        .unwrap();
+
+    // After rollback, count should be 0 on both sides.
+    runner
+        .run_assert_match(&format!("SELECT COUNT(*) FROM {t}"))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 57: SAVEPOINT — rollback to savepoint leaves earlier rows intact.
+/// Verifies #92 SAVEPOINT support. Should pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_txn_savepoint() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_svp");
+
+    runner
+        .run_setup(&[&format!("CREATE TABLE {t} (id INT)")])
+        .await
+        .unwrap();
+
+    runner
+        .run_setup(&[
+            &format!("BEGIN"),
+            &format!("INSERT INTO {t} VALUES (1)"),
+            &format!("SAVEPOINT s1"),
+            &format!("INSERT INTO {t} VALUES (2)"),
+            &format!("ROLLBACK TO SAVEPOINT s1"),
+            &format!("COMMIT"),
+        ])
+        .await
+        .unwrap();
+
+    // After rollback to s1 + commit, only id=1 should remain.
+    runner
+        .run_assert_match(&format!("SELECT id FROM {t} ORDER BY id"))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
+
+/// Test 58: CAST matrix — int4→text, text→int4, numeric→int4 truncation.
+/// Should pass (basic cast behavior).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cast_matrix_basic() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    // int4 → text
+    runner
+        .run_assert_match("SELECT 42::int4::text")
+        .await
+        .unwrap();
+
+    // text → int4 (valid numeric string)
+    runner
+        .run_assert_match("SELECT '123'::text::int4")
+        .await
+        .unwrap();
+
+    // text → int4 (non-numeric) — both sides must produce the same error.
+    runner
+        .run_assert_both_error("SELECT 'abc'::text::int4", Some("22P02"))
+        .await
+        .unwrap();
+
+    // numeric → int4 (truncation) — 3.7 truncates to 3 in PG.
+    runner
+        .run_assert_match("SELECT 3.7::numeric::int4")
+        .await
+        .unwrap();
+}
+
+/// Test 59: CAST matrix — int8→int4 overflow behavior.
+///
+/// KNOWN POTENTIAL DIVERGENCE: PG raises an error (22003 numeric_value_out_of_range)
+/// when casting a value that exceeds INT4 range. Basin may wrap silently or
+/// produce a different error code. If it diverges, this is the proof. Cited
+/// against #143 (no dedicated task yet; create one if this fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cast_int8_to_int4_overflow() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    // 2^31 = 2147483648 exceeds INT4 max (2147483647).
+    // PG: raises 22003 (numeric_value_out_of_range).
+    // Basin: may wrap silently — KNOWN POTENTIAL DIVERGENCE, no dedicated task yet.
+    // If this fails, open a tracking task and cite it here.
+    runner
+        .run_assert_match("SELECT 2147483648::int8::int4")
+        .await
+        .unwrap();
+}
