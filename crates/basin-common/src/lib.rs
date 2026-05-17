@@ -14,5 +14,5 @@ pub mod telemetry;
 
 pub use error::{BasinError, Result};
 pub use events::{ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry};
-pub use ids::{Ident, PartitionKey, TableName, ProjectId, MAX_IDENT_LEN};
+pub use ids::{Ident, PartitionKey, ProjectId, QualifiedTableName, SchemaName, TableName, MAX_IDENT_LEN};
 pub use telemetry::{ProjectCounterRegistry, ProjectCounters, ProjectCountersSnapshot};
