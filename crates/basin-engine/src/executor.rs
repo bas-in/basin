@@ -81,6 +81,36 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 return crate::truncate::exec_truncate(sess, &tree).await;
             }
 
+            // Transaction control — intercept before noop_accept so TxState
+            // is updated on every BEGIN / COMMIT / ROLLBACK. Behavior is still
+            // auto-commit (no DML path consults tx_state yet — Step 3+ of
+            // #83), but the flag and snapshot heads are now tracked.
+            match kind {
+                crate::pg_ast::StmtKind::BeginTransaction => {
+                    // Snapshot the current catalog heads into TxState so a
+                    // future real ROLLBACK can restore them.
+                    let current_snapshots = sess
+                        .state
+                        .snapshots
+                        .try_lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    crate::session::tx_begin(&sess.state, current_snapshots);
+                    return Ok(ExecResult::Empty { tag: "BEGIN".into() });
+                }
+                crate::pg_ast::StmtKind::Commit => {
+                    crate::session::tx_commit(&sess.state);
+                    return Ok(ExecResult::Empty { tag: "COMMIT".into() });
+                }
+                crate::pg_ast::StmtKind::Rollback => {
+                    crate::session::tx_rollback(&sess.state);
+                    return Ok(ExecResult::Empty {
+                        tag: "ROLLBACK".into(),
+                    });
+                }
+                _ => {}
+            }
+
             if let Some(result) =
                 crate::noop_accept::try_accept_as_noop(kind, sql)
             {

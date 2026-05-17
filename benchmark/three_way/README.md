@@ -215,59 +215,68 @@ currently emits a single 3-column file; splitting it into two is a one-liner
 
 ---
 
-## Folding results into the cloud benchmark landing
+## How outputs flow into the landing page
 
-The existing `benchmark/bundle.py` script reads `benchmark/<data_dir>/*.json`
-and bundles them into `<data_dir>/results.js`.  To add the 3-way comparison:
+The `benchmark/bundle.py` script reads `benchmark/<data_dir>/*.json` and
+bundles them into `<data_dir>/results.js`.  The 3-way dashboard is already
+wired in — no TOML edits required.
 
-1. Copy the result JSON to a new data directory:
+### Step 1 — after a live run, copy the result JSON
 
-   ```sh
-   mkdir -p benchmark/data_three_way
-   cp benchmark/three_way/out/three_way_fra_<timestamp>.json \
-      benchmark/data_three_way/compare_three_way_fra.json
-   ```
+```sh
+cp benchmark/three_way/out/three_way_fra_<timestamp>.json \
+   benchmark/data_three_way/compare_three_way_fra.json
+```
 
-2. Create a minimal `manifest.json` in that directory:
+The target directory `benchmark/data_three_way/` and its `manifest.json` are
+already committed.  The manifest lists `three_way_fra` under `compare`, which
+matches the `id` field in the JSON emitted by this harness.
 
-   ```json
-   {
-     "viability": [],
-     "scaling":   [],
-     "compare":   ["three_way_fra"]
-   }
-   ```
+### Step 2 — bundle the dashboard
 
-3. Append a `[[dashboard]]` row to `benchmark/dashboards.toml` (do not modify
-   `bundle.py` or `template.html`):
+```sh
+python3 benchmark/bundle.py --dir data_three_way
+```
 
-   ```toml
-   [[dashboard]]
-   slug             = "three_way"
-   storage_backend  = "tigris"
-   compute_backend  = "cloud"
-   environment      = "cloud"
-   data_dir         = "data_three_way"
-   title            = "Basin Cloud — 3-way Frankfurt benchmark"
-   h1               = "Basin Cloud — Frankfurt 3-way"
-   subtitle         = "Neon vs Supabase vs Basin Cloud — identical workload, same region."
-   footer           = "Run by the operator after deploying all three services to eu-central/fra."
-   ```
+This writes:
+- `benchmark/data_three_way/results.js` — script-tag bundle for the HTML dashboard
+- `benchmark/RESULTS_three_way.md` — plain-text report with a 3-column table
+- `benchmark/index_three_way.html` — the static HTML dashboard (re-rendered from
+  `benchmark/template.html`)
 
-4. Run the bundler:
+```sh
+open benchmark/index_three_way.html
+```
 
-   ```sh
-   python3 benchmark/bundle.py --dir data_three_way
-   ```
+### Step 3 — mirror to basin-cloud (cloud landing page)
 
-   This writes `benchmark/data_three_way/results.js` and
-   `benchmark/RESULTS_three_way.md`.
+The basin-cloud `public/benchmarks/data_three_way/` directory is a target for
+the `copy-benchmark-data.mjs` script.  After the OSS bundle step, run:
 
-5. Open `benchmark/index_three_way.html` to see the dashboard.
+```sh
+cd ../basin-cloud
+node scripts/copy-benchmark-data.mjs
+```
 
-> **Note:** Step 4 will use the existing `compareCard()` renderer which shows
-> only `basin` and `postgres` columns.  Implement `threeWayCompareCard()` in
-> `assets/dashboard.js` (see Option A above) for the full 3-column view.
+This mirrors the JSON (including `compare_three_way_fra.json` and `manifest.json`)
+from `basin/benchmark/data_three_way/` to
+`basin-cloud/public/benchmarks/data_three_way/`.  The landing page's benchmark
+selector will then show the "3-way Frankfurt" option; it is **hidden** when the
+directory is empty (the `.gitkeep` placeholder does not trigger the selector).
+
+### JSON shape consumed by bundle.py
+
+The 3-way compare reports use a superset of the standard `compare` shape:
+metrics carry `neon`, `supabase`, and `basin` value columns instead of
+`basin` + `postgres`.  `bundle.py`'s `render_compare()` detects this
+automatically (by the presence of a `neon` or `supabase` key in any metric) and
+renders a 3-column Markdown table instead of the legacy 2-column table.
+
+The `dashboard.js` renderer in the static HTML dashboard uses the existing
+`compareCard()` which reads `m.basin` and `m.postgres`; it will display only
+the Basin column for 3-way results.  A future `threeWayCompareCard()` extension
+to `assets/dashboard.js` would render all three columns (see Option A above)
+— that is out of scope for the current wiring pass.
 
 ---
 

@@ -236,6 +236,14 @@ def render_scaling(reports: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
+def _is_three_way(r: dict) -> bool:
+    """Return True if this compare report uses the 3-column neon/supabase/basin shape."""
+    for m in r.get("metrics", []):
+        if "neon" in m or "supabase" in m:
+            return True
+    return False
+
+
 def render_compare(reports: dict[str, dict]) -> str:
     items = [
         (name, r)
@@ -261,29 +269,65 @@ def render_compare(reports: dict[str, dict]) -> str:
         lines.append("")
         lines.append(f"_{r.get('claim', '')}_")
         lines.append("")
-        lines.append("| Metric | Basin | Postgres | Winner | Ratio |")
-        lines.append("|---|---|---|---|---|")
-        for m in r.get("metrics", []):
-            label = m.get("label", "?")
-            basin = m.get("basin", 0.0)
-            pg = m.get("postgres", 0.0)
-            unit = m.get("unit", "")
-            better = m.get("better", "tie")
-            winner_label = {
-                "basin": "Basin",
-                "postgres": "Postgres",
-                "tie": "tie",
-            }.get(better, better)
-            ratio = m.get("ratio_text") or "—"
-            if unit == "bytes":
-                basin_s = f"{basin / 1_048_576:.2f} MiB"
-                pg_s = f"{pg / 1_048_576:.2f} MiB"
-            else:
-                basin_s = f"{basin:.2f} {unit}".strip()
-                pg_s = f"{pg:.2f} {unit}".strip()
-            lines.append(
-                f"| {label} | `{basin_s}` | `{pg_s}` | **{winner_label}** | `{ratio}` |"
-            )
+
+        if _is_three_way(r):
+            # 3-column compare: Neon | Supabase | Basin
+            lines.append("| Metric | Neon | Supabase | Basin | Winner |")
+            lines.append("|---|---|---|---|---|")
+            for m in r.get("metrics", []):
+                label = m.get("label", "?")
+                neon = m.get("neon")
+                supabase = m.get("supabase")
+                basin = m.get("basin")
+                unit = m.get("unit", "")
+                better = m.get("better") or "—"
+                winner_label = {
+                    "basin": "**Basin**",
+                    "neon": "**Neon**",
+                    "supabase": "**Supabase**",
+                    "tie": "tie",
+                }.get(better, better)
+
+                def _fmt(v: float | None, u: str) -> str:
+                    if v is None:
+                        return "—"
+                    if u == "bytes":
+                        return f"{v / 1_048_576:.2f} MiB"
+                    return f"{v:.2f} {u}".strip()
+
+                lines.append(
+                    f"| {label} "
+                    f"| `{_fmt(neon, unit)}` "
+                    f"| `{_fmt(supabase, unit)}` "
+                    f"| `{_fmt(basin, unit)}` "
+                    f"| {winner_label} |"
+                )
+        else:
+            # Legacy 2-column compare: Basin | Postgres
+            lines.append("| Metric | Basin | Postgres | Winner | Ratio |")
+            lines.append("|---|---|---|---|---|")
+            for m in r.get("metrics", []):
+                label = m.get("label", "?")
+                basin = m.get("basin", 0.0)
+                pg = m.get("postgres", 0.0)
+                unit = m.get("unit", "")
+                better = m.get("better", "tie")
+                winner_label = {
+                    "basin": "Basin",
+                    "postgres": "Postgres",
+                    "tie": "tie",
+                }.get(better, better)
+                ratio = m.get("ratio_text") or "—"
+                if unit == "bytes":
+                    basin_s = f"{basin / 1_048_576:.2f} MiB"
+                    pg_s = f"{pg / 1_048_576:.2f} MiB"
+                else:
+                    basin_s = f"{basin:.2f} {unit}".strip()
+                    pg_s = f"{pg:.2f} {unit}".strip()
+                lines.append(
+                    f"| {label} | `{basin_s}` | `{pg_s}` | **{winner_label}** | `{ratio}` |"
+                )
+
         note = r.get("note")
         if note:
             lines.append("")

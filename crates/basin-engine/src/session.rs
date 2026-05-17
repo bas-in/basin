@@ -96,6 +96,44 @@ pub(crate) enum OverridingKind {
     User,
 }
 
+/// Per-session transaction state — tracks whether a `BEGIN` has been issued
+/// and records catalog-snapshot heads captured at `BEGIN` time.
+///
+/// ## Role in the overall transaction model
+///
+/// This struct is **plumbing only** (Steps 1–2 of issue #83). The `active`
+/// flag is set by `BEGIN` and cleared by `COMMIT` / `ROLLBACK`, and
+/// `pre_tx_snapshots` captures the catalog heads at `BEGIN` time so that a
+/// future real `ROLLBACK` can restore them. Neither field is *consulted* by
+/// any DML path yet — INSERT / UPDATE / DELETE still commit immediately
+/// (auto-commit semantics preserved). The remaining step (Step 3+) that
+/// defers catalog commits when `active == true` requires a lockstep flip of
+/// three pinned integration tests in `coverage_txn_schema.rs` and must be
+/// approved by the user before proceeding.
+///
+/// ## Fields
+///
+/// * `active` — `true` between a `BEGIN` and the matching `COMMIT`/`ROLLBACK`.
+///   Currently unused by DML; only set/cleared.
+/// * `pre_tx_snapshots` — snapshot IDs captured from `SessionState::snapshots`
+///   at `BEGIN` time. When Step 3 lands, `ROLLBACK` will use these to restore
+///   catalog heads. Currently unused by any rollback logic.
+/// * `pending_files` — reserved for Step 3: files written during the open
+///   transaction that have NOT yet been committed to the catalog. Currently
+///   always empty; populated and drained by the Step 3 INSERT deferral.
+#[derive(Debug, Default)]
+pub(crate) struct TxState {
+    /// `true` between `BEGIN` and the matching `COMMIT` / `ROLLBACK`.
+    pub(crate) active: bool,
+    /// Snapshot IDs of tables as they appeared when `BEGIN` was issued.
+    /// Used by a future `ROLLBACK` to restore catalog heads.
+    pub(crate) pre_tx_snapshots: HashMap<TableName, SnapshotId>,
+    /// Data files written during the open transaction that have not yet
+    /// been committed to the catalog. Populated by Step 3 INSERT deferral
+    /// (not yet implemented).
+    pub(crate) pending_files: HashMap<TableName, Vec<DataFileRef>>,
+}
+
 /// Per-session mutable state. The `SessionContext` itself is `Send + Sync`
 /// and DataFusion handles concurrency on it; we only need the snapshot cache
 /// behind a mutex.
@@ -136,6 +174,16 @@ pub(crate) struct SessionState {
     /// `.take()` synchronously from inside the INSERT path without
     /// crossing an `await`.
     pub(crate) pending_overriding: std::sync::Mutex<Option<OverridingKind>>,
+    /// Per-session explicit-transaction state. Tracks whether a `BEGIN`
+    /// has been issued and (in the future) the catalog-snapshot heads at
+    /// `BEGIN` time. See [`TxState`] doc-comment for the full rationale
+    /// and the Step 3+ design notes.
+    ///
+    /// Uses a `std::sync::Mutex` (not `tokio`) because the accessors
+    /// (`tx_begin`, `tx_commit`, `tx_rollback`, `tx_is_active`) are
+    /// called from synchronous contexts inside the executor dispatch path
+    /// — no `await` needed.
+    pub(crate) tx_state: std::sync::Mutex<TxState>,
 }
 
 impl SessionState {
@@ -148,8 +196,69 @@ impl SessionState {
             cursors: crate::cursor::CursorRegistry::new(),
             schema_state: Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default())),
             pending_overriding: std::sync::Mutex::new(None),
+            tx_state: std::sync::Mutex::new(TxState::default()),
         }
     }
+}
+
+/// Mark the start of an explicit transaction. Snapshots the current
+/// per-table snapshot-id map into `TxState::pre_tx_snapshots` so that a
+/// future real `ROLLBACK` implementation can restore the catalog heads.
+/// Idempotent if called while already active (matches PG behaviour for
+/// `WARNING: there is already a transaction in progress`).
+///
+/// Currently: sets `active = true` and copies snapshot heads. No DML path
+/// consults `active` yet — auto-commit semantics are fully preserved.
+pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableName, SnapshotId>) {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    // Idempotent: if already active, leave state unchanged (matches PG
+    // WARNING: there is already a transaction in progress).
+    if !tx.active {
+        tx.active = true;
+        tx.pre_tx_snapshots = current_snapshots;
+        tx.pending_files.clear();
+    }
+}
+
+/// Mark the end of an explicit transaction with `COMMIT`. Clears `active`,
+/// drops the saved snapshot heads, and drops any (currently empty) pending
+/// files list. Auto-commit semantics: all DML already committed individually
+/// so there is nothing to flush.
+pub(crate) fn tx_commit(state: &SessionState) {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    tx.active = false;
+    tx.pre_tx_snapshots.clear();
+    tx.pending_files.clear();
+}
+
+/// Mark the end of an explicit transaction with `ROLLBACK`. Clears `active`
+/// and drops saved state. Auto-commit semantics: the DML is already durable
+/// so no catalog restoration happens here. Step 3+ will use
+/// `pre_tx_snapshots` and `pending_files` to actually undo writes.
+pub(crate) fn tx_rollback(state: &SessionState) {
+    let mut tx = state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned");
+    tx.active = false;
+    tx.pre_tx_snapshots.clear();
+    tx.pending_files.clear();
+}
+
+/// Returns `true` if an explicit `BEGIN` has been issued and neither
+/// `COMMIT` nor `ROLLBACK` has been seen yet. Pure flag read — no I/O.
+pub(crate) fn tx_is_active(state: &SessionState) -> bool {
+    state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned")
+        .active
 }
 
 /// Stash the OVERRIDING kind extracted from the current INSERT
@@ -860,5 +969,180 @@ mod tests {
         println!(
             "Improvement: p50 {speedup:.1}x faster ({before_p50:.3}ms -> {after_p50:.3}ms)",
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // TxState plumbing unit tests (Steps 1-2 of issue #83)
+    //
+    // These tests verify that BEGIN/COMMIT/ROLLBACK correctly flip
+    // TxState::active and populate / clear pre_tx_snapshots. They do NOT
+    // require any I/O or a real catalog — SessionState::new() is enough.
+    //
+    // Auto-commit semantics are PRESERVED: no DML path reads TxState::active
+    // yet. These tests only prove the flag and snapshot heads are tracked.
+    // -------------------------------------------------------------------------
+
+    fn make_test_session_state() -> SessionState {
+        SessionState::new()
+    }
+
+    /// Initially inactive: a fresh session has no open transaction.
+    #[test]
+    fn tx_state_initially_inactive() {
+        let state = make_test_session_state();
+        assert!(
+            !tx_is_active(&state),
+            "TxState must be inactive on a fresh session"
+        );
+    }
+
+    /// BEGIN sets the active flag and captures snapshot heads.
+    #[test]
+    fn tx_begin_sets_active_and_snapshots() {
+        let state = make_test_session_state();
+
+        let mut heads = HashMap::new();
+        let table = TableName::new("orders").expect("valid table name");
+        heads.insert(table.clone(), basin_catalog::SnapshotId(42));
+
+        tx_begin(&state, heads.clone());
+
+        assert!(tx_is_active(&state), "tx_begin must set active = true");
+
+        let tx = state.tx_state.lock().expect("lock");
+        assert_eq!(
+            tx.pre_tx_snapshots.get(&table),
+            Some(&basin_catalog::SnapshotId(42)),
+            "pre_tx_snapshots must capture the heads passed to tx_begin"
+        );
+        assert!(
+            tx.pending_files.is_empty(),
+            "pending_files must be empty after tx_begin (Step 3 not yet implemented)"
+        );
+    }
+
+    /// COMMIT clears the active flag and drops snapshot heads.
+    #[test]
+    fn tx_commit_clears_state() {
+        let state = make_test_session_state();
+
+        let mut heads = HashMap::new();
+        let table = TableName::new("events").expect("valid table name");
+        heads.insert(table.clone(), basin_catalog::SnapshotId(7));
+        tx_begin(&state, heads);
+
+        assert!(tx_is_active(&state), "precondition: active after BEGIN");
+
+        tx_commit(&state);
+
+        assert!(
+            !tx_is_active(&state),
+            "tx_commit must set active = false"
+        );
+
+        let tx = state.tx_state.lock().expect("lock");
+        assert!(
+            tx.pre_tx_snapshots.is_empty(),
+            "tx_commit must clear pre_tx_snapshots"
+        );
+        assert!(
+            tx.pending_files.is_empty(),
+            "tx_commit must clear pending_files"
+        );
+    }
+
+    /// ROLLBACK clears the active flag and drops snapshot heads.
+    #[test]
+    fn tx_rollback_clears_state() {
+        let state = make_test_session_state();
+
+        let mut heads = HashMap::new();
+        let table = TableName::new("logs").expect("valid table name");
+        heads.insert(table.clone(), basin_catalog::SnapshotId(99));
+        tx_begin(&state, heads);
+
+        assert!(tx_is_active(&state), "precondition: active after BEGIN");
+
+        tx_rollback(&state);
+
+        assert!(
+            !tx_is_active(&state),
+            "tx_rollback must set active = false"
+        );
+
+        let tx = state.tx_state.lock().expect("lock");
+        assert!(
+            tx.pre_tx_snapshots.is_empty(),
+            "tx_rollback must clear pre_tx_snapshots"
+        );
+        assert!(
+            tx.pending_files.is_empty(),
+            "tx_rollback must clear pending_files"
+        );
+    }
+
+    /// Idempotent BEGIN: calling tx_begin while already active must not
+    /// overwrite the existing snapshot heads (mirrors PG's WARNING: there
+    /// is already a transaction in progress — the transaction continues).
+    #[test]
+    fn tx_begin_idempotent_preserves_first_snapshots() {
+        let state = make_test_session_state();
+
+        let table = TableName::new("items").expect("valid table name");
+
+        // First BEGIN: capture snapshot 1.
+        let mut heads1 = HashMap::new();
+        heads1.insert(table.clone(), basin_catalog::SnapshotId(1));
+        tx_begin(&state, heads1);
+
+        // Second BEGIN: would capture snapshot 2, but must be ignored.
+        let mut heads2 = HashMap::new();
+        heads2.insert(table.clone(), basin_catalog::SnapshotId(2));
+        tx_begin(&state, heads2);
+
+        let tx = state.tx_state.lock().expect("lock");
+        assert_eq!(
+            tx.pre_tx_snapshots.get(&table),
+            Some(&basin_catalog::SnapshotId(1)),
+            "second tx_begin must not overwrite snapshots from the first BEGIN"
+        );
+    }
+
+    /// Full lifecycle: BEGIN → COMMIT → BEGIN again.
+    #[test]
+    fn tx_lifecycle_begin_commit_begin_again() {
+        let state = make_test_session_state();
+
+        tx_begin(&state, HashMap::new());
+        assert!(tx_is_active(&state));
+
+        tx_commit(&state);
+        assert!(!tx_is_active(&state));
+
+        // A second transaction in the same session must be allowed.
+        tx_begin(&state, HashMap::new());
+        assert!(
+            tx_is_active(&state),
+            "session must accept a second BEGIN after a completed transaction"
+        );
+    }
+
+    /// ROLLBACK without a preceding BEGIN: must not panic (matches PG's
+    /// WARNING: there is no transaction in progress).
+    #[test]
+    fn tx_rollback_without_begin_no_panic() {
+        let state = make_test_session_state();
+        // Must not panic.
+        tx_rollback(&state);
+        assert!(!tx_is_active(&state));
+    }
+
+    /// COMMIT without a preceding BEGIN: must not panic.
+    #[test]
+    fn tx_commit_without_begin_no_panic() {
+        let state = make_test_session_state();
+        // Must not panic.
+        tx_commit(&state);
+        assert!(!tx_is_active(&state));
     }
 }
