@@ -15,7 +15,7 @@ use arrow_array::types::{
     IntervalMonthDayNanoType, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, FixedSizeListArray, LargeListArray, ListArray, RecordBatch};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use basin_common::Result;
 use bytes::{BufMut, BytesMut};
@@ -461,6 +461,33 @@ fn encode_value_binary(
                 buf,
             );
         }
+        // PG array binary wire format. 1-D only; nested arrays (ListArray of
+        // ListArray) would need recursive handling and are deferred until a
+        // concrete production need arises.
+        DataType::List(_field) => {
+            let list_arr = col
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("ListArray for List column");
+            let elem_array = list_arr.value(idx);
+            encode_array_binary(elem_array.as_ref(), buf);
+        }
+        DataType::LargeList(_field) => {
+            let list_arr = col
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("LargeListArray for LargeList column");
+            let elem_array = list_arr.value(idx);
+            encode_array_binary(elem_array.as_ref(), buf);
+        }
+        DataType::FixedSizeList(_field, _size) => {
+            let list_arr = col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("FixedSizeListArray for FixedSizeList column");
+            let elem_array = list_arr.value(idx);
+            encode_array_binary(elem_array.as_ref(), buf);
+        }
         // For types we don't have a binary representation for yet, fall back
         // to text. This is a deliberate v1 trade-off: drivers requesting
         // binary for an exotic type get the text form, which is a violation
@@ -633,6 +660,203 @@ fn encode_numeric_binary(raw: i128, scale: u16, buf: &mut BytesMut) {
     for d in &digits {
         buf.put_u16(*d);
     }
+}
+
+/// Map an Arrow `DataType` to the Postgres element OID used inside the PG
+/// array binary wire header. Mirrors `arrow_to_pg_type` but returns the raw
+/// `u32` OID rather than a `pgwire::Type` because the array header needs the
+/// *element* OID directly.
+///
+/// Falls back to `Type::TEXT.oid()` (25) for any unmapped type, consistent
+/// with the text-fallback policy used elsewhere in this file.
+fn oid_for_arrow_type(dt: &DataType) -> u32 {
+    match dt {
+        DataType::Boolean => Type::BOOL.oid(),
+        DataType::Int16 => Type::INT2.oid(),
+        DataType::Int32 => Type::INT4.oid(),
+        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => Type::INT8.oid(),
+        DataType::Float32 => Type::FLOAT4.oid(),
+        DataType::Float64 => Type::FLOAT8.oid(),
+        DataType::Utf8 | DataType::LargeUtf8 => Type::TEXT.oid(),
+        DataType::Binary | DataType::LargeBinary => Type::BYTEA.oid(),
+        DataType::Date32 => Type::DATE.oid(),
+        DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ.oid(),
+        DataType::Timestamp(_, None) => Type::TIMESTAMP.oid(),
+        DataType::Interval(IntervalUnit::MonthDayNano) => Type::INTERVAL.oid(),
+        DataType::Decimal128(_, _) => Type::NUMERIC.oid(),
+        _ => Type::TEXT.oid(),
+    }
+}
+
+/// Encode a single element at index `j` of `elem_array` into `buf` as a
+/// length-prefixed binary value (or -1 for NULL). This is the per-element
+/// encoding used inside the PG array binary wire format.
+///
+/// Supports the same scalar types as `encode_value_binary`; exotic types fall
+/// back to a text encoding (same lenient policy as the outer scalar path).
+fn encode_element_binary(elem_array: &dyn Array, j: usize, buf: &mut BytesMut) {
+    if elem_array.is_null(j) {
+        buf.put_i32(-1);
+        return;
+    }
+    match elem_array.data_type() {
+        DataType::Boolean => {
+            let v = elem_array.as_boolean().value(j);
+            buf.put_i32(1);
+            buf.put_u8(if v { 1 } else { 0 });
+        }
+        DataType::Int16 => {
+            let v = elem_array.as_primitive::<Int16Type>().value(j);
+            buf.put_i32(2);
+            buf.put_i16(v);
+        }
+        DataType::Int32 => {
+            let v = elem_array.as_primitive::<Int32Type>().value(j);
+            buf.put_i32(4);
+            buf.put_i32(v);
+        }
+        DataType::Int64 => {
+            let v = elem_array.as_primitive::<Int64Type>().value(j);
+            buf.put_i32(8);
+            buf.put_i64(v);
+        }
+        DataType::UInt32 => {
+            let v = elem_array.as_primitive::<UInt32Type>().value(j) as i64;
+            buf.put_i32(8);
+            buf.put_i64(v);
+        }
+        DataType::UInt64 => {
+            let v = elem_array.as_primitive::<UInt64Type>().value(j) as i64;
+            buf.put_i32(8);
+            buf.put_i64(v);
+        }
+        DataType::Float32 => {
+            let v = elem_array.as_primitive::<Float32Type>().value(j);
+            buf.put_i32(4);
+            buf.put_f32(v);
+        }
+        DataType::Float64 => {
+            let v = elem_array.as_primitive::<Float64Type>().value(j);
+            buf.put_i32(8);
+            buf.put_f64(v);
+        }
+        DataType::Utf8 => {
+            let s = elem_array.as_string::<i32>().value(j);
+            buf.put_i32(s.len() as i32);
+            buf.put_slice(s.as_bytes());
+        }
+        DataType::LargeUtf8 => {
+            let s = elem_array.as_string::<i64>().value(j);
+            buf.put_i32(s.len() as i32);
+            buf.put_slice(s.as_bytes());
+        }
+        DataType::Binary => {
+            let bytes = elem_array.as_binary::<i32>().value(j);
+            buf.put_i32(bytes.len() as i32);
+            buf.put_slice(bytes);
+        }
+        DataType::LargeBinary => {
+            let bytes = elem_array.as_binary::<i64>().value(j);
+            buf.put_i32(bytes.len() as i32);
+            buf.put_slice(bytes);
+        }
+        DataType::Date32 => {
+            let days = elem_array.as_primitive::<Date32Type>().value(j);
+            buf.put_i32(4);
+            buf.put_i32(days - PG_EPOCH_DAYS_FROM_UNIX);
+        }
+        DataType::Timestamp(unit, _tz) => {
+            let raw: i64 = match unit {
+                TimeUnit::Second => elem_array.as_primitive::<TimestampSecondType>().value(j),
+                TimeUnit::Millisecond => {
+                    elem_array.as_primitive::<TimestampMillisecondType>().value(j)
+                }
+                TimeUnit::Microsecond => {
+                    elem_array.as_primitive::<TimestampMicrosecondType>().value(j)
+                }
+                TimeUnit::Nanosecond => {
+                    elem_array.as_primitive::<TimestampNanosecondType>().value(j)
+                }
+            };
+            let unix_micros: i64 = match unit {
+                TimeUnit::Second => raw.saturating_mul(1_000_000),
+                TimeUnit::Millisecond => raw.saturating_mul(1_000),
+                TimeUnit::Microsecond => raw,
+                TimeUnit::Nanosecond => raw / 1_000,
+            };
+            buf.put_i32(8);
+            buf.put_i64(unix_micros - PG_EPOCH_MICROS_FROM_UNIX);
+        }
+        DataType::Decimal128(_, scale) => {
+            let scale = *scale as u16;
+            encode_numeric_binary(
+                elem_array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Decimal128Array>()
+                    .expect("Decimal128Array for NUMERIC array element")
+                    .value(j),
+                scale,
+                buf,
+            );
+        }
+        other => {
+            // Fallback: emit the element as text (same lenient policy as the
+            // outer scalar catch-all). Strict drivers may balk, but this is
+            // better than panicking or omitting the element.
+            tracing::debug!(
+                ?other,
+                "array element binary format not implemented, emitting text"
+            );
+            let s = render_cell(elem_array, j);
+            buf.put_i32(s.len() as i32);
+            buf.put_slice(s.as_bytes());
+        }
+    }
+}
+
+/// Encode a 1-D Arrow list as the Postgres binary array wire format.
+///
+/// ## Wire layout (all big-endian, per PG docs §55.2.12 + `postgres-types`
+/// `array_to_sql`):
+/// ```text
+/// i32  ndim         = 1
+/// i32  has_nulls    = 0 or 1
+/// u32  elem_oid     = OID of element type
+/// i32  dim_len      = N (number of elements)
+/// i32  lower_bound  = 1 (PG arrays are 1-indexed by default)
+/// // N elements, each:
+/// i32  elem_len     = byte-length of element, or -1 for NULL
+/// [elem_len bytes]  = binary encoding of the element (absent if NULL)
+/// ```
+///
+/// Multi-dimension arrays (ndim > 1): deferred — basin's Arrow arrays are
+/// 1-D in all current production paths. Nested ListArrays would require
+/// recursive handling; document this and punt until needed.
+fn encode_array_binary(elem_array: &dyn Array, buf: &mut BytesMut) {
+    let n = elem_array.len();
+    let has_nulls: i32 = if elem_array.null_count() > 0 { 1 } else { 0 };
+    let elem_oid: u32 = oid_for_arrow_type(elem_array.data_type());
+
+    // Reserve space for the outer length prefix; we'll fill it in at the end.
+    let len_pos = buf.len();
+    buf.put_i32(0); // placeholder — overwritten below
+
+    // Array header.
+    buf.put_i32(1);             // ndim = 1
+    buf.put_i32(has_nulls);
+    buf.put_u32(elem_oid);
+    buf.put_i32(n as i32);      // dim_len
+    buf.put_i32(1);             // lower_bound (1-indexed)
+
+    // Elements.
+    for j in 0..n {
+        encode_element_binary(elem_array, j, buf);
+    }
+
+    // Back-fill the outer length prefix (bytes written after the 4-byte len).
+    let body_len = (buf.len() - len_pos - 4) as i32;
+    let bytes = body_len.to_be_bytes();
+    buf[len_pos..len_pos + 4].copy_from_slice(&bytes);
 }
 
 /// Encode the value at row `idx` of `col` into `buf` as a length-prefixed
@@ -1518,5 +1742,236 @@ mod tests {
         assert_eq!(ndigits, 2);
         assert_eq!(digits[0], 1);
         assert_eq!(digits[1], 5000);
+    }
+
+    // -----------------------------------------------------------------------
+    // ARRAY binary wire format tests (#144)
+    // -----------------------------------------------------------------------
+    //
+    // Helper: parse the PG array binary body from the raw wire bytes.
+    // Returns (ndim, has_nulls, elem_oid, dim_len, lower_bound, element_bytes)
+    // where element_bytes is the raw bytes after the per-dimension headers.
+    fn parse_array_header(data: &[u8]) -> (i32, i32, u32, i32, i32, &[u8]) {
+        // First 4 bytes = outer length prefix (body size).
+        let body_len = i32::from_be_bytes(data[0..4].try_into().unwrap());
+        assert!(body_len >= 0, "NULL array not expected in parse_array_header");
+        let ndim      = i32::from_be_bytes(data[4..8].try_into().unwrap());
+        let has_nulls = i32::from_be_bytes(data[8..12].try_into().unwrap());
+        let elem_oid  = u32::from_be_bytes(data[12..16].try_into().unwrap());
+        let dim_len   = i32::from_be_bytes(data[16..20].try_into().unwrap());
+        let lower_bound = i32::from_be_bytes(data[20..24].try_into().unwrap());
+        let elements = &data[24..4 + body_len as usize];
+        (ndim, has_nulls, elem_oid, dim_len, lower_bound, elements)
+    }
+
+    // Parse element stream: returns (len, body_slice_or_empty_for_null) pairs.
+    fn parse_elements(mut data: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let mut out = Vec::new();
+        while !data.is_empty() {
+            let elem_len = i32::from_be_bytes(data[0..4].try_into().unwrap());
+            data = &data[4..];
+            if elem_len == -1 {
+                out.push(None);
+            } else {
+                let n = elem_len as usize;
+                out.push(Some(data[..n].to_vec()));
+                data = &data[n..];
+            }
+        }
+        out
+    }
+
+    // --- Test A: [1, 2, 3] as Int32 LIST → ndim=1, has_nulls=0, elem_oid=23 ---
+    // Each element is 4 bytes big-endian i32.
+    // Wire: len=32+body, ndim=1, has_nulls=0, oid=23, dim=3, lb=1,
+    //       (4,\x00\x00\x00\x01), (4,\x00\x00\x00\x02), (4,\x00\x00\x00\x03)
+    #[test]
+    fn array_binary_int4_simple() {
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_array::{Int32Array, ListArray as ArrowListArray};
+        use arrow_schema::Field as ArrowField;
+        let elem_field = Arc::new(ArrowField::new("item", DataType::Int32, false));
+        let values = Arc::new(Int32Array::from(vec![1i32, 2, 3]));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 3]));
+        let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("arr", DataType::List(elem_field), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(list)],
+        ).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let data = &rows[0].data;
+        let (ndim, has_nulls, elem_oid, dim_len, lower_bound, elems_bytes) =
+            parse_array_header(data);
+        assert_eq!(ndim, 1);
+        assert_eq!(has_nulls, 0);
+        assert_eq!(elem_oid, Type::INT4.oid());
+        assert_eq!(dim_len, 3);
+        assert_eq!(lower_bound, 1);
+        let elems = parse_elements(elems_bytes);
+        assert_eq!(elems.len(), 3);
+        // Element bodies are big-endian i32.
+        assert_eq!(elems[0].as_deref(), Some(&1i32.to_be_bytes()[..]));
+        assert_eq!(elems[1].as_deref(), Some(&2i32.to_be_bytes()[..]));
+        assert_eq!(elems[2].as_deref(), Some(&3i32.to_be_bytes()[..]));
+    }
+
+    // --- Test B: [1, NULL, 3] as Int64 LIST → has_nulls=1, elem_oid=20 ---
+    #[test]
+    fn array_binary_int8_with_null() {
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_array::{Int64Array, ListArray as ArrowListArray};
+        use arrow_schema::Field as ArrowField;
+        let elem_field = Arc::new(ArrowField::new("item", DataType::Int64, true));
+        let values = Arc::new(Int64Array::from(vec![Some(1i64), None, Some(3)]));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 3]));
+        let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("arr", DataType::List(elem_field), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let data = &rows[0].data;
+        let (ndim, has_nulls, elem_oid, dim_len, _lower, elems_bytes) =
+            parse_array_header(data);
+        assert_eq!(ndim, 1);
+        assert_eq!(has_nulls, 1);
+        assert_eq!(elem_oid, Type::INT8.oid());
+        assert_eq!(dim_len, 3);
+        let elems = parse_elements(elems_bytes);
+        assert_eq!(elems[0].as_deref(), Some(&1i64.to_be_bytes()[..]));
+        assert_eq!(elems[1], None); // NULL element
+        assert_eq!(elems[2].as_deref(), Some(&3i64.to_be_bytes()[..]));
+    }
+
+    // --- Test C: [] as Int32 LIST → dim=0, no elements ---
+    #[test]
+    fn array_binary_empty() {
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_array::{Int32Array, ListArray as ArrowListArray};
+        use arrow_schema::Field as ArrowField;
+        let elem_field = Arc::new(ArrowField::new("item", DataType::Int32, false));
+        let values = Arc::new(Int32Array::from(vec![] as Vec<i32>));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0]));
+        let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("arr", DataType::List(elem_field), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let data = &rows[0].data;
+        let (_ndim, has_nulls, _elem_oid, dim_len, lower_bound, elems_bytes) =
+            parse_array_header(data);
+        assert_eq!(has_nulls, 0);
+        assert_eq!(dim_len, 0);
+        assert_eq!(lower_bound, 1);
+        assert_eq!(elems_bytes.len(), 0);
+    }
+
+    // --- Test D: ['hello', 'world'] as TEXT LIST → elem_oid=25 ---
+    // Element bodies are UTF-8 bytes (no extra length prefix within the body).
+    #[test]
+    fn array_binary_text() {
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_array::{ListArray as ArrowListArray, StringArray};
+        use arrow_schema::Field as ArrowField;
+        let elem_field = Arc::new(ArrowField::new("item", DataType::Utf8, false));
+        let values = Arc::new(StringArray::from(vec!["hello", "world"]));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2]));
+        let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("arr", DataType::List(elem_field), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let data = &rows[0].data;
+        let (_ndim, has_nulls, elem_oid, dim_len, _lower, elems_bytes) =
+            parse_array_header(data);
+        assert_eq!(has_nulls, 0);
+        assert_eq!(elem_oid, Type::TEXT.oid()); // 25
+        assert_eq!(dim_len, 2);
+        let elems = parse_elements(elems_bytes);
+        assert_eq!(elems[0].as_deref(), Some(b"hello" as &[u8]));
+        assert_eq!(elems[1].as_deref(), Some(b"world" as &[u8]));
+    }
+
+    // --- Test E: [NULL, NULL] as Int32 LIST → has_nulls=1, both elems NULL ---
+    #[test]
+    fn array_binary_all_null() {
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_array::{Int32Array, ListArray as ArrowListArray};
+        use arrow_schema::Field as ArrowField;
+        let elem_field = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let values = Arc::new(Int32Array::from(vec![None::<i32>, None::<i32>]));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2]));
+        let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("arr", DataType::List(elem_field), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let data = &rows[0].data;
+        let (_ndim, has_nulls, _elem_oid, dim_len, _lower, elems_bytes) =
+            parse_array_header(data);
+        assert_eq!(has_nulls, 1);
+        assert_eq!(dim_len, 2);
+        let elems = parse_elements(elems_bytes);
+        assert_eq!(elems[0], None);
+        assert_eq!(elems[1], None);
+    }
+
+    // --- Test F: NULL LIST row → 4-byte -1 prefix, no body ---
+    // The entire list cell is NULL (not elements within it).
+    #[test]
+    fn array_binary_null_row() {
+        use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_array::{Int32Array, ListArray as ArrowListArray};
+        use arrow_schema::Field as ArrowField;
+        let elem_field = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let values = Arc::new(Int32Array::from(vec![] as Vec<i32>));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0]));
+        // Mark the single row NULL.
+        let nulls = NullBuffer::from(vec![false]);
+        let list = ArrowListArray::new(elem_field.clone(), offsets, values, Some(nulls));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("arr", DataType::List(elem_field), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let data = &rows[0].data;
+        // NULL row: exactly 4 bytes, value -1.
+        assert_eq!(data.len(), 4);
+        assert_eq!(i32::from_be_bytes(data[0..4].try_into().unwrap()), -1);
+    }
+
+    // --- Test G: round-trip via encode_batches_with_formats, LargeList ---
+    // Verify the LargeList arm is also exercised end-to-end.
+    #[test]
+    fn array_binary_round_trip_via_encode_batches() {
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_array::{Int32Array, LargeListArray as ArrowLargeListArray};
+        use arrow_schema::Field as ArrowField;
+        let elem_field = Arc::new(ArrowField::new("item", DataType::Int32, false));
+        let values = Arc::new(Int32Array::from(vec![10i32, 20]));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 2]));
+        let list = ArrowLargeListArray::new(elem_field.clone(), offsets, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("arr", DataType::LargeList(elem_field), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let data = &rows[0].data;
+        let (ndim, has_nulls, elem_oid, dim_len, lower_bound, elems_bytes) =
+            parse_array_header(data);
+        assert_eq!(ndim, 1);
+        assert_eq!(has_nulls, 0);
+        assert_eq!(elem_oid, Type::INT4.oid());
+        assert_eq!(dim_len, 2);
+        assert_eq!(lower_bound, 1);
+        let elems = parse_elements(elems_bytes);
+        assert_eq!(elems[0].as_deref(), Some(&10i32.to_be_bytes()[..]));
+        assert_eq!(elems[1].as_deref(), Some(&20i32.to_be_bytes()[..]));
     }
 }
