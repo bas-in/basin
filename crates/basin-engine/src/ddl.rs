@@ -1616,6 +1616,248 @@ fn at_word_boundary_end(bytes: &[u8], i: usize) -> bool {
     !(c.is_ascii_alphanumeric() || c == b'_')
 }
 
+/// Case-insensitive keyword prefix match at the start of `bytes`.
+fn matches_keyword(bytes: &[u8], kw: &[u8]) -> bool {
+    if bytes.len() < kw.len() {
+        return false;
+    }
+    bytes
+        .iter()
+        .zip(kw.iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Strip a trailing `WITH [NO] DATA` clause from a `CREATE TABLE … AS
+/// <query> [WITH [NO] DATA]` statement.
+///
+/// sqlparser 0.61 cannot parse the clause (its `CreateTable` AST has no
+/// field for it; the statement parser fails with "Expected: end of
+/// statement, found: WITH"). libpg_query — already parsed by the
+/// executor — *does* understand it, so the caller passes the
+/// libpg_query-derived `is_ctas` gate: this function is only invoked
+/// when the statement is genuinely a plain CTAS. Even so the scan stays
+/// deliberately conservative:
+///
+/// - It only removes the **last** `WITH` token in the statement, and
+///   only when that `WITH` is followed by an optional `NO` and then
+///   `DATA` (and nothing but optional `;` / whitespace afterwards).
+/// - It is string- and comment-literal aware (single-quoted strings,
+///   `--` line comments, `/* */` block comments are skipped) so a
+///   `WITH`/`DATA`/`NO` appearing inside a literal or comment can never
+///   be mistaken for the clause.
+/// - A **leading** CTE `WITH cte AS (...)` is never the *last* `WITH`
+///   in a CTAS that ends in `WITH [NO] DATA`, and a CTE `WITH` is never
+///   directly followed by the bare token `DATA`/`NO DATA` at end of
+///   statement, so the CTE form is left untouched.
+///
+/// Returns the original `sql` unchanged when no exactly-trailing
+/// `WITH [NO] DATA` token sequence is found.
+pub(crate) fn strip_trailing_with_data(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    // Position of the last top-level `WITH` keyword (outside strings /
+    // comments) — that is the candidate for the trailing data clause.
+    let mut last_with: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+        if at_word_boundary(bytes, i)
+            && matches_keyword(&bytes[i..], b"WITH")
+            && at_word_boundary_end(bytes, i + 4)
+        {
+            last_with = Some(i);
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+
+    let Some(with_pos) = last_with else {
+        return sql.to_string();
+    };
+
+    // Walk forward from the candidate `WITH`: optional whitespace, an
+    // optional `NO`, optional whitespace, then `DATA`, then only
+    // whitespace / `;` until end of statement.
+    let mut j = with_pos + 4;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if matches_keyword(&bytes[j..], b"NO") && at_word_boundary_end(bytes, j + 2) {
+        j += 2;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+    }
+    if !(matches_keyword(&bytes[j..], b"DATA") && at_word_boundary_end(bytes, j + 4)) {
+        return sql.to_string();
+    }
+    j += 4;
+    // Everything after `DATA` must be whitespace or a single trailing
+    // `;` — otherwise this `WITH … DATA` is not the trailing data clause
+    // (defensive: a real CTAS never has tokens after it).
+    let mut k = j;
+    while k < bytes.len() {
+        let c = bytes[k];
+        if c.is_ascii_whitespace() || c == b';' {
+            k += 1;
+        } else {
+            return sql.to_string();
+        }
+    }
+
+    // Splice out `WITH [NO] DATA`, preserving any trailing `;`.
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(sql[..with_pos].trim_end());
+    let tail = sql[j..].trim();
+    if tail.starts_with(';') {
+        out.push(';');
+    }
+    out
+}
+
+/// Strip the bare LHS column-name list from a
+/// `CREATE TABLE [IF NOT EXISTS] <name> (col, …) AS <query>` so
+/// sqlparser 0.61 (which rejects the bare list with "Expected: a data
+/// type name") can parse the `CREATE TABLE <name> AS <query>` body. The
+/// names themselves are recovered from libpg_query by the caller, so
+/// they need not be parsed here.
+///
+/// Only invoked when libpg_query has already classified the statement
+/// as a plain CTAS *with* a non-empty column-name list, so the only
+/// `(...)` group that can appear between the table name and the `AS`
+/// keyword is that list. The scan is string/comment aware and removes
+/// exactly the first balanced `(...)` group that precedes the top-level
+/// `AS`. Returns `sql` unchanged if no such group is found (defensive).
+pub(crate) fn strip_ctas_column_list(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    // Find the first top-level `(` that appears before the first
+    // top-level `AS` keyword.
+    let mut paren_start: Option<usize> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+        if at_word_boundary(bytes, i)
+            && matches_keyword(&bytes[i..], b"AS")
+            && at_word_boundary_end(bytes, i + 2)
+        {
+            // Reached the `AS` with no preceding `(` — nothing to strip
+            // (e.g. the column list was already absent).
+            return sql.to_string();
+        }
+        if b == b'(' {
+            paren_start = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(start) = paren_start else {
+        return sql.to_string();
+    };
+    // Walk the balanced parenthesis group (string/comment aware).
+    let mut depth = 0usize;
+    let mut j = start;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b == b'\'' {
+            j += 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\'' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            continue;
+        }
+        if b == b'(' {
+            depth += 1;
+        } else if b == b')' {
+            depth -= 1;
+            if depth == 0 {
+                j += 1;
+                break;
+            }
+        }
+        j += 1;
+    }
+    if depth != 0 {
+        return sql.to_string();
+    }
+    // Splice out the `(...)` group, collapsing the surrounding
+    // whitespace to a single space so `name (a,b) AS` → `name AS`.
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(sql[..start].trim_end());
+    out.push(' ');
+    out.push_str(sql[j..].trim_start());
+    out
+}
+
 #[cfg(test)]
 mod cluster_by_tests {
     use super::*;

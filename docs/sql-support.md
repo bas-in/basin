@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1779054718 (Unix epoch)
-SQL fragments tested: 697 total / 1911 green (across all three configurations).
+Last run: 1779059902 (Unix epoch)
+SQL fragments tested: 697 total / 1905 green (across all three configurations).
 
 ## Configurations
 
@@ -165,7 +165,7 @@ SQL fragments tested: 697 total / 1911 green (across all three configurations).
 | `ALTER TABLE t DETACH PARTITION p` | 🚫 | 🚫 | 🚫 | setup failed: feature not supported: CREATE TABLE … PARTITION OF is not sup… |
 | `CREATE TABLE t (name TEXT COLLATE "C")` | 📜 | 📜 | 📜 | invalid schema: unsupported column option in PoC: COLLATE "C" |
 | `CREATE TABLE t2 AS SELECT * FROM t` | ✅ | ✅ | ✅ |  |
-| `CREATE TABLE t2 AS SELECT * FROM t WITH NO DATA` | ❌ | ❌ | ❌ | internal: parse error: sql parser error: Expected: end of statement, found: W… |
+| `CREATE TABLE t2 AS SELECT * FROM t WITH NO DATA` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE t_default PARTITION OF t DEFAULT` | 📜 | 📜 | 📜 | setup failed: invalid schema: PARTITION BY RANGE column id must be TIMESTAMPT… |
 
 ## DML
@@ -667,7 +667,7 @@ SQL fragments tested: 697 total / 1911 green (across all three configurations).
 | `SELECT * FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id NOT IN (SELECT id FROM u)` | ✅ | ✅ | ✅ |  |
 | `SELECT t.id, (SELECT COUNT(*) FROM u WHERE u.id = t.id) AS cnt FROM t` | ✅ | ✅ | ✅ |  |
-| `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Argument #2 must be an INTEGER or NULL… |
+| `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t, LATERAL unnest(ARRAY[1,2,3]) tag` | ✅ | ✅ | ✅ |  |
 | `SELECT t.id, sub.* FROM t, LATERAL jsonb_each('{"a":1}'::jsonb) sub` | ✅ | ✅ | ✅ |  |
@@ -782,17 +782,17 @@ SQL fragments tested: 697 total / 1911 green (across all three configurations).
 | `BEGIN` | ✅ | ✅ | ✅ |  |
 | `COMMIT` | ✅ | ✅ | ✅ |  |
 | `ROLLBACK` | ✅ | ✅ | ✅ |  |
-| `SAVEPOINT s` | ✅ | ✅ | ✅ |  |
-| `RELEASE SAVEPOINT s` | ✅ | ✅ | ✅ |  |
-| `ROLLBACK TO s` | ✅ | ✅ | ✅ |  |
+| `SAVEPOINT s` | 📜 | 📜 | 📜 | invalid schema: SAVEPOINT can only be used in transaction blocks (SQLSTATE 25… |
+| `RELEASE SAVEPOINT s` | 📜 | 📜 | 📜 | invalid schema: RELEASE SAVEPOINT can only be used in transaction blocks (SQL… |
+| `ROLLBACK TO s` | 📜 | 📜 | 📜 | invalid schema: ROLLBACK TO SAVEPOINT can only be used in transaction blocks … |
 | `BEGIN ISOLATION LEVEL SERIALIZABLE` | ✅ | ✅ | ✅ |  |
 | `BEGIN READ ONLY` | ✅ | ✅ | ✅ |  |
 | `BEGIN READ WRITE` | ✅ | ✅ | ✅ |  |
 | `START TRANSACTION` | ✅ | ✅ | ✅ |  |
 | `START TRANSACTION ISOLATION LEVEL READ COMMITTED` | ✅ | ✅ | ✅ |  |
 | `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` | ✅ | ✅ | ✅ |  |
-| `ROLLBACK TO SAVEPOINT s` | 📜 | 📜 | 📜 | invalid schema: savepoint "s" does not exist |
-| `RELEASE SAVEPOINT s` | ✅ | ✅ | ✅ |  |
+| `ROLLBACK TO SAVEPOINT s` | 📜 | 📜 | 📜 | invalid schema: ROLLBACK TO SAVEPOINT can only be used in transaction blocks … |
+| `RELEASE SAVEPOINT s` | 📜 | 📜 | 📜 | invalid schema: RELEASE SAVEPOINT can only be used in transaction blocks (SQL… |
 
 ## Types
 

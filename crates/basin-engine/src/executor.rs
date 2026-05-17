@@ -149,103 +149,138 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     }
                     return Ok(ExecResult::Empty { tag: "COMMIT".into() });
                 }
-                crate::pg_ast::StmtKind::Rollback => {
-                    // Distinguish bare ROLLBACK from ROLLBACK TO SAVEPOINT.
-                    let sql_upper = raw_sql.trim().to_ascii_uppercase();
-                    if sql_upper.contains("TO") && sql_upper.contains("SAVEPOINT") {
-                        // ROLLBACK TO SAVEPOINT <name>
-                        let sp_name = extract_savepoint_name(raw_sql, "rollback_to");
-                        match sp_name {
-                            Some(name) => {
-                                match crate::session::tx_rollback_to_savepoint(&sess.state, &name) {
-                                    Ok((abandoned, snapshots)) => {
-                                        // Delete abandoned files (best-effort).
-                                        for (_, files) in &abandoned {
-                                            for f in files {
-                                                let path = object_store::path::Path::from(f.path.as_str());
-                                                let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
-                                            }
-                                        }
-                                        // Refresh DataFusion ctx for affected tables.
-                                        let touched = crate::session::tx_touched_tables(&sess.state);
-                                        for table in &touched {
-                                            let pending = crate::session::tx_pending_files_for(&sess.state, table);
-                                            let _ = crate::session::refresh_table_with_extra(
-                                                &sess.engine,
-                                                &sess.project,
-                                                &sess.ctx,
-                                                &sess.state,
-                                                table,
-                                                &pending,
-                                            ).await;
-                                        }
-                                        // Tables where all pending files were abandoned:
-                                        // restore to pre-tx catalog view.
-                                        for table in abandoned.keys() {
-                                            if !touched.contains(table) {
-                                                if let Some(snap) = snapshots.get(table) {
-                                                    let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap).await;
-                                                }
-                                                let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
-                                            }
-                                        }
-                                        return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
-                                    }
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            None => {
-                                return Err(basin_common::BasinError::internal(
-                                    "ROLLBACK TO SAVEPOINT: missing savepoint name"
+                crate::pg_ast::StmtKind::Rollback
+                | crate::pg_ast::StmtKind::Savepoint => {
+                    // Use libpg_query's authoritative parse to tell the
+                    // transaction-control sub-forms apart and to pull the
+                    // savepoint name straight from the AST.  PostgreSQL makes
+                    // `WORK`, `TRANSACTION`, and `SAVEPOINT` all optional, so
+                    // the old `contains("SAVEPOINT")` text heuristic mis-routed
+                    // `ROLLBACK TO s` (no SAVEPOINT keyword) into a full
+                    // transaction rollback. `txn_stmt` is exact.
+                    let txn = tree
+                        .stmts()
+                        .next()
+                        .and_then(crate::pg_ast::txn_stmt);
+                    use crate::pg_ast::TxnStmt;
+                    match txn {
+                        Some(TxnStmt::RollbackToSavepoint(name)) => {
+                            // PG: outside an explicit transaction block this is
+                            // an error (SQLSTATE 25P01, no_active_sql_transaction):
+                            // `ROLLBACK TO SAVEPOINT can only be used in
+                            // transaction blocks` — not "savepoint does not exist".
+                            if !crate::session::tx_is_active(&sess.state) {
+                                return Err(basin_common::BasinError::InvalidSchema(
+                                    "ROLLBACK TO SAVEPOINT can only be used in \
+                                     transaction blocks (SQLSTATE 25P01)"
+                                        .into(),
                                 ));
                             }
-                        }
-                    } else {
-                        // Bare ROLLBACK — undo everything.
-                        let (pending, snapshots) = crate::session::tx_rollback(&sess.state);
-                        // Delete pending (not-yet-committed) files best-effort.
-                        for (_, files) in &pending {
-                            for f in files {
-                                let path = object_store::path::Path::from(f.path.as_str());
-                                let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
+                            if name.is_empty() {
+                                return Err(basin_common::BasinError::internal(
+                                    "ROLLBACK TO SAVEPOINT: missing savepoint name",
+                                ));
                             }
-                        }
-                        // Restore catalog snapshot for each touched table.
-                        for (table, snap_id) in &snapshots {
-                            let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap_id).await;
-                            let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
-                        }
-                        return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
-                    }
-                }
-                crate::pg_ast::StmtKind::Savepoint => {
-                    // Distinguish SAVEPOINT <name> from RELEASE SAVEPOINT <name>.
-                    let sql_upper = raw_sql.trim().to_ascii_uppercase();
-                    if sql_upper.starts_with("RELEASE") {
-                        // RELEASE SAVEPOINT <name>
-                        let sp_name = extract_savepoint_name(raw_sql, "release");
-                        match sp_name {
-                            Some(name) => {
-                                if crate::session::tx_is_active(&sess.state) {
-                                    // Ignore errors for unknown savepoint names
-                                    // in non-active sessions.
-                                    let _ = crate::session::tx_release_savepoint(&sess.state, &name);
+                            match crate::session::tx_rollback_to_savepoint(&sess.state, &name) {
+                                Ok((abandoned, snapshots)) => {
+                                    // Delete abandoned files (best-effort).
+                                    for (_, files) in &abandoned {
+                                        for f in files {
+                                            let path = object_store::path::Path::from(f.path.as_str());
+                                            let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
+                                        }
+                                    }
+                                    // Refresh DataFusion ctx for affected tables.
+                                    let touched = crate::session::tx_touched_tables(&sess.state);
+                                    for table in &touched {
+                                        let pending = crate::session::tx_pending_files_for(&sess.state, table);
+                                        let _ = crate::session::refresh_table_with_extra(
+                                            &sess.engine,
+                                            &sess.project,
+                                            &sess.ctx,
+                                            &sess.state,
+                                            table,
+                                            &pending,
+                                        ).await;
+                                    }
+                                    // Tables where all pending files were abandoned:
+                                    // restore to pre-tx catalog view.
+                                    for table in abandoned.keys() {
+                                        if !touched.contains(table) {
+                                            if let Some(snap) = snapshots.get(table) {
+                                                let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap).await;
+                                            }
+                                            let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
+                                        }
+                                    }
+                                    return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
                                 }
-                                return Ok(ExecResult::Empty { tag: "RELEASE".into() });
-                            }
-                            None => {
-                                return Ok(ExecResult::Empty { tag: "RELEASE".into() });
+                                Err(e) => return Err(e),
                             }
                         }
-                    } else {
-                        // SAVEPOINT <name>
-                        let sp_name = extract_savepoint_name(raw_sql, "savepoint");
-                        if let Some(name) = sp_name {
-                            if crate::session::tx_is_active(&sess.state) {
-                                crate::session::tx_push_savepoint(&sess.state, name);
+                        Some(TxnStmt::Rollback) | None
+                            if matches!(kind, crate::pg_ast::StmtKind::Rollback) =>
+                        {
+                            // Bare ROLLBACK — undo everything.
+                            let (pending, snapshots) = crate::session::tx_rollback(&sess.state);
+                            // Delete pending (not-yet-committed) files best-effort.
+                            for (_, files) in &pending {
+                                for f in files {
+                                    let path = object_store::path::Path::from(f.path.as_str());
+                                    let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
+                                }
                             }
+                            // Restore catalog snapshot for each touched table.
+                            for (table, snap_id) in &snapshots {
+                                let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap_id).await;
+                                let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
+                            }
+                            return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
                         }
-                        return Ok(ExecResult::Empty { tag: "SAVEPOINT".into() });
+                        Some(TxnStmt::Savepoint(name)) => {
+                            // PG: `SAVEPOINT can only be used in transaction
+                            // blocks` (SQLSTATE 25P01) when not inside BEGIN.
+                            if !crate::session::tx_is_active(&sess.state) {
+                                return Err(basin_common::BasinError::InvalidSchema(
+                                    "SAVEPOINT can only be used in transaction \
+                                     blocks (SQLSTATE 25P01)"
+                                        .into(),
+                                ));
+                            }
+                            if name.is_empty() {
+                                return Err(basin_common::BasinError::internal(
+                                    "SAVEPOINT: missing savepoint name",
+                                ));
+                            }
+                            crate::session::tx_push_savepoint(&sess.state, name);
+                            return Ok(ExecResult::Empty { tag: "SAVEPOINT".into() });
+                        }
+                        Some(TxnStmt::ReleaseSavepoint(name)) => {
+                            // PG: outside a transaction block this is an error
+                            // (SQLSTATE 25P01): `RELEASE SAVEPOINT can only be
+                            // used in transaction blocks`.
+                            if !crate::session::tx_is_active(&sess.state) {
+                                return Err(basin_common::BasinError::InvalidSchema(
+                                    "RELEASE SAVEPOINT can only be used in \
+                                     transaction blocks (SQLSTATE 25P01)"
+                                        .into(),
+                                ));
+                            }
+                            if name.is_empty() {
+                                return Err(basin_common::BasinError::internal(
+                                    "RELEASE SAVEPOINT: missing savepoint name",
+                                ));
+                            }
+                            // PG raises SQLSTATE 3B001 (no_such_savepoint)
+                            // when the name is unknown; propagate it instead
+                            // of silently swallowing.
+                            crate::session::tx_release_savepoint(&sess.state, &name)?;
+                            return Ok(ExecResult::Empty { tag: "RELEASE".into() });
+                        }
+                        // Defensive: a transaction node we don't special-case
+                        // here (e.g. PREPARE TRANSACTION) falls through to the
+                        // noop-accept gate below, preserving prior behaviour.
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -445,6 +480,40 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let sql_owned = lifecycle_stripped;
     let sql = sql_owned.as_str();
 
+    // `CREATE TABLE … AS <query> [WITH [NO] DATA]` (CTAS). libpg_query —
+    // the real PostgreSQL parser already run above as `raw_pg_tree` —
+    // understands the trailing `WITH [NO] DATA` clause and exposes it as
+    // `into.skip_data`. sqlparser 0.61's `CreateTable` AST has no field
+    // for the clause, so its statement parser fails ("Expected: end of
+    // statement, found: WITH"). When the original statement is a plain
+    // CTAS we strip the trailing clause textually here (string/comment
+    // aware, only the exactly-trailing token sequence) so sqlparser
+    // parses the `CREATE TABLE … AS <query>` body normally; the
+    // `skip_data` boolean is threaded into `exec_create_table` so the
+    // row-population step can be skipped for `WITH NO DATA`. Not a CTAS
+    // → SQL is left exactly as-is and `ctas_no_data` stays `None`.
+    let mut ctas_shape: Option<crate::pg_ast::CtasShape> = None;
+    if let Some(ref tree) = raw_pg_tree {
+        if let Some(node) = tree.stmts().next() {
+            ctas_shape = crate::pg_ast::ctas_shape(node);
+        }
+    }
+    let ctas_stripped = if let Some(ref shape) = ctas_shape {
+        // Strip the trailing `WITH [NO] DATA`, then (if present) the
+        // bare LHS column-name list — both are libpg_query-confirmed
+        // and unparseable by sqlparser 0.61. Order matters: strip the
+        // tail first so the column-list scan sees a clean head.
+        let s = crate::ddl::strip_trailing_with_data(sql);
+        if shape.col_names.is_empty() {
+            s
+        } else {
+            crate::ddl::strip_ctas_column_list(&s)
+        }
+    } else {
+        sql.to_string()
+    };
+    let sql = ctas_stripped.as_str();
+
     // INCLUDE DELETED on SELECT is the soft-delete opt-out.
     let (select_stripped, include_deleted) = extract_select_include_deleted(sql);
     let sql = select_stripped.as_str();
@@ -638,6 +707,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     //     → `INNER JOIN (SELECT u.col, expr AS a FROM u) sub ON sub.col = t.col`
     // Only fires for non-aggregate, single-predicate, no-ORDER-BY/LIMIT bodies.
     let rewritten = crate::pg_operators::rewrite_lateral_correlated_row(&rewritten);
+    // Decorrelate `[CROSS] JOIN LATERAL generate_series(<lo>, <tbl>.<col>)
+    // <alias>` (and the comma form) into a bounded recursive-CTE JOIN. The
+    // built-in `generate_series` table function rejects non-literal args
+    // (correlated column refs AND scalar subqueries alike), so the textbook
+    // `generate_series(1, (SELECT max(t.id) FROM t))` rewrite is NOT viable on
+    // DataFusion 53 — a recursive series bounded by the table max plus a
+    // per-row range predicate reproduces exact PG semantics. Must run BEFORE
+    // the recursive-CTE column-alias rewriter (below) so the emitted
+    // `WITH RECURSIVE name(value) AS (SELECT …)` base case is normalised.
+    // No-op unless the 2nd arg is a correlated `tbl.col`; the constant/constant
+    // `generate_series(1, 3)` form is left untouched (already works).
+    let rewritten = crate::pg_operators::rewrite_lateral_generate_series(&rewritten);
     // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
     let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
     // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.
@@ -838,7 +919,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     }
 
     let result = match stmt {
-        Statement::CreateTable(ct) => exec_create_table(sess, ct, cluster_columns, lifecycle).await,
+        Statement::CreateTable(ct) => {
+            exec_create_table(sess, ct, cluster_columns, lifecycle, ctas_shape).await
+        }
         Statement::CreateIndex(ci) => exec_create_index(sess, ci).await,
         Statement::Drop {
             object_type: sqlparser::ast::ObjectType::Index,
@@ -1294,9 +1377,33 @@ async fn exec_create_table(
     mut ct: sqlparser::ast::CreateTable,
     cluster_columns: Option<Vec<String>>,
     lifecycle: CreateTableLifecycle,
+    ctas_shape: Option<crate::pg_ast::CtasShape>,
 ) -> Result<ExecResult> {
     let name = single_part_name(&ct.name)?;
     let table = TableName::new(name)?;
+
+    // `CREATE TABLE … AS <query>` (CTAS). `ctas_shape` is `Some` iff
+    // libpg_query classified the original statement as a plain CTAS.
+    // `skip_data` true → `WITH NO DATA` (schema only, no rows); false →
+    // populate from the query result. The query's resolved output
+    // schema becomes the table schema; `col_names` (the optional LHS
+    // `(col, …)` list, captured by libpg_query because sqlparser cannot
+    // parse it) renames the columns positionally (PG semantics).
+    if let Some(shape) = ctas_shape {
+        let query = ct.query.as_deref().ok_or_else(|| {
+            BasinError::internal("CREATE TABLE AS: missing query body after parse")
+        })?;
+        return exec_create_table_as(
+            sess,
+            &table,
+            name,
+            query,
+            &shape.col_names,
+            ct.if_not_exists,
+            shape.skip_data,
+        )
+        .await;
+    }
 
     // Phase 5.11.K2: resolve column types that reference a user-defined
     // enum or domain. Each match rewrites the column's data_type to the
@@ -1502,6 +1609,117 @@ async fn exec_create_table(
 
     Ok(ExecResult::Empty {
         tag: "CREATE TABLE".into(),
+    })
+}
+
+/// `CREATE TABLE <name> [(<col>, …)] AS <query> [WITH [NO] DATA]`.
+///
+/// PostgreSQL semantics: the new table's column set is the **resolved
+/// output schema of `query`** (names + types exactly as `SELECT …`
+/// would produce). An optional `(col, …)` list positionally renames
+/// those output columns. `WITH NO DATA` (`no_data == true`) creates the
+/// schema only — zero rows; `WITH DATA` / no clause populates it from
+/// the query result.
+///
+/// The query is planned through the session's DataFusion context (the
+/// same context the SQL pre-screen pipeline already prepared), so CTEs,
+/// inlined SQL functions, RLS, and partition pruning are all in effect.
+/// Population is delegated to the normal `INSERT INTO … <query>` path so
+/// constraint / RLS / event machinery is reused unchanged.
+async fn exec_create_table_as(
+    sess: &ProjectSession,
+    table: &TableName,
+    name: &str,
+    query: &sqlparser::ast::Query,
+    rename: &[String],
+    if_not_exists: bool,
+    no_data: bool,
+) -> Result<ExecResult> {
+    // Resolve the query's output schema by planning it (no execution).
+    let query_sql = query.to_string();
+    let df = sess
+        .ctx
+        .sql(&query_sql)
+        .await
+        .map_err(|e| BasinError::internal(format!("CREATE TABLE AS plan: {e}")))?;
+    let df_schema = df.schema().as_arrow().clone();
+    let mut ws_schema = schema_df_to_ws(&df_schema)?;
+
+    // An explicit `(col, …)` list renames the query's output columns
+    // positionally (PG: must not be wider than the query's projection).
+    if !rename.is_empty() {
+        if rename.len() > ws_schema.fields().len() {
+            return Err(BasinError::InvalidSchema(format!(
+                "CREATE TABLE {name}: column name list has {} entries but the query \
+                 produces only {} column(s)",
+                rename.len(),
+                ws_schema.fields().len()
+            )));
+        }
+        let renamed: Vec<arrow_schema::Field> = ws_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let nm = rename.get(i).cloned().unwrap_or_else(|| f.name().clone());
+                let mut nf =
+                    arrow_schema::Field::new(nm, f.data_type().clone(), f.is_nullable());
+                if !f.metadata().is_empty() {
+                    nf = nf.with_metadata(f.metadata().clone());
+                }
+                nf
+            })
+            .collect();
+        ws_schema = arrow_schema::Schema::new(renamed);
+    }
+
+    match sess
+        .engine
+        .config()
+        .catalog
+        .create_table(&sess.project, table, &ws_schema)
+        .await
+    {
+        Ok(_metadata) => {}
+        Err(BasinError::Catalog(_)) if if_not_exists => {
+            // Pre-existing table + IF NOT EXISTS — PG no-ops (no create,
+            // no populate).
+            return Ok(ExecResult::Empty {
+                tag: "CREATE TABLE".into(),
+            });
+        }
+        Err(e) => return Err(e),
+    }
+
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
+
+    if no_data {
+        // Schema-only clone: table exists with the query's columns and
+        // zero rows.
+        return Ok(ExecResult::Empty {
+            tag: "CREATE TABLE AS".into(),
+        });
+    }
+
+    // Populate via the standard INSERT … SELECT path so constraint /
+    // RLS / change-event handling is identical to a hand-written
+    // `INSERT INTO t <query>`. When the LHS renamed columns, name the
+    // target columns explicitly so positional mapping is unambiguous.
+    let insert_sql = if rename.is_empty() {
+        format!("INSERT INTO {} {}", table.as_str(), query_sql)
+    } else {
+        let cols = ws_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("INSERT INTO {} ({}) {}", table.as_str(), cols, query_sql)
+    };
+    Box::pin(execute(sess, &insert_sql)).await?;
+
+    Ok(ExecResult::Empty {
+        tag: "CREATE TABLE AS".into(),
     })
 }
 
@@ -4667,58 +4885,10 @@ pub(crate) async fn rewrite_json_agg_whole_row(
     result
 }
 
-// ---------------------------------------------------------------------------
-// Savepoint name extraction
-// ---------------------------------------------------------------------------
-
-/// Extract the savepoint name from a `SAVEPOINT <name>`, `RELEASE SAVEPOINT
-/// <name>`, or `ROLLBACK TO SAVEPOINT <name>` statement.
-///
-/// `mode` is one of `"savepoint"`, `"release"`, or `"rollback_to"`.
-/// Returns `None` if the name cannot be determined.
-fn extract_savepoint_name(sql: &str, mode: &str) -> Option<String> {
-    let upper = sql.trim().to_ascii_uppercase();
-    let rest = match mode {
-        "savepoint" => upper.strip_prefix("SAVEPOINT")?,
-        "release" => {
-            let r = upper.strip_prefix("RELEASE")?;
-            let r = r.trim();
-            r.strip_prefix("SAVEPOINT").unwrap_or(r)
-        }
-        "rollback_to" => {
-            let r = upper.strip_prefix("ROLLBACK")?;
-            let r = r.trim();
-            let r = if let Some(x) = r.strip_prefix("TO") { x } else { return None; };
-            let r = r.trim();
-            r.strip_prefix("SAVEPOINT").unwrap_or(r)
-        }
-        _ => return None,
-    };
-    // The name is the trimmed remainder; strip any trailing semicolon.
-    let name_upper = rest.trim().trim_end_matches(';');
-    if name_upper.is_empty() {
-        return None;
-    }
-    // Find the same token in the original (case-preserving) SQL.
-    // Strategy: tokenise on whitespace and semicolons, find the token
-    // at the corresponding position.
-    let tokens: Vec<&str> = sql
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .filter(|s| !s.is_empty())
-        .collect();
-    // Keywords to skip over (case-insensitive).
-    let skip: &[&str] = match mode {
-        "savepoint" => &["SAVEPOINT"],
-        "release" => &["RELEASE", "SAVEPOINT"],
-        "rollback_to" => &["ROLLBACK", "TO", "SAVEPOINT"],
-        _ => &[],
-    };
-    let name_token = tokens
-        .iter()
-        .skip_while(|t| skip.iter().any(|k| t.eq_ignore_ascii_case(k)))
-        .next()?;
-    Some(name_token.trim_end_matches(';').to_string())
-}
+// Savepoint name extraction was previously done by re-scraping the SQL
+// text (`extract_savepoint_name`).  It was replaced by
+// `pg_ast::txn_stmt`, which reads libpg_query's authoritative parsed
+// `TransactionStmt.savepoint_name`, so the text-scraper is gone.
 
 // ---------------------------------------------------------------------------
 // Data-modifying CTE orchestrator

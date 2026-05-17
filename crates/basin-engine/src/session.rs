@@ -377,17 +377,21 @@ pub(crate) fn tx_release_savepoint(state: &SessionState, name: &str) -> Result<(
             tx.savepoints.remove(i);
             Ok(())
         }
+        // PG: SQLSTATE 3B001 (no_such_savepoint).
         None => Err(BasinError::InvalidSchema(format!(
-            "savepoint \"{name}\" does not exist"
+            "savepoint \"{name}\" does not exist (SQLSTATE 3B001)"
         ))),
     }
 }
 
-/// Roll back to the named savepoint. Removes the named frame and all frames
-/// created after it. Returns the abandoned pending files (tail beyond each
-/// saved offset per table) so the executor can delete them from storage.
-/// Also returns the pre-tx snapshot map (for restoring tables that now have
-/// zero pending files after truncation, so reads can see the pre-tx state).
+/// Roll back to the named savepoint. Discards every savepoint frame created
+/// *after* the named one, but — per PostgreSQL — KEEPS the named savepoint
+/// itself so it can be rolled back to again (it remains re-establishable
+/// until `RELEASE`d, `COMMIT`, or full `ROLLBACK`). Returns the abandoned
+/// pending files (tail beyond the named savepoint's saved offset per table)
+/// so the executor can delete them from storage. Also returns the pre-tx
+/// snapshot map (for restoring tables that now have zero pending files
+/// after truncation, so reads can see the pre-tx state).
 pub(crate) fn tx_rollback_to_savepoint(
     state: &SessionState,
     name: &str,
@@ -401,14 +405,19 @@ pub(crate) fn tx_rollback_to_savepoint(
     let pos = match pos {
         Some(i) => i,
         None => {
+            // PG: SQLSTATE 3B001 (no_such_savepoint).
             return Err(BasinError::InvalidSchema(format!(
-                "savepoint \"{name}\" does not exist"
+                "savepoint \"{name}\" does not exist (SQLSTATE 3B001)"
             )))
         }
     };
-    // Pop all frames at or after the target.
+    // PG: keep the named savepoint, drop only the inner (later) ones.
+    // `truncate(pos + 1)` retains the target frame at index `pos`; a
+    // subsequent `ROLLBACK TO SAVEPOINT <name>` therefore still finds it.
+    // The target frame's recorded watermarks remain valid because we are
+    // about to discard every pending file beyond them.
     let target_frame = tx.savepoints[pos].clone_offsets();
-    tx.savepoints.truncate(pos);
+    tx.savepoints.truncate(pos + 1);
 
     // Collect the abandoned tail for each table.
     let mut abandoned: HashMap<TableName, Vec<DataFileRef>> = HashMap::new();

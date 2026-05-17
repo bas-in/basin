@@ -287,6 +287,67 @@ pub fn parse(sql: &str) -> Result<ParseTree> {
     }
 }
 
+/// Shape of a plain `CREATE TABLE … AS <query>` statement, as classified
+/// by libpg_query (the real PostgreSQL parser).
+#[derive(Debug, Clone)]
+pub struct CtasShape {
+    /// `true` for `WITH NO DATA` (schema-only clone); `false` for
+    /// `WITH DATA` / no clause (populate from the query result).
+    pub skip_data: bool,
+    /// Explicit `(col, …)` LHS column-name list, if present. PostgreSQL
+    /// renames the query's output columns positionally with this list.
+    pub col_names: Vec<String>,
+}
+
+/// Detect a plain `CREATE TABLE [(col, …)] … AS <query> [WITH [NO] DATA]`
+/// statement and lift the bits sqlparser 0.61 cannot represent.
+///
+/// libpg_query understands both the trailing `WITH [NO] DATA` clause
+/// (exposed as `into.skip_data`) and the bare LHS column-name list
+/// (`into.col_names`). sqlparser 0.61's `CreateTable` AST has a field
+/// for neither: `WITH [NO] DATA` makes its statement parser fail with
+/// "Expected: end of statement, found: WITH", and the bare column list
+/// makes it fail with "Expected: a data type name". The executor uses
+/// this classification to strip both forms textually before sqlparser
+/// sees the SQL, then re-applies them from the captured metadata.
+///
+/// Returns `None` for anything that is not a plain CTAS
+/// (`CREATE MATERIALIZED VIEW`, the `SELECT … INTO` form, or any
+/// non-CTAS statement) — caller leaves the SQL untouched.
+pub fn ctas_shape(node: &Node) -> Option<CtasShape> {
+    let inner = node.node.as_ref()?;
+    let NodeEnum::CreateTableAsStmt(ctas) = inner else {
+        return None;
+    };
+    // `CREATE MATERIALIZED VIEW` also lands on CreateTableAsStmt; that
+    // form has its own dedicated path. `SELECT … INTO foo` is the
+    // is_select_into shape and is likewise out of scope here.
+    if ctas.objtype == pg_query::protobuf::ObjectType::ObjectMatview as i32
+        || ctas.is_select_into
+    {
+        return None;
+    }
+    let into = ctas.into.as_ref();
+    // `into` is always present for a real CTAS; default to "populate"
+    // if the field is somehow absent rather than silently dropping rows.
+    let skip_data = into.map(|i| i.skip_data).unwrap_or(false);
+    let col_names = into
+        .map(|i| {
+            i.col_names
+                .iter()
+                .filter_map(|c| match c.node.as_ref() {
+                    Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(CtasShape {
+        skip_data,
+        col_names,
+    })
+}
+
 /// Classify a top-level statement node.
 ///
 /// `node` must be the inner `RawStmt.stmt.node` — i.e. the per-statement
@@ -459,6 +520,55 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
 
         _ => StmtKind::Other,
     }
+}
+
+/// Precise classification of a transaction-control statement, with the
+/// savepoint name lifted straight from libpg_query's authoritative parse
+/// (`TransactionStmt.savepoint_name`) rather than re-scraped from the SQL
+/// text.  This is what the executor uses to tell `ROLLBACK` apart from
+/// `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>` (PostgreSQL makes
+/// every one of `WORK`, `TRANSACTION`, and `SAVEPOINT` optional, so the
+/// old `contains("SAVEPOINT")` text heuristic mis-routed `ROLLBACK TO s`
+/// into a full-transaction rollback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnStmt {
+    /// `BEGIN` / `START TRANSACTION`.
+    Begin,
+    /// `COMMIT` / `COMMIT PREPARED`.
+    Commit,
+    /// Bare `ROLLBACK` / `ABORT` / `ROLLBACK PREPARED` — undo whole txn.
+    Rollback,
+    /// `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>`.
+    RollbackToSavepoint(String),
+    /// `SAVEPOINT <name>`.
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] <name>`.
+    ReleaseSavepoint(String),
+    /// Any other transaction node (PREPARE TRANSACTION, etc.).
+    Other,
+}
+
+/// Classify `node` as a [`TxnStmt`] when it is a `TransactionStmt`.
+/// Returns `None` for non-transaction statements.  The savepoint name
+/// comes from libpg_query's parsed `savepoint_name` field, so it is
+/// exact regardless of optional `WORK`/`TRANSACTION`/`SAVEPOINT` noise
+/// words, comments, or identifier quoting.
+pub fn txn_stmt(node: &Node) -> Option<TxnStmt> {
+    use pg_query::protobuf::TransactionStmtKind as Tk;
+    let NodeEnum::TransactionStmt(s) = node.node.as_ref()? else {
+        return None;
+    };
+    Some(match Tk::try_from(s.kind) {
+        Ok(Tk::TransStmtBegin) | Ok(Tk::TransStmtStart) => TxnStmt::Begin,
+        Ok(Tk::TransStmtCommit) | Ok(Tk::TransStmtCommitPrepared) => TxnStmt::Commit,
+        Ok(Tk::TransStmtRollback) | Ok(Tk::TransStmtRollbackPrepared) => TxnStmt::Rollback,
+        Ok(Tk::TransStmtRollbackTo) => {
+            TxnStmt::RollbackToSavepoint(s.savepoint_name.clone())
+        }
+        Ok(Tk::TransStmtSavepoint) => TxnStmt::Savepoint(s.savepoint_name.clone()),
+        Ok(Tk::TransStmtRelease) => TxnStmt::ReleaseSavepoint(s.savepoint_name.clone()),
+        _ => TxnStmt::Other,
+    })
 }
 
 /// Rewrite the `@@` tsvector-match operator to a `tsvector_match_udf(lhs, rhs)`

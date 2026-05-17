@@ -2417,6 +2417,274 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// Correlated LATERAL generate_series → recursive-CTE decorrelation
+// ---------------------------------------------------------------------------
+
+/// Decorrelate `… JOIN LATERAL generate_series(<lo>, <tbl>.<col>[, <step>]) <alias>`
+/// into a plain JOIN against a bounded recursive series.
+///
+/// ## Problem
+///
+/// `SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` expands each
+/// row of `t` into a `1 .. t.id` series. DataFusion 53's built-in
+/// `generate_series` table function **requires literal integer arguments**
+/// (`Arguments must be literals`); a correlated column reference (`t.id`) — or
+/// even a scalar subquery `(SELECT max(t.id) FROM t)` — is rejected at plan
+/// time with `Argument #2 must be an INTEGER or NULL`.  So the textbook
+/// "bounded-max" rewrite to `generate_series(1, (SELECT max(t.id) FROM t))` is
+/// **not viable on this engine** (empirically confirmed: same error as the
+/// correlated column).
+///
+/// ## Decorrelation used
+///
+/// We materialise the series via a recursive CTE bounded by the table's max,
+/// then join it back with the per-row range predicate:
+///
+/// ```sql
+/// -- in:
+/// SELECT <proj> FROM t CROSS JOIN LATERAL generate_series(1, t.id) g WHERE …
+/// -- out:
+/// WITH RECURSIVE __basin_gs_<alias>(value) AS (
+///     SELECT CAST(1 AS BIGINT)
+///     UNION ALL
+///     SELECT value + 1 FROM __basin_gs_<alias>
+///       WHERE value + 1 <= (SELECT max(t.id) FROM t)
+/// )
+/// SELECT <proj> FROM t
+///   JOIN __basin_gs_<alias> <alias>
+///     ON <alias>.value >= 1 AND <alias>.value <= t.id
+///   WHERE …
+/// ```
+///
+/// Each `t`-row pairs with `1 .. t.id` (PG-identical), `t.id <= 0` / NULL yields
+/// zero rows for that row, and an empty `t` yields zero rows overall (the
+/// recursive bound's `max(...)` is NULL so the CTE is empty / the JOIN matches
+/// nothing).  Verified row-exact against the per-row, empty, and 0/NULL cases.
+///
+/// ## Scope (conservative — no-op on anything unhandled)
+///
+/// Fires only for:
+/// - `[CROSS] JOIN LATERAL generate_series(...)` **or** comma form
+///   `, LATERAL generate_series(...)`.
+/// - First argument is a constant integer (`generate_series(<int>, …)`); the
+///   constant becomes both the recursive seed and the `>= <lo>` floor.
+/// - Second argument is exactly `<table_alias>.<col>` (a correlated column).
+/// - Optional third (step) argument: only a literal `1` (or absent) is handled;
+///   any other step → **no-op** (left for the original error; honest defer).
+/// - The query has **no existing `WITH`** clause (we prepend our own); if a
+///   `WITH` is present we defer (merging CTE lists is out of scope).
+/// - Exactly one such correlated-`generate_series` LATERAL in the statement.
+///
+/// If the args are both constant (`generate_series(1, 3)`) it is **not**
+/// correlated — left unchanged (DataFusion already handles that form, and
+/// rewriting it would regress it).  Anything else returns the SQL verbatim.
+pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    // Fast bail: needs both LATERAL and generate_series.
+    if !lower.contains("lateral") || !lower.contains("generate_series") {
+        return sql.to_string();
+    }
+    // Conservative: do not touch statements that already have a WITH clause
+    // (merging into an existing CTE list is out of scope).
+    {
+        let mut k = 0usize;
+        let lb = lower.as_bytes();
+        while k < lb.len() && lb[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if lower[k..].starts_with("with") {
+            return sql.to_string();
+        }
+    }
+
+    let bytes = sql.as_bytes();
+
+    // Locate `lateral` (word-bounded) followed by `generate_series(`.
+    let mut search = 0usize;
+    let (lat_start, gs_open, gs_close, sr_alias_start, sr_alias_end) = loop {
+        let Some(rel) = lower[search..].find("lateral") else {
+            return sql.to_string();
+        };
+        let ls = search + rel;
+        let le = ls + 7;
+        let pre_ok = ls == 0 || !bytes[ls - 1].is_ascii_alphanumeric();
+        let post_ok = le >= sql.len()
+            || bytes[le].is_ascii_whitespace()
+            || bytes[le] == b'(';
+        if !pre_ok || !post_ok {
+            search = le;
+            continue;
+        }
+        // Skip whitespace; expect `generate_series`.
+        let mut j = le;
+        while j < sql.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if !lower[j..].starts_with("generate_series") {
+            search = le;
+            continue;
+        }
+        let mut k = j + "generate_series".len();
+        while k < sql.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= sql.len() || bytes[k] != b'(' {
+            search = le;
+            continue;
+        }
+        let open = k;
+        let Some(close) = find_matching_close_paren(sql, open) else {
+            return sql.to_string();
+        };
+        // Parse trailing alias: optional `AS`, then identifier, optional
+        // `(colname)` column list (which we ignore — we always expose `value`).
+        let mut a = close + 1;
+        while a < sql.len() && bytes[a].is_ascii_whitespace() {
+            a += 1;
+        }
+        if lower[a..].starts_with("as ") || lower[a..].starts_with("as\t") {
+            a += 3;
+            while a < sql.len() && bytes[a].is_ascii_whitespace() {
+                a += 1;
+            }
+        }
+        let as_start = a;
+        while a < sql.len()
+            && (bytes[a].is_ascii_alphanumeric() || bytes[a] == b'_')
+        {
+            a += 1;
+        }
+        if a == as_start {
+            // No alias — cannot build join target.
+            return sql.to_string();
+        }
+        let as_end = a;
+        break (ls, open, close, as_start, as_end);
+    };
+
+    let alias = sql[sr_alias_start..sr_alias_end].to_string();
+
+    // Consume an optional `(col [, ...])` column-alias list after the alias.
+    // IMPORTANT: only advance `after_alias` when a column list is actually
+    // present — otherwise the whitespace before the next clause (e.g. the
+    // space before `ORDER BY`) would be swallowed, fusing two tokens.
+    let mut after_alias = sr_alias_end;
+    {
+        let mut peek = sr_alias_end;
+        while peek < sql.len() && bytes[peek].is_ascii_whitespace() {
+            peek += 1;
+        }
+        if peek < sql.len() && bytes[peek] == b'(' {
+            match find_matching_close_paren(sql, peek) {
+                Some(c) => after_alias = c + 1,
+                None => return sql.to_string(),
+            }
+        }
+    }
+
+    // Parse the generate_series argument list at depth 0.
+    let args_str = &sql[gs_open + 1..gs_close];
+    let args = split_at_depth0_commas(args_str);
+    if args.len() < 2 || args.len() > 3 {
+        return sql.to_string();
+    }
+    let lo_raw = args[0].trim();
+    let hi_raw = args[1].trim();
+
+    // Lower bound must be a plain integer literal.
+    let lo: i64 = match lo_raw.parse() {
+        Ok(v) => v,
+        Err(_) => return sql.to_string(),
+    };
+
+    // Optional step: only literal `1` (or absent) supported. Anything else
+    // (negative, !=1, non-literal) → conservative no-op.
+    if args.len() == 3 {
+        let step_raw = args[2].trim();
+        if step_raw.parse::<i64>().ok() != Some(1) {
+            return sql.to_string();
+        }
+    }
+
+    // Upper bound must be exactly `<ident>.<ident>` (a correlated column).
+    let hi_lower = hi_raw.to_ascii_lowercase();
+    let Some((tbl, col)) = parse_dotted_ref(&hi_lower) else {
+        // Both-constant form (`generate_series(1, 3)`) lands here too — leave
+        // it untouched so the already-working non-correlated path is unchanged.
+        return sql.to_string();
+    };
+    // Re-extract original-case `tbl.col` from `hi_raw` for emitted SQL.
+    let hi_ref = hi_raw.to_string();
+    // Validate identifiers (defensive: parse_dotted_ref already rejects spaces).
+    let ident_ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    if !ident_ok(tbl) || !ident_ok(col) {
+        return sql.to_string();
+    }
+
+    // Determine the join keyword span to replace. We replace from the start of
+    // the join lead-in (`,` / `cross join` / `join` / `inner join`) through the
+    // end of the alias (and optional column-alias list).
+    let pre = lower[..lat_start].trim_end();
+    let (replace_from, lead_kw): (usize, &str) = if pre.ends_with("cross join") {
+        (lower[..lat_start].rfind("cross join").unwrap(), "JOIN")
+    } else if pre.ends_with("inner join") {
+        (lower[..lat_start].rfind("inner join").unwrap(), "JOIN")
+    } else if pre.ends_with("join") {
+        // Plain JOIN (not left/right/full — those change row semantics here).
+        let bj = pre[..pre.len() - 4].trim_end();
+        if bj.ends_with("left")
+            || bj.ends_with("right")
+            || bj.ends_with("full")
+        {
+            return sql.to_string();
+        }
+        (lower[..lat_start].rfind("join").unwrap(), "JOIN")
+    } else if pre.ends_with(',') {
+        (lower[..lat_start].rfind(',').unwrap(), "JOIN")
+    } else {
+        // Unrecognised lead-in — defer.
+        return sql.to_string();
+    };
+    let replace_to = after_alias;
+
+    // Reject if there is more than one correlated generate_series LATERAL: a
+    // second occurrence after our match means multi-lateral — defer honestly.
+    if let Some(rel2) = lower[replace_to..].find("lateral") {
+        let abs = replace_to + rel2;
+        let mut j = abs + 7;
+        while j < sql.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if lower[j..].starts_with("generate_series") {
+            return sql.to_string();
+        }
+    }
+
+    let cte = format!("__basin_gs_{alias}");
+    // Build the prefix (everything before the join lead-in) and suffix.
+    let prefix = &sql[..replace_from];
+    let suffix = &sql[replace_to..];
+
+    // The recursive CTE: seed at `lo`, step by 1, bounded by the table max so
+    // the working set is finite. The per-row range predicate enforces the
+    // exact `lo .. tbl.col` window for every outer row (PG semantics).
+    let new_sql = format!(
+        "WITH RECURSIVE {cte}(value) AS (\
+SELECT CAST({lo} AS BIGINT) \
+UNION ALL \
+SELECT value + 1 FROM {cte} \
+WHERE value + 1 <= (SELECT max({hi_ref}) FROM {tbl})\
+) {prefix} {lead_kw} {cte} {alias} \
+ON {alias}.value >= {lo} AND {alias}.value <= {hi_ref}{suffix}"
+    );
+    new_sql
+}
+
 /// Result of parsing a single correlation predicate from the LATERAL WHERE clause.
 struct CorrPredicate {
     /// The child-side column name (unqualified) used as the FK.
@@ -5418,5 +5686,123 @@ mod tests {
         // `my_jsonb_each_helper` must not trigger the rewrite.
         let sql = "SELECT my_jsonb_each_helper('{}')";
         assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql);
+    }
+
+    // ── correlated LATERAL generate_series → recursive CTE ───────────────────
+    use super::rewrite_lateral_generate_series as rlgs;
+
+    #[test]
+    fn lgs_cross_join_lateral_correlated_rewritten() {
+        let sql = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g";
+        let out = rlgs(sql);
+        let lo = out.to_ascii_lowercase();
+        assert!(!lo.contains("lateral"), "LATERAL must be removed: {out}");
+        assert!(lo.contains("with recursive __basin_gs_g(value)"),
+            "recursive CTE must be emitted: {out}");
+        assert!(lo.contains("union all"), "recursive term required: {out}");
+        assert!(lo.contains("(select max(t.id) from t)"),
+            "bound must be table max of correlated col: {out}");
+        assert!(lo.contains("join __basin_gs_g g"), "plain JOIN required: {out}");
+        assert!(lo.contains("g.value >= 1 and g.value <= t.id"),
+            "per-row range predicate required: {out}");
+        assert!(lo.contains("select * from t"),
+            "outer projection/from must be preserved: {out}");
+    }
+
+    #[test]
+    fn lgs_comma_lateral_correlated_rewritten() {
+        let sql = "SELECT t.id, gs.value FROM t, LATERAL generate_series(1, t.n) AS gs";
+        let out = rlgs(sql);
+        let lo = out.to_ascii_lowercase();
+        assert!(!lo.contains("lateral"), "comma-LATERAL removed: {out}");
+        assert!(lo.contains("with recursive __basin_gs_gs(value)"), "{out}");
+        assert!(lo.contains("(select max(t.n) from t)"), "{out}");
+        assert!(lo.contains("join __basin_gs_gs gs"),
+            "comma form becomes JOIN: {out}");
+        assert!(lo.contains("gs.value >= 1 and gs.value <= t.n"), "{out}");
+        // The leading comma must be gone (replaced by JOIN).
+        assert!(!out.contains("t, "), "comma join lead-in replaced: {out}");
+    }
+
+    #[test]
+    fn lgs_column_alias_list_ignored() {
+        // `AS gs(i)` — we still expose `value`; the (i) list is dropped.
+        let sql = "SELECT t.id, gs.i FROM t, LATERAL generate_series(1, t.n) AS gs(i)";
+        let out = rlgs(sql);
+        let lo = out.to_ascii_lowercase();
+        assert!(!lo.contains("lateral"), "{out}");
+        assert!(lo.contains("join __basin_gs_gs gs"), "{out}");
+        assert!(lo.contains("gs.value >= 1 and gs.value <= t.n"), "{out}");
+    }
+
+    #[test]
+    fn lgs_noncorrelated_constant_left_unchanged() {
+        // Both args constant → NOT correlated; must be a verbatim no-op so the
+        // already-working DataFusion path is not regressed.
+        let sql = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, 3) g";
+        assert_eq!(rlgs(sql), sql, "constant/constant must be untouched");
+    }
+
+    #[test]
+    fn lgs_lo_floor_uses_literal() {
+        let sql = "SELECT * FROM t CROSS JOIN LATERAL generate_series(2, t.id) g";
+        let out = rlgs(sql).to_ascii_lowercase();
+        assert!(out.contains("select cast(2 as bigint)"), "seed = lo: {out}");
+        assert!(out.contains("g.value >= 2 and g.value <= t.id"),
+            "floor = lo literal: {out}");
+    }
+
+    #[test]
+    fn lgs_step_one_ok_other_step_noop() {
+        let ok = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id, 1) g";
+        assert!(!rlgs(ok).to_ascii_lowercase().contains("lateral"),
+            "step=1 supported");
+        let bad = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id, 2) g";
+        assert_eq!(rlgs(bad), bad, "step != 1 must be a conservative no-op");
+        let neg = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id, -1) g";
+        assert_eq!(rlgs(neg), neg, "negative step must be a conservative no-op");
+    }
+
+    #[test]
+    fn lgs_existing_with_clause_deferred() {
+        let sql = "WITH c AS (SELECT 1) SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g";
+        assert_eq!(rlgs(sql), sql, "existing WITH → defer (no merge)");
+    }
+
+    #[test]
+    fn lgs_left_join_lateral_deferred() {
+        // LEFT/RIGHT/FULL JOIN LATERAL changes row-preservation semantics —
+        // conservative no-op.
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL generate_series(1, t.id) g ON true";
+        assert_eq!(rlgs(sql), sql, "LEFT JOIN LATERAL must defer");
+    }
+
+    #[test]
+    fn lgs_no_lateral_or_no_gs_fast_exit() {
+        let a = "SELECT * FROM t JOIN u ON t.id = u.id";
+        assert_eq!(rlgs(a), a);
+        let b = "SELECT * FROM generate_series(1, 3) g"; // no LATERAL
+        assert_eq!(rlgs(b), b);
+        let c = "SELECT * FROM t, LATERAL (SELECT 1) s"; // no generate_series
+        assert_eq!(rlgs(c), c);
+    }
+
+    #[test]
+    fn lgs_preserves_outer_where_and_projection() {
+        let sql = "SELECT t.id AS tid, g.value v FROM t CROSS JOIN LATERAL generate_series(1, t.id) g WHERE t.id > 1 ORDER BY t.id";
+        let out = rlgs(sql);
+        assert!(out.contains("t.id AS tid, g.value v"),
+            "projection preserved verbatim: {out}");
+        assert!(out.contains("WHERE t.id > 1 ORDER BY t.id"),
+            "trailing WHERE/ORDER BY preserved: {out}");
+        assert!(!out.to_ascii_lowercase().contains("lateral"), "{out}");
+    }
+
+    #[test]
+    fn lgs_multiple_correlated_lateral_deferred() {
+        let sql = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.a) g \
+                   CROSS JOIN LATERAL generate_series(1, t.b) h";
+        assert_eq!(rlgs(sql), sql,
+            "more than one correlated generate_series LATERAL → defer");
     }
 }

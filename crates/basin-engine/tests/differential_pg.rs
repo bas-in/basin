@@ -620,6 +620,237 @@ async fn diff_rls_with_check_satisfied_accepted_both() {
     }
 }
 
+// --------------------------------------------------------------------------
+// SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT parity
+//
+// These probe SQLSTATE classes the shared `basin_sqlstate` mapper does not
+// model (25P01 no_active_sql_transaction, 3B001 no_such_savepoint), so they
+// use a local SQLSTATE extractor that reads the code basin embeds in its
+// error message. Both legs run statements on a single long-lived
+// session/client so transaction + savepoint state is shared across the
+// script, exactly like a real client connection.
+// --------------------------------------------------------------------------
+
+/// Pull a 5-char SQLSTATE token (e.g. `25P01`, `3B001`) out of a basin
+/// error message. basin embeds `(SQLSTATE XXXXX)` in the message for the
+/// transaction/savepoint error paths.
+fn sqlstate_from_basin_msg(msg: &str) -> String {
+    if let Some(idx) = msg.find("SQLSTATE ") {
+        let tail = &msg[idx + "SQLSTATE ".len()..];
+        let code: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if code.len() == 5 {
+            return code;
+        }
+    }
+    "XXOTHER".to_string()
+}
+
+impl DifferentialRunner {
+    /// Run `sql` on basin and (if a DSN is set) PG, returning the outcome
+    /// of each as `Ok` or `Err(sqlstate)`. Unlike `probe`, this uses the
+    /// savepoint-aware SQLSTATE extractor and keeps the SAME session/client
+    /// across calls so transaction + savepoint state persists.
+    async fn step(&self, sql: &str) -> (Outcome, Option<Outcome>) {
+        let basin = match self.sess.execute(sql).await {
+            Ok(_) => Outcome::Ok,
+            Err(e) => Outcome::Err(sqlstate_from_basin_msg(&format!("{e}"))),
+        };
+        let pg = match &self.pg {
+            None => None,
+            Some(pg) => Some(match pg.batch_execute(sql).await {
+                Ok(_) => Outcome::Ok,
+                Err(e) => {
+                    let code = e
+                        .as_db_error()
+                        .map(|db| db.code().code().to_string())
+                        .unwrap_or_else(|| "XXOTHER".to_string());
+                    Outcome::Err(code)
+                }
+            }),
+        };
+        (basin, pg)
+    }
+
+    /// Run a two-`BIGINT`-column `SELECT` on basin and (when a DSN is set) PG,
+    /// returning each side's full row set as `Vec<(i64, i64)>` in the query's
+    /// own order. Used to assert exact per-row LATERAL-expansion parity.
+    async fn rows_pairs(&self, sql: &str) -> (Vec<(i64, i64)>, Option<Vec<(i64, i64)>>) {
+        use basin_engine::ExecResult;
+        let basin = match self.sess.execute(sql).await {
+            Ok(ExecResult::Rows { batches, .. }) => {
+                let mut v = Vec::new();
+                for b in &batches {
+                    let c0 = b.column(0);
+                    let c1 = b.column(1);
+                    let get = |c: &std::sync::Arc<dyn arrow_array::Array>, r: usize| -> i64 {
+                        if let Some(a) = c.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                            a.value(r)
+                        } else if let Some(a) =
+                            c.as_any().downcast_ref::<arrow_array::Int32Array>()
+                        {
+                            a.value(r) as i64
+                        } else {
+                            panic!("expected an integer column in rows_pairs");
+                        }
+                    };
+                    for r in 0..b.num_rows() {
+                        v.push((get(c0, r), get(c1, r)));
+                    }
+                }
+                v
+            }
+            other => panic!("expected rows from {sql:?}, got {other:?}"),
+        };
+        let pg = match &self.pg {
+            None => None,
+            Some(pg) => {
+                let rows = pg
+                    .query(sql, &[])
+                    .await
+                    .unwrap_or_else(|e| panic!("PG rows_pairs failed for {sql:?}: {e}"));
+                let mut v = Vec::new();
+                for row in &rows {
+                    // Accept INT4 or INT8 on either column.
+                    let a = row
+                        .try_get::<_, i64>(0)
+                        .or_else(|_| row.try_get::<_, i32>(0).map(|x| x as i64))
+                        .expect("PG col 0 integer");
+                    let b = row
+                        .try_get::<_, i64>(1)
+                        .or_else(|_| row.try_get::<_, i32>(1).map(|x| x as i64))
+                        .expect("PG col 1 integer");
+                    v.push((a, b));
+                }
+                Some(v)
+            }
+        };
+        (basin, pg)
+    }
+}
+
+/// BEGIN; INSERT; SAVEPOINT; INSERT; ROLLBACK TO SAVEPOINT; COMMIT — the
+/// post-savepoint row is gone, the pre-savepoint row persists. Both
+/// backends agree on every step's outcome and the final count.
+#[tokio::test]
+async fn diff_savepoint_rollback_to_partial_undo() {
+    let r = DifferentialRunner::new("sp_partial").await;
+    r.setup("CREATE TABLE t (id INT)").await;
+
+    for sql in [
+        "BEGIN",
+        "INSERT INTO t (id) VALUES (1)",
+        "SAVEPOINT s",
+        "INSERT INTO t (id) VALUES (2)",
+        "ROLLBACK TO SAVEPOINT s",
+        "INSERT INTO t (id) VALUES (3)",
+        "COMMIT",
+    ] {
+        let (basin, pg) = r.step(sql).await;
+        assert_eq!(basin, Outcome::Ok, "basin must accept {sql:?}");
+        if let Some(pg) = pg {
+            assert_eq!(basin, pg, "basin/PG disagree on {sql:?}");
+        }
+    }
+
+    // Pre-savepoint (1) and post-rollback (3) survive; rolled-back (2) does not.
+    let (basin, pg) = r.count_both("SELECT count(*) FROM t").await;
+    assert_eq!(basin, 2, "basin: 2 rows survive partial rollback");
+    if let Some(pg) = pg {
+        assert_eq!(basin, pg, "basin/PG row-count disagree after partial undo");
+    }
+}
+
+/// RELEASE SAVEPOINT keeps post-savepoint writes on both backends.
+#[tokio::test]
+async fn diff_release_savepoint_keeps_writes() {
+    let r = DifferentialRunner::new("sp_release").await;
+    r.setup("CREATE TABLE t (id INT)").await;
+
+    for sql in [
+        "BEGIN",
+        "INSERT INTO t (id) VALUES (1)",
+        "SAVEPOINT s",
+        "INSERT INTO t (id) VALUES (2)",
+        "RELEASE SAVEPOINT s",
+        "COMMIT",
+    ] {
+        let (basin, pg) = r.step(sql).await;
+        assert_eq!(basin, Outcome::Ok, "basin must accept {sql:?}");
+        if let Some(pg) = pg {
+            assert_eq!(basin, pg, "basin/PG disagree on {sql:?}");
+        }
+    }
+
+    let (basin, pg) = r.count_both("SELECT count(*) FROM t").await;
+    assert_eq!(basin, 2, "basin: RELEASE keeps both rows");
+    if let Some(pg) = pg {
+        assert_eq!(basin, pg, "basin/PG disagree: RELEASE must keep writes");
+    }
+}
+
+/// ROLLBACK TO a non-existent savepoint inside a txn: PG raises 3B001
+/// (no_such_savepoint); basin must match.
+#[tokio::test]
+async fn diff_rollback_to_nonexistent_savepoint_3b001() {
+    let r = DifferentialRunner::new("sp_nosuch").await;
+
+    let (b0, p0) = r.step("BEGIN").await;
+    assert_eq!(b0, Outcome::Ok);
+    if let Some(p0) = p0 {
+        assert_eq!(b0, p0);
+    }
+
+    let (basin, pg) = r.step("ROLLBACK TO SAVEPOINT nope").await;
+    assert_eq!(
+        basin,
+        Outcome::Err("3B001".to_string()),
+        "basin must raise 3B001 for an unknown savepoint"
+    );
+    if let Some(pg) = pg {
+        assert_eq!(basin, pg, "basin/PG disagree on no_such_savepoint code");
+    }
+}
+
+/// SAVEPOINT outside any transaction block: PG raises 25P01
+/// (no_active_sql_transaction); basin must match (not a silent no-op).
+#[tokio::test]
+async fn diff_savepoint_outside_txn_25p01() {
+    let r = DifferentialRunner::new("sp_no_txn").await;
+
+    let (basin, pg) = r.step("SAVEPOINT s").await;
+    assert_eq!(
+        basin,
+        Outcome::Err("25P01".to_string()),
+        "basin must raise 25P01 for SAVEPOINT outside a txn block"
+    );
+    if let Some(pg) = pg {
+        assert_eq!(basin, pg, "basin/PG disagree on SAVEPOINT-without-txn code");
+    }
+}
+
+/// ROLLBACK TO SAVEPOINT outside any transaction block: PG raises 25P01;
+/// basin must match (historically basin mis-reported "does not exist").
+#[tokio::test]
+async fn diff_rollback_to_savepoint_outside_txn_25p01() {
+    let r = DifferentialRunner::new("rbsp_no_txn").await;
+
+    let (basin, pg) = r.step("ROLLBACK TO SAVEPOINT s").await;
+    assert_eq!(
+        basin,
+        Outcome::Err("25P01".to_string()),
+        "basin must raise 25P01 for ROLLBACK TO SAVEPOINT outside a txn"
+    );
+    if let Some(pg) = pg {
+        assert_eq!(
+            basin, pg,
+            "basin/PG disagree on ROLLBACK-TO-SAVEPOINT-without-txn code"
+        );
+    }
+}
+
 /// With ROW LEVEL SECURITY never enabled, the policy is inert: the
 /// WITH CHECK-violating row is accepted by BOTH backends (strict parity).
 #[tokio::test]
@@ -649,4 +880,132 @@ async fn diff_rls_disabled_policy_inert_both_accept() {
             "basin and PG must agree: RLS disabled ⇒ policy inert"
         );
     }
+}
+
+/// `CREATE TABLE … AS <query> WITH NO DATA` creates the schema-only clone
+/// on BOTH backends: the probe statement (the CTAS) succeeds, and the
+/// resulting table has the query's columns but ZERO rows. `WITH DATA`
+/// populates it. We compare the post-CTAS `count(*)` so the
+/// schema-vs-data semantics are checked, not just the parse.
+#[tokio::test]
+async fn diff_ctas_with_no_data_is_schema_only() {
+    let r = DifferentialRunner::new("ctas_nodata").await;
+
+    r.setup("CREATE TABLE src (id INT, label TEXT)").await;
+    r.setup("INSERT INTO src (id, label) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await;
+
+    // Probe: the WITH NO DATA CTAS itself must parse + succeed on both.
+    let (basin, pg) = r
+        .probe("CREATE TABLE clone_empty AS SELECT id, label FROM src WITH NO DATA")
+        .await;
+    assert_eq!(
+        basin,
+        Outcome::Ok,
+        "basin must accept CREATE TABLE AS … WITH NO DATA"
+    );
+    if let Some(pg) = pg {
+        assert_eq!(basin, pg, "basin/PG disagree on WITH NO DATA acceptance");
+    }
+
+    // WITH NO DATA ⇒ schema present, zero rows on both backends.
+    let (basin_n, pg_n) = r.count_both("SELECT count(*) FROM clone_empty").await;
+    assert_eq!(basin_n, 0, "WITH NO DATA must yield an empty table");
+    if let Some(pg_n) = pg_n {
+        assert_eq!(basin_n, pg_n, "basin/PG row-count disagree (WITH NO DATA)");
+    }
+
+    // The empty clone is insertable afterward (real table, not a view).
+    let (basin_i, pg_i) = r
+        .probe("INSERT INTO clone_empty (id, label) VALUES (9, 'z')")
+        .await;
+    assert_eq!(basin_i, Outcome::Ok, "WITH NO DATA clone must be insertable");
+    if let Some(pg_i) = pg_i {
+        assert_eq!(basin_i, pg_i, "basin/PG disagree on post-CTAS insert");
+    }
+    let (basin_n2, pg_n2) = r.count_both("SELECT count(*) FROM clone_empty").await;
+    assert_eq!(basin_n2, 1, "row inserted into the WITH NO DATA clone");
+    if let Some(pg_n2) = pg_n2 {
+        assert_eq!(basin_n2, pg_n2, "basin/PG row-count disagree after insert");
+    }
+
+    // WITH DATA populates from the query on both backends.
+    let (basin_d, pg_d) = r
+        .probe("CREATE TABLE clone_full AS SELECT id, label FROM src WITH DATA")
+        .await;
+    assert_eq!(basin_d, Outcome::Ok, "basin must accept WITH DATA CTAS");
+    if let Some(pg_d) = pg_d {
+        assert_eq!(basin_d, pg_d, "basin/PG disagree on WITH DATA acceptance");
+    }
+    let (basin_f, pg_f) = r.count_both("SELECT count(*) FROM clone_full").await;
+    assert_eq!(basin_f, 3, "WITH DATA must copy all source rows");
+    if let Some(pg_f) = pg_f {
+        assert_eq!(basin_f, pg_f, "basin/PG row-count disagree (WITH DATA)");
+    }
+}
+
+/// #113 — correlated `LATERAL generate_series(1, t.col)` per-row expansion.
+///
+/// `FROM t CROSS JOIN LATERAL generate_series(1, t.id) g` must expand each
+/// `t`-row into the series `1 .. t.id`. DataFusion's `generate_series` table
+/// function rejects the correlated column argument, so basin pre-rewrites the
+/// shape into a bounded recursive-CTE JOIN. This pins exact per-row parity vs
+/// real PG (when a DSN is set) and a basin-only exact-row assertion otherwise.
+#[tokio::test]
+async fn diff_lateral_generate_series_per_row_expansion() {
+    let r = DifferentialRunner::new("lat_gs").await;
+    r.setup("CREATE TABLE t (id INT NOT NULL)").await;
+    r.setup("INSERT INTO t VALUES (2), (3)").await;
+
+    // ids {2,3} ⇒ 2 → {1,2}, 3 → {1,2,3}.  Exact ordered set, both engines.
+    let (b, p) = r
+        .rows_pairs(
+            "SELECT t.id, g.value \
+             FROM t CROSS JOIN LATERAL generate_series(1, t.id) g \
+             ORDER BY t.id, g.value",
+        )
+        .await;
+    let expected = vec![(2i64, 1i64), (2, 2), (3, 1), (3, 2), (3, 3)];
+    assert_eq!(b, expected, "basin per-row LATERAL expansion wrong");
+    if let Some(p) = p {
+        assert_eq!(b, p, "basin/PG disagree on LATERAL generate_series rows");
+    }
+
+    // Comma-LATERAL form with explicit `AS gs(i)` — same expansion.
+    let (b2, p2) = r
+        .rows_pairs(
+            "SELECT t.id, gs.value \
+             FROM t, LATERAL generate_series(1, t.id) AS gs(i) \
+             ORDER BY t.id, gs.value",
+        )
+        .await;
+    assert_eq!(b2, expected, "basin comma-LATERAL expansion wrong");
+    if let Some(p2) = p2 {
+        assert_eq!(b2, p2, "basin/PG disagree on comma-LATERAL rows");
+    }
+
+    // Edge: id = 0 and NULL contribute zero rows; only id = 5 expands.
+    r.setup("CREATE TABLE z (id INT)").await;
+    r.setup("INSERT INTO z VALUES (0), (NULL), (5)").await;
+    let (bz, pz) = r
+        .rows_pairs(
+            "SELECT z.id, g.value \
+             FROM z CROSS JOIN LATERAL generate_series(1, z.id) g \
+             ORDER BY z.id, g.value",
+        )
+        .await;
+    let expected_z = vec![(5i64, 1i64), (5, 2), (5, 3), (5, 4), (5, 5)];
+    assert_eq!(bz, expected_z, "basin 0/NULL edge expansion wrong");
+    if let Some(pz) = pz {
+        assert_eq!(bz, pz, "basin/PG disagree on 0/NULL-edge rows");
+    }
+
+    // Regression guard: the non-correlated `generate_series(1, 3)` form is
+    // NOT rewritten and still works (cross join, 2 t-rows × 3 series = 6).
+    let (bc, _pc) = r
+        .count_both(
+            "SELECT count(*) FROM t CROSS JOIN LATERAL generate_series(1, 3) g",
+        )
+        .await;
+    assert_eq!(bc, 6, "non-correlated generate_series(1,3) must be unaffected");
 }
