@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, ChangeOp, Result, TableName, ProjectId};
+use basin_common::{BasinError, ChangeOp, QualifiedTableName, Result, SchemaName, TableName, ProjectId};
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
@@ -359,6 +359,124 @@ impl PostgresCatalog {
                 "ALTER TABLE {schema}.snapshots
                  ADD COLUMN IF NOT EXISTS removed_paths_json JSONB"
             ),
+            // Phase A.3 (#116 / #119): multi-schema isolation.
+            //
+            // `basin_schemas` tracks which schemas exist for each project.
+            // `public` is pre-seeded in `create_namespace` (idempotent via ON
+            // CONFLICT DO NOTHING). The `(project_id, schema_name)` PK ensures
+            // uniqueness without a separate uniqueness index.
+            //
+            // v0.1 has no production data, so this migration is safe to run on
+            // all existing deployments. New deployments get both the `CREATE
+            // TABLE` and the `ADD COLUMN` in one pass; existing deployments get
+            // only the `ADD COLUMN` (which back-fills with DEFAULT 'public',
+            // preserving the semantics of every row written before this
+            // migration).
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.basin_schemas (
+                    project_id   TEXT NOT NULL REFERENCES {schema}.namespaces(project_id),
+                    schema_name  TEXT NOT NULL,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_id, schema_name)
+                )"
+            ),
+            // Phase A.3: add `schema_name` to `tables`. DEFAULT 'public'
+            // back-fills all existing rows.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS schema_name TEXT NOT NULL DEFAULT 'public'"
+            ),
+            // Phase A.3: add `schema_name` to `snapshots`. DEFAULT 'public'
+            // back-fills existing rows. The snapshot FK and PK are updated
+            // below to include this column.
+            format!(
+                "ALTER TABLE {schema}.snapshots
+                 ADD COLUMN IF NOT EXISTS schema_name TEXT NOT NULL DEFAULT 'public'"
+            ),
+            // Phase A.3: upgrade the tables PRIMARY KEY from (project_id,
+            // table_name) to (project_id, schema_name, table_name) so that the
+            // same table name can exist in different schemas.
+            //
+            // All DDL here is guarded by IF NOT EXISTS / IF EXISTS / DO-block
+            // conditionals so that re-running migrate() on an already-upgraded
+            // schema is a no-op (simulated-restart tests hit this path).
+            //
+            // v0.1 has no production data, so a full table rewrite is safe.
+            // Order of operations:
+            //   1. Drop snapshots FK (references old tables PK) — idempotent via IF EXISTS
+            //   2. Drop old tables PK — idempotent via DO block
+            //   3. Add new tables PK — idempotent via DO block
+            //   4. Drop old snapshots PK — idempotent via DO block
+            //   5. Add new snapshots PK — idempotent via DO block
+            //   6. Add new snapshots FK — idempotent via DO block
+            format!("ALTER TABLE {schema}.snapshots DROP CONSTRAINT IF EXISTS snapshots_project_id_table_name_fkey"),
+            format!("ALTER TABLE {schema}.snapshots DROP CONSTRAINT IF EXISTS snapshots_table_fk"),
+            // Idempotent PK swap for tables: drop old, add new.
+            format!(
+                "DO $$ BEGIN \
+                   IF EXISTS ( \
+                     SELECT 1 FROM pg_constraint \
+                     WHERE conrelid = '{schema}.tables'::regclass \
+                       AND contype = 'p' \
+                       AND pg_get_constraintdef(oid) NOT LIKE '%schema_name%' \
+                   ) THEN \
+                     ALTER TABLE {schema}.tables DROP CONSTRAINT tables_pkey; \
+                   END IF; \
+                 END $$"
+            ),
+            format!(
+                "DO $$ BEGIN \
+                   IF NOT EXISTS ( \
+                     SELECT 1 FROM pg_constraint \
+                     WHERE conrelid = '{schema}.tables'::regclass \
+                       AND contype = 'p' \
+                   ) THEN \
+                     ALTER TABLE {schema}.tables ADD PRIMARY KEY (project_id, schema_name, table_name); \
+                   END IF; \
+                 END $$"
+            ),
+            // Idempotent PK swap for snapshots: drop old (3-col), add new (4-col).
+            format!(
+                "DO $$ BEGIN \
+                   IF EXISTS ( \
+                     SELECT 1 FROM pg_constraint \
+                     WHERE conrelid = '{schema}.snapshots'::regclass \
+                       AND contype = 'p' \
+                       AND pg_get_constraintdef(oid) NOT LIKE '%schema_name%' \
+                   ) THEN \
+                     ALTER TABLE {schema}.snapshots DROP CONSTRAINT snapshots_pkey; \
+                   END IF; \
+                 END $$"
+            ),
+            format!(
+                "DO $$ BEGIN \
+                   IF NOT EXISTS ( \
+                     SELECT 1 FROM pg_constraint \
+                     WHERE conrelid = '{schema}.snapshots'::regclass \
+                       AND contype = 'p' \
+                   ) THEN \
+                     ALTER TABLE {schema}.snapshots ADD PRIMARY KEY (project_id, schema_name, table_name, snapshot_id); \
+                   END IF; \
+                 END $$"
+            ),
+            // Add new snapshots FK (idempotent: IF NOT EXISTS).
+            // ON UPDATE CASCADE means that renaming a table row in `tables`
+            // automatically retargets all its snapshot rows — no manual
+            // snapshots UPDATE needed in rename_table_qualified.
+            format!(
+                "DO $$ BEGIN \
+                   IF NOT EXISTS ( \
+                     SELECT 1 FROM pg_constraint \
+                     WHERE conrelid = '{schema}.snapshots'::regclass \
+                       AND conname = 'snapshots_table_fk' \
+                   ) THEN \
+                     ALTER TABLE {schema}.snapshots ADD CONSTRAINT snapshots_table_fk \
+                       FOREIGN KEY (project_id, schema_name, table_name) \
+                       REFERENCES {schema}.tables(project_id, schema_name, table_name) \
+                       ON DELETE CASCADE ON UPDATE CASCADE; \
+                   END IF; \
+                 END $$"
+            ),
         ];
         let client = self.client.lock().await;
         for stmt in stmts {
@@ -375,16 +493,38 @@ impl PostgresCatalog {
 impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
-        let sql = format!(
-            "INSERT INTO {schema}.namespaces (project_id) VALUES ($1)
-             ON CONFLICT (project_id) DO NOTHING",
-            schema = self.schema
-        );
-        let client = self.client.lock().await;
-        client
-            .execute(&sql, &[&project.to_string()])
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
             .await
-            .map_err(|e| BasinError::catalog(format!("create_namespace: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("create_namespace txn: {e}")))?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.namespaces (project_id) VALUES ($1)
+                 ON CONFLICT (project_id) DO NOTHING"
+            ),
+            &[&project_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("create_namespace: {e}")))?;
+        // Phase A.3: pre-seed the `public` schema so `list_schemas` always
+        // returns at least `["public"]` after `create_namespace`. Idempotent
+        // via ON CONFLICT DO NOTHING — calling `create_namespace` twice is a
+        // no-op (matches the InMemoryCatalog contract).
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.basin_schemas (project_id, schema_name) VALUES ($1, 'public')
+                 ON CONFLICT (project_id, schema_name) DO NOTHING"
+            ),
+            &[&project_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("create_namespace seed public schema: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("create_namespace commit: {e}")))?;
         Ok(())
     }
 
@@ -440,9 +580,9 @@ impl Catalog for PostgresCatalog {
         let inserted = tx
             .execute(
                 &format!(
-                    "INSERT INTO {sch}.tables (project_id, table_name, schema_json, current_snapshot, format_version, partition_spec_json, rls_enabled, policies_json)
-                     VALUES ($1, $2, $3, 0, 2, $4, FALSE, $5)
-                     ON CONFLICT (project_id, table_name) DO NOTHING"
+                    "INSERT INTO {sch}.tables (project_id, schema_name, table_name, schema_json, current_snapshot, format_version, partition_spec_json, rls_enabled, policies_json)
+                     VALUES ($1, 'public', $2, $3, 0, 2, $4, FALSE, $5)
+                     ON CONFLICT (project_id, schema_name, table_name) DO NOTHING"
                 ),
                 &[&project_str, &table_str, &schema_json, &default_spec_json, &empty_policies_json],
             )
@@ -458,8 +598,8 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots
-                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
-                 VALUES ($1, $2, 0, NULL, 'genesis', $3, $4, $5)"
+                   (project_id, schema_name, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
+                 VALUES ($1, 'public', $2, 0, NULL, 'genesis', $3, $4, $5)"
             ),
             &[
                 &project_str,
@@ -530,7 +670,7 @@ impl Catalog for PostgresCatalog {
                             pk_columns_json, check_constraints_json, foreign_keys_json,
                             unique_constraints_json, indexes_json
                      FROM {sch}.tables
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project_str, &table_str],
             )
@@ -625,7 +765,7 @@ impl Catalog for PostgresCatalog {
             None => Vec::new(),
         };
 
-        let snapshots = fetch_snapshots(&client, sch, &project_str, &table_str).await?;
+        let snapshots = fetch_snapshots(&client, sch, &project_str, "public", &table_str).await?;
         Ok(TableMetadata {
             project: *project,
             table: table.clone(),
@@ -657,7 +797,10 @@ impl Catalog for PostgresCatalog {
         let client = self.client.lock().await;
         let n = client
             .execute(
-                &format!("DELETE FROM {sch}.tables WHERE project_id = $1 AND table_name = $2"),
+                &format!(
+                    "DELETE FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
+                ),
                 &[&project.to_string(), &table.to_string()],
             )
             .await
@@ -670,12 +813,18 @@ impl Catalog for PostgresCatalog {
 
     #[instrument(skip(self), fields(project = %project))]
     async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>> {
+        // Back-compat: return only public-schema table names (bare TableName,
+        // not qualified). Phase A.3 adds `schema_name`; this filter preserves
+        // existing callers' expectations. Use `list_tables_qualified` for
+        // cross-schema enumeration.
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = client
             .query(
                 &format!(
-                    "SELECT table_name FROM {sch}.tables WHERE project_id = $1 ORDER BY table_name"
+                    "SELECT table_name FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = 'public' \
+                     ORDER BY table_name"
                 ),
                 &[&project.to_string()],
             )
@@ -750,6 +899,13 @@ impl Catalog for PostgresCatalog {
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace project_storage_config: {e}")))?;
+        // Phase A.3: remove all schema-set rows for this project.
+        tx.execute(
+            &format!("DELETE FROM {sch}.basin_schemas WHERE project_id = $1"),
+            &[&project.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace basin_schemas: {e}")))?;
         tx.execute(
             &format!("DELETE FROM {sch}.namespaces WHERE project_id = $1"),
             &[&project.to_string()],
@@ -836,7 +992,7 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT current_snapshot FROM {sch}.tables
-                     WHERE project_id = $1 AND table_name = $2
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2
                      FOR UPDATE"
                 ),
                 &[&project_str, &table_str],
@@ -862,8 +1018,8 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots
-                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
-                 VALUES ($1, $2, $3, $4, 'append', $5, $6, $7)"
+                   (project_id, schema_name, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
+                 VALUES ($1, 'public', $2, $3, $4, 'append', $5, $6, $7)"
             ),
             &[
                 &project_str,
@@ -881,7 +1037,7 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "UPDATE {sch}.tables SET current_snapshot = $3
-                 WHERE project_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
             ),
             &[&project_str, &table_str, &new_id_pg],
         )
@@ -958,7 +1114,7 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT current_snapshot FROM {sch}.tables
-                     WHERE project_id = $1 AND table_name = $2
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2
                      FOR UPDATE"
                 ),
                 &[&project_str, &table_str],
@@ -984,8 +1140,8 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots
-                   (project_id, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files, removed_paths_json)
-                 VALUES ($1, $2, $3, $4, 'replace', $5, $6, $7, $8)"
+                   (project_id, schema_name, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files, removed_paths_json)
+                 VALUES ($1, 'public', $2, $3, $4, 'replace', $5, $6, $7, $8)"
             ),
             &[
                 &project_str,
@@ -1004,7 +1160,7 @@ impl Catalog for PostgresCatalog {
         tx.execute(
             &format!(
                 "UPDATE {sch}.tables SET current_snapshot = $3
-                 WHERE project_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
             ),
             &[&project_str, &table_str, &new_id_pg],
         )
@@ -1034,7 +1190,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET partition_spec_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &json],
             )
@@ -1062,7 +1218,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET rls_enabled = $3, policies_json = $4
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &rls_enabled, &json],
             )
@@ -1097,7 +1253,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET cold_after_seconds = $3, cold_age_column = $4
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[
                     &project.to_string(),
@@ -1129,7 +1285,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET bloom_filter_columns_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &json],
             )
@@ -1163,7 +1319,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET row_group_rows = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &rows_pg],
             )
@@ -1194,7 +1350,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET continuous_aggregate_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &json],
             )
@@ -1231,7 +1387,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET cluster_columns_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &json],
             )
@@ -1256,7 +1412,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET home_region = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &region],
             )
@@ -1310,7 +1466,7 @@ impl Catalog for PostgresCatalog {
                      SET pk_columns_json = $3,
                          check_constraints_json = $4,
                          foreign_keys_json = $5
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[
                     &project.to_string(),
@@ -1350,7 +1506,7 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "UPDATE {sch}.tables
                      SET unique_constraints_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &unique_json],
             )
@@ -1406,7 +1562,7 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "UPDATE {sch}.tables
                      SET indexes_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &indexes_json],
             )
@@ -1443,7 +1599,7 @@ impl Catalog for PostgresCatalog {
                 &format!(
                     "UPDATE {sch}.tables
                      SET indexes_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &indexes_json],
             )
@@ -1465,7 +1621,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "UPDATE {sch}.tables SET schema_json = $3
-                     WHERE project_id = $1 AND table_name = $2"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
                 &[&project.to_string(), &table.to_string(), &schema_json],
             )
@@ -1487,7 +1643,10 @@ impl Catalog for PostgresCatalog {
         // rather than an empty list when the table is missing.
         let exists = client
             .query_opt(
-                &format!("SELECT 1 FROM {sch}.tables WHERE project_id = $1 AND table_name = $2"),
+                &format!(
+                    "SELECT 1 FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
+                ),
                 &[&project_str, &table_str],
             )
             .await
@@ -1495,7 +1654,7 @@ impl Catalog for PostgresCatalog {
         if exists.is_none() {
             return Err(BasinError::not_found(format!("{project}/{table}")));
         }
-        fetch_snapshots(&client, sch, &project_str, &table_str).await
+        fetch_snapshots(&client, sch, &project_str, "public", &table_str).await
     }
 
     #[instrument(skip(self), fields(project = %project))]
@@ -1515,7 +1674,9 @@ impl Catalog for PostgresCatalog {
                             s.operation, s.summary_json
                      FROM {sch}.tables t
                      JOIN {sch}.snapshots s
-                       ON s.project_id = t.project_id AND s.table_name = t.table_name
+                       ON s.project_id = t.project_id
+                          AND s.schema_name = t.schema_name
+                          AND s.table_name = t.table_name
                      WHERE t.project_id = $1
                      ORDER BY s.committed_at ASC, t.table_name ASC, s.snapshot_id ASC"
                 ),
@@ -1570,7 +1731,7 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.tables \
-                     WHERE project_id = $1 AND table_name = $2 \
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2 \
                      FOR UPDATE"
                 ),
                 &[&project_str, &src_str],
@@ -1588,7 +1749,7 @@ impl Catalog for PostgresCatalog {
             .execute(
                 &format!(
                     "INSERT INTO {sch}.tables (
-                        project_id, table_name, schema_json, current_snapshot,
+                        project_id, schema_name, table_name, schema_json, current_snapshot,
                         format_version, partition_spec_json, rls_enabled,
                         policies_json, cold_after_seconds, cold_age_column,
                         bloom_filter_columns_json, row_group_rows,
@@ -1596,7 +1757,7 @@ impl Catalog for PostgresCatalog {
                         home_region,
                         pk_columns_json, check_constraints_json, foreign_keys_json
                      )
-                     SELECT project_id, $3, schema_json, current_snapshot,
+                     SELECT project_id, schema_name, $3, schema_json, current_snapshot,
                             format_version, partition_spec_json, rls_enabled,
                             policies_json, cold_after_seconds, cold_age_column,
                             bloom_filter_columns_json, row_group_rows,
@@ -1604,8 +1765,8 @@ impl Catalog for PostgresCatalog {
                             home_region,
                             pk_columns_json, check_constraints_json, foreign_keys_json
                      FROM {sch}.tables
-                     WHERE project_id = $1 AND table_name = $2
-                     ON CONFLICT (project_id, table_name) DO NOTHING"
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2
+                     ON CONFLICT (project_id, schema_name, table_name) DO NOTHING"
                 ),
                 &[&project_str, &src_str, &dst_str],
             )
@@ -1623,15 +1784,15 @@ impl Catalog for PostgresCatalog {
         txn.execute(
             &format!(
                 "INSERT INTO {sch}.snapshots (
-                    project_id, table_name, snapshot_id, parent_id,
+                    project_id, schema_name, table_name, snapshot_id, parent_id,
                     operation, committed_at, summary_json, data_files,
                     removed_paths_json
                  )
-                 SELECT project_id, $3, snapshot_id, parent_id,
+                 SELECT project_id, schema_name, $3, snapshot_id, parent_id,
                         operation, committed_at, summary_json, data_files,
                         removed_paths_json
                  FROM {sch}.snapshots
-                 WHERE project_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
             ),
             &[&project_str, &src_str, &dst_str],
         )
@@ -1671,7 +1832,7 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.tables \
-                     WHERE project_id = $1 AND table_name = $2 \
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2 \
                      FOR UPDATE"
                 ),
                 &[&project_str, &table_str],
@@ -1685,7 +1846,7 @@ impl Catalog for PostgresCatalog {
             .query_opt(
                 &format!(
                     "SELECT 1 FROM {sch}.snapshots \
-                     WHERE project_id = $1 AND table_name = $2 \
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2 \
                        AND snapshot_id = $3"
                 ),
                 &[&project_str, &table_str, &snap_id_i64],
@@ -1702,7 +1863,7 @@ impl Catalog for PostgresCatalog {
         txn.execute(
             &format!(
                 "DELETE FROM {sch}.snapshots \
-                 WHERE project_id = $1 AND table_name = $2 \
+                 WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2 \
                    AND snapshot_id > $3"
             ),
             &[&project_str, &table_str, &snap_id_i64],
@@ -1714,7 +1875,7 @@ impl Catalog for PostgresCatalog {
         txn.execute(
             &format!(
                 "UPDATE {sch}.tables SET current_snapshot = $3 \
-                 WHERE project_id = $1 AND table_name = $2"
+                 WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
             ),
             &[&project_str, &table_str, &snap_id_i64],
         )
@@ -2858,6 +3019,647 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("deserialise project_storage_config: {e}")))?;
         Ok(Some(config))
     }
+
+    // -----------------------------------------------------------------------
+    // Phase A.3 (#116 / #119): schema-qualified API overrides
+    //
+    // OLD-METHOD PRESERVATION CHOICE: The old `create_table`, `load_table`,
+    // `drop_table`, etc. methods are left **as-is** (operating on
+    // `(project_id, table_name)` in the public schema via DEFAULT 'public').
+    // This is the safer choice for this phase: downstream callers (engine,
+    // router, storage) still use the old `&TableName` API and changing those
+    // call sites is out of scope. The `*_qualified` overrides are the real
+    // schema-aware paths; old methods are back-compat shims that continue to
+    // work exactly as before.
+    // -----------------------------------------------------------------------
+
+    /// Schema-qualified CREATE TABLE. Verifies that `qtable.schema` exists in
+    /// `basin_schemas` before inserting — returns `BasinError::Catalog` with
+    /// "schema X does not exist" if it doesn't, matching InMemoryCatalog's
+    /// honest-reject contract.
+    #[instrument(skip(self, schema), fields(project = %project, qtable = %qtable))]
+    async fn create_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: std::sync::Arc<arrow_schema::Schema>,
+    ) -> Result<TableMetadata> {
+        let schema_json = serde_json::to_value(schema.as_ref())
+            .map_err(|e| BasinError::catalog(format!("serialise arrow schema: {e}")))?;
+        let now = chrono::Utc::now();
+        let genesis_summary = SnapshotSummary {
+            operation: SnapshotOperation::Genesis,
+            added_files: 0,
+            added_rows: 0,
+            added_bytes: 0,
+            removed_files: 0,
+        };
+        let genesis_summary_json = serde_json::to_value(&genesis_summary)
+            .map_err(|e| BasinError::catalog(format!("serialise genesis summary: {e}")))?;
+        let empty_files: Vec<DataFileRef> = Vec::new();
+        let empty_files_json = serde_json::to_value(&empty_files)
+            .map_err(|e| BasinError::catalog(format!("serialise data files: {e}")))?;
+
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let table_str = qtable.name.to_string();
+        let schema_name_str = qtable.schema.as_str();
+
+        let default_spec_json = serde_json::to_value(PartitionSpec::Unpartitioned)
+            .map_err(|e| BasinError::catalog(format!("serialise partition spec: {e}")))?;
+        let empty_policies_json = serde_json::to_value::<Vec<Policy>>(Vec::new())
+            .map_err(|e| BasinError::catalog(format!("serialise policies: {e}")))?;
+
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("begin create_table_qualified: {e}")))?;
+
+        // Ensure namespace exists.
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.namespaces (project_id) VALUES ($1)
+                 ON CONFLICT (project_id) DO NOTHING"
+            ),
+            &[&project_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("ensure namespace: {e}")))?;
+
+        // Verify the target schema exists. For `public`, we auto-seed it;
+        // for other schemas, the caller must have run `create_schema` first.
+        if schema_name_str == "public" {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {sch}.basin_schemas (project_id, schema_name) VALUES ($1, 'public')
+                     ON CONFLICT (project_id, schema_name) DO NOTHING"
+                ),
+                &[&project_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("seed public schema: {e}")))?;
+        } else {
+            let schema_exists = tx
+                .query_opt(
+                    &format!(
+                        "SELECT 1 FROM {sch}.basin_schemas
+                         WHERE project_id = $1 AND schema_name = $2"
+                    ),
+                    &[&project_str, &schema_name_str],
+                )
+                .await
+                .map_err(|e| BasinError::catalog(format!("check schema exists: {e}")))?;
+            if schema_exists.is_none() {
+                tx.rollback().await.ok();
+                return Err(BasinError::catalog(format!(
+                    "schema {schema_name_str} does not exist for project {project}"
+                )));
+            }
+        }
+
+        let inserted = tx
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.tables \
+                     (project_id, schema_name, table_name, schema_json, current_snapshot, \
+                      format_version, partition_spec_json, rls_enabled, policies_json) \
+                     VALUES ($1, $2, $3, $4, 0, 2, $5, FALSE, $6) \
+                     ON CONFLICT (project_id, schema_name, table_name) DO NOTHING"
+                ),
+                &[
+                    &project_str,
+                    &schema_name_str,
+                    &table_str,
+                    &schema_json,
+                    &default_spec_json,
+                    &empty_policies_json,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("insert table qualified: {e}")))?;
+        if inserted == 0 {
+            tx.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "table {project}/{qtable} already exists"
+            )));
+        }
+
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.snapshots
+                   (project_id, schema_name, table_name, snapshot_id, parent_id, operation, committed_at, summary_json, data_files)
+                 VALUES ($1, $2, $3, 0, NULL, 'genesis', $4, $5, $6)"
+            ),
+            &[
+                &project_str,
+                &schema_name_str,
+                &table_str,
+                &now,
+                &genesis_summary_json,
+                &empty_files_json,
+            ],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("insert genesis snapshot: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("commit create_table_qualified: {e}")))?;
+
+        Ok(TableMetadata {
+            project: *project,
+            table: qtable.name.clone(),
+            schema,
+            current_snapshot: SnapshotId::GENESIS,
+            snapshots: vec![Snapshot {
+                id: SnapshotId::GENESIS,
+                parent: None,
+                committed_at: now,
+                data_files: empty_files,
+                removed_paths: vec![],
+                summary: genesis_summary,
+            }],
+            format_version: 2,
+            partition_spec: PartitionSpec::Unpartitioned,
+            rls_enabled: false,
+            policies: Vec::new(),
+            cold_after_seconds: None,
+            cold_age_column: None,
+            bloom_filter_columns: Vec::new(),
+            row_group_rows: None,
+            continuous_aggregate: None,
+            cluster_columns: Vec::new(),
+            home_region: None,
+            indexes: Vec::new(),
+            pk_columns: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            unique_constraints: Vec::new(),
+        })
+    }
+
+    /// Schema-qualified LOAD TABLE. WHERE clause includes `schema_name`.
+    #[instrument(skip(self), fields(project = %project, qtable = %qtable))]
+    async fn load_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let table_str = qtable.name.to_string();
+        let schema_name_str = qtable.schema.as_str();
+
+        let client = self.client.lock().await;
+        let row_opt = client
+            .query_opt(
+                &format!(
+                    "SELECT schema_json, current_snapshot, format_version, partition_spec_json,
+                            rls_enabled, policies_json, cold_after_seconds, cold_age_column,
+                            bloom_filter_columns_json, row_group_rows,
+                            continuous_aggregate_json, cluster_columns_json,
+                            home_region,
+                            pk_columns_json, check_constraints_json, foreign_keys_json,
+                            unique_constraints_json, indexes_json
+                     FROM {sch}.tables
+                     WHERE project_id = $1 AND schema_name = $2 AND table_name = $3"
+                ),
+                &[&project_str, &schema_name_str, &table_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("load_table_qualified: {e}")))?;
+        let Some(row) = row_opt else {
+            return Err(BasinError::not_found(format!("{project}/{qtable}")));
+        };
+        // Reuse the same column-deserialization logic as `load_table`.
+        let schema_json: serde_json::Value = row.get(0);
+        let current: i64 = row.get(1);
+        let format_version: i16 = row.get(2);
+        let partition_spec_json: Option<serde_json::Value> = row.get(3);
+        let rls_enabled: bool = row.get(4);
+        let policies_json: Option<serde_json::Value> = row.get(5);
+        let cold_after_seconds_pg: Option<i64> = row.get(6);
+        let cold_age_column: Option<String> = row.get(7);
+        let bloom_filter_columns_json: Option<serde_json::Value> = row.get(8);
+        let row_group_rows_pg: Option<i64> = row.get(9);
+        let continuous_aggregate_json: Option<serde_json::Value> = row.get(10);
+        let cluster_columns_json: Option<serde_json::Value> = row.get(11);
+        let home_region: Option<String> = row.get(12);
+        let pk_columns_json: Option<serde_json::Value> = row.get(13);
+        let check_constraints_json: Option<serde_json::Value> = row.get(14);
+        let foreign_keys_json: Option<serde_json::Value> = row.get(15);
+        let unique_constraints_json: Option<serde_json::Value> = row.get(16);
+        let indexes_json: Option<serde_json::Value> = row.get(17);
+
+        let arrow_schema: Schema = serde_json::from_value(schema_json)
+            .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
+        let partition_spec = match partition_spec_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise partition spec: {e}")))?,
+            None => PartitionSpec::Unpartitioned,
+        };
+        let policies: Vec<Policy> = match policies_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise policies: {e}")))?,
+            None => Vec::new(),
+        };
+        let cold_after_seconds = cold_after_seconds_pg.and_then(|v| u64::try_from(v).ok());
+        let bloom_filter_columns: Vec<String> = match bloom_filter_columns_json {
+            Some(v) => serde_json::from_value(v).map_err(|e| {
+                BasinError::catalog(format!("deserialise bloom_filter_columns: {e}"))
+            })?,
+            None => Vec::new(),
+        };
+        let row_group_rows: Option<usize> = row_group_rows_pg.and_then(|v| {
+            if v >= 0 { usize::try_from(v).ok() } else { None }
+        });
+        let continuous_aggregate: Option<CvDef> = match continuous_aggregate_json {
+            Some(v) => Some(serde_json::from_value(v).map_err(|e| {
+                BasinError::catalog(format!("deserialise continuous_aggregate: {e}"))
+            })?),
+            None => None,
+        };
+        let cluster_columns: Vec<String> = match cluster_columns_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise cluster_columns: {e}")))?,
+            None => Vec::new(),
+        };
+        let pk_columns: Vec<String> = match pk_columns_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise pk_columns: {e}")))?,
+            None => Vec::new(),
+        };
+        let check_constraints: Vec<CheckConstraint> = match check_constraints_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise check_constraints: {e}")))?,
+            None => Vec::new(),
+        };
+        let foreign_keys: Vec<ForeignKeyDef> = match foreign_keys_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise foreign_keys: {e}")))?,
+            None => Vec::new(),
+        };
+        let unique_constraints: Vec<UniqueConstraint> = match unique_constraints_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise unique_constraints: {e}")))?,
+            None => Vec::new(),
+        };
+        let indexes: Vec<SecondaryIndex> = match indexes_json {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| BasinError::catalog(format!("deserialise indexes: {e}")))?,
+            None => Vec::new(),
+        };
+
+        let snapshots = fetch_snapshots(&client, sch, &project_str, schema_name_str, &table_str).await?;
+        Ok(TableMetadata {
+            project: *project,
+            table: qtable.name.clone(),
+            schema: std::sync::Arc::new(arrow_schema),
+            current_snapshot: SnapshotId(current as u64),
+            snapshots,
+            format_version: format_version as u8,
+            partition_spec,
+            rls_enabled,
+            policies,
+            cold_after_seconds,
+            cold_age_column,
+            bloom_filter_columns,
+            row_group_rows,
+            continuous_aggregate,
+            cluster_columns,
+            home_region,
+            indexes,
+            pk_columns,
+            check_constraints,
+            foreign_keys,
+            unique_constraints,
+        })
+    }
+
+    /// Schema-qualified DROP TABLE. WHERE clause includes `schema_name`.
+    #[instrument(skip(self), fields(project = %project, qtable = %qtable))]
+    async fn drop_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = $2 AND table_name = $3"
+                ),
+                &[
+                    &project.to_string(),
+                    &qtable.schema.as_str(),
+                    &qtable.name.to_string(),
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_table_qualified: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{project}/{qtable}")));
+        }
+        Ok(())
+    }
+
+    /// Schema-qualified RENAME TABLE. Operates within the source schema only.
+    ///
+    /// Cross-schema renames (moving a table from one schema to another) are
+    /// deferred to a future phase: the `snapshots` table keys on
+    /// `(project_id, table_name)` without a `schema_name` dimension, so a
+    /// rename that changes `table_name` in-place is safe, but one that *also*
+    /// changes `schema_name` could collide with another table's snapshot rows
+    /// if the same `table_name` exists in both schemas. Phase A.4 will add
+    /// `schema_name` to `snapshots` and lift this restriction.
+    #[instrument(skip(self), fields(project = %project, old = %old, new = %new))]
+    async fn rename_table_qualified(
+        &self,
+        project: &ProjectId,
+        old: &QualifiedTableName,
+        new: &QualifiedTableName,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let old_schema = old.schema.as_str();
+        let old_table = old.name.to_string();
+        let new_schema = new.schema.as_str();
+        let new_table = new.name.to_string();
+
+        // Cross-schema rename is not supported in this phase (see doc above).
+        if old_schema != new_schema {
+            return Err(BasinError::FeatureNotSupported(
+                "cross-schema rename is not yet supported in PostgresCatalog \
+                 (phase A.3 restriction; snapshots table lacks schema_name)"
+                    .into(),
+            ));
+        }
+
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("begin rename_table_qualified: {e}")))?;
+
+        // Verify source exists.
+        let src = tx
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = $2 AND table_name = $3 \
+                     FOR UPDATE"
+                ),
+                &[&project_str, &old_schema, &old_table],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("rename_table_qualified src lookup: {e}")))?;
+        if src.is_none() {
+            tx.rollback().await.ok();
+            return Err(BasinError::not_found(format!("{project}/{old}")));
+        }
+
+        // Verify destination does not exist.
+        let dst = tx
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = $2 AND table_name = $3"
+                ),
+                &[&project_str, &new_schema, &new_table],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("rename_table_qualified dst check: {e}")))?;
+        if dst.is_some() {
+            tx.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "rename_table_qualified: target {project}/{new} already exists"
+            )));
+        }
+
+        // Update the tables row. The FK on snapshots has ON UPDATE CASCADE,
+        // so Postgres automatically retargets all snapshot rows from
+        // old_table_name to new_table_name — no manual snapshots UPDATE needed.
+        tx.execute(
+            &format!(
+                "UPDATE {sch}.tables \
+                 SET table_name = $4 \
+                 WHERE project_id = $1 AND schema_name = $2 AND table_name = $3"
+            ),
+            &[&project_str, &old_schema, &old_table, &new_table],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("rename_table_qualified update: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("rename_table_qualified commit: {e}")))?;
+        Ok(())
+    }
+
+    /// List all tables across all schemas for `project`. Returns all
+    /// `(schema_name, table_name)` pairs sorted by `(schema, table)`.
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_tables_qualified(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<QualifiedTableName>> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT schema_name, table_name FROM {sch}.tables \
+                     WHERE project_id = $1 \
+                     ORDER BY schema_name, table_name"
+                ),
+                &[&project.to_string()],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("list_tables_qualified: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let schema_str: String = row.get(0);
+            let table_str: String = row.get(1);
+            let sname = SchemaName::new(schema_str)
+                .map_err(|e| BasinError::catalog(format!("list_tables_qualified bad schema: {e}")))?;
+            let tname = TableName::new(table_str)
+                .map_err(|e| BasinError::catalog(format!("list_tables_qualified bad table: {e}")))?;
+            out.push(QualifiedTableName::new(sname, tname));
+        }
+        Ok(out)
+    }
+
+    /// List all schemas that exist for `project`. Always includes `public`
+    /// after the first `create_namespace` call.
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_schemas(&self, project: &ProjectId) -> Result<Vec<SchemaName>> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT schema_name FROM {sch}.basin_schemas \
+                     WHERE project_id = $1 \
+                     ORDER BY schema_name"
+                ),
+                &[&project.to_string()],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("list_schemas: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let s: String = row.get(0);
+            let sname = SchemaName::new(s)
+                .map_err(|e| BasinError::catalog(format!("list_schemas bad ident: {e}")))?;
+            out.push(sname);
+        }
+        // If the project has no basin_schemas rows yet (old deployment before
+        // A.3 migration that hasn't called create_namespace again), fall back
+        // to returning ["public"] so callers always see at least one schema.
+        if out.is_empty() {
+            out.push(SchemaName::public());
+        }
+        Ok(out)
+    }
+
+    /// Create a new schema under `project`. Idempotent: creating `public`
+    /// again, or any schema that already exists, is a no-op.
+    #[instrument(skip(self), fields(project = %project, schema = %schema))]
+    async fn create_schema(&self, project: &ProjectId, schema: &SchemaName) -> Result<()> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let schema_str = schema.as_str();
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("begin create_schema: {e}")))?;
+        // Ensure namespace row exists so the FK on basin_schemas is satisfied.
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.namespaces (project_id) VALUES ($1)
+                 ON CONFLICT (project_id) DO NOTHING"
+            ),
+            &[&project_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("create_schema ensure ns: {e}")))?;
+        // Idempotent: ON CONFLICT DO NOTHING mirrors InMemoryCatalog.
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.basin_schemas (project_id, schema_name) \
+                 VALUES ($1, $2) \
+                 ON CONFLICT (project_id, schema_name) DO NOTHING"
+            ),
+            &[&project_str, &schema_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("create_schema: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("create_schema commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Drop a schema under `project`.
+    ///
+    /// `cascade = false` (RESTRICT): returns `BasinError::Catalog` if any
+    /// tables still live in that schema. `cascade = true`: drops all tables
+    /// in the schema first (inside a transaction), then removes the schema
+    /// row. Dropping `public` always returns `BasinError::Catalog`.
+    #[instrument(skip(self), fields(project = %project, schema = %schema, cascade = cascade))]
+    async fn drop_schema(
+        &self,
+        project: &ProjectId,
+        schema: &SchemaName,
+        cascade: bool,
+    ) -> Result<()> {
+        if schema == &SchemaName::public() {
+            return Err(BasinError::catalog("cannot drop the public schema"));
+        }
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let schema_str = schema.as_str();
+
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("begin drop_schema: {e}")))?;
+
+        // Verify the schema exists.
+        let exists = tx
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.basin_schemas \
+                     WHERE project_id = $1 AND schema_name = $2 \
+                     FOR UPDATE"
+                ),
+                &[&project_str, &schema_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_schema exists check: {e}")))?;
+        if exists.is_none() {
+            tx.rollback().await.ok();
+            return Err(BasinError::not_found(format!(
+                "{project}: schema {schema:?}"
+            )));
+        }
+
+        // Count tables in this schema.
+        let count_row = tx
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = $2"
+                ),
+                &[&project_str, &schema_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_schema count: {e}")))?;
+        let table_count: i64 = count_row.get(0);
+
+        if !cascade && table_count > 0 {
+            tx.rollback().await.ok();
+            return Err(BasinError::catalog(format!(
+                "cannot drop schema {schema}: {table_count} table(s) still exist \
+                 (use CASCADE to drop them)"
+            )));
+        }
+
+        // CASCADE: delete all tables in this schema. The FK ON DELETE CASCADE
+        // on `snapshots` removes snapshot rows automatically.
+        if cascade && table_count > 0 {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = $2"
+                ),
+                &[&project_str, &schema_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_schema cascade tables: {e}")))?;
+        }
+
+        // Remove the schema row.
+        tx.execute(
+            &format!(
+                "DELETE FROM {sch}.basin_schemas \
+                 WHERE project_id = $1 AND schema_name = $2"
+            ),
+            &[&project_str, &schema_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_schema: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_schema commit: {e}")))?;
+        Ok(())
+    }
 }
 
 impl PostgresCatalog {
@@ -2980,6 +3782,7 @@ async fn fetch_snapshots(
     client: &Client,
     schema: &str,
     project_str: &str,
+    schema_name_str: &str,
     table_str: &str,
 ) -> Result<Vec<Snapshot>> {
     let rows = client
@@ -2988,10 +3791,10 @@ async fn fetch_snapshots(
                 "SELECT snapshot_id, parent_id, committed_at, summary_json, data_files,
                         removed_paths_json
                  FROM {schema}.snapshots
-                 WHERE project_id = $1 AND table_name = $2
+                 WHERE project_id = $1 AND schema_name = $2 AND table_name = $3
                  ORDER BY snapshot_id ASC"
             ),
-            &[&project_str, &table_str],
+            &[&project_str, &schema_name_str, &table_str],
         )
         .await
         .map_err(|e| BasinError::catalog(format!("fetch snapshots: {e}")))?;
@@ -4413,5 +5216,306 @@ mod tests {
         assert!(cat.list_procedures(&t).await.is_empty());
         assert!(cat.lookup_procedure(&t, "p1").await.is_none());
         assert!(cat.lookup_procedure(&t, "p2").await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase A.3 (#119): schema-qualified API tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_schemas_returns_public_after_create_namespace() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+        let schemas = cat.list_schemas(&project).await.unwrap();
+        assert_eq!(schemas, vec![basin_common::SchemaName::public()]);
+    }
+
+    #[tokio::test]
+    async fn create_and_list_schema() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let analytics = basin_common::SchemaName::new("analytics").unwrap();
+        cat.create_schema(&project, &analytics).await.unwrap();
+
+        let mut schemas = cat.list_schemas(&project).await.unwrap();
+        schemas.sort();
+        assert!(schemas.contains(&basin_common::SchemaName::public()));
+        assert!(schemas.contains(&analytics));
+        assert_eq!(schemas.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_schema_is_idempotent() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+        let s = basin_common::SchemaName::new("audit").unwrap();
+        // Calling twice must not error.
+        cat.create_schema(&project, &s).await.unwrap();
+        cat.create_schema(&project, &s).await.unwrap();
+        // Creating public again is also a no-op.
+        cat.create_schema(&project, &basin_common::SchemaName::public())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_table_in_non_public_schema() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let reporting = basin_common::SchemaName::new("reporting").unwrap();
+        cat.create_schema(&project, &reporting).await.unwrap();
+
+        let qtable = basin_common::QualifiedTableName::new(
+            reporting.clone(),
+            TableName::new("monthly").unwrap(),
+        );
+        let meta = cat
+            .create_table_qualified(&project, &qtable, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+        assert_eq!(meta.table, TableName::new("monthly").unwrap());
+
+        // list_tables_qualified should include it.
+        let all = cat.list_tables_qualified(&project).await.unwrap();
+        assert!(all.contains(&qtable));
+
+        // load_table_qualified should return it.
+        let loaded = cat.load_table_qualified(&project, &qtable).await.unwrap();
+        assert_eq!(loaded.table, TableName::new("monthly").unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_table_in_missing_schema_errors() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let ghost = basin_common::SchemaName::new("ghost").unwrap();
+        let qtable = basin_common::QualifiedTableName::new(
+            ghost.clone(),
+            TableName::new("t").unwrap(),
+        );
+        let err = cat
+            .create_table_qualified(&project, &qtable, std::sync::Arc::new(schema()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ghost") && msg.contains("does not exist"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_table_qualified_removes_correct_row() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let s1 = basin_common::SchemaName::new("s1").unwrap();
+        let s2 = basin_common::SchemaName::new("s2").unwrap();
+        cat.create_schema(&project, &s1).await.unwrap();
+        cat.create_schema(&project, &s2).await.unwrap();
+
+        let q1 = basin_common::QualifiedTableName::new(s1.clone(), TableName::new("events").unwrap());
+        let q2 = basin_common::QualifiedTableName::new(s2.clone(), TableName::new("events").unwrap());
+        cat.create_table_qualified(&project, &q1, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&project, &q2, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+
+        // Drop q1 only.
+        cat.drop_table_qualified(&project, &q1).await.unwrap();
+
+        // q2 still loadable.
+        cat.load_table_qualified(&project, &q2).await.unwrap();
+        // q1 gone.
+        assert!(cat.load_table_qualified(&project, &q1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn drop_schema_restrict_refuses_nonempty() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let s = basin_common::SchemaName::new("nonempty").unwrap();
+        cat.create_schema(&project, &s).await.unwrap();
+        let qt = basin_common::QualifiedTableName::new(s.clone(), TableName::new("t").unwrap());
+        cat.create_table_qualified(&project, &qt, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+
+        let err = cat.drop_schema(&project, &s, false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonempty") || msg.contains("table"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_schema_cascade_removes_tables() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let s = basin_common::SchemaName::new("transient").unwrap();
+        cat.create_schema(&project, &s).await.unwrap();
+        let qt = basin_common::QualifiedTableName::new(s.clone(), TableName::new("t").unwrap());
+        cat.create_table_qualified(&project, &qt, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+
+        // CASCADE should succeed and remove the table.
+        cat.drop_schema(&project, &s, true).await.unwrap();
+
+        // Schema no longer in list.
+        let schemas = cat.list_schemas(&project).await.unwrap();
+        assert!(!schemas.contains(&s));
+
+        // Table no longer accessible.
+        assert!(cat.load_table_qualified(&project, &qt).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn drop_public_schema_rejected() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+        let err = cat
+            .drop_schema(&project, &basin_common::SchemaName::public(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("public"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_qualified_spans_schemas() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let s = basin_common::SchemaName::new("ext").unwrap();
+        cat.create_schema(&project, &s).await.unwrap();
+
+        let pub_t = basin_common::QualifiedTableName::in_public(TableName::new("pub_t").unwrap());
+        let ext_t = basin_common::QualifiedTableName::new(s, TableName::new("ext_t").unwrap());
+        cat.create_table_qualified(&project, &pub_t, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.create_table_qualified(&project, &ext_t, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+
+        let all = cat.list_tables_qualified(&project).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&pub_t));
+        assert!(all.contains(&ext_t));
+
+        // Old list_tables returns only public tables (back-compat).
+        let pub_only = cat.list_tables(&project).await.unwrap();
+        assert_eq!(pub_only, vec![TableName::new("pub_t").unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn schema_isolated_from_other_projects() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+        cat.create_namespace(&a).await.unwrap();
+        cat.create_namespace(&b).await.unwrap();
+
+        let s = basin_common::SchemaName::new("shared_name").unwrap();
+        cat.create_schema(&a, &s).await.unwrap();
+        // Project B has not created this schema.
+        let b_schemas = cat.list_schemas(&b).await.unwrap();
+        assert!(!b_schemas.contains(&s));
+    }
+
+    #[tokio::test]
+    async fn rename_table_qualified_within_same_schema() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+
+        let s = basin_common::SchemaName::new("analytics").unwrap();
+        cat.create_schema(&project, &s).await.unwrap();
+
+        let old = basin_common::QualifiedTableName::new(s.clone(), TableName::new("tbl").unwrap());
+        let new = basin_common::QualifiedTableName::new(s, TableName::new("tbl_renamed").unwrap());
+        cat.create_table_qualified(&project, &old, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+        cat.rename_table_qualified(&project, &old, &new)
+            .await
+            .unwrap();
+
+        // Old name gone; new name present.
+        assert!(cat.load_table_qualified(&project, &old).await.is_err());
+        cat.load_table_qualified(&project, &new).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_table_qualified_cross_schema_returns_feature_not_supported() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let project = ProjectId::new();
+        cat.create_namespace(&project).await.unwrap();
+        let s1 = basin_common::SchemaName::new("schema_a").unwrap();
+        let s2 = basin_common::SchemaName::new("schema_b").unwrap();
+        cat.create_schema(&project, &s1).await.unwrap();
+        cat.create_schema(&project, &s2).await.unwrap();
+        let old =
+            basin_common::QualifiedTableName::new(s1, TableName::new("cross_tbl").unwrap());
+        cat.create_table_qualified(&project, &old, std::sync::Arc::new(schema()))
+            .await
+            .unwrap();
+        let new =
+            basin_common::QualifiedTableName::new(s2, TableName::new("cross_tbl").unwrap());
+        let err = cat
+            .rename_table_qualified(&project, &old, &new)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::FeatureNotSupported(_)),
+            "expected FeatureNotSupported, got: {err}"
+        );
     }
 }
