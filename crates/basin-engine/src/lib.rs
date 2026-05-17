@@ -578,6 +578,7 @@ mod function_ddl;
 mod generated_cols;
 mod geo_glue;
 mod index_extras;
+mod inet_udf;
 mod info_schema_provider;
 mod interval_tz_udf;
 mod jsonb_udf;
