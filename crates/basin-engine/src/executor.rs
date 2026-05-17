@@ -565,6 +565,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
     // JSONPath @? / @@ operator rewrites → jsonb_path_exists / jsonb_path_match.
     let rewritten = crate::jsonb_path_udf::rewrite_jsonpath_operators(&rewritten);
+    let rewritten = crate::window_extras::rewrite_ignore_nulls_in_args(&rewritten);
     let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
     // Rewrite `'{1,2,3}'::int[]` curly-brace array literal casts to
     // `make_array(1,2,3)` before the array-operator pass sees them.

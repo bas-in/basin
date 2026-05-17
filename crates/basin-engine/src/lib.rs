@@ -565,6 +565,7 @@ mod cursor;
 mod cv_ddl;
 pub mod cv_time_bucket;
 mod datetime_extras;
+mod datetime_more_udf;
 mod ddl;
 mod dml;
 mod dml_mutate;
@@ -603,11 +604,7 @@ mod seq_udf;
 mod session;
 mod sql_functions;
 mod string_dt_udf;
-// QUARANTINED — dead-agent WIP needing more work, re-queued as tasks:
-//   datetime_more_udf (#151): needs SessionState.datetime field (executor hooks reverted)
-//   inet_udf (#153 INET part): UDF structs missing DynHash/DynEq derives
-//   string_more_udf (#150): base64 engine API + byte-Pattern misuse
-// The 4 clean files below are wired and land now.
+mod string_more_udf;
 mod json_build_udf;
 mod jsonb_modify_udf;
 mod jsonb_path_udf;
@@ -618,8 +615,7 @@ mod udf;
 mod vector_planner;
 mod vector_search;
 mod view_ddl;
-// window_extras QUARANTINED — IGNORE NULLS rewrite logic is broken (6/7 of its
-// own tests fail; could mangle real window queries). Re-queued as #156.
+mod window_extras;
 pub mod webhook_ddl;
 pub mod webhook_registry;
 
