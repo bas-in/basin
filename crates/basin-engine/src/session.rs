@@ -73,6 +73,9 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
     crate::pg_agg_udf::register_json_agg_udafs(&ctx);
     crate::range_udf::register_range_udfs(&ctx);
+    crate::jsonb_path_udf::register_jsonb_path_udfs(&ctx);
+    crate::jsonb_modify_udf::register_jsonb_modify_udfs(&ctx);
+    crate::json_build_udf::register_json_build_udfs(&ctx);
     crate::datetime_extras::register_datetime_extras(&ctx);
     let state = ctx.state();
     StatelessUdfCache {
@@ -533,6 +536,7 @@ pub(crate) async fn open(
     // that is not captured by `StatelessUdfCache` (which only snapshots scalar
     // and aggregate functions). These must be registered per-session.
     crate::jsonb_udf::register_jsonb_udtfs(&ctx);
+    crate::jsonb_path_udf::register_jsonb_path_udtfs(&ctx);
 
     // Auth session functions: `auth_uid()`, `auth_role()`, `auth_jwt()`.
     // These capture a per-session Arc<AuthContext> so they cannot be cached.
