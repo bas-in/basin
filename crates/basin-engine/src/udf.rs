@@ -3765,16 +3765,32 @@ fn split_multidim_rows(s: &str) -> Vec<&str> {
 /// Strip `::jsonb` and `::json` casts so DataFusion's planner does not reject
 /// them with "Unsupported SQL type JSONB". Safe because every JSONB UDF already
 /// accepts Utf8 string literals, and stored JSONB columns are LargeBinary.
+///
+/// Also handles the SQL-standard `CAST(expr AS JSONB)` form, rewriting it to
+/// just `expr` so that a text column passed through `CAST(col AS jsonb)` is
+/// transparently forwarded to the downstream JSONB UDF (which already accepts
+/// Utf8 inputs via `extract_jsonb_value`).
+///
+/// After stripping a `::jsonb` / `::json` cast a single space is emitted when
+/// the immediately-following character is not already whitespace.  This is
+/// necessary so that the operator-rewriter's identifier-boundary guard
+/// (`prev_ok`) does not fire false-negatives on patterns like
+/// `col::jsonb->>'key'` which, after naive stripping, would become
+/// `col->>'key'` — making the `a` preceding `->>` look like an identifier
+/// continuation and preventing the rewrite.
 fn strip_jsonb_casts(sql: &str) -> String {
-    if !sql.contains("::") {
+    // Quick exit: no cast-like token present.
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("::") && !lower.contains("cast") {
         return sql.to_string();
     }
     let bytes = sql.as_bytes();
     let len = bytes.len();
-    let mut out = String::with_capacity(sql.len());
+    let mut out = String::with_capacity(sql.len() + 8);
     let mut i = 0usize;
     while i < len {
         let b = bytes[i];
+        // Pass through single-quoted string literals verbatim.
         if b == b'\'' {
             let start = i;
             i += 1;
@@ -3787,6 +3803,7 @@ fn strip_jsonb_casts(sql: &str) -> String {
             out.push_str(&sql[start..i]);
             continue;
         }
+        // Pass through double-quoted identifiers verbatim.
         if b == b'"' {
             let start = i;
             i += 1;
@@ -3794,6 +3811,7 @@ fn strip_jsonb_casts(sql: &str) -> String {
             out.push_str(&sql[start..i]);
             continue;
         }
+        // Pass through line comments verbatim.
         if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
             let start = i;
             i += 2;
@@ -3801,6 +3819,7 @@ fn strip_jsonb_casts(sql: &str) -> String {
             out.push_str(&sql[start..i]);
             continue;
         }
+        // Pass through block comments verbatim.
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             let start = i;
             i += 2;
@@ -3809,6 +3828,7 @@ fn strip_jsonb_casts(sql: &str) -> String {
             out.push_str(&sql[start..i]);
             continue;
         }
+        // Handle `::jsonb` / `::json` cast suffix.
         if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
             let mut j = i + 2;
             while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
@@ -3819,6 +3839,7 @@ fn strip_jsonb_casts(sql: &str) -> String {
                 let mut k = j;
                 while k < len && bytes[k].is_ascii_whitespace() { k += 1; }
                 if k < len && bytes[k] == b'(' {
+                    // `::jsonb(...)` — consume the parenthesised argument list.
                     let mut depth = 1i32;
                     k += 1;
                     while k < len && depth > 0 {
@@ -3829,7 +3850,76 @@ fn strip_jsonb_casts(sql: &str) -> String {
                 } else {
                     i = j;
                 }
+                // Emit a space so that the next character (e.g. `-` in `->>`
+                // or `@` in `@>`) is not directly adjacent to the preceding
+                // token, keeping the operator-rewriter's boundary guard happy.
+                if i < len && !bytes[i].is_ascii_whitespace() {
+                    out.push(' ');
+                }
                 continue;
+            }
+        }
+        // Handle `CAST(expr AS JSONB)` / `CAST(expr AS JSON)` — rewrite to
+        // just `expr`, preserving the identifier-separation invariant.
+        //
+        // Only fires when:
+        //   • the current position is the `C` of a word-boundary `CAST(`
+        //   • inside the parens there is an `AS jsonb` or `AS json` clause
+        //     immediately before the closing paren.
+        if (b == b'C' || b == b'c')
+            && i + 4 < len
+            && lower[i..].starts_with("cast(")
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+        {
+            // Find the matching closing paren.
+            let paren_open = i + 4; // position of `(`
+            let mut depth = 1i32;
+            let mut k = paren_open + 1;
+            while k < len && depth > 0 {
+                match bytes[k] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b'\'' => {
+                        k += 1;
+                        while k < len {
+                            if bytes[k] == b'\'' {
+                                if k + 1 < len && bytes[k + 1] == b'\'' { k += 2; continue; }
+                                break;
+                            }
+                            k += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                if depth > 0 { k += 1; }
+            }
+            // k is now at the closing `)`.
+            if depth == 0 && k < len {
+                let inner = &sql[paren_open + 1..k];
+                let inner_lower = inner.to_ascii_lowercase();
+                // Check that the last token after `AS` is `jsonb` or `json`.
+                let trimmed = inner_lower.trim_end();
+                let is_jsonb_cast = trimmed.ends_with(" as jsonb")
+                    || trimmed.ends_with("\tas jsonb")
+                    || trimmed.ends_with("\nas jsonb")
+                    || trimmed.ends_with(" as json")
+                    || trimmed.ends_with("\tas json")
+                    || trimmed.ends_with("\nas json");
+                if is_jsonb_cast {
+                    // Extract the expr part (everything before ` AS jsonb`).
+                    let as_pos = trimmed.rfind(" as ").or_else(|| trimmed.rfind("\tas ")).or_else(|| trimmed.rfind("\nas "));
+                    if let Some(pos) = as_pos {
+                        let expr = inner[..pos].trim();
+                        out.push_str(expr);
+                        // Emit a space so the next token (e.g. `->`) has a
+                        // clean boundary.
+                        if k + 1 < len && !bytes[k + 1].is_ascii_whitespace() {
+                            out.push(' ');
+                        }
+                        i = k + 1; // skip past `)`
+                        continue;
+                    }
+                }
             }
         }
         let char_len = if b < 0x80 { 1 } else if b < 0xC0 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
@@ -4163,5 +4253,236 @@ mod json_op_rewrite_tests {
                 || r.contains("make_array(make_array(1, 2), make_array(3, 4))"),
             "got: {r}"
         );
+    }
+
+    // ── text-column ::jsonb cast stripping (fix #88) ──────────────────────────
+
+    /// `col::jsonb->>'k'` — no spaces around operator; the most common app pattern.
+    #[test]
+    fn test_col_cast_jsonb_double_arrow_no_space() {
+        let r = rewrite_json_operators("SELECT data::jsonb->>'key' FROM t");
+        assert!(
+            r.contains("json_get_text(data, 'key')"),
+            "expected json_get_text(data, 'key'), got: {r}"
+        );
+    }
+
+    /// `col::jsonb ->> 'k'` — with spaces; must still work.
+    #[test]
+    fn test_col_cast_jsonb_double_arrow_with_space() {
+        let r = rewrite_json_operators("SELECT data::jsonb ->> 'key' FROM t");
+        assert!(
+            r.contains("json_get_text(data, 'key')"),
+            "expected json_get_text(data, 'key'), got: {r}"
+        );
+    }
+
+    /// `col::jsonb->'k'` — single arrow; must still work.
+    #[test]
+    fn test_col_cast_jsonb_arrow_no_space() {
+        let r = rewrite_json_operators("SELECT data::jsonb->'arr' FROM t");
+        assert!(
+            r.contains("json_get(data, 'arr')"),
+            "expected json_get(data, 'arr'), got: {r}"
+        );
+    }
+
+    /// `col::jsonb #>> '{a,b}'` — hash-double-arrow after cast.
+    #[test]
+    fn test_col_cast_jsonb_hash_double_arrow() {
+        let r = rewrite_json_operators("SELECT data::jsonb #>> '{a,b}' FROM t");
+        assert!(
+            r.contains("json_path_extract_text(data, '{a,b}')"),
+            "expected json_path_extract_text(data, '{{a,b}}'), got: {r}"
+        );
+    }
+
+    /// `col::jsonb @> '{"a":1}'::jsonb` — containment with cast on both sides.
+    #[test]
+    fn test_col_cast_jsonb_contains() {
+        let r = rewrite_json_operators("SELECT data::jsonb @> '{\"a\":1}'::jsonb FROM t");
+        assert!(
+            r.contains("jsonb_contains(data,"),
+            "expected jsonb_contains(data, ...), got: {r}"
+        );
+    }
+
+    /// `CAST(col AS JSONB)->>'k'` — SQL-standard cast form, no space.
+    #[test]
+    fn test_cast_as_jsonb_double_arrow_no_space() {
+        let r = rewrite_json_operators("SELECT CAST(data AS JSONB)->>'key' FROM t");
+        assert!(
+            r.contains("json_get_text(data, 'key')"),
+            "expected json_get_text(data, 'key'), got: {r}"
+        );
+    }
+
+    /// `CAST(col AS jsonb) ->> 'k'` — SQL-standard cast form, lowercase, with space.
+    #[test]
+    fn test_cast_as_jsonb_lower_double_arrow_space() {
+        let r = rewrite_json_operators("SELECT CAST(data AS jsonb) ->> 'key' FROM t");
+        assert!(
+            r.contains("json_get_text(data, 'key')"),
+            "expected json_get_text(data, 'key'), got: {r}"
+        );
+    }
+
+    /// Literal `'{"k":1}'::jsonb->>'k'` — existing literal path must not regress.
+    #[test]
+    fn test_literal_cast_jsonb_double_arrow_no_space() {
+        let r = rewrite_json_operators("SELECT '{\"k\":1}'::jsonb->>'k' FROM t");
+        assert!(
+            r.contains("json_get_text('{\"k\":1}', 'k')")
+                || r.contains("json_get_text('{\"k\":1}' , 'k')")
+                || r.contains("json_get_text( '{\"k\":1}', 'k')"),
+            "expected json_get_text on literal, got: {r}"
+        );
+    }
+
+    /// Stripping `::jsonb` should not corrupt a JSON string literal's content.
+    #[test]
+    fn test_jsonb_cast_inside_literal_not_stripped() {
+        // The `::jsonb` here is INSIDE a quoted string — must NOT be stripped.
+        let sql = "SELECT '::jsonb' AS x";
+        let r = rewrite_json_operators(sql);
+        assert!(r.contains("'::jsonb'"), "literal must be preserved, got: {r}");
+    }
+}
+
+// ── Runtime tests: json_get_text / json_get on Utf8 text columns (fix #88) ──
+
+#[cfg(test)]
+mod jsonb_text_column_runtime_tests {
+    use std::sync::Arc;
+    use datafusion::arrow::array::{Array, ArrayRef, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    /// Build a minimal SessionContext with JSONB UDFs registered and a single
+    /// `t` table with a Utf8 `data` column.
+    fn make_ctx(rows: &[Option<&str>]) -> SessionContext {
+        let ctx = SessionContext::new();
+        crate::jsonb_udf::register_jsonb_udfs(&ctx);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data", DataType::Utf8, true),
+        ]));
+        let data_arr: ArrayRef = Arc::new(StringArray::from(rows.to_vec()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![data_arr]).unwrap();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        ctx
+    }
+
+    fn rewrite(sql: &str) -> String {
+        crate::udf::rewrite_json_operators(sql)
+    }
+
+    /// Helper: run a rewritten SQL string and collect the first column as
+    /// `Vec<Option<String>>`.
+    async fn run_str(ctx: &SessionContext, sql: &str) -> Vec<Option<String>> {
+        let df = ctx.sql(sql).await.expect("plan");
+        let batches = df.collect().await.expect("execute");
+        let mut out = Vec::new();
+        for batch in batches {
+            let col = batch.column(0);
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("expected StringArray");
+            for i in 0..arr.len() {
+                if arr.is_null(i) { out.push(None); } else { out.push(Some(arr.value(i).to_string())); }
+            }
+        }
+        out
+    }
+
+    /// `SELECT data::jsonb->>'key' FROM t` — text column, happy path.
+    #[tokio::test]
+    async fn col_jsonb_cast_extract_string_value() {
+        let ctx = make_ctx(&[Some(r#"{"key":"value"}"#)]);
+        let rewritten = rewrite("SELECT data::jsonb->>'key' FROM t");
+        let result = run_str(&ctx, &rewritten).await;
+        assert_eq!(result, vec![Some("value".to_string())], "got: {result:?}");
+    }
+
+    /// `data = '{"key":42}'` — numeric value extracted as text.
+    #[tokio::test]
+    async fn col_jsonb_cast_extract_numeric_as_text() {
+        let ctx = make_ctx(&[Some(r#"{"key":42}"#)]);
+        let rewritten = rewrite("SELECT data::jsonb->>'key' FROM t");
+        let result = run_str(&ctx, &rewritten).await;
+        assert_eq!(result, vec![Some("42".to_string())], "got: {result:?}");
+    }
+
+    /// `data = NULL` → NULL output.
+    #[tokio::test]
+    async fn col_jsonb_cast_extract_null_row() {
+        let ctx = make_ctx(&[None]);
+        let rewritten = rewrite("SELECT data::jsonb->>'key' FROM t");
+        let result = run_str(&ctx, &rewritten).await;
+        assert_eq!(result, vec![None], "got: {result:?}");
+    }
+
+    /// `data = '{}'` → NULL output (key not present).
+    #[tokio::test]
+    async fn col_jsonb_cast_extract_missing_key() {
+        let ctx = make_ctx(&[Some("{}")]);
+        let rewritten = rewrite("SELECT data::jsonb->>'key' FROM t");
+        let result = run_str(&ctx, &rewritten).await;
+        assert_eq!(result, vec![None], "got: {result:?}");
+    }
+
+    /// Literal path `'{"k":"hello"}'::jsonb->>'k'` must not regress.
+    #[tokio::test]
+    async fn literal_cast_jsonb_double_arrow_runtime() {
+        let ctx = make_ctx(&[Some("{}")]);  // row exists but we use a literal
+        let rewritten = rewrite(r#"SELECT '{"k":"hello"}'::jsonb->>'k' FROM t"#);
+        let result = run_str(&ctx, &rewritten).await;
+        assert_eq!(result, vec![Some("hello".to_string())], "got: {result:?}");
+    }
+
+    /// `SELECT data::jsonb->'arr' FROM t` — single arrow returns JSON array
+    /// as a LargeBinary (jsonb) value; we verify it is non-null and parseable.
+    #[tokio::test]
+    async fn col_jsonb_cast_single_arrow_array() {
+        use datafusion::arrow::array::LargeBinaryArray;
+        let ctx = make_ctx(&[Some(r#"{"arr":[1,2]}"#)]);
+        let rewritten = rewrite("SELECT data::jsonb->'arr' FROM t");
+        let df = ctx.sql(&rewritten).await.expect("plan");
+        let batches = df.collect().await.expect("execute");
+        let batch = &batches[0];
+        let col = batch.column(0);
+        let arr = col.as_any().downcast_ref::<LargeBinaryArray>().expect("LargeBinaryArray");
+        assert!(!arr.is_null(0), "expected non-null");
+        let json_bytes = arr.value(0);
+        let v: serde_json::Value = serde_json::from_slice(json_bytes).expect("valid json");
+        assert_eq!(v, serde_json::json!([1, 2]), "got: {v}");
+    }
+
+    /// `CAST(data AS JSONB)->>'key'` — SQL-standard cast form at runtime.
+    #[tokio::test]
+    async fn cast_as_jsonb_extract_runtime() {
+        let ctx = make_ctx(&[Some(r#"{"key":"world"}"#)]);
+        let rewritten = rewrite("SELECT CAST(data AS JSONB)->>'key' FROM t");
+        let result = run_str(&ctx, &rewritten).await;
+        assert_eq!(result, vec![Some("world".to_string())], "got: {result:?}");
+    }
+
+    /// `data::jsonb @> '{"a":1}'::jsonb` — containment with text-column LHS.
+    #[tokio::test]
+    async fn col_jsonb_cast_contains_runtime() {
+        use datafusion::arrow::array::BooleanArray;
+        let ctx = make_ctx(&[Some(r#"{"a":1,"b":2}"#), Some(r#"{"a":2}"#)]);
+        let rewritten = rewrite(r#"SELECT data::jsonb @> '{"a":1}'::jsonb FROM t"#);
+        let df = ctx.sql(&rewritten).await.expect("plan");
+        let batches = df.collect().await.expect("execute");
+        let batch = &batches[0];
+        let col = batch.column(0);
+        let arr = col.as_any().downcast_ref::<BooleanArray>().expect("BooleanArray");
+        assert_eq!(arr.value(0), true, "first row should contain {{\"a\":1}}");
+        assert_eq!(arr.value(1), false, "second row should not contain {{\"a\":1}}");
     }
 }
