@@ -948,6 +948,15 @@ fn array_extract_right(s: &str, start: usize) -> (usize, usize) {
 /// (subquery)` is the standard SQL equivalent and works reliably.
 /// `OP ALL` is rewritten using aggregate scalar subqueries.
 pub(crate) fn rewrite_any_some_subquery(sql: &str) -> String {
+    // Fast-path: if neither "any", "some", nor "all" appears in the query
+    // (case-insensitive), none of the quantified operators can be present.
+    let lower_check = sql.to_ascii_lowercase();
+    if !lower_check.contains("any")
+        && !lower_check.contains("some")
+        && !lower_check.contains(" all")
+    {
+        return sql.to_string();
+    }
     // `= ANY (...)` → `IN (...)`
     let s = rewrite_quantified_op(sql, "= any", "IN");
     // `= SOME (...)` → `IN (...)`
@@ -1270,6 +1279,13 @@ fn rewrite_quantified_op(sql: &str, op_kw: &str, new_op: &str) -> String {
 ///
 /// Also handles `<> ANY(ARRAY[...])` / `!= ANY(ARRAY[...])` → `NOT IN (...)`.
 pub(crate) fn rewrite_any_array(sql: &str) -> String {
+    // Fast-path: if neither "any" nor "some" appears at all (case-insensitive),
+    // there is nothing for this rewriter to do.  This avoids the per-variant
+    // string allocation + lowercase scan for the common case.
+    let lower_check = sql.to_ascii_lowercase();
+    if !lower_check.contains("any") && !lower_check.contains("some") {
+        return sql.to_string();
+    }
     let mut s = rewrite_one_any_array(sql, "= any", false);
     s = rewrite_one_any_array(&s, "= some", false);
     s = rewrite_one_any_array(&s, "<> any", true);
@@ -1366,6 +1382,12 @@ fn rewrite_one_any_array(sql: &str, op_lower: &str, negate: bool) -> String {
 /// path which converts them to `NOT IN` — not touched here.
 /// `= ALL` is left unhandled (rare; semantics require both min = max = x).
 pub(crate) fn rewrite_all_array(sql: &str) -> String {
+    // Fast-path: if " all" does not appear in the query (case-insensitive)
+    // none of the operators (>= all, <= all, > all, < all) can be present.
+    let lower_check = sql.to_ascii_lowercase();
+    if !lower_check.contains(" all") {
+        return sql.to_string();
+    }
     // Pairs: (op_lower_including_all, array_aggregate_fn)
     // Longer operators first to avoid `>= all` being eaten by `> all`.
     const OPS: &[(&str, &str)] = &[
@@ -2833,7 +2855,12 @@ fn array_extract_right_pub(s: &str, start: usize) -> (usize, usize) {
 /// Only rewrites the exact pattern `(expr, expr) OVERLAPS (expr, expr)`;
 /// leaves everything else untouched.
 pub(crate) fn rewrite_overlaps(sql: &str) -> String {
+    // Fast-path: if "overlaps" does not appear in the query there is nothing
+    // to rewrite.  Avoids the loop-local lowercase allocation for the common case.
     let lower = sql.to_ascii_lowercase();
+    if !lower.contains("overlaps") {
+        return sql.to_string();
+    }
     let mut s = sql.to_string();
     let mut search_from = 0usize;
     loop {
@@ -3002,6 +3029,11 @@ fn find_matching_open_paren(s: &str, close_paren: usize) -> Option<usize> {
 /// Only fires on `FILTER` that appears outside string literals and is
 /// preceded by `)` (end of the aggregate's argument list).
 pub(crate) fn rewrite_aggregate_filter(sql: &str) -> String {
+    // Fast-path: if "filter" does not appear in the query there is nothing
+    // to rewrite.  Avoids the loop-local lowercase allocation for the common case.
+    if !sql.to_ascii_lowercase().contains("filter") {
+        return sql.to_string();
+    }
     let mut s = sql.to_string();
     let mut search_from = 0usize;
     loop {
@@ -3135,6 +3167,11 @@ fn find_matching_close_paren(s: &str, open_paren: usize) -> Option<usize> {
 /// - `WITH cte AS MATERIALIZED (...)` → `WITH cte AS (...)`
 /// - `WITH cte AS NOT MATERIALIZED (...)` → `WITH cte AS (...)`
 pub(crate) fn rewrite_cte_materialized(sql: &str) -> String {
+    // Fast-path: if "materialized" does not appear in the query there is
+    // nothing to rewrite.
+    if !sql.to_ascii_lowercase().contains("materialized") {
+        return sql.to_string();
+    }
     // Replace `AS NOT MATERIALIZED (` → `AS (` (longer match first).
     let s = rewrite_cte_keyword(sql, "as not materialized (", "AS (");
     rewrite_cte_keyword(&s, "as materialized (", "AS (")
@@ -3555,6 +3592,12 @@ fn strip_expr_alias(expr: &str) -> &str {
 ///
 /// The rewrite is case-insensitive for the `::UUID` suffix.
 pub(crate) fn rewrite_uuid_cast(sql: &str) -> String {
+    // Fast-path: if "uuid" does not appear in the query at all, there is
+    // nothing to rewrite.  This avoids the unconditional `sql.to_string()`
+    // allocation for the common case.
+    if !sql.to_ascii_lowercase().contains("uuid") {
+        return sql.to_string();
+    }
     // Simple case-insensitive suffix substitution: `::UUID` → `::VARCHAR`.
     // We only replace the literal `::UUID` suffix (no modifier).
     let lower = sql.to_ascii_lowercase();
@@ -3597,6 +3640,12 @@ pub(crate) fn rewrite_uuid_cast(sql: &str) -> String {
 /// The rewriter detects `B'...'` only when `B` appears **outside** any
 /// existing single-quoted string context (e.g. `'B'` is left as-is).
 pub(crate) fn rewrite_bit_string_literal(sql: &str) -> String {
+    // Fast-path: if there's no `B'` or `b'` sequence at all, there are no
+    // bit-string literals and the query is unchanged. Avoids the full O(n)
+    // character scan for the common case.
+    if !sql.contains("B'") && !sql.contains("b'") {
+        return sql.to_string();
+    }
     // Use a character-level scan that correctly handles multi-byte UTF-8 and
     // tracks whether we're inside a single-quoted string literal.
     let chars: Vec<char> = sql.chars().collect();
@@ -3670,6 +3719,11 @@ pub(crate) fn rewrite_bit_string_literal(sql: &str) -> String {
 /// them to the equivalent number of seconds. Non-matching interval strings
 /// (like `'1 hour 30 minutes'`) pass through unchanged.
 pub(crate) fn rewrite_interval_hms_cast(sql: &str) -> String {
+    // Fast-path: if "interval" does not appear in the query there is nothing
+    // to scan.  Avoids the full O(n) character scan and extra string allocation.
+    if !sql.to_ascii_lowercase().contains("interval") {
+        return sql.to_string();
+    }
     let lower = sql.to_ascii_lowercase();
     let bytes = sql.as_bytes();
     let n = bytes.len();
@@ -4966,5 +5020,84 @@ mod tests {
         // The embedded `''` must survive in the wrapped form.
         assert!(out.contains("it''s"), "escaped quotes must survive: {out}");
         assert!(out.to_ascii_lowercase().contains("json_to_recordset"), "must use recordset: {out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fast-exit guard tests: verify that each rewrite function returns the
+    // input unchanged (as the exact same string content) when the target
+    // pattern is provably absent.  These pin the fast-path so it can't silently
+    // regress under refactoring.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fast_exit_bit_string_literal_plain_select() {
+        let sql = "SELECT id, name FROM events WHERE id = 42";
+        assert_eq!(rewrite_bit_string_literal(sql), sql,
+            "rewrite_bit_string_literal must be a no-op when no B' sequence is present");
+    }
+
+    #[test]
+    fn fast_exit_bit_string_literal_still_rewrites() {
+        // Sanity check: a real bit-string literal DOES get rewritten.
+        let sql = "SELECT B'1010'";
+        let out = rewrite_bit_string_literal(sql);
+        // The rewriter should turn B'...' into a different form.
+        assert_ne!(out, sql, "rewrite_bit_string_literal should transform B'...' literals");
+    }
+
+    #[test]
+    fn fast_exit_any_array_plain_select() {
+        let sql = "SELECT id FROM t WHERE id = 1";
+        assert_eq!(rewrite_any_array(sql), sql,
+            "rewrite_any_array must be a no-op when 'any'/'some' is absent");
+    }
+
+    #[test]
+    fn fast_exit_all_array_plain_select() {
+        let sql = "SELECT id FROM t WHERE id = 1";
+        assert_eq!(rewrite_all_array(sql), sql,
+            "rewrite_all_array must be a no-op when ' all' is absent");
+    }
+
+    #[test]
+    fn fast_exit_uuid_cast_plain_select() {
+        let sql = "SELECT id, value FROM events WHERE id = 42";
+        assert_eq!(rewrite_uuid_cast(sql), sql,
+            "rewrite_uuid_cast must be a no-op when 'uuid' is absent");
+    }
+
+    #[test]
+    fn fast_exit_overlaps_plain_select() {
+        let sql = "SELECT id, ts FROM events WHERE id = 42";
+        assert_eq!(rewrite_overlaps(sql), sql,
+            "rewrite_overlaps must be a no-op when 'overlaps' is absent");
+    }
+
+    #[test]
+    fn fast_exit_aggregate_filter_plain_select() {
+        let sql = "SELECT count(*) FROM events WHERE id = 42";
+        assert_eq!(rewrite_aggregate_filter(sql), sql,
+            "rewrite_aggregate_filter must be a no-op when 'filter' is absent");
+    }
+
+    #[test]
+    fn fast_exit_cte_materialized_plain_select() {
+        let sql = "WITH cte AS (SELECT id FROM t) SELECT * FROM cte";
+        assert_eq!(rewrite_cte_materialized(sql), sql,
+            "rewrite_cte_materialized must be a no-op when 'materialized' is absent");
+    }
+
+    #[test]
+    fn fast_exit_interval_hms_cast_plain_select() {
+        let sql = "SELECT id, created_at FROM events WHERE id = 42";
+        assert_eq!(rewrite_interval_hms_cast(sql), sql,
+            "rewrite_interval_hms_cast must be a no-op when 'interval' is absent");
+    }
+
+    #[test]
+    fn fast_exit_any_some_subquery_plain_select() {
+        let sql = "SELECT id FROM t WHERE id = 1";
+        assert_eq!(rewrite_any_some_subquery(sql), sql,
+            "rewrite_any_some_subquery must be a no-op when any/some/all are absent");
     }
 }
