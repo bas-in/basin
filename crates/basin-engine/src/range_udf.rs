@@ -65,6 +65,21 @@ pub(crate) fn register_range_udfs(ctx: &SessionContext) {
         sig: make_range_ctor_sig(DataType::Utf8),
     }));
 
+    // Multirange constructors — variadic, accept one or more range JSON strings.
+    let multirange_sig = Signature::variadic_any(Volatility::Immutable);
+    ctx.register_udf(ScalarUDF::from(MultirangeConstructorUdf {
+        name: "int4multirange",
+        sig: multirange_sig.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(MultirangeConstructorUdf {
+        name: "int8multirange",
+        sig: multirange_sig.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(MultirangeConstructorUdf {
+        name: "nummultirange",
+        sig: multirange_sig,
+    }));
+
     let utf8_sig = Signature::exact(vec![DataType::Utf8], Volatility::Immutable);
 
     // Accessors.
@@ -133,6 +148,23 @@ pub(crate) fn register_range_udfs(ctx: &SessionContext) {
     // Set operations.
     ctx.register_udf(ScalarUDF::from(RangeMergeUdf {
         sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+    }));
+
+    // Arithmetic operators (pre-parse rewriter maps +/*/- to these).
+    let two_utf8 = Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable);
+    ctx.register_udf(ScalarUDF::from(RangeUnionUdf { sig: two_utf8.clone() }));
+    ctx.register_udf(ScalarUDF::from(RangeIntersectionUdf { sig: two_utf8.clone() }));
+    ctx.register_udf(ScalarUDF::from(RangeDiffUdf { sig: two_utf8 }));
+
+    // Multirange @> scalar containment.
+    ctx.register_udf(ScalarUDF::from(MultirangeContainsUdf {
+        sig: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Float64]),
+            ],
+            Volatility::Immutable,
+        ),
     }));
 }
 
@@ -920,6 +952,474 @@ impl ScalarUDFImpl for RangeMergeUdf {
 }
 
 // ---------------------------------------------------------------------------
+// Range arithmetic: union (+), intersection (*), difference (-)
+// ---------------------------------------------------------------------------
+
+/// Internal parse result: extracted range bounds as f64 with inclusivity flags.
+struct RangeParts {
+    lo: Option<f64>,
+    hi: Option<f64>,
+    li: bool,
+    ui: bool,
+    empty: bool,
+}
+
+fn parse_range_parts(s: &str) -> Option<RangeParts> {
+    // Special "empty" sentinel (stored as `{"empty":true}` or the raw string "empty").
+    if s.trim() == "empty" {
+        return Some(RangeParts { lo: None, hi: None, li: false, ui: false, empty: true });
+    }
+    let v = parse_range(s)?;
+    if v.get("empty").and_then(|e| e.as_bool()).unwrap_or(false) {
+        return Some(RangeParts { lo: None, hi: None, li: false, ui: false, empty: true });
+    }
+    let lo = range_bound_f64(&v, "l");
+    let hi = range_bound_f64(&v, "u");
+    let li = v.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
+    let ui = v.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
+    Some(RangeParts { lo, hi, li, ui, empty: false })
+}
+
+fn format_range_parts(p: &RangeParts) -> String {
+    if p.empty {
+        return r#"{"empty":true}"#.to_string();
+    }
+    let lo_str = p.lo.map(|v| {
+        // Emit as integer if the value is a whole number, otherwise float.
+        if v.fract() == 0.0 && v.abs() < 1e15 {
+            format!("{}", v as i64)
+        } else {
+            v.to_string()
+        }
+    });
+    let hi_str = p.hi.map(|v| {
+        if v.fract() == 0.0 && v.abs() < 1e15 {
+            format!("{}", v as i64)
+        } else {
+            v.to_string()
+        }
+    });
+    format_range(lo_str.as_deref(), hi_str.as_deref(), p.li, p.ui)
+}
+
+/// True if two ranges are overlapping or adjacent (i.e. their union is contiguous).
+/// "Adjacent" means: one's upper bound == the other's lower bound, and together
+/// the inclusivity covers that point (exactly one of the two bounds is inclusive).
+fn ranges_contiguous(a: &RangeParts, b: &RangeParts) -> bool {
+    if a.empty || b.empty {
+        return true; // empty + anything is always fine
+    }
+    // Do they overlap?
+    let a_ends_before_b = match (a.hi, b.lo) {
+        (Some(ah), Some(bl)) => {
+            if a.ui && b.li { ah < bl } else { ah <= bl }
+        }
+        _ => false,
+    };
+    let b_ends_before_a = match (b.hi, a.lo) {
+        (Some(bh), Some(al)) => {
+            if b.ui && a.li { bh < al } else { bh <= al }
+        }
+        _ => false,
+    };
+    if !a_ends_before_b && !b_ends_before_a {
+        return true; // overlapping
+    }
+    // Adjacent: a_hi == b_lo (exactly one inclusive) or b_hi == a_lo.
+    let adj_a_b = match (a.hi, b.lo) {
+        (Some(ah), Some(bl)) => {
+            (ah - bl).abs() < 1e-12 && (a.ui != b.li)
+        }
+        _ => false,
+    };
+    let adj_b_a = match (b.hi, a.lo) {
+        (Some(bh), Some(al)) => {
+            (bh - al).abs() < 1e-12 && (b.ui != a.li)
+        }
+        _ => false,
+    };
+    adj_a_b || adj_b_a
+}
+
+fn range_union_impl(a: &RangeParts, b: &RangeParts) -> DFResult<RangeParts> {
+    if a.empty { return Ok(RangeParts { lo: b.lo, hi: b.hi, li: b.li, ui: b.ui, empty: b.empty }); }
+    if b.empty { return Ok(RangeParts { lo: a.lo, hi: a.hi, li: a.li, ui: a.ui, empty: a.empty }); }
+    if !ranges_contiguous(a, b) {
+        return exec_err!("result of range union would not be contiguous");
+    }
+    // Lower: min
+    let (new_lo, new_li) = match (a.lo, b.lo) {
+        (None, _) | (_, None) => (None, false),
+        (Some(al), Some(bl)) => {
+            if al < bl { (Some(al), a.li) }
+            else if al > bl { (Some(bl), b.li) }
+            else { (Some(al), a.li || b.li) }
+        }
+    };
+    // Upper: max
+    let (new_hi, new_ui) = match (a.hi, b.hi) {
+        (None, _) | (_, None) => (None, false),
+        (Some(ah), Some(bh)) => {
+            if ah > bh { (Some(ah), a.ui) }
+            else if ah < bh { (Some(bh), b.ui) }
+            else { (Some(ah), a.ui || b.ui) }
+        }
+    };
+    Ok(RangeParts { lo: new_lo, hi: new_hi, li: new_li, ui: new_ui, empty: false })
+}
+
+fn range_intersection_impl(a: &RangeParts, b: &RangeParts) -> RangeParts {
+    if a.empty || b.empty {
+        return RangeParts { lo: None, hi: None, li: false, ui: false, empty: true };
+    }
+    // Lower: max of the two lower bounds.
+    let (new_lo, new_li) = match (a.lo, b.lo) {
+        (None, blo) => (blo, b.li),
+        (alo, None) => (alo, a.li),
+        (Some(al), Some(bl)) => {
+            if al > bl { (Some(al), a.li) }
+            else if al < bl { (Some(bl), b.li) }
+            else { (Some(al), a.li && b.li) }
+        }
+    };
+    // Upper: min of the two upper bounds.
+    let (new_hi, new_ui) = match (a.hi, b.hi) {
+        (None, bhi) => (bhi, b.ui),
+        (ahi, None) => (ahi, a.ui),
+        (Some(ah), Some(bh)) => {
+            if ah < bh { (Some(ah), a.ui) }
+            else if ah > bh { (Some(bh), b.ui) }
+            else { (Some(ah), a.ui && b.ui) }
+        }
+    };
+    // Check if intersection is empty.
+    let is_empty = match (new_lo, new_hi) {
+        (Some(lo), Some(hi)) => {
+            lo > hi || (lo == hi && (!new_li || !new_ui))
+        }
+        _ => false,
+    };
+    if is_empty {
+        RangeParts { lo: None, hi: None, li: false, ui: false, empty: true }
+    } else {
+        RangeParts { lo: new_lo, hi: new_hi, li: new_li, ui: new_ui, empty: false }
+    }
+}
+
+fn range_diff_impl(a: &RangeParts, b: &RangeParts) -> DFResult<RangeParts> {
+    if a.empty || b.empty {
+        return Ok(RangeParts { lo: a.lo, hi: a.hi, li: a.li, ui: a.ui, empty: a.empty });
+    }
+    // Compute intersection to determine the overlap.
+    let inter = range_intersection_impl(a, b);
+    if inter.empty {
+        // No overlap — return a unchanged.
+        return Ok(RangeParts { lo: a.lo, hi: a.hi, li: a.li, ui: a.ui, empty: a.empty });
+    }
+    // b fully covers a → result is empty.
+    // Check: inter == a (b contains a).
+    let b_covers_a = {
+        // Lower: inter.lo == a.lo (same or a is -inf when both are None).
+        let lo_match = match (inter.lo, a.lo) {
+            (None, None) => true,
+            (Some(il), Some(al)) => (il - al).abs() < 1e-12 && inter.li == a.li,
+            _ => false,
+        };
+        let hi_match = match (inter.hi, a.hi) {
+            (None, None) => true,
+            (Some(ih), Some(ah)) => (ih - ah).abs() < 1e-12 && inter.ui == a.ui,
+            _ => false,
+        };
+        lo_match && hi_match
+    };
+    if b_covers_a {
+        return Ok(RangeParts { lo: None, hi: None, li: false, ui: false, empty: true });
+    }
+    // If b splits a in the middle → contiguity error.
+    // b is "in the middle" if both a.lo < inter.lo (a has stuff left of b) AND
+    // inter.hi < a.hi (a has stuff right of b).
+    let left_remains = match (a.lo, inter.lo) {
+        (None, _) => true,      // a has -inf lower
+        (_, None) => false,
+        (Some(al), Some(il)) => al < il || (al == il && a.li && !inter.li),
+    };
+    let right_remains = match (a.hi, inter.hi) {
+        (None, _) => true,      // a has +inf upper
+        (_, None) => false,
+        (Some(ah), Some(ih)) => ah > ih || (ah == ih && a.ui && !inter.ui),
+    };
+    if left_remains && right_remains {
+        return exec_err!("result of range difference would not be contiguous");
+    }
+    // b cuts one end off: return the remaining piece.
+    if left_remains {
+        // b cuts the right end — result is [a.lo, b.lo)
+        let (new_hi, new_ui) = match b.lo {
+            None => (None, false),
+            Some(bl) => (Some(bl), !b.li), // complement b's lower inclusivity
+        };
+        Ok(RangeParts { lo: a.lo, hi: new_hi, li: a.li, ui: new_ui, empty: false })
+    } else {
+        // b cuts the left end — result is (b.hi, a.hi]
+        let (new_lo, new_li) = match b.hi {
+            None => (None, false),
+            Some(bh) => (Some(bh), !b.ui),
+        };
+        Ok(RangeParts { lo: new_lo, hi: a.hi, li: new_li, ui: a.ui, empty: false })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RangeUnionUdf — range_union(a, b)  maps to SQL `a + b`
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Eq, Hash)]
+struct RangeUnionUdf {
+    sig: Signature,
+}
+
+impl std::fmt::Debug for RangeUnionUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RangeUnionUdf")
+    }
+}
+
+impl ScalarUDFImpl for RangeUnionUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "range_union" }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.number_rows;
+        let a_strs = columnar_to_strings(&args.args[0], n)?;
+        let b_strs = columnar_to_strings(&args.args[1], n)?;
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let result = (|| -> DFResult<Option<String>> {
+                let as_ = match a_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
+                let bs = match b_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
+                let a = parse_range_parts(as_).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_union: invalid range A".into()))?;
+                let b = parse_range_parts(bs).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_union: invalid range B".into()))?;
+                let res = range_union_impl(&a, &b)?;
+                Ok(Some(format_range_parts(&res)))
+            })()?;
+            out.push(result);
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RangeIntersectionUdf — range_intersection(a, b)  maps to SQL `a * b`
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Eq, Hash)]
+struct RangeIntersectionUdf {
+    sig: Signature,
+}
+
+impl std::fmt::Debug for RangeIntersectionUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RangeIntersectionUdf")
+    }
+}
+
+impl ScalarUDFImpl for RangeIntersectionUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "range_intersection" }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.number_rows;
+        let a_strs = columnar_to_strings(&args.args[0], n)?;
+        let b_strs = columnar_to_strings(&args.args[1], n)?;
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let result = a_strs[i].as_deref().and_then(|as_| {
+                let bs = b_strs[i].as_deref()?;
+                let a = parse_range_parts(as_)?;
+                let b = parse_range_parts(bs)?;
+                Some(format_range_parts(&range_intersection_impl(&a, &b)))
+            });
+            out.push(result);
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RangeDiffUdf — range_diff(a, b)  maps to SQL `a - b`
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Eq, Hash)]
+struct RangeDiffUdf {
+    sig: Signature,
+}
+
+impl std::fmt::Debug for RangeDiffUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RangeDiffUdf")
+    }
+}
+
+impl ScalarUDFImpl for RangeDiffUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "range_diff" }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.number_rows;
+        let a_strs = columnar_to_strings(&args.args[0], n)?;
+        let b_strs = columnar_to_strings(&args.args[1], n)?;
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let result = (|| -> DFResult<Option<String>> {
+                let as_ = match a_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
+                let bs = match b_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
+                let a = parse_range_parts(as_).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_diff: invalid range A".into()))?;
+                let b = parse_range_parts(bs).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_diff: invalid range B".into()))?;
+                let res = range_diff_impl(&a, &b)?;
+                Ok(Some(format_range_parts(&res)))
+            })()?;
+            out.push(result);
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MultirangeConstructorUdf — int4multirange(range...) → JSON array of ranges
+// ---------------------------------------------------------------------------
+
+/// A multirange is stored as a JSON array of range JSON objects, e.g.
+/// `[{"l":1,"u":5,"li":true,"ui":false},{"l":10,"u":20,"li":true,"ui":false}]`
+/// The ranges are kept in sorted, non-overlapping order (adjacent ranges are
+/// NOT merged — PG does merge them on construction, but for our purposes
+/// the containment check works correctly with sorted non-overlapping ranges).
+#[derive(PartialEq, Eq, Hash)]
+struct MultirangeConstructorUdf {
+    name: &'static str,
+    sig: Signature,
+}
+
+impl std::fmt::Debug for MultirangeConstructorUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MultirangeConstructorUdf({})", self.name)
+    }
+}
+
+impl ScalarUDFImpl for MultirangeConstructorUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { self.name }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.number_rows;
+        // Collect each argument (range JSON string) into a Vec.
+        let mut arg_string_cols: Vec<Vec<Option<String>>> = Vec::with_capacity(args.args.len());
+        for cv in &args.args {
+            arg_string_cols.push(columnar_to_strings(cv, n)?);
+        }
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let mut ranges: Vec<serde_json::Value> = Vec::new();
+            let mut any_null = false;
+            for col in &arg_string_cols {
+                match col[row].as_deref() {
+                    None => { any_null = true; break; }
+                    Some(s) => {
+                        match parse_range(s) {
+                            Some(v) => ranges.push(v),
+                            None => { any_null = true; break; }
+                        }
+                    }
+                }
+            }
+            if any_null {
+                out.push(None);
+            } else {
+                // Sort ranges by lower bound (nulls = -inf first).
+                ranges.sort_by(|a, b| {
+                    let al = range_bound_f64(a, "l");
+                    let bl = range_bound_f64(b, "l");
+                    match (al, bl) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, _) => std::cmp::Ordering::Less,
+                        (_, None) => std::cmp::Ordering::Greater,
+                        (Some(av), Some(bv)) => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
+                    }
+                });
+                out.push(Some(serde_json::Value::Array(ranges).to_string()));
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MultirangeContainsUdf — multirange_contains_elem(mrange, elem)
+// Maps to SQL `int4multirange(...) @> scalar`
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Eq, Hash)]
+struct MultirangeContainsUdf {
+    sig: Signature,
+}
+
+impl std::fmt::Debug for MultirangeContainsUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MultirangeContainsUdf")
+    }
+}
+
+impl ScalarUDFImpl for MultirangeContainsUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "multirange_contains_elem" }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.number_rows;
+        let mrange_strs = columnar_to_strings(&args.args[0], n)?;
+        let elem_strs = columnar_to_strings(&args.args[1], n)?;
+        let mut out: Vec<Option<bool>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let result = mrange_strs[i].as_deref().and_then(|ms| {
+                let es = elem_strs[i].as_deref()?;
+                let elem: f64 = es.parse().ok()?;
+                // Parse as JSON array of range objects.
+                let arr: Vec<serde_json::Value> = serde_json::from_str(ms).ok()?;
+                for range_val in &arr {
+                    let li = range_val.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
+                    let ui = range_val.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let lower_ok = match range_val.get("l") {
+                        Some(lv) if !lv.is_null() => {
+                            let lo: f64 = lv.as_f64()
+                                .or_else(|| lv.as_str().and_then(|s| s.parse().ok()))?;
+                            if li { elem >= lo } else { elem > lo }
+                        }
+                        _ => true,
+                    };
+                    let upper_ok = match range_val.get("u") {
+                        Some(uv) if !uv.is_null() => {
+                            let hi: f64 = uv.as_f64()
+                                .or_else(|| uv.as_str().and_then(|s| s.parse().ok()))?;
+                            if ui { elem <= hi } else { elem < hi }
+                        }
+                        _ => true,
+                    };
+                    if lower_ok && upper_ok {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            });
+            out.push(result);
+        }
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Operator rewriter
 // ---------------------------------------------------------------------------
 
@@ -928,6 +1428,11 @@ impl ScalarUDFImpl for RangeMergeUdf {
 /// operators of the same name.
 const RANGE_CTOR_KEYWORDS: &[&str] = &[
     "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+];
+
+/// Multirange constructor keywords.
+const MULTIRANGE_CTOR_KEYWORDS: &[&str] = &[
+    "int4multirange", "int8multirange", "nummultirange",
 ];
 
 /// Rewrite range type cast suffixes like `'[1,10)'::int4range` to just
@@ -973,11 +1478,17 @@ pub(crate) fn rewrite_range_casts(sql: &str) -> String {
 pub(crate) fn rewrite_range_operators(sql: &str) -> String {
     let ops: &[(&str, &str)] = &[
         ("-|-", "range_adjacent"),
-        ("@>", "__range_at_gt"),   // placeholder, see below
-        ("<@", "__range_lt_at"),   // placeholder, see below
+        ("@>", "__range_at_gt"),         // placeholder, see below
+        ("<@", "__range_lt_at"),          // placeholder, see below
         ("&&", "range_overlaps"),
         ("<<", "range_strictly_left"),
         (">>", "range_strictly_right"),
+        // Arithmetic operators: only rewrite when both operands look like
+        // range constructors (heuristic), so we don't rewrite plain numeric
+        // `a + b`, `a * b`, `a - b` expressions.
+        ("+", "__range_plus"),            // placeholder
+        ("*", "__range_star"),            // placeholder
+        ("-", "__range_minus"),           // placeholder
     ];
     let mut s = sql.to_string();
     for &(op, func) in ops {
@@ -1001,10 +1512,13 @@ fn rewrite_range_op_once(sql: &str, op: &str, func: &str) -> String {
         let lhs = &s[lhs_start..lhs_end];
         let rhs = &s[rhs_start..rhs_end];
 
-        // For @> / <@ decide if this is range or leave alone.
+        // For @> / <@ / +/* /- decide if this is range or leave alone.
         let actual_func = match func {
             "__range_at_gt" => {
-                if looks_like_range(lhs) || looks_like_range(rhs) {
+                if looks_like_multirange(lhs) {
+                    // multirange @> scalar → multirange_contains_elem
+                    "multirange_contains_elem"
+                } else if looks_like_range(lhs) || looks_like_range(rhs) {
                     // If rhs also looks like a range → range_contains_range;
                     // otherwise → range_contains_elem.
                     if looks_like_range(rhs) {
@@ -1048,6 +1562,28 @@ fn rewrite_range_op_once(sql: &str, op: &str, func: &str) -> String {
                     break;
                 }
             }
+            "__range_plus" => {
+                // Only rewrite if BOTH operands look like range constructors.
+                if looks_like_range(lhs) && looks_like_range(rhs) {
+                    "range_union"
+                } else {
+                    break; // not a range expression, leave untouched
+                }
+            }
+            "__range_star" => {
+                if looks_like_range(lhs) && looks_like_range(rhs) {
+                    "range_intersection"
+                } else {
+                    break;
+                }
+            }
+            "__range_minus" => {
+                if looks_like_range(lhs) && looks_like_range(rhs) {
+                    "range_diff"
+                } else {
+                    break;
+                }
+            }
             other => other,
         };
 
@@ -1066,6 +1602,12 @@ fn rewrite_range_op_once(sql: &str, op: &str, func: &str) -> String {
 fn looks_like_range(expr: &str) -> bool {
     let trimmed = expr.trim().to_ascii_lowercase();
     RANGE_CTOR_KEYWORDS.iter().any(|kw| trimmed.starts_with(kw))
+}
+
+/// Return `true` if `expr` looks like a multirange constructor call.
+fn looks_like_multirange(expr: &str) -> bool {
+    let trimmed = expr.trim().to_ascii_lowercase();
+    MULTIRANGE_CTOR_KEYWORDS.iter().any(|kw| trimmed.starts_with(kw))
 }
 
 /// Find the first occurrence of `op` that is not inside a single-quoted
@@ -1440,5 +1982,272 @@ mod tests {
         } else {
             panic!("expected array");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Range arithmetic: union (+), intersection (*), difference (-)
+    // -----------------------------------------------------------------------
+
+    fn make_union_udf() -> RangeUnionUdf {
+        RangeUnionUdf {
+            sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+        }
+    }
+
+    fn make_intersection_udf() -> RangeIntersectionUdf {
+        RangeIntersectionUdf {
+            sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+        }
+    }
+
+    fn make_diff_udf() -> RangeDiffUdf {
+        RangeDiffUdf {
+            sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+        }
+    }
+
+    fn extract_string(result: ColumnarValue) -> String {
+        if let ColumnarValue::Array(arr) = result {
+            let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
+            sa.value(0).to_string()
+        } else {
+            panic!("expected array result");
+        }
+    }
+
+    fn parse_bounds(json_str: &str) -> (i64, i64, bool, bool) {
+        let v: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
+        let lo = v["l"].as_i64().unwrap();
+        let hi = v["u"].as_i64().unwrap();
+        let li = v["li"].as_bool().unwrap();
+        let ui = v["ui"].as_bool().unwrap();
+        (lo, hi, li, ui)
+    }
+
+    fn is_empty_json(json_str: &str) -> bool {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            v.get("empty").and_then(|e| e.as_bool()).unwrap_or(false)
+        } else {
+            json_str.trim() == "empty"
+        }
+    }
+
+    /// `int4range(1,5) + int4range(3,8)` → `[1,8)`
+    #[test]
+    fn range_union_overlapping() {
+        let a = make_range(1, 5);
+        let b = make_range(3, 8);
+        let udf = make_union_udf();
+        let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
+        let (lo, hi, li, ui) = parse_bounds(&result);
+        assert_eq!(lo, 1);
+        assert_eq!(hi, 8);
+        assert!(li);
+        assert!(!ui);
+    }
+
+    /// `int4range(1,5) + int4range(5,10)` — adjacent `[1,5)` and `[5,10)` → `[1,10)`
+    #[test]
+    fn range_union_adjacent() {
+        let a = make_range(1, 5);
+        let b = make_range(5, 10);
+        let udf = make_union_udf();
+        let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
+        let (lo, hi, li, ui) = parse_bounds(&result);
+        assert_eq!(lo, 1);
+        assert_eq!(hi, 10);
+        assert!(li);
+        assert!(!ui);
+    }
+
+    /// `int4range(1,5) + int4range(10,15)` → contiguity error
+    #[test]
+    fn range_union_disjoint_errors() {
+        let a = make_range(1, 5);
+        let b = make_range(10, 15);
+        let udf = make_union_udf();
+        let err = udf.invoke_batch(&[a, b], 1).unwrap_err();
+        assert!(err.to_string().contains("contiguous"), "expected contiguity error, got: {err}");
+    }
+
+    /// `int4range(1,10) * int4range(5,15)` → `[5,10)`
+    #[test]
+    fn range_intersection_overlapping() {
+        let a = make_range(1, 10);
+        let b = make_range(5, 15);
+        let udf = make_intersection_udf();
+        let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
+        let (lo, hi, li, ui) = parse_bounds(&result);
+        assert_eq!(lo, 5);
+        assert_eq!(hi, 10);
+        assert!(li);
+        assert!(!ui);
+    }
+
+    /// `int4range(1,10) * int4range(20,30)` → empty
+    #[test]
+    fn range_intersection_disjoint_empty() {
+        let a = make_range(1, 10);
+        let b = make_range(20, 30);
+        let udf = make_intersection_udf();
+        let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
+        assert!(is_empty_json(&result), "expected empty range, got: {result}");
+    }
+
+    /// `int4range(1,10) - int4range(5,15)` → `[1,5)`
+    #[test]
+    fn range_diff_tail_cut() {
+        let a = make_range(1, 10);
+        let b = make_range(5, 15);
+        let udf = make_diff_udf();
+        let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
+        let (lo, hi, li, ui) = parse_bounds(&result);
+        assert_eq!(lo, 1);
+        assert_eq!(hi, 5);
+        assert!(li);
+        assert!(!ui); // complement of b's li=true → not-inclusive on upper
+    }
+
+    /// `int4range(5,15) - int4range(1,10)` → `[10,15)` (head cut)
+    #[test]
+    fn range_diff_head_cut() {
+        let a = make_range(5, 15);
+        let b = make_range(1, 10);
+        let udf = make_diff_udf();
+        let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
+        let (lo, hi, li, ui) = parse_bounds(&result);
+        assert_eq!(lo, 10);
+        assert_eq!(hi, 15);
+        assert!(li); // complement of b's ui=false → inclusive
+        assert!(!ui);
+    }
+
+    /// `int4range(1,10) - int4range(3,7)` → contiguity error (middle split)
+    #[test]
+    fn range_diff_middle_split_errors() {
+        let a = make_range(1, 10);
+        let b = make_range(3, 7);
+        let udf = make_diff_udf();
+        let err = udf.invoke_batch(&[a, b], 1).unwrap_err();
+        assert!(err.to_string().contains("contiguous"), "expected contiguity error, got: {err}");
+    }
+
+    /// `int4range(1,10) - int4range(0,20)` → empty (b fully covers a)
+    #[test]
+    fn range_diff_fully_covered_empty() {
+        let a = make_range(1, 10);
+        let b = make_range(0, 20);
+        let udf = make_diff_udf();
+        let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
+        assert!(is_empty_json(&result), "expected empty range, got: {result}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Multirange containment (@>)
+    // -----------------------------------------------------------------------
+
+    fn make_multirange_contains_udf() -> MultirangeContainsUdf {
+        MultirangeContainsUdf {
+            sig: Signature::one_of(
+                vec![
+                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
+                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Float64]),
+                ],
+                Volatility::Immutable,
+            ),
+        }
+    }
+
+    fn make_multirange_json(ranges: &[(i64, i64)]) -> ColumnarValue {
+        let arr: Vec<serde_json::Value> = ranges
+            .iter()
+            .map(|(lo, hi)| serde_json::json!({ "l": lo, "u": hi, "li": true, "ui": false }))
+            .collect();
+        ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            serde_json::Value::Array(arr).to_string(),
+        )))
+    }
+
+    /// `int4multirange(int4range(1,5), int4range(10,20)) @> 3` → true
+    #[test]
+    fn multirange_contains_elem_true() {
+        let mrange = make_multirange_json(&[(1, 5), (10, 20)]);
+        let elem = ColumnarValue::Scalar(ScalarValue::Int64(Some(3)));
+        let udf = make_multirange_contains_udf();
+        let result = udf.invoke_batch(&[mrange, elem], 1).unwrap();
+        if let ColumnarValue::Array(arr) = result {
+            let ba = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert!(ba.value(0));
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    /// `int4multirange(int4range(1,5), int4range(10,20)) @> 7` → false
+    #[test]
+    fn multirange_contains_elem_false_gap() {
+        let mrange = make_multirange_json(&[(1, 5), (10, 20)]);
+        let elem = ColumnarValue::Scalar(ScalarValue::Int64(Some(7)));
+        let udf = make_multirange_contains_udf();
+        let result = udf.invoke_batch(&[mrange, elem], 1).unwrap();
+        if let ColumnarValue::Array(arr) = result {
+            let ba = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert!(!ba.value(0));
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Operator rewriter — arithmetic rewrites
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rewrite_range_plus_operator() {
+        let sql = "SELECT int4range(1,5) + int4range(3,8)";
+        let rewritten = rewrite_range_operators(sql);
+        assert!(
+            rewritten.contains("range_union("),
+            "expected range_union rewrite, got: {rewritten}"
+        );
+        assert!(!rewritten.contains(" + "), "original + should be gone: {rewritten}");
+    }
+
+    #[test]
+    fn rewrite_range_star_operator() {
+        let sql = "SELECT int4range(1,10) * int4range(5,15)";
+        let rewritten = rewrite_range_operators(sql);
+        assert!(
+            rewritten.contains("range_intersection("),
+            "expected range_intersection rewrite, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_range_minus_operator() {
+        let sql = "SELECT int4range(1,10) - int4range(5,15)";
+        let rewritten = rewrite_range_operators(sql);
+        assert!(
+            rewritten.contains("range_diff("),
+            "expected range_diff rewrite, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_multirange_at_gt() {
+        let sql = "SELECT int4multirange(int4range(1,5)) @> 3";
+        let rewritten = rewrite_range_operators(sql);
+        assert!(
+            rewritten.contains("multirange_contains_elem("),
+            "expected multirange_contains_elem rewrite, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_does_not_touch_plain_addition() {
+        // Regular numeric addition should NOT be rewritten.
+        let sql = "SELECT 1 + 2";
+        let rewritten = rewrite_range_operators(sql);
+        assert_eq!(rewritten, sql, "plain numeric + should be unchanged");
     }
 }

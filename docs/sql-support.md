@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1778973257 (Unix epoch)
-SQL fragments tested: 697 total / 1917 green (across all three configurations).
+Last run: 1779033150 (Unix epoch)
+SQL fragments tested: 697 total / 1929 green (across all three configurations).
 
 ## Configurations
 
@@ -568,12 +568,12 @@ SQL fragments tested: 697 total / 1917 green (across all three configurations).
 | `SELECT upper_inc(int4range(1, 10))` | ✅ | ✅ | ✅ |  |
 | `SELECT lower_inf(int4range(NULL, 10))` | ✅ | ✅ | ✅ |  |
 | `SELECT upper_inf(int4range(1, NULL))` | ✅ | ✅ | ✅ |  |
-| `SELECT int4range(1,5) + int4range(3,8)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot coerce arithmetic expression Ut… |
-| `SELECT int4range(1,10) * int4range(5,15)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot coerce arithmetic expression Ut… |
-| `SELECT int4range(1,10) - int4range(5,15)` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot coerce arithmetic expression Ut… |
+| `SELECT int4range(1,5) + int4range(3,8)` | ✅ | ✅ | ✅ |  |
+| `SELECT int4range(1,10) * int4range(5,15)` | ✅ | ✅ | ✅ |  |
+| `SELECT int4range(1,10) - int4range(5,15)` | ✅ | ✅ | ✅ |  |
 | `SELECT int4range(1,5) << int4range(7,10)` | ✅ | ✅ | ✅ |  |
 | `SELECT int4range(1,5) -\|- int4range(5,10)` | ✅ | ✅ | ✅ |  |
-| `SELECT int4multirange(int4range(1,5)) @> 3` | 🛠 | 🛠 | 🛠 | internal: plan: Error during planning: Cannot infer common argument type for … |
+| `SELECT int4multirange(int4range(1,5)) @> 3` | ✅ | ✅ | ✅ |  |
 
 ## Roles
 
@@ -773,7 +773,7 @@ SQL fragments tested: 697 total / 1917 green (across all three configurations).
 | `DROP SCHEMA myschema CASCADE` | ✅ | ✅ | ✅ |  |
 | `DROP SCHEMA IF EXISTS myschema` | ✅ | ✅ | ✅ |  |
 | `SELECT myschema.t.id FROM myschema.t` | ✅ | ✅ | ✅ |  |
-| `ALTER TABLE myschema.t ADD COLUMN name TEXT` | 🚫 | 🚫 | 🚫 | invalid identifier: schema-qualified table not supported in PoC: myschema.t |
+| `ALTER TABLE myschema.t ADD COLUMN name TEXT` | ✅ | ✅ | ✅ |  |
 
 ## Transactions
 
@@ -791,7 +791,7 @@ SQL fragments tested: 697 total / 1917 green (across all three configurations).
 | `START TRANSACTION` | ✅ | ✅ | ✅ |  |
 | `START TRANSACTION ISOLATION LEVEL READ COMMITTED` | ✅ | ✅ | ✅ |  |
 | `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` | ✅ | ✅ | ✅ |  |
-| `ROLLBACK TO SAVEPOINT s` | ✅ | ✅ | ✅ |  |
+| `ROLLBACK TO SAVEPOINT s` | 📜 | 📜 | 📜 | invalid schema: savepoint "s" does not exist |
 | `RELEASE SAVEPOINT s` | ✅ | ✅ | ✅ |  |
 
 ## Types
