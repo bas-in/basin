@@ -32,13 +32,13 @@
 //! engine never sees a non-project-qualified `Catalog::set_*` call.
 
 use arrow_schema::{Field, Schema};
-use crate::pg_ast::ObjectNamePartExt;
+use crate::schema_ddl::SchemaState;
 use basin_catalog::{Catalog, CheckConstraint};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, ObjectName, TableConstraint,
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::types::arrow_data_type;
 
@@ -116,9 +116,19 @@ pub(crate) fn match_basin_alter_extension(sql: &str) -> Result<Option<BasinAlter
     // "(id," land as separate tokens. We don't need full SQL tokenisation
     // — the keyword set is small and identifiers never contain whitespace.
     let mut after_alter_table = trimmed["alter table".len()..].trim_start();
-    // Read the table identifier (bare; schema-qualified names and quoted
-    // idents are out of scope for v0.1, matching the rest of the engine).
-    let (raw_name, rest) = read_identifier(after_alter_table)?;
+    // Read the table identifier. Accepts bare names (`t`) and
+    // schema-qualified names (`myschema.t`): read the first identifier
+    // part, and if followed by `.` consume the second part too (stripping
+    // the schema prefix so the rest of the matcher sees only the bare name).
+    let (first_part, rest_after_first) = read_identifier(after_alter_table)?;
+    let (raw_name, rest) = if rest_after_first.starts_with('.') {
+        // schema.table — consume the second part, discard the schema.
+        let after_dot = &rest_after_first[1..];
+        let (table_part, tail) = read_identifier(after_dot)?;
+        (table_part, tail)
+    } else {
+        (first_part, rest_after_first)
+    };
     after_alter_table = rest.trim_start();
     let table = TableName::new(&raw_name)?;
 
@@ -414,8 +424,9 @@ pub(crate) async fn apply_standard_alter_table(
     project: &basin_common::ProjectId,
     name: &ObjectName,
     operations: &[AlterTableOperation],
+    schema_state: &Arc<RwLock<SchemaState>>,
 ) -> Result<&'static str> {
-    let table = single_part_object_name(name)?;
+    let table = single_part_object_name(name, schema_state)?;
     if operations.is_empty() {
         return Err(BasinError::InvalidSchema(
             "ALTER TABLE requires at least one operation".into(),
@@ -453,7 +464,7 @@ pub(crate) async fn apply_standard_alter_table(
                     sqlparser::ast::RenameTableNameKind::As(n)
                     | sqlparser::ast::RenameTableNameKind::To(n) => n,
                 };
-                let new_table = single_part_object_name(new_name)?;
+                let new_table = single_part_object_name(new_name, schema_state)?;
                 catalog.rename_table(project, &table, &new_table).await?;
             }
             AlterTableOperation::AlterColumn { column_name, op } => match op {
@@ -868,13 +879,17 @@ async fn add_column(
     Ok(())
 }
 
-fn single_part_object_name(name: &ObjectName) -> Result<TableName> {
-    if name.0.len() != 1 {
-        return Err(BasinError::InvalidIdent(format!(
-            "schema-qualified table not supported in PoC: {name}"
-        )));
-    }
-    TableName::new(name.0[0].id_val().clone())
+fn single_part_object_name(
+    name: &ObjectName,
+    schema_state: &Arc<RwLock<SchemaState>>,
+) -> Result<TableName> {
+    // Delegates to `schema_ddl::table_name_from_object` which accepts both
+    // bare names and schema-qualified names (`myschema.t`). The schema is
+    // validated (must be known on this session) and then stripped — all
+    // tables live in the flat per-project catalog namespace, matching the
+    // behaviour of CREATE/INSERT/SELECT/UPDATE/DELETE.
+    let bare = crate::schema_ddl::table_name_from_object(name, schema_state)?;
+    TableName::new(bare)
 }
 
 // ---- Hand-rolled mini-parser for the Basin extension forms ---------------
@@ -1228,5 +1243,158 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── Schema-qualified extension forms (Site 3 fix) ─────────────────────
+
+    #[test]
+    fn match_schema_qualified_cold_after() {
+        // `myschema.events` — schema prefix must be stripped; result table
+        // name must equal bare `events`.
+        let m =
+            match_basin_alter_extension("ALTER TABLE myschema.events SET cold_after = 86400")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::SetColdAfter {
+                table: TableName::new("events").unwrap(),
+                seconds: 86_400,
+            }
+        );
+    }
+
+    #[test]
+    fn match_schema_qualified_cluster_by() {
+        let m =
+            match_basin_alter_extension("ALTER TABLE public.metrics CLUSTER BY (ts, id)")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::SetClusterColumns {
+                table: TableName::new("metrics").unwrap(),
+                columns: vec!["ts".into(), "id".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn match_schema_qualified_reset_cluster_by() {
+        let m =
+            match_basin_alter_extension("ALTER TABLE myschema.events RESET CLUSTER BY")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::ResetClusterColumns {
+                table: TableName::new("events").unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn match_schema_qualified_bloom_filters() {
+        let m = match_basin_alter_extension(
+            "ALTER TABLE analytics.events SET BLOOM FILTERS ON (id, user_id)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::SetBloomFilterColumns {
+                table: TableName::new("events").unwrap(),
+                columns: vec!["id".into(), "user_id".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn match_schema_qualified_validate_constraint() {
+        let m =
+            match_basin_alter_extension("ALTER TABLE myschema.orders VALIDATE CONSTRAINT orders_pkey")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::ValidateConstraint {
+                table: TableName::new("orders").unwrap(),
+                name: "orders_pkey".to_string(),
+            }
+        );
+    }
+
+    // single_part_object_name schema-stripping (Sites 1 & 2)
+
+    #[test]
+    fn single_part_object_name_strips_known_schema() {
+        use crate::schema_ddl::SchemaState;
+        use std::sync::{Arc, RwLock};
+        use sqlparser::ast::{Ident, ObjectName};
+        use crate::pg_ast::ObjectNamePartExt as _;
+
+        let mut st = SchemaState::default();
+        st.insert("myschema".to_string());
+        let schema_state: Arc<RwLock<SchemaState>> = Arc::new(RwLock::new(st));
+
+        // Two-part name: myschema.events → bare "events"
+        let name = ObjectName(vec![
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("myschema")),
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("events")),
+        ]);
+        let result = single_part_object_name(&name, &schema_state).unwrap();
+        assert_eq!(result.as_str(), "events");
+    }
+
+    #[test]
+    fn single_part_object_name_bare_still_works() {
+        use crate::schema_ddl::SchemaState;
+        use std::sync::{Arc, RwLock};
+        use sqlparser::ast::{Ident, ObjectName};
+
+        let schema_state: Arc<RwLock<SchemaState>> =
+            Arc::new(RwLock::new(SchemaState::default()));
+
+        let name = ObjectName(vec![
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("events")),
+        ]);
+        let result = single_part_object_name(&name, &schema_state).unwrap();
+        assert_eq!(result.as_str(), "events");
+    }
+
+    #[test]
+    fn single_part_object_name_unknown_schema_errors() {
+        use crate::schema_ddl::SchemaState;
+        use std::sync::{Arc, RwLock};
+        use sqlparser::ast::{Ident, ObjectName};
+
+        // Only "public" is known by default; "badschema" is not.
+        let schema_state: Arc<RwLock<SchemaState>> =
+            Arc::new(RwLock::new(SchemaState::default()));
+
+        let name = ObjectName(vec![
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("badschema")),
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("events")),
+        ]);
+        let err = single_part_object_name(&name, &schema_state).unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    #[test]
+    fn single_part_object_name_public_schema_works() {
+        use crate::schema_ddl::SchemaState;
+        use std::sync::{Arc, RwLock};
+        use sqlparser::ast::{Ident, ObjectName};
+
+        // "public" is always in the default SchemaState.
+        let schema_state: Arc<RwLock<SchemaState>> =
+            Arc::new(RwLock::new(SchemaState::default()));
+
+        let name = ObjectName(vec![
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("public")),
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("users")),
+        ]);
+        let result = single_part_object_name(&name, &schema_state).unwrap();
+        assert_eq!(result.as_str(), "users");
     }
 }

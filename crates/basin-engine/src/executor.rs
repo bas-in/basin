@@ -3670,15 +3670,21 @@ async fn exec_alter_table(
         &sess.project,
         &name,
         &operations,
+        &sess.state.schema_state,
     )
     .await?;
 
     // ADD COLUMN replaced the schema in the catalog; refresh the
     // session's DataFusion ListingTable so subsequent SELECTs see the
     // new column. We pull the (now possibly different) table name out
-    // of the AST.
-    if name.0.len() == 1 {
-        if let Ok(t) = TableName::new(name.0[0].id_val().clone()) {
+    // of the AST, stripping any schema qualifier (`myschema.t` → `t`).
+    let bare_name = match name.0.len() {
+        1 => Some(name.0[0].id_val().clone()),
+        2 => Some(name.0[1].id_val().clone()),
+        _ => None,
+    };
+    if let Some(raw) = bare_name {
+        if let Ok(t) = TableName::new(raw) {
             refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &t).await?;
         }
     }
