@@ -52,6 +52,9 @@ uuid.workspace = true
 # uses for outbound HTTP throttling, keeping the limiter implementation
 # uniform across both protocols.
 governor.workspace = true
+# Jitter generation for the commit-conflict exponential-backoff retry in
+# `protocol.rs`. Same workspace version used by the integration test suite.
+rand.workspace = true
 # pgwire 0.28's `process_socket` already does the SSLRequest peek + 'S'/'N'
 # response when handed a TlsAcceptor; we just need to construct one from
 # PEM material in `tls.rs`. Versions match what pgwire pulls in transitively

@@ -27,7 +27,9 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::TimeZone as _; // for Utc.timestamp_opt()
@@ -75,6 +77,34 @@ use tokio::sync::Mutex;
 use crate::error::error_response;
 use crate::resolver::ProjectResolver;
 use crate::types::{arrow_to_pg_type, encode_batches, row_description};
+
+// ── Commit-conflict retry policy ──────────────────────────────────────────────
+//
+// When a write DML (INSERT / UPDATE / DELETE) lands a `CommitConflict` the
+// router retries it transparently with exponential backoff + jitter before
+// surfacing SQLSTATE 40001 to the client.  The retry re-executes the *exact*
+// same `BoundStatement` that was already Bind-substituted: params are baked
+// into the SQL string, so the semantics are identical on every attempt.
+//
+// Correctness constraints:
+//  * Only bare DML portals (not SELECT) enter the retry path.
+//  * `UniqueViolation` (23505) and other non-snapshot errors propagate
+//    immediately — they are schema conflicts, not snapshot races.
+//  * On exhaustion the caller receives the original `CommitConflict` error,
+//    which the router maps to SQLSTATE 40001 (`serialization_failure`).
+//  * No enclosing transaction awareness needed for v0.1 (auto-commit only).
+
+/// Maximum number of retry attempts after the initial execution failure.
+/// After this many retries the error is returned to the client.
+const COMMIT_CONFLICT_MAX_RETRIES: u32 = 6;
+
+/// Base delay in milliseconds for the first retry.  Each subsequent attempt
+/// doubles the base before jitter is added (1, 2, 4, 8, 16, 32 ms).
+const COMMIT_CONFLICT_BASE_MS: u64 = 1;
+
+/// Global observable counters — readable by tests / metrics scrapers.
+pub static COMMIT_CONFLICT_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static COMMIT_CONFLICT_EXHAUSTED_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Internal trait abstracting whatever runs SQL. `ProjectSession` implements it
 /// transparently; tests substitute a fake.
@@ -407,6 +437,11 @@ struct PortalEntry {
     /// Present for RETURNING DML portals; `None` for SELECT portals and
     /// plain DML without RETURNING.
     dml_tag_prefix: Option<String>,
+    /// True when the statement is a bare write DML (INSERT / UPDATE / DELETE).
+    /// Used by the commit-conflict retry loop in `handle_execute` to gate
+    /// the transparent retry: reads (SELECT) never need a retry, and retrying
+    /// them would be semantically wrong if they had UDF side-effects.
+    is_write_dml: bool,
 }
 
 impl ExtendedState {
@@ -418,6 +453,67 @@ impl ExtendedState {
             copy_portals: HashMap::new(),
         }
     }
+}
+
+/// Returns `true` if `sql` is a bare write-DML statement (INSERT, UPDATE, or
+/// DELETE) that may produce a `CommitConflict` under concurrent load and should
+/// therefore enter the transparent retry path.
+///
+/// Detection is intentionally simple: skip leading whitespace / SQL comments
+/// (`--` line-comment, `/* */` block-comment) and check the first keyword.
+/// This is cheaper than a full parse and correct for the shapes Basin emits
+/// (the prepared-statement substitution always produces a well-formed
+/// statement where the verb is the very first token after optional comments).
+///
+/// SELECT, COPY, DDL, etc. all return `false` and bypass the retry.
+fn sql_is_write_dml(sql: &str) -> bool {
+    // Skip whitespace and SQL-style comments to find the first keyword.
+    let mut chars = sql.trim_start().chars().peekable();
+    // Consume block comments `/* ... */` and line comments `-- ...`.
+    loop {
+        match (chars.peek().copied(), {
+            let mut it = chars.clone();
+            it.next();
+            it.peek().copied()
+        }) {
+            (Some('/'), Some('*')) => {
+                // Block comment: scan until `*/`.
+                chars.next(); // '/'
+                chars.next(); // '*'
+                loop {
+                    match chars.next() {
+                        None => return false,
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next(); // '/'
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                // Consume any whitespace after the comment.
+                while chars.peek().map(|c| c.is_whitespace()).unwrap_or(false) {
+                    chars.next();
+                }
+            }
+            (Some('-'), Some('-')) => {
+                // Line comment: scan until newline.
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                // Consume any whitespace after the comment.
+                while chars.peek().map(|c| c.is_whitespace()).unwrap_or(false) {
+                    chars.next();
+                }
+            }
+            _ => break,
+        }
+    }
+    // Collect the first keyword (ASCII alpha chars).
+    let keyword: String = chars
+        .take_while(|c| c.is_ascii_alphabetic())
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+    matches!(keyword.as_str(), "INSERT" | "UPDATE" | "DELETE")
 }
 
 /// Decode a parameter byte slice into a [`ScalarParam`] using its declared
@@ -1071,6 +1167,10 @@ where
         }
     }
 
+    // Detect write-DML at bind time so `handle_execute` can gate the
+    // commit-conflict retry without a keyword scan on every Execute.
+    let is_write_dml = sql_is_write_dml(&entry.sql);
+
     match session.bind(&entry.handle, params).await {
         Ok(bound) => {
             state.lock().await.portals.insert(
@@ -1080,6 +1180,7 @@ where
                     schema: entry.schema,
                     result_format_codes: msg.result_column_format_codes,
                     dml_tag_prefix: entry.dml_tag_prefix,
+                    is_write_dml,
                 },
             );
             vec![PgWireBackendMessage::BindComplete(BindComplete::new())]
@@ -1257,9 +1358,28 @@ where
         }
     };
 
+    // ── Execute with commit-conflict retry ───────────────────────────────────
+    // For write-DML portals (INSERT / UPDATE / DELETE) the engine may return
+    // `BasinError::CommitConflict` when two writers race on the same snapshot.
+    // We retry transparently with exponential backoff + jitter rather than
+    // immediately surfacing SQLSTATE 40001 to the client.  The `BoundStatement`
+    // already contains the fully parameter-substituted SQL, so each retry is
+    // semantically identical to the first execution.
+    //
+    // Correctness guard: only `CommitConflict` triggers retry.  All other
+    // errors — including `UniqueViolation` (23505), `CheckViolation`,
+    // `ForeignKeyViolation`, `NotFound`, etc. — surface immediately, preserving
+    // their original SQLSTATE.  `UniqueViolation` is a schema constraint, not a
+    // snapshot race, and must NOT be retried.
+    let exec_result = if entry.is_write_dml {
+        execute_with_conflict_retry(session, entry.bound.clone()).await
+    } else {
+        session.execute_bound(entry.bound).await
+    };
+
     let mut out = Vec::new();
     let mut is_error = false;
-    match session.execute_bound(entry.bound).await {
+    match exec_result {
         Ok(ExecResult::Empty { tag }) => {
             out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
                 tag,
@@ -1325,6 +1445,78 @@ where
         messages: out,
         start_copy_in: None,
         is_error,
+    }
+}
+
+/// Execute a write-DML [`BoundStatement`] with transparent exponential-backoff
+/// retry on `CommitConflict`.
+///
+/// Backoff schedule (before jitter): 1 ms, 2 ms, 4 ms, 8 ms, 16 ms, 32 ms.
+/// Jitter: uniform random 0–50 % of the base delay added to each interval to
+/// avoid thundering-herd re-synchronisation between concurrent writers.
+///
+/// On exhaustion returns the last `CommitConflict` error, which the router
+/// maps to SQLSTATE 40001 (`serialization_failure`).  The caller should not
+/// call this for non-write-DML statements.
+async fn execute_with_conflict_retry<S>(
+    session: &S,
+    bound: BoundStatement,
+) -> basin_common::Result<ExecResult>
+where
+    S: Session + ?Sized,
+{
+    use basin_common::BasinError;
+    use rand::Rng as _;
+
+    let mut attempt = 0u32;
+    loop {
+        // Clone the BoundStatement for all but the last attempt so the last
+        // one can consume by-value (avoids a redundant clone on success).
+        let stmt = if attempt < COMMIT_CONFLICT_MAX_RETRIES {
+            bound.clone()
+        } else {
+            // Final attempt: consume the original.
+            bound.clone()
+        };
+        match session.execute_bound(stmt).await {
+            // ── Success ───────────────────────────────────────────────────────
+            Ok(result) => return Ok(result),
+
+            // ── Snapshot conflict — eligible for retry ─────────────────────
+            Err(BasinError::CommitConflict(_)) if attempt < COMMIT_CONFLICT_MAX_RETRIES => {
+                attempt += 1;
+                COMMIT_CONFLICT_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                // Exponential base: 1, 2, 4, 8, 16, 32 ms.
+                let base_ms = COMMIT_CONFLICT_BASE_MS << (attempt - 1);
+                // Jitter: 0..=50 % of base_ms.
+                let jitter_ms = rand::thread_rng().gen_range(0..=(base_ms / 2).max(1));
+                let delay = Duration::from_millis(base_ms + jitter_ms);
+
+                tracing::debug!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "commit conflict; retrying write-DML"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            // ── Conflict exhausted — give up ───────────────────────────────
+            Err(e @ BasinError::CommitConflict(_)) => {
+                COMMIT_CONFLICT_EXHAUSTED_COUNT.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    attempt,
+                    max = COMMIT_CONFLICT_MAX_RETRIES,
+                    "commit conflict: max retries exhausted, returning 40001"
+                );
+                return Err(e);
+            }
+
+            // ── Any other error — propagate immediately ────────────────────
+            // This includes UniqueViolation (23505), CheckViolation, etc.
+            // None of those are snapshot races; retrying would be wrong.
+            Err(other) => return Err(other),
+        }
     }
 }
 
@@ -3300,5 +3492,67 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    // ── sql_is_write_dml ─────────────────────────────────────────────────────
+
+    #[test]
+    fn write_dml_detects_insert() {
+        assert!(super::sql_is_write_dml(
+            "INSERT INTO t (a) VALUES (1)"
+        ));
+        assert!(super::sql_is_write_dml(
+            "  insert into t (a) values (1)"
+        ));
+        assert!(super::sql_is_write_dml(
+            "INSERT INTO t SELECT * FROM src"
+        ));
+    }
+
+    #[test]
+    fn write_dml_detects_update() {
+        assert!(super::sql_is_write_dml("UPDATE t SET a = 1 WHERE id = 2"));
+        assert!(super::sql_is_write_dml("update t set a = 1"));
+    }
+
+    #[test]
+    fn write_dml_detects_delete() {
+        assert!(super::sql_is_write_dml("DELETE FROM t WHERE id = 3"));
+        assert!(super::sql_is_write_dml("delete from t"));
+    }
+
+    #[test]
+    fn write_dml_rejects_select() {
+        assert!(!super::sql_is_write_dml("SELECT * FROM t"));
+        assert!(!super::sql_is_write_dml("  select id from t where id = 1"));
+    }
+
+    #[test]
+    fn write_dml_rejects_ddl() {
+        assert!(!super::sql_is_write_dml("CREATE TABLE t (id BIGINT)"));
+        assert!(!super::sql_is_write_dml("ALTER TABLE t ADD COLUMN x INT"));
+        assert!(!super::sql_is_write_dml("DROP TABLE t"));
+    }
+
+    #[test]
+    fn write_dml_handles_leading_comment() {
+        // Block comment before the verb.
+        assert!(super::sql_is_write_dml(
+            "/* write data */ INSERT INTO t (a) VALUES (1)"
+        ));
+        // Line comment before the verb.
+        assert!(super::sql_is_write_dml(
+            "-- seed row\nINSERT INTO t (a) VALUES (1)"
+        ));
+        // SELECT after a comment is still not a write.
+        assert!(!super::sql_is_write_dml(
+            "/* read */ SELECT * FROM t"
+        ));
+    }
+
+    #[test]
+    fn write_dml_rejects_empty() {
+        assert!(!super::sql_is_write_dml(""));
+        assert!(!super::sql_is_write_dml("   "));
     }
 }

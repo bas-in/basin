@@ -949,6 +949,7 @@ dependencies = [
  "governor",
  "object_store",
  "pgwire",
+ "rand 0.8.6",
  "rcgen",
  "rustls-pemfile",
  "serde_json",

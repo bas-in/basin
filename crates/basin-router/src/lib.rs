@@ -70,6 +70,7 @@ pub use resolver::{
 };
 pub use sharding::{parse_pins_env, ShardMap};
 pub use tls::{build_acceptor, TlsConfig};
+pub use protocol::{COMMIT_CONFLICT_RETRY_COUNT, COMMIT_CONFLICT_EXHAUSTED_COUNT};
 
 use crate::protocol::{
     BasinExtendedQueryHandler, BasinHandlers, BasinSimpleQueryHandlerSlot, BasinStartupHandler,
