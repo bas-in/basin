@@ -450,6 +450,17 @@ fn encode_value_binary(
             buf.put_i32(days);
             buf.put_i32(months);
         }
+        DataType::Decimal128(_, scale) => {
+            let scale = *scale as u16;
+            encode_numeric_binary(
+                col.as_any()
+                    .downcast_ref::<arrow_array::Decimal128Array>()
+                    .expect("Decimal128Array for NUMERIC column")
+                    .value(idx),
+                scale,
+                buf,
+            );
+        }
         // For types we don't have a binary representation for yet, fall back
         // to text. This is a deliberate v1 trade-off: drivers requesting
         // binary for an exotic type get the text form, which is a violation
@@ -469,6 +480,159 @@ fn encode_value_binary(
         }
     }
     Ok(())
+}
+
+/// Encode an Arrow `Decimal128` value as the Postgres binary wire format for
+/// the `numeric` type (OID 1700).
+///
+/// ## Wire layout (all big-endian)
+///
+/// ```text
+/// u16  ndigits   — number of base-10000 "digits" in the digit array
+/// i16  weight    — positional weight of the first (most-significant) digit
+///                  (weight=0 means the digit represents units 1–9999,
+///                   weight=1 means 10000–99999999, etc.)
+/// u16  sign      — 0x0000 positive, 0x4000 negative, 0xC000 NaN
+/// u16  dscale    — decimal digits after the decimal point to display
+/// u16  digits…   — ndigits × base-10000 digit values (each 0–9999)
+/// ```
+///
+/// ## Algorithm
+///
+/// Arrow stores `Decimal128(p, s)` as a signed 128-bit integer where the
+/// true value is `i128_value / 10^scale`. We need to decompose the number
+/// into PG's base-10000 representation.
+///
+/// 1. Extract sign; work with the absolute value.
+/// 2. Separate integer and fractional parts using the scale.
+/// 3. Decompose the integer part into base-10000 digits (most-significant
+///    first). `weight` is the index of the most-significant digit in PG's
+///    numbering (0-based from the units position).
+/// 4. Decompose the fractional part into base-10000 digits (after the
+///    decimal point, each group covers 4 decimal places).
+/// 5. Strip trailing zero digits from the digit array (PG does this too),
+///    but preserve `dscale` for display fidelity.
+///
+/// Zero is a special case: ndigits=0, weight=0, sign=0, dscale=0.
+fn encode_numeric_binary(raw: i128, scale: u16, buf: &mut BytesMut) {
+    // PG sign constants.
+    const NUMERIC_POS: u16 = 0x0000;
+    const NUMERIC_NEG: u16 = 0x4000;
+
+    // --- 1. Sign + absolute value ---
+    let (sign, abs_val): (u16, u128) = if raw < 0 {
+        (NUMERIC_NEG, raw.unsigned_abs())
+    } else {
+        (NUMERIC_POS, raw as u128)
+    };
+
+    // --- 2. Separate integer and fractional parts ---
+    // scale = number of decimal digits after the decimal point.
+    // divisor = 10^scale
+    let divisor: u128 = 10u128.pow(scale as u32);
+    let int_part: u128 = abs_val / divisor;
+    let frac_part: u128 = abs_val % divisor;
+
+    // --- 3. Decompose integer part into base-10000 digits (most-significant first) ---
+    // We collect digits in reverse (least-significant first), then reverse.
+    let mut int_digits: Vec<u16> = Vec::with_capacity(10);
+    let mut tmp = int_part;
+    if tmp == 0 {
+        // No integer digits — we'll still need a digit slot if frac_part is nonzero.
+        // Leave int_digits empty; weight will be -1 (relative to the first frac digit).
+    } else {
+        while tmp > 0 {
+            int_digits.push((tmp % 10000) as u16);
+            tmp /= 10000;
+        }
+        int_digits.reverse();
+    }
+
+    // --- 4. Decompose fractional part into base-10000 digits ---
+    // `scale` decimal places → ceil(scale / 4) base-10000 digit groups.
+    // Each group covers exactly 4 decimal positions. The fractional integer
+    // is scaled up to fill full 4-digit groups if scale is not a multiple of 4.
+    let frac_groups = scale.div_ceil(4) as usize;
+    let mut frac_digits: Vec<u16> = Vec::with_capacity(frac_groups);
+    if frac_groups > 0 {
+        // Pad frac_part to exactly frac_groups*4 decimal digits.
+        let full_scale = frac_groups as u32 * 4;
+        // Scale up by the difference so frac_part fills full groups.
+        let padding = full_scale - scale as u32;
+        let padded = frac_part * 10u128.pow(padding);
+
+        // Extract frac_groups base-10000 digits (most-significant first).
+        // The most-significant frac group represents 10^(full_scale-4)..10^(full_scale-1).
+        let mut divisor_group = 10u128.pow((frac_groups as u32 - 1) * 4);
+        let mut remaining = padded;
+        for _ in 0..frac_groups {
+            frac_digits.push((remaining / divisor_group) as u16);
+            remaining %= divisor_group;
+            if divisor_group > 1 {
+                divisor_group /= 10000;
+            }
+        }
+    }
+
+    // --- 5. Strip trailing zero digit groups ---
+    // PG strips trailing zeros from the digit array while preserving dscale.
+    while frac_digits.last() == Some(&0) {
+        frac_digits.pop();
+    }
+
+    // --- Special case: zero ---
+    if int_part == 0 && frac_part == 0 {
+        // PG encodes zero as ndigits=0, weight=0, sign=0x0000, dscale=0
+        // regardless of the declared scale.
+        let body_len: i32 = 8; // 4 × u16 header, no digit array
+        buf.put_i32(body_len);
+        buf.put_u16(0); // ndigits
+        buf.put_i16(0); // weight
+        buf.put_u16(NUMERIC_POS); // sign
+        buf.put_u16(0); // dscale
+        return;
+    }
+
+    // --- 6. Assemble final digit array and compute weight ---
+    let all_digits: Vec<u16> = int_digits
+        .iter()
+        .chain(frac_digits.iter())
+        .copied()
+        .collect();
+
+    // `weight` = index of first digit in PG's scheme:
+    //   0 means that digit represents values 1..9999 (units group),
+    //   1 means 10000..99999999, etc.
+    // For a number with `int_digits.len()` integer digit groups:
+    //   weight = int_digits.len() - 1  (if there are integer digits)
+    //   weight = -1 (if int_part == 0, the first frac digit is weight -1,
+    //               but that can recurse for leading zero frac groups)
+    let weight: i16 = if !int_digits.is_empty() {
+        (int_digits.len() as i16) - 1
+    } else {
+        // int_part == 0: find first nonzero frac digit to determine weight.
+        // Each frac group represents weight -1, -2, etc.
+        let first_nonzero = frac_digits.iter().position(|&d| d != 0).unwrap_or(0);
+        -1 - (first_nonzero as i16)
+    };
+
+    // Strip leading zero digit groups (can appear when int_part==0 and
+    // the frac_digits vector has leading zeros before the first nonzero group).
+    let digits: Vec<u16> = {
+        let skip = all_digits.iter().position(|&d| d != 0).unwrap_or(0);
+        all_digits[skip..].to_vec()
+    };
+
+    let ndigits = digits.len() as u16;
+    let body_len: i32 = 8 + (ndigits as i32) * 2;
+    buf.put_i32(body_len);
+    buf.put_u16(ndigits);
+    buf.put_i16(weight);
+    buf.put_u16(sign);
+    buf.put_u16(scale); // dscale = display scale (number of decimal digits to show)
+    for d in &digits {
+        buf.put_u16(*d);
+    }
 }
 
 /// Encode the value at row `idx` of `col` into `buf` as a length-prefixed
@@ -1122,5 +1286,237 @@ mod tests {
         assert_eq!(rd.fields[0].type_id, Type::INT8.oid());
         assert_eq!(rd.fields[1].name, "b");
         assert_eq!(rd.fields[1].type_id, Type::TEXT.oid());
+    }
+
+    // -----------------------------------------------------------------------
+    // NUMERIC binary wire format tests (#141)
+    // -----------------------------------------------------------------------
+    //
+    // Helper: call encode_numeric_binary and return the full byte slice
+    // (including the 4-byte length prefix).
+    fn numeric_binary_bytes(raw: i128, scale: u16) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        encode_numeric_binary(raw, scale, &mut buf);
+        buf.to_vec()
+    }
+
+    // Parse the PG numeric binary body (after the 4-byte length prefix) into
+    // (ndigits, weight, sign, dscale, digits).
+    fn parse_numeric_binary(bytes: &[u8]) -> (u16, i16, u16, u16, Vec<u16>) {
+        let body_len = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        assert!(body_len >= 8, "body_len too small: {body_len}");
+        let ndigits = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+        let weight  = i16::from_be_bytes(bytes[6..8].try_into().unwrap());
+        let sign    = u16::from_be_bytes(bytes[8..10].try_into().unwrap());
+        let dscale  = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
+        let mut digits = Vec::with_capacity(ndigits as usize);
+        for i in 0..ndigits as usize {
+            let off = 12 + i * 2;
+            digits.push(u16::from_be_bytes(bytes[off..off + 2].try_into().unwrap()));
+        }
+        assert_eq!(body_len, 8 + (ndigits as usize) * 2);
+        (ndigits, weight, sign, dscale, digits)
+    }
+
+    // Reconstruct the decimal value from PG numeric binary fields for
+    // round-trip checking.
+    fn pg_numeric_to_f64(ndigits: u16, weight: i16, sign: u16, _dscale: u16, digits: &[u16]) -> f64 {
+        let mut val = 0f64;
+        for (i, &d) in digits.iter().enumerate() {
+            let exp = (weight as i32 - i as i32) * 4;
+            val += (d as f64) * 10f64.powi(exp);
+        }
+        if sign == 0x4000 { -val } else { val }
+    }
+
+    // --- Test 1: zero ---
+    // SELECT 0::numeric → ndigits=0, weight=0, sign=0x0000, dscale=0
+    // Wire bytes (body 8): 00 00 00 00 00 00 00 00
+    #[test]
+    fn numeric_binary_zero() {
+        let bytes = numeric_binary_bytes(0i128, 0);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&bytes);
+        assert_eq!(ndigits, 0);
+        assert_eq!(weight, 0);
+        assert_eq!(sign, 0x0000);
+        assert_eq!(dscale, 0);
+        assert!(digits.is_empty());
+        // Exact wire bytes: [0,0,0,8, 0,0, 0,0, 0,0, 0,0]
+        assert_eq!(&bytes[4..12], &[0u8, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    // --- Test 2: SELECT 1::numeric (integer, no fraction) ---
+    // raw=1, scale=0 → integer_part=1, frac_part=0
+    // int_digits=[1], weight=0, sign=0x0000, dscale=0, ndigits=1
+    // Digit value = 1, body = 00 01  00 00  00 00  00 00  00 01
+    #[test]
+    fn numeric_binary_one() {
+        let bytes = numeric_binary_bytes(1i128, 0);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&bytes);
+        assert_eq!(ndigits, 1);
+        assert_eq!(weight, 0);
+        assert_eq!(sign, 0x0000);
+        assert_eq!(dscale, 0);
+        assert_eq!(digits, vec![1]);
+    }
+
+    // --- Test 3: SELECT 1.5::numeric(38,1) ---
+    // raw=15, scale=1 → int_part=1, frac_part=5
+    // int_digits=[1], frac_groups=1 (scale=1 → pad to 4 → frac=5000)
+    // digits=[1, 5000], weight=0, dscale=1
+    #[test]
+    fn numeric_binary_one_point_five() {
+        let bytes = numeric_binary_bytes(15i128, 1);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&bytes);
+        assert_eq!(sign, 0x0000);
+        assert_eq!(dscale, 1);
+        assert_eq!(weight, 0);
+        // Digit group 0 (weight=0) = 1, digit group 1 (weight=-1) = 5000
+        assert_eq!(ndigits, 2);
+        assert_eq!(digits[0], 1);
+        assert_eq!(digits[1], 5000);
+        // Round-trip check
+        let v = pg_numeric_to_f64(ndigits, weight, sign, dscale, &digits);
+        assert!((v - 1.5).abs() < 1e-10, "expected 1.5, got {v}");
+    }
+
+    // --- Test 4: SELECT -1::numeric ---
+    // raw=-1, scale=0 → sign=0x4000, int_part=1
+    #[test]
+    fn numeric_binary_negative_one() {
+        let bytes = numeric_binary_bytes(-1i128, 0);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&bytes);
+        assert_eq!(sign, 0x4000); // NUMERIC_NEG
+        assert_eq!(weight, 0);
+        assert_eq!(dscale, 0);
+        assert_eq!(ndigits, 1);
+        assert_eq!(digits, vec![1]);
+    }
+
+    // --- Test 5: SELECT -1234.56789::numeric(38,5) ---
+    // raw = -123456789, scale=5
+    // int_part=1234, frac_part=56789
+    // int_digits=[1234], weight=0
+    // frac scale=5 → frac_groups=2 (covers 8 decimal places)
+    // padded frac = 56789 * 10^3 = 56789000 → group0=5678, group1=9000
+    // strip trailing zeros: group1=9000 (nonzero, keep)
+    // digits=[1234, 5678, 9000], weight=0, dscale=5, sign=0x4000
+    #[test]
+    fn numeric_binary_neg_1234_56789() {
+        let raw: i128 = -123456789i128;
+        let bytes = numeric_binary_bytes(raw, 5);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&bytes);
+        assert_eq!(sign, 0x4000);
+        assert_eq!(dscale, 5);
+        assert_eq!(weight, 0);
+        assert_eq!(ndigits, 3);
+        assert_eq!(digits[0], 1234);
+        assert_eq!(digits[1], 5678);
+        assert_eq!(digits[2], 9000);
+        let v = pg_numeric_to_f64(ndigits, weight, sign, dscale, &digits);
+        assert!((v - (-1234.56789)).abs() < 1e-7, "expected -1234.56789, got {v}");
+    }
+
+    // --- Test 6: SELECT 0.000001::numeric(38,10) ---
+    // raw=10000, scale=10 → int_part=0, frac_part=10000
+    // frac_groups=3 (covers 12 decimal places)
+    // padded: 10000 * 10^2 = 1000000 → group0=0, group1=0, group2=100 (wait: let's recompute)
+    // frac_groups = ceil(10/4) = 3, full_scale=12, padding=2
+    // padded = 10000 * 100 = 1000000
+    // divisor_group for group0 = 10^8 = 100000000 → 1000000 / 100000000 = 0
+    // divisor_group for group1 = 10^4 = 10000 → 1000000 / 10000 = 100
+    // remainder 0
+    // So digits: group0=0, group1=100, group2=0 → strip trailing 0 → [0, 100]
+    // weight = -1 (int_part=0, first nonzero is at index 1 → weight = -1 - 1 = -2)
+    // After stripping leading zeros: skip one 0 → digits=[100], weight=-2
+    #[test]
+    fn numeric_binary_small_fraction() {
+        // 0.000001 = 1e-6, stored as Decimal128(38,10): raw = 1 * 10^4 = 10000
+        let raw: i128 = 10000i128; // 0.000001 with scale=10 → actual value = 10000 / 10^10 = 0.000001
+        let bytes = numeric_binary_bytes(raw, 10);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&bytes);
+        assert_eq!(sign, 0x0000);
+        assert_eq!(dscale, 10);
+        // Reconstruct as float and verify
+        let v = pg_numeric_to_f64(ndigits, weight, sign, dscale, &digits);
+        assert!((v - 0.000001).abs() < 1e-14, "expected 0.000001, got {v}");
+    }
+
+    // --- Test 7: SELECT 99999999999999999999.99999999::numeric(38,8) ---
+    // Large value: raw = 9999999999999999999999999999 (28 digits), scale=8
+    // int_part = 99999999999999999999 (20 digits → 5 base-10000 groups)
+    // frac_part = 99999999 (8 decimal digits → 2 base-10000 groups of 9999,9900)
+    #[test]
+    fn numeric_binary_large_value() {
+        // raw = 99999999999999999999_99999999 as i128
+        // = 99999999999999999999 * 10^8 + 99999999
+        let int: i128 = 99999999999999999999i128;
+        let frac: i128 = 99999999i128;
+        let raw: i128 = int * 100_000_000 + frac;
+        let bytes = numeric_binary_bytes(raw, 8);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&bytes);
+        assert_eq!(sign, 0x0000);
+        assert_eq!(dscale, 8);
+        // int_part has 20 digits → 5 groups of 4 each → weight=4
+        assert_eq!(weight, 4);
+        assert!(ndigits >= 5, "expected at least 5 digits, got {ndigits}");
+        // All int groups should be 9999
+        for i in 0..5usize {
+            assert_eq!(digits[i], 9999, "int digit group {i} should be 9999");
+        }
+        // frac: 99999999 → padded to 8 decimal places → groups: 9999, 9900 (after strip: no trailing zero)
+        // Actually 99999999 → group0=9999, group1=9900... wait:
+        // scale=8, frac_groups=2, full_scale=8, padding=0
+        // divisor_group for group0 = 10^4 = 10000 → 99999999 / 10000 = 9999, rem=9999
+        // divisor_group for group1 = 1 → 9999 / 1 = 9999
+        // So frac digits = [9999, 9999], no trailing zeros
+        assert_eq!(digits[5], 9999);
+        assert_eq!(digits[6], 9999);
+    }
+
+    // --- Test 8: NULL numeric binary ---
+    #[test]
+    fn numeric_binary_null() {
+        use arrow_array::Decimal128Array;
+        let arr = Decimal128Array::from(vec![None::<i128>])
+            .with_precision_and_scale(38, 4)
+            .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "n",
+            DataType::Decimal128(38, 4),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        // NULL → 4-byte -1 prefix, no body
+        assert_eq!(rows[0].data.len(), 4);
+        assert_eq!(i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap()), -1);
+    }
+
+    // --- Test 9: round-trip via encode_batches_with_formats ---
+    // Verify the binary path is actually invoked for Decimal128 columns when
+    // format_codes=[1] (all-binary).
+    #[test]
+    fn numeric_binary_round_trip_via_encode_batches() {
+        use arrow_array::Decimal128Array;
+        // 1.5 stored as Decimal128(38,1): raw=15
+        let arr = Decimal128Array::from(vec![Some(15i128)])
+            .with_precision_and_scale(38, 1)
+            .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Decimal128(38, 1),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
+        let (ndigits, weight, sign, dscale, digits) =
+            parse_numeric_binary(&rows[0].data);
+        assert_eq!(sign, 0x0000);
+        assert_eq!(dscale, 1);
+        assert_eq!(weight, 0);
+        assert_eq!(ndigits, 2);
+        assert_eq!(digits[0], 1);
+        assert_eq!(digits[1], 5000);
     }
 }
