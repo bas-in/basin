@@ -115,10 +115,9 @@ workloads feasible:
 At 10,000 active projects with this profile: **~$1,500/mo total**. The same
 workload on Supabase Pro is 10,000 × $25/mo = $250,000/mo (assuming you could
 even provision 10,000 projects). On Neon Launch: 10,000 × $19/mo = $190,000/mo.
-Basin Pro covers 10 projects at $39/mo; Scale covers 100 projects at $249/mo.
-The cost story is two orders of magnitude. That's the wedge.
-
-For pricing on basin-cloud specifically, see [`PRICING.md`](../PRICING.md).
+Basin's per-project cost is **O(bytes stored)**, not **O(provisioned pool)** —
+the same workload is dominated by storage bytes, not per-project minimums, so
+the cost story is orders of magnitude cheaper. That's the wedge.
 
 ---
 
@@ -179,8 +178,6 @@ This satisfies the SOC2 / HIPAA blast-radius story: customer auditors can
 walk through "Basin compute never had decryption-permissioned access to your
 data" and verify it from your IAM logs.
 
-See [`PRICING.md`](../PRICING.md#plans) for the plans that include these.
-
 ---
 
 ## Where multi-project on Basin is *not* the answer
@@ -205,7 +202,6 @@ See [`PRICING.md`](../PRICING.md#plans) for the plans that include these.
 ## See also
 
 - [Main README](../README.md) — landing-page overview
-- [PRICING.md](../PRICING.md) — basin-cloud plans, all start at 1 project
 - [Architecture](./architecture.md) — the four-layer stack
 - [Capabilities](../CAPABILITIES.md) — every feature, status-tagged
 - [Decision log](./decisions/) — every "no" with the trigger that would change our mind
