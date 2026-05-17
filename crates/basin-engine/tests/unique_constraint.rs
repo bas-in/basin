@@ -295,3 +295,234 @@ async fn unique_referencing_missing_column_rejected_at_create_table() {
         .unwrap_err();
     assert!(matches!(err, BasinError::InvalidSchema(_)), "got {err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// CREATE UNIQUE INDEX enforcement (BUG #136)
+//
+// A plain-column `CREATE UNIQUE INDEX` is semantically identical to an inline
+// `UNIQUE` constraint in PostgreSQL and MUST reject duplicate keys with
+// SQLSTATE 23505. Previously basin accepted it as metadata-only, silently
+// letting duplicate rows accumulate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_unique_index_rejects_duplicate_insert() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE UNIQUE INDEX users_email_uidx ON users (email)")
+        .await
+        .unwrap();
+
+    sess.execute("INSERT INTO users (id, email) VALUES (1, 'ada@example.com')")
+        .await
+        .unwrap();
+
+    let err = sess
+        .execute("INSERT INTO users (id, email) VALUES (2, 'ada@example.com')")
+        .await
+        .unwrap_err();
+    // PG: ERROR 23505 duplicate key value violates unique constraint.
+    assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("users_email_uidx") && msg.contains("duplicate key"),
+        "msg = {msg}"
+    );
+}
+
+#[tokio::test]
+async fn create_unique_index_distinct_values_succeed() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE UNIQUE INDEX users_email_uidx ON users (email)")
+        .await
+        .unwrap();
+
+    sess.execute("INSERT INTO users (id, email) VALUES (1, 'a@x.com')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO users (id, email) VALUES (2, 'b@x.com')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO users (id, email) VALUES (3, 'c@x.com')")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_unique_index_update_to_existing_rejected() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE UNIQUE INDEX users_email_uidx ON users (email)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO users VALUES (1, 'a@x.com')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO users VALUES (2, 'b@x.com')")
+        .await
+        .unwrap();
+
+    let err = sess
+        .execute("UPDATE users SET email = 'a@x.com' WHERE id = 2")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn create_unique_index_multi_column_enforces_on_tuple() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE memberships (\
+             id BIGINT PRIMARY KEY, \
+             org_id BIGINT NOT NULL, \
+             user_id BIGINT NOT NULL)",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "CREATE UNIQUE INDEX memberships_org_user_uidx \
+         ON memberships (org_id, user_id)",
+    )
+    .await
+    .unwrap();
+
+    sess.execute("INSERT INTO memberships VALUES (1, 10, 100)")
+        .await
+        .unwrap();
+    // Same org, different user — OK.
+    sess.execute("INSERT INTO memberships VALUES (2, 10, 200)")
+        .await
+        .unwrap();
+    // Same user, different org — OK.
+    sess.execute("INSERT INTO memberships VALUES (3, 20, 100)")
+        .await
+        .unwrap();
+    // Duplicate (org_id, user_id) tuple — must reject.
+    let err = sess
+        .execute("INSERT INTO memberships VALUES (4, 10, 100)")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("memberships_org_user_uidx"),
+        "msg = {msg}"
+    );
+}
+
+#[tokio::test]
+async fn create_unique_index_intra_batch_duplicate_rejected() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE UNIQUE INDEX users_email_uidx ON users (email)")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("INSERT INTO users VALUES (1, 'a@x.com'), (2, 'a@x.com')")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn drop_index_removes_unique_enforcement() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE UNIQUE INDEX users_email_uidx ON users (email)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO users VALUES (1, 'a@x.com')")
+        .await
+        .unwrap();
+    // Enforcement is live: duplicate rejected.
+    sess.execute("INSERT INTO users VALUES (2, 'a@x.com')")
+        .await
+        .unwrap_err();
+
+    // Drop the index — uniqueness enforcement must go away (PG parity).
+    sess.execute("DROP INDEX users_email_uidx").await.unwrap();
+
+    // The previously-rejected duplicate now succeeds.
+    sess.execute("INSERT INTO users VALUES (3, 'a@x.com')")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn non_unique_index_does_not_enforce() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    // Plain (non-UNIQUE) index: duplicates are allowed.
+    sess.execute("CREATE INDEX users_email_idx ON users (email)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO users VALUES (1, 'a@x.com')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO users VALUES (2, 'a@x.com')")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_unique_index_if_not_exists_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+
+    sess.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE UNIQUE INDEX users_email_uidx ON users (email)")
+        .await
+        .unwrap();
+    // Re-run under IF NOT EXISTS — must not double-register the constraint
+    // and must still enforce.
+    sess.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users (email)")
+        .await
+        .unwrap();
+
+    sess.execute("INSERT INTO users VALUES (1, 'a@x.com')")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("INSERT INTO users VALUES (2, 'a@x.com')")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
+}

@@ -953,6 +953,56 @@ async fn diff_jsonb_each_srf() {
     drop_table(&runner, &t).await;
 }
 
+/// Test 17b: jsonb_array_elements() over a JSON *literal* must expand to one
+/// row per element, matching PostgreSQL.  Pins the #139 fix for the common ORM
+/// array-expansion idiom `SELECT * FROM jsonb_array_elements('[…]'::jsonb)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_jsonb_array_elements_literal_srf() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    // FROM-clause form (canonical ORM pattern).
+    runner
+        .run_assert_match(
+            "SELECT value FROM jsonb_array_elements('[1,2,3]'::jsonb) AS t(value) ORDER BY value::text",
+        )
+        .await
+        .unwrap();
+
+    // Scalar SELECT-list form — PG expands it to a row set as well.
+    runner
+        .run_assert_match("SELECT jsonb_array_elements('[10,20,30]'::jsonb)")
+        .await
+        .unwrap();
+}
+
+/// Test 17c: jsonb_each() over a JSON *literal* expands to (key, value) rows
+/// exactly like PostgreSQL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_jsonb_each_literal_srf() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    runner
+        .run_assert_match(
+            "SELECT key, value FROM jsonb_each('{\"x\":1,\"y\":2,\"z\":3}'::jsonb) ORDER BY key",
+        )
+        .await
+        .unwrap();
+
+    // jsonb_object_keys over a literal: one row per top-level key.
+    runner
+        .run_assert_match(
+            "SELECT k FROM jsonb_object_keys('{\"a\":1,\"b\":2}'::jsonb) AS t(k) ORDER BY k",
+        )
+        .await
+        .unwrap();
+}
+
 // =============================================================================
 // WINDOW FUNCTIONS
 // =============================================================================
@@ -2844,4 +2894,129 @@ async fn diff_create_table_default_schema() {
         .unwrap();
 
     drop_table(&runner, &t).await;
+}
+
+// =============================================================================
+// Advisory locks (BUG #138) — single-session, well-defined PG parity.
+//
+// Cross-session contention is NOT tested here (the differential harness uses
+// one Basin connection and one PG connection; "held by another session" is
+// asserted by the in-crate unit tests in advisory_lock.rs). These cases cover
+// the semantics that are deterministic within ONE session, where Basin and
+// real PostgreSQL must agree exactly.
+// =============================================================================
+
+/// Test 72: pg_try_advisory_lock then pg_advisory_unlock — within one session
+/// the lock is free, so try-lock returns true and unlock returns true.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_advisory_try_lock_then_unlock() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    runner
+        .run_assert_match("SELECT pg_try_advisory_lock(424242)")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT pg_advisory_unlock(424242)")
+        .await
+        .unwrap();
+}
+
+/// Test 73: pg_advisory_unlock on a key this session never held returns false
+/// (PG also raises a WARNING but still returns false).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_advisory_unlock_unheld_returns_false() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    runner
+        .run_assert_match("SELECT pg_advisory_unlock(919191)")
+        .await
+        .unwrap();
+}
+
+/// Test 74: reentrant lock — same session locks the same key twice, then
+/// unlocks twice. PG: try_lock=t, try_lock=t, unlock=t, unlock=t.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_advisory_reentrant_same_session() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    runner
+        .run_assert_match(
+            "SELECT pg_try_advisory_lock(5151), pg_try_advisory_lock(5151), \
+                    pg_advisory_unlock(5151), pg_advisory_unlock(5151)",
+        )
+        .await
+        .unwrap();
+}
+
+/// Test 75: the (int4,int4) form addresses the same lock as the equivalent
+/// packed bigint. After taking it via the 2-arg form, unlocking via the same
+/// 2-arg form returns true; a redundant unlock then returns false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_advisory_two_int4_form() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    runner
+        .run_assert_match("SELECT pg_try_advisory_lock(7, 11)")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT pg_advisory_unlock(7, 11)")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT pg_advisory_unlock(7, 11)")
+        .await
+        .unwrap();
+}
+
+/// Test 76: pg_advisory_lock (blocking variant) on a free key in a single
+/// session returns void immediately; a subsequent unlock returns true.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_advisory_blocking_lock_uncontended() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    runner
+        .run_assert_match("SELECT pg_advisory_lock(31337)")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT pg_advisory_unlock(31337)")
+        .await
+        .unwrap();
+}
+
+/// Test 77: xact-scoped advisory lock auto-releases at COMMIT. After the txn
+/// ends, a try-lock on the same key in the same session succeeds again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_advisory_xact_lock_releases_on_commit() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    runner.run_setup(&["BEGIN"]).await.unwrap();
+    runner
+        .run_assert_match("SELECT pg_advisory_xact_lock(246810)")
+        .await
+        .unwrap();
+    runner.run_setup(&["COMMIT"]).await.unwrap();
+    // After COMMIT the xact lock is gone — re-acquire as session lock.
+    runner
+        .run_assert_match("SELECT pg_try_advisory_lock(246810)")
+        .await
+        .unwrap();
+    runner
+        .run_assert_match("SELECT pg_advisory_unlock(246810)")
+        .await
+        .unwrap();
 }

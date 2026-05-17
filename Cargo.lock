@@ -758,6 +758,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tokio-test",
  "tracing",
  "url",
@@ -803,6 +804,7 @@ dependencies = [
 name = "basin-integration-tests"
 version = "0.1.7"
 dependencies = [
+ "anyhow",
  "arrow",
  "arrow-array",
  "arrow-schema",

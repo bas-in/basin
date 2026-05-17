@@ -538,6 +538,14 @@ pub(crate) fn register_jsonb_udtfs(ctx: &SessionContext) {
     ctx.register_udtf("jsonb_array_elements", Arc::new(JsonbArrayElementsTf { text_values: false }));
     ctx.register_udtf("jsonb_array_elements_text", Arc::new(JsonbArrayElementsTf { text_values: true }));
     ctx.register_udtf("jsonb_object_keys", Arc::new(JsonbObjectKeysTf {}));
+    // `json`-prefixed aliases. PostgreSQL's `json_*` SRFs behave identically to
+    // the `jsonb_*` ones for the row-expansion semantics we implement (Basin
+    // stores both as canonical JSON text), so they reuse the same UDTFs.
+    ctx.register_udtf("json_each", Arc::new(JsonbEachTf { text_values: false }));
+    ctx.register_udtf("json_each_text", Arc::new(JsonbEachTf { text_values: true }));
+    ctx.register_udtf("json_array_elements", Arc::new(JsonbArrayElementsTf { text_values: false }));
+    ctx.register_udtf("json_array_elements_text", Arc::new(JsonbArrayElementsTf { text_values: true }));
+    ctx.register_udtf("json_object_keys", Arc::new(JsonbObjectKeysTf {}));
     // json_to_recordset / jsonb_to_recordset — table functions that expand a
     // JSON array of objects into rows.
     ctx.register_udtf("json_to_recordset", Arc::new(JsonToRecordsetTf {}));

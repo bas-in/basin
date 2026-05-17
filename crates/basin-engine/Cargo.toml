@@ -68,3 +68,7 @@ tokio-test.workspace = true
 basin-webhooks.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
+# Differential harness (`tests/differential_pg.rs`) replays identical SQL
+# against a real PostgreSQL when `PG_DIFF_TEST_DSN` is set; without the env
+# var the cases skip cleanly so this stays test-only.
+tokio-postgres.workspace = true

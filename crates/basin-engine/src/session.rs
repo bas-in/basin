@@ -205,6 +205,22 @@ pub(crate) struct SessionState {
     /// called from synchronous contexts inside the executor dispatch path
     /// — no `await` needed.
     pub(crate) tx_state: std::sync::Mutex<TxState>,
+    /// Per-session advisory-lock ownership (BUG #138). Holds this session's
+    /// unique owner token and the set of keys it currently holds (session-
+    /// and xact-scoped). The `pg_advisory_*` UDFs registered in
+    /// `session::open` share this `Arc`. Xact-scoped locks are released by
+    /// `tx_commit` / `tx_rollback`; all locks are released when the session
+    /// is dropped (see `impl Drop for SessionState`).
+    pub(crate) advisory: Arc<crate::advisory_lock::AdvisorySessionLocks>,
+}
+
+impl Drop for SessionState {
+    fn drop(&mut self) {
+        // Session end: release every advisory lock this session still holds
+        // (session- and xact-scoped). Matches PG, which drops all advisory
+        // locks held by a backend when the connection terminates.
+        self.advisory.release_all_on_session_end();
+    }
 }
 
 impl SessionState {
@@ -218,6 +234,7 @@ impl SessionState {
             schema_state: Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default())),
             pending_overriding: std::sync::Mutex::new(None),
             tx_state: std::sync::Mutex::new(TxState::default()),
+            advisory: Arc::new(crate::advisory_lock::AdvisorySessionLocks::new()),
         }
     }
 }
@@ -256,6 +273,9 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
     tx.aborted = false;
     tx.pre_tx_snapshots.clear();
     tx.savepoints.clear();
+    drop(tx);
+    // PG: xact-scoped advisory locks auto-release at transaction end.
+    state.advisory.release_xact();
     pending
 }
 
@@ -275,6 +295,10 @@ pub(crate) fn tx_rollback(
     tx.active = false;
     tx.aborted = false;
     tx.savepoints.clear();
+    drop(tx);
+    // PG: xact-scoped advisory locks auto-release at transaction end
+    // (ROLLBACK releases them just like COMMIT).
+    state.advisory.release_xact();
     (pending, snapshots)
 }
 
@@ -559,6 +583,12 @@ pub(crate) async fn open(
     .map_err(|e| BasinError::internal(format!("info_schema providers: {e}")))?;
 
     let state = Arc::new(SessionState::new());
+
+    // Advisory-lock UDFs (BUG #138). Session-scoped: a lock owned by this
+    // session must appear "held" to other sessions, so these capture the
+    // per-session `Arc<AdvisorySessionLocks>` and overwrite (by name) the
+    // removed stateless stubs. Registered here, like `register_auth_udfs`.
+    crate::advisory_lock::register_advisory_lock_udfs(&ctx, state.advisory.clone());
 
     // 3. Pre-register every table the catalog already knows about. This makes
     //    SELECT work immediately without a per-query refresh.

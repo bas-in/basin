@@ -4262,6 +4262,187 @@ fn rewrite_scalar_select_to_from_recordset(sql: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// JSONB set-returning functions in SELECT-list position
+// ---------------------------------------------------------------------------
+
+/// The JSON/JSONB set-returning functions that PostgreSQL expands to multiple
+/// rows.  Basin implements each as a table function (UDTF) — see
+/// `jsonb_udf::register_jsonb_udtfs`.  When written in *scalar SELECT* position
+/// (`SELECT jsonb_array_elements('[1,2,3]'::jsonb)`), DataFusion would resolve
+/// the same-named *scalar* stub UDF and collapse the result to a single row.
+/// PostgreSQL instead expands the SRF into one row per element.
+///
+/// The longest names must appear first so prefix matching picks the most
+/// specific function (e.g. `jsonb_array_elements_text` before
+/// `jsonb_array_elements`, `jsonb_each_text` before `jsonb_each`).
+const JSONB_SRF_NAMES: &[&str] = &[
+    "jsonb_array_elements_text",
+    "json_array_elements_text",
+    "jsonb_array_elements",
+    "json_array_elements",
+    "jsonb_object_keys",
+    "json_object_keys",
+    "jsonb_each_text",
+    "json_each_text",
+    "jsonb_each",
+    "json_each",
+];
+
+/// Rewrite a FROM-less `SELECT <jsonb_srf>(args)[ AS alias]` into
+/// `SELECT * FROM <jsonb_srf>(args)[ AS alias]` so the registered table
+/// function (UDTF) — which correctly expands one row per element/key/pair —
+/// is used instead of the single-row scalar stub.
+///
+/// PostgreSQL allows set-returning functions in the SELECT list of a
+/// FROM-less query and expands them to a row set; the ORM array-expansion
+/// idiom `SELECT * FROM jsonb_array_elements('[…]'::jsonb)` and its scalar
+/// shorthand `SELECT jsonb_array_elements('[…]'::jsonb)` are the common forms.
+///
+/// ## What is rewritten
+///
+/// Only the conservative, unambiguous shape:
+/// - The statement starts with `SELECT` (optionally `SELECT DISTINCT`).
+/// - The SELECT list is *exactly* one of the [`JSONB_SRF_NAMES`] calls,
+///   optionally followed by `AS <alias>` (or a bare alias).
+/// - There is **no** `FROM` / `WHERE` / `GROUP` / etc. clause after it.
+///
+/// Anything else (the SRF mixed with other columns, used with an existing
+/// FROM, inside a subquery with other clauses) is left untouched so we never
+/// change the semantics of a query that already works.  The FROM-clause form
+/// (`SELECT * FROM jsonb_array_elements(...)`) already routes to the UDTF and
+/// is not affected by this rewrite.
+pub(crate) fn rewrite_jsonb_srf_scalar_select(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+
+    // Fast path: must mention at least one of the SRF names.
+    if !JSONB_SRF_NAMES.iter().any(|n| lower.contains(n)) {
+        return sql.to_string();
+    }
+
+    let trimmed_start = sql.len() - sql.trim_start().len();
+    let body = sql.trim();
+    let body_lower = lower[trimmed_start..].trim_end();
+
+    // Must start with `SELECT` and a word boundary.
+    if !body_lower.starts_with("select") {
+        return sql.to_string();
+    }
+    let after_select = 6; // len("select")
+    let bytes = body.as_bytes();
+    if after_select < body.len()
+        && (bytes[after_select].is_ascii_alphanumeric() || bytes[after_select] == b'_')
+    {
+        return sql.to_string();
+    }
+
+    // Skip whitespace after SELECT.  We deliberately do NOT handle
+    // `SELECT DISTINCT` / `SELECT ALL` here: rewriting those to a FROM clause
+    // would have to relocate the set-quantifier, and the FROM-less DISTINCT-SRF
+    // shape is rare — leaving it untouched is the safe (correct-or-noop) choice.
+    let mut j = after_select;
+    while j < body.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+
+    // Must be immediately followed by one of the SRF names + `(`.
+    let select_list_start = j;
+    let srf = JSONB_SRF_NAMES.iter().find(|name| {
+        let after = j + name.len();
+        body_lower[j..].starts_with(*name)
+            && body
+                .as_bytes()
+                .get(after)
+                .map(|c| *c == b'(' || c.is_ascii_whitespace())
+                .unwrap_or(false)
+    });
+    let srf = match srf {
+        Some(s) => *s,
+        None => return sql.to_string(),
+    };
+
+    // Find the opening paren of the SRF call.
+    let mut k = j + srf.len();
+    while k < body.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k >= body.len() || bytes[k] != b'(' {
+        return sql.to_string();
+    }
+
+    // Match the balanced argument parenthesis (skip string literals inside).
+    let mut depth = 0i32;
+    let mut p = k;
+    while p < body.len() {
+        match bytes[p] {
+            b'\'' => {
+                p = skip_quoted_string(body, p);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        p += 1;
+    }
+    if depth != 0 || p >= body.len() {
+        return sql.to_string(); // unbalanced — leave untouched
+    }
+    let call_end = p + 1; // index just past the closing `)`
+
+    // After the call there may be an alias (`AS x` or bare `x`) and then the
+    // statement must end (optionally a trailing `;`).  No other clause may
+    // follow — if it does, this is not the simple FROM-less SRF shorthand.
+    let mut rest = body[call_end..].trim_end();
+    if let Some(stripped) = rest.strip_suffix(';') {
+        rest = stripped.trim_end();
+    }
+    let rest_lower = rest.trim().to_ascii_lowercase();
+    if !rest_lower.is_empty() {
+        // Allow only an alias clause: `AS ident` or a single bare identifier.
+        let alias_ok = if let Some(after_as) = rest_lower.strip_prefix("as ") {
+            is_simple_identifier(after_as.trim())
+        } else {
+            is_simple_identifier(rest_lower.trim())
+        };
+        if !alias_ok {
+            return sql.to_string();
+        }
+    }
+
+    // Build: `<leading ws>SELECT * FROM <srf-call>[ <alias>]`
+    // The SRF call is `body[select_list_start..call_end]`; `rest` holds the
+    // already-validated, semicolon-stripped alias clause (or is empty).
+    let mut out = String::with_capacity(sql.len() + 16);
+    out.push_str(&sql[..trimmed_start]); // preserve leading whitespace
+    out.push_str("SELECT * FROM ");
+    out.push_str(body[select_list_start..call_end].trim());
+    if !rest.is_empty() {
+        out.push(' ');
+        out.push_str(rest.trim());
+    }
+    out
+}
+
+/// True if `s` is a single, simple SQL identifier (letters, digits, `_`,
+/// optionally double-quoted).  Used to validate a trailing column alias.
+fn is_simple_identifier(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        return !s[1..s.len() - 1].contains('"');
+    }
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !s.chars().next().unwrap().is_ascii_digit()
+}
+
 /// Skip a single-quoted SQL string literal starting at `start` (which must be
 /// the `'` character).  Returns the index of the character AFTER the closing
 /// `'`.  Handles `''` escape sequences.
@@ -5131,5 +5312,104 @@ mod tests {
         let sql = "SELECT id FROM t WHERE id = 1";
         assert_eq!(rewrite_any_some_subquery(sql), sql,
             "rewrite_any_some_subquery must be a no-op when any/some/all are absent");
+    }
+
+    // ── rewrite_jsonb_srf_scalar_select (BUG #139) ──────────────────────────
+
+    #[test]
+    fn jsonb_srf_scalar_array_elements_rewritten() {
+        let sql = "SELECT jsonb_array_elements('[1,2,3]'::jsonb)";
+        let out = rewrite_jsonb_srf_scalar_select(sql);
+        assert_eq!(out, "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)");
+    }
+
+    #[test]
+    fn jsonb_srf_scalar_with_alias_rewritten() {
+        let sql = "SELECT jsonb_array_elements('[1,2,3]'::jsonb) AS v";
+        let out = rewrite_jsonb_srf_scalar_select(sql);
+        assert_eq!(out, "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS v");
+    }
+
+    #[test]
+    fn jsonb_srf_scalar_each_and_keys_rewritten() {
+        assert_eq!(
+            rewrite_jsonb_srf_scalar_select("SELECT jsonb_each('{\"a\":1}'::jsonb)"),
+            "SELECT * FROM jsonb_each('{\"a\":1}'::jsonb)"
+        );
+        assert_eq!(
+            rewrite_jsonb_srf_scalar_select("SELECT jsonb_object_keys('{\"a\":1}'::jsonb)"),
+            "SELECT * FROM jsonb_object_keys('{\"a\":1}'::jsonb)"
+        );
+    }
+
+    #[test]
+    fn jsonb_srf_text_and_json_prefix_variants_rewritten() {
+        assert_eq!(
+            rewrite_jsonb_srf_scalar_select("SELECT jsonb_array_elements_text('[\"a\"]'::jsonb)"),
+            "SELECT * FROM jsonb_array_elements_text('[\"a\"]'::jsonb)"
+        );
+        assert_eq!(
+            rewrite_jsonb_srf_scalar_select("SELECT json_array_elements('[1]')"),
+            "SELECT * FROM json_array_elements('[1]')"
+        );
+        // Longest-prefix wins: `jsonb_each_text` not `jsonb_each`.
+        assert_eq!(
+            rewrite_jsonb_srf_scalar_select("SELECT jsonb_each_text('{\"a\":\"b\"}'::jsonb)"),
+            "SELECT * FROM jsonb_each_text('{\"a\":\"b\"}'::jsonb)"
+        );
+    }
+
+    #[test]
+    fn jsonb_srf_trailing_semicolon_rewritten() {
+        assert_eq!(
+            rewrite_jsonb_srf_scalar_select("SELECT jsonb_array_elements('[1,2]'::jsonb);"),
+            "SELECT * FROM jsonb_array_elements('[1,2]'::jsonb)"
+        );
+    }
+
+    #[test]
+    fn jsonb_srf_distinct_left_untouched() {
+        // SELECT DISTINCT is intentionally not rewritten (safe no-op).
+        let sql = "SELECT DISTINCT jsonb_array_elements('[1,1,2]'::jsonb)";
+        assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql);
+    }
+
+    #[test]
+    fn jsonb_srf_already_from_clause_untouched() {
+        // FROM-clause form already routes to the UDTF — must not be altered.
+        let sql = "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)";
+        assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql);
+    }
+
+    #[test]
+    fn jsonb_srf_mixed_select_list_untouched() {
+        // SRF mixed with another column needs LATERAL semantics — out of
+        // scope; must NOT be rewritten (could change result shape).
+        let sql = "SELECT 1, jsonb_array_elements('[1,2,3]'::jsonb)";
+        assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql);
+        let sql2 = "SELECT jsonb_array_elements('[1]'::jsonb), id FROM t";
+        assert_eq!(rewrite_jsonb_srf_scalar_select(sql2), sql2);
+    }
+
+    #[test]
+    fn jsonb_srf_with_existing_from_untouched() {
+        // A SRF in the SELECT list of a query that already has a FROM must be
+        // left alone (per-row lateral expansion is not handled here).
+        let sql = "SELECT jsonb_array_elements(col) FROM t";
+        assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql);
+    }
+
+    #[test]
+    fn jsonb_srf_no_match_fast_exit() {
+        let sql = "SELECT id, name FROM users WHERE id = 1";
+        assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql,
+            "must be a no-op when no jsonb SRF name is present");
+    }
+
+    #[test]
+    fn jsonb_srf_substring_name_not_matched() {
+        // `my_jsonb_each_helper` must not trigger the rewrite.
+        let sql = "SELECT my_jsonb_each_helper('{}')";
+        assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql);
     }
 }

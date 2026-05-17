@@ -273,30 +273,13 @@ fn register_all(ctx: &SessionContext) {
         signature: sig_priv,
     }));
 
-    // ----------- pg_advisory_lock / pg_advisory_unlock / pg_try_advisory_lock -----------
-    // Advisory locks are no-ops in Basin (no distributed lock manager in v0.1).
-    let sig_advisory = Signature::one_of(
-        vec![
-            TypeSignature::Exact(vec![DataType::Int64]),
-            TypeSignature::Exact(vec![DataType::Int32]),
-            TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
-            TypeSignature::Exact(vec![DataType::Int32, DataType::Int32]),
-        ],
-        Volatility::Volatile,
-    );
-    ctx.register_udf(ScalarUDF::from(VoidNullArgUdf {
-        name: "pg_advisory_lock".into(),
-        signature: sig_advisory.clone(),
-    }));
-    ctx.register_udf(ScalarUDF::from(VoidNullArgUdf {
-        name: "pg_advisory_unlock".into(),
-        signature: sig_advisory.clone(),
-    }));
-    ctx.register_udf(ScalarUDF::from(SimpleConstBoolUdf {
-        name: "pg_try_advisory_lock".into(),
-        value: true,
-        signature: sig_advisory,
-    }));
+    // ----------- pg_advisory_lock family -----------
+    // Advisory locks are NOT registered here. They are session-scoped (a lock
+    // is owned by a specific session and must be visible as "held" to other
+    // sessions), so a stateless stub cannot implement PG semantics. The real,
+    // PG-faithful implementations are registered per-session in
+    // `session::open` via `crate::advisory_lock::register_advisory_lock_udfs`
+    // (BUG #138). See `crates/basin-engine/src/advisory_lock.rs`.
 
     // ----------- pg_typeof -----------
     // Returns the type of the argument as a text string.  Best-effort: we
@@ -898,70 +881,9 @@ impl ScalarUDFImpl for HasPrivilegeUdf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// VoidNullArgUdf — (any args) -> NULL (void stub for pg_advisory_lock etc.)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct VoidNullArgUdf {
-    name: String,
-    signature: Signature,
-}
-
-impl ScalarUDFImpl for VoidNullArgUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Null)
-    }
-    #[allow(deprecated)]
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
-        let _ = args;
-        Ok(ColumnarValue::Scalar(ScalarValue::Null))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SimpleConstBoolUdf — (any args) -> bool constant
-// Used for: pg_try_advisory_lock (always returns true = lock acquired)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SimpleConstBoolUdf {
-    name: String,
-    value: bool,
-    signature: Signature,
-}
-
-impl ScalarUDFImpl for SimpleConstBoolUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Boolean)
-    }
-    #[allow(deprecated)]
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
-        let n = num_rows(args);
-        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![self.value; n]));
-        Ok(ColumnarValue::Array(arr))
-    }
-}
+// (Advisory-lock stub UDFs removed — see BUG #138 / advisory_lock.rs. The
+// PG-faithful, session-scoped implementations live in that module and are
+// registered per-session in session::open.)
 
 // ---------------------------------------------------------------------------
 // SimpleConstTextUdf — (any args) -> text constant

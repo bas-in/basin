@@ -66,6 +66,37 @@ async fn one_jsonb(sess: &basin_engine::ProjectSession, sql: &str) -> Option<Val
     }))
 }
 
+/// Run a SELECT that returns one row × one JSON-bearing column, tolerating
+/// either the JSONB binary physical type (LargeBinary) or a Utf8/JSON-text
+/// column. Used where the *value* must be PG-correct but the result column's
+/// physical type is a known, separately-tracked divergence (see #160).
+async fn one_json_any(sess: &basin_engine::ProjectSession, sql: &str) -> Option<Value> {
+    let batches = match sess.execute(sql).await {
+        Ok(ExecResult::Rows { batches, .. }) => batches,
+        Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
+        Err(e) => panic!("execute error for: {sql}\n  err: {e}"),
+    };
+    let batch = batches.first().expect("no batches");
+    assert_eq!(batch.num_rows(), 1, "expected 1 row from: {sql}");
+    let col = batch.column(0);
+    if col.is_null(0) {
+        return None;
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Some(
+            serde_json::from_slice(arr.value(0))
+                .unwrap_or_else(|e| panic!("json decode (binary) failed for: {sql}\n  err: {e}")),
+        );
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        return Some(
+            serde_json::from_str(arr.value(0))
+                .unwrap_or_else(|e| panic!("json decode (text) failed for: {sql}\n  err: {e}")),
+        );
+    }
+    panic!("expected LargeBinary or Utf8 JSON column for: {sql}, got {:?}", col.data_type());
+}
+
 /// Run a SELECT that returns one row × one Utf8 column.
 async fn one_text(sess: &basin_engine::ProjectSession, sql: &str) -> Option<String> {
     let batches = match sess.execute(sql).await {
@@ -334,93 +365,118 @@ async fn test_jsonb_path_match() {
     );
 }
 
-/// 10. jsonb_object_keys — get object keys (SRF stub: comma-joined)
+/// Run a SELECT and return every value of column `col` (Utf8) across all rows.
+async fn col_text(
+    sess: &basin_engine::ProjectSession,
+    sql: &str,
+    col: &str,
+) -> Vec<String> {
+    let batches = match sess.execute(sql).await {
+        Ok(ExecResult::Rows { batches, .. }) => batches,
+        Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
+        Err(e) => panic!("execute error for: {sql}\n  err: {e}"),
+    };
+    let mut out = Vec::new();
+    for b in &batches {
+        let arr = b
+            .column_by_name(col)
+            .unwrap_or_else(|| panic!("no column `{col}` for: {sql} ({:?})", b.schema()))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("expected Utf8 column `{col}` for: {sql}"));
+        for i in 0..arr.len() {
+            out.push(arr.value(i).to_string());
+        }
+    }
+    out
+}
+
+/// 10. jsonb_object_keys — set-returning: one row per top-level key (#139).
 #[tokio::test]
 async fn test_jsonb_object_keys() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let result = one_text(
+    // PG semantics: a FROM-less SELECT of a SRF expands to one row per key.
+    let mut keys = col_text(
         &sess,
         r#"SELECT jsonb_object_keys('{"b":2,"a":1,"c":3}')"#,
+        "jsonb_object_keys",
     )
-    .await
-    .expect("jsonb_object_keys should return text");
-
-    // Keys should be present (order depends on serde_json's BTreeMap — sorted)
-    let keys: Vec<&str> = result.split(',').collect();
-    assert!(keys.contains(&"a"), "key a missing from: {result}");
-    assert!(keys.contains(&"b"), "key b missing from: {result}");
-    assert!(keys.contains(&"c"), "key c missing from: {result}");
+    .await;
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["a", "b", "c"],
+        "jsonb_object_keys must yield one row per top-level key"
+    );
 }
 
-/// 11. jsonb_each — SRF stub: returns JSON text
+/// 11. jsonb_each — set-returning: one (key, value) row per pair (#139).
 #[tokio::test]
 async fn test_jsonb_each() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let result = one_text(
-        &sess,
-        r#"SELECT jsonb_each('{"a":1,"b":2}')"#,
-    )
-    .await
-    .expect("jsonb_each should return text");
-
-    // The stub returns the JSON string; it should be non-empty and parseable
-    let v: Value = serde_json::from_str(&result)
-        .unwrap_or_else(|_| panic!("jsonb_each stub output should be parseable JSON: {result}"));
-    assert!(v.is_object(), "stub should return object JSON: {result}");
+    let sql = r#"SELECT key, value FROM jsonb_each('{"a":1,"b":2}'::jsonb) ORDER BY key"#;
+    let keys = col_text(&sess, sql, "key").await;
+    let vals = col_text(&sess, sql, "value").await;
+    assert_eq!(keys, vec!["a", "b"], "jsonb_each must yield one row per key");
+    assert_eq!(vals, vec!["1", "2"], "jsonb_each value column");
 }
 
-/// 12. jsonb_each_text — SRF stub: key=value text pairs
+/// 12. jsonb_each_text — set-returning: (key, text-value) rows (#139).
 #[tokio::test]
 async fn test_jsonb_each_text() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let result = one_text(
-        &sess,
-        r#"SELECT jsonb_each_text('{"a":1,"b":"hello"}')"#,
-    )
-    .await
-    .expect("jsonb_each_text should return text");
-
-    // Stub returns "key=value,..." pairs
-    assert!(result.contains("a="), "should contain a= pair: {result}");
-    assert!(result.contains("b="), "should contain b= pair: {result}");
+    let sql =
+        r#"SELECT key, value FROM jsonb_each_text('{"a":1,"b":"hello"}'::jsonb) ORDER BY key"#;
+    let keys = col_text(&sess, sql, "key").await;
+    let vals = col_text(&sess, sql, "value").await;
+    assert_eq!(keys, vec!["a", "b"]);
+    // `_text` unwraps JSON strings: "hello" (no surrounding quotes).
+    assert_eq!(vals, vec!["1", "hello"], "jsonb_each_text unwraps strings");
 }
 
-/// 13. jsonb_array_elements — SRF stub: first element
+/// 13. jsonb_array_elements — set-returning: one row per element (#139).
 #[tokio::test]
 async fn test_jsonb_array_elements() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let result = one_jsonb(
+    // Scalar SELECT-list form must expand to 3 rows (ORM idiom).
+    let vals = col_text(
         &sess,
-        r#"SELECT jsonb_array_elements('[10,20,30]')"#,
+        r#"SELECT jsonb_array_elements('[10,20,30]'::jsonb)"#,
+        "value",
     )
-    .await
-    .expect("jsonb_array_elements should return jsonb (first element)");
-
-    assert_eq!(result, json!(10), "stub should return first element");
+    .await;
+    assert_eq!(
+        vals,
+        vec!["10", "20", "30"],
+        "jsonb_array_elements must yield one row per element"
+    );
 }
 
-/// 14. jsonb_array_elements_text — SRF stub: first element as text
+/// 14. jsonb_array_elements_text — set-returning: text element per row (#139).
 #[tokio::test]
 async fn test_jsonb_array_elements_text() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let result = one_text(
+    let vals = col_text(
         &sess,
-        r#"SELECT jsonb_array_elements_text('["alpha","beta","gamma"]')"#,
+        r#"SELECT jsonb_array_elements_text('["alpha","beta","gamma"]'::jsonb)"#,
+        "value",
     )
-    .await
-    .expect("jsonb_array_elements_text should return text (first element)");
-
-    assert_eq!(result, "alpha", "stub should return first string element");
+    .await;
+    assert_eq!(
+        vals,
+        vec!["alpha", "beta", "gamma"],
+        "jsonb_array_elements_text yields each unwrapped string as a row"
+    );
 }
 
 /// 15. jsonb_build_object — build object from key/value pairs
@@ -520,34 +576,49 @@ async fn test_array_to_json() {
     }
 }
 
-/// 20. jsonb_agg stub — must return a user-friendly error, not panic
+/// 20. jsonb_agg is a real aggregate (PG: jsonb_agg(1) -> [1])
 #[tokio::test]
-async fn test_jsonb_agg_stub_errors_cleanly() {
+async fn test_jsonb_agg_returns_array() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    // The stub should error with a clear message
-    let result = sess.execute(r#"SELECT jsonb_agg(1)"#).await;
-    assert!(result.is_err(), "jsonb_agg stub should return an error");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("jsonb_agg") || err.contains("AggregateUDFImpl") || err.contains("deferred"),
-        "error message should mention jsonb_agg or deferral: {err}"
+    let scalar = one_json_any(&sess, r#"SELECT jsonb_agg(1)"#).await;
+    assert_eq!(scalar, Some(serde_json::json!([1])), "jsonb_agg(1) must be [1]");
+
+    let multi = one_json_any(
+        &sess,
+        r#"SELECT jsonb_agg(x) FROM (VALUES (1),(2),(3)) AS v(x)"#,
+    )
+    .await;
+    assert_eq!(
+        multi,
+        Some(serde_json::json!([1, 2, 3])),
+        "jsonb_agg over rows must collect all values in order"
     );
 }
 
-/// 21. jsonb_object_agg stub — must return a user-friendly error, not panic
+/// 21. jsonb_object_agg is a real aggregate (PG: jsonb_object_agg('k','v') -> {"k":"v"})
 #[tokio::test]
-async fn test_jsonb_object_agg_stub_errors_cleanly() {
+async fn test_jsonb_object_agg_returns_object() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let result = sess.execute(r#"SELECT jsonb_object_agg('k', 'v')"#).await;
-    assert!(result.is_err(), "jsonb_object_agg stub should return an error");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("jsonb_object_agg") || err.contains("AggregateUDFImpl") || err.contains("deferred"),
-        "error message should mention jsonb_object_agg or deferral: {err}"
+    let scalar = one_json_any(&sess, r#"SELECT jsonb_object_agg('k', 'v')"#).await;
+    assert_eq!(
+        scalar,
+        Some(serde_json::json!({"k": "v"})),
+        "jsonb_object_agg('k','v') must be {{\"k\":\"v\"}}"
+    );
+
+    let multi = one_json_any(
+        &sess,
+        r#"SELECT jsonb_object_agg(k, v) FROM (VALUES ('a','1'),('b','2')) AS t(k,v)"#,
+    )
+    .await;
+    assert_eq!(
+        multi,
+        Some(serde_json::json!({"a": "1", "b": "2"})),
+        "jsonb_object_agg over rows must build the full object"
     );
 }
 

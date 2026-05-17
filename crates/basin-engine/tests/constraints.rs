@@ -490,3 +490,166 @@ async fn key_column_usage_lists_pk_and_fk_columns() {
     assert_eq!(cols, vec!["order_id".to_string(), "item_id".to_string()]);
     assert_eq!(positions, vec![1, 2]);
 }
+
+// ----- VARCHAR(n) / CHAR(n) declared-length enforcement (BUG #140) --------
+// PG rejects an over-length value with SQLSTATE 22001
+// (`value too long for type character varying(n)`). CHAR(n) is
+// blank-padded to exactly n on store. Unbounded VARCHAR / TEXT are
+// unaffected.
+
+#[tokio::test]
+async fn varchar_n_over_length_insert_rejected() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, code VARCHAR(5))")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("INSERT INTO t VALUES (1, 'toolong')")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::StringTooLong(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("value too long for type character varying(5)"),
+        "msg = {msg}"
+    );
+}
+
+#[tokio::test]
+async fn varchar_n_exactly_n_insert_ok() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, code VARCHAR(5))")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'abcde'), (2, 'ab')")
+        .await
+        .unwrap();
+    let batches = rows(&sess, "SELECT code FROM t ORDER BY id").await;
+    assert_eq!(
+        col_string(&batches, "code"),
+        vec!["abcde".to_string(), "ab".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn varchar_n_trailing_spaces_truncated_not_error() {
+    // PG parity: over-length *trailing spaces* on a varchar input are
+    // silently truncated to fit, not a 22001 error.
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, code VARCHAR(3))")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'ab     ')")
+        .await
+        .unwrap();
+    let batches = rows(&sess, "SELECT code FROM t").await;
+    // Kept value is exactly n chars: "ab " (the non-space prefix plus one
+    // space, padded out of the original trailing run).
+    assert_eq!(col_string(&batches, "code"), vec!["ab ".to_string()]);
+}
+
+#[tokio::test]
+async fn varchar_n_update_grow_past_limit_rejected() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, code VARCHAR(5))")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'ab')")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("UPDATE t SET code = 'abcdefg' WHERE id = 1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::StringTooLong(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn char_n_blank_padded_on_store() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, code CHAR(5))")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'ab')")
+        .await
+        .unwrap();
+    let batches = rows(&sess, "SELECT code FROM t").await;
+    // CHAR(5) blank-pads "ab" → "ab   " (exactly 5 chars).
+    assert_eq!(col_string(&batches, "code"), vec!["ab   ".to_string()]);
+}
+
+#[tokio::test]
+async fn char_n_over_length_insert_rejected() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, code CHAR(3))")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("INSERT INTO t VALUES (1, 'abcd')")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::StringTooLong(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("value too long for type character(3)"),
+        "msg = {msg}"
+    );
+}
+
+#[tokio::test]
+async fn unbounded_varchar_and_text_unaffected() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, a VARCHAR, b TEXT)")
+        .await
+        .unwrap();
+    let long = "x".repeat(10_000);
+    sess.execute(&format!("INSERT INTO t VALUES (1, '{long}', '{long}')"))
+        .await
+        .unwrap();
+    let batches = rows(&sess, "SELECT a, b FROM t").await;
+    assert_eq!(col_string(&batches, "a"), vec![long.clone()]);
+    assert_eq!(col_string(&batches, "b"), vec![long]);
+}
+
+#[tokio::test]
+async fn char_n_update_grow_past_limit_rejected() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, code CHAR(4))")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'ab')")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("UPDATE t SET code = 'abcde' WHERE id = 1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BasinError::StringTooLong(_)), "got {err:?}");
+    // The pre-existing row is still readable and remains blank-padded.
+    let batches = rows(&sess, "SELECT code FROM t").await;
+    assert_eq!(col_string(&batches, "code"), vec!["ab  ".to_string()]);
+}

@@ -127,6 +127,139 @@ pub const BASIN_ENUM_TYPE_KEY: &str = basin_catalog::BASIN_ENUM_TYPE_KEY;
 /// predicate against each row at INSERT time.
 pub const BASIN_DOMAIN_KEY: &str = basin_catalog::BASIN_DOMAIN_KEY;
 
+/// Per-column marker for a declared character-length limit on
+/// `VARCHAR(n)` / `CHARACTER VARYING(n)` / `CHAR(n)` / `CHARACTER(n)`.
+/// The Arrow physical type stays `Utf8` (these are just length-checked
+/// text). Value format:
+///   - `"varchar(n)"` — variable-length, error if char-length > n
+///     (trailing spaces beyond n are truncated rather than erroring,
+///     matching PG's `varchar` cast rule).
+///   - `"char(n)"`    — fixed-length, error if char-length > n, and
+///     blank-padded with spaces up to n on store (PG `bpchar`).
+/// Unbounded `VARCHAR` / `CHARACTER VARYING` / `TEXT` carry no marker
+/// (no length check). `CHAR` with no length is `CHAR(1)` per the SQL
+/// standard and PG.
+pub const BASIN_CHARLEN_KEY: &str = "BASIN_CHARLEN";
+
+/// The declared character-length flavour parsed back out of a
+/// [`BASIN_CHARLEN_KEY`] marker value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CharLen {
+    /// `VARCHAR(n)` — length-checked, no padding.
+    Varchar(u32),
+    /// `CHAR(n)` — length-checked, blank-padded to exactly `n`.
+    Char(u32),
+}
+
+/// Compute the [`BASIN_CHARLEN_KEY`] marker value for a column's declared
+/// type, or `None` when the type carries no enforceable character-length
+/// limit (`TEXT`, unbounded `VARCHAR`, non-text types).
+///
+/// PG semantics encoded here:
+///   - `VARCHAR(n)` / `CHARACTER VARYING(n)` → `varchar(n)`
+///   - bare `VARCHAR` / `CHARACTER VARYING`  → no marker (unbounded)
+///   - `CHAR(n)` / `CHARACTER(n)`            → `char(n)`
+///   - bare `CHAR` / `CHARACTER`             → `char(1)`
+///   - `TEXT` / `STRING`                     → no marker
+pub(crate) fn charlen_marker(sql: &SqlDataType) -> Option<String> {
+    fn n_of(info: &Option<sqlparser::ast::CharacterLength>) -> Option<u32> {
+        match info {
+            Some(sqlparser::ast::CharacterLength::IntegerLength { length, .. }) => {
+                u32::try_from(*length).ok()
+            }
+            // `CHARACTER VARYING(MAX)` (T-SQL-ism) — treat as unbounded.
+            Some(sqlparser::ast::CharacterLength::Max) => None,
+            None => None,
+        }
+    }
+    match sql {
+        SqlDataType::Varchar(info) | SqlDataType::CharacterVarying(info) => {
+            n_of(info).map(|n| format!("varchar({n})"))
+        }
+        SqlDataType::Char(info) | SqlDataType::Character(info) => {
+            // PG: bare CHAR ≡ CHAR(1).
+            let n = n_of(info).unwrap_or(1);
+            Some(format!("char({n})"))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a [`BASIN_CHARLEN_KEY`] marker value into a [`CharLen`]. Returns
+/// `None` for an absent / unparseable marker (treated as "no limit").
+pub(crate) fn parse_charlen(field: &arrow_schema::Field) -> Option<CharLen> {
+    let v = field.metadata().get(BASIN_CHARLEN_KEY)?;
+    if let Some(rest) = v.strip_prefix("varchar(") {
+        let n: u32 = rest.strip_suffix(')')?.parse().ok()?;
+        return Some(CharLen::Varchar(n));
+    }
+    if let Some(rest) = v.strip_prefix("char(") {
+        let n: u32 = rest.strip_suffix(')')?.parse().ok()?;
+        return Some(CharLen::Char(n));
+    }
+    None
+}
+
+/// Enforce a declared `VARCHAR(n)` / `CHAR(n)` limit on one text value,
+/// returning the value as it should be stored.
+///
+/// PG parity:
+///   - `VARCHAR(n)`: if `char_length(s) > n` *after* stripping trailing
+///     spaces down to n, raise SQLSTATE 22001. Otherwise stored as-is
+///     (the trailing-space truncation only kicks in when it lets an
+///     otherwise-too-long value fit, exactly like PG's `varchar` input).
+///   - `CHAR(n)`: if `char_length(s) > n` raise 22001; else blank-pad
+///     with spaces to exactly `n` characters.
+///
+/// Length is measured in Unicode scalar values (`chars().count()`),
+/// matching PG's per-character semantics rather than byte length.
+pub(crate) fn enforce_charlen<'a>(
+    limit: CharLen,
+    s: &'a str,
+    col: &str,
+) -> Result<std::borrow::Cow<'a, str>> {
+    use std::borrow::Cow;
+    match limit {
+        CharLen::Varchar(n) => {
+            let n = n as usize;
+            let len = s.chars().count();
+            if len <= n {
+                return Ok(Cow::Borrowed(s));
+            }
+            // PG truncates over-length *trailing spaces* for varchar input
+            // instead of erroring; only non-space overflow is an error.
+            let trimmed: &str = s.trim_end_matches(' ');
+            let trimmed_len = trimmed.chars().count();
+            if trimmed_len <= n {
+                // Keep exactly n chars (trailing spaces beyond n dropped).
+                let kept: String = s.chars().take(n).collect();
+                return Ok(Cow::Owned(kept));
+            }
+            let _ = col;
+            Err(BasinError::StringTooLong(format!(
+                "value too long for type character varying({n})"
+            )))
+        }
+        CharLen::Char(n) => {
+            let n = n as usize;
+            let len = s.chars().count();
+            if len > n {
+                return Err(BasinError::StringTooLong(format!(
+                    "value too long for type character({n})"
+                )));
+            }
+            if len == n {
+                Ok(Cow::Borrowed(s))
+            } else {
+                let mut out = String::with_capacity(s.len() + (n - len));
+                out.push_str(s);
+                out.extend(std::iter::repeat(' ').take(n - len));
+                Ok(Cow::Owned(out))
+            }
+        }
+    }
+}
+
 /// Returns `true` if `field` carries the `JSONB` metadata marker. Cheap — just
 /// a hashmap lookup on a small map.
 pub(crate) fn field_is_jsonb(field: &arrow_schema::Field) -> bool {

@@ -88,6 +88,12 @@ pub enum BasinError {
     #[error("{0}")]
     ForeignKeyViolation(String),
 
+    /// A text value exceeded a declared `VARCHAR(n)` / `CHAR(n)` length.
+    /// Router maps to SQLSTATE `22001` (`string_data_right_truncation`),
+    /// matching PostgreSQL's `value too long for type ...` error.
+    #[error("{0}")]
+    StringTooLong(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),

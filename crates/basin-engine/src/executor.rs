@@ -558,6 +558,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // → `SELECT * FROM json_to_recordset([J]) AS t(coldefs)` so that sqlparser
     // does not choke on the typed coldef list in scalar-SELECT / FROM position.
     let rewritten = crate::pg_operators::rewrite_json_to_record(&rewritten);
+    // Rewrite a FROM-less `SELECT jsonb_array_elements('[…]'::jsonb)` (and the
+    // other JSON/JSONB set-returning functions) into
+    // `SELECT * FROM jsonb_array_elements('[…]'::jsonb)` so the row-expanding
+    // table function (UDTF) is used instead of the single-row scalar stub.
+    // PostgreSQL expands SRFs in the SELECT list to a row set; this restores
+    // that behaviour for the common ORM array-/object-expansion idiom.
+    let rewritten = crate::pg_operators::rewrite_jsonb_srf_scalar_select(&rewritten);
     // Rewrite PostgreSQL POSIX regex operators (`~`, `!~`, `~*`, `!~*`) to
     // `regexp_like(…)` calls DataFusion accepts; expand `BETWEEN SYMMETRIC`;
     // rewrite array containment / overlap operators (`@>`, `<@`, `&&`) for
@@ -1603,8 +1610,22 @@ async fn exec_create_index(
         }
     };
 
+    // A plain-column `CREATE UNIQUE INDEX` is semantically identical to an
+    // inline `UNIQUE` constraint in PostgreSQL and MUST be enforced (BUG
+    // #136 — previously it was silently accepted as metadata, allowing
+    // duplicate rows to accumulate). We register a real enforced
+    // `UniqueConstraint` below, routing into the SAME catalog machinery a
+    // table-level `UNIQUE (...)` uses, so the existing INSERT / UPDATE
+    // enforcement (`constraints::enforce_unique_on_insert`) covers it.
+    //
+    // Partial unique indexes (`WHERE ...`) and expression unique indexes
+    // remain non-enforcing (out of scope) — those keep the metadata-only
+    // notice so behavior does not regress.
+    let enforce_unique =
+        ci.unique && ci.predicate.is_none() && !has_expressions;
+
     // Emit notices for accepted-but-not-enforced features.
-    if ci.unique {
+    if ci.unique && !enforce_unique {
         log_unique_notice(&index_name);
     }
     if let Some(pred) = &ci.predicate {
@@ -1669,6 +1690,40 @@ async fn exec_create_index(
         )
         .await?;
 
+    // BUG #136 fix: register an enforced UNIQUE constraint for a plain-column
+    // `CREATE UNIQUE INDEX`. PG names the implicit constraint after the index,
+    // so we reuse `index_name` as the constraint name (this is also what
+    // surfaces in the SQLSTATE 23505 message). `set_unique_constraints`
+    // *replaces* the whole list, so load the existing set, append, and write
+    // it back. If a constraint with this index's name already exists (e.g. a
+    // re-run under IF NOT EXISTS where create_index was a no-op) we leave the
+    // set untouched to keep the operation idempotent.
+    if enforce_unique {
+        let meta = sess
+            .engine
+            .config()
+            .catalog
+            .load_table(&sess.project, &table)
+            .await?;
+        let already_registered = meta
+            .unique_constraints
+            .iter()
+            .any(|u| u.name == index_name);
+        if !already_registered {
+            let mut uniques = meta.unique_constraints.clone();
+            uniques.push(basin_catalog::UniqueConstraint {
+                name: index_name.clone(),
+                columns: catalog_columns.clone(),
+            });
+            sess.engine
+                .config()
+                .catalog
+                .set_unique_constraints(&sess.project, &table, uniques)
+                .await?;
+        }
+        refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
+    }
+
     Ok(ExecResult::Empty {
         tag: "CREATE INDEX".into(),
     })
@@ -1712,6 +1767,31 @@ async fn exec_drop_index(
                     .catalog
                     .drop_index(&sess.project, t, index_name)
                     .await?;
+                // BUG #136 fix: a `CREATE UNIQUE INDEX` also registered an
+                // enforced UNIQUE constraint named after the index. Dropping
+                // the index must drop that enforcement too (PG: DROP INDEX on
+                // a unique index removes the uniqueness). Constraints created
+                // by an inline table-level `UNIQUE (...)` are not named after
+                // an index, so this only removes the index-derived one.
+                if meta
+                    .unique_constraints
+                    .iter()
+                    .any(|u| u.name == index_name)
+                {
+                    let remaining: Vec<basin_catalog::UniqueConstraint> = meta
+                        .unique_constraints
+                        .iter()
+                        .filter(|u| u.name != index_name)
+                        .cloned()
+                        .collect();
+                    sess.engine
+                        .config()
+                        .catalog
+                        .set_unique_constraints(&sess.project, t, remaining)
+                        .await?;
+                    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t)
+                        .await?;
+                }
                 found = true;
                 break;
             }
@@ -5353,5 +5433,240 @@ mod auto_commit_ryow_tests {
 
         let n2 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
         assert_eq!(n2, 2, "both rows must be visible after INSERT RETURNING");
+    }
+}
+
+/// Regression coverage for BUG #139: the JSON/JSONB set-returning functions
+/// (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`, …) must expand
+/// to one row per element/key/pair like PostgreSQL — both in FROM-clause
+/// position *and* in scalar SELECT-list position (the common ORM idiom
+/// `SELECT jsonb_array_elements('[…]'::jsonb)`).
+#[cfg(test)]
+mod jsonb_srf_expansion_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, StringArray};
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig { storage, catalog, shard: None })
+    }
+
+    async fn rows(sess: &crate::ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
+        match sess.execute(sql).await {
+            Ok(ExecResult::Rows { batches, .. }) => batches,
+            other => panic!("expected Rows for `{sql}`, got {other:?}"),
+        }
+    }
+
+    fn total_rows(b: &[arrow_array::RecordBatch]) -> usize {
+        b.iter().map(|x| x.num_rows()).sum()
+    }
+
+    /// Collect a String column by name across all batches.
+    fn col_str(b: &[arrow_array::RecordBatch], name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for batch in b {
+            let arr = batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("no column `{name}` in {:?}", batch.schema()))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column must be Utf8");
+            for i in 0..arr.len() {
+                out.push(arr.value(i).to_string());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn array_elements_select_list_multi() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        // Scalar SELECT-list position (the regressed form) must expand to 3 rows.
+        let b = rows(&sess, "SELECT jsonb_array_elements('[1,2,3]'::jsonb)").await;
+        assert_eq!(total_rows(&b), 3, "must yield one row per array element");
+        assert_eq!(col_str(&b, "value"), vec!["1", "2", "3"]);
+    }
+
+    #[tokio::test]
+    async fn array_elements_from_clause_multi() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let b = rows(&sess, "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)").await;
+        assert_eq!(total_rows(&b), 3);
+        assert_eq!(col_str(&b, "value"), vec!["1", "2", "3"]);
+    }
+
+    #[tokio::test]
+    async fn array_elements_empty_and_single() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let empty = rows(&sess, "SELECT jsonb_array_elements('[]'::jsonb)").await;
+        assert_eq!(total_rows(&empty), 0, "empty array → zero rows");
+        let one = rows(&sess, "SELECT jsonb_array_elements('[42]'::jsonb)").await;
+        assert_eq!(total_rows(&one), 1);
+        assert_eq!(col_str(&one, "value"), vec!["42"]);
+    }
+
+    #[tokio::test]
+    async fn array_elements_nested_values_preserved() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let b = rows(
+            &sess,
+            "SELECT jsonb_array_elements('[[1,2],{\"k\":3}]'::jsonb)",
+        )
+        .await;
+        assert_eq!(total_rows(&b), 2);
+        assert_eq!(col_str(&b, "value"), vec!["[1,2]", "{\"k\":3}"]);
+    }
+
+    #[tokio::test]
+    async fn array_elements_text_variant() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        // `_text` unwraps JSON strings (no surrounding quotes).
+        let b = rows(
+            &sess,
+            "SELECT jsonb_array_elements_text('[\"a\",\"b\",\"c\"]'::jsonb)",
+        )
+        .await;
+        assert_eq!(total_rows(&b), 3);
+        assert_eq!(col_str(&b, "value"), vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn each_select_list_and_from() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        for sql in [
+            "SELECT jsonb_each('{\"a\":1,\"b\":2}'::jsonb)",
+            "SELECT * FROM jsonb_each('{\"a\":1,\"b\":2}'::jsonb)",
+        ] {
+            let b = rows(&sess, sql).await;
+            assert_eq!(total_rows(&b), 2, "jsonb_each → one row per pair: {sql}");
+            assert_eq!(col_str(&b, "key"), vec!["a", "b"], "keys for {sql}");
+            assert_eq!(col_str(&b, "value"), vec!["1", "2"], "values for {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_text_unwraps_strings() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let b = rows(
+            &sess,
+            "SELECT jsonb_each_text('{\"a\":\"x\",\"b\":\"y\"}'::jsonb)",
+        )
+        .await;
+        assert_eq!(total_rows(&b), 2);
+        assert_eq!(col_str(&b, "key"), vec!["a", "b"]);
+        assert_eq!(col_str(&b, "value"), vec!["x", "y"]);
+    }
+
+    #[tokio::test]
+    async fn each_empty_object() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let b = rows(&sess, "SELECT jsonb_each('{}'::jsonb)").await;
+        assert_eq!(total_rows(&b), 0, "empty object → zero rows");
+    }
+
+    #[tokio::test]
+    async fn object_keys_select_list_and_from() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let s = rows(
+            &sess,
+            "SELECT jsonb_object_keys('{\"a\":1,\"b\":2,\"c\":3}'::jsonb)",
+        )
+        .await;
+        assert_eq!(total_rows(&s), 3, "one row per top-level key");
+        assert_eq!(col_str(&s, "jsonb_object_keys"), vec!["a", "b", "c"]);
+
+        let f = rows(
+            &sess,
+            "SELECT * FROM jsonb_object_keys('{\"a\":1,\"b\":2,\"c\":3}'::jsonb)",
+        )
+        .await;
+        assert_eq!(total_rows(&f), 3);
+        assert_eq!(col_str(&f, "jsonb_object_keys"), vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn object_keys_empty() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let b = rows(&sess, "SELECT jsonb_object_keys('{}'::jsonb)").await;
+        assert_eq!(total_rows(&b), 0);
+    }
+
+    #[tokio::test]
+    async fn json_prefixed_variants_expand() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let a = rows(&sess, "SELECT json_array_elements('[1,2,3]')").await;
+        assert_eq!(total_rows(&a), 3, "json_array_elements must expand too");
+        assert_eq!(col_str(&a, "value"), vec!["1", "2", "3"]);
+
+        let k = rows(&sess, "SELECT json_object_keys('{\"x\":1,\"y\":2}')").await;
+        assert_eq!(total_rows(&k), 2, "json_object_keys must expand too");
+    }
+
+    #[tokio::test]
+    async fn select_list_with_alias_expands() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        // `AS v` aliases the table function; column is still `value`.
+        let b = rows(&sess, "SELECT jsonb_array_elements('[1,2,3]'::jsonb) AS v").await;
+        assert_eq!(total_rows(&b), 3);
+    }
+
+    #[tokio::test]
+    async fn mixed_select_list_not_rewritten() {
+        // Safety: a SRF mixed with other columns must NOT be rewritten by the
+        // scalar→FROM rule (that needs LATERAL semantics, out of scope). The
+        // query must still plan (using the scalar stub) and return 1 row — we
+        // only assert it does not error or explode into the wrong shape.
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let b = rows(
+            &sess,
+            "SELECT 1 AS n, jsonb_array_elements('[1,2,3]'::jsonb)",
+        )
+        .await;
+        assert_eq!(
+            total_rows(&b),
+            1,
+            "mixed SELECT list keeps scalar-stub behaviour (not in scope for #139)"
+        );
     }
 }

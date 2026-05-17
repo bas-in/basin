@@ -2300,7 +2300,12 @@ async fn apply_assignments(
             None => original,
             Some((_, AssignmentRhs::Scalar(scalar))) => {
                 let field = schema.field(col_idx);
-                build_assigned_column(field.data_type(), &original, mask, scalar)?
+                let built = build_assigned_column(field.data_type(), &original, mask, scalar)?;
+                // VARCHAR(n)/CHAR(n): the SET may grow the value past the
+                // declared limit (22001) or, for CHAR(n), need re-padding.
+                // Unassigned columns keep `original` (already enforced at
+                // INSERT) so only the assigned path needs the check.
+                crate::dml::enforce_charlen_array(field, built)?
             }
             Some((_, AssignmentRhs::Expr(text))) => {
                 let field = schema.field(col_idx);
@@ -2312,7 +2317,8 @@ async fn apply_assignments(
                     field.data_type(),
                 )
                 .await?;
-                crate::generated_cols::merge_by_mask(&original, &computed, mask)?
+                let merged = crate::generated_cols::merge_by_mask(&original, &computed, mask)?;
+                crate::dml::enforce_charlen_array(field, merged)?
             }
         };
         new_columns.push(new_col);

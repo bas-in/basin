@@ -552,6 +552,7 @@ pub enum ExecResult {
     },
 }
 
+mod advisory_lock;
 mod alter;
 pub mod noop_accept;
 pub mod pg_ast;

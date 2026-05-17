@@ -15,8 +15,8 @@ use arrow_array::builder::{
 };
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    ArrayRef, BooleanArray, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Schema, TimeUnit};
 use basin_catalog::PartitionSpec;
@@ -457,11 +457,58 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 )));
             }
         };
+        // VARCHAR(n) / CHAR(n) length enforcement + CHAR blank-padding.
+        // Applied as a post-pass on the freshly built Utf8 column so it
+        // covers every Utf8 build path (bulk / nullable / per-row) in one
+        // place. No-op (zero-copy) for unmarked text columns.
+        let array = enforce_charlen_array(field, array)?;
         columns.push(array);
     }
 
     RecordBatch::try_new(schema, columns)
         .map_err(|e| BasinError::internal(format!("RecordBatch build: {e}")))
+}
+
+/// If `field` declares a `VARCHAR(n)` / `CHAR(n)` limit, validate every
+/// non-null value in `array` against it (raising [`BasinError::StringTooLong`]
+/// — SQLSTATE 22001 — on overflow) and, for `CHAR(n)`, return a new array
+/// with each value blank-padded to exactly `n` characters. Columns with no
+/// limit (the overwhelmingly common case) are returned untouched.
+pub(crate) fn enforce_charlen_array(
+    field: &arrow_schema::Field,
+    array: ArrayRef,
+) -> Result<ArrayRef> {
+    let Some(limit) = crate::types::parse_charlen(field) else {
+        return Ok(array);
+    };
+    let Some(strs) = array.as_any().downcast_ref::<StringArray>() else {
+        // Charlen marker only ever attaches to Utf8 columns; anything else
+        // means the column isn't actually a text array (defensive no-op).
+        return Ok(array);
+    };
+    let needs_pad = matches!(limit, crate::types::CharLen::Char(_));
+    let mut out: Vec<Option<String>> = Vec::with_capacity(strs.iter().len());
+    let mut rewrote = false;
+    for cell in strs.iter() {
+        let Some(v) = cell else {
+            out.push(None);
+            continue;
+        };
+        let stored = crate::types::enforce_charlen(limit, v, field.name())?;
+        match stored {
+            std::borrow::Cow::Borrowed(s) => out.push(Some(s.to_string())),
+            std::borrow::Cow::Owned(s) => {
+                rewrote = true;
+                out.push(Some(s));
+            }
+        }
+    }
+    if !rewrote && !needs_pad {
+        // Pure length-check passed and nothing was rewritten — keep the
+        // original buffer (avoids a copy on the hot path).
+        return Ok(array);
+    }
+    Ok(Arc::new(StringArray::from(out)))
 }
 
 /// Bulk path for `Int64 NOT NULL` columns. Avoids the per-row builder pattern

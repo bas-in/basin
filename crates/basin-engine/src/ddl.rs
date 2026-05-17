@@ -13,7 +13,7 @@ use sqlparser::ast::{
 
 use crate::lifecycle::CreateTableLifecycle;
 use crate::types::{
-    arrow_data_type, basin_type_marker, is_cidr_sql, is_daterange_sql, is_inet_sql,
+    arrow_data_type, basin_type_marker, charlen_marker, is_cidr_sql, is_daterange_sql, is_inet_sql,
     is_int4range_sql, is_int8range_sql, is_macaddr8_sql, is_macaddr_sql, is_money_sql,
     is_numrange_sql, is_tsrange_sql, is_tstzrange_sql, is_xml_sql, serial_kind,
     BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY, BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS,
@@ -22,7 +22,7 @@ use crate::types::{
     BASIN_TYPE_INT4RANGE, BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY,
     BASIN_TYPE_MACADDR, BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE,
     BASIN_TYPE_TSQUERY, BASIN_TYPE_TSRANGE, BASIN_TYPE_TSTZRANGE, BASIN_TYPE_TSVECTOR,
-    BASIN_TYPE_UUID, BASIN_TYPE_XML,
+    BASIN_TYPE_UUID, BASIN_TYPE_XML, BASIN_CHARLEN_KEY,
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -570,6 +570,13 @@ pub(crate) fn schema_and_constraints_from_columns(
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSVECTOR.to_string());
         } else if is_tsquery_sql(&col.data_type) {
             md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSQUERY.to_string());
+        }
+        // VARCHAR(n) / CHAR(n) declared length. Rides alongside any other
+        // marker on the same Utf8 column — it is orthogonal to the
+        // BASIN_TYPE markers above (none of which apply to plain text
+        // columns) so it is inserted unconditionally when present.
+        if let Some(cl) = charlen_marker(&col.data_type) {
+            md.insert(BASIN_CHARLEN_KEY.to_string(), cl);
         }
         if let Some(expr_text) = generated_expr.as_ref() {
             md.insert(BASIN_GENERATED_AS.to_string(), expr_text.clone());
