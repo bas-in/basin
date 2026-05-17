@@ -2294,3 +2294,554 @@ async fn diff_cast_int8_to_int4_overflow() {
         .await
         .unwrap();
 }
+
+// =============================================================================
+// MULTI-SCHEMA — CREATE SCHEMA, DROP SCHEMA, cross-schema correctness
+// (Tests 60–71)
+//
+// Tests 60–63 should pass on any reasonably functional schema-DDL
+// implementation. Tests 64–71 exercise cross-schema isolation; those are
+// KNOWN DIVERGENCES today (gated on #117-125 schema-isolation cascade).
+// Failures are intentional: they prove the harness catches the bugs.
+// Each test flips to passing automatically when the relevant task lands.
+//
+// NOTE: diff_schema_isolation_multi_schema (Test 26) already covers the
+// basic same-name-in-two-schemas collision. The tests below extend coverage
+// to the full CREATE/DROP lifecycle and cross-schema DML semantics.
+// =============================================================================
+
+/// Test 60: CREATE SCHEMA — basic creation and information_schema visibility.
+///
+/// PG: returns 1 row from information_schema.schemata for the new schema.
+/// Basin: may return 0 if information_schema introspection is not wired to the
+/// catalog (gated on #119 introspection layer).
+///
+/// KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+/// PG exposes created schemas via information_schema.schemata; Basin's flat
+/// catalog may not. Failure proves the harness catches the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_create_schema_basic() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let schema = format!("{pfx}_cs");
+
+    // Both sides should accept CREATE SCHEMA without error.
+    runner
+        .run_assert_both_ok(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    // KNOWN DIVERGENCE — gated on #119 (information_schema introspection layer).
+    // PG returns 1 row; basin may return 0 if schemas aren't queryable via
+    // information_schema. Failure is the proof the harness catches the bug.
+    runner
+        .run_assert_match(&format!(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name = '{schema}'"
+        ))
+        .await
+        .unwrap();
+
+    // Best-effort cleanup.
+    let _ = runner
+        .basin
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+    let _ = runner
+        .pg
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+}
+
+/// Test 61: CREATE SCHEMA IF NOT EXISTS — idempotent double-create.
+///
+/// Issuing `CREATE SCHEMA IF NOT EXISTS` twice must not error on either side.
+/// Should pass on both PG and Basin if schema-DDL parses IF NOT EXISTS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_create_schema_if_not_exists_idempotent() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let schema = format!("{pfx}_csi");
+
+    // First creation — must succeed.
+    runner
+        .run_assert_both_ok(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+        .await
+        .unwrap();
+
+    // Second creation with IF NOT EXISTS — must also succeed (no error).
+    runner
+        .run_assert_both_ok(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+        .await
+        .unwrap();
+
+    // Best-effort cleanup.
+    let _ = runner
+        .basin
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+    let _ = runner
+        .pg
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+}
+
+/// Test 62: CREATE SCHEMA AUTHORIZATION — owner clause accepted without error.
+///
+/// PG records the owner; Basin ignores ownership (see schema_ddl.rs docs) but
+/// must not error. Tests that the syntax is parsed and executed on both sides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_create_schema_authorization() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let schema = format!("{pfx}_csa");
+
+    // Both sides should accept the AUTHORIZATION clause without error.
+    runner
+        .run_assert_both_ok(&format!(
+            "CREATE SCHEMA {schema} AUTHORIZATION current_user"
+        ))
+        .await
+        .unwrap();
+
+    // Best-effort cleanup.
+    let _ = runner
+        .basin
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+    let _ = runner
+        .pg
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+}
+
+/// Test 63: DROP SCHEMA empty — drop then re-create succeeds.
+///
+/// An empty schema can be dropped and subsequently re-created. Both operations
+/// should succeed on both sides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_drop_schema_empty() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let schema = format!("{pfx}_dse");
+
+    // Create.
+    runner
+        .run_assert_both_ok(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    // Drop empty schema — must succeed on both sides.
+    runner
+        .run_assert_both_ok(&format!("DROP SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    // Re-create to confirm the drop actually took effect.
+    runner
+        .run_assert_both_ok(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    // Final cleanup.
+    let _ = runner
+        .basin
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+    let _ = runner
+        .pg
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+}
+
+/// Test 64: DROP SCHEMA RESTRICT with dependent table — must error on both sides.
+///
+/// KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+/// PG: "cannot drop schema s because other objects depend on it" (SQLSTATE 2BP01).
+/// Basin: currently silently succeeds or returns a different error code because
+/// dependency tracking is not wired. Failure proves the harness catches the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_drop_schema_with_tables_restrict_errors() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let schema = format!("{pfx}_dsr");
+
+    // Setup: create schema and a table inside it.
+    runner
+        .run_assert_both_ok(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    runner
+        .run_assert_both_ok(&format!("CREATE TABLE {schema}.t (id INT)"))
+        .await
+        .unwrap();
+
+    // KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+    // PG errors with 2BP01 (dependent_objects_still_exist); basin may succeed
+    // or produce a different code. Failure is intentional proof the harness
+    // catches the missing dependency check.
+    runner
+        .run_assert_both_error(&format!("DROP SCHEMA {schema}"), Some("2BP01"))
+        .await
+        .unwrap();
+
+    // Best-effort cleanup — use CASCADE so we can clean up regardless.
+    let _ = runner
+        .basin
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+    let _ = runner
+        .pg
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+}
+
+/// Test 65: DROP SCHEMA CASCADE — drops schema and all contained tables.
+///
+/// KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+/// PG: DROP SCHEMA CASCADE silently removes the schema and every table in it;
+/// subsequent SELECT from that table errors with "relation does not exist".
+/// Basin: may not fully enforce CASCADE removal of contained objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_drop_schema_cascade() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let schema = format!("{pfx}_dsc");
+
+    // Setup: schema + table + data.
+    runner
+        .run_assert_both_ok(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    runner
+        .run_assert_both_ok(&format!("CREATE TABLE {schema}.t (id INT)"))
+        .await
+        .unwrap();
+    runner
+        .run_assert_both_ok(&format!("INSERT INTO {schema}.t VALUES (1), (2)"))
+        .await
+        .unwrap();
+
+    // DROP SCHEMA CASCADE — must succeed on both sides.
+    runner
+        .run_assert_both_ok(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+
+    // KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+    // After DROP SCHEMA CASCADE the table must no longer be reachable.
+    // PG: errors "relation does not exist". Basin may still serve the table
+    // from its flat catalog. Failure proves the harness catches the bug.
+    runner
+        .run_assert_both_error(
+            &format!("SELECT * FROM {schema}.t"),
+            None, // SQLSTATE varies (42P01 on PG); accept any matching code.
+        )
+        .await
+        .unwrap();
+}
+
+/// Test 66: Qualified INSERT — values go into the correct schema's table.
+///
+/// KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+/// Basin's flat catalog stores a.t and b.t under the same unqualified key "t",
+/// so inserts may go to the wrong table. PG returns 20 from b.t; basin may
+/// return 10 (or error). Failure proves the harness catches the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cross_schema_qualified_insert() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let sa = format!("{pfx}_qi_a");
+    let sb = format!("{pfx}_qi_b");
+
+    // KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+    // Setup: two schemas, same table name in each.
+    runner
+        .run_setup(&[
+            &format!("CREATE SCHEMA {sa}"),
+            &format!("CREATE SCHEMA {sb}"),
+            &format!("CREATE TABLE {sa}.t (id INT)"),
+            &format!("CREATE TABLE {sb}.t (id INT)"),
+            &format!("INSERT INTO {sa}.t VALUES (10)"),
+            &format!("INSERT INTO {sb}.t VALUES (20)"),
+        ])
+        .await
+        .unwrap();
+
+    // Select from b.t — must return 20, not 10.
+    runner
+        .run_assert_match(&format!("SELECT id FROM {sb}.t ORDER BY id"))
+        .await
+        .unwrap();
+
+    // Best-effort cleanup.
+    for side in [&runner.basin, &runner.pg] {
+        let _ = side
+            .simple_query(&format!("DROP TABLE IF EXISTS {sa}.t"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP TABLE IF EXISTS {sb}.t"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {sa}"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {sb}"))
+            .await;
+    }
+}
+
+/// Test 67: Cross-schema UPDATE isolation — UPDATE on a.t must not affect b.t.
+///
+/// KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+/// Basin's flat catalog may conflate a.t and b.t; an UPDATE on a.t may
+/// overwrite b.t's data. PG keeps b.t.id = 20 after `UPDATE a.t SET id = 99`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cross_schema_update_only_target_schema() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let sa = format!("{pfx}_upd_a");
+    let sb = format!("{pfx}_upd_b");
+
+    // KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+    runner
+        .run_setup(&[
+            &format!("CREATE SCHEMA {sa}"),
+            &format!("CREATE SCHEMA {sb}"),
+            &format!("CREATE TABLE {sa}.t (id INT)"),
+            &format!("CREATE TABLE {sb}.t (id INT)"),
+            &format!("INSERT INTO {sa}.t VALUES (10)"),
+            &format!("INSERT INTO {sb}.t VALUES (20)"),
+        ])
+        .await
+        .unwrap();
+
+    // Update only the a.t table.
+    runner
+        .run_assert_both_ok(&format!("UPDATE {sa}.t SET id = 99"))
+        .await
+        .unwrap();
+
+    // b.t must still contain 20.
+    runner
+        .run_assert_match(&format!("SELECT id FROM {sb}.t ORDER BY id"))
+        .await
+        .unwrap();
+
+    // Best-effort cleanup.
+    for side in [&runner.basin, &runner.pg] {
+        let _ = side
+            .simple_query(&format!("DROP TABLE IF EXISTS {sa}.t"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP TABLE IF EXISTS {sb}.t"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {sa}"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {sb}"))
+            .await;
+    }
+}
+
+/// Test 68: Cross-schema JOIN — JOIN tables from two different schemas.
+///
+/// KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+/// Basin may not resolve fully-qualified schema.table references correctly
+/// in JOIN positions, or may conflate the two tables. PG returns the joined row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_cross_schema_join() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let sa = format!("{pfx}_jn_a");
+    let sb = format!("{pfx}_jn_b");
+
+    // KNOWN DIVERGENCE — gated on #117-125 schema-isolation cascade.
+    runner
+        .run_setup(&[
+            &format!("CREATE SCHEMA {sa}"),
+            &format!("CREATE SCHEMA {sb}"),
+            &format!("CREATE TABLE {sa}.parent (id INT PRIMARY KEY)"),
+            &format!("CREATE TABLE {sb}.child (parent_id INT)"),
+            &format!("INSERT INTO {sa}.parent VALUES (1), (2)"),
+            &format!("INSERT INTO {sb}.child VALUES (1), (2), (1)"),
+        ])
+        .await
+        .unwrap();
+
+    // Cross-schema JOIN — result should be the joined rows, ordered.
+    runner
+        .run_assert_match(&format!(
+            "SELECT p.id, c.parent_id \
+             FROM {sa}.parent p JOIN {sb}.child c ON p.id = c.parent_id \
+             ORDER BY p.id, c.parent_id"
+        ))
+        .await
+        .unwrap();
+
+    // Best-effort cleanup.
+    for side in [&runner.basin, &runner.pg] {
+        let _ = side
+            .simple_query(&format!("DROP TABLE IF EXISTS {sb}.child"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP TABLE IF EXISTS {sa}.parent"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {sa}"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {sb}"))
+            .await;
+    }
+}
+
+/// Test 69: search_path resolution — unqualified name resolves via search_path.
+///
+/// KNOWN DIVERGENCE — gated on #122 (search_path resolution in query planner).
+/// PG: after `SET search_path = myschema, public`, an unqualified `t` resolves
+/// to `myschema.t`. Basin stores search_path (schema_ddl.rs) but does not
+/// consult it during name resolution, so `SELECT * FROM t` likely fails or
+/// falls back to public. Failure proves the harness catches the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_search_path_resolution() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let schema = format!("{pfx}_sp");
+
+    // KNOWN DIVERGENCE — gated on #122 (search_path name resolution).
+    runner
+        .run_setup(&[
+            &format!("CREATE SCHEMA {schema}"),
+            &format!("CREATE TABLE {schema}.t (id INT)"),
+            &format!("INSERT INTO {schema}.t VALUES (1)"),
+        ])
+        .await
+        .unwrap();
+
+    // After setting search_path, bare `t` should resolve to schema.t.
+    runner
+        .run_assert_both_ok(&format!("SET search_path = {schema}, public"))
+        .await
+        .unwrap();
+
+    runner
+        .run_assert_match("SELECT id FROM t ORDER BY id")
+        .await
+        .unwrap();
+
+    // Best-effort cleanup — reset search_path before dropping.
+    for side in [&runner.basin, &runner.pg] {
+        let _ = side.simple_query("SET search_path = public").await;
+        let _ = side
+            .simple_query(&format!("DROP TABLE IF EXISTS {schema}.t"))
+            .await;
+        let _ = side
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema}"))
+            .await;
+    }
+}
+
+/// Test 70: search_path fallback — non-existent first schema falls back to public.
+///
+/// KNOWN DIVERGENCE — gated on #122 (search_path resolution in query planner).
+/// PG: `SET search_path = nonexistent, public` resolves unqualified names to
+/// `public` since `nonexistent` doesn't exist. Basin may fail to set the path
+/// or may not fall back correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_search_path_fallback_to_public() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+
+    // KNOWN DIVERGENCE — gated on #122 (search_path resolution in query planner).
+    // SET with a non-existent schema is accepted by PG (no error at SET time);
+    // resolution simply skips it. Basin must not error on the SET itself.
+    runner
+        .run_assert_both_ok("SET search_path = nonexistent_schema_xyzzy, public")
+        .await
+        .unwrap();
+
+    // current_schema() should resolve to 'public' since nonexistent_schema_xyzzy
+    // doesn't exist. PG returns 'public'; basin may return something different.
+    runner
+        .run_assert_match(
+            "SELECT current_schema()",
+        )
+        .await
+        .unwrap();
+
+    // Restore default search_path.
+    for side in [&runner.basin, &runner.pg] {
+        let _ = side.simple_query("SET search_path = public").await;
+    }
+}
+
+/// Test 71: CREATE TABLE without schema qualifier goes into public.
+///
+/// Without an explicit schema, `CREATE TABLE t(id INT)` lands in the `public`
+/// schema. The table must be reachable as both `t` and `public.t`.
+/// Should pass — basin already targets public by default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_create_table_default_schema() {
+    let server = start_basin_server().await;
+    let Some(runner) = make_runner(&server).await else {
+        return;
+    };
+    let pfx = table_prefix();
+    let t = format!("{pfx}_pub");
+
+    runner
+        .run_setup(&[
+            &format!("CREATE TABLE {t} (id INT)"),
+            &format!("INSERT INTO {t} VALUES (42)"),
+        ])
+        .await
+        .unwrap();
+
+    // Unqualified name — both sides must return 42.
+    runner
+        .run_assert_match(&format!("SELECT id FROM {t} ORDER BY id"))
+        .await
+        .unwrap();
+
+    // Fully qualified with public schema — must also work.
+    runner
+        .run_assert_match(&format!("SELECT id FROM public.{t} ORDER BY id"))
+        .await
+        .unwrap();
+
+    drop_table(&runner, &t).await;
+}
