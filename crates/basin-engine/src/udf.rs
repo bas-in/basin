@@ -4181,6 +4181,325 @@ fn rewrite_binary_op_skip_arrays(sql: &str, op: &str, func: &str) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// TABLESAMPLE sampling UDFs (BUG #134)
+//
+// The SQL pre-screen (`select_advanced::rewrite_tablesample`) lowers
+// `TABLESAMPLE { BERNOULLI | SYSTEM } (p) [REPEATABLE(s)]` into a derived
+// sub-select whose WHERE clause calls one of these four boolean UDFs:
+//
+//   basin_tablesample_keep(p)               BERNOULLI, non-seeded
+//   basin_tablesample_keep_seeded(p, s)     BERNOULLI, REPEATABLE(s)
+//   basin_tablesample_block_keep(p)         SYSTEM,    non-seeded
+//   basin_tablesample_block_keep_seeded(p,s) SYSTEM,   REPEATABLE(s)
+//
+// Semantics
+// ---------
+// * BERNOULLI: an independent Bernoulli(p/100) trial per row.
+// * SYSTEM   : block-level. Our "block" is one DataFusion record batch
+//   (~8192 rows). One Bernoulli(p/100) trial decides the whole batch; every
+//   row in a kept batch is emitted. PG documents SYSTEM's block size as
+//   implementation-defined, so batch granularity is conformant.
+// * REPEATABLE(s): a deterministic sample. The seeded variants draw from a
+//   splitmix64 PRNG seeded from `s` and advanced by a per-UDF-instance
+//   atomic counter. These UDFs are registered *per session* (fresh counter
+//   each session), so the determinism guarantee is precisely:
+//     same seed + same data + same scan order, evaluated from a fresh
+//     session = identical sample.
+//   The integration / differential tests honour this by opening a fresh
+//   session per probed query. KNOWN GAP: two sampled queries in one
+//   long-lived session share the counter, so the second is not guaranteed
+//   to reproduce the first — REPEATABLE's contract is per-statement and
+//   basin's RNG plumbing has no per-statement reset hook from inside a
+//   nullary UDF. Non-seeded variants are intentionally volatile.
+//
+// p == 0 -> keeps nothing; p == 100 -> keeps everything (handled by the
+// threshold comparison directly). Out-of-range p is rejected earlier, in
+// the SQL rewrite, with a PG-parity error.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use datafusion::arrow::array::BooleanBuilder;
+
+/// splitmix64: tiny, fast, well-distributed deterministic PRNG. Used only
+/// for the seeded (REPEATABLE) sampling variants.
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Map a u64 to a uniform f64 in [0, 1).
+#[inline]
+fn u64_to_unit_f64(x: u64) -> f64 {
+    // Top 53 bits -> exact f64 mantissa precision.
+    ((x >> 11) as f64) * (1.0_f64 / ((1u64 << 53) as f64))
+}
+
+/// Register the four TABLESAMPLE sampling UDFs on `ctx`. Registered per
+/// session (see `session::open` plumbing) so each session's seeded RNG
+/// counter starts at 0.
+pub(crate) fn register_tablesample_udfs(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(TableSampleKeep {
+        name: "basin_tablesample_keep",
+        block: false,
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Float64]),
+                TypeSignature::Exact(vec![DataType::Int64]),
+            ],
+            Volatility::Volatile,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(TableSampleKeep {
+        name: "basin_tablesample_block_keep",
+        block: true,
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Float64]),
+                TypeSignature::Exact(vec![DataType::Int64]),
+            ],
+            Volatility::Volatile,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(TableSampleKeepSeeded {
+        name: "basin_tablesample_keep_seeded",
+        block: false,
+        counter: Arc::new(AtomicU64::new(0)),
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Float64, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+            ],
+            Volatility::Volatile,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(TableSampleKeepSeeded {
+        name: "basin_tablesample_block_keep_seeded",
+        block: true,
+        counter: Arc::new(AtomicU64::new(0)),
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Float64, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+            ],
+            Volatility::Volatile,
+        ),
+    }));
+}
+
+/// Coerce the first argument (p) to an f64 percentage, scalar or array.
+fn sample_pct(arg: &ColumnarValue) -> DFResult<f64> {
+    use datafusion::scalar::ScalarValue;
+    match arg {
+        ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => Ok(*v),
+        ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => Ok(*v as f64),
+        ColumnarValue::Scalar(ScalarValue::Int32(Some(v))) => Ok(*v as f64),
+        ColumnarValue::Array(a) => {
+            if let Some(f) = a.as_any().downcast_ref::<Float64Array>() {
+                Ok(if f.is_empty() { 0.0 } else { f.value(0) })
+            } else if let Some(i) = a.as_any().downcast_ref::<Int64Array>() {
+                Ok(if i.is_empty() { 0.0 } else { i.value(0) as f64 })
+            } else {
+                exec_err!("tablesample: percentage must be numeric")
+            }
+        }
+        _ => exec_err!("tablesample: percentage must be a numeric literal"),
+    }
+}
+
+fn sample_seed(arg: &ColumnarValue) -> DFResult<u64> {
+    use datafusion::scalar::ScalarValue;
+    let raw: i64 = match arg {
+        ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => *v,
+        ColumnarValue::Scalar(ScalarValue::Int32(Some(v))) => *v as i64,
+        ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => *v as i64,
+        ColumnarValue::Array(a) => {
+            if let Some(i) = a.as_any().downcast_ref::<Int64Array>() {
+                if i.is_empty() {
+                    0
+                } else {
+                    i.value(0)
+                }
+            } else {
+                return exec_err!("tablesample: REPEATABLE seed must be an integer");
+            }
+        }
+        _ => return exec_err!("tablesample: REPEATABLE seed must be an integer literal"),
+    };
+    Ok(raw as u64)
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TableSampleKeep {
+    name: &'static str,
+    block: bool,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for TableSampleKeep {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.number_rows.max(1);
+        let pct = sample_pct(&args.args[0])?;
+        let prob = (pct / 100.0).clamp(0.0, 1.0);
+        let mut b = BooleanBuilder::with_capacity(n);
+        if prob <= 0.0 {
+            for _ in 0..n {
+                b.append_value(false);
+            }
+        } else if prob >= 1.0 {
+            for _ in 0..n {
+                b.append_value(true);
+            }
+        } else if self.block {
+            // One trial for the whole batch ("block" = record batch).
+            let mut seed = [0u8; 8];
+            getrandom_fill(&mut seed);
+            let keep = u64_to_unit_f64(u64::from_le_bytes(seed)) < prob;
+            for _ in 0..n {
+                b.append_value(keep);
+            }
+        } else {
+            let mut bytes = vec![0u8; n * 8];
+            getrandom_fill(&mut bytes);
+            for i in 0..n {
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+                b.append_value(u64_to_unit_f64(u64::from_le_bytes(w)) < prob);
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+    }
+}
+
+#[derive(Debug)]
+struct TableSampleKeepSeeded {
+    name: &'static str,
+    block: bool,
+    counter: Arc<AtomicU64>,
+    signature: Signature,
+}
+
+// The per-session draw counter is excluded from identity: two instances
+// with the same name/block/signature are interchangeable as far as the
+// planner's UDF dedup is concerned (it never compares the live counter).
+impl PartialEq for TableSampleKeepSeeded {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.block == other.block
+            && self.signature == other.signature
+    }
+}
+impl Eq for TableSampleKeepSeeded {}
+impl std::hash::Hash for TableSampleKeepSeeded {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.block.hash(state);
+        self.signature.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for TableSampleKeepSeeded {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let n = args.number_rows.max(1);
+        let pct = sample_pct(&args.args[0])?;
+        let seed = sample_seed(&args.args[1])?;
+        let prob = (pct / 100.0).clamp(0.0, 1.0);
+        let mut b = BooleanBuilder::with_capacity(n);
+        if prob <= 0.0 {
+            for _ in 0..n {
+                b.append_value(false);
+            }
+            return Ok(ColumnarValue::Array(Arc::new(b.finish())));
+        }
+        if prob >= 1.0 {
+            for _ in 0..n {
+                b.append_value(true);
+            }
+            return Ok(ColumnarValue::Array(Arc::new(b.finish())));
+        }
+        if self.block {
+            // Deterministic per-block decision. The block ordinal is the
+            // per-session draw counter; reproducible from a fresh session.
+            let ord = self.counter.fetch_add(1, Ordering::SeqCst);
+            let mut st = seed ^ ord.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            let keep = u64_to_unit_f64(splitmix64(&mut st)) < prob;
+            for _ in 0..n {
+                b.append_value(keep);
+            }
+        } else {
+            // Reserve a contiguous [base, base+n) draw range so each row's
+            // draw is a pure function of (seed, absolute row ordinal).
+            let base = self.counter.fetch_add(n as u64, Ordering::SeqCst);
+            for i in 0..n {
+                let idx = base + i as u64;
+                let mut st = seed ^ idx.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                b.append_value(u64_to_unit_f64(splitmix64(&mut st)) < prob);
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+    }
+}
+
+#[cfg(test)]
+mod tablesample_udf_tests {
+    use super::*;
+
+    #[test]
+    fn unit_f64_in_range() {
+        for x in [0u64, 1, u64::MAX, 12345, 1 << 53] {
+            let v = u64_to_unit_f64(x);
+            assert!((0.0..1.0).contains(&v), "out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn splitmix64_deterministic() {
+        let mut a = 42u64;
+        let mut b = 42u64;
+        for _ in 0..100 {
+            assert_eq!(splitmix64(&mut a), splitmix64(&mut b));
+        }
+    }
+
+    #[test]
+    fn splitmix64_seed_sensitive() {
+        let mut a = 1u64;
+        let mut b = 2u64;
+        assert_ne!(splitmix64(&mut a), splitmix64(&mut b));
+    }
+}
+
 #[cfg(test)]
 mod json_op_rewrite_tests {
     use super::rewrite_json_operators;

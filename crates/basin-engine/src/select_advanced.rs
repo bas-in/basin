@@ -11,7 +11,7 @@
 //! | Construct | Issue | Fix |
 //! |-----------|-------|-----|
 //! | `TABLE foo` | sqlparser top-level dispatch doesn't recognise `TABLE` as a statement start | Rewrite to `SELECT * FROM foo` |
-//! | `TABLESAMPLE BERNOULLI(N)` / `SYSTEM(N)` | sqlparser 0.52 has the keyword but no grammar rule | Strip the clause; DataFusion scans all rows (best-effort sampling) |
+//! | `TABLESAMPLE BERNOULLI(N)` / `SYSTEM(N)` [`REPEATABLE(seed)`] | sqlparser 0.52 has the keyword but no grammar rule | Rewrite the clause into a sampling predicate (`basin_tablesample_*` UDFs) injected as a `WHERE` filter so the sample is actually taken |
 //! | `FETCH FIRST N ROWS ONLY` / `FETCH NEXT N ROWS ONLY` | sqlparser parses into `Query.fetch`, DataFusion only reads `Query.limit` | Rewrite to `LIMIT N` |
 //! | `OFFSET N ROWS FETCH NEXT M ROWS ONLY` | Combined SQL-standard form | Rewrite to `LIMIT M OFFSET N` |
 //! | `FOR NO KEY UPDATE [OF tbl] [SKIP LOCKED\|NOWAIT]` | sqlparser 0.52 only recognises `FOR UPDATE` / `FOR SHARE` | Rewrite to `FOR UPDATE` |
@@ -61,92 +61,378 @@ pub(crate) fn rewrite_table_shorthand(sql: &str) -> Cow<'_, str> {
     Cow::Owned(format!("SELECT * FROM {name}"))
 }
 
-/// Strip `TABLESAMPLE BERNOULLI(<pct>)` or `TABLESAMPLE SYSTEM(<pct>)` from
-/// a SELECT statement.  The clause is removed entirely; DataFusion will scan
-/// all matching rows (best-effort: correct result, un-sampled).
+/// Error returned when a `TABLESAMPLE` percentage is outside `[0, 100]`.
+/// PostgreSQL raises SQLSTATE `2202H` (`invalid_tablesample_argument`),
+/// "sample percentage must be between 0 and 100". The caller maps this
+/// to a `BasinError` so the failure surfaces instead of silently
+/// returning all rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableSampleError(pub String);
+
+/// Rewrite `<table-ref> TABLESAMPLE { BERNOULLI | SYSTEM } (<pct>)
+/// [ REPEATABLE (<seed>) ]` into a derived-table sub-select whose `WHERE`
+/// clause carries a sampling predicate, so the sample is *actually taken*
+/// (the historical behaviour silently stripped the clause and returned
+/// every row — BUG #134).
 ///
-/// The rewrite is conservative: it only fires when the clause appears between
-/// a closing `>` identifier and `WHERE`/`ORDER`/`LIMIT`/`FETCH`/end-of-input.
-/// Complex cases (subqueries, CTEs) are left unchanged.
-pub(crate) fn strip_tablesample(sql: &str) -> Cow<'_, str> {
-    // Fast path: no TABLESAMPLE keyword.
+/// The lowered form is:
+///
+/// ```text
+/// FROM tbl TABLESAMPLE BERNOULLI(10)
+///   -> FROM (SELECT * FROM tbl WHERE basin_tablesample_keep(10)) tbl
+///
+/// FROM tbl TABLESAMPLE SYSTEM(10) REPEATABLE(42)
+///   -> FROM (SELECT * FROM tbl
+///            WHERE basin_tablesample_block_keep_seeded(10, 42)) tbl
+/// ```
+///
+/// Wrapping the sampled table in its own sub-select localises the sample to
+/// that single relation (matching PG's per-table semantics) and composes
+/// with joins / WHERE / GROUP BY in the outer query without any positional
+/// surgery on the rest of the statement. DataFusion pushes the predicate
+/// down onto the scan.
+///
+/// Implementation of the predicates (registered as UDFs, see
+/// `crate::udf::register_tablesample_udfs`):
+///
+/// * `BERNOULLI(p)` -> `basin_tablesample_keep(p)`: an independent Bernoulli
+///   trial per row at probability `p/100` (a volatile row-level filter).
+/// * `SYSTEM(p)` -> `basin_tablesample_block_keep(p)`: one trial per
+///   record-batch (DataFusion's ~8192-row batch is our "block"); every row
+///   in a kept batch is emitted. This is the implementation-defined block
+///   granularity PG's docs explicitly allow.
+/// * `REPEATABLE(s)` adds a `, <s>` seed argument and selects the
+///   `_seeded` UDF variant, giving a deterministic sample for the same
+///   seed + same data + same scan order.
+///
+/// Returns `Ok(Cow::Borrowed)` (unchanged) when there is no `TABLESAMPLE`
+/// clause or the shape isn't one we recognise, and `Err(TableSampleError)`
+/// when the percentage is outside `[0, 100]` (PG parity).
+pub(crate) fn rewrite_tablesample(sql: &str) -> Result<Cow<'_, str>, TableSampleError> {
     let upper = sql.to_ascii_uppercase();
     if !upper.contains("TABLESAMPLE") {
-        return Cow::Borrowed(sql);
+        return Ok(Cow::Borrowed(sql));
     }
 
-    // Find `TABLESAMPLE` in the uppercased string, then splice it out from
-    // the original. We match both method names case-insensitively.
-    let mut result = String::new();
-    let mut remaining = sql;
-    let mut remaining_upper = upper.as_str();
+    let mut result = String::with_capacity(sql.len() + 64);
+    let mut idx = 0usize; // byte cursor into the ORIGINAL sql
+    let mut rewrote = false;
 
-    while let Some(pos) = remaining_upper.find("TABLESAMPLE") {
-        // Emit everything before TABLESAMPLE.
-        result.push_str(&remaining[..pos]);
-        // Advance past the keyword.
-        let after_kw = &remaining[pos + "TABLESAMPLE".len()..];
-        let after_kw_upper = &remaining_upper[pos + "TABLESAMPLE".len()..];
-        // Skip optional whitespace, then `BERNOULLI` or `SYSTEM`.
-        let after_ws = after_kw.trim_start();
-        let after_ws_upper = after_kw_upper.trim_start();
-        let delta = after_kw.len() - after_ws.len();
-        let method_end = if let Some(r) = after_ws_upper.strip_prefix("BERNOULLI") {
-            r.len()
-        } else if let Some(r) = after_ws_upper.strip_prefix("SYSTEM") {
-            r.len()
-        } else {
-            // Unknown method; don't touch.
-            result.push_str("TABLESAMPLE");
-            remaining = &remaining[pos + "TABLESAMPLE".len()..];
-            remaining_upper = &remaining_upper[pos + "TABLESAMPLE".len()..];
-            continue;
+    while let Some(rel_ts) = upper[idx..].find("TABLESAMPLE") {
+        let ts_pos = idx + rel_ts;
+        // Identify the table-ref token that precedes TABLESAMPLE so we can
+        // wrap it. We only support the common forms:
+        //   FROM tbl TABLESAMPLE ...
+        //   FROM tbl alias TABLESAMPLE ...
+        //   FROM tbl AS alias TABLESAMPLE ...
+        //   JOIN tbl [AS] alias TABLESAMPLE ...
+        // Anything else (subquery before TABLESAMPLE, etc.) is left alone.
+        let (table_start, table_ref, alias) =
+            match split_preceding_table_ref(sql, &upper, ts_pos) {
+                Some(v) => v,
+                None => {
+                    // Can't safely wrap; emit text up to and including the
+                    // keyword unchanged and keep scanning.
+                    result.push_str(&sql[idx..ts_pos + "TABLESAMPLE".len()]);
+                    idx = ts_pos + "TABLESAMPLE".len();
+                    continue;
+                }
+            };
+
+        // Parse `{ BERNOULLI | SYSTEM } ( <pct> ) [ REPEATABLE ( <seed> ) ]`.
+        let after_kw = ts_pos + "TABLESAMPLE".len();
+        let parsed = match parse_tablesample_args(sql, &upper, after_kw) {
+            Some(p) => p,
+            None => {
+                result.push_str(&sql[idx..after_kw]);
+                idx = after_kw;
+                continue;
+            }
         };
-        // The original string after the method word.
-        let after_method_orig = &after_ws[after_ws.len() - method_end..];
-        let after_method = after_method_orig.trim_start();
-        let _after_method_upper = &after_ws_upper[after_ws_upper.len() - method_end..].trim_start().to_ascii_uppercase();
-        // Expect `(...)`.
-        if !after_method.starts_with('(') {
-            // No paren; leave unchanged.
-            result.push_str("TABLESAMPLE");
-            remaining = &remaining[pos + "TABLESAMPLE".len()..];
-            remaining_upper = &remaining_upper[pos + "TABLESAMPLE".len()..];
-            continue;
+
+        // PG parity: percentage must be in [0, 100].
+        if !(0.0..=100.0).contains(&parsed.pct) {
+            return Err(TableSampleError(
+                "sample percentage must be between 0 and 100".to_string(),
+            ));
         }
-        // Find matching closing paren (no nested parens in TABLESAMPLE args).
-        if let Some(close) = after_method.find(')') {
-            // Skip past `)`.
-            let skip_to = after_method[close + 1..].trim_start();
-            // Emit a space so we don't run adjacent tokens together.
-            result.push(' ');
-            let _consumed = sql.len() - remaining.len()   // already emitted
-                + pos                                      // up to TABLESAMPLE
-                + "TABLESAMPLE".len()                      // keyword
-                + delta                                    // ws before method
-                + (after_ws.len() - method_end)           // method name
-                + (after_method_orig.len() - after_method.len()) // ws before (
-                + close + 1;                               // through ')'
-            let skip_ws = sql.len() - remaining.len() + pos + "TABLESAMPLE".len() + delta
-                + (after_ws.len() - method_end)
-                + (after_method_orig.len() - after_method.len())
-                + close + 1
-                + (after_method[close + 1..].len() - skip_to.len());
-            remaining = &sql[skip_ws..];
-            remaining_upper = &upper[skip_ws..];
-        } else {
-            // Malformed; leave unchanged.
-            result.push_str("TABLESAMPLE");
-            remaining = &remaining[pos + "TABLESAMPLE".len()..];
-            remaining_upper = &remaining_upper[pos + "TABLESAMPLE".len()..];
-        }
+
+        // Build the sampling predicate.
+        let func = match (parsed.system, parsed.seed.is_some()) {
+            (false, false) => "basin_tablesample_keep",
+            (false, true) => "basin_tablesample_keep_seeded",
+            (true, false) => "basin_tablesample_block_keep",
+            (true, true) => "basin_tablesample_block_keep_seeded",
+        };
+        let pred = match &parsed.seed {
+            Some(s) => format!("{func}({}, {s})", fmt_pct(parsed.pct)),
+            None => format!("{func}({})", fmt_pct(parsed.pct)),
+        };
+
+        // Emit everything before the table-ref token verbatim.
+        result.push_str(&sql[idx..table_start]);
+        // Replace `tbl [AS] [alias]` with the derived sub-select. The alias
+        // (explicit or the bare table name) keeps outer column references
+        // (`tbl.col`, `alias.col`) resolving exactly as before.
+        let bind = match &alias {
+            Some(a) => a.clone(),
+            None => default_alias(table_ref),
+        };
+        result.push_str(&format!(
+            "(SELECT * FROM {table_ref} WHERE {pred}) {bind}"
+        ));
+
+        idx = parsed.end; // resume right after the (REPEATABLE) clause
+        rewrote = true;
     }
-    result.push_str(remaining);
-    if result == sql {
-        Cow::Borrowed(sql)
+    result.push_str(&sql[idx..]);
+
+    if rewrote {
+        Ok(Cow::Owned(result))
     } else {
-        Cow::Owned(result)
+        Ok(Cow::Borrowed(sql))
     }
+}
+
+/// Format a percentage without a trailing `.0` for integers (keeps the
+/// rewritten SQL tidy and the integer-literal path in the parser).
+fn fmt_pct(p: f64) -> String {
+    if p.fract() == 0.0 {
+        format!("{}", p as i64)
+    } else {
+        format!("{p}")
+    }
+}
+
+/// Derive an alias from a (possibly schema-qualified, possibly quoted)
+/// table reference: `public."Ev"` -> `"Ev"`, `s.t` -> `t`, `t` -> `t`.
+fn default_alias(table_ref: &str) -> String {
+    let last = table_ref.rsplit('.').next().unwrap_or(table_ref);
+    last.trim().to_string()
+}
+
+struct ParsedSample {
+    pct: f64,
+    system: bool,
+    seed: Option<String>,
+    /// Byte offset just past the whole `BERNOULLI(..)[ REPEATABLE(..)]`.
+    end: usize,
+}
+
+/// Parse the method + args starting at `pos` (just after the `TABLESAMPLE`
+/// keyword). Returns `None` if the shape isn't recognised.
+fn parse_tablesample_args(sql: &str, upper: &str, pos: usize) -> Option<ParsedSample> {
+    let ws = pos + count_ws(&sql[pos..]);
+    let rest_upper = &upper[ws..];
+    let (system, after_method) = if let Some(r) = rest_upper.strip_prefix("BERNOULLI") {
+        (false, ws + "BERNOULLI".len() + (r.len() - r.trim_start().len()))
+    } else if let Some(r) = rest_upper.strip_prefix("SYSTEM") {
+        (true, ws + "SYSTEM".len() + (r.len() - r.trim_start().len()))
+    } else {
+        return None;
+    };
+    if !sql[after_method..].starts_with('(') {
+        return None;
+    }
+    let open = after_method;
+    let close_rel = sql[open + 1..].find(')')?;
+    let close = open + 1 + close_rel;
+    let pct: f64 = sql[open + 1..close].trim().parse().ok()?;
+
+    // Optional REPEATABLE ( <seed> ).
+    let mut end = close + 1;
+    let tail_start = end + count_ws(&sql[end..]);
+    let tail_upper = &upper[tail_start..];
+    let seed = if let Some(r) = tail_upper.strip_prefix("REPEATABLE") {
+        let ro = tail_start + "REPEATABLE".len();
+        let ro = ro + count_ws(&sql[ro..]);
+        if !sql[ro..].starts_with('(') {
+            return None;
+        }
+        let rclose_rel = sql[ro + 1..].find(')')?;
+        let rclose = ro + 1 + rclose_rel;
+        let seed_txt = sql[ro + 1..rclose].trim().to_string();
+        if seed_txt.is_empty() {
+            return None;
+        }
+        let _ = r;
+        end = rclose + 1;
+        Some(seed_txt)
+    } else {
+        None
+    };
+
+    Some(ParsedSample {
+        pct,
+        system,
+        seed,
+        end,
+    })
+}
+
+/// Given the position of the `TABLESAMPLE` keyword, walk backwards over the
+/// optional alias / `AS alias` and the table reference, returning
+/// `(table_start_byte, table_ref, Option<alias>)`. Only the simple
+/// identifier forms are handled; returns `None` for anything else (e.g. a
+/// `)` immediately before TABLESAMPLE, i.e. a subquery / paren group).
+fn split_preceding_table_ref<'a>(
+    sql: &'a str,
+    upper: &str,
+    ts_pos: usize,
+) -> Option<(usize, &'a str, Option<String>)> {
+    // token immediately before TABLESAMPLE
+    let (t1_start, t1_end) = prev_token(sql, ts_pos)?;
+    let t1 = &sql[t1_start..t1_end];
+    if !is_ident_like(t1) {
+        return None;
+    }
+    // Is there an `AS` or a bare-alias before t1?
+    let (t2_start, t2_end) = match prev_token(sql, t1_start) {
+        Some(v) => v,
+        None => {
+            // t1 is the table, no alias, nothing before it (unusual but safe
+            // to leave alone — needs a FROM/JOIN keyword in practice).
+            return None;
+        }
+    };
+    let t2 = &sql[t2_start..t2_end];
+    let t2_up = &upper[t2_start..t2_end];
+
+    if t2_up == "AS" {
+        // `<tbl> AS <alias> TABLESAMPLE`  -> alias = t1, table = token before AS
+        let (tb_start, tb_end) = prev_token(sql, t2_start)?;
+        let tb = &sql[tb_start..tb_end];
+        if !is_ident_like(tb) || !is_from_or_join_anchor(sql, upper, tb_start) {
+            return None;
+        }
+        Some((tb_start, &sql[tb_start..tb_end], Some(t1.to_string())))
+    } else if is_ident_like(t2)
+        && !is_reserved_clause_kw(t2_up)
+        && is_from_or_join_anchor(sql, upper, t2_start)
+    {
+        // `<tbl> <alias> TABLESAMPLE`  -> alias = t1, table = t2
+        Some((t2_start, &sql[t2_start..t2_end], Some(t1.to_string())))
+    } else if is_from_or_join_kw(t2_up) {
+        // `FROM <tbl> TABLESAMPLE` / `JOIN <tbl> TABLESAMPLE` -> no alias
+        Some((t1_start, t1, None))
+    } else {
+        None
+    }
+}
+
+/// True when the token starting at `start` is anchored by a `FROM` or
+/// `JOIN` keyword somewhere immediately before it (directly, or directly
+/// before the table when an alias sits between).
+fn is_from_or_join_anchor(sql: &str, upper: &str, start: usize) -> bool {
+    match prev_token(sql, start) {
+        Some((s, e)) => is_from_or_join_kw(&upper[s..e]),
+        None => false,
+    }
+}
+
+fn is_from_or_join_kw(up: &str) -> bool {
+    matches!(up, "FROM" | "JOIN")
+}
+
+/// Clause keywords that must never be mistaken for a bare table alias.
+fn is_reserved_clause_kw(up: &str) -> bool {
+    matches!(
+        up,
+        "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            | "HAVING"
+            | "UNION"
+            | "ON"
+            | "USING"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "CROSS"
+            | "FETCH"
+            | "FOR"
+    )
+}
+
+/// Identifier-ish: a SQL identifier, schema-qualified name, or double-quoted
+/// identifier. Rejects punctuation tokens like `)` or `,`.
+fn is_ident_like(tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    let bytes = tok.as_bytes();
+    if bytes[0] == b'"' {
+        return true; // quoted identifier (possibly schema."Quoted")
+    }
+    tok.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && tok.chars().next().is_some_and(|c| {
+            c.is_ascii_alphabetic() || c == '_'
+        })
+}
+
+/// Count leading ASCII-whitespace bytes.
+fn count_ws(s: &str) -> usize {
+    s.len() - s.trim_start().len()
+}
+
+/// Return the `(start, end)` byte span of the whitespace-delimited token
+/// immediately before byte offset `before` (skipping trailing whitespace).
+/// A leading `(` or `)` or `,` is treated as its own one-char token so the
+/// caller can detect subquery / list boundaries. Quoted identifiers
+/// (`"x"`, possibly `schema."x"`) are returned whole.
+fn prev_token(sql: &str, before: usize) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut e = before;
+    while e > 0 && bytes[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    if e == 0 {
+        return None;
+    }
+    // Single-char structural tokens.
+    let last = bytes[e - 1];
+    if last == b'(' || last == b')' || last == b',' {
+        return Some((e - 1, e));
+    }
+    // If the token ends with a closing quote, walk back to its opening quote
+    // (and absorb a `schema.` prefix if present).
+    if last == b'"' {
+        let mut s = e - 1;
+        // find the matching opening quote
+        while s > 0 && bytes[s - 1] != b'"' {
+            s -= 1;
+        }
+        s = s.saturating_sub(1); // include the opening quote
+        // absorb `ident.` prefix
+        while s > 0
+            && (bytes[s - 1].is_ascii_alphanumeric()
+                || bytes[s - 1] == b'_'
+                || bytes[s - 1] == b'.'
+                || bytes[s - 1] == b'"')
+        {
+            s -= 1;
+        }
+        return Some((s, e));
+    }
+    let mut s = e;
+    while s > 0 {
+        let c = bytes[s - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+            s -= 1;
+        } else {
+            break;
+        }
+    }
+    if s == e {
+        // Non-ident punctuation we don't model; treat as one char.
+        return Some((e - 1, e));
+    }
+    Some((s, e))
 }
 
 /// Rewrite SQL-standard `FETCH FIRST N ROWS ONLY` / `FETCH NEXT N ROWS ONLY`
@@ -473,35 +759,82 @@ mod tests {
         assert_eq!(rewrite_table_shorthand(sql), sql);
     }
 
-    // --- TABLESAMPLE strip ---
+    // --- TABLESAMPLE rewrite ---
 
     #[test]
-    fn tablesample_bernoulli_stripped() {
+    fn tablesample_bernoulli_rewritten_to_predicate() {
         let sql = "SELECT * FROM t TABLESAMPLE BERNOULLI(10)";
-        let out = strip_tablesample(sql);
-        assert!(!out.contains("TABLESAMPLE"), "should strip TABLESAMPLE: {out}");
-        assert!(out.contains("SELECT * FROM t"), "should keep base query: {out}");
+        let out = rewrite_tablesample(sql).unwrap();
+        assert!(!out.contains("TABLESAMPLE"), "TABLESAMPLE removed: {out}");
+        assert!(
+            out.contains("basin_tablesample_keep(10)"),
+            "BERNOULLI -> row predicate: {out}"
+        );
+        // The sampled relation is wrapped in a derived table aliased back to
+        // its name so outer references still resolve.
+        assert!(
+            out.contains("(SELECT * FROM t WHERE basin_tablesample_keep(10)) t"),
+            "wrapped sub-select with alias: {out}"
+        );
     }
 
     #[test]
-    fn tablesample_system_stripped() {
+    fn tablesample_system_rewritten_to_block_predicate() {
         let sql = "SELECT * FROM t TABLESAMPLE SYSTEM(25)";
-        let out = strip_tablesample(sql);
-        assert!(!out.contains("TABLESAMPLE"), "should strip TABLESAMPLE: {out}");
+        let out = rewrite_tablesample(sql).unwrap();
+        assert!(!out.contains("TABLESAMPLE"), "TABLESAMPLE removed: {out}");
+        assert!(
+            out.contains("basin_tablesample_block_keep(25)"),
+            "SYSTEM -> block predicate: {out}"
+        );
     }
 
     #[test]
-    fn tablesample_with_where_clause() {
+    fn tablesample_repeatable_uses_seeded_variant() {
+        let sql = "SELECT * FROM t TABLESAMPLE BERNOULLI(10) REPEATABLE(42)";
+        let out = rewrite_tablesample(sql).unwrap();
+        assert!(
+            out.contains("basin_tablesample_keep_seeded(10, 42)"),
+            "REPEATABLE -> seeded variant: {out}"
+        );
+        assert!(!out.contains("REPEATABLE"), "REPEATABLE consumed: {out}");
+    }
+
+    #[test]
+    fn tablesample_with_where_clause_composes() {
         let sql = "SELECT * FROM t TABLESAMPLE BERNOULLI(10) WHERE id > 5";
-        let out = strip_tablesample(sql);
-        assert!(!out.contains("TABLESAMPLE"), "should strip TABLESAMPLE: {out}");
-        assert!(out.contains("WHERE id > 5"), "should keep WHERE: {out}");
+        let out = rewrite_tablesample(sql).unwrap();
+        assert!(!out.contains("TABLESAMPLE"), "TABLESAMPLE removed: {out}");
+        assert!(out.contains("WHERE id > 5"), "outer WHERE kept: {out}");
+        assert!(
+            out.contains("basin_tablesample_keep(10)"),
+            "sample predicate present: {out}"
+        );
+    }
+
+    #[test]
+    fn tablesample_alias_preserved() {
+        let sql = "SELECT s.id FROM tbl AS s TABLESAMPLE SYSTEM(50)";
+        let out = rewrite_tablesample(sql).unwrap();
+        assert!(
+            out.contains("(SELECT * FROM tbl WHERE basin_tablesample_block_keep(50)) s"),
+            "explicit alias preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn tablesample_out_of_range_is_error() {
+        assert!(rewrite_tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI(150)").is_err());
+        assert!(rewrite_tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI(-1)").is_err());
+        // 0 and 100 are the valid boundary values.
+        assert!(rewrite_tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI(0)").is_ok());
+        assert!(rewrite_tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI(100)").is_ok());
     }
 
     #[test]
     fn no_tablesample_passthrough() {
         let sql = "SELECT * FROM t WHERE id > 5";
-        assert_eq!(strip_tablesample(sql), sql);
+        assert_eq!(rewrite_tablesample(sql).unwrap(), sql);
     }
 
     // --- FETCH FIRST/NEXT rewrite ---

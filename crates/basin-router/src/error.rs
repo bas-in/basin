@@ -54,6 +54,7 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::UniqueViolation(_) => ("ERROR", "23505"), // unique_violation
         BasinError::CheckViolation(_) => ("ERROR", "23514"), // check_violation
         BasinError::ForeignKeyViolation(_) => ("ERROR", "23503"), // foreign_key_violation
+        BasinError::RlsViolation(_) => ("ERROR", "42501"), // insufficient_privilege (RLS)
         BasinError::StringTooLong(_) => ("ERROR", "22001"), // string_data_right_truncation
         BasinError::IsolationViolation(_) => ("FATAL", "XX000"),
         // Coarse-grained internal categories all collapse to XX000.

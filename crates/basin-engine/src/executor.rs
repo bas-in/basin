@@ -463,11 +463,15 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let table_shorthand_rewrite = crate::select_advanced::rewrite_table_shorthand(sql);
     let sql = table_shorthand_rewrite.as_ref();
     //
-    // 2. Strip `TABLESAMPLE BERNOULLI(N)` / `SYSTEM(N)`.
-    //    sqlparser 0.52 has the keyword but no grammar production for it, so
-    //    the parse fails.  We strip the clause (best-effort: DataFusion returns
-    //    all rows un-sampled) so the query reaches DataFusion at all.
-    let tablesample_rewrite = crate::select_advanced::strip_tablesample(sql);
+    // 2. Lower `TABLESAMPLE { BERNOULLI | SYSTEM } (p) [REPEATABLE(s)]` into a
+    //    derived sub-select carrying a sampling predicate (BUG #134: the
+    //    clause used to be silently stripped, so every row was returned).
+    //    BERNOULLI -> per-row Bernoulli trial; SYSTEM -> per-record-batch
+    //    trial; REPEATABLE -> seeded deterministic variant. An out-of-range
+    //    percentage is a hard error (PG parity: "sample percentage must be
+    //    between 0 and 100").
+    let tablesample_rewrite = crate::select_advanced::rewrite_tablesample(sql)
+        .map_err(|e| BasinError::InvalidSchema(e.0))?;
     let sql = tablesample_rewrite.as_ref();
     //
     // 2b. Strip `ONLY ` table inheritance modifier from `FROM ONLY <tbl>` /
@@ -1986,6 +1990,18 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
                 &batch,
             )
             .await?;
+            // BUG #133: RLS WITH CHECK on INSERT. Reuses the same per-row
+            // predicate-evaluation machinery as CHECK constraints above.
+            crate::rls::enforce_with_check(
+                &sess.auth_context,
+                table.as_str(),
+                meta.rls_enabled,
+                &meta.policies,
+                &sess.current_user,
+                basin_catalog::PolicyCommand::Insert,
+                &batch,
+            )
+            .await?;
             crate::constraints::enforce_fk_on_insert(
                 &sess.engine.config().catalog,
                 &sess.engine.config().storage,
@@ -2068,6 +2084,18 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         table.as_str(),
         meta.schema.as_ref(),
         &meta.check_constraints,
+        &batch,
+    )
+    .await?;
+    // BUG #133: RLS WITH CHECK on INSERT. Same per-row predicate-eval
+    // machinery as CHECK constraints; no-op when rls_enabled = false.
+    crate::rls::enforce_with_check(
+        &sess.auth_context,
+        table.as_str(),
+        meta.rls_enabled,
+        &meta.policies,
+        &sess.current_user,
+        basin_catalog::PolicyCommand::Insert,
         &batch,
     )
     .await?;
@@ -2387,6 +2415,18 @@ async fn exec_insert_select(
         &batch,
     )
     .await?;
+    // BUG #133: RLS WITH CHECK on INSERT ... SELECT — the materialised
+    // rows are subject to the same policy enforcement as VALUES inserts.
+    crate::rls::enforce_with_check(
+        &sess.auth_context,
+        table.as_str(),
+        meta.rls_enabled,
+        &meta.policies,
+        &sess.current_user,
+        basin_catalog::PolicyCommand::Insert,
+        &batch,
+    )
+    .await?;
     crate::constraints::enforce_fk_on_insert(
         &sess.engine.config().catalog,
         &sess.engine.config().storage,
@@ -2531,6 +2571,17 @@ async fn exec_insert_default_values(
         table.as_str(),
         meta.schema.as_ref(),
         &meta.check_constraints,
+        &batch,
+    )
+    .await?;
+    // BUG #133: RLS WITH CHECK on INSERT ... DEFAULT VALUES.
+    crate::rls::enforce_with_check(
+        &sess.auth_context,
+        table.as_str(),
+        meta.rls_enabled,
+        &meta.policies,
+        &sess.current_user,
+        basin_catalog::PolicyCommand::Insert,
         &batch,
     )
     .await?;

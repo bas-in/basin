@@ -1014,6 +1014,57 @@ pub fn reject_unsupported(tree: &ParseTree) -> Result<()> {
             }
         }
 
+        // BUG #132 — CREATE TRIGGER / CREATE CONSTRAINT TRIGGER honest-reject.
+        // Basin has no PL/pgSQL trigger runtime (ADR 0012). A silent no-op
+        // here is a correctness bomb (audit rows / derived columns /
+        // validation never fire). Reject loudly with SQLSTATE 0A000. Both
+        // `CREATE TRIGGER` and `CREATE CONSTRAINT TRIGGER` parse to
+        // `CreateTrigStmt` (the latter sets `isconstraint = true`).
+        if let NodeEnum::CreateTrigStmt(cts) = inner {
+            let what = if cts.isconstraint {
+                "CREATE CONSTRAINT TRIGGER"
+            } else {
+                "CREATE TRIGGER"
+            };
+            return Err(BasinError::FeatureNotSupported(format!(
+                "{what} is not supported (SQLSTATE 0A000): Basin has no \
+                 PL/pgSQL trigger runtime. Use declarative AUTO_UPDATE / \
+                 AUDIT TO / SOFT DELETE columns or a SQL-bodied REACT ON \
+                 reactor (ADR 0012) instead of a row/statement trigger."
+            )));
+        }
+
+        // BUG #132 — DROP TRIGGER asymmetry. No trigger can ever exist in
+        // Basin, so `DROP TRIGGER ... IF EXISTS` is correctly a silent no-op
+        // (noop-accepted before this gate runs) while a bare `DROP TRIGGER`
+        // must error exactly as PG does ("trigger ... does not exist"). Only
+        // the bare (missing_ok == false) form reaches here — the IF-EXISTS
+        // form was already accepted by `noop_accept::try_accept_as_noop`.
+        if let NodeEnum::DropStmt(ds) = inner {
+            use pg_query::protobuf::ObjectType as O;
+            if ds.remove_type == O::ObjectTrigger as i32 && !ds.missing_ok {
+                let name = ds
+                    .objects
+                    .iter()
+                    .find_map(|o| match o.node.as_ref() {
+                        Some(NodeEnum::List(l)) => l.items.last().and_then(|n| {
+                            if let Some(NodeEnum::String(s)) = n.node.as_ref() {
+                                Some(s.sval.clone())
+                            } else {
+                                None
+                            }
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                return Err(BasinError::FeatureNotSupported(format!(
+                    "trigger \"{name}\" does not exist (SQLSTATE 0A000): \
+                     Basin has no trigger runtime so no trigger can exist; \
+                     use DROP TRIGGER IF EXISTS for an idempotent no-op."
+                )));
+            }
+        }
+
         // ALTER TABLE … DETACH PARTITION — declarative partitioning design exclusion.
         if let NodeEnum::AlterTableStmt(at) = inner {
             use pg_query::protobuf::AlterTableType;
@@ -1284,6 +1335,63 @@ mod tests {
     }
 
     #[test]
+    fn reject_unsupported_blocks_triggers_bug_132() {
+        // BUG #132 — CREATE TRIGGER / CREATE CONSTRAINT TRIGGER and a bare
+        // DROP TRIGGER (no IF EXISTS) must be honestly rejected with SQLSTATE
+        // 0A000 instead of silently swallowed. `DROP TRIGGER ... IF EXISTS`
+        // is a faithful PG no-op and is asserted elsewhere to pass.
+        let create_cases = [
+            (
+                "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE TRIGGER",
+            ),
+            (
+                "CREATE CONSTRAINT TRIGGER ct AFTER INSERT ON t \
+                 FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE CONSTRAINT TRIGGER",
+            ),
+        ];
+        for (sql, label) in create_cases {
+            let tree = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
+            let err =
+                reject_unsupported(&tree).expect_err(&format!("{sql:?} should be rejected"));
+            match err {
+                BasinError::FeatureNotSupported(msg) => {
+                    assert!(
+                        msg.contains("0A000"),
+                        "{sql:?}: expected SQLSTATE 0A000, got: {msg}"
+                    );
+                    assert!(
+                        msg.contains(label) && msg.contains("not supported"),
+                        "{sql:?}: expected {label:?}/not supported, got: {msg}"
+                    );
+                }
+                other => panic!("{sql:?}: expected FeatureNotSupported, got {other:?}"),
+            }
+        }
+
+        // Bare DROP TRIGGER — PG raises "trigger \"x\" does not exist"; Basin
+        // mirrors that (no trigger can exist) with SQLSTATE 0A000.
+        let tree = parse("DROP TRIGGER tr ON t").unwrap();
+        let err = reject_unsupported(&tree).expect_err("bare DROP TRIGGER should be rejected");
+        match err {
+            BasinError::FeatureNotSupported(msg) => {
+                assert!(msg.contains("0A000"), "expected 0A000, got: {msg}");
+                assert!(
+                    msg.contains("does not exist") && msg.contains("tr"),
+                    "expected 'does not exist'/name, got: {msg}"
+                );
+            }
+            other => panic!("expected FeatureNotSupported, got {other:?}"),
+        }
+
+        // DROP TRIGGER ... IF EXISTS must pass reject_unsupported (faithful
+        // PG no-op; silently noop-accepted upstream).
+        let tree = parse("DROP TRIGGER IF EXISTS tr ON t").unwrap();
+        reject_unsupported(&tree).expect("DROP TRIGGER IF EXISTS should be allowed");
+    }
+
+    #[test]
     fn reject_unsupported_allows_supported_kinds() {
         // Every supported / noop-accepted / Other kind must pass through
         // `reject_unsupported` cleanly. Noop-accepted kinds are intercepted
@@ -1323,8 +1431,12 @@ mod tests {
             "COMMIT",
             "ROLLBACK",
             "SAVEPOINT s",
-            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-            "DROP TRIGGER tr ON t",
+            // BUG #132: `DROP TRIGGER ... IF EXISTS` is a faithful PG no-op
+            // (nothing to drop) — `missing_ok = true`, so reject_unsupported
+            // must let it through (it is silently noop-accepted upstream).
+            // The bare `DROP TRIGGER` and `CREATE TRIGGER` forms are now
+            // honestly rejected; see `reject_unsupported_blocks_each_kind`.
+            "DROP TRIGGER IF EXISTS tr ON t",
             "CREATE EXTENSION pgcrypto",
             "DROP EXTENSION pgcrypto",
         ];

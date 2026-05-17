@@ -43,8 +43,10 @@ use std::collections::HashMap;
 use crate::pg_ast::ObjectNamePartExt;
 use std::sync::Arc;
 
+use arrow_array::{Array, BooleanArray, RecordBatch};
 use basin_catalog::{Policy, PolicyCommand};
 use basin_common::{BasinError, Result, TableName};
+use datafusion::datasource::MemTable;
 use datafusion::logical_expr::{Filter, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::{DataFrame, SessionContext};
 use sqlparser::ast::{
@@ -578,14 +580,133 @@ pub(crate) async fn build_policies_for_query(
     Ok(out)
 }
 
-// TODO(v0.2): WITH CHECK enforcement on INSERT/UPDATE. The catalog already
-// stores `with_check_expr`; the engine's `dml.rs` (INSERT) and
-// `dml_mutate.rs` (UPDATE) need a hook that materialises the predicate
-// against the about-to-be-written batch and rejects rows that fail. The
-// hook lives at the same layer as predicate injection (logical-plan), so
-// the right shape is to wrap the staged batch in a `MemTable`, build a
-// `SELECT * FROM staged WHERE NOT (<with_check>)` plan, and reject the
-// write if that plan returns >0 rows.
+// --- WITH CHECK enforcement on INSERT / UPDATE -----------------------------
+
+/// Enforce row-level-security WITH CHECK on a candidate (about-to-be-written)
+/// batch — the INSERT image, or an UPDATE's post-SET image.
+///
+/// This is the write-side mirror of `inject_select_predicates`. It reuses the
+/// exact per-row predicate-evaluation machinery `enforce_check_constraints`
+/// uses for table CHECK constraints: materialise the batch as an in-memory
+/// table `t`, then for the combined policy predicate evaluate
+/// `SELECT (<pred>) AS ok FROM t` and reject the statement if any row's `ok`
+/// is FALSE or NULL.
+///
+/// PostgreSQL semantics implemented here:
+///   * RLS is only enforced when the table has `rls_enabled = true`; callers
+///     must pass `rls_enabled` and we no-op when it is false (one bool — the
+///     no-RLS hot path is untouched).
+///   * For each applicable enabled policy the WITH CHECK expression is used;
+///     when a policy declares no WITH CHECK we fall back to its USING
+///     expression (Postgres behaviour).
+///   * Multiple *permissive* policies combine with OR — a row passes if it
+///     satisfies the WITH CHECK of at least one applicable policy. v0.1 ships
+///     PERMISSIVE only; RESTRICTIVE (AND) is deferred (the parser does not yet
+///     surface `AS RESTRICTIVE`, so every stored policy is permissive — there
+///     is no silent mis-combination).
+///   * RLS on + no applicable policy ⇒ no row may be written (Postgres'
+///     documented default-deny). We express that as a literal FALSE predicate.
+///   * Role/owner simplification: basin has no table-owner / role-membership
+///     model — a session is just a `current_user` string with no ownership.
+///     PostgreSQL exempts the table owner unless `FORCE ROW LEVEL SECURITY`
+///     is set; basin has neither concept, so WITH CHECK is enforced for
+///     *every* writer (equivalent to `FORCE ROW LEVEL SECURITY` for all
+///     roles). This is the safe (fail-closed) direction.
+///
+/// `kind` is `PolicyCommand::Insert` for INSERT and `PolicyCommand::Update`
+/// for UPDATE; `select_applicable` already maps `PolicyCommand::All` to both.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn enforce_with_check(
+    auth_context: &Arc<crate::AuthContext>,
+    table_name_str: &str,
+    rls_enabled: bool,
+    policies: &[Policy],
+    current_user: &str,
+    kind: PolicyCommand,
+    batch: &RecordBatch,
+) -> Result<()> {
+    // One bool on the no-RLS hot path.
+    if !rls_enabled || batch.num_rows() == 0 {
+        return Ok(());
+    }
+
+    let applicable = select_applicable(policies, current_user, kind);
+
+    // Build one predicate string per applicable policy: WITH CHECK if
+    // present, else USING (Postgres fallback).
+    let mut preds: Vec<String> = Vec::with_capacity(applicable.len());
+    for p in &applicable {
+        let raw = p.with_check_expr.as_deref().unwrap_or(p.using_expr.as_str());
+        preds.push(substitute_current_user(raw, current_user));
+    }
+
+    // RLS on + no permissive policy applies ⇒ default-deny: no row may be
+    // written. Postgres rejects the write with 42501 here.
+    let combined: String = if preds.is_empty() {
+        "FALSE".to_string()
+    } else {
+        // OR-merge: a row passes if it satisfies *any* applicable
+        // permissive policy's WITH CHECK (Postgres permissive semantics).
+        preds
+            .iter()
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+
+    // Materialise the candidate batch as `t` and evaluate the combined
+    // predicate row-by-row — the same shape `enforce_check_constraints`
+    // uses. We register the *session's* auth UDFs (auth_uid / auth_role /
+    // auth_jwt) so policies that reference them resolve to the writing
+    // principal's claims, exactly as the SELECT-side RLS path does.
+    let ctx = SessionContext::new();
+    crate::udf::register_distance_udfs(&ctx);
+    crate::udf::register_pg_udfs(&ctx);
+    crate::udf::register_pg_compat_udfs(&ctx);
+    crate::udf::register_auth_udfs(&ctx, auth_context.clone());
+
+    let df_batch = crate::convert::batch_ws_to_df(batch)?;
+    let df_schema = df_batch.schema();
+    let provider = MemTable::try_new(df_schema, vec![vec![df_batch]])
+        .map_err(|e| BasinError::internal(format!("RLS WITH CHECK MemTable: {e}")))?;
+    ctx.register_table("t", Arc::new(provider))
+        .map_err(|e| BasinError::internal(format!("RLS WITH CHECK register: {e}")))?;
+
+    let sql = format!("SELECT ({combined}) AS ok FROM t");
+    let df = ctx.sql(&sql).await.map_err(|e| {
+        BasinError::InvalidSchema(format!(
+            "RLS WITH CHECK predicate {combined:?} on \"{table_name_str}\": {e}"
+        ))
+    })?;
+    let results = df.collect().await.map_err(|e| {
+        BasinError::InvalidSchema(format!(
+            "RLS WITH CHECK evaluation on \"{table_name_str}\": {e}"
+        ))
+    })?;
+    for rb in &results {
+        let ws_rb = crate::convert::batch_df_to_ws(rb)?;
+        let ok = ws_rb
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "RLS WITH CHECK on \"{table_name_str}\": predicate must return BOOLEAN"
+                ))
+            })?;
+        for r in 0..ws_rb.num_rows() {
+            // Postgres: a WITH CHECK that evaluates to FALSE *or* NULL
+            // rejects the row (unlike table CHECK constraints, where NULL
+            // passes). Match that — only TRUE permits the write.
+            if ok.is_null(r) || !ok.value(r) {
+                return Err(BasinError::RlsViolation(format!(
+                    "new row violates row-level security policy for table \"{table_name_str}\""
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

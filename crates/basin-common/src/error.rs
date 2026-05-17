@@ -88,6 +88,14 @@ pub enum BasinError {
     #[error("{0}")]
     ForeignKeyViolation(String),
 
+    /// Row-level-security policy violation: an INSERT/UPDATE produced a
+    /// row that fails an applicable policy's WITH CHECK (or USING when no
+    /// WITH CHECK is declared) expression. Router maps to SQLSTATE
+    /// `42501` (`insufficient_privilege`) — exactly what PostgreSQL
+    /// raises for `new row violates row-level security policy`.
+    #[error("{0}")]
+    RlsViolation(String),
+
     /// A text value exceeded a declared `VARCHAR(n)` / `CHAR(n)` length.
     /// Router maps to SQLSTATE `22001` (`string_data_right_truncation`),
     /// matching PostgreSQL's `value too long for type ...` error.

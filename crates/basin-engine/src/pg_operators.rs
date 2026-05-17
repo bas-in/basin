@@ -3872,7 +3872,14 @@ pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
             }
             str_end += 1;
         }
-        // str_end now points to the closing `'`.
+        // str_end now points to the closing `'` — unless the literal is
+        // unterminated (malformed or injection-style input), in which case
+        // str_end == bytes.len(). Bail out safely instead of slicing past
+        // the end (every branch below indexes `&sql[..str_end + 1]`).
+        if str_end >= bytes.len() {
+            out.push_str(&sql[str_start..]);
+            break;
+        }
         let str_inner = &sql[i..str_end]; // content between quotes
 
         if !is_curly || str_inner.starts_with("{{") {

@@ -160,16 +160,38 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
             tag: "SAVEPOINT".into(),
         }),
 
-        // Trigger DDL — accepted syntactically; Basin does not execute trigger
-        // bodies. Declarative lifecycle (`AUTO_UPDATE`, `AUDIT TO`, `SOFT DELETE`)
-        // and SQL-bodied reactors (`REACT ON`) cover the common trigger use
-        // cases without PL/pgSQL. See ADR 0012.
-        StmtKind::CreateTrigger => Some(ExecResult::Empty {
-            tag: "CREATE TRIGGER".into(),
-        }),
-        StmtKind::DropTrigger => Some(ExecResult::Empty {
-            tag: "DROP TRIGGER".into(),
-        }),
+        // Trigger DDL — BUG #132 honest-reject.
+        //
+        // `CREATE TRIGGER` / `CREATE CONSTRAINT TRIGGER` are DELIBERATELY NOT
+        // noop-accepted. Silently succeeding on CREATE TRIGGER is a
+        // correctness bomb: applications believe their audit rows / derived
+        // columns / validation triggers are firing when nothing is. Basin has
+        // no PL/pgSQL trigger runtime (ADR 0012 — declarative `AUTO_UPDATE`,
+        // `AUDIT TO`, `SOFT DELETE` and SQL-bodied `REACT ON` reactors cover
+        // the common cases instead). Returning `None` lets the statement fall
+        // through to `pg_ast::reject_unsupported`, which surfaces an honest
+        // "triggers are not supported" error (SQLSTATE 0A000). This mirrors
+        // the `StmtKind::Merge => None` precedent above.
+        StmtKind::CreateTrigger => None,
+        // `DROP TRIGGER` asymmetry (faithful PG semantics): no trigger can
+        // ever exist in Basin, so `DROP TRIGGER ... IF EXISTS` is correctly a
+        // silent no-op (PG: "nothing to drop"), while a bare `DROP TRIGGER`
+        // must error (PG raises "trigger ... does not exist"). The IF-EXISTS
+        // case is the only one accepted here; the bare form returns `None`
+        // and is rejected by `reject_unsupported`. `missing_ok` lives on the
+        // libpg_query `DropStmt`, which `reject_unsupported` inspects; here we
+        // only have the raw SQL, so we detect `IF EXISTS` textually (same
+        // approach the `VariableShow` arm uses for `SHOW TABLES`).
+        StmtKind::DropTrigger => {
+            let upper = sql.trim().to_ascii_uppercase();
+            if upper.contains("IF EXISTS") {
+                Some(ExecResult::Empty {
+                    tag: "DROP TRIGGER".into(),
+                })
+            } else {
+                None
+            }
+        }
 
         // Extension DDL — accepted; Basin ships its own extension-equivalents
         // natively per ADR 0002 (no upstream `.so` loading). Loading an

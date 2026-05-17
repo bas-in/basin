@@ -570,6 +570,12 @@ pub(crate) async fn open(
     // Only these 3 UDFs require individual write-lock acquisitions per session.
     crate::udf::register_auth_udfs(&ctx, auth_context.clone());
 
+    // TABLESAMPLE sampling UDFs (BUG #134). Registered per-session, not in
+    // the stateless cache, because the REPEATABLE (seeded) variants hold a
+    // per-session draw counter that must start at 0 for each fresh session
+    // so a seeded sample is reproducible from a clean session.
+    crate::udf::register_tablesample_udfs(&ctx);
+
     // Phase 5.11.M: route `information_schema.tables` and
     // `pg_catalog.pg_class` SELECTs to the project-scoped catalog
     // snapshot. The providers hold `Arc<dyn Catalog>` + `ProjectId` only;

@@ -995,6 +995,24 @@ pub(crate) async fn exec_update(
             .await?;
         }
     }
+    // BUG #133: RLS WITH CHECK on UPDATE. The post-SET (new-image)
+    // batches must satisfy an applicable policy's WITH CHECK (or USING
+    // when no WITH CHECK), or PG raises 42501 — an UPDATE may not move a
+    // row out of the policy. No-op when rls_enabled = false (one bool).
+    if meta.rls_enabled {
+        for batch in &replacement_batches {
+            crate::rls::enforce_with_check(
+                &sess.auth_context,
+                table.as_str(),
+                meta.rls_enabled,
+                &meta.policies,
+                &sess.current_user,
+                basin_catalog::PolicyCommand::Update,
+                batch,
+            )
+            .await?;
+        }
+    }
     let assignments_touch_pk = meta.pk_columns.iter().any(|p| {
         assignments
             .iter()
