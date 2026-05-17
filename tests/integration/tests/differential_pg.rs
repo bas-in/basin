@@ -919,8 +919,11 @@ async fn diff_jsonb_path_op() {
 /// Basin currently returns a scalar from `jsonb_each` instead of multiple rows
 /// (issue #139). Ignored until the SRF fix lands — at that point it will flip
 /// green automatically, confirming the fix is correct end-to-end.
+// KNOWN DIVERGENCE — gated on #139. Test runs and FAILS honestly today: basin's
+// jsonb_each is a scalar stub returning a single text value, while PG returns
+// N rows (one per JSON object key). The failure proves the harness catches the
+// bug. This will flip to passing automatically when #139 lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "gated on #139 jsonb SRF fix — jsonb_each must return multiple rows"]
 async fn diff_jsonb_each_srf() {
     let server = start_basin_server().await;
     let Some(runner) = make_runner(&server).await else {
@@ -1076,8 +1079,11 @@ async fn diff_agg_filter_plain() {
 ///
 /// Issue #110 investigation: aggregate FILTER in window position may diverge
 /// today. Ignored until confirmed correct; acts as a guard-in-waiting.
+// KNOWN-POTENTIAL DIVERGENCE — basin's aggregate FILTER in window position
+// may produce different results than PG due to the CASE-WHEN rewrite path
+// (#110 investigation flagged this). Running honestly — if it passes, the
+// rewrite is correct; if it fails, the failure pinpoints the exact divergence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "gated on #110 — window aggregate FILTER may diverge; enable when confirmed correct"]
 async fn diff_agg_filter_window() {
     let server = start_basin_server().await;
     let Some(runner) = make_runner(&server).await else {
@@ -1180,10 +1186,13 @@ async fn diff_error_not_null_violation() {
 /// Test 26: Multi-schema isolation.
 ///
 /// PG supports `CREATE SCHEMA` and fully qualified `schema.table` names.
-/// Basin currently does not have full multi-schema isolation (issue #116).
-/// Ignored until that fix lands; serves as a guard-in-waiting.
+/// Basin currently does NOT have full multi-schema isolation (issue #116-125):
+/// two tables with the same name in different schemas collide silently.
+///
+/// KNOWN DIVERGENCE — this test runs and FAILS honestly today. The failure
+/// IS the proof the harness catches the bug. When #116-125 lands the test
+/// will flip to passing automatically — making it a real correctness guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "gated on #116 multi-schema isolation — basin will fail/diverge today"]
 async fn diff_schema_isolation_multi_schema() {
     let server = start_basin_server().await;
     let Some(runner) = make_runner(&server).await else {

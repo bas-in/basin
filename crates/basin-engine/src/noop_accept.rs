@@ -183,13 +183,15 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         }),
 
         // MERGE INTO t USING src ON cond WHEN MATCHED THEN ... WHEN NOT MATCHED THEN ...
-        // v0.1 accepts the syntax but does not execute the MERGE logic.
-        // The WHEN MATCHED UPDATE and WHEN NOT MATCHED INSERT branches must
-        // be run as separate UPDATE / INSERT statements until Phase 5 ships
-        // real MERGE execution. Documented in CAPABILITIES.md.
-        StmtKind::Merge => Some(ExecResult::Empty {
-            tag: "MERGE".into(),
-        }),
+        // DELIBERATELY NOT NOOP-ACCEPTED. Silently succeeding on MERGE is a
+        // correctness bomb — applications believe their writes happened when
+        // nothing did. Until the basin-native MERGE handler ships (tracked
+        // as task #115), MERGE statements MUST fall through to the executor
+        // dispatch and surface as an honest "feature not yet supported"
+        // error (SQLSTATE 0A000). Apps that try MERGE will get a clear
+        // error and can fall back to WHEN MATCHED/NOT MATCHED equivalents
+        // as separate UPDATE/INSERT statements until #115 lands.
+        StmtKind::Merge => None,
 
         // REINDEX — accepted; Basin indexes are managed by DataFusion's
         // adaptive planner (no manual rebuild needed). This keeps tooling

@@ -301,9 +301,15 @@ fn cluster_is_noop_accepted() {
 }
 
 #[test]
-fn merge_is_noop_accepted() {
-    // MERGE INTO … USING … WHEN MATCHED / NOT MATCHED accepted in v0.1;
-    // not executed (see noop_accept.rs and CAPABILITIES.md).
+fn merge_passes_preflight_unsupported_check() {
+    // MERGE INTO … USING … WHEN MATCHED / NOT MATCHED passes the pg_ast-layer
+    // `reject_unsupported` pre-flight (this test). HOWEVER, MERGE is NO LONGER
+    // silently noop-accepted at the execution layer (that was a correctness
+    // bomb — apps believed writes happened when nothing did). Execution-layer
+    // MERGE handling is tracked as task #115; until it lands, MERGE statements
+    // surface an honest "unsupported" error at execution time. See
+    // `merge_basic_is_honestly_rejected` in tests/integration/tests/noop_accept.rs
+    // for the execution-layer assertion.
     assert_allowed(
         "MERGE INTO t USING src ON t.id = src.id \
          WHEN MATCHED THEN UPDATE SET val = src.val \

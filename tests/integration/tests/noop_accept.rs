@@ -236,39 +236,46 @@ async fn drop_extension_is_accepted() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// MERGE — syntactic accept; v0.1 does not execute MERGE logic
+// MERGE — HONEST REJECTION (correctness fix)
 // ──────────────────────────────────────────────────────────────────────────────
+// Previously these tests pinned silent-noop acceptance: MERGE statements would
+// return success with tag "MERGE" while performing NO DATA CHANGES. That was a
+// correctness bomb — apps believed their writes happened when nothing did.
+// Real MERGE execution is tracked as a separate effort (task #115). Until
+// that lands, MERGE must fail honestly with a clear "unsupported" error so
+// callers can fall back to equivalent UPDATE / INSERT statements.
 
 #[tokio::test]
-async fn merge_basic_is_accepted() {
-    // MERGE INTO … USING … ON … WHEN MATCHED / NOT MATCHED is accepted
-    // syntactically in v0.1 but the MERGE logic is not executed. Run the
-    // WHEN MATCHED UPDATE and WHEN NOT MATCHED INSERT branches as separate
-    // UPDATE / INSERT statements until Phase 5 ships real MERGE execution.
+async fn merge_basic_is_honestly_rejected() {
+    // PREVIOUSLY: assert_noop(.., "MERGE")  — silent success, no writes.
+    // NOW: must return an error. Apps that try MERGE get a clean signal
+    // instead of silently-empty results.
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    assert_noop(
-        &sess,
+    let result = sess.execute(
         "MERGE INTO target t \
          USING source s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET val = s.val \
          WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)",
-        "MERGE",
-    )
-    .await;
+    ).await;
+    assert!(
+        result.is_err(),
+        "MERGE must fail honestly, not silent-succeed (was a correctness bomb). got: {result:?}"
+    );
 }
 
 #[tokio::test]
-async fn merge_matched_only_is_accepted() {
+async fn merge_matched_only_is_honestly_rejected() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    assert_noop(
-        &sess,
+    let result = sess.execute(
         "MERGE INTO t USING s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET val = s.val",
-        "MERGE",
-    )
-    .await;
+    ).await;
+    assert!(
+        result.is_err(),
+        "MERGE must fail honestly. got: {result:?}"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
