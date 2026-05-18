@@ -262,6 +262,16 @@ pub struct CvDef {
     pub last_bucket_max_unix_ms: Option<i64>,
 }
 
+/// Per-table on-disk data-file format (#161). `Parquet` is the default and
+/// the value every pre-existing catalog row deserialises to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TableFileFormat {
+    #[default]
+    Parquet,
+    Vortex,
+}
+
 /// Materialized view of a table at one point in time.
 ///
 /// `current_snapshot` is the head of the history; `snapshots` is the full
@@ -335,6 +345,16 @@ pub struct TableMetadata {
     /// [`crate::Catalog::set_cluster_columns`] or `CLUSTER BY (...)` on
     /// `CREATE TABLE`.
     pub cluster_columns: Vec<String>,
+    /// On-disk data-file format for this table (#161). `Parquet` (the
+    /// default) preserves Iceberg / Athena / Spark / DuckDB read-compat;
+    /// `Vortex` is the opt-in columnar format selected at CREATE TABLE via
+    /// `WITH (basin.file_format = 'vortex')`. `#[serde(default)]` means
+    /// every pre-existing catalog row deserialises to `Parquet`, so this
+    /// is fully back-compatible. A table is single-format (mixed
+    /// Parquet+Vortex within one table is a deferred feature); the write
+    /// path picks the format from here, the read path from each file's
+    /// extension.
+    pub file_format: TableFileFormat,
     /// Phase 6 multi-region scaffolding (ADR 0009). The region a project's
     /// writes for this table are *pinned* to — i.e. the home region for
     /// all writes; reads can come from any region (with the freshness

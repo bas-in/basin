@@ -32,7 +32,7 @@ use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
 use crate::functions::SqlFunctionDef;
 use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
-    TableMetadata, UniqueConstraint,
+    TableFileFormat, TableMetadata, UniqueConstraint,
 };
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::project_storage_config::ProjectStorageConfig;
@@ -641,6 +641,7 @@ impl Catalog for PostgresCatalog {
             row_group_rows: None,
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
+            file_format: TableFileFormat::default(),
             // Phase 6 multi-region scaffolding (ADR 0009). New tables are
             // not pinned by default; `set_home_region` is the only mutator.
             home_region: None,
@@ -784,6 +785,7 @@ impl Catalog for PostgresCatalog {
             row_group_rows,
             continuous_aggregate,
             cluster_columns,
+            file_format: TableFileFormat::default(),
             home_region,
             indexes,
             pk_columns,
@@ -3206,6 +3208,7 @@ impl Catalog for PostgresCatalog {
             row_group_rows: None,
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
+            file_format: TableFileFormat::default(),
             home_region: None,
             indexes: Vec::new(),
             pk_columns: Vec::new(),
@@ -3349,6 +3352,7 @@ impl Catalog for PostgresCatalog {
             row_group_rows,
             continuous_aggregate,
             cluster_columns,
+            file_format: TableFileFormat::default(),
             home_region,
             indexes,
             pk_columns,

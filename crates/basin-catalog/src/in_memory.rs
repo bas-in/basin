@@ -21,7 +21,7 @@ use crate::enums::{self, EnumError, EnumTypeDef};
 use crate::functions::SqlFunctionDef;
 use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
-    TableMetadata, UniqueConstraint,
+    TableFileFormat, TableMetadata, UniqueConstraint,
 };
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::project_storage_config::ProjectStorageConfig;
@@ -242,6 +242,7 @@ impl InMemoryCatalog {
             row_group_rows: state.row_group_rows,
             continuous_aggregate: state.continuous_aggregate.clone(),
             cluster_columns: state.cluster_columns.clone(),
+            file_format: TableFileFormat::default(),
             home_region: state.home_region.clone(),
             indexes: state.indexes.clone(),
             pk_columns: state.pk_columns.clone(),

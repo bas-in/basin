@@ -53,7 +53,7 @@ pub use functions::{
 pub use in_memory::InMemoryCatalog;
 pub use metadata::{
     CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
-    PolicyCommand, RefAction, SecondaryIndex, TableMetadata, UniqueConstraint,
+    PolicyCommand, RefAction, SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
@@ -582,6 +582,23 @@ pub trait Catalog: Send + Sync {
         columns: Vec<String>,
     ) -> Result<()> {
         let _ = (project, table, columns);
+        Ok(())
+    }
+
+    /// #161: set the on-disk data-file format for `(project, table)`.
+    /// Selected at CREATE TABLE via `WITH (basin.file_format = 'vortex')`.
+    /// The writer reads `TableMetadata::file_format` to choose the encoder
+    /// (Parquet vs Vortex) and the read path picks the DataFusion
+    /// `FileFormat` per table. Default impl is a no-op so the stub
+    /// `RestCatalog` and any future backend stay buildable; the in-memory
+    /// and Postgres backends override this.
+    async fn set_file_format(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        format: crate::metadata::TableFileFormat,
+    ) -> Result<()> {
+        let _ = (project, table, format);
         Ok(())
     }
 
