@@ -25,6 +25,7 @@ mod reader;
 mod scheduler;
 mod tier;
 mod vector_index;
+mod vortex_format;
 mod writer;
 
 use std::collections::HashMap;
