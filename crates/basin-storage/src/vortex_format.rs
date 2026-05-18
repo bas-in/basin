@@ -280,9 +280,47 @@ pub(crate) async fn decode(
     // fallback path can reuse the same backing allocation.
     let has_filter = filter.is_some();
     let pushed = projection.is_some() || has_filter;
-    match decode_inner(bytes.clone(), schema.clone(), projection, filter).await {
+    match decode_inner(bytes.clone(), schema.clone(), projection, filter, None, None, 0).await {
         Ok(b) => Ok((b, has_filter)),
-        Err(_) if pushed => decode_inner(bytes, schema, None, None).await.map(|b| (b, false)),
+        Err(_) if pushed => decode_inner(bytes, schema, None, None, None, None, 0)
+            .await
+            .map(|b| (b, false)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Like [`decode`] but threads a [`VortexFooterCache`] through so repeated
+/// queries to the same physical file skip the per-file flatbuffer footer parse.
+///
+/// `path` + `size_bytes` form the cache key; see [`VortexFooterCache`] for the
+/// key-safety argument. Both the cache lookup and the cache populate are
+/// transparent to callers — results are identical to [`decode`].
+pub(crate) async fn decode_with_cache(
+    bytes: bytes::Bytes,
+    schema: Option<Arc<Schema>>,
+    projection: Option<&[String]>,
+    filter: Option<vortex_array::expr::Expression>,
+    cache: Option<&crate::vortex_footer_cache::VortexFooterCache>,
+    path: &object_store::path::Path,
+    size_bytes: u64,
+) -> Result<(Vec<RecordBatch>, bool)> {
+    let has_filter = filter.is_some();
+    let pushed = projection.is_some() || has_filter;
+    match decode_inner(
+        bytes.clone(),
+        schema.clone(),
+        projection,
+        filter,
+        cache,
+        Some(path),
+        size_bytes,
+    )
+    .await
+    {
+        Ok(b) => Ok((b, has_filter)),
+        Err(_) if pushed => decode_inner(bytes, schema, None, None, cache, Some(path), size_bytes)
+            .await
+            .map(|b| (b, false)),
         Err(e) => Err(e),
     }
 }
@@ -292,13 +330,39 @@ async fn decode_inner(
     schema: Option<Arc<Schema>>,
     projection: Option<&[String]>,
     filter: Option<vortex_array::expr::Expression>,
+    cache: Option<&crate::vortex_footer_cache::VortexFooterCache>,
+    path: Option<&object_store::path::Path>,
+    size_bytes: u64,
 ) -> Result<Vec<RecordBatch>> {
     use vortex_array::expr::{root, select};
 
-    let vf = session()
-        .open_options()
-        .open_buffer(bytes)
-        .map_err(|e| BasinError::storage(format!("vortex: open_buffer: {e}")))?;
+    // Footer cache fast path: if a cache and path are provided, probe the
+    // cache before the (synchronous) flatbuffer footer parse. On hit, pass
+    // the cached Footer into `open_options().with_footer()` so
+    // `open_buffer` skips `block_on(read_footer(...))` entirely. On miss,
+    // parse the footer as normal then populate the cache for next time.
+    let cached_footer = match (cache, path) {
+        (Some(c), Some(p)) => c.get(p, size_bytes),
+        _ => None,
+    };
+
+    let vf = if let Some(footer) = cached_footer {
+        session()
+            .open_options()
+            .with_footer(footer)
+            .open_buffer(bytes)
+            .map_err(|e| BasinError::storage(format!("vortex: open_buffer (cached footer): {e}")))?
+    } else {
+        let vf = session()
+            .open_options()
+            .open_buffer(bytes)
+            .map_err(|e| BasinError::storage(format!("vortex: open_buffer: {e}")))?;
+        // Populate the cache for the next query on this file.
+        if let (Some(c), Some(p)) = (cache, path) {
+            c.insert(p.clone(), size_bytes, vf.footer().clone());
+        }
+        vf
+    };
 
     // Inferred (self-describing) full schema, normalised so Vortex's
     // `Utf8View`/`BinaryView` become Basin-canonical `Utf8`/`Binary` (the

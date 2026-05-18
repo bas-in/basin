@@ -25,6 +25,7 @@ mod reader;
 mod scheduler;
 mod tier;
 mod vector_index;
+mod vortex_footer_cache;
 mod vortex_format;
 mod writer;
 
@@ -51,6 +52,7 @@ pub use predicate::{
 pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
+pub use vortex_footer_cache::VortexFooterCache;
 pub use writer::{FileFormat, WriteOptions};
 
 use arrow_array::RecordBatch;
@@ -240,6 +242,10 @@ struct Inner {
     /// [`StorageConfig::page_cache`] for the rationale; `None` is the
     /// default (every read decodes from Parquet bytes).
     page_cache: Option<Arc<PageCache>>,
+    /// Cache of parsed Vortex file footers. Always enabled; capacity is
+    /// [`DEFAULT_VORTEX_FOOTER_CACHE_CAP`]. See [`VortexFooterCache`] for
+    /// the key-safety and cloneability rationale.
+    vortex_footer_cache: Arc<VortexFooterCache>,
     /// Optional per-project counters registry (Phase 6 telemetry). Attached by
     /// the engine via [`Storage::attach_project_counters`]; first attach wins.
     /// When present, every successful write/read bumps `bytes_written_total` /
@@ -325,6 +331,13 @@ const DEFAULT_PARQUET_META_CACHE_CAP: usize = 1024;
 /// segments per (project, table, column).
 const DEFAULT_HNSW_SEGMENT_CACHE_CAP: usize = 256;
 
+/// Default capacity for the Vortex footer cache: 512 entries. Each entry
+/// holds a cloned `vortex_file::Footer` (Arc-wrapped internals, O(1) clone)
+/// so the per-entry cost is dominated by the Arc ref counts, not by the
+/// footer payload size. 512 covers the working set of all current benchmarks
+/// and the Phase 5.7 integration suite without material RAM overhead.
+const DEFAULT_VORTEX_FOOTER_CACHE_CAP: usize = 512;
+
 impl Storage {
     pub fn new(cfg: StorageConfig) -> Self {
         // If a disk cache is configured, wrap the supplied object store
@@ -372,6 +385,14 @@ impl Storage {
                 default_project_concurrency: DEFAULT_PROJECT_CONCURRENCY,
                 read_counters: Arc::new(ReadCounters::default()),
                 page_cache,
+                // Vortex footer cache: always enabled with the default capacity.
+                // Mirrors parquet_meta_cache — always-on; zero Cargo.toml churn
+                // (uses the `lru` dep already present). Non-breaking: no new
+                // `StorageConfig` field means every existing call site compiles
+                // unchanged.
+                vortex_footer_cache: Arc::new(VortexFooterCache::new(
+                    DEFAULT_VORTEX_FOOTER_CACHE_CAP,
+                )),
                 project_counters: OnceLock::new(),
                 encryption: OnceLock::new(),
                 catalog: OnceLock::new(),
@@ -595,6 +616,12 @@ impl Storage {
 
     pub(crate) fn page_cache_handle(&self) -> Option<&Arc<PageCache>> {
         self.inner.page_cache.as_ref()
+    }
+
+    /// Handle to the Vortex footer cache. Exposed to the reader module so
+    /// `read_one` can pass it through to `decode_with_cache`.
+    pub(crate) fn vortex_footer_cache_handle(&self) -> &Arc<VortexFooterCache> {
+        &self.inner.vortex_footer_cache
     }
 
     pub(crate) fn hnsw_segment_cache(&self) -> &Arc<metadata_cache::HnswSegmentCache> {

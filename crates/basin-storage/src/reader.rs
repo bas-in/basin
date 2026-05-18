@@ -25,6 +25,7 @@ use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache};
 use crate::paths::table_tier_prefix;
 use crate::predicate::{self, Predicate, ScalarValue};
 use crate::tier::Tier;
+use crate::vortex_footer_cache::VortexFooterCache;
 use crate::writer::wrapped_sidecar_key;
 use crate::{ReadCounters, ReadOptions, Storage};
 use basin_catalog::ProjectStorageConfig;
@@ -468,6 +469,7 @@ async fn read_paths_inner(
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
+    let vortex_cache = storage.vortex_footer_cache_handle().clone();
     let project_counters = storage.project_counters(project);
     let encryption = storage.encryption_provider();
     // Resolve the per-project storage config once for the whole batch of
@@ -487,6 +489,7 @@ async fn read_paths_inner(
             let cache = cache.clone();
             let counters = counters.clone();
             let page_cache = page_cache.clone();
+            let vortex_cache = vortex_cache.clone();
             let project_counters = project_counters.clone();
             let encryption = encryption.clone();
             let project_config = project_config.clone();
@@ -499,6 +502,7 @@ async fn read_paths_inner(
                     cache,
                     counters,
                     page_cache,
+                    vortex_cache,
                     project_counters,
                     encryption,
                     project_config,
@@ -536,6 +540,7 @@ pub(crate) async fn read_file(
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
+    let vortex_cache = storage.vortex_footer_cache_handle().clone();
     let project_counters = storage.project_counters(project);
     let encryption = storage.encryption_provider();
     let project_config = if encryption.is_some() {
@@ -550,6 +555,7 @@ pub(crate) async fn read_file(
         cache,
         counters,
         page_cache,
+        vortex_cache,
         project_counters,
         encryption,
         project_config,
@@ -567,6 +573,7 @@ async fn read_one(
     meta_cache: Arc<ParquetMetaCache>,
     counters: Arc<ReadCounters>,
     page_cache: Option<Arc<PageCache>>,
+    vortex_cache: Arc<VortexFooterCache>,
     project_counters: Option<Arc<basin_common::ProjectCounters>>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     project_config: Option<ProjectStorageConfig>,
@@ -666,14 +673,20 @@ async fn read_one(
         // post-filter pass entirely (projection + missing-column synthesis
         // still run). The smoke gate proves correctness: a wrong skip
         // would produce results that differ from Parquet.
+        //
+        // `bytes.len()` is captured before moving `bytes` into the decoder.
+        let size_bytes = bytes.len() as u64;
         let read_proj = vortex_read_projection(opts.as_ref());
         let (push_filter, all_filters_pushed) =
             vortex_filter_expr(&opts.filters, catalog_schema.as_deref());
-        let (batches, decode_used_filter) = crate::vortex_format::decode(
+        let (batches, decode_used_filter) = crate::vortex_format::decode_with_cache(
             bytes,
             schema,
             read_proj.as_deref(),
             push_filter,
+            Some(&vortex_cache),
+            &path,
+            size_bytes,
         )
         .await?;
         // Skip the Arrow re-filter only when Vortex handled ALL predicates
@@ -1779,6 +1792,7 @@ mod tests {
             storage.parquet_meta_cache().clone(),
             storage.read_counters().clone(),
             storage.page_cache_handle().cloned(),
+            storage.vortex_footer_cache_handle().clone(),
             storage.project_counters(&project),
             storage.encryption_provider(),
             project_config,
