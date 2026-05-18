@@ -71,6 +71,15 @@ pub(crate) enum BasinAlterExtension {
     /// `ALTER TABLE <t> RESET CLUSTER BY`. Clears the cluster spec; the
     /// writer reverts to the pre-B2 unsorted byte-equivalent path.
     ResetClusterColumns { table: TableName },
+    /// `ALTER TABLE <t> SET FILE_FORMAT = 'vortex' | 'parquet'` (#161).
+    /// Switches the table's on-disk data-file format. Vortex is opt-in;
+    /// `Parquet` stays the catalog default. In-place conversion of an
+    /// already-populated table is deferred — the `apply` step rejects a
+    /// non-empty target so the format only ever changes on a fresh table.
+    SetFileFormat {
+        table: TableName,
+        format: basin_catalog::TableFileFormat,
+    },
     /// `ALTER TABLE <t> VALIDATE CONSTRAINT <name>`. sqlparser 0.52
     /// doesn't model this PG-specific form; we recognise it textually
     /// and accept as a no-op (Basin doesn't have deferred / NOT VALID
@@ -244,6 +253,10 @@ pub(crate) fn match_basin_alter_extension(sql: &str) -> Result<Option<BasinAlter
             columns,
         }));
     }
+    if let Some(rest) = strip_keyword(after_set, &after_set_lower, "file_format") {
+        let format = parse_eq_file_format(rest)?;
+        return Ok(Some(BasinAlterExtension::SetFileFormat { table, format }));
+    }
     if let Some(rest) = strip_keyword(after_set, &after_set_lower, "row_group_rows") {
         let value = parse_eq_int(rest, "row_group_rows")?;
         if value <= 0 {
@@ -272,6 +285,7 @@ impl BasinAlterExtension {
             | BasinAlterExtension::ResetRowGroupRows { table }
             | BasinAlterExtension::SetClusterColumns { table, .. }
             | BasinAlterExtension::ResetClusterColumns { table }
+            | BasinAlterExtension::SetFileFormat { table, .. }
             | BasinAlterExtension::ValidateConstraint { table, .. }
             | BasinAlterExtension::AttachPartition { table }
             | BasinAlterExtension::DetachPartition { table } => table,
@@ -360,6 +374,28 @@ impl BasinAlterExtension {
                 catalog
                     .set_cluster_columns(project, &table, Vec::new())
                     .await?;
+                Ok("ALTER TABLE")
+            }
+            BasinAlterExtension::SetFileFormat { table, format } => {
+                // In-place format change rewrites every live data file in
+                // the new encoding (Parquet ⇄ Vortex). That conversion is
+                // deferred (#161) — for now we only allow the switch on a
+                // table with no live rows so existing files are never
+                // stranded in the old format. Emptiness is read straight
+                // from the catalog's live file set (the same
+                // `live_data_files()` view the read path uses), so no
+                // storage round-trip is needed.
+                let meta = catalog.load_table(project, &table).await?;
+                let live_rows: u64 = meta.live_data_files().iter().map(|f| f.row_count).sum();
+                if live_rows != 0 {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "ALTER TABLE {table}: SET FILE_FORMAT requires an empty table — \
+                         in-place data-file format conversion on a populated table is not \
+                         supported yet ({live_rows} live row(s)); set the format at CREATE \
+                         TABLE time via WITH (basin.file_format = '…') instead"
+                    )));
+                }
+                catalog.set_file_format(project, &table, format).await?;
                 Ok("ALTER TABLE")
             }
             BasinAlterExtension::ValidateConstraint { table, name } => {
@@ -1066,6 +1102,24 @@ fn parse_eq_string_or_ident(rest: &str, what: &str) -> Result<String> {
     Ok(ident)
 }
 
+/// Parse the `= '<fmt>'` tail of `SET FILE_FORMAT`. Accepts a quoted
+/// string, a double-quoted string, or a bare identifier (mirrors
+/// [`parse_eq_string_or_ident`]'s tolerance) and maps it
+/// case-insensitively to a [`basin_catalog::TableFileFormat`]. Any value
+/// other than `parquet` / `vortex` is rejected with the sibling
+/// `InvalidSchema` error style.
+fn parse_eq_file_format(rest: &str) -> Result<basin_catalog::TableFileFormat> {
+    let raw = parse_eq_string_or_ident(rest, "file_format")?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "parquet" => Ok(basin_catalog::TableFileFormat::Parquet),
+        "vortex" => Ok(basin_catalog::TableFileFormat::Vortex),
+        other => Err(BasinError::InvalidSchema(format!(
+            "ALTER TABLE … SET file_format: unrecognised format {other:?}; \
+             expected 'parquet' or 'vortex'"
+        ))),
+    }
+}
+
 fn parse_paren_ident_list(rest: &str) -> Result<Vec<String>> {
     let rest = rest.trim_start();
     let after_paren = rest.strip_prefix('(').ok_or_else(|| {
@@ -1248,6 +1302,110 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── SET FILE_FORMAT (#161) ────────────────────────────────────────────
+
+    #[test]
+    fn match_set_file_format_vortex() {
+        let m = match_basin_alter_extension("ALTER TABLE events SET FILE_FORMAT = 'vortex'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::SetFileFormat {
+                table: TableName::new("events").unwrap(),
+                format: basin_catalog::TableFileFormat::Vortex,
+            }
+        );
+    }
+
+    #[test]
+    fn match_set_file_format_parquet() {
+        let m = match_basin_alter_extension("ALTER TABLE events SET FILE_FORMAT = 'parquet'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::SetFileFormat {
+                table: TableName::new("events").unwrap(),
+                format: basin_catalog::TableFileFormat::Parquet,
+            }
+        );
+    }
+
+    #[test]
+    fn match_set_file_format_case_insensitive_value() {
+        // Mixed/upper-case value and lower-case statement keywords both
+        // resolve; the format token is matched case-insensitively.
+        let m = match_basin_alter_extension("alter table EVENTS set file_format = 'VoRtEx';")
+            .unwrap()
+            .unwrap();
+        match m {
+            BasinAlterExtension::SetFileFormat { format, .. } => {
+                assert_eq!(format, basin_catalog::TableFileFormat::Vortex);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let m = match_basin_alter_extension("ALTER TABLE events SET FILE_FORMAT = 'PARQUET'")
+            .unwrap()
+            .unwrap();
+        match m {
+            BasinAlterExtension::SetFileFormat { format, .. } => {
+                assert_eq!(format, basin_catalog::TableFileFormat::Parquet);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_set_file_format_bare_and_double_quoted() {
+        // Bare identifier value (no quotes).
+        let m = match_basin_alter_extension("ALTER TABLE events SET FILE_FORMAT = vortex")
+            .unwrap()
+            .unwrap();
+        match m {
+            BasinAlterExtension::SetFileFormat { format, .. } => {
+                assert_eq!(format, basin_catalog::TableFileFormat::Vortex);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Double-quoted value.
+        let m = match_basin_alter_extension("ALTER TABLE events SET FILE_FORMAT = \"parquet\"")
+            .unwrap()
+            .unwrap();
+        match m {
+            BasinAlterExtension::SetFileFormat { format, .. } => {
+                assert_eq!(format, basin_catalog::TableFileFormat::Parquet);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_file_format_rejects_unrecognised_value() {
+        let err =
+            match_basin_alter_extension("ALTER TABLE events SET FILE_FORMAT = 'orc'").unwrap_err();
+        assert!(matches!(err, BasinError::InvalidSchema(_)));
+        let err =
+            match_basin_alter_extension("ALTER TABLE events SET FILE_FORMAT = csv").unwrap_err();
+        assert!(matches!(err, BasinError::InvalidSchema(_)));
+    }
+
+    #[test]
+    fn match_schema_qualified_set_file_format() {
+        // schema prefix must be stripped; bare table name preserved.
+        let m =
+            match_basin_alter_extension("ALTER TABLE myschema.events SET FILE_FORMAT = 'vortex'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            m,
+            BasinAlterExtension::SetFileFormat {
+                table: TableName::new("events").unwrap(),
+                format: basin_catalog::TableFileFormat::Vortex,
+            }
+        );
     }
 
     // ── Schema-qualified extension forms (Site 3 fix) ─────────────────────
