@@ -1362,7 +1362,9 @@ fn sanitize_create_table_extensions(sql: &str) -> String {
                         .filter(|e| {
                             !e.is_empty() && {
                                 let key = with_option_key(e);
-                                key != "basin.file_format" && key != "file_format"
+                                key != "basin.file_format"
+                                    && key != "file_format"
+                                    && key != "basin.sort_by"
                             }
                         })
                         .collect();
@@ -1554,6 +1556,132 @@ pub fn parse_create_table_file_format(sql: &str) -> basin_catalog::TableFileForm
     }
 
     TableFileFormat::default()
+}
+
+/// Parse `basin.sort_by = 'col1,col2'` out of a CREATE TABLE `WITH (...)`
+/// clause and return the column list (trimmed, in declaration order).
+///
+/// This is the read counterpart to the `basin.sort_by` stripping performed by
+/// [`sanitize_create_table_extensions`]: the sanitiser removes the key before
+/// sqlparser sees the SQL; this function inspects the *same* unsanitised SQL to
+/// recover the declared columns so the catalog row can be tagged with the sort
+/// order.
+///
+/// Recognised key (case-insensitive): `basin.sort_by`.
+/// Value is a quoted string of comma-separated column names, e.g.
+/// `'id'` or `'ts,id'`.
+///
+/// Returns `None` when the key is absent or when the value is blank after
+/// parsing. This never errors — a malformed clause simply yields `None` and
+/// the real diagnostic is left to sqlparser downstream.
+pub fn parse_create_table_sort_by(sql: &str) -> Option<Vec<String>> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    // Walk the statement skipping literals/idents/comments, looking for
+    // the first top-level `WITH` keyword followed by `(`.
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // String literal: `'...'` with `''` escapes.
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Quoted identifier: `"..."` with `""` escapes.
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Line comment.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+
+        if matches_kw_at(bytes, i, b"WITH") {
+            let mut k = i + b"WITH".len();
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                if let Some(close) = find_matching_paren(bytes, k) {
+                    let inside = &sql[k + 1..close];
+                    return sort_by_from_with_body(inside);
+                }
+                return None;
+            }
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+/// Scan the body (without surrounding parens) of a CREATE TABLE `WITH (...)`
+/// clause for a `basin.sort_by` option. Returns `None` when the key is absent
+/// or the value is blank; returns `Some(cols)` with the trimmed column list
+/// otherwise.
+fn sort_by_from_with_body(inside: &str) -> Option<Vec<String>> {
+    for seg in split_top_level_commas(inside) {
+        let seg = seg.trim();
+        let Some(eq) = seg.find('=') else {
+            continue;
+        };
+        let raw_key = seg[..eq].trim();
+        let raw_val = seg[eq + 1..].trim();
+        let key = unquote_with_token(raw_key).to_ascii_lowercase();
+        if key != "basin.sort_by" {
+            continue;
+        }
+        let val = unquote_with_token(raw_val);
+        let cols: Vec<String> = val
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.is_empty() {
+            return None;
+        }
+        return Some(cols);
+    }
+    None
 }
 
 /// Scan the body (without surrounding parens) of a CREATE TABLE
@@ -2378,5 +2506,67 @@ mod file_format_tests {
     fn trailing_semicolon_ok() {
         let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format='vortex');";
         assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
+    }
+}
+
+#[cfg(test)]
+mod sort_by_tests {
+    use super::parse_create_table_sort_by;
+
+    #[test]
+    fn single_column() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.sort_by='id')";
+        assert_eq!(
+            parse_create_table_sort_by(sql),
+            Some(vec!["id".to_string()])
+        );
+    }
+
+    #[test]
+    fn multi_column() {
+        let sql = "CREATE TABLE foo (id BIGINT, ts BIGINT) WITH (basin.sort_by='ts,id')";
+        assert_eq!(
+            parse_create_table_sort_by(sql),
+            Some(vec!["ts".to_string(), "id".to_string()])
+        );
+    }
+
+    #[test]
+    fn combined_with_file_format() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.sort_by='id', basin.file_format='vortex')";
+        assert_eq!(
+            parse_create_table_sort_by(sql),
+            Some(vec!["id".to_string()])
+        );
+    }
+
+    #[test]
+    fn absent_returns_none() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format='parquet')";
+        assert_eq!(parse_create_table_sort_by(sql), None);
+    }
+
+    #[test]
+    fn no_with_clause_returns_none() {
+        let sql = "CREATE TABLE foo (id BIGINT)";
+        assert_eq!(parse_create_table_sort_by(sql), None);
+    }
+
+    #[test]
+    fn case_insensitive_key() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (BASIN.SORT_BY='id')";
+        assert_eq!(
+            parse_create_table_sort_by(sql),
+            Some(vec!["id".to_string()])
+        );
+    }
+
+    #[test]
+    fn columns_are_trimmed() {
+        let sql = "CREATE TABLE foo (id BIGINT, ts BIGINT) WITH (basin.sort_by=' ts , id ')";
+        assert_eq!(
+            parse_create_table_sort_by(sql),
+            Some(vec!["ts".to_string(), "id".to_string()])
+        );
     }
 }

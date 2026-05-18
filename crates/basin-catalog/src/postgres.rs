@@ -660,6 +660,7 @@ impl Catalog for PostgresCatalog {
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             unique_constraints: Vec::new(),
+            global_sort_order: None,
         })
     }
 
@@ -801,6 +802,7 @@ impl Catalog for PostgresCatalog {
             check_constraints,
             foreign_keys,
             unique_constraints,
+            global_sort_order: None,
         })
     }
 
@@ -3256,6 +3258,7 @@ impl Catalog for PostgresCatalog {
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             unique_constraints: Vec::new(),
+            global_sort_order: None,
         })
     }
 
@@ -3401,6 +3404,7 @@ impl Catalog for PostgresCatalog {
             check_constraints,
             foreign_keys,
             unique_constraints,
+            global_sort_order: None,
         })
     }
 

@@ -602,6 +602,26 @@ pub trait Catalog: Send + Sync {
         Ok(())
     }
 
+    /// W3-R3: declare the user-asserted global sort order for `(project,
+    /// table)`. Set at CREATE TABLE time via `WITH (basin.sort_by = '...')`.
+    /// When `columns` is non-empty, every data file is sorted ascending on
+    /// those columns AND cross-file ranges are non-overlapping — the user
+    /// asserts monotone-append. The session reads this back and wires
+    /// `ListingOptions::with_file_sort_order` so DataFusion can skip
+    /// `SortExec` insertion before window aggregations.
+    ///
+    /// Default impl is a no-op so the stub `RestCatalog` and any future
+    /// backend stay buildable; the in-memory backend overrides this.
+    async fn set_global_sort_order(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let _ = (project, table, columns);
+        Ok(())
+    }
+
     /// Phase 6 multi-region scaffolding (ADR 0009). Pin `(project, table)`
     /// to a home region (or clear the pin with `None`). v0.1 only
     /// *records* the value; the cross-region routing / replication that

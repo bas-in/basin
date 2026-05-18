@@ -1708,6 +1708,24 @@ async fn exec_create_table(
         .set_file_format(&sess.project, &table, fmt)
         .await?;
 
+    // W3-R3: persist the user-asserted global sort order declared via
+    // `WITH (basin.sort_by = '...')`. The sanitiser already stripped this
+    // key before sqlparser saw the SQL; we recover it from the original.
+    if let Some(sort_cols) = crate::ddl::parse_create_table_sort_by(raw_sql) {
+        for c in &sort_cols {
+            if schema.field_with_name(c).is_err() {
+                return Err(basin_common::BasinError::InvalidSchema(format!(
+                    "basin.sort_by column {c:?} is not in the table schema"
+                )));
+            }
+        }
+        sess.engine
+            .config()
+            .catalog
+            .set_global_sort_order(&sess.project, &table, sort_cols)
+            .await?;
+    }
+
     if !constraints.pk_columns.is_empty()
         || !constraints.checks.is_empty()
         || !constraints.foreign_keys.is_empty()

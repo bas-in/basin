@@ -34,6 +34,7 @@ use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::logical_expr::{col, SortExpr};
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
@@ -647,6 +648,17 @@ fn listing_file_format(format: TableFileFormat) -> (Arc<dyn FileFormat>, &'stati
     }
 }
 
+/// Build `Vec<Vec<SortExpr>>` suitable for
+/// `ListingOptions::with_file_sort_order` from a global sort-column list.
+///
+/// Each column sorts ASC NULLS FIRST — the cheapest useful declaration for
+/// DataFusion's ordering-propagation pass.  The outer `Vec` wraps a single
+/// inner `Vec` (one sort key per file, not multiple alternative orderings).
+fn build_file_sort_order(cols: &[String]) -> Vec<Vec<SortExpr>> {
+    let exprs: Vec<SortExpr> = cols.iter().map(|c| col(c.as_str()).sort(true, true)).collect();
+    vec![exprs]
+}
+
 /// Re-load a table's catalog metadata and (re-)register it with the
 /// `SessionContext`. Called after CREATE / INSERT so subsequent queries see
 /// the new state.
@@ -696,7 +708,12 @@ pub(crate) async fn refresh_table(
         // already handles the same way. Prepend the synthetic `basin://engine/`
         // scheme so DataFusion routes I/O through the registered ObjectStore.
         let (file_format, file_ext) = listing_file_format(meta.file_format);
-        let listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
+        let mut listing_options =
+            ListingOptions::new(file_format).with_file_extension(file_ext);
+        if let Some(sort_cols) = meta.global_sort_order.as_deref() {
+            listing_options =
+                listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+        }
         let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
         for f in &live_files {
             let mut s = String::from(BASIN_URL_BASE);
@@ -758,7 +775,11 @@ pub(crate) async fn refresh_table_with_extra(
     all_files.extend_from_slice(extra_files);
 
     let (file_format, file_ext) = listing_file_format(meta.file_format);
-    let listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
+    let mut listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
+    if let Some(sort_cols) = meta.global_sort_order.as_deref() {
+        listing_options =
+            listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+    }
     let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(all_files.len());
     for f in &all_files {
         let mut s = String::from(BASIN_URL_BASE);
@@ -861,6 +882,7 @@ pub(crate) async fn apply_partition_pruning_for_query(
             &meta.schema,
             meta.file_format,
             &matching,
+            meta.global_sort_order.as_deref(),
         )
         .await;
     }
@@ -878,10 +900,15 @@ async fn register_pruned_listing_table(
     schema: &arrow_schema::Schema,
     file_format: TableFileFormat,
     paths: &[String],
+    global_sort_order: Option<&[String]>,
 ) -> Result<()> {
     let df_schema = Arc::new(schema_ws_to_df(schema)?);
     let (file_format, file_ext) = listing_file_format(file_format);
-    let listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
+    let mut listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
+    if let Some(sort_cols) = global_sort_order {
+        listing_options =
+            listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+    }
 
     let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(paths.len());
     for p in paths {

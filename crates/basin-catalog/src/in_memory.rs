@@ -53,6 +53,7 @@ struct TableState {
     check_constraints: Vec<CheckConstraint>,
     foreign_keys: Vec<ForeignKeyDef>,
     unique_constraints: Vec<UniqueConstraint>,
+    global_sort_order: Option<Vec<String>>,
 }
 
 impl TableState {
@@ -92,6 +93,7 @@ impl TableState {
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             unique_constraints: Vec::new(),
+            global_sort_order: None,
         }
     }
 }
@@ -251,6 +253,7 @@ impl InMemoryCatalog {
             check_constraints: state.check_constraints.clone(),
             foreign_keys: state.foreign_keys.clone(),
             unique_constraints: state.unique_constraints.clone(),
+            global_sort_order: state.global_sort_order.clone(),
         }
     }
 }
@@ -575,6 +578,26 @@ impl Catalog for InMemoryCatalog {
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
         state.file_format = format;
+        Ok(())
+    }
+
+    /// W3-R3: persist the user-asserted global sort order so that
+    /// `load_table` returns it and the session can wire
+    /// `ListingOptions::with_file_sort_order`.
+    async fn set_global_sort_order(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let qtable = QualifiedTableName::in_public(table.clone());
+        let state_arc = self.get_table_qualified(project, &qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.global_sort_order = if columns.is_empty() {
+            None
+        } else {
+            Some(columns)
+        };
         Ok(())
     }
 
@@ -1350,6 +1373,7 @@ impl Catalog for InMemoryCatalog {
                 check_constraints: s.check_constraints.clone(),
                 foreign_keys: s.foreign_keys.clone(),
                 unique_constraints: s.unique_constraints.clone(),
+                global_sort_order: s.global_sort_order.clone(),
             }
         };
 

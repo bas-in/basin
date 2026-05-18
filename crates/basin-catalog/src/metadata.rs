@@ -407,6 +407,24 @@ pub struct TableMetadata {
     /// use the secondary index file format once basin-storage ships
     /// it; today the scan is honest about its O(N) cost.
     pub unique_constraints: Vec<UniqueConstraint>,
+    /// User-asserted global sort order declared via `WITH (basin.sort_by
+    /// = 'col1,col2')` at CREATE TABLE time.
+    ///
+    /// **Semantics (user assertion, not auto-detected):** when `Some(cols)`,
+    /// every data file is sorted ascending on `cols` AND the column ranges
+    /// across files are non-overlapping (i.e. `SortPreservingMergeExec`
+    /// across files is correct without a full re-sort). This invariant
+    /// holds only if writes are strictly monotone-append on those columns.
+    /// An UPDATE that touches the sort key or an INSERT with out-of-order
+    /// keys invalidates the invariant — the engine does *not* enforce this
+    /// at write time in v0.1; the user accepts responsibility by setting
+    /// `basin.sort_by`.
+    ///
+    /// When `Some`, the session wires `ListingOptions::with_file_sort_order`
+    /// so DataFusion can propagate the ordering through the plan and avoid
+    /// inserting a `SortExec` before `WindowAggExec` / `SortMergeJoin`.
+    /// `None` is the default for every table that predates this feature.
+    pub global_sort_order: Option<Vec<String>>,
 }
 
 impl TableMetadata {
