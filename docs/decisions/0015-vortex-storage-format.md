@@ -1,7 +1,46 @@
-# 0015 — Vortex as opt-in per-table storage format (Parquet stays default)
+# 0015 — Vortex storage format (now the default; Parquet first-class selectable)
 
-- **Status:** Accepted (Parquet remains the default this phase; lead may revise if the default flips later)
+- **Status:** Accepted — **superseded by the 2026-05-18 update below: Vortex IS now the default.**
 - **Tags:** architecture, storage, file-format, performance, read-compat
+
+## 2026-05-18 Update — Vortex is the default (supersedes "Parquet stays default")
+
+The "Parquet-coupled correctness subsystems" this ADR originally deferred
+behind have all been resolved, so **Vortex is now the default on-disk
+format**; Parquet stays a first-class, per-table-selectable format via
+`WITH (basin.file_format='parquet')`.
+
+**Correctness — done, not claimed:** zero net regressions vs the
+pre-existing Parquet baseline (full per-crate test suite identical to
+baseline, `orm_compat` 19/19, `sql_support_matrix` green), and a
+`vortex_parquet_differential` harness asserts Vortex results are
+byte-identical to Parquet across point / range / inequality / IS NULL /
+string-eq / compound / aggregate / GROUP BY / ORDER BY+LIMIT / projection
+/ full-scan plus DELETE/UPDATE rewrite — on multi-file tables. The fixes:
+filter+projection applied to Vortex reads; `list_data_files` lists
+`.vortex`; Vortex `row_count`/`column_stats` from the footer (write-time
+from the in-memory batch — no blob re-open); catalog-stats file pruning in
+`fast_select`; schema-metadata reattach for CHAR/GENERATED on UPDATE;
+format-aware shard compaction; format-agnostic vector-search.
+
+**Performance — honest characterization (no "faster than Parquet
+everywhere" claim — a fast Vortex⇆Parquet smoke harness disproves that):**
+
+- **Decisive wins:** on-disk size (~1.95× smaller than ZSTD Parquet,
+  deterministic, per `RESULTS_vortex_migration.md`) and scan/aggregate
+  throughput (on-par-to-better than Parquet: full-scan ≈1.0×,
+  aggregate ≈1.0×, string-eq ~1.17×).
+- **Currently trailing a mature Parquet reader on latency** for
+  point-lookup and sort+limit shapes (point ≈0.65× after catalog-stats
+  file pruning, down from 0.11×; `ORDER BY … LIMIT` ≈0.38×). Native
+  vortex-datafusion execution / pushdown optimisation is **ongoing**;
+  Parquet remains selectable for latency-critical or lakehouse-interchange
+  tables in the meantime.
+- Vortex pushdown is type-gated (Vortex panics, uncatchably, on a
+  mixed-DType compare) — predicates are pushed only when the catalog
+  schema proves the column's Arrow type exactly matches the literal.
+
+The original opt-in design and rationale below are retained for history.
 
 ## Context
 
