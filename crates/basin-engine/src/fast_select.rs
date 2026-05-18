@@ -25,7 +25,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use basin_catalog::TableMetadata;
 use basin_common::{BasinError, PartitionKey, Result, TableName};
-use basin_storage::{Predicate, ReadOptions, ScalarValue};
+use basin_storage::{
+    evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ReadOptions,
+    ScalarValue,
+};
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, ObjectName, Query, SelectItem, SetExpr, Statement,
@@ -379,11 +382,39 @@ pub(crate) async fn execute_simple_select(
     // only the pre-rollback files — physical files from post-rollback snapshots
     // are never included (bug #41 fix). Convert each path string to an
     // `ObjectPath` for `storage.read_paths`.
-    let live_paths: Vec<object_store::path::Path> = meta
-        .live_data_files()
-        .into_iter()
-        .map(|f| object_store::path::Path::from(f.path.as_str()))
-        .collect();
+    // Catalog-stats file pruning: skip any data file whose per-file
+    // column_stats (min/max/null-count, populated at write time for BOTH
+    // Parquet and Vortex) prove the predicate cannot match a single row
+    // (`PruneOutcome::NoMatch`). Done BEFORE `read_paths` so a pruned file
+    // is never opened — decisive for Vortex, whose per-file open is far
+    // heavier than a Parquet footer read, and a win for Parquet too
+    // (point/range/compound queries touch one file instead of all).
+    let live_files = meta.live_data_files();
+    let live_paths: Vec<object_store::path::Path> = match &plan.predicate {
+        Some(pred) => {
+            let cp = CompoundPredicate::Atom(pred.clone());
+            let schema = meta.schema.as_ref();
+            live_files
+                .into_iter()
+                .filter(|f| {
+                    !matches!(
+                        evaluate_compound_for_pruning(
+                            &cp,
+                            &f.column_stats,
+                            schema,
+                            f.row_count,
+                        ),
+                        PruneOutcome::NoMatch
+                    )
+                })
+                .map(|f| object_store::path::Path::from(f.path.as_str()))
+                .collect()
+        }
+        None => live_files
+            .into_iter()
+            .map(|f| object_store::path::Path::from(f.path.as_str()))
+            .collect(),
+    };
 
     let batches = if let Some(shard) = sess.engine.config().shard.as_ref() {
         // Shard path: this read merges the in-RAM tail with the Parquet base.

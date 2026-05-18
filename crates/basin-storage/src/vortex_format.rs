@@ -70,37 +70,83 @@ pub(crate) async fn encode(batch: &RecordBatch) -> Result<Vec<u8>> {
     Ok(buf.as_slice().to_vec())
 }
 
-/// Total logical row count of a Vortex blob, read from the file footer
-/// (no data decode — symmetric with reading a Parquet footer's row count).
-/// Used by `list_data_files_with_stats` so DELETE/UPDATE row math and the
-/// constraint scans see the real per-file row count for Vortex tables.
-pub(crate) async fn row_count(bytes: &[u8]) -> Result<u64> {
-    let vf = session()
-        .open_options()
-        .open_buffer(bytes.to_vec())
-        .map_err(|e| BasinError::storage(format!("vortex: open_buffer (row_count): {e}")))?;
-    Ok(vf.row_count())
+
+/// Per-column min/max/null-count computed directly from the **in-memory
+/// Arrow batch** being written — the same source Parquet's
+/// `extract_column_stats(&bytes, batch)` uses. This is the WRITE path:
+/// it must NOT re-open the encoded Vortex blob (doing so doubled insert
+/// latency — the blob open/parse is as expensive as the encode itself).
+/// Same `ColumnStats` byte contract + type gate as [`column_stats`]
+/// (i64/f64 8-byte LE + null-count), so catalog file-pruning treats
+/// Vortex and Parquet identically; correctness gated by the
+/// Vortex⇆Parquet differential harness.
+pub(crate) fn column_stats_from_batch(
+    batch: &RecordBatch,
+) -> std::collections::BTreeMap<String, crate::data_file::ColumnStats> {
+    use arrow_array::{Array, Float64Array, Int64Array};
+
+    let mut out = std::collections::BTreeMap::new();
+    let schema = batch.schema();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        let null_count = Some(col.null_count() as u64);
+        let (min_bytes, max_bytes) = match field.data_type() {
+            DataType::Int64 => {
+                let a = col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 column");
+                (
+                    arrow::compute::min(a).map(|v| v.to_le_bytes().to_vec()),
+                    arrow::compute::max(a).map(|v| v.to_le_bytes().to_vec()),
+                )
+            }
+            DataType::Float64 => {
+                let a = col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Float64 column");
+                (
+                    arrow::compute::min(a).map(|v| v.to_le_bytes().to_vec()),
+                    arrow::compute::max(a).map(|v| v.to_le_bytes().to_vec()),
+                )
+            }
+            _ => (None, None),
+        };
+        out.insert(
+            field.name().clone(),
+            crate::data_file::ColumnStats {
+                null_count,
+                min_bytes,
+                max_bytes,
+            },
+        );
+    }
+    out
 }
 
-/// Per-column min/max/null-count for a Vortex blob, read from the file
-/// **footer only** (no data decode — symmetric with reading a Parquet
-/// footer's stats), in Basin's `ColumnStats` byte contract so the catalog
-/// file-pruning path (`evaluate_compound_for_pruning` / `file_outcome`)
-/// treats Vortex and Parquet identically.
+/// Single-`open_buffer` footer read returning BOTH the logical row count
+/// and the per-column min/max/null-count, **footer only** (no data
+/// decode). The list path (`list_data_files_with_stats`) needs both; one
+/// open instead of two halves the per-file footer cost when listing many
+/// Vortex files. (The write path uses [`column_stats_from_batch`] — it
+/// must NOT re-open the encoded blob.)
 ///
-/// **Type-gated for correctness**, exactly like the filter-pushdown:
-/// `min`/`max` bytes are emitted ONLY for columns whose Vortex dtype is
-/// precisely `i64` or `f64` (8-byte little-endian, matching
-/// `reader::decode_le_i64` / `decode_le_f64`). Any other type leaves
-/// min/max `None` → that column simply doesn't participate in file
-/// pruning (correct, just unoptimised) rather than risk an encoding
-/// mismatch that could wrongly prune a matching file. `null_count` is
-/// safe for every column. The Vortex⇆Parquet differential harness
-/// (`tests/vortex_parquet_differential.rs`) is the correctness gate: a
-/// wrongly pruned file shows up there as a mismatch vs the Parquet oracle.
-pub(crate) async fn column_stats(
+/// Stats use Basin's `ColumnStats` byte contract so the catalog
+/// file-pruning path (`evaluate_compound_for_pruning` / `file_outcome`)
+/// treats Vortex and Parquet identically, and are **type-gated for
+/// correctness** exactly like the filter-pushdown: `min`/`max` bytes are
+/// emitted ONLY for columns whose Vortex dtype is precisely `i64`/`f64`
+/// (8-byte little-endian, matching `reader::decode_le_i64`/`decode_le_f64`);
+/// any other type leaves min/max `None` (no prune participation) rather
+/// than risk an encoding mismatch that could wrongly prune a matching
+/// file. The Vortex⇆Parquet differential harness is the correctness gate.
+pub(crate) async fn footer_meta(
     bytes: &[u8],
-) -> Result<std::collections::BTreeMap<String, crate::data_file::ColumnStats>> {
+) -> Result<(
+    u64,
+    std::collections::BTreeMap<String, crate::data_file::ColumnStats>,
+)> {
     use vortex_array::dtype::{DType, PType};
     use vortex_array::expr::stats::Stat;
 
@@ -108,16 +154,17 @@ pub(crate) async fn column_stats(
     let vf = session()
         .open_options()
         .open_buffer(bytes.to_vec())
-        .map_err(|e| BasinError::storage(format!("vortex: open_buffer (stats): {e}")))?;
+        .map_err(|e| BasinError::storage(format!("vortex: open_buffer (footer): {e}")))?;
+    let rc = vf.row_count();
 
     // Top-level struct field names, in field order (the same order the
     // file statistics are recorded in).
     let names: Vec<String> = match vf.dtype() {
         DType::Struct(sd, _) => sd.names().iter().map(|n| n.to_string()).collect(),
-        _ => return Ok(out),
+        _ => return Ok((rc, out)),
     };
     let Some(fs) = vf.file_stats() else {
-        return Ok(out);
+        return Ok((rc, out));
     };
 
     for (idx, name) in names.iter().enumerate() {
@@ -167,7 +214,7 @@ pub(crate) async fn column_stats(
             );
         }
     }
-    Ok(out)
+    Ok((rc, out))
 }
 
 /// Decode a Vortex byte blob back to `RecordBatch`es. One `RecordBatch` is

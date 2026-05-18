@@ -180,13 +180,12 @@ pub(crate) async fn list_data_files_with_stats(
                         Ok(obj) => obj.bytes().await.ok(),
                         Err(_) => None,
                     };
+                    // One footer open returns BOTH row_count and stats.
                     let (rc, stats) = match bytes {
-                        Some(b) => (
-                            crate::vortex_format::row_count(&b).await.ok(),
-                            crate::vortex_format::column_stats(&b)
-                                .await
-                                .unwrap_or_default(),
-                        ),
+                        Some(b) => match crate::vortex_format::footer_meta(&b).await {
+                            Ok((n, s)) => (Some(n), s),
+                            Err(_) => (None, BTreeMap::new()),
+                        },
                         None => (None, BTreeMap::new()),
                     };
                     (i, rc, stats)

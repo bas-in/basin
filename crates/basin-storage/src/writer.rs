@@ -215,11 +215,11 @@ pub(crate) async fn write_batch_with_options(
     // pruning. Parquet behaviour is unchanged.
     let column_stats = match opts.file_format {
         FileFormat::Parquet => extract_column_stats(&bytes, batch_to_write)?,
-        // Footer-only Vortex stats in the same byte contract as Parquet so
-        // the catalog file-pruning path treats both identically. Type-gated
-        // (i64/f64/null-count) for correctness; validated by the
-        // Vortex⇆Parquet differential harness.
-        FileFormat::Vortex => crate::vortex_format::column_stats(&bytes).await?,
+        // Vortex stats from the in-memory batch (same source Parquet uses)
+        // — NOT by re-opening the encoded blob, which doubled insert
+        // latency. Same byte contract / type gate; differential-harness
+        // gated.
+        FileFormat::Vortex => crate::vortex_format::column_stats_from_batch(batch_to_write),
     };
 
     // Envelope-encrypt the body if a provider is attached. The on-disk
