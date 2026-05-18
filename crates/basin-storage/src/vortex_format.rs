@@ -70,14 +70,33 @@ pub(crate) async fn encode(batch: &RecordBatch) -> Result<Vec<u8>> {
     Ok(buf.as_slice().to_vec())
 }
 
-/// Decode a Vortex byte blob back to `RecordBatch`es with the given Arrow
-/// schema (schema-driven, like the Parquet read path). One `RecordBatch` is
+/// Decode a Vortex byte blob back to `RecordBatch`es. One `RecordBatch` is
 /// produced per Vortex chunk in the file.
-pub(crate) async fn decode(bytes: &[u8], schema: Arc<Schema>) -> Result<Vec<RecordBatch>> {
+///
+/// `schema` is **optional and self-describing**, mirroring Parquet's footer:
+/// * `Some(s)` — the table-aware read path supplies the authoritative
+///   catalog schema; it drives projection and exact-type fidelity (e.g.
+///   timestamp timezone, dictionary types).
+/// * `None` — Basin's schema-less internal read paths (continuous-view
+///   refresh, cron-job state, system tables). The Arrow schema is recovered
+///   from the Vortex file's own `DType`, so a Vortex file is decodable with
+///   nothing but its bytes, exactly like a Parquet file.
+pub(crate) async fn decode(bytes: &[u8], schema: Option<Arc<Schema>>) -> Result<Vec<RecordBatch>> {
     let vf = session()
         .open_options()
         .open_buffer(bytes.to_vec())
         .map_err(|e| BasinError::storage(format!("vortex: open_buffer: {e}")))?;
+
+    // Self-describing fallback: recover the Arrow schema from the file's
+    // embedded DType when the caller supplies none. The encode path writes a
+    // NonNullable top-level struct, so `to_arrow_schema` succeeds; per-column
+    // nullability/types are carried by the struct's field DTypes.
+    let arrow_schema: Arc<Schema> = match schema {
+        Some(s) => s,
+        None => Arc::new(vf.dtype().to_arrow_schema().map_err(|e| {
+            BasinError::storage(format!("vortex: infer arrow schema from file dtype: {e}"))
+        })?),
+    };
 
     let stream = vf
         .scan()
@@ -96,7 +115,7 @@ pub(crate) async fn decode(bytes: &[u8], schema: Arc<Schema>) -> Result<Vec<Reco
         // internally via the legacy session).
         let struct_array = chunk.to_struct();
         let rb = struct_array
-            .into_record_batch_with_schema(schema.as_ref())
+            .into_record_batch_with_schema(arrow_schema.as_ref())
             .map_err(|e| {
                 BasinError::storage(format!("vortex: into_record_batch_with_schema: {e}"))
             })?;
@@ -112,7 +131,7 @@ mod tests {
 
     use arrow_array::{
         Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
-        StringArray, TimestampMicrosecondArray,
+        StringArray, StringViewArray, TimestampMicrosecondArray,
     };
     use arrow_schema::{DataType, Field, TimeUnit};
 
@@ -191,7 +210,9 @@ mod tests {
         let bytes = encode(&original).await.expect("encode");
         assert!(!bytes.is_empty(), "encoded blob must be non-empty");
 
-        let decoded = decode(&bytes, schema.clone()).await.expect("decode");
+        let decoded = decode(&bytes, Some(schema.clone()))
+            .await
+            .expect("decode");
 
         // All rows come back; merge chunks (this fixture is a single chunk).
         let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
@@ -323,6 +344,111 @@ mod tests {
         assert_eq!(
             g_vals, o_vals,
             "FixedSizeList<Float32,4> values must round-trip (vector column)"
+        );
+    }
+
+    /// Self-describing decode: with `schema = None` the Arrow schema is
+    /// recovered from the Vortex file's own DType (Parquet-footer-symmetric).
+    /// This is the path Basin's schema-less internal readers
+    /// (continuous-view refresh, cron-job state, system tables) take. The
+    /// simple types those paths use must round-trip with no external schema.
+    #[tokio::test]
+    async fn self_describing_decode_without_schema() {
+        let (_schema, original) = sample_batch();
+        let bytes = encode(&original).await.expect("encode");
+
+        let decoded = decode(&bytes, None).await.expect("schema-less decode");
+
+        let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, original.num_rows(), "row count must match");
+        let got = &decoded[0];
+
+        // Field names recovered from the file's DType, in order.
+        let got_schema = got.schema();
+        let got_names: Vec<&str> = got_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            got_names,
+            vec!["id", "note", "score", "flag", "ts", "embedding"],
+            "field names must be recovered from the file DType"
+        );
+
+        // The plain types Basin's internal read paths actually use must be
+        // value-identical with no external schema. (Timestamp-tz and
+        // FixedSizeList are exactly why the table-aware path passes the
+        // authoritative catalog schema; they are asserted in the
+        // schema-driven test, not here.)
+        let g_id = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64 inferred");
+        let o_id = original
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(g_id, o_id, "Int64 must round-trip self-describing");
+
+        // Vortex's DType→Arrow inference maps its string type to the
+        // zero-copy `Utf8View` (a first-class Arrow type DataFusion handles
+        // natively) rather than `Utf8`. The physical layout differs; the
+        // logical values, incl. nulls, must be identical. Exact-type
+        // coercion to the catalog's `Utf8` is the table-aware path's job.
+        let g_note = got
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("note inferred as Utf8View");
+        let o_note = original
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(g_note.len(), o_note.len(), "note row count");
+        for r in 0..o_note.len() {
+            assert_eq!(
+                g_note.is_null(r),
+                o_note.is_null(r),
+                "note null-ness must match at row {r}"
+            );
+            if !o_note.is_null(r) {
+                assert_eq!(
+                    g_note.value(r),
+                    o_note.value(r),
+                    "note value must match at row {r}"
+                );
+            }
+        }
+
+        let g_score = got
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("score Float64 inferred");
+        let o_score = original
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(g_score, o_score, "Float64 must round-trip self-describing");
+
+        let g_flag = got
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("flag Boolean inferred");
+        let o_flag = original
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(
+            g_flag, o_flag,
+            "Boolean incl. nulls must round-trip self-describing"
         );
     }
 }

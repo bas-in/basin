@@ -500,19 +500,17 @@ async fn read_one(
     // strictly opt-in per table (`WITH (basin.file_format='vortex')`); the
     // default format is unchanged.
     //
-    // Vortex decode is schema-driven (mirrors how the Parquet path resolves
-    // its read schema from the catalog): we hand `vortex_format::decode` the
-    // same `Arc<Schema>` the Parquet path threads in as `catalog_schema`.
-    // Callers without a catalog schema (`read_file` / `read_paths`) can't
-    // decode a Vortex file — that requires the table's Arrow schema — so we
-    // surface a clear error rather than guessing.
+    // Vortex decode is self-describing, symmetric with Parquet's footer:
+    // when the table-aware path supplies the catalog schema we pass it
+    // through (authoritative for projection / exact-type fidelity); when a
+    // schema-less caller (`read_file` / `read_paths`: continuous-view
+    // refresh, cron-job state, system tables) passes `None`, the decoder
+    // recovers the Arrow schema from the Vortex file's own DType. A Vortex
+    // file is therefore decodable from nothing but its bytes, exactly like
+    // a Parquet file — so Vortex is safe on every read path, not just the
+    // table-aware one.
     if path.as_ref().ends_with(".vortex") {
-        let schema = catalog_schema.clone().ok_or_else(|| {
-            BasinError::storage(format!(
-                "vortex read {path}: catalog schema required to decode Vortex files \
-                 (use the table-aware read path)"
-            ))
-        })?;
+        let schema = catalog_schema.clone();
 
         // Two byte-acquisition paths must feed the Vortex decoder:
         //   (a) envelope-encrypted: a `<path>.wrapped` sidecar exists, so we
