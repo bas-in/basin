@@ -225,8 +225,8 @@ async fn vortex_vs_parquet_many_shapes() {
 
     let total = n_batches() * rows_per_batch();
     let nb = (total + BATCH - 1) / BATCH;
-    build(&sess, "tp", " WITH (basin.file_format='parquet')", total).await;
-    build(&sess, "tv", "", total).await; // default = Vortex
+    build(&sess, "tp", " WITH (basin.file_format='parquet', basin.sort_by='id')", total).await;
+    build(&sess, "tv", " WITH (basin.sort_by='id')", total).await; // default = Vortex; sort_by enables file_sort_order
     build_dim(&sess, "dp", " WITH (basin.file_format='parquet')").await;
     build_dim(&sess, "dv", "").await;
 
@@ -928,8 +928,8 @@ async fn vortex_vs_parquet_size_matrix() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
-        build(&sess, "tp", " WITH (basin.file_format='parquet')", sz).await;
-        build(&sess, "tv", "", sz).await;
+        build(&sess, "tp", " WITH (basin.file_format='parquet', basin.sort_by='id')", sz).await;
+        build(&sess, "tv", " WITH (basin.sort_by='id')", sz).await;
         build_dim(&sess, "dp", " WITH (basin.file_format='parquet')").await;
         build_dim(&sess, "dv", "").await;
         let (lo, hi, mid) = (sz / 4, sz / 4 + sz / 2, sz / 2 + 7);
