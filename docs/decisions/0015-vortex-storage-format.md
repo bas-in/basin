@@ -105,13 +105,17 @@ read-compat is preserved for every default (Parquet) table.
   revisit only if in-place conversion ships and needs a transitional
   both-formats-readable window.
 - **Vortex as the global default.** Blocked, empirically (see Alternatives →
-  "Flip the default to Vortex now"): the schema-less internal read paths
-  (`read_file`/`read_paths`: continuous-view refresh, cron state, system
-  tables) cannot decode Vortex without an externally-supplied Arrow schema, so
-  a blanket default regressed 33 test targets. Prerequisite: a self-describing
-  Vortex decode path (or schema-threading for every internal reader) plus a
-  Parquet export lane for external read-compat. Until then Vortex is opt-in
-  only and Parquet remains the default.
+  "Flip the default to Vortex now"). The self-describing-decode +
+  view-normalisation prerequisites are **done and shipped** (they harden the
+  opt-in path: `vortex_format::decode` recovers the schema from the file's
+  own DType and normalises view types). The remaining blockers are
+  Parquet-coupled correctness subsystems — UNIQUE/PK/FK enforcement scans,
+  predicate filtering/pruning, RLS `WITH CHECK`, stats-driven query routing,
+  and `basin-shard` compaction — which must each be audited/reimplemented for
+  Vortex, plus a Parquet export lane for external read-compat. Until then
+  Vortex is opt-in only and Parquet remains the default. (Empirical
+  progression on the prototype flip: 33 → 25 → 20 failing targets vs. an ~8
+  pre-existing baseline; the residual ~12 are the subsystems above.)
 
 ## Alternatives considered
 
@@ -122,24 +126,36 @@ this phase on two grounds, the second empirically proven:
 
 1. It silently breaks Iceberg / Athena / Spark / DuckDB read-compat for every
    table, which is a wedge-load-bearing property.
-2. **Vortex is not self-describing on Basin's non-table-aware read paths.**
-   The Vortex decode path requires the table's Arrow schema to be supplied
-   externally (Parquet embeds its schema in the file footer; Vortex, as
-   integrated, does not recover it standalone). Basin's table-aware SELECT
-   path threads the catalog schema and works (validated by codec round-trip
-   and the end-to-end `vortex_select` test). But internal/system read paths —
-   continuous-view incremental refresh, cron-job state, and other
-   `read_file`/`read_paths` callers that pass no schema — error with
-   `catalog schema required to decode Vortex files`. Flipping the global
-   default routed those paths onto Vortex and regressed **33 test targets**
-   (vs. ~8 pre-existing baseline failures); the opt-in path itself has **zero**
-   regressions. The numbers were captured on the prototype flip and the flip
-   was reverted.
+2. **A long tail of Parquet-coupled correctness subsystems.** The flip was
+   prototyped, measured, and iteratively hardened end-to-end; the regression
+   count was driven down **33 → 25 → 20** by two real fixes that *shipped*
+   (and strengthen the opt-in feature): a **self-describing Vortex decode**
+   path (`decode` recovers the Arrow schema from the file's own `DType` via
+   `vf.dtype().to_arrow_schema()` when no catalog schema is supplied —
+   symmetric with Parquet's footer), and **view-type normalisation**
+   (`Utf8View`/`BinaryView` → canonical `Utf8`/`Binary`, since the engine
+   downcasts to `StringArray` everywhere). Those resolved the schema-
+   availability and type-drift classes. The **residual ~12 regressions vs.
+   the ~8-target baseline are distinct subsystems that assume Parquet
+   semantics**, several of them *silent correctness* failures, not crashes:
+   - UNIQUE / PRIMARY KEY / FK enforcement (full-table-scan pre-write checks
+     do not detect duplicates/violations on Vortex tables — a data-integrity
+     failure: a dup INSERT is accepted).
+   - Predicate filtering on Vortex tables can return *all* rows for a
+     `WHERE` (decode-then-filter not wired through; Parquet row-group/stats
+     pruning has no Vortex equivalent).
+   - RLS `WITH CHECK` enforcement.
+   - Stats-driven analytical query routing (keyed off Parquet column stats /
+     row-group metadata Vortex tables don't emit).
+   - WAL → data-file compaction (`basin-shard`) is Parquet-hardcoded.
 
-Revisiting the default requires either a self-describing Vortex read path for
-the schema-less internal callers, or routing every internal reader through a
-catalog-schema-aware path, plus a Parquet export lane for external read-compat.
-Tracked under Deferred below.
+Revisiting the default requires auditing/reimplementing each of those
+subsystems for Vortex (constraint-scan, predicate pushdown + pruning, RLS,
+stats/routing, compaction) **plus** a Parquet export lane for external
+read-compat. The self-describing-decode prerequisite is **done**; the
+correctness-subsystem work is a bounded but multi-subsystem effort. Tracked
+under Deferred below. The flip itself was reverted; the two decode fixes
+were kept because they make the *opt-in* path robust on every read path.
 
 **Mixed-format tables (per-file format within a table).**
 Would allow gradual in-place migration of a populated table. Rejected for now:
