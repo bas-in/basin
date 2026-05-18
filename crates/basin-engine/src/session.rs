@@ -621,9 +621,16 @@ fn listing_file_format(format: TableFileFormat) -> (Arc<dyn FileFormat>, &'stati
         // `projection_pushdown` so a projected scan reads only the needed
         // columns natively instead of DataFusion projecting post-scan.
         TableFileFormat::Vortex => {
+            // `scan_concurrency` parallelises per-file row-chunk splits so
+            // range/group_by/order_by/window/join shapes overlap I/O with
+            // decode.  8 is a safe constant that spans both local-dev
+            // (usually ≤8 cores) and cloud instances without over-saturating
+            // the object-store connection pool.  `num_cpus` is not a
+            // workspace dep, so we use a literal rather than a runtime probe.
             let factory = vortex_datafusion::VortexFormatFactory::new().with_options(
                 vortex_datafusion::VortexTableOptions {
                     projection_pushdown: true,
+                    scan_concurrency: Some(8),
                     ..Default::default()
                 },
             );
