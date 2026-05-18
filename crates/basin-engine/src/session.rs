@@ -532,6 +532,14 @@ pub(crate) async fn open(
     // plus every Basin stateless UDF as `Arc<ScalarUDF>` handles; cloning
     // the Vec here is O(n) Arc ref-count bumps — no struct allocation.
     let udf_cache = engine.inner.udf_cache.as_ref();
+    // Prepend our ANY/ALL → scalar-subquery rule so it fires before
+    // DataFusion's RewriteSetComparison decomposes uncorrelated ANY/ALL
+    // into LeftMark NestedLoopJoin plans.
+    let mut optimizer_rules = datafusion::optimizer::Optimizer::default().rules;
+    optimizer_rules.insert(
+        0,
+        std::sync::Arc::new(crate::any_all_rewrite::AnyAllToScalarSubquery),
+    );
     let state = SessionStateBuilder::new()
         .with_config(session_cfg)
         // Non-UDF defaults: table factories, file formats, expr planners,
@@ -539,6 +547,8 @@ pub(crate) async fn open(
         // aggregate_functions below with the combined (DF defaults + Basin)
         // cache, so `with_default_features` is not called for those.
         .with_default_features()
+        // Inject our prepended optimizer rule list.
+        .with_optimizer_rules(optimizer_rules)
         // Replace the default scalar/aggregate sets with the combined cache.
         // `with_scalar_functions` overwrites whatever `with_default_features`
         // set; since the cache includes DF's own defaults, nothing is lost.

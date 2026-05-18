@@ -557,6 +557,7 @@ pub enum ExecResult {
 
 mod advisory_lock;
 mod alter;
+mod any_all_rewrite;
 mod constraints;
 mod convert;
 mod cost_check;
