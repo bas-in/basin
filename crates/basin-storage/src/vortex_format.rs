@@ -9,7 +9,7 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 use basin_common::{BasinError, Result};
 use futures::StreamExt;
 use vortex_array::arrow::FromArrowArray;
@@ -91,11 +91,23 @@ pub(crate) async fn decode(bytes: &[u8], schema: Option<Arc<Schema>>) -> Result<
     // embedded DType when the caller supplies none. The encode path writes a
     // NonNullable top-level struct, so `to_arrow_schema` succeeds; per-column
     // nullability/types are carried by the struct's field DTypes.
+    //
+    // Vortex's DType→Arrow inference maps its string/binary types to the
+    // zero-copy *view* variants (`Utf8View`/`BinaryView`). Basin's engine is
+    // canonically `Utf8`/`Binary` everywhere (constraint/FK/PK scans, cron
+    // job columns, RLS, events all downcast to `StringArray`), so a Vortex
+    // file decoded on an internal path must present the same Arrow types a
+    // Parquet file would. Normalise the inferred schema's view types to
+    // their non-view equivalents; `into_record_batch_with_schema` then casts
+    // the data accordingly, making Vortex a true drop-in.
     let arrow_schema: Arc<Schema> = match schema {
         Some(s) => s,
-        None => Arc::new(vf.dtype().to_arrow_schema().map_err(|e| {
-            BasinError::storage(format!("vortex: infer arrow schema from file dtype: {e}"))
-        })?),
+        None => {
+            let inferred = vf.dtype().to_arrow_schema().map_err(|e| {
+                BasinError::storage(format!("vortex: infer arrow schema from file dtype: {e}"))
+            })?;
+            Arc::new(normalize_view_types_schema(&inferred))
+        }
     };
 
     let stream = vf
@@ -125,13 +137,56 @@ pub(crate) async fn decode(bytes: &[u8], schema: Option<Arc<Schema>>) -> Result<
     Ok(batches)
 }
 
+/// Rewrite a single Arrow [`DataType`], replacing the zero-copy *view*
+/// string/binary variants with Basin's canonical non-view equivalents and
+/// recursing through nested containers. Everything else is returned
+/// unchanged. Keeps Vortex's self-describing schema type-compatible with the
+/// Parquet read path the rest of the engine assumes.
+fn normalize_view_dtype(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Utf8View => DataType::Utf8,
+        DataType::BinaryView => DataType::Binary,
+        DataType::List(f) => DataType::List(normalize_view_field(f).into()),
+        DataType::LargeList(f) => DataType::LargeList(normalize_view_field(f).into()),
+        DataType::FixedSizeList(f, n) => {
+            DataType::FixedSizeList(normalize_view_field(f).into(), *n)
+        }
+        DataType::Struct(fields) => {
+            DataType::Struct(fields.iter().map(|f| normalize_view_field(f)).collect())
+        }
+        DataType::Map(f, sorted) => DataType::Map(normalize_view_field(f).into(), *sorted),
+        DataType::Dictionary(k, v) => {
+            DataType::Dictionary(k.clone(), Box::new(normalize_view_dtype(v)))
+        }
+        other => other.clone(),
+    }
+}
+
+fn normalize_view_field(f: &Field) -> Field {
+    Field::new(f.name(), normalize_view_dtype(f.data_type()), f.is_nullable())
+        .with_metadata(f.metadata().clone())
+}
+
+/// Normalise every field of an inferred Vortex schema (see
+/// [`normalize_view_dtype`]).
+fn normalize_view_types_schema(schema: &Schema) -> Schema {
+    Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| normalize_view_field(f))
+            .collect::<Vec<_>>(),
+    )
+    .with_metadata(schema.metadata().clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use arrow_array::{
         Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
-        StringArray, StringViewArray, TimestampMicrosecondArray,
+        StringArray, TimestampMicrosecondArray,
     };
     use arrow_schema::{DataType, Field, TimeUnit};
 
@@ -210,9 +265,7 @@ mod tests {
         let bytes = encode(&original).await.expect("encode");
         assert!(!bytes.is_empty(), "encoded blob must be non-empty");
 
-        let decoded = decode(&bytes, Some(schema.clone()))
-            .await
-            .expect("decode");
+        let decoded = decode(&bytes, Some(schema.clone())).await.expect("decode");
 
         // All rows come back; merge chunks (this fixture is a single chunk).
         let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
@@ -393,36 +446,25 @@ mod tests {
             .unwrap();
         assert_eq!(g_id, o_id, "Int64 must round-trip self-describing");
 
-        // Vortex's DType→Arrow inference maps its string type to the
-        // zero-copy `Utf8View` (a first-class Arrow type DataFusion handles
-        // natively) rather than `Utf8`. The physical layout differs; the
-        // logical values, incl. nulls, must be identical. Exact-type
-        // coercion to the catalog's `Utf8` is the table-aware path's job.
+        // Vortex's DType→Arrow inference yields `Utf8View`; the decoder
+        // normalises it back to Basin's canonical `Utf8` so a self-described
+        // Vortex file presents the exact Arrow types a Parquet file would
+        // (the engine downcasts to `StringArray` everywhere). Value + null
+        // identity, no external schema.
         let g_note = got
             .column(1)
             .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("note inferred as Utf8View");
+            .downcast_ref::<StringArray>()
+            .expect("note normalised to Utf8 (not Utf8View)");
         let o_note = original
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(g_note.len(), o_note.len(), "note row count");
-        for r in 0..o_note.len() {
-            assert_eq!(
-                g_note.is_null(r),
-                o_note.is_null(r),
-                "note null-ness must match at row {r}"
-            );
-            if !o_note.is_null(r) {
-                assert_eq!(
-                    g_note.value(r),
-                    o_note.value(r),
-                    "note value must match at row {r}"
-                );
-            }
-        }
+        assert_eq!(
+            g_note, o_note,
+            "Utf8 incl. nulls must round-trip self-describing (view-normalised)"
+        );
 
         let g_score = got
             .column(2)
