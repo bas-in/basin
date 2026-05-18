@@ -610,6 +610,7 @@ mod select_advanced;
 mod seq_ddl;
 mod seq_udf;
 mod session;
+mod sort_streaming_limit;
 mod sql_functions;
 mod string_dt_udf;
 mod string_more_udf;

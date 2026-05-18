@@ -554,6 +554,14 @@ pub(crate) async fn open(
         // set; since the cache includes DF's own defaults, nothing is lost.
         .with_scalar_functions(udf_cache.scalar.clone())
         .with_aggregate_functions(udf_cache.aggregate.clone())
+        // Appended after all DF default physical optimizer rules: force
+        // single-partition streaming when OFFSET sits above a sort that
+        // matches the file's natural sort order.  The rule runs last so
+        // EnforceDistribution / EnforceSorting have already finished their
+        // fan-out decisions; we then collapse when the pattern allows it.
+        .with_physical_optimizer_rule(std::sync::Arc::new(
+            crate::sort_streaming_limit::SortStreamingLimit::new(),
+        ))
         .build();
     let ctx = SessionContext::new_with_state(state);
     let url = Url::parse(BASIN_URL_BASE)
