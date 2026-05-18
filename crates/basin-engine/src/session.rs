@@ -542,6 +542,10 @@ pub(crate) async fn open(
         0,
         std::sync::Arc::new(crate::any_all_rewrite::AnyAllToScalarSubquery),
     );
+    optimizer_rules.insert(
+        0,
+        std::sync::Arc::new(crate::union_scan_collapse::UnionScanCollapse),
+    );
 
     // Build a per-session RuntimeEnv that plugs in the process-wide file
     // metadata cache. Vortex/Parquet footer parses survive session recycling —

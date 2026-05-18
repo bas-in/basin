@@ -634,6 +634,7 @@ mod truncate;
 mod type_ddl;
 mod types;
 mod udf;
+mod union_scan_collapse;
 mod vector_planner;
 mod vector_search;
 mod view_ddl;
