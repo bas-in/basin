@@ -819,7 +819,18 @@ async fn perf_smoke_pg_10k() {
         "basin point query p50 {basin_point_ms:.1}ms — catastrophic regression"
     );
 
+    // Clean up the PG schema explicitly on the live async connection,
+    // then DEFUSE the guard with `mem::forget`. `SchemaGuard::drop` does
+    // `thread::spawn(|| handle.block_on(..)).join()`, a re-entrant
+    // block_on + blocking join on a runtime worker that deadlocks under
+    // PG-lock contention — that is the post-print "freeze" this test hit.
+    // The explicit async drop here is the real cleanup; the guard's
+    // unsound Drop must never run for this test.
+    let _ = pg
+        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await;
+    std::mem::forget(_guard);
+
     instance.bg.shutdown().await;
     instance.wal.close().await.unwrap();
-    drop(_guard);
 }
