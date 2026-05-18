@@ -26,8 +26,21 @@ use tempfile::TempDir;
 // Tuned so the whole test is a few seconds: enough rows + files that
 // timing is meaningful and file/chunk pruning is exercised, small enough
 // to stay in the loop.
-const N_BATCHES: i64 = 12;
-const ROWS_PER_BATCH: i64 = 2_000; // 24k rows total, ~12 data files/table
+// Scale is env-overridable so the same harness serves both the fast loop
+// (default 24k / ~12 files) and a larger comparison run, e.g.
+// `BASIN_SMOKE_BATCHES=20 BASIN_SMOKE_ROWS=5000` → 100k / ~20 files.
+fn n_batches() -> i64 {
+    std::env::var("BASIN_SMOKE_BATCHES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12)
+}
+fn rows_per_batch() -> i64 {
+    std::env::var("BASIN_SMOKE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000)
+}
 const REPS: usize = 5; // median of N timed runs per shape
 
 fn engine_in(dir: &TempDir) -> Engine {
@@ -116,10 +129,11 @@ async fn build(sess: &ProjectSession, table: &str, with: &str) {
         ),
     )
     .await;
-    for batch in 0..N_BATCHES {
+    let rpb = rows_per_batch();
+    for batch in 0..n_batches() {
         let mut vals = String::new();
-        for i in 0..ROWS_PER_BATCH {
-            let id = batch * ROWS_PER_BATCH + i;
+        for i in 0..rpb {
+            let id = batch * rpb + i;
             if !vals.is_empty() {
                 vals.push(',');
             }
@@ -154,7 +168,8 @@ async fn vortex_vs_parquet_many_shapes() {
     build(&sess, "tp", " WITH (basin.file_format='parquet')").await;
     build(&sess, "tv", "").await; // default = Vortex
 
-    let total = N_BATCHES * ROWS_PER_BATCH;
+    let nb = n_batches();
+    let total = nb * rows_per_batch();
     let lo = total / 4;
     let hi = lo + total / 2;
     let mid = total / 2 + 7;
@@ -196,7 +211,7 @@ async fn vortex_vs_parquet_many_shapes() {
     ];
 
     println!(
-        "\n[VORTEX vs PARQUET smoke — {total} rows, {N_BATCHES} files/table, median of {REPS}]\n\
+        "\n[VORTEX vs PARQUET smoke — {total} rows, {nb} files/table, median of {REPS}]\n\
          {:<22}{:>12}{:>12}{:>14}",
         "shape", "parquet_ms", "vortex_ms", "ratio(p/v)"
     );
