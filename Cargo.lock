@@ -898,6 +898,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "vortex-datafusion",
 ]
 
 [[package]]
@@ -6971,6 +6972,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vortex"
+version = "0.70.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6a9250fbf9b121d5204d7367866b4177183cf924467fbc5a783b7ee159ef9e8"
+dependencies = [
+ "vortex-alp",
+ "vortex-array",
+ "vortex-btrblocks",
+ "vortex-buffer",
+ "vortex-bytebool",
+ "vortex-datetime-parts",
+ "vortex-decimal-byte-parts",
+ "vortex-error",
+ "vortex-fastlanes",
+ "vortex-file",
+ "vortex-flatbuffers",
+ "vortex-fsst",
+ "vortex-io",
+ "vortex-ipc",
+ "vortex-layout",
+ "vortex-mask",
+ "vortex-metrics",
+ "vortex-pco",
+ "vortex-proto",
+ "vortex-runend",
+ "vortex-scan",
+ "vortex-sequence",
+ "vortex-session",
+ "vortex-sparse",
+ "vortex-utils",
+ "vortex-zigzag",
+ "vortex-zstd",
+]
+
+[[package]]
 name = "vortex-alp"
 version = "0.70.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7131,6 +7167,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-datafusion"
+version = "0.70.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe0125954a3b6ad4b57cc294a7d713c5d2494ad2288c2c351a59a9b685fd2c9c"
+dependencies = [
+ "arrow-schema",
+ "async-trait",
+ "datafusion-catalog",
+ "datafusion-common",
+ "datafusion-common-runtime",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-adapter",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "datafusion-pruning",
+ "futures",
+ "itertools 0.14.0",
+ "object_store",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "vortex",
+ "vortex-utils",
+]
+
+[[package]]
 name = "vortex-datetime-parts"
 version = "0.70.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7169,7 +7235,9 @@ dependencies = [
  "arrow-schema",
  "flatbuffers",
  "jiff",
+ "object_store",
  "prost 0.14.3",
+ "tokio",
 ]
 
 [[package]]
@@ -7203,9 +7271,11 @@ dependencies = [
  "itertools 0.14.0",
  "kanal",
  "moka",
+ "object_store",
  "oneshot",
  "parking_lot",
  "pin-project-lite",
+ "tokio",
  "tracing",
  "vortex-alp",
  "vortex-array",
@@ -7273,6 +7343,7 @@ dependencies = [
  "futures",
  "glob",
  "kanal",
+ "object_store",
  "oneshot",
  "parking_lot",
  "pin-project-lite",
@@ -7286,6 +7357,24 @@ dependencies = [
  "vortex-session",
  "vortex-utils",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "vortex-ipc"
+version = "0.70.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "445b41227cfd4e4ab2ed805af34eb2843a5643f96957bca2538a9976d144ddd0"
+dependencies = [
+ "bytes",
+ "flatbuffers",
+ "futures",
+ "itertools 0.14.0",
+ "pin-project-lite",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-flatbuffers",
+ "vortex-session",
 ]
 
 [[package]]
@@ -7314,6 +7403,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "sketches-ddsketch",
  "termtree",
+ "tokio",
  "tracing",
  "vortex-array",
  "vortex-btrblocks",
@@ -7382,6 +7472,7 @@ version = "0.70.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab758ef0a632235a9c2b0d84936a196fdbe4c977b76ae26bf61551ea06bb978f"
 dependencies = [
+ "arrow-array",
  "itertools 0.14.0",
  "num-traits",
  "prost 0.14.3",

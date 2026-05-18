@@ -24,6 +24,9 @@ arrow-select.workspace = true
 parquet.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
+# Vortex DataFusion integration (#162 — read path for opt-in Vortex tables).
+# 0.70 targets datafusion 53 / arrow 58 = the workspace pins exactly.
+vortex-datafusion = "0.70"
 sqlparser.workspace = true
 object_store.workspace = true
 thiserror.workspace = true
