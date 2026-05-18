@@ -693,15 +693,71 @@ pub(crate) fn batch_ws_to_df(batch: &ws_array::RecordBatch) -> Result<df_array::
         .map_err(|e| BasinError::internal(format!("rebuild df batch: {e}")))
 }
 
+/// Returns `true` when `dt` (a DataFusion-side schema type) requires actual
+/// per-row conversion before it can be handed to the workspace-arrow side.
+///
+/// The three non-identity mappings in `data_type_df_to_ws` are:
+///   • `LargeUtf8`  → `Utf8`   (different offsets width + layout)
+///   • `Utf8View`   → `Utf8`   (view-format buffer layout)
+///   • `BinaryView` → `Binary` (view-format buffer layout)
+///
+/// Everything else is structurally identical between the two "sides" (which
+/// resolve to the same arrow-array 58.x crate, so the types are literally the
+/// same Rust type).  Nested types are checked recursively.
+fn dtype_needs_conversion(dt: &df_schema::DataType) -> bool {
+    match dt {
+        df_schema::DataType::LargeUtf8
+        | df_schema::DataType::Utf8View
+        | df_schema::DataType::BinaryView => true,
+        df_schema::DataType::List(child)
+        | df_schema::DataType::LargeList(child)
+        | df_schema::DataType::FixedSizeList(child, _) => {
+            dtype_needs_conversion(child.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` when any column in `batch` requires conversion.
+fn batch_needs_conversion(batch: &df_array::RecordBatch) -> bool {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| dtype_needs_conversion(f.data_type()))
+}
+
 /// Translate one DataFusion-side `RecordBatch` into a workspace-side
 /// `RecordBatch`. Since both arrow crates store the same physical layouts and
 /// the PoC only exercises a handful of scalar types, we walk arrays
 /// element-by-element rather than touching the FFI layer.
+///
+/// **Zero-copy fast path**: `datafusion::arrow` is a re-export of the same
+/// `arrow-array 58.x` crate the workspace uses, so `df_array::RecordBatch` and
+/// `ws_array::RecordBatch` are literally the same Rust type.  When no column
+/// requires layout conversion (`LargeUtf8`/`Utf8View`/`BinaryView`), the batch
+/// is returned as-is with only an `Arc` clone of the schema pointer — no
+/// per-row allocations.
 pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::RecordBatch> {
-    let target_schema = Arc::new(schema_df_to_ws(batch.schema().as_ref())?);
+    // ── Zero-copy fast path ───────────────────────────────────────────────────
+    // If no column needs layout conversion the batch is already the right type.
+    // Clone just bumps Arc reference counts — no Arrow buffer is copied.
+    if !batch_needs_conversion(batch) {
+        return Ok(batch.clone());
+    }
+    // ── Slow path: at least one column needs re-materialising ─────────────────
+    let src_schema = batch.schema(); // keep Arc alive for the loop lifetime
+    let target_schema = Arc::new(schema_df_to_ws(src_schema.as_ref())?);
     let mut columns: Vec<Arc<dyn ws_array::Array>> = Vec::with_capacity(batch.num_columns());
     for (i, field) in target_schema.fields().iter().enumerate() {
         let src = batch.column(i);
+        // Per-column identity pass-through: if the source column's DataFusion
+        // type maps 1-to-1 to the workspace type (no layout conversion needed),
+        // clone the Arc reference — zero data copies.
+        if !dtype_needs_conversion(src_schema.field(i).data_type()) {
+            columns.push(src.clone());
+            continue;
+        }
         let dst: Arc<dyn ws_array::Array> = match field.data_type() {
             ws_schema::DataType::Null => Arc::new(ws_array::NullArray::new(src.len())),
             ws_schema::DataType::Interval(WsIntervalUnit::MonthDayNano) => {
