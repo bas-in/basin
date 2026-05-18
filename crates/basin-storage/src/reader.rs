@@ -182,7 +182,7 @@ pub(crate) async fn list_data_files_with_stats(
                     };
                     // One footer open returns BOTH row_count and stats.
                     let (rc, stats) = match bytes {
-                        Some(b) => match crate::vortex_format::footer_meta(&b).await {
+                        Some(b) => match crate::vortex_format::footer_meta(b).await {
                             Ok((n, s)) => (Some(n), s),
                             Err(_) => (None, BTreeMap::new()),
                         },

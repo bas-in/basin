@@ -12,10 +12,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use basin_common::{BasinError, Result};
 use futures::StreamExt;
-use vortex_array::arrow::FromArrowArray;
+use vortex_array::arrow::{ArrowArrayExecutor, FromArrowArray};
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
-use vortex_array::{ArrayRef, ToCanonical};
+use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
 use vortex_file::{
@@ -149,7 +149,7 @@ pub(crate) fn column_stats_from_batch(
 /// than risk an encoding mismatch that could wrongly prune a matching
 /// file. The Vortex⇆Parquet differential harness is the correctness gate.
 pub(crate) async fn footer_meta(
-    bytes: &[u8],
+    bytes: bytes::Bytes,
 ) -> Result<(
     u64,
     std::collections::BTreeMap<String, crate::data_file::ColumnStats>,
@@ -160,7 +160,7 @@ pub(crate) async fn footer_meta(
     let mut out = std::collections::BTreeMap::new();
     let vf = session()
         .open_options()
-        .open_buffer(bytes.to_vec())
+        .open_buffer(bytes)
         .map_err(|e| BasinError::storage(format!("vortex: open_buffer (footer): {e}")))?;
     let rc = vf.row_count();
 
@@ -366,15 +366,20 @@ async fn decode_inner(
         .map_err(|e| BasinError::storage(format!("vortex: into_array_stream: {e}")))?;
     futures::pin_mut!(stream);
 
+    // One ExecutionCtx per decode call, reused across all chunks.  Creating a
+    // new ctx per chunk (the old `into_record_batch_with_schema` path) was
+    // building a LEGACY_SESSION ctx on every iteration — this hoists that cost
+    // to once per file and threads the warm ctx through every chunk.
+    let mut ctx = session().create_execution_ctx();
+
     let mut batches = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk: ArrayRef =
             chunk.map_err(|e| BasinError::storage(format!("vortex: scan chunk: {e}")))?;
-        let struct_array = chunk.to_struct();
-        let rb = struct_array
-            .into_record_batch_with_schema(arrow_schema.as_ref())
+        let rb = chunk
+            .execute_record_batch(arrow_schema.as_ref(), &mut ctx)
             .map_err(|e| {
-                BasinError::storage(format!("vortex: into_record_batch_with_schema: {e}"))
+                BasinError::storage(format!("vortex: execute_record_batch: {e}"))
             })?;
         batches.push(rb);
     }
