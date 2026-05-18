@@ -2153,8 +2153,11 @@ async fn write_replacement(
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
         cluster_columns: meta.cluster_columns.clone(),
-        // Phase 2: Parquet (default). Phase 3 wires meta.file_format.
-        file_format: basin_storage::FileFormat::default(),
+        // Phase 3: honour the table's persisted on-disk format so the
+        // copy-on-write replacement file matches the rest of the table.
+        // Defaults to Parquet (catalog default) — byte-identical to the
+        // legacy rewrite path for every Parquet table.
+        file_format: crate::executor::map_file_format(meta.file_format),
     };
     let df = sess
         .engine

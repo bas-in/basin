@@ -967,7 +967,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
 
     let result = match stmt {
         Statement::CreateTable(ct) => {
-            exec_create_table(sess, ct, cluster_columns, lifecycle, ctas_shape).await
+            exec_create_table(sess, ct, cluster_columns, lifecycle, ctas_shape, raw_sql).await
         }
         Statement::CreateIndex(ci) => exec_create_index(sess, ci).await,
         Statement::Drop {
@@ -1425,6 +1425,12 @@ async fn exec_create_table(
     cluster_columns: Option<Vec<String>>,
     lifecycle: CreateTableLifecycle,
     ctas_shape: Option<crate::pg_ast::CtasShape>,
+    // The unmodified statement the caller provided. The trailing
+    // `STORED AS <format>` clause is stripped from the SQL before
+    // sqlparser parses it (same pre-screen strategy as CLUSTER BY), so
+    // the file format must be recovered from the original text rather
+    // than the parsed `CreateTable` AST.
+    raw_sql: &str,
 ) -> Result<ExecResult> {
     let name = single_part_name(&ct.name)?;
     let table = TableName::new(name)?;
@@ -1626,6 +1632,20 @@ async fn exec_create_table(
             .set_cluster_columns(&sess.project, &table, cols)
             .await?;
     }
+
+    // Phase 3: persist the on-disk file format. The `STORED AS <format>`
+    // clause is stripped from the SQL before sqlparser sees it (same
+    // pre-screen strategy as CLUSTER BY above), so we recover it from the
+    // original statement text. Persisted UNCONDITIONALLY for every CREATE
+    // TABLE — `parse_create_table_file_format` returns the default
+    // (Parquet) when the clause is absent, so the catalog always carries
+    // an explicit format and the write path never has to guess.
+    let fmt = crate::ddl::parse_create_table_file_format(raw_sql);
+    sess.engine
+        .config()
+        .catalog
+        .set_file_format(&sess.project, &table, fmt)
+        .await?;
 
     if !constraints.pk_columns.is_empty()
         || !constraints.checks.is_empty()
@@ -3787,6 +3807,20 @@ fn causation_user(sess: &ProjectSession) -> Option<String> {
     }
 }
 
+/// Map the catalog's per-table `TableFileFormat` (#161) onto the storage
+/// layer's `FileFormat`. The two enums are intentionally 1:1 (Parquet /
+/// Vortex); they live in separate crates so the catalog has no storage
+/// dependency, hence the explicit bridge. Vortex is opt-in — `Parquet`
+/// stays the default on both sides and the Parquet path is byte-identical
+/// when the table's format is `Parquet`. Shared by the executor and
+/// `dml_mutate` write paths so the mapping has exactly one definition.
+pub(crate) fn map_file_format(fmt: basin_catalog::TableFileFormat) -> FileFormat {
+    match fmt {
+        basin_catalog::TableFileFormat::Parquet => FileFormat::Parquet,
+        basin_catalog::TableFileFormat::Vortex => FileFormat::Vortex,
+    }
+}
+
 /// Build the per-write `WriteOptions` from the table's catalog metadata.
 /// Two knobs survive the trip:
 ///  * `bloom_filter_columns` — Phase 5.7 A3, the writer materialises a
@@ -3801,9 +3835,10 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
         cluster_columns: meta.cluster_columns.clone(),
-        // Phase 2: always Parquet. Phase 3 wires this to meta.file_format
-        // once TableMetadata carries the per-table format.
-        file_format: FileFormat::default(),
+        // Phase 3: honour the table's persisted on-disk format. Defaults
+        // to Parquet (catalog default), keeping the legacy write path
+        // byte-identical for every Parquet table.
+        file_format: map_file_format(meta.file_format),
     }
 }
 
