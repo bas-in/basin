@@ -171,9 +171,11 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // about them.
     let projection = parse_projection(&select.projection)?;
 
-    // WHERE clause: an optional `<col> = <literal>` predicate.
+    // WHERE clause: an optional single `<col> <op> <literal>` predicate where
+    // `<op>` is `=`, `>`, `<`, `>=`, `<=`. Anything more complex (AND/OR,
+    // IS NULL, BETWEEN, expressions) falls through to DataFusion.
     let predicate = match &select.selection {
-        Some(expr) => Some(parse_eq_literal(expr)?),
+        Some(expr) => Some(parse_predicate(expr)?),
         None => None,
     };
 
@@ -240,24 +242,66 @@ fn parse_projection(items: &[SelectItem]) -> Option<Option<Vec<String>>> {
     Some(Some(cols))
 }
 
-/// Parse `<col> = <literal>` (or its mirror, `<literal> = <col>`).
-fn parse_eq_literal(expr: &Expr) -> Option<Predicate> {
-    let (left, right) = match expr {
-        Expr::BinaryOp {
-            op: BinaryOperator::Eq,
-            left,
-            right,
-        } => (left.as_ref(), right.as_ref()),
+/// Parse a single `<col> <op> <literal>` predicate where `<op>` is one of
+/// `=`, `>`, `<`, `>=`, `<=` (and their mirror forms). Anything else returns
+/// `None` and falls back to the DataFusion path.
+///
+/// `>=` and `<=` are encoded as the open-ended variants `Gt`/`Lt` of the
+/// adjacent integer: `col >= v` → `Predicate::Gt(col, v-1)` and
+/// `col <= v` → `Predicate::Lt(col, v+1)`. This transformation is only
+/// applied to `Int64` literals where the predecessor/successor is
+/// representable; all other types return `None` so the fast path does not
+/// silently widen the result set.
+fn parse_predicate(expr: &Expr) -> Option<Predicate> {
+    let (op, left, right) = match expr {
+        Expr::BinaryOp { op, left, right } => (op, left.as_ref(), right.as_ref()),
         _ => return None,
     };
 
-    if let (Some(col), Some(lit)) = (as_identifier(left), literal_value(right)) {
-        return Some(Predicate::Eq(col, lit));
-    }
-    if let (Some(col), Some(lit)) = (as_identifier(right), literal_value(left)) {
-        return Some(Predicate::Eq(col, lit));
-    }
-    None
+    // (col, literal, flipped): flipped=true means the user wrote `lit op col`
+    // so we have to invert the comparison direction.
+    let (col, lit, flipped) = if let (Some(c), Some(v)) = (as_identifier(left), literal_value(right)) {
+        (c, v, false)
+    } else if let (Some(c), Some(v)) = (as_identifier(right), literal_value(left)) {
+        (c, v, true)
+    } else {
+        return None;
+    };
+
+    // Map the SQL operator (accounting for col/literal order flip) to a
+    // `Predicate` variant. `>=` / `<=` use the predecessor/successor trick for
+    // Int64 only — other scalar types remain unsupported to avoid silent
+    // widening of float or string comparisons.
+    let pred = match (op, flipped) {
+        (BinaryOperator::Eq, _) => Predicate::Eq(col, lit),
+
+        // col > lit  /  lit < col
+        (BinaryOperator::Gt, false) | (BinaryOperator::Lt, true) => Predicate::Gt(col, lit),
+
+        // col < lit  /  lit > col
+        (BinaryOperator::Lt, false) | (BinaryOperator::Gt, true) => Predicate::Lt(col, lit),
+
+        // col >= lit → Gt(col, lit-1), only for Int64
+        (BinaryOperator::GtEq, false) | (BinaryOperator::LtEq, true) => match lit {
+            ScalarValue::Int64(v) => {
+                let prev = v.checked_sub(1)?; // don't fast-path i64::MIN
+                Predicate::Gt(col, ScalarValue::Int64(prev))
+            }
+            _ => return None,
+        },
+
+        // col <= lit → Lt(col, lit+1), only for Int64
+        (BinaryOperator::LtEq, false) | (BinaryOperator::GtEq, true) => match lit {
+            ScalarValue::Int64(v) => {
+                let next = v.checked_add(1)?; // don't fast-path i64::MAX
+                Predicate::Lt(col, ScalarValue::Int64(next))
+            }
+            _ => return None,
+        },
+
+        _ => return None,
+    };
+    Some(pred)
 }
 
 fn as_identifier(e: &Expr) -> Option<String> {
@@ -682,6 +726,61 @@ mod tests {
         let stmt = parse_one("SELECT id FROM t");
         let plan = match_simple_select(&stmt).expect("fast path should match");
         assert!(plan.predicate.is_none());
+    }
+
+    #[test]
+    fn matches_gt_predicate() {
+        let stmt = parse_one("SELECT id FROM t WHERE k > 10");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        match plan.predicate {
+            Some(Predicate::Gt(col, ScalarValue::Int64(10))) => assert_eq!(col, "k"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_lt_predicate() {
+        let stmt = parse_one("SELECT id FROM t WHERE k < 5");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        match plan.predicate {
+            Some(Predicate::Lt(col, ScalarValue::Int64(5))) => assert_eq!(col, "k"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_gteq_predicate_as_gt_predecessor() {
+        let stmt = parse_one("SELECT * FROM t WHERE id >= 6000");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        // >=6000 is encoded as >5999 so existing Predicate::Gt handles it.
+        match plan.predicate {
+            Some(Predicate::Gt(col, ScalarValue::Int64(5999))) => assert_eq!(col, "id"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_lteq_predicate_as_lt_successor() {
+        let stmt = parse_one("SELECT * FROM t WHERE id <= 100");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        // <=100 is encoded as <101.
+        match plan.predicate {
+            Some(Predicate::Lt(col, ScalarValue::Int64(101))) => assert_eq!(col, "id"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_order_by_limit_with_inequality() {
+        let stmt =
+            parse_one("SELECT * FROM t WHERE id >= 6000 ORDER BY id DESC LIMIT 10");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        assert_eq!(plan.limit, Some(10));
+        assert_eq!(plan.order_by, Some(("id".to_string(), false)));
+        match plan.predicate {
+            Some(Predicate::Gt(col, ScalarValue::Int64(5999))) => assert_eq!(col, "id"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
