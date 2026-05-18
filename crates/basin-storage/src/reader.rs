@@ -493,6 +493,78 @@ async fn read_one(
         }
     }
 
+    // Opt-in Vortex format branch. Object keys ending in `.vortex` were
+    // written by the Vortex codec (`crate::vortex_format::encode`); keys
+    // ending in `.parquet` fall through untouched so the Parquet pipeline
+    // below is byte-identical to before this branch existed. Vortex is
+    // strictly opt-in per table (`WITH (basin.file_format='vortex')`); the
+    // default format is unchanged.
+    //
+    // Vortex decode is schema-driven (mirrors how the Parquet path resolves
+    // its read schema from the catalog): we hand `vortex_format::decode` the
+    // same `Arc<Schema>` the Parquet path threads in as `catalog_schema`.
+    // Callers without a catalog schema (`read_file` / `read_paths`) can't
+    // decode a Vortex file — that requires the table's Arrow schema — so we
+    // surface a clear error rather than guessing.
+    if path.as_ref().ends_with(".vortex") {
+        let schema = catalog_schema.clone().ok_or_else(|| {
+            BasinError::storage(format!(
+                "vortex read {path}: catalog schema required to decode Vortex files \
+                 (use the table-aware read path)"
+            ))
+        })?;
+
+        // Two byte-acquisition paths must feed the Vortex decoder:
+        //   (a) envelope-encrypted: a `<path>.wrapped` sidecar exists, so we
+        //       unwrap + AES-GCM decrypt to recover the plaintext blob;
+        //   (b) plaintext: no sidecar (file written before a provider was
+        //       attached, or no provider configured) — GET the raw bytes.
+        // Either way we end up with the fully decrypted/plaintext Vortex
+        // blob and route it through the same decoder.
+        let bytes: Vec<u8> = match encryption.as_ref() {
+            Some(provider) => match try_load_encrypted(
+                &store,
+                &path,
+                provider.as_ref(),
+                project_config.as_ref(),
+                &project,
+            )
+            .await?
+            {
+                Some(plaintext) => plaintext,
+                None => store
+                    .get(&path)
+                    .await
+                    .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?
+                    .bytes()
+                    .await
+                    .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?
+                    .to_vec(),
+            },
+            None => store
+                .get(&path)
+                .await
+                .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?
+                .bytes()
+                .await
+                .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?
+                .to_vec(),
+        };
+
+        if let Some(tc) = project_counters.as_ref() {
+            tc.record_bytes_read(bytes.len() as u64);
+        }
+
+        // TODO: native Vortex predicate/projection pushdown is deferred —
+        // v1 decodes every chunk and returns all rows/columns, then relies
+        // on the engine's higher-level filtering. A follow-up should push
+        // `opts.projection` / `opts.filters` into the Vortex scan so we
+        // skip chunks and columns the query doesn't need.
+        let batches = crate::vortex_format::decode(&bytes, schema).await?;
+        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+        return Ok(stream.boxed());
+    }
+
     // Envelope-encryption probe. When a provider is attached AND a
     // `<path>.wrapped` sidecar exists, fetch the body, unwrap the data
     // key, decrypt, and run the parquet pipeline against an in-memory
@@ -1264,4 +1336,198 @@ fn synthesise_missing_columns(
 
     RecordBatch::try_new(output_schema.clone(), columns)
         .map_err(|e| BasinError::storage(format!("synthesise_missing_columns: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Reader-side coverage for the opt-in Vortex format branch in
+    //! [`read_one`]. Mirrors the existing encrypted round-trip pattern used
+    //! across the storage crate (attach an `EncryptionProvider`, write an
+    //! envelope-encrypted body + `.wrapped` sidecar via the public writer,
+    //! then read it back through `read_one`) — only here the on-disk format
+    //! is Vortex (`.vortex` key) instead of Parquet.
+
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_array::{Float64Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use basin_common::{PartitionKey, ProjectId, Result as BasinResult, TableName};
+    use futures::StreamExt;
+    use object_store::memory::InMemory;
+
+    use crate::encryption::{EncryptionProvider, WrappedKey};
+    use crate::writer::{FileFormat, WriteOptions};
+    use crate::{ReadOptions, Storage, StorageConfig};
+
+    /// Minimal in-process provider: a fixed 32-byte data key, round-tripped
+    /// through an opaque sidecar. Mirrors the no-config (`wrap_key` /
+    /// `unwrap_key`) leg of the integration suite's `RecordingProvider`,
+    /// trimmed to exactly what the reader's encrypted path needs.
+    struct StaticProvider;
+
+    #[async_trait]
+    impl EncryptionProvider for StaticProvider {
+        async fn wrap_key(&self, _project: &ProjectId) -> BasinResult<(Vec<u8>, WrappedKey)> {
+            let key = vec![0x42u8; 32];
+            Ok((key.clone(), WrappedKey(key)))
+        }
+
+        async fn unwrap_key(
+            &self,
+            _project: &ProjectId,
+            wrapped: &WrappedKey,
+        ) -> BasinResult<Vec<u8>> {
+            Ok(wrapped.0.clone())
+        }
+    }
+
+    fn sample_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("note", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, false),
+        ]))
+    }
+
+    fn sample_batch() -> RecordBatch {
+        let id = Int64Array::from(vec![10, 20, 30, 40]);
+        let note = StringArray::from(vec![Some("a"), None, Some("c"), Some("d")]);
+        let score = Float64Array::from(vec![1.5, -2.25, 3.0, 0.0]);
+        RecordBatch::try_new(
+            sample_schema(),
+            vec![Arc::new(id), Arc::new(note), Arc::new(score)],
+        )
+        .expect("build sample batch")
+    }
+
+    /// End-to-end: write an envelope-encrypted Vortex file via the public
+    /// writer, then read it back through `read_one`. The decrypted plaintext
+    /// must flow into `vortex_format::decode` and the RecordBatch must round
+    /// -trip. This is the encrypted-byte-acquisition path for `.vortex`.
+    #[tokio::test]
+    async fn encrypted_vortex_round_trips_through_read_one() {
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(InMemory::new()),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        storage.attach_encryption_provider(Arc::new(StaticProvider));
+
+        let project = ProjectId::new();
+        let table = TableName::new("vortex_enc").unwrap();
+        let part = PartitionKey::default_key();
+        let schema = sample_schema();
+        let original = sample_batch();
+
+        // Public writer with the opt-in Vortex format. An encryption
+        // provider is attached, so this produces a `.vortex` body that is
+        // AES-GCM enveloped plus a `<key>.wrapped` sidecar.
+        let df = storage
+            .write_batch_with_options(
+                &project,
+                &table,
+                &part,
+                &original,
+                &WriteOptions {
+                    file_format: FileFormat::Vortex,
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .expect("write encrypted vortex");
+        assert!(
+            df.path.as_ref().ends_with(".vortex"),
+            "writer must produce a .vortex key, got {}",
+            df.path
+        );
+
+        // Read it back through `read_one` directly. No catalog is attached,
+        // so we thread the table schema in via `catalog_schema` exactly as
+        // the table-aware reader would — that is the `Arc<Schema>` the
+        // Vortex decoder needs (the Parquet path resolves the same schema
+        // from the catalog at this site).
+        let project_config = storage
+            .project_storage_config_cached(&project)
+            .await
+            .unwrap();
+        let stream = read_one(
+            storage.project_store(&project),
+            df.path.clone(),
+            Arc::new(ReadOptions::default()),
+            storage.parquet_meta_cache().clone(),
+            storage.read_counters().clone(),
+            storage.page_cache_handle().cloned(),
+            storage.project_counters(&project),
+            storage.encryption_provider(),
+            project_config,
+            project,
+            Some(schema.clone()),
+        )
+        .await
+        .expect("read_one encrypted vortex");
+
+        let batches: Vec<_> = stream.collect().await;
+        let decoded: Vec<RecordBatch> = batches
+            .into_iter()
+            .map(|b| b.expect("batch decode"))
+            .collect();
+
+        let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows,
+            original.num_rows(),
+            "row count must round-trip through encrypted vortex"
+        );
+        assert_eq!(decoded.len(), 1, "single-chunk fixture -> one batch");
+
+        let got = &decoded[0];
+        assert_eq!(
+            got.num_columns(),
+            original.num_columns(),
+            "column count must round-trip"
+        );
+
+        let g_id = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64");
+        let o_id = original
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(g_id, o_id, "Int64 column must round-trip");
+
+        let g_note = got
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("note Utf8");
+        let o_note = original
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            g_note, o_note,
+            "Utf8 column (incl. nulls) must round-trip through encryption"
+        );
+
+        let g_score = got
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("score Float64");
+        let o_score = original
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(g_score, o_score, "Float64 column must round-trip");
+    }
 }
