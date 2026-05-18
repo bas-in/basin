@@ -36,6 +36,8 @@ use datafusion::datasource::listing::{
 };
 use datafusion::logical_expr::{col, SortExpr};
 use datafusion::datasource::MemTable;
+use datafusion::execution::cache::cache_manager::CacheManagerConfig;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::ValueWithSpan;
@@ -540,8 +542,21 @@ pub(crate) async fn open(
         0,
         std::sync::Arc::new(crate::any_all_rewrite::AnyAllToScalarSubquery),
     );
+
+    // Build a per-session RuntimeEnv that plugs in the process-wide file
+    // metadata cache. Vortex/Parquet footer parses survive session recycling —
+    // the dominant cost behind scale regressions at 100k rows / 50 files.
+    // DefaultFilesMetadataCache validates entries via size + last_modified.
+    let cache_cfg = CacheManagerConfig::default().with_file_metadata_cache(Some(
+        engine.inner.file_metadata_cache.clone(),
+    ));
+    let runtime_env = RuntimeEnvBuilder::new()
+        .with_cache_manager(cache_cfg)
+        .build_arc()
+        .map_err(|e| BasinError::internal(format!("RuntimeEnv build: {e}")))?;
     let state = SessionStateBuilder::new()
         .with_config(session_cfg)
+        .with_runtime_env(runtime_env)
         // Non-UDF defaults: table factories, file formats, expr planners,
         // optimizer rules, window functions. We override scalar_functions and
         // aggregate_functions below with the combined (DF defaults + Basin)

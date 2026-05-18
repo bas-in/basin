@@ -49,6 +49,8 @@ use basin_common::{
     ChangeEventSink, EventSinkRegistry, ProjectCounterRegistry, ProjectCountersSnapshot, ProjectId,
     Result, TableName,
 };
+use datafusion::execution::cache::cache_manager::{CacheManagerConfig, FileMetadataCache};
+use datafusion::execution::cache::DefaultFilesMetadataCache;
 use uuid::Uuid;
 
 /// Pre-built stateless UDF registry shared across all sessions on one `Engine`.
@@ -130,8 +132,12 @@ pub(crate) struct EngineInner {
     /// session-open clones only the `Arc` handles (ref-count bumps, no heap
     /// allocation for the UDF structs themselves). See `StatelessUdfCache`.
     pub(crate) udf_cache: Arc<StatelessUdfCache>,
-    // additional state (DataFusion runtime, per-project context cache) lives
-    // in the implementation module; intentionally not exposed here.
+    /// Process-wide file metadata cache (Vortex footer / Parquet footer data).
+    /// Shared across all sessions so footer parses survive session recycling.
+    /// Each session-open builds a fresh `RuntimeEnv` but plugs this same
+    /// `Arc` into its `CacheManagerConfig` so the cache outlives any single
+    /// session. Capacity: 50 MiB (covers ~hundreds of Vortex/Parquet files).
+    pub(crate) file_metadata_cache: Arc<dyn FileMetadataCache>,
 }
 
 impl Engine {
@@ -169,6 +175,14 @@ impl Engine {
         // Session-open time then just clones these Arc handles instead of
         // constructing ~200 UDF structs and acquiring 200+ write-locks.
         let udf_cache = Arc::new(crate::session::build_stateless_udf_cache());
+        // Build the process-wide file metadata cache once. Each session-open
+        // plugs this Arc into a fresh per-session RuntimeEnv so Vortex/Parquet
+        // footer data persists across session recycling. 50 MiB covers hundreds
+        // of small files; the LRU evicts cold entries when the limit is reached.
+        let file_metadata_cache: Arc<dyn FileMetadataCache> =
+            Arc::new(DefaultFilesMetadataCache::new(
+                CacheManagerConfig::default().metadata_cache_limit,
+            ));
         let inner = Arc::new(EngineInner {
             cfg,
             vector_routing_count: AtomicU64::new(0),
@@ -179,6 +193,7 @@ impl Engine {
             event_seq: Mutex::new(HashMap::new()),
             webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
             udf_cache,
+            file_metadata_cache,
         });
         attach_reactor_sink(&inner, catalog);
         Self { inner }
