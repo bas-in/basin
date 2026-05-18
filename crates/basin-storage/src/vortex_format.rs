@@ -93,38 +93,107 @@ pub(crate) async fn row_count(bytes: &[u8]) -> Result<u64> {
 ///   refresh, cron-job state, system tables). The Arrow schema is recovered
 ///   from the Vortex file's own `DType`, so a Vortex file is decodable with
 ///   nothing but its bytes, exactly like a Parquet file.
-pub(crate) async fn decode(bytes: &[u8], schema: Option<Arc<Schema>>) -> Result<Vec<RecordBatch>> {
+/// `projection` (column names, in order) and `filter` are **pushed into the
+/// Vortex scan** — projection reads only those columns, and a pushed filter
+/// drives Vortex's native zone-map chunk pruning (skip chunks the predicate
+/// excludes) instead of decoding the whole file. Both are a pure
+/// optimisation: the engine still re-applies the authoritative filter +
+/// projection post-decode (see `reader::vortex_project_and_filter`), and any
+/// pushdown error transparently falls back to a full decode, so results are
+/// always correct.
+pub(crate) async fn decode(
+    bytes: &[u8],
+    schema: Option<Arc<Schema>>,
+    projection: Option<&[String]>,
+    filter: Option<vortex_array::expr::Expression>,
+) -> Result<Vec<RecordBatch>> {
+    // Pushdown is best-effort: a literal/column dtype mismatch or any other
+    // scan error must never change results. Try with pushdown; on failure
+    // retry once with a plain full decode (the path the engine post-filters
+    // anyway). Only retry when pushdown was actually requested.
+    let pushed = projection.is_some() || filter.is_some();
+    match decode_inner(bytes, schema.clone(), projection, filter).await {
+        Ok(b) => Ok(b),
+        Err(_) if pushed => decode_inner(bytes, schema, None, None).await,
+        Err(e) => Err(e),
+    }
+}
+
+async fn decode_inner(
+    bytes: &[u8],
+    schema: Option<Arc<Schema>>,
+    projection: Option<&[String]>,
+    filter: Option<vortex_array::expr::Expression>,
+) -> Result<Vec<RecordBatch>> {
+    use vortex_array::expr::{root, select};
+
     let vf = session()
         .open_options()
         .open_buffer(bytes.to_vec())
         .map_err(|e| BasinError::storage(format!("vortex: open_buffer: {e}")))?;
 
-    // Self-describing fallback: recover the Arrow schema from the file's
-    // embedded DType when the caller supplies none. The encode path writes a
-    // NonNullable top-level struct, so `to_arrow_schema` succeeds; per-column
-    // nullability/types are carried by the struct's field DTypes.
-    //
-    // Vortex's DType→Arrow inference maps its string/binary types to the
-    // zero-copy *view* variants (`Utf8View`/`BinaryView`). Basin's engine is
-    // canonically `Utf8`/`Binary` everywhere (constraint/FK/PK scans, cron
-    // job columns, RLS, events all downcast to `StringArray`), so a Vortex
-    // file decoded on an internal path must present the same Arrow types a
-    // Parquet file would. Normalise the inferred schema's view types to
-    // their non-view equivalents; `into_record_batch_with_schema` then casts
-    // the data accordingly, making Vortex a true drop-in.
-    let arrow_schema: Arc<Schema> = match schema {
-        Some(s) => s,
-        None => {
-            let inferred = vf.dtype().to_arrow_schema().map_err(|e| {
-                BasinError::storage(format!("vortex: infer arrow schema from file dtype: {e}"))
-            })?;
-            Arc::new(normalize_view_types_schema(&inferred))
-        }
+    // Inferred (self-describing) full schema, normalised so Vortex's
+    // `Utf8View`/`BinaryView` become Basin-canonical `Utf8`/`Binary` (the
+    // engine downcasts to `StringArray` everywhere).
+    let infer_full = || -> Result<Schema> {
+        let inferred = vf.dtype().to_arrow_schema().map_err(|e| {
+            BasinError::storage(format!("vortex: infer arrow schema from file dtype: {e}"))
+        })?;
+        Ok(normalize_view_types_schema(&inferred))
     };
 
-    let stream = vf
+    let mut sb = vf
         .scan()
-        .map_err(|e| BasinError::storage(format!("vortex: scan: {e}")))?
+        .map_err(|e| BasinError::storage(format!("vortex: scan: {e}")))?;
+    if let Some(cols) = projection {
+        let names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        sb = sb.with_projection(select(names, root()));
+    }
+    if let Some(f) = filter {
+        sb = sb.with_some_filter(Some(f));
+    }
+
+    // Target Arrow schema for `into_record_batch_with_schema`. With a
+    // projection the returned struct is exactly the projected columns in
+    // order, so the schema must be that subset: prefer the authoritative
+    // catalog `schema` (keeps exact types — e.g. timestamp tz), else the
+    // projected dtype the scan reports.
+    let arrow_schema: Arc<Schema> = match (projection, &schema) {
+        (Some(cols), Some(s)) => {
+            let mut fields = Vec::with_capacity(cols.len());
+            let mut all_present = true;
+            for name in cols {
+                match s.field_with_name(name) {
+                    Ok(f) => fields.push(f.clone()),
+                    Err(_) => {
+                        all_present = false;
+                        break;
+                    }
+                }
+            }
+            if all_present {
+                Arc::new(Schema::new(fields))
+            } else {
+                Arc::new(normalize_view_types_schema(&sb.dtype().map_err(|e| {
+                    BasinError::storage(format!("vortex: projected dtype: {e}"))
+                })?.to_arrow_schema().map_err(|e| {
+                    BasinError::storage(format!("vortex: projected to_arrow_schema: {e}"))
+                })?))
+            }
+        }
+        (Some(_), None) => Arc::new(normalize_view_types_schema(
+            &sb.dtype()
+                .map_err(|e| BasinError::storage(format!("vortex: projected dtype: {e}")))?
+                .to_arrow_schema()
+                .map_err(|e| {
+                    BasinError::storage(format!("vortex: projected to_arrow_schema: {e}"))
+                })?,
+        )),
+        (None, Some(s)) => s.clone(),
+        (None, None) => Arc::new(infer_full()?),
+    };
+
+    let stream = sb
         .into_array_stream()
         .map_err(|e| BasinError::storage(format!("vortex: into_array_stream: {e}")))?;
     futures::pin_mut!(stream);
@@ -133,10 +202,6 @@ pub(crate) async fn decode(bytes: &[u8], schema: Option<Arc<Schema>>) -> Result<
     while let Some(chunk) = stream.next().await {
         let chunk: ArrayRef =
             chunk.map_err(|e| BasinError::storage(format!("vortex: scan chunk: {e}")))?;
-        // Each scanned chunk is a struct-typed Vortex array. Canonicalize to a
-        // `StructArray` then project onto the caller's Arrow schema (this is
-        // exactly what vortex's own `into_record_batch_with_schema` does
-        // internally via the legacy session).
         let struct_array = chunk.to_struct();
         let rb = struct_array
             .into_record_batch_with_schema(arrow_schema.as_ref())
@@ -281,7 +346,9 @@ mod tests {
         let bytes = encode(&original).await.expect("encode");
         assert!(!bytes.is_empty(), "encoded blob must be non-empty");
 
-        let decoded = decode(&bytes, Some(schema.clone())).await.expect("decode");
+        let decoded = decode(&bytes, Some(schema.clone()), None, None)
+            .await
+            .expect("decode");
 
         // All rows come back; merge chunks (this fixture is a single chunk).
         let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
@@ -426,7 +493,9 @@ mod tests {
         let (_schema, original) = sample_batch();
         let bytes = encode(&original).await.expect("encode");
 
-        let decoded = decode(&bytes, None).await.expect("schema-less decode");
+        let decoded = decode(&bytes, None, None, None)
+            .await
+            .expect("schema-less decode");
 
         let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, original.num_rows(), "row count must match");

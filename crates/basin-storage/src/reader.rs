@@ -622,18 +622,27 @@ async fn read_one(
             tc.record_bytes_read(bytes.len() as u64);
         }
 
-        // Decode, then apply `opts.filters` and `opts.projection`
-        // post-decode. The Parquet path pushes these into the reader
-        // (RowFilter + ProjectionMask); Vortex decodes the chunks and we
-        // filter/project the resulting batches. Semantically identical
-        // results — callers (`fast_select`, the constraint/UNIQUE/FK and
-        // RLS row-matching scans, DELETE/UPDATE) delegate predicate
-        // application to the storage layer exactly as they do for Parquet,
-        // so this is correctness-critical, not an optimisation. Native
-        // chunk/zone-map pushdown is still a follow-up; correctness here is
-        // not. Filtering runs BEFORE projection so predicate columns are
-        // still present (mirrors Parquet's RowFilter ordering).
-        let batches = crate::vortex_format::decode(&bytes, schema).await?;
+        // Push projection + filter into the Vortex scan: read only the
+        // needed columns and let Vortex's native zone maps prune chunks the
+        // predicate excludes (the analogue of Parquet's ProjectionMask +
+        // row-group stats pruning). This is a pure optimisation —
+        // `vortex_project_and_filter` below still re-applies the
+        // authoritative `opts.filters`/`opts.projection` post-decode, and
+        // `decode` transparently falls back to a full decode on any
+        // pushdown error, so the result is correctness-identical to the
+        // decode-then-filter path while skipping most of the I/O + decode
+        // for selective queries. The read projection deliberately includes
+        // filter-only columns so the post-decode re-verification still has
+        // them before they are projected away.
+        let read_proj = vortex_read_projection(opts.as_ref());
+        let push_filter = vortex_filter_expr(&opts.filters, catalog_schema.as_deref());
+        let batches = crate::vortex_format::decode(
+            &bytes,
+            schema,
+            read_proj.as_deref(),
+            push_filter,
+        )
+        .await?;
         let batches = vortex_project_and_filter(batches, opts.as_ref(), catalog_schema.as_ref())?;
 
         // Page-cache write-through, keyed by the same (path, projection,
@@ -1439,6 +1448,74 @@ fn vortex_project_and_filter(
         out.push(projected);
     }
     Ok(out)
+}
+
+/// Translate Basin's storage `Predicate`s into a single Vortex filter
+/// `Expression` to push into the scan (drives native zone-map chunk
+/// pruning).
+///
+/// **Type-safety is mandatory, not best-effort.** Vortex *panics* (in a
+/// spawned scan task — uncatchable by the `decode` `Result` fallback) when
+/// a pushed comparison mixes DTypes, e.g. an `i64` literal against an
+/// `INT4`/`i32` column ("Cannot compare different DTypes i32 and i64").
+/// So a predicate is pushed ONLY when the catalog schema proves the
+/// column's Arrow type *exactly* equals the scalar's natural type
+/// (Int64/Float64/Boolean/UInt64). Anything else — width mismatch,
+/// strings (Vortex `Utf8View` nuance), timestamps, or no catalog schema —
+/// is NOT pushed; `vortex_project_and_filter` still applies it
+/// post-decode, so correctness is unaffected and only the zone-prune
+/// optimisation is skipped for that predicate. Returns `None` when nothing
+/// is safely pushable.
+fn vortex_filter_expr(
+    filters: &[Predicate],
+    catalog_schema: Option<&Schema>,
+) -> Option<vortex_array::expr::Expression> {
+    use arrow_schema::DataType;
+    use vortex_array::expr::{and_collect, col, eq, gt, lit, lt, Expression};
+
+    let schema = catalog_schema?;
+    let type_safe_lit = |c: &str, v: &ScalarValue| -> Option<Expression> {
+        let dt = schema.field_with_name(c).ok()?.data_type();
+        match (v, dt) {
+            (ScalarValue::Int64(i), DataType::Int64) => Some(lit(*i)),
+            (ScalarValue::Float64(f), DataType::Float64) => Some(lit(*f)),
+            (ScalarValue::Boolean(b), DataType::Boolean) => Some(lit(*b)),
+            (ScalarValue::UInt64(u), DataType::UInt64) => Some(lit(*u)),
+            // Width/type mismatch, strings, timestamps, decimals, etc. —
+            // do NOT push (would risk a Vortex dtype-compare panic).
+            _ => None,
+        }
+    };
+    let terms = filters.iter().filter_map(|p| match p {
+        Predicate::Eq(c, v) => type_safe_lit(c, v).map(|l| eq(col(c.as_str()), l)),
+        Predicate::Gt(c, v) => type_safe_lit(c, v).map(|l| gt(col(c.as_str()), l)),
+        Predicate::Lt(c, v) => type_safe_lit(c, v).map(|l| lt(col(c.as_str()), l)),
+    });
+    and_collect(terms)
+}
+
+/// The set of columns the Vortex scan must materialise: the requested
+/// projection plus any columns referenced only by the (post-decode)
+/// filter, in a stable order (projection order first). Returning `None`
+/// means "read every column" (no projection requested). Filter columns are
+/// included so `vortex_project_and_filter` can still re-verify the
+/// predicate authoritatively before dropping them.
+fn vortex_read_projection(opts: &ReadOptions) -> Option<Vec<String>> {
+    let proj = opts.projection.as_ref()?;
+    let mut out: Vec<String> = Vec::with_capacity(proj.len() + opts.filters.len());
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in proj {
+        if seen.insert(c.as_str()) {
+            out.push(c.clone());
+        }
+    }
+    for f in &opts.filters {
+        let c = f.column();
+        if seen.insert(c) {
+            out.push(c.to_string());
+        }
+    }
+    Some(out)
 }
 
 fn synthesise_missing_columns(

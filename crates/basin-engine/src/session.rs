@@ -614,14 +614,19 @@ fn listing_file_format(format: TableFileFormat) -> (Arc<dyn FileFormat>, &'stati
     match format {
         // KEEP byte-identical with the historical inline expression.
         TableFileFormat::Parquet => (Arc::new(ParquetFormat::default()), ".parquet"),
-        // Opt-in Vortex read path. `VortexFormatFactory::new()` builds a
-        // process-default `VortexSession` internally (registering encodings),
-        // and its `FileFormatFactory::default()` yields a ready `VortexFormat`
-        // with default table options — the constructor the crate's own docs
-        // recommend for hand-wired `ListingTable`s. No separate `VortexSession`
-        // value needs to be named here.
+        // Vortex read path. `VortexFormatFactory::new()` builds a
+        // process-default `VortexSession` internally (registering encodings).
+        // Filter pushdown + whole-file pruning are already active on this
+        // DataFusion path via `VortexSource`; we additionally turn on
+        // `projection_pushdown` so a projected scan reads only the needed
+        // columns natively instead of DataFusion projecting post-scan.
         TableFileFormat::Vortex => {
-            let factory = vortex_datafusion::VortexFormatFactory::new();
+            let factory = vortex_datafusion::VortexFormatFactory::new().with_options(
+                vortex_datafusion::VortexTableOptions {
+                    projection_pushdown: true,
+                    ..Default::default()
+                },
+            );
             (FileFormatFactory::default(&factory), ".vortex")
         }
     }
