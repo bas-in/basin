@@ -497,6 +497,150 @@ async fn vortex_vs_parquet_many_shapes() {
              LEFT JOIN {Q} a ON a.k = g.v GROUP BY g.v ORDER BY g.v"
                 .to_string(),
         ),
+        // ---- HARD SHAPES: stress correlated / set-quantified / window /
+        // multi-dim agg / complex-predicate / string-fn paths where a mature
+        // Parquet reader is expected to win until Vortex matches. ----
+        (
+            "anti_join_not_exists",
+            "SELECT COUNT(*) FROM {Q} q \
+             WHERE NOT EXISTS (SELECT 1 FROM {D} d WHERE d.dk = q.k AND d.w > 20.0)"
+                .to_string(),
+        ),
+        (
+            "scalar_correlated_select",
+            format!(
+                "SELECT id, (SELECT label FROM {{D}} d WHERE d.dk = q.k) lbl \
+                 FROM {{Q}} q WHERE id < {lo} ORDER BY id LIMIT 100"
+            ),
+        ),
+        (
+            "any_subquery_gt",
+            "SELECT COUNT(*) FROM {Q} \
+             WHERE k > ANY (SELECT dk FROM {D} WHERE w < 15.0)"
+                .to_string(),
+        ),
+        (
+            "all_subquery_lt",
+            "SELECT COUNT(*) FROM {Q} \
+             WHERE k < ALL (SELECT dk FROM {D} WHERE label LIKE 'lbl1%')"
+                .to_string(),
+        ),
+        (
+            "top_1_per_k_window",
+            "SELECT id, k FROM ( \
+               SELECT id, k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id DESC) rn \
+               FROM {Q} \
+             ) t WHERE rn = 1 ORDER BY k"
+                .to_string(),
+        ),
+        (
+            "lateral_top_3_per_k",
+            "SELECT d.dk, t.id FROM {D} d, \
+               LATERAL (SELECT id FROM {Q} WHERE k = d.dk ORDER BY id LIMIT 3) t \
+             ORDER BY d.dk, t.id"
+                .to_string(),
+        ),
+        (
+            "pivot_via_filter_agg",
+            "SELECT k, \
+               COUNT(*) FILTER (WHERE b IS TRUE)  t, \
+               COUNT(*) FILTER (WHERE b IS FALSE) f, \
+               COUNT(*) FILTER (WHERE b IS NULL)  n \
+             FROM {Q} GROUP BY k ORDER BY k"
+                .to_string(),
+        ),
+        (
+            "lag_lead_window",
+            format!(
+                "SELECT id, k, LAG(k, 2, -1) OVER (ORDER BY id) lg, \
+                              LEAD(k, 3, -1) OVER (ORDER BY id) ld \
+                 FROM {{Q}} WHERE id < {lo} ORDER BY id LIMIT 50"
+            ),
+        ),
+        (
+            "named_window_multi",
+            format!(
+                "SELECT id, AVG(f) OVER w av, RANK() OVER w rk \
+                 FROM {{Q}} WHERE id < {lo} \
+                 WINDOW w AS (ORDER BY id) ORDER BY id LIMIT 50"
+            ),
+        ),
+        (
+            "nth_value_window",
+            format!(
+                "SELECT id, k, NTH_VALUE(k, 3) OVER (PARTITION BY b ORDER BY id) nth \
+                 FROM {{Q}} WHERE id < {lo} ORDER BY id LIMIT 50"
+            ),
+        ),
+        (
+            "range_window_frame",
+            format!(
+                "SELECT id, AVG(f) OVER ( \
+                   ORDER BY id RANGE BETWEEN 100 PRECEDING AND CURRENT ROW \
+                 ) av FROM {{Q}} WHERE id < {lo} ORDER BY id LIMIT 50"
+            ),
+        ),
+        (
+            "deep_or_chain",
+            "SELECT COUNT(*) FROM {Q} WHERE \
+             id = 1 OR id = 7 OR id = 13 OR id = 23 OR id = 31 OR id = 47 OR \
+             id = 71 OR id = 103 OR id = 137 OR id = 191 OR id = 233 OR \
+             id = 311 OR id = 419 OR id = 521 OR id = 587 OR id = 647"
+                .to_string(),
+        ),
+        (
+            "in_subquery_range",
+            "SELECT COUNT(*) FROM {Q} q \
+             WHERE k IN (SELECT dk FROM {D} WHERE w BETWEEN 5.0 AND 25.0)"
+                .to_string(),
+        ),
+        (
+            "cube_agg",
+            "SELECT k, b, COUNT(*) c, SUM(id) s FROM {Q} \
+             GROUP BY CUBE (k, b) ORDER BY k NULLS LAST, b NULLS LAST"
+                .to_string(),
+        ),
+        (
+            "case_having_complex",
+            "SELECT CASE WHEN k < 6 THEN 'lo' WHEN k < 12 THEN 'mid' ELSE 'hi' END g, \
+                    COUNT(*) c, AVG(f) a \
+             FROM {Q} GROUP BY 1 HAVING COUNT(*) > 100 ORDER BY g"
+                .to_string(),
+        ),
+        (
+            "distinct_count_case",
+            format!(
+                "SELECT b, COUNT(DISTINCT CASE WHEN id < {mid} THEN k END) cd \
+                 FROM {{Q}} GROUP BY b ORDER BY b NULLS LAST"
+            ),
+        ),
+        (
+            "cte_self_join",
+            "WITH t AS (SELECT k, COUNT(*) c FROM {Q} GROUP BY k) \
+             SELECT a.k ak, b.k bk, a.c FROM t a JOIN t b ON a.c = b.c \
+             WHERE a.k < b.k ORDER BY a.k, b.k"
+                .to_string(),
+        ),
+        (
+            "string_chain_funcs",
+            "SELECT k, COUNT(*) c FROM {Q} \
+             WHERE LENGTH(s) > 0 AND LOWER(s) LIKE 'v%' GROUP BY k ORDER BY k"
+                .to_string(),
+        ),
+        (
+            "modulo_predicate_expr",
+            format!(
+                "SELECT id, k * 3 + 1 e1, f / 2.0 e2 \
+                 FROM {{Q}} WHERE (id % 100) BETWEEN 10 AND 50 \
+                 ORDER BY id LIMIT 200"
+            ),
+        ),
+        (
+            "coalesce_nullif_filter",
+            "SELECT COUNT(*) FROM {Q} \
+             WHERE COALESCE(s, 'X') <> 'X' AND NULLIF(k, 0) IS NOT NULL"
+                .to_string(),
+        ),
     ];
 
     let subst = |t: &str, fact: &str, dim: &str| t.replace("{Q}", fact).replace("{D}", dim);
