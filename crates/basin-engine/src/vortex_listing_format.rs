@@ -25,7 +25,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result as DFResult;
@@ -98,7 +98,12 @@ impl FileFormat for BasinVortexFormat {
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> DFResult<SchemaRef> {
-        self.inner.infer_schema(state, store, objects).await
+        // Promote Utf8/Binary → Utf8View/BinaryView so DataFusion's string UDF
+        // kernels (LOWER, SUBSTR, concat, REPLACE, …) hit their StringViewArray
+        // fast paths.  Vortex's scan layer already emits view types natively;
+        // this aligns the catalog schema with that representation.
+        let schema = self.inner.infer_schema(state, store, objects).await?;
+        Ok(Arc::new(promote_utf8_to_view_schema(&schema)))
     }
 
     /// Delegates to the inner `VortexFormat::infer_stats`, then patches
@@ -184,6 +189,40 @@ impl FileFormat for BasinVortexFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         self.inner.file_source(table_schema)
     }
+}
+
+fn promote_utf8_dtype(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Utf8 => DataType::Utf8View,
+        DataType::Binary => DataType::BinaryView,
+        DataType::List(f) => DataType::List(promote_utf8_field(f).into()),
+        DataType::LargeList(f) => DataType::LargeList(promote_utf8_field(f).into()),
+        DataType::FixedSizeList(f, n) => {
+            DataType::FixedSizeList(promote_utf8_field(f).into(), *n)
+        }
+        DataType::Struct(fields) => {
+            let promoted: Fields = fields.iter().map(|f| promote_utf8_field(f)).collect();
+            DataType::Struct(promoted)
+        }
+        DataType::Map(f, sorted) => DataType::Map(promote_utf8_field(f).into(), *sorted),
+        other => other.clone(),
+    }
+}
+
+fn promote_utf8_field(f: &Field) -> Field {
+    Field::new(f.name(), promote_utf8_dtype(f.data_type()), f.is_nullable())
+        .with_metadata(f.metadata().clone())
+}
+
+fn promote_utf8_to_view_schema(schema: &Schema) -> Schema {
+    Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| promote_utf8_field(f))
+            .collect::<Vec<_>>(),
+    )
+    .with_metadata(schema.metadata().clone())
 }
 
 #[cfg(test)]
