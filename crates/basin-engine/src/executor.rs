@@ -1222,7 +1222,16 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     let has_rls = meta.rls_enabled;
                     let has_soft_delete =
                         crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
-                    if !is_view && !has_rls && !has_soft_delete {
+                    // Inside an explicit transaction the fast path (and the
+                    // aggregate fast path, which shares this dispatch) reads
+                    // only the committed snapshot + shard tail — it does NOT
+                    // merge `TxState::pending_files`, so a SELECT/aggregate
+                    // would miss this txn's uncommitted writes (and mis-handle
+                    // ROLLBACK TO SAVEPOINT). Bail to the transaction-aware
+                    // DataFusion path whenever a txn is open; a missed fast
+                    // path is merely slower, a wrong answer is not acceptable.
+                    let in_txn = crate::session::tx_is_active(&sess.state);
+                    if !is_view && !has_rls && !has_soft_delete && !in_txn {
                         return execute_simple_select(sess, plan, table_meta).await;
                     }
                 }

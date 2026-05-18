@@ -358,17 +358,18 @@ async fn savepoint_reusable_after_rollback_to() {
     assert_eq!(ids(&sess, "SELECT id FROM t").await, vec![1]);
 }
 
-/// Documents a PRE-EXISTING, savepoint-unrelated engine limitation: a
-/// bare projection scan (`SELECT id FROM t`) of pending rows returns
-/// nothing *inside* an open transaction, while `SELECT count(*)` is
-/// correct. Reproduces with ZERO savepoints, so it is squarely a
-/// #83/#92 deferred-commit visibility gap, not a savepoint defect. If
-/// the engine later gains mid-txn projection RYOW, this test's
-/// `assert_eq!(rows, Vec::new())` will start failing and should be
-/// flipped to assert `[1]` (and the savepoint tests above upgraded to
-/// assert via projection mid-txn).
+/// #83/#92 mid-txn projection read-your-own-writes: NOW FIXED. A bare
+/// projection scan (`SELECT id FROM t`) of pending rows inside an open
+/// transaction now correctly returns those rows (it previously returned
+/// nothing — the documented deferred-commit visibility gap). Reproduces
+/// with ZERO savepoints, so this exercises the general mid-txn
+/// visibility path, not a savepoint defect. The gap closed as a
+/// side-effect of the Vortex read-path rework (#161); the test author's
+/// own note said to flip `assert_eq!(rows, Vec::new())` → `[1]` once
+/// RYOW landed — done here. `count(*)` was already correct mid-txn and
+/// still is, so projection and aggregate now agree.
 #[tokio::test]
-async fn in_txn_projection_visibility_is_a_known_gap() {
+async fn in_txn_projection_sees_pending_rows_ryow() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -380,12 +381,13 @@ async fn in_txn_projection_visibility_is_a_known_gap() {
     // Aggregate read path: correct mid-txn.
     assert_eq!(count(&sess).await, 1, "count(*) sees the pending row");
 
-    // Projection read path: KNOWN GAP -- returns nothing mid-txn.
+    // Projection read path: now also correct mid-txn (RYOW) — #83/#92
+    // gap closed; projection and aggregate agree on the pending row.
     let rows = ids(&sess, "SELECT id FROM t").await;
     assert_eq!(
         rows,
-        Vec::<i32>::new(),
-        "pre-existing #83/#92 gap: mid-txn projection of pending rows is empty"
+        vec![1],
+        "#83/#92 fixed: mid-txn projection sees this txn's pending row"
     );
 
     exec(&sess, "ROLLBACK").await;
