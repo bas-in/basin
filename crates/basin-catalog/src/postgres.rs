@@ -209,6 +209,14 @@ impl PostgresCatalog {
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS home_region TEXT"
             ),
+            // #161: per-table on-disk data-file format (Parquet | Vortex).
+            // NULL / absent means Parquet — the back-compat default. Old
+            // rows, and rows created before the engine records a format,
+            // deserialise to Parquet. Stored as the serde snake_case token.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS file_format TEXT"
+            ),
             // Constraint enforcement (PK / CHECK / FK). Each is a JSONB
             // payload — empty array / null means "no constraints"
             // (back-compat: old rows deserialise to empty vecs).
@@ -671,7 +679,7 @@ impl Catalog for PostgresCatalog {
                             continuous_aggregate_json, cluster_columns_json,
                             home_region,
                             pk_columns_json, check_constraints_json, foreign_keys_json,
-                            unique_constraints_json, indexes_json
+                            unique_constraints_json, indexes_json, file_format
                      FROM {sch}.tables
                      WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
@@ -699,6 +707,7 @@ impl Catalog for PostgresCatalog {
         let foreign_keys_json: Option<serde_json::Value> = row.get(15);
         let unique_constraints_json: Option<serde_json::Value> = row.get(16);
         let indexes_json: Option<serde_json::Value> = row.get(17);
+        let file_format_token: Option<String> = row.get(18);
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
         let partition_spec = match partition_spec_json {
@@ -785,7 +794,7 @@ impl Catalog for PostgresCatalog {
             row_group_rows,
             continuous_aggregate,
             cluster_columns,
-            file_format: TableFileFormat::default(),
+            file_format: file_format_from_token(file_format_token.as_deref()),
             home_region,
             indexes,
             pk_columns,
@@ -1408,6 +1417,36 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
+    /// #161: persist the table's on-disk data-file format. Mirrors
+    /// `set_cluster_columns`' single-column UPDATE; the token is the serde
+    /// snake_case representation and is read back by `load_table` /
+    /// `load_table_qualified` (NULL → Parquet for back-compat).
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn set_file_format(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        format: TableFileFormat,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let token = file_format_to_token(format);
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET file_format = $3
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
+                ),
+                &[&project.to_string(), &table.to_string(), &token],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_file_format: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{project}/{table}")));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn set_home_region(
         &self,
@@ -1773,7 +1812,8 @@ impl Catalog for PostgresCatalog {
                         bloom_filter_columns_json, row_group_rows,
                         continuous_aggregate_json, cluster_columns_json,
                         home_region,
-                        pk_columns_json, check_constraints_json, foreign_keys_json
+                        pk_columns_json, check_constraints_json, foreign_keys_json,
+                        file_format
                      )
                      SELECT project_id, schema_name, $3, schema_json, current_snapshot,
                             format_version, partition_spec_json, rls_enabled,
@@ -1781,7 +1821,8 @@ impl Catalog for PostgresCatalog {
                             bloom_filter_columns_json, row_group_rows,
                             continuous_aggregate_json, cluster_columns_json,
                             home_region,
-                            pk_columns_json, check_constraints_json, foreign_keys_json
+                            pk_columns_json, check_constraints_json, foreign_keys_json,
+                            file_format
                      FROM {sch}.tables
                      WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2
                      ON CONFLICT (project_id, schema_name, table_name) DO NOTHING"
@@ -3240,7 +3281,7 @@ impl Catalog for PostgresCatalog {
                             continuous_aggregate_json, cluster_columns_json,
                             home_region,
                             pk_columns_json, check_constraints_json, foreign_keys_json,
-                            unique_constraints_json, indexes_json
+                            unique_constraints_json, indexes_json, file_format
                      FROM {sch}.tables
                      WHERE project_id = $1 AND schema_name = $2 AND table_name = $3"
                 ),
@@ -3270,6 +3311,7 @@ impl Catalog for PostgresCatalog {
         let foreign_keys_json: Option<serde_json::Value> = row.get(15);
         let unique_constraints_json: Option<serde_json::Value> = row.get(16);
         let indexes_json: Option<serde_json::Value> = row.get(17);
+        let file_format_token: Option<String> = row.get(18);
 
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
@@ -3352,7 +3394,7 @@ impl Catalog for PostgresCatalog {
             row_group_rows,
             continuous_aggregate,
             cluster_columns,
-            file_format: TableFileFormat::default(),
+            file_format: file_format_from_token(file_format_token.as_deref()),
             home_region,
             indexes,
             pk_columns,
@@ -3730,6 +3772,26 @@ impl PostgresCatalog {
             }
         }
         Ok(out)
+    }
+}
+
+/// #161: serialise the table's on-disk file format to the compact token
+/// stored in the `file_format` TEXT column. Kept in sync with
+/// `TableFileFormat`'s serde snake_case representation.
+fn file_format_to_token(f: TableFileFormat) -> &'static str {
+    match f {
+        TableFileFormat::Parquet => "parquet",
+        TableFileFormat::Vortex => "vortex",
+    }
+}
+
+/// #161: parse the `file_format` column back. NULL / absent / unrecognised
+/// deserialises to Parquet — the back-compat default (old rows, and rows
+/// created before the engine records a format, must read as Parquet).
+fn file_format_from_token(s: Option<&str>) -> TableFileFormat {
+    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("vortex") => TableFileFormat::Vortex,
+        _ => TableFileFormat::Parquet,
     }
 }
 
