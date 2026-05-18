@@ -631,7 +631,7 @@ async fn vortex_vs_parquet_many_shapes() {
             "modulo_predicate_expr",
             format!(
                 "SELECT id, k * 3 + 1 e1, f / 2.0 e2 \
-                 FROM {{Q}} WHERE (id % 100) BETWEEN 10 AND 50 \
+                 FROM {{Q}} WHERE MOD(id, 100) BETWEEN 10 AND 50 \
                  ORDER BY id LIMIT 200"
             ),
         ),
