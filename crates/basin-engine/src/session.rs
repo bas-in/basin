@@ -26,10 +26,11 @@ use std::sync::{Arc, RwLock};
 
 use crate::AuthContext;
 
-use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId};
+use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId, TableFileFormat};
 use basin_common::{BasinError, ProjectId, Result, TableName};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::{FileFormat, FileFormatFactory};
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -605,6 +606,27 @@ pub(crate) async fn open(
     })
 }
 
+/// Build the DataFusion [`FileFormat`] + file extension for a table's
+/// on-disk data format (#161/#162). Single format per table — opt-in Vortex,
+/// Parquet remains the default and is byte-identical to the prior inline
+/// expression so existing tables see zero regression.
+fn listing_file_format(format: TableFileFormat) -> (Arc<dyn FileFormat>, &'static str) {
+    match format {
+        // KEEP byte-identical with the historical inline expression.
+        TableFileFormat::Parquet => (Arc::new(ParquetFormat::default()), ".parquet"),
+        // Opt-in Vortex read path. `VortexFormatFactory::new()` builds a
+        // process-default `VortexSession` internally (registering encodings),
+        // and its `FileFormatFactory::default()` yields a ready `VortexFormat`
+        // with default table options — the constructor the crate's own docs
+        // recommend for hand-wired `ListingTable`s. No separate `VortexSession`
+        // value needs to be named here.
+        TableFileFormat::Vortex => {
+            let factory = vortex_datafusion::VortexFormatFactory::new();
+            (FileFormatFactory::default(&factory), ".vortex")
+        }
+    }
+}
+
 /// Re-load a table's catalog metadata and (re-)register it with the
 /// `SessionContext`. Called after CREATE / INSERT so subsequent queries see
 /// the new state.
@@ -653,8 +675,8 @@ pub(crate) async fn refresh_table(
         // `Storage::list_data_files` emits and that `register_pruned_listing_table`
         // already handles the same way. Prepend the synthetic `basin://engine/`
         // scheme so DataFusion routes I/O through the registered ObjectStore.
-        let listing_options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let (file_format, file_ext) = listing_file_format(meta.file_format);
+        let listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
         let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
         for f in &live_files {
             let mut s = String::from(BASIN_URL_BASE);
@@ -715,8 +737,8 @@ pub(crate) async fn refresh_table_with_extra(
     let mut all_files: Vec<DataFileRef> = meta.live_data_files();
     all_files.extend_from_slice(extra_files);
 
-    let listing_options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+    let (file_format, file_ext) = listing_file_format(meta.file_format);
+    let listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
     let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(all_files.len());
     for f in &all_files {
         let mut s = String::from(BASIN_URL_BASE);
@@ -812,7 +834,15 @@ pub(crate) async fn apply_partition_pruning_for_query(
             // matches (no point re-registering). Skip the swap.
             continue;
         }
-        let _ = register_pruned_listing_table(engine, ctx, &table, &meta.schema, &matching).await;
+        let _ = register_pruned_listing_table(
+            engine,
+            ctx,
+            &table,
+            &meta.schema,
+            meta.file_format,
+            &matching,
+        )
+        .await;
     }
     Ok(())
 }
@@ -826,11 +856,12 @@ async fn register_pruned_listing_table(
     ctx: &SessionContext,
     table: &TableName,
     schema: &arrow_schema::Schema,
+    file_format: TableFileFormat,
     paths: &[String],
 ) -> Result<()> {
     let df_schema = Arc::new(schema_ws_to_df(schema)?);
-    let listing_options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+    let (file_format, file_ext) = listing_file_format(file_format);
+    let listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
 
     let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(paths.len());
     for p in paths {
