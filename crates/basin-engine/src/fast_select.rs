@@ -47,6 +47,11 @@ pub(crate) struct SimpleSelectPlan {
     pub projection: Option<Vec<String>>,
     pub predicate: Option<Predicate>,
     pub limit: Option<usize>,
+    /// `Some((column, ascending))` for a single-column ORDER BY recognised by
+    /// the fast path. `ascending=true` means ASC (or no direction specified);
+    /// `ascending=false` means DESC. When `Some`, `execute_simple_select` sorts
+    /// all decoded rows by this column and applies the limit post-sort.
+    pub order_by: Option<(String, bool)>,
 }
 
 /// Recognise the supported "simple SELECT" shape. Returns `None` if any
@@ -62,7 +67,6 @@ pub(crate) fn match_simple_select(stmt: &Statement) -> Option<SimpleSelectPlan> 
 
 fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     if q.with.is_some()
-        || q.order_by.is_some()
         || !q.ext_limit_by().is_empty()
         || q.ext_offset().is_some()
         || q.fetch.is_some()
@@ -73,6 +77,31 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     {
         return None;
     }
+
+    // Parse an optional single-column ORDER BY. Any ORDER BY that is more
+    // complex (multiple columns, expressions, NULLS FIRST/LAST, WITH FILL)
+    // falls through to DataFusion. `None` here means "no ORDER BY at all".
+    let order_by: Option<(String, bool)> = match q.order_by.as_ref() {
+        None => None,
+        Some(ob) => {
+            let exprs = ob.ext_exprs();
+            if exprs.len() != 1 {
+                return None;
+            }
+            let e = &exprs[0];
+            // Reject ClickHouse WITH FILL and NULLS FIRST/LAST — leave those
+            // to DataFusion so NULL ordering matches its semantics exactly.
+            if e.with_fill.is_some() || e.options.nulls_first.is_some() {
+                return None;
+            }
+            let col = match &e.expr {
+                Expr::Identifier(id) => id.value.clone(),
+                _ => return None,
+            };
+            let ascending = e.options.asc.unwrap_or(true); // default ASC
+            Some((col, ascending))
+        }
+    };
 
     let select = match q.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -162,11 +191,19 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         Some(_) => return None,
     };
 
+    // ORDER BY without LIMIT means "sort ALL rows" — let DataFusion handle
+    // that; it can parallelise and pipeline the sort better. Only handle
+    // ORDER BY when paired with a LIMIT.
+    if order_by.is_some() && limit.is_none() {
+        return None;
+    }
+
     Some(SimpleSelectPlan {
         table,
         projection,
         predicate,
         limit,
+        order_by,
     })
 }
 
@@ -469,9 +506,17 @@ pub(crate) async fn execute_simple_select(
         None => meta.schema.clone(),
     };
 
-    let trimmed = match plan.limit {
-        Some(limit) => apply_limit(batches, limit),
-        None => batches,
+    // ORDER BY + LIMIT: merge batches into one, sort by the column, take
+    // the first `limit` rows. We only reach here when `order_by.is_some()`
+    // implies `limit.is_some()` (enforced in match_query).
+    let trimmed = if let Some((ref col, ascending)) = plan.order_by {
+        let limit = plan.limit.expect("order_by implies limit");
+        apply_order_by_limit(batches, col, ascending, limit, &projected_schema)?
+    } else {
+        match plan.limit {
+            Some(limit) => apply_limit(batches, limit),
+            None => batches,
+        }
     };
 
     Ok(ExecResult::Rows {
@@ -505,6 +550,59 @@ where
     .await
     .map_err(|e| BasinError::internal(format!("spawn_blocking join: {e}")))?;
     join
+}
+
+/// Sort batches by a single column and return the first `limit` rows as one
+/// or more `RecordBatch`es. Uses Arrow's `sort_to_indices` + `take` so the
+/// sort key is only materialised once. NULLs sort last in ASC order (matching
+/// DataFusion's default NULL handling for `ORDER BY col ASC`).
+///
+/// Returns an error if the sort column is absent from the projected schema.
+fn apply_order_by_limit(
+    batches: Vec<RecordBatch>,
+    col: &str,
+    ascending: bool,
+    limit: usize,
+    schema: &Arc<Schema>,
+) -> Result<Vec<RecordBatch>> {
+    use arrow::compute::{SortOptions, sort_to_indices, take};
+    use arrow_select::concat;
+
+    if batches.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Concatenate all batches into one so the sort sees global row order.
+    let refs: Vec<&RecordBatch> = batches.iter().collect();
+    let merged = concat::concat_batches(schema, refs)
+        .map_err(|e| BasinError::internal(format!("order_by concat: {e}")))?;
+
+    let col_idx = merged.schema().index_of(col).map_err(|_| {
+        BasinError::InvalidSchema(format!("ORDER BY column '{col}' not in result schema"))
+    })?;
+    let sort_col = merged.column(col_idx);
+
+    // nulls_first=false: NULLs sort LAST (DataFusion default for ASC).
+    // For DESC, NULLs sort FIRST (DataFusion default), so nulls_first=true.
+    let opts = SortOptions {
+        descending: !ascending,
+        nulls_first: !ascending,
+    };
+    let indices = sort_to_indices(sort_col, Some(opts), Some(limit))
+        .map_err(|e| BasinError::internal(format!("order_by sort_to_indices: {e}")))?;
+
+    // Reorder every column by the sort indices.
+    let columns: Vec<arrow_array::ArrayRef> = (0..merged.num_columns())
+        .map(|i| {
+            take(merged.column(i).as_ref(), &indices, None)
+                .map_err(|e| BasinError::internal(format!("order_by take col {i}: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let result = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| BasinError::internal(format!("order_by result batch: {e}")))?;
+
+    Ok(vec![result])
 }
 
 /// Truncate the merged batches to at most `limit` rows total. Empty batches
