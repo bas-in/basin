@@ -128,10 +128,14 @@ async fn try_query(sess: &ProjectSession, sql: &str) -> Result<Vec<String>, Stri
 
 /// Median wall-time (ms) over REPS runs after one warm-up, or `Err` if
 /// the query is rejected.
-async fn try_timed(sess: &ProjectSession, sql: &str) -> Result<(f64, Vec<String>), String> {
+async fn try_timed_reps(
+    sess: &ProjectSession,
+    sql: &str,
+    reps: usize,
+) -> Result<(f64, Vec<String>), String> {
     let result = try_query(sess, sql).await?; // warm + snapshot
-    let mut s = Vec::with_capacity(REPS);
-    for _ in 0..REPS {
+    let mut s = Vec::with_capacity(reps);
+    for _ in 0..reps {
         let t = Instant::now();
         let _ = try_query(sess, sql).await?;
         s.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -140,7 +144,17 @@ async fn try_timed(sess: &ProjectSession, sql: &str) -> Result<(f64, Vec<String>
     Ok((s[s.len() / 2], result))
 }
 
-async fn build(sess: &ProjectSession, table: &str, with: &str) {
+async fn try_timed(sess: &ProjectSession, sql: &str) -> Result<(f64, Vec<String>), String> {
+    try_timed_reps(sess, sql, REPS).await
+}
+
+/// ~2000 rows per INSERT → one data file each, so a table of `total_rows`
+/// spans `ceil(total_rows/2000)` files (file/chunk pruning is exercised at
+/// every size). Data formulas are identical across sizes and to the
+/// dimension table's keyspace (`k = id % 17`).
+const BATCH: i64 = 2_000;
+
+async fn build(sess: &ProjectSession, table: &str, with: &str, total_rows: i64) {
     exec(
         sess,
         &format!(
@@ -148,12 +162,13 @@ async fn build(sess: &ProjectSession, table: &str, with: &str) {
         ),
     )
     .await;
-    let rpb = rows_per_batch();
-    for batch in 0..n_batches() {
-        let mut vals = String::new();
-        for i in 0..rpb {
-            let id = batch * rpb + i;
-            if !vals.is_empty() {
+    let mut written = 0i64;
+    while written < total_rows {
+        let n = (total_rows - written).min(BATCH);
+        let mut vals = String::with_capacity(n as usize * 24);
+        for j in 0..n {
+            let id = written + j;
+            if j > 0 {
                 vals.push(',');
             }
             let s = if id % 7 == 0 {
@@ -175,6 +190,7 @@ async fn build(sess: &ProjectSession, table: &str, with: &str) {
             &format!("INSERT INTO {table} (id, k, s, f, b) VALUES {vals}"),
         )
         .await;
+        written += n;
     }
 }
 
@@ -207,13 +223,13 @@ async fn vortex_vs_parquet_many_shapes() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    build(&sess, "tp", " WITH (basin.file_format='parquet')").await;
-    build(&sess, "tv", "").await; // default = Vortex
+    let total = n_batches() * rows_per_batch();
+    let nb = (total + BATCH - 1) / BATCH;
+    build(&sess, "tp", " WITH (basin.file_format='parquet')", total).await;
+    build(&sess, "tv", "", total).await; // default = Vortex
     build_dim(&sess, "dp", " WITH (basin.file_format='parquet')").await;
     build_dim(&sess, "dv", "").await;
 
-    let nb = n_batches();
-    let total = nb * rows_per_batch();
     let lo = total / 4;
     let hi = lo + total / 2;
     let mid = total / 2 + 7;
@@ -546,6 +562,170 @@ async fn vortex_vs_parquet_many_shapes() {
              ({wins} win, {parity} parity, {unsupported} unsupported)",
             slower.len(),
             slower.join(", ")
+        );
+    }
+}
+
+const REPS_MATRIX: usize = 3; // median-of-3 keeps the size sweep fast
+
+/// Sizes for the size×shape matrix. Default 10k/25k/100k (fast); add 1M
+/// only when `BASIN_SMOKE_1M` is set. Override fully with
+/// `BASIN_SMOKE_SIZES=10000,50000`.
+fn matrix_sizes() -> Vec<i64> {
+    let mut v: Vec<i64> = match std::env::var("BASIN_SMOKE_SIZES") {
+        Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+        Err(_) => vec![10_000, 25_000, 100_000],
+    };
+    if v.is_empty() {
+        v = vec![10_000, 25_000, 100_000];
+    }
+    if std::env::var("BASIN_SMOKE_1M").is_ok() {
+        v.push(1_000_000);
+    }
+    v
+}
+
+/// Curated representative shapes (all proven Basin-supported) spanning the
+/// spectrum: simple scans/points, the historically-weak DataFusion-path
+/// shapes, joins, and the metadata-aggregate win. `{Q}`=fact, `{D}`=dim.
+fn matrix_shapes(lo: i64, hi: i64, mid: i64) -> Vec<(&'static str, String)> {
+    vec![
+        ("full_scan", "SELECT * FROM {Q}".into()),
+        ("projection_2col", "SELECT id, k FROM {Q}".into()),
+        ("point_eq", format!("SELECT * FROM {{Q}} WHERE id = {mid}")),
+        (
+            "range_between",
+            format!("SELECT * FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}"),
+        ),
+        ("inequality_gt", "SELECT id, k FROM {Q} WHERE k > 10".into()),
+        ("is_null", "SELECT * FROM {Q} WHERE s IS NULL".into()),
+        ("string_eq", "SELECT * FROM {Q} WHERE s = 'v3'".into()),
+        (
+            "compound",
+            format!("SELECT * FROM {{Q}} WHERE id BETWEEN {lo} AND {hi} AND b = true"),
+        ),
+        (
+            "aggregate_full",
+            "SELECT COUNT(*), SUM(id), MIN(k), MAX(k) FROM {Q}".into(),
+        ),
+        (
+            "aggregate_filtered",
+            format!("SELECT COUNT(*), SUM(id) FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}"),
+        ),
+        ("group_by", "SELECT k, COUNT(*) FROM {Q} GROUP BY k".into()),
+        ("order_by_limit", "SELECT * FROM {Q} ORDER BY id LIMIT 20".into()),
+        (
+            "inner_join",
+            format!(
+                "SELECT a.id, d.label FROM {{Q}} a JOIN {{D}} d ON a.k = d.dk \
+                 WHERE a.id BETWEEN {lo} AND {hi}"
+            ),
+        ),
+        (
+            "in_list",
+            "SELECT * FROM {Q} WHERE k IN (1, 3, 5, 7, 9, 11, 13, 15)".into(),
+        ),
+        (
+            "or_predicate",
+            "SELECT * FROM {Q} WHERE k = 1 OR k = 9 OR k = 13".into(),
+        ),
+        ("count_distinct", "SELECT COUNT(DISTINCT k) FROM {Q}".into()),
+        ("distinct_rows", "SELECT DISTINCT k, b FROM {Q}".into()),
+        (
+            "window_row_number",
+            format!("SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM {{Q}} WHERE id < {lo}"),
+        ),
+        (
+            "subquery_from",
+            format!("SELECT COUNT(*) FROM (SELECT k FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}) t"),
+        ),
+        (
+            "expr_projection",
+            format!("SELECT id, k, id + k AS s1, k * 2 AS s2 FROM {{Q}} WHERE id < {lo}"),
+        ),
+    ]
+}
+
+/// Size×shape matrix: builds a fresh Parquet table and a fresh Vortex
+/// table at each size, runs every curated shape on both, ASSERTS
+/// byte-identical results (correctness) and records `parquet_ms /
+/// vortex_ms`. Prints a shape×size ratio matrix and the exact list of
+/// `(shape@size)` cells where Vortex is slower — the precise target for
+/// "best at all shapes AND all sizes". Fast: median-of-3, curated subset,
+/// 1M opt-in.
+#[tokio::test]
+async fn vortex_vs_parquet_size_matrix() {
+    let sizes = matrix_sizes();
+    // labels in shape order (taken from the first size's shape list)
+    let labels: Vec<&'static str> = matrix_shapes(1, 2, 3).iter().map(|(l, _)| *l).collect();
+    // ratios[shape_idx][size_idx] = Some(ratio) or None (unsupported)
+    let mut ratios: Vec<Vec<Option<f64>>> = vec![vec![None; sizes.len()]; labels.len()];
+
+    for (si, &sz) in sizes.iter().enumerate() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        build(&sess, "tp", " WITH (basin.file_format='parquet')", sz).await;
+        build(&sess, "tv", "", sz).await;
+        build_dim(&sess, "dp", " WITH (basin.file_format='parquet')").await;
+        build_dim(&sess, "dv", "").await;
+        let (lo, hi, mid) = (sz / 4, sz / 4 + sz / 2, sz / 2 + 7);
+        for (li, (label, tmpl)) in matrix_shapes(lo, hi, mid).iter().enumerate() {
+            let pq = tmpl.replace("{Q}", "tp").replace("{D}", "dp");
+            let vq = tmpl.replace("{Q}", "tv").replace("{D}", "dv");
+            let p = try_timed_reps(&sess, &pq, REPS_MATRIX).await;
+            let v = try_timed_reps(&sess, &vq, REPS_MATRIX).await;
+            match (p, v) {
+                (Ok((pm, pr)), Ok((vm, vr))) => {
+                    assert_eq!(
+                        vr, pr,
+                        "CORRECTNESS: Vortex != Parquet for `{label}` @ {sz} rows"
+                    );
+                    ratios[li][si] = Some(if vm > 0.0 { pm / vm } else { f64::NAN });
+                }
+                (Err(_), Err(_)) => { /* Basin SQL gap — leave None */ }
+                (pr, vr) => panic!(
+                    "CORRECTNESS DIVERGENCE `{label}` @ {sz}: parquet={pr:?} vortex={vr:?}"
+                ),
+            }
+        }
+        // dir/eng/sess are loop-scoped → dropped here (per-size isolation).
+    }
+
+    // ---- print matrix ----
+    print!("\n[VORTEX vs PARQUET size×shape matrix — ratio = parquet/vortex, >1 = Vortex faster, median of {REPS_MATRIX}]\n{:<22}", "shape");
+    for sz in &sizes {
+        print!("{:>12}", format!("{}", sz));
+    }
+    println!();
+    let mut losses: Vec<String> = Vec::new();
+    for (li, label) in labels.iter().enumerate() {
+        print!("{label:<22}");
+        for (si, sz) in sizes.iter().enumerate() {
+            match ratios[li][si] {
+                Some(r) => {
+                    print!("{r:>12.2}");
+                    if r < 0.98 {
+                        losses.push(format!("{label}@{sz}({r:.2}x)"));
+                    }
+                }
+                None => print!("{:>12}", "n/a"),
+            }
+        }
+        println!();
+    }
+    println!();
+    if losses.is_empty() {
+        println!(
+            "[matrix] Vortex >= Parquet on ALL ({} shapes x {} sizes)",
+            labels.len(),
+            sizes.len()
+        );
+    } else {
+        println!(
+            "[matrix] Vortex slower on {} (shape@size) cells: {}",
+            losses.len(),
+            losses.join(", ")
         );
     }
 }
