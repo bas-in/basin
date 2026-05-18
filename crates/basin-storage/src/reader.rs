@@ -152,13 +152,16 @@ pub(crate) async fn list_data_files_with_stats(
 
     // Vortex files carry no Parquet footer, but DELETE/UPDATE row math and
     // the constraint/FK/UNIQUE scans rely on `row_count` (e.g. exec_delete
-    // does `deleted += f.row_count` and `removed = f.row_count - kept`). The
-    // Vortex footer has a cheap logical row count — read it so those paths
-    // are correct. `column_stats` stays empty (Vortex stats-pruning is a
-    // deliberate no-op; absent stats only disables an optimisation). The
-    // GET is best-effort: a failure (e.g. an envelope-encrypted blob, which
-    // this listing path does not decrypt — the same limitation the Parquet
-    // footer read here has) leaves row_count at 0, no worse than before.
+    // does `deleted += f.row_count` and `removed = f.row_count - kept`), and
+    // the catalog file-pruning path needs `column_stats`. Both come from
+    // the Vortex footer (no data decode) off a single GET of the blob.
+    // `column_stats` is type-gated (i64/f64/null-count only) in the same
+    // byte contract as Parquet so `evaluate_compound_for_pruning` treats
+    // them identically; the Vortex⇆Parquet differential harness is the
+    // correctness gate. The GET is best-effort: a failure (e.g. an
+    // envelope-encrypted blob, which this listing path does not decrypt —
+    // the same limitation the Parquet footer read here has) leaves the
+    // listing defaults (row_count 0, empty stats), no worse than before.
     let vortex_idxs: Vec<usize> = files
         .iter()
         .enumerate()
@@ -166,30 +169,40 @@ pub(crate) async fn list_data_files_with_stats(
         .map(|(i, _)| i)
         .collect();
     if !vortex_idxs.is_empty() {
+        type VortexStat = (usize, Option<u64>, BTreeMap<String, ColumnStats>);
         let vwork: Vec<_> = vortex_idxs
             .into_iter()
             .map(|i| {
                 let store = store.clone();
                 let path = files[i].path.clone();
                 async move {
-                    let rc = match store.get(&path).await {
-                        Ok(obj) => match obj.bytes().await {
-                            Ok(b) => crate::vortex_format::row_count(&b).await.ok(),
-                            Err(_) => None,
-                        },
+                    let bytes = match store.get(&path).await {
+                        Ok(obj) => obj.bytes().await.ok(),
                         Err(_) => None,
                     };
-                    (i, rc)
+                    let (rc, stats) = match bytes {
+                        Some(b) => (
+                            crate::vortex_format::row_count(&b).await.ok(),
+                            crate::vortex_format::column_stats(&b)
+                                .await
+                                .unwrap_or_default(),
+                        ),
+                        None => (None, BTreeMap::new()),
+                    };
+                    (i, rc, stats)
                 }
             })
             .collect();
-        let vresolved: Vec<(usize, Option<u64>)> = futures::stream::iter(vwork)
+        let vresolved: Vec<VortexStat> = futures::stream::iter(vwork)
             .buffer_unordered(8)
             .collect()
             .await;
-        for (i, rc) in vresolved {
+        for (i, rc, stats) in vresolved {
             if let Some(rows) = rc {
                 files[i].row_count = rows;
+            }
+            if !stats.is_empty() {
+                files[i].column_stats = stats;
             }
         }
     }

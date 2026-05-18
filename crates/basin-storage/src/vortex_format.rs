@@ -82,6 +82,94 @@ pub(crate) async fn row_count(bytes: &[u8]) -> Result<u64> {
     Ok(vf.row_count())
 }
 
+/// Per-column min/max/null-count for a Vortex blob, read from the file
+/// **footer only** (no data decode — symmetric with reading a Parquet
+/// footer's stats), in Basin's `ColumnStats` byte contract so the catalog
+/// file-pruning path (`evaluate_compound_for_pruning` / `file_outcome`)
+/// treats Vortex and Parquet identically.
+///
+/// **Type-gated for correctness**, exactly like the filter-pushdown:
+/// `min`/`max` bytes are emitted ONLY for columns whose Vortex dtype is
+/// precisely `i64` or `f64` (8-byte little-endian, matching
+/// `reader::decode_le_i64` / `decode_le_f64`). Any other type leaves
+/// min/max `None` → that column simply doesn't participate in file
+/// pruning (correct, just unoptimised) rather than risk an encoding
+/// mismatch that could wrongly prune a matching file. `null_count` is
+/// safe for every column. The Vortex⇆Parquet differential harness
+/// (`tests/vortex_parquet_differential.rs`) is the correctness gate: a
+/// wrongly pruned file shows up there as a mismatch vs the Parquet oracle.
+pub(crate) async fn column_stats(
+    bytes: &[u8],
+) -> Result<std::collections::BTreeMap<String, crate::data_file::ColumnStats>> {
+    use vortex_array::dtype::{DType, PType};
+    use vortex_array::expr::stats::Stat;
+
+    let mut out = std::collections::BTreeMap::new();
+    let vf = session()
+        .open_options()
+        .open_buffer(bytes.to_vec())
+        .map_err(|e| BasinError::storage(format!("vortex: open_buffer (stats): {e}")))?;
+
+    // Top-level struct field names, in field order (the same order the
+    // file statistics are recorded in).
+    let names: Vec<String> = match vf.dtype() {
+        DType::Struct(sd, _) => sd.names().iter().map(|n| n.to_string()).collect(),
+        _ => return Ok(out),
+    };
+    let Some(fs) = vf.file_stats() else {
+        return Ok(out);
+    };
+
+    for (idx, name) in names.iter().enumerate() {
+        let (ss, col_dt) = fs.get(idx);
+
+        let null_count = Stat::NullCount
+            .dtype(col_dt)
+            .and_then(|nc_dt| ss.get_as::<u64>(Stat::NullCount, &nc_dt))
+            .and_then(|p| p.as_exact());
+
+        // Only exact i64 / f64 columns get min/max, in the 8-byte LE
+        // contract `reader::decode_le_i64` / `decode_le_f64` expect.
+        let (min_bytes, max_bytes) = match col_dt {
+            DType::Primitive(PType::I64, _) => {
+                let mn = ss
+                    .get_as::<i64>(Stat::Min, col_dt)
+                    .and_then(|p| p.as_exact())
+                    .map(|v| v.to_le_bytes().to_vec());
+                let mx = ss
+                    .get_as::<i64>(Stat::Max, col_dt)
+                    .and_then(|p| p.as_exact())
+                    .map(|v| v.to_le_bytes().to_vec());
+                (mn, mx)
+            }
+            DType::Primitive(PType::F64, _) => {
+                let mn = ss
+                    .get_as::<f64>(Stat::Min, col_dt)
+                    .and_then(|p| p.as_exact())
+                    .map(|v| v.to_le_bytes().to_vec());
+                let mx = ss
+                    .get_as::<f64>(Stat::Max, col_dt)
+                    .and_then(|p| p.as_exact())
+                    .map(|v| v.to_le_bytes().to_vec());
+                (mn, mx)
+            }
+            _ => (None, None),
+        };
+
+        if null_count.is_some() || min_bytes.is_some() || max_bytes.is_some() {
+            out.insert(
+                name.clone(),
+                crate::data_file::ColumnStats {
+                    null_count,
+                    min_bytes,
+                    max_bytes,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Decode a Vortex byte blob back to `RecordBatch`es. One `RecordBatch` is
 /// produced per Vortex chunk in the file.
 ///

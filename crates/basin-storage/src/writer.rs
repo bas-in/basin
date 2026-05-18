@@ -215,7 +215,11 @@ pub(crate) async fn write_batch_with_options(
     // pruning. Parquet behaviour is unchanged.
     let column_stats = match opts.file_format {
         FileFormat::Parquet => extract_column_stats(&bytes, batch_to_write)?,
-        FileFormat::Vortex => BTreeMap::new(),
+        // Footer-only Vortex stats in the same byte contract as Parquet so
+        // the catalog file-pruning path treats both identically. Type-gated
+        // (i64/f64/null-count) for correctness; validated by the
+        // Vortex⇆Parquet differential harness.
+        FileFormat::Vortex => crate::vortex_format::column_stats(&bytes).await?,
     };
 
     // Envelope-encrypt the body if a provider is attached. The on-disk
