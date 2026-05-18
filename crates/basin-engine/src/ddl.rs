@@ -1339,11 +1339,331 @@ fn sanitize_create_table_extensions(sql: &str) -> String {
             }
         }
 
+        // Basin owns the per-table `WITH (basin.file_format = '…')`
+        // storage option. `parse_create_table_file_format` recovers it
+        // from the *raw* SQL before this sanitiser runs; sqlparser then
+        // rejects the dotted key, so strip just that one entry here.
+        // Other PG storage parameters are preserved verbatim, and a
+        // `WITH (…)` left empty by the removal is dropped entirely so a
+        // bare `CREATE TABLE` parses. The `next non-ws is '('` guard
+        // distinguishes the table-options clause from a leading CTE
+        // (`WITH x AS (…)`) or CTAS `WITH [NO] DATA`.
+        if matches_kw_at(bytes, i, b"WITH") {
+            let mut k = i + b"WITH".len();
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                if let Some(close) = find_matching_paren(bytes, k) {
+                    let body = &sql[k + 1..close];
+                    let kept: Vec<&str> = split_top_level_commas(body)
+                        .into_iter()
+                        .map(|e| e.trim())
+                        .filter(|e| {
+                            !e.is_empty() && {
+                                let key = with_option_key(e);
+                                key != "basin.file_format" && key != "file_format"
+                            }
+                        })
+                        .collect();
+                    if kept.is_empty() {
+                        if !out.ends_with(' ') && !out.is_empty() {
+                            out.push(' ');
+                        }
+                    } else {
+                        out.push_str("WITH (");
+                        out.push_str(&kept.join(", "));
+                        out.push(')');
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+
         // Plain pass-through.
         out.push(bytes[i] as char);
         i += 1;
     }
     out
+}
+
+/// Split a `WITH (...)` body on top-level commas, skipping commas inside
+/// string literals, quoted identifiers, and nested parentheses.
+fn split_top_level_commas(body: &str) -> Vec<&str> {
+    let b = body.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&body[start..]);
+    parts
+}
+
+/// The lowercased, unquoted option key of one `WITH (...)` entry — the
+/// text left of the first `=` (or the whole entry when there is none).
+fn with_option_key(entry: &str) -> String {
+    let raw = match entry.find('=') {
+        Some(p) => &entry[..p],
+        None => entry,
+    };
+    let t = raw.trim();
+    let unquoted = t
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(t);
+    unquoted.trim().to_ascii_lowercase()
+}
+
+/// Parse the per-table on-disk file format out of a CREATE TABLE
+/// `WITH (...)` clause.
+///
+/// This is the *read* counterpart to [`sanitize_create_table_extensions`]:
+/// the sanitiser strips `basin.*` storage parameters out of the SQL before
+/// sqlparser sees it; this function inspects the *same* unsanitised SQL to
+/// recover the `basin.file_format` option the sanitiser dropped, so the
+/// catalog row can be tagged with the requested format.
+///
+/// Recognised key (case-insensitive, with or without the `basin.` prefix —
+/// the sanitiser treats `basin.<k>` and bare `<k>` the same way for the
+/// keys it owns): `basin.file_format` / `file_format`.
+///
+/// Recognised values (case-insensitive, quoted or bare):
+/// * `vortex`  → [`TableFileFormat::Vortex`]
+/// * `parquet` → [`TableFileFormat::Parquet`]
+///
+/// Defaults to [`TableFileFormat::Parquet`] when the key is absent OR the
+/// value is unrecognised. This never errors: an unparseable / malformed
+/// WITH clause simply yields the default, leaving the real diagnostic to
+/// sqlparser downstream.
+///
+/// Only the *first* top-level `WITH (...)` group is consulted, and string
+/// literals / quoted identifiers / comments are skipped so a `WITH` (or a
+/// `basin.file_format=...`) buried inside a literal or comment can't spoof
+/// the format.
+pub fn parse_create_table_file_format(sql: &str) -> basin_catalog::TableFileFormat {
+    use basin_catalog::TableFileFormat;
+
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    // Walk the statement, skipping literals/idents/comments, looking for a
+    // top-level `WITH` keyword followed by `(`.
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // String literal: `'...'` with `''` escapes.
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Quoted identifier: `"..."` with `""` escapes.
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Line comment.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+
+        if matches_kw_at(bytes, i, b"WITH") {
+            let mut k = i + b"WITH".len();
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                if let Some(close) = find_matching_paren(bytes, k) {
+                    let inside = &sql[k + 1..close];
+                    if let Some(fmt) = file_format_from_with_body(inside) {
+                        return fmt;
+                    }
+                }
+                // A `WITH (...)` we couldn't parse a format out of —
+                // fall back to the default (no error).
+                return TableFileFormat::default();
+            }
+        }
+
+        i += 1;
+    }
+
+    TableFileFormat::default()
+}
+
+/// Scan the body (without surrounding parens) of a CREATE TABLE
+/// `WITH (...)` clause for a `basin.file_format` / `file_format` option
+/// and map its value to a [`TableFileFormat`]. Returns `None` when the
+/// key is absent so the caller can apply the crate default; returns
+/// `Some(Parquet)` for a present-but-unrecognised value.
+fn file_format_from_with_body(inside: &str) -> Option<basin_catalog::TableFileFormat> {
+    use basin_catalog::TableFileFormat;
+
+    // Split on top-level commas, skipping commas inside quotes.
+    let bytes = inside.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut found: Option<TableFileFormat> = None;
+
+    let mut handle_segment = |seg: &str, found: &mut Option<TableFileFormat>| {
+        let Some(eq) = seg.find('=') else {
+            return;
+        };
+        let raw_key = seg[..eq].trim();
+        let raw_val = seg[eq + 1..].trim();
+
+        // Unquote the key (handles `"basin.file_format"` and bare).
+        let key = unquote_with_token(raw_key);
+        // Accept both the `basin.`-prefixed and bare spelling — the
+        // sanitiser owns both for the keys it strips.
+        let key_lc = key.to_ascii_lowercase();
+        let is_file_format = key_lc == "basin.file_format" || key_lc == "file_format";
+        if !is_file_format {
+            return;
+        }
+
+        let val = unquote_with_token(raw_val);
+        let mapped = if val.eq_ignore_ascii_case("vortex") {
+            TableFileFormat::Vortex
+        } else {
+            // 'parquet' or anything unrecognised → Parquet.
+            TableFileFormat::Parquet
+        };
+        *found = Some(mapped);
+    };
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b',' => {
+                handle_segment(&inside[start..i], &mut found);
+                if found.is_some() {
+                    return found;
+                }
+                start = i + 1;
+                i += 1;
+                continue;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    handle_segment(&inside[start..], &mut found);
+    found
+}
+
+/// Strip a single layer of surrounding `'...'` or `"..."` quoting from a
+/// WITH-option token, collapsing the doubled-quote escape. A bare
+/// (unquoted) token is returned trimmed and unchanged.
+fn unquote_with_token(tok: &str) -> String {
+    let t = tok.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2 {
+        let q = bytes[0];
+        if (q == b'\'' || q == b'"') && bytes[bytes.len() - 1] == q {
+            let inner = &t[1..t.len() - 1];
+            let dq = [q, q];
+            // SAFETY: `q` is ASCII so the 2-byte pattern is valid UTF-8.
+            let pat = std::str::from_utf8(&dq).unwrap();
+            let single = (q as char).to_string();
+            return inner.replace(pat, &single);
+        }
+    }
+    t.to_string()
 }
 
 /// Find the matching `)` for a `(` at `bytes[open]`, respecting nested
@@ -1965,5 +2285,96 @@ mod cluster_by_tests {
         let (stripped, cols) = extract_create_table_cluster_by(sql).unwrap();
         assert_eq!(stripped, sql);
         assert_eq!(cols, None);
+    }
+}
+
+#[cfg(test)]
+mod file_format_tests {
+    use super::parse_create_table_file_format;
+    use basin_catalog::TableFileFormat;
+
+    #[test]
+    fn vortex_lowercase() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format='vortex')";
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
+    }
+
+    #[test]
+    fn vortex_uppercase_key_and_value() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (BASIN.FILE_FORMAT = 'VORTEX')";
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
+    }
+
+    #[test]
+    fn explicit_parquet() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format='parquet')";
+        assert_eq!(
+            parse_create_table_file_format(sql),
+            TableFileFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn key_absent_defaults_parquet() {
+        let sql = "CREATE TABLE foo (id BIGINT)";
+        assert_eq!(
+            parse_create_table_file_format(sql),
+            TableFileFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn key_absent_with_other_options_defaults_parquet() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (fillfactor = 70, autovacuum_enabled = true)";
+        assert_eq!(
+            parse_create_table_file_format(sql),
+            TableFileFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn unrecognised_value_defaults_parquet() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format = 'orc')";
+        assert_eq!(
+            parse_create_table_file_format(sql),
+            TableFileFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn embedded_among_other_with_options() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (fillfactor = 70, \
+                   basin.file_format = 'vortex', autovacuum_enabled = true)";
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
+    }
+
+    #[test]
+    fn bare_key_without_basin_prefix() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (file_format = 'vortex')";
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
+    }
+
+    #[test]
+    fn unquoted_value_accepted() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format = vortex)";
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
+    }
+
+    #[test]
+    fn with_in_string_literal_ignored() {
+        // A `WITH (...)` buried inside a column DEFAULT literal must not
+        // be mistaken for a real storage-parameter clause.
+        let sql = "CREATE TABLE foo (id BIGINT, note TEXT DEFAULT \
+                   'WITH (basin.file_format=vortex)')";
+        assert_eq!(
+            parse_create_table_file_format(sql),
+            TableFileFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn trailing_semicolon_ok() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format='vortex');";
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
     }
 }
