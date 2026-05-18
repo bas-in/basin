@@ -1,6 +1,6 @@
 //! Registry validation tests. Cheap, no HTTP server needed.
 
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_webhooks::{
     SubscriptionError, WebhookOps, WebhookRegistry, WebhookSubscription, WebhookSubscriptionId,
 };

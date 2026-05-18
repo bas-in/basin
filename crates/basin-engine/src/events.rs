@@ -21,8 +21,8 @@ use arrow_array::{
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use basin_common::{
-    BasinError, ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry, Result, TableName,
-    ProjectId,
+    BasinError, ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry, ProjectId, Result,
+    TableName,
 };
 use chrono::Utc;
 use serde_json::{Map, Value};

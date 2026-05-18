@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{Storage, StorageConfig};

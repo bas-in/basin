@@ -10,7 +10,7 @@ use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog, SqlArgType, SqlFunctionArg,
     SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 
 fn tname(s: &str) -> TableName {
     TableName::new(s).unwrap()

@@ -45,9 +45,9 @@
 //!   scalar subqueries are supported since #106.
 //! - Subquery / function-call WHERE.
 
-use std::sync::Arc;
 use crate::pg_ast::ObjectNamePartExt;
 use object_store::ObjectStoreExt;
+use std::sync::Arc;
 
 use arrow_array::builder::{
     BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
@@ -59,7 +59,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::DataFileRef;
-use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName, ProjectId};
+use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, ProjectId, Result, TableName};
 use basin_storage::{
     evaluate_compound, evaluate_compound_for_pruning, vector_index_segment_key_for_data_file,
     CompoundPredicate, DataFile, Predicate, PruneOutcome, ScalarValue, Storage,
@@ -86,10 +86,7 @@ use sqlparser::ast::{
 /// result as a literal list and feed it through the normal predicate path.
 /// The function is recursive so nested AND/OR containing IN-subqueries work
 /// too.
-pub(crate) async fn resolve_subqueries_in_expr(
-    sess: &ProjectSession,
-    expr: Expr,
-) -> Result<Expr> {
+pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr) -> Result<Expr> {
     match expr {
         Expr::InSubquery {
             expr: col_expr,
@@ -97,9 +94,10 @@ pub(crate) async fn resolve_subqueries_in_expr(
             negated,
         } => {
             let sql = subquery.to_string();
-            let df = sess.ctx.sql(&sql).await.map_err(|e| {
-                BasinError::internal(format!("IN (SELECT …) – plan failed: {e}"))
-            })?;
+            let df =
+                sess.ctx.sql(&sql).await.map_err(|e| {
+                    BasinError::internal(format!("IN (SELECT …) – plan failed: {e}"))
+                })?;
             let df_batches = df.collect().await.map_err(|e| {
                 BasinError::internal(format!("IN (SELECT …) – execute failed: {e}"))
             })?;
@@ -144,9 +142,10 @@ pub(crate) async fn resolve_subqueries_in_expr(
         // per-outer-row sub-execution and are deferred as a follow-up.
         Expr::Subquery(subquery) => {
             let sql = subquery.to_string();
-            let df = sess.ctx.sql(&sql).await.map_err(|e| {
-                BasinError::internal(format!("scalar subquery – plan failed: {e}"))
-            })?;
+            let df =
+                sess.ctx.sql(&sql).await.map_err(|e| {
+                    BasinError::internal(format!("scalar subquery – plan failed: {e}"))
+                })?;
             let df_batches = df.collect().await.map_err(|e| {
                 BasinError::internal(format!("scalar subquery – execute failed: {e}"))
             })?;
@@ -237,9 +236,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(
-                        Value::Number((-v).to_string(), false).into(),
-                    )),
+                    expr: Box::new(Expr::Value(Value::Number((-v).to_string(), false).into())),
                 })
             } else {
                 Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
@@ -257,9 +254,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(
-                        Value::Number((-v).to_string(), false).into(),
-                    )),
+                    expr: Box::new(Expr::Value(Value::Number((-v).to_string(), false).into())),
                 })
             } else {
                 Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
@@ -275,9 +270,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(
-                        Value::Number((-v).to_string(), false).into(),
-                    )),
+                    expr: Box::new(Expr::Value(Value::Number((-v).to_string(), false).into())),
                 })
             } else {
                 Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
@@ -289,7 +282,9 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| BasinError::internal("expected StringArray"))?
                 .value(i);
-            Ok(Expr::Value((Value::SingleQuotedString(v.to_string())).into()))
+            Ok(Expr::Value(
+                (Value::SingleQuotedString(v.to_string())).into(),
+            ))
         }
         Dt::Float64 => {
             let v = col
@@ -300,9 +295,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0.0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(
-                        Value::Number((-v).to_string(), false).into(),
-                    )),
+                    expr: Box::new(Expr::Value(Value::Number((-v).to_string(), false).into())),
                 })
             } else {
                 Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
@@ -318,9 +311,7 @@ fn arrow_col_value_to_expr(col: &dyn arrow_array::Array, i: usize) -> Result<Exp
             if v < 0.0 {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(
-                        Value::Number((-v).to_string(), false).into(),
-                    )),
+                    expr: Box::new(Expr::Value(Value::Number((-v).to_string(), false).into())),
                 })
             } else {
                 Ok(Expr::Value((Value::Number(v.to_string(), false)).into()))
@@ -892,7 +883,8 @@ pub(crate) async fn exec_update(
                 let catalog = &sess.engine.config().catalog;
                 let (rows_matched, mut new_batches, before_batches, mask_per_batch) =
                     if capture_events {
-                        let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
+                        let befores =
+                            read_file_to_batches(&storage, &sess.project, &f.path).await?;
                         let mut masks = Vec::with_capacity(befores.len());
                         let mut news = Vec::with_capacity(befores.len());
                         let mut matched = 0usize;
@@ -957,9 +949,7 @@ pub(crate) async fn exec_update(
                         for (b, m) in new_batches.iter().zip(mask_per_batch.iter()) {
                             let filtered = arrow_select::filter::filter_record_batch(b, m)
                                 .map_err(|e| {
-                                    BasinError::internal(format!(
-                                        "filter returning batch: {e}"
-                                    ))
+                                    BasinError::internal(format!("filter returning batch: {e}"))
                                 })?;
                             if filtered.num_rows() > 0 {
                                 returning_input.push(filtered);
@@ -1161,10 +1151,7 @@ async fn exec_delete_using(
     let target_str = target.as_str();
 
     // Build the SELECT that materialises matching PK tuples.
-    let pk_proj: Vec<String> = pk
-        .iter()
-        .map(|c| format!("{target_str}.{c}"))
-        .collect();
+    let pk_proj: Vec<String> = pk.iter().map(|c| format!("{target_str}.{c}")).collect();
 
     // USING tables as a comma-separated FROM list.
     let using_str: Vec<String> = using_tables
@@ -1189,13 +1176,19 @@ async fn exec_delete_using(
     let join_result = Box::pin(sess.execute(&join_select)).await?;
     let batches = match join_result {
         ExecResult::Rows { batches, .. } => batches,
-        ExecResult::Empty { .. } => return Ok(ExecResult::Empty { tag: "DELETE 0".into() }),
+        ExecResult::Empty { .. } => {
+            return Ok(ExecResult::Empty {
+                tag: "DELETE 0".into(),
+            })
+        }
     };
 
     // Collect pk tuples.
     let pk_tuples = collect_pk_batches(&batches, pk)?;
     if pk_tuples.is_empty() {
-        return Ok(ExecResult::Empty { tag: "DELETE 0".into() });
+        return Ok(ExecResult::Empty {
+            tag: "DELETE 0".into(),
+        });
     }
 
     // Build a WHERE clause: for single-pk tables use simple IN; for multi-pk
@@ -1269,7 +1262,10 @@ async fn exec_update_from(
                     name.0[0].id_val().clone()
                 } else {
                     // schema.column — take the last part
-                    name.0.last().map(|i| i.id_val().clone()).unwrap_or_default()
+                    name.0
+                        .last()
+                        .map(|i| i.id_val().clone())
+                        .unwrap_or_default()
                 }
             }
             AssignmentTarget::Tuple(_) => {
@@ -1311,7 +1307,11 @@ async fn exec_update_from(
     let join_result = Box::pin(sess.execute(&join_select)).await?;
     let batches = match join_result {
         ExecResult::Rows { batches, .. } => batches,
-        ExecResult::Empty { .. } => return Ok(ExecResult::Empty { tag: "UPDATE 0".into() }),
+        ExecResult::Empty { .. } => {
+            return Ok(ExecResult::Empty {
+                tag: "UPDATE 0".into(),
+            })
+        }
     };
 
     // For each matching row emit an individual UPDATE.
@@ -1432,10 +1432,7 @@ async fn exec_delete_via_df_rowset(
         // Build: SELECT t.pk1, t.pk2, … FROM t [AS alias] WHERE <selection>
         // The table qualifier prevents ambiguity when the subquery also
         // references `t`.
-        let pk_proj: Vec<String> = pk
-            .iter()
-            .map(|c| format!("{qualifier}.{c}"))
-            .collect();
+        let pk_proj: Vec<String> = pk.iter().map(|c| format!("{qualifier}.{c}")).collect();
 
         let rowset_sql = format!(
             "SELECT {proj} FROM {from_clause} WHERE {pred}",
@@ -1584,10 +1581,7 @@ async fn exec_update_via_df_rowset(
     let pk = &meta.pk_columns;
 
     // Build: SELECT t.pk1, … FROM t WHERE <selection>
-    let pk_proj: Vec<String> = pk
-        .iter()
-        .map(|c| format!("{table_str}.{c}"))
-        .collect();
+    let pk_proj: Vec<String> = pk.iter().map(|c| format!("{table_str}.{c}")).collect();
 
     let rowset_sql = format!(
         "SELECT {proj} FROM {tbl} WHERE {pred}",
@@ -1614,27 +1608,19 @@ async fn exec_update_via_df_rowset(
     }
 
     // Build SET clause text.
-    let set_parts: Vec<String> = assignments
-        .iter()
-        .map(|a| format!("{}", a))
-        .collect();
+    let set_parts: Vec<String> = assignments.iter().map(|a| format!("{}", a)).collect();
     let set_clause = set_parts.join(", ");
 
     let schema = meta.schema.clone();
     let where_pred = build_pk_in_predicate(&pk_tuples, pk, &schema)?;
-    let update_sql = format!(
-        "UPDATE {table_str} SET {set_clause} WHERE {where_pred}"
-    );
+    let update_sql = format!("UPDATE {table_str} SET {set_clause} WHERE {where_pred}");
     Box::pin(sess.execute(&update_sql)).await
 }
 
 /// Collect `(pk_col1, pk_col2, …)` tuples from a result set as string
 /// literals. Each column value is rendered as its SQL literal form
 /// (quoted for text, unquoted for numeric types).
-fn collect_pk_batches(
-    batches: &[RecordBatch],
-    pk_cols: &[String],
-) -> Result<Vec<Vec<String>>> {
+fn collect_pk_batches(batches: &[RecordBatch], pk_cols: &[String]) -> Result<Vec<Vec<String>>> {
     let mut out = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
@@ -1653,11 +1639,7 @@ fn collect_pk_batches(
 
 /// Render an Arrow array element at `row` as a SQL literal string.
 /// Quoted for Utf8; bare numeric / bool otherwise.
-fn scalar_from_array(
-    arr: &dyn arrow_array::Array,
-    row: usize,
-    dt: &DataType,
-) -> Result<String> {
+fn scalar_from_array(arr: &dyn arrow_array::Array, row: usize, dt: &DataType) -> Result<String> {
     use arrow_array::cast::AsArray;
     if arr.is_null(row) {
         return Ok("NULL".into());
@@ -1671,12 +1653,30 @@ fn scalar_from_array(
             let s = arr.as_string::<i64>().value(row);
             Ok(format!("'{}'", s.replace('\'', "''")))
         }
-        DataType::Int8 => Ok(arr.as_primitive::<arrow_array::types::Int8Type>().value(row).to_string()),
-        DataType::Int16 => Ok(arr.as_primitive::<arrow_array::types::Int16Type>().value(row).to_string()),
-        DataType::Int32 => Ok(arr.as_primitive::<arrow_array::types::Int32Type>().value(row).to_string()),
-        DataType::Int64 => Ok(arr.as_primitive::<arrow_array::types::Int64Type>().value(row).to_string()),
-        DataType::Float32 => Ok(arr.as_primitive::<arrow_array::types::Float32Type>().value(row).to_string()),
-        DataType::Float64 => Ok(arr.as_primitive::<arrow_array::types::Float64Type>().value(row).to_string()),
+        DataType::Int8 => Ok(arr
+            .as_primitive::<arrow_array::types::Int8Type>()
+            .value(row)
+            .to_string()),
+        DataType::Int16 => Ok(arr
+            .as_primitive::<arrow_array::types::Int16Type>()
+            .value(row)
+            .to_string()),
+        DataType::Int32 => Ok(arr
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(row)
+            .to_string()),
+        DataType::Int64 => Ok(arr
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(row)
+            .to_string()),
+        DataType::Float32 => Ok(arr
+            .as_primitive::<arrow_array::types::Float32Type>()
+            .value(row)
+            .to_string()),
+        DataType::Float64 => Ok(arr
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(row)
+            .to_string()),
         DataType::Boolean => {
             let b = arr.as_boolean().value(row);
             Ok(if b { "TRUE".into() } else { "FALSE".into() })
@@ -1732,7 +1732,10 @@ fn build_pk_in_predicate(
 #[allow(dead_code)]
 enum AssignmentValue {
     Scalar(ScalarValue),
-    DFExpr { sql_text: String, col_type: DataType },
+    DFExpr {
+        sql_text: String,
+        col_type: DataType,
+    },
 }
 
 /// One captured row-level change, lazily materialised only when at
@@ -2484,8 +2487,7 @@ async fn project_returning(
         .map(|it| it.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let projection_sql =
-        format!("SELECT {projection} FROM __basin_returning_src");
+    let projection_sql = format!("SELECT {projection} FROM __basin_returning_src");
     let rewritten =
         crate::sql_functions::rewrite_sql_inlining_functions(catalog, project, &projection_sql)
             .await?;
@@ -2835,7 +2837,13 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
     let (negated, inner) = peel_unary(expr);
     match (dt, inner) {
         // BIGINT / INT8 column — 64-bit signed.
-        (DataType::Int64, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+        (
+            DataType::Int64,
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }),
+        ) => {
             let parsed: i64 = s.parse().map_err(|e| {
                 BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
             })?;
@@ -2847,21 +2855,47 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
         }
         // INT / INTEGER / INT4 column — 32-bit. Store as Int64 so the SET
         // path can range-check and narrow back to i32.
-        (DataType::Int32, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+        (
+            DataType::Int32,
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }),
+        ) => {
             let parsed: i64 = s.parse().map_err(|e| {
                 BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
             })?;
-            Ok(Some(ScalarValue::Int64(if negated { -parsed } else { parsed })))
+            Ok(Some(ScalarValue::Int64(if negated {
+                -parsed
+            } else {
+                parsed
+            })))
         }
         // SMALLINT / INT2 column — 16-bit. Store as Int64 for the same reason.
-        (DataType::Int16, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+        (
+            DataType::Int16,
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }),
+        ) => {
             let parsed: i64 = s.parse().map_err(|e| {
                 BasinError::InvalidSchema(format!("bad integer literal {s:?}: {e}"))
             })?;
-            Ok(Some(ScalarValue::Int64(if negated { -parsed } else { parsed })))
+            Ok(Some(ScalarValue::Int64(if negated {
+                -parsed
+            } else {
+                parsed
+            })))
         }
         // DOUBLE PRECISION / FLOAT8 column.
-        (DataType::Float64, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+        (
+            DataType::Float64,
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }),
+        ) => {
             let parsed: f64 = s
                 .parse()
                 .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")))?;
@@ -2873,7 +2907,13 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
         }
         // REAL / FLOAT4 column — 32-bit. Store as Float64 so the SET path
         // can narrow to f32.
-        (DataType::Float32, Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+        (
+            DataType::Float32,
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }),
+        ) => {
             let parsed: f64 = s
                 .parse()
                 .map_err(|e| BasinError::InvalidSchema(format!("bad float literal {s:?}: {e}")))?;
@@ -2883,10 +2923,34 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
                 parsed
             })))
         }
-        (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }))
-        | (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. }))
-        | (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. }))
-        | (DataType::Utf8, Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. })) => {
+        (
+            DataType::Utf8,
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }),
+        )
+        | (
+            DataType::Utf8,
+            Expr::Value(ValueWithSpan {
+                value: Value::DoubleQuotedString(s),
+                ..
+            }),
+        )
+        | (
+            DataType::Utf8,
+            Expr::Value(ValueWithSpan {
+                value: Value::EscapedStringLiteral(s),
+                ..
+            }),
+        )
+        | (
+            DataType::Utf8,
+            Expr::Value(ValueWithSpan {
+                value: Value::NationalStringLiteral(s),
+                ..
+            }),
+        ) => {
             if negated {
                 Err(BasinError::InvalidSchema(format!(
                     "cannot negate string literal in SET {col} = {expr}"
@@ -2895,7 +2959,13 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
                 Ok(Some(ScalarValue::Utf8(s.clone())))
             }
         }
-        (DataType::Boolean, Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. })) => {
+        (
+            DataType::Boolean,
+            Expr::Value(ValueWithSpan {
+                value: Value::Boolean(b),
+                ..
+            }),
+        ) => {
             if negated {
                 Err(BasinError::InvalidSchema(format!(
                     "cannot negate boolean literal in SET {col} = {expr}"
@@ -2912,21 +2982,34 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
             // refresh-token-rotate, and password-reset flows all rely on
             // this round trip.
             let micros: i64 = match inner {
-                Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().map_err(|e| {
+                Expr::Value(ValueWithSpan {
+                    value: Value::Number(s, _),
+                    ..
+                }) => s.parse::<i64>().map_err(|e| {
                     BasinError::InvalidSchema(format!("bad timestamp literal {s:?}: {e}"))
                 })?,
-                Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
-                | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
-                | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
-                | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_micros())
-                        .map_err(|e| {
-                            BasinError::InvalidSchema(format!(
-                                "bad RFC3339 timestamp {s:?} in SET {col}: {e}"
-                            ))
-                        })?
-                }
+                Expr::Value(ValueWithSpan {
+                    value: Value::SingleQuotedString(s),
+                    ..
+                })
+                | Expr::Value(ValueWithSpan {
+                    value: Value::DoubleQuotedString(s),
+                    ..
+                })
+                | Expr::Value(ValueWithSpan {
+                    value: Value::EscapedStringLiteral(s),
+                    ..
+                })
+                | Expr::Value(ValueWithSpan {
+                    value: Value::NationalStringLiteral(s),
+                    ..
+                }) => chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_micros())
+                    .map_err(|e| {
+                        BasinError::InvalidSchema(format!(
+                            "bad RFC3339 timestamp {s:?} in SET {col}: {e}"
+                        ))
+                    })?,
                 _ => return Ok(None),
             };
             Ok(Some(ScalarValue::Int64(if negated {
@@ -3106,7 +3189,10 @@ fn identifier_or_err(e: &Expr) -> Result<String> {
 fn as_literal(e: &Expr) -> Result<Option<ScalarValue>> {
     let (negated, inner) = peel_unary(e);
     Ok(match inner {
-        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => {
             // Try integer first; fall back to float if the literal has a `.`.
             if s.contains('.') || s.contains('e') || s.contains('E') {
                 let v: f64 = s.parse().map_err(|e| {
@@ -3120,10 +3206,22 @@ fn as_literal(e: &Expr) -> Result<Option<ScalarValue>> {
                 Some(ScalarValue::Int64(if negated { -v } else { v }))
             }
         }
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::DoubleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::EscapedStringLiteral(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::NationalStringLiteral(s),
+            ..
+        }) => {
             if negated {
                 return Err(BasinError::InvalidSchema(
                     "cannot negate string literal in WHERE".into(),
@@ -3131,7 +3229,10 @@ fn as_literal(e: &Expr) -> Result<Option<ScalarValue>> {
             }
             Some(ScalarValue::Utf8(s.clone()))
         }
-        Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(b),
+            ..
+        }) => {
             if negated {
                 return Err(BasinError::InvalidSchema(
                     "cannot negate boolean literal in WHERE".into(),
@@ -3168,9 +3269,7 @@ fn single_table_from_delete(d: &Delete) -> Result<TableName> {
         ));
     }
     let name = match &twj.relation {
-        TableFactor::Table {
-            name, args, ..
-        } => {
+        TableFactor::Table { name, args, .. } => {
             if args.is_some() {
                 return Err(BasinError::InvalidSchema(
                     "DELETE target must be a bare table name".into(),
@@ -3223,10 +3322,7 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
 /// already explicitly set. `now_micros` is captured once per UPDATE so
 /// every AUTO_UPDATE column stamped in the same statement gets the same
 /// timestamp.
-fn inject_auto_update_assignments(
-    schema: &Schema,
-    assignments: &mut Vec<(usize, AssignmentRhs)>,
-) {
+fn inject_auto_update_assignments(schema: &Schema, assignments: &mut Vec<(usize, AssignmentRhs)>) {
     let now_micros = chrono::Utc::now().timestamp_micros();
     for (idx, field) in schema.fields().iter().enumerate() {
         if !crate::types::field_is_auto_update(field) {
@@ -3284,7 +3380,10 @@ async fn exec_soft_delete(
         BasinError::internal(format!("soft-delete column {sd_col:?} missing from schema"))
     })?;
     let now_micros = chrono::Utc::now().timestamp_micros();
-    let assignments = vec![(sd_idx, AssignmentRhs::Scalar(ScalarValue::Int64(now_micros)))];
+    let assignments = vec![(
+        sd_idx,
+        AssignmentRhs::Scalar(ScalarValue::Int64(now_micros)),
+    )];
 
     // Compose the effective predicate: `<user-pred> AND <sd_col> IS NULL`.
     // Without the IS NULL guard a re-DELETE on already-soft-deleted rows
@@ -3532,7 +3631,11 @@ mod tests {
         let expr = arrow_col_value_to_expr(&arr, 0).expect("Int32 must not error");
         match expr {
             Expr::Value(ref v) => {
-                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                let ValueWithSpan {
+                    value: Value::Number(ref s, _),
+                    ..
+                } = *v
+                else {
                     panic!("expected Number literal, got {expr:?}");
                 };
                 assert_eq!(s, "42");
@@ -3548,11 +3651,18 @@ mod tests {
         let arr = Int32Array::from(vec![-7i32]);
         let expr = arrow_col_value_to_expr(&arr, 0).expect("negative Int32 must not error");
         match expr {
-            Expr::UnaryOp { op: UnaryOperator::Minus, ref expr } => {
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                ref expr,
+            } => {
                 let Expr::Value(ref v) = **expr else {
                     panic!("expected Number inside UnaryOp, got {expr:?}");
                 };
-                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                let ValueWithSpan {
+                    value: Value::Number(ref s, _),
+                    ..
+                } = *v
+                else {
                     panic!("expected Number literal, got {v:?}");
                 };
                 assert_eq!(s, "7");
@@ -3569,7 +3679,11 @@ mod tests {
         let expr = arrow_col_value_to_expr(&arr, 0).expect("Int16 must not error");
         match expr {
             Expr::Value(ref v) => {
-                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                let ValueWithSpan {
+                    value: Value::Number(ref s, _),
+                    ..
+                } = *v
+                else {
                     panic!("expected Number literal, got {expr:?}");
                 };
                 assert_eq!(s, "100");
@@ -3582,17 +3696,21 @@ mod tests {
     #[test]
     fn arrow_col_value_to_expr_float32_positive() {
         use arrow_array::Float32Array;
-        let arr = Float32Array::from(vec![3.14f32]);
+        let arr = Float32Array::from(vec![2.5f32]);
         let expr = arrow_col_value_to_expr(&arr, 0).expect("Float32 must not error");
         // The value is widened to f64 — just verify it's a Number and parses
-        // back to something close to 3.14.
+        // back to something close to 2.5.
         match expr {
             Expr::Value(ref v) => {
-                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                let ValueWithSpan {
+                    value: Value::Number(ref s, _),
+                    ..
+                } = *v
+                else {
                     panic!("expected Number literal, got {expr:?}");
                 };
                 let parsed: f64 = s.parse().expect("must be numeric string");
-                assert!((parsed - 3.14f64).abs() < 0.01, "got {parsed}");
+                assert!((parsed - 2.5f64).abs() < 0.01, "got {parsed}");
             }
             other => panic!("expected Value(Number), got {other:?}"),
         }
@@ -3606,7 +3724,11 @@ mod tests {
         let expr = arrow_col_value_to_expr(&arr, 0).expect("Int64 must not error");
         match expr {
             Expr::Value(ref v) => {
-                let ValueWithSpan { value: Value::Number(ref s, _), .. } = *v else {
+                let ValueWithSpan {
+                    value: Value::Number(ref s, _),
+                    ..
+                } = *v
+                else {
                     panic!("expected Number literal, got {expr:?}");
                 };
                 assert_eq!(s, "9000000000");
@@ -3639,17 +3761,13 @@ mod tests {
         let full = format!("SELECT {sql}");
         let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, &full).unwrap();
         match stmts.pop().unwrap() {
-            sqlparser::ast::Statement::Query(q) => {
-                match q.body.as_ref() {
-                    sqlparser::ast::SetExpr::Select(s) => {
-                        match &s.projection[0] {
-                            sqlparser::ast::SelectItem::UnnamedExpr(e) => e.clone(),
-                            other => panic!("not an expr: {other:?}"),
-                        }
-                    }
-                    other => panic!("not a SELECT: {other:?}"),
-                }
-            }
+            sqlparser::ast::Statement::Query(q) => match q.body.as_ref() {
+                sqlparser::ast::SetExpr::Select(s) => match &s.projection[0] {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e) => e.clone(),
+                    other => panic!("not an expr: {other:?}"),
+                },
+                other => panic!("not a SELECT: {other:?}"),
+            },
             other => panic!("not a query: {other:?}"),
         }
     }

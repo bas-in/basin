@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::error::Result;
-use crate::ids::{TableName, ProjectId};
+use crate::ids::{ProjectId, TableName};
 
 /// What kind of mutation produced this event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

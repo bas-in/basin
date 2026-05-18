@@ -144,7 +144,12 @@ pub(crate) struct CopyInState {
 }
 
 impl CopyInState {
-    pub(crate) fn new(table: String, columns: Vec<Field>, with_header: bool, opts: CopyOptions) -> Self {
+    pub(crate) fn new(
+        table: String,
+        columns: Vec<Field>,
+        with_header: bool,
+        opts: CopyOptions,
+    ) -> Self {
         Self {
             table,
             columns,
@@ -241,10 +246,7 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
             } else if sc.peek_punct('\'') {
                 Some(parse_string_literal(&mut sc)?)
             } else {
-                return Err(
-                    "expected STDIN or '<absolute-path>' after COPY <table> FROM"
-                        .into(),
-                );
+                return Err("expected STDIN or '<absolute-path>' after COPY <table> FROM".into());
             }
         }
         Direction::To => {
@@ -258,10 +260,7 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
             } else if sc.peek_punct('\'') {
                 Some(parse_string_literal(&mut sc)?)
             } else {
-                return Err(
-                    "expected STDOUT or '<absolute-path>' after COPY <table> TO"
-                        .into(),
-                );
+                return Err("expected STDOUT or '<absolute-path>' after COPY <table> TO".into());
             }
         }
     };
@@ -326,9 +325,18 @@ fn parse_subquery(sc: &mut Scanner<'_>) -> std::result::Result<String, String> {
             continue;
         }
         match b {
-            b'\'' => { in_single_quote = true; sc.pos += 1; }
-            b'"' => { in_double_quote = true; sc.pos += 1; }
-            b'(' => { depth += 1; sc.pos += 1; }
+            b'\'' => {
+                in_single_quote = true;
+                sc.pos += 1;
+            }
+            b'"' => {
+                in_double_quote = true;
+                sc.pos += 1;
+            }
+            b'(' => {
+                depth += 1;
+                sc.pos += 1;
+            }
             b')' => {
                 depth -= 1;
                 if depth == 0 {
@@ -338,7 +346,9 @@ fn parse_subquery(sc: &mut Scanner<'_>) -> std::result::Result<String, String> {
                 }
                 sc.pos += 1;
             }
-            _ => { sc.pos += 1; }
+            _ => {
+                sc.pos += 1;
+            }
         }
     }
     Err("unterminated subquery in COPY (SELECT …)".into())
@@ -753,7 +763,12 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
             state.buffer.drain(..n);
             continue;
         }
-        let record = match parse_csv_record(record_bytes, state.opts.delimiter, state.opts.quote, &state.opts.null_string) {
+        let record = match parse_csv_record(
+            record_bytes,
+            state.opts.delimiter,
+            state.opts.quote,
+            &state.opts.null_string,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 state.error = Some(format!("CSV parse error: {e}"));
@@ -812,7 +827,11 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
 /// `quote_char` is the character used to delimit quoted fields (default `"`).
 /// Only ASCII quote chars are supported here (non-ASCII fall back to `"`).
 fn split_record(buf: &[u8], final_chunk: bool, quote_char: char) -> Option<(&[u8], usize)> {
-    let qb = if quote_char.is_ascii() { quote_char as u8 } else { b'"' };
+    let qb = if quote_char.is_ascii() {
+        quote_char as u8
+    } else {
+        b'"'
+    };
     let mut in_quotes = false;
     let mut i = 0;
     while i < buf.len() {
@@ -924,8 +943,7 @@ fn parse_csv_record(
             if chars[i] != delimiter {
                 return Err(format!(
                     "expected {:?} after quoted field, got {:?}",
-                    delimiter,
-                    chars[i]
+                    delimiter, chars[i]
                 ));
             }
             i += 1;
@@ -1116,7 +1134,12 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
             if i > 0 {
                 row.push(opts.delimiter);
             }
-            csv_encode_into(schema.field(idx).name(), &mut row, opts.delimiter, opts.quote);
+            csv_encode_into(
+                schema.field(idx).name(),
+                &mut row,
+                opts.delimiter,
+                opts.quote,
+            );
         }
         row.push('\n');
         Some(row.into_bytes())
@@ -1326,10 +1349,14 @@ pub(crate) async fn copy_query_to_stdout_messages<S: Session + ?Sized>(
         n_cols,
     )));
     if let Some(h) = header {
-        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(h))));
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
+            h,
+        ))));
     }
     for row in body {
-        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(row))));
+        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
+            row,
+        ))));
     }
     out.push(PgWireBackendMessage::CopyDone(
         pgwire::messages::copy::CopyDone::new(),
@@ -1348,7 +1375,9 @@ pub(crate) async fn copy_query_to_stdout_messages<S: Session + ?Sized>(
 /// double internal quote chars. Empty string is written without quotes
 /// (empty-unquoted) — the COPY-IN reader will treat it as NULL by default.
 fn csv_encode_into(v: &str, out: &mut String, delimiter: char, quote: char) {
-    let needs_quote = v.chars().any(|c| c == delimiter || c == quote || c == '\n' || c == '\r');
+    let needs_quote = v
+        .chars()
+        .any(|c| c == delimiter || c == quote || c == '\n' || c == '\r');
     if !needs_quote {
         out.push_str(v);
         return;
@@ -1647,7 +1676,8 @@ mod tests {
 
     #[test]
     fn parse_copy_accepts_quote_and_escape() {
-        let cmd = parse_copy("COPY t FROM STDIN WITH (FORMAT CSV, QUOTE '\"', ESCAPE '\\')").unwrap();
+        let cmd =
+            parse_copy("COPY t FROM STDIN WITH (FORMAT CSV, QUOTE '\"', ESCAPE '\\')").unwrap();
         assert!(
             matches!(cmd, Some(CopyCommand::From { ref opts, .. }) if opts.quote == '"' && opts.escape == '\\'),
             "expected custom quote/escape"
@@ -1656,7 +1686,9 @@ mod tests {
 
     #[test]
     fn parse_copy_accepts_query_source() {
-        let cmd = parse_copy("COPY (SELECT id, name FROM t WHERE id > 5) TO STDOUT WITH (FORMAT CSV)").unwrap();
+        let cmd =
+            parse_copy("COPY (SELECT id, name FROM t WHERE id > 5) TO STDOUT WITH (FORMAT CSV)")
+                .unwrap();
         assert!(
             matches!(cmd, Some(CopyCommand::QueryTo { ref query, with_header, .. })
                 if query.contains("SELECT") && !with_header),
@@ -1666,9 +1698,16 @@ mod tests {
 
     #[test]
     fn parse_copy_accepts_query_source_with_header() {
-        let cmd = parse_copy("COPY (SELECT * FROM t) TO STDOUT WITH (FORMAT CSV, HEADER true)").unwrap();
+        let cmd =
+            parse_copy("COPY (SELECT * FROM t) TO STDOUT WITH (FORMAT CSV, HEADER true)").unwrap();
         assert!(
-            matches!(cmd, Some(CopyCommand::QueryTo { with_header: true, .. })),
+            matches!(
+                cmd,
+                Some(CopyCommand::QueryTo {
+                    with_header: true,
+                    ..
+                })
+            ),
             "expected QueryTo with header"
         );
     }
@@ -1888,7 +1927,10 @@ mod tests {
         std::env::set_var(COPY_ALLOW_FILE_PATHS_ENV, "1");
         std::env::remove_var(COPY_PATH_ALLOWLIST_ENV);
         let e = validate_copy_path("/tmp/x.csv").unwrap_err();
-        assert!(e.contains("disabled") || e.contains(COPY_PATH_ALLOWLIST_ENV), "got: {e}");
+        assert!(
+            e.contains("disabled") || e.contains(COPY_PATH_ALLOWLIST_ENV),
+            "got: {e}"
+        );
         std::env::remove_var(COPY_ALLOW_FILE_PATHS_ENV);
     }
 

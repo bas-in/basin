@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -97,7 +97,10 @@ async fn rename_table_changes_catalog_key() {
     let cat = &eng.config().catalog;
     // v0.1 keeps the old key alive as a synonym so the engine's
     // post-ALTER session refresh can still find the table.
-    assert!(cat.load_table(&project, &TableName::new("u").unwrap()).await.is_ok());
+    assert!(cat
+        .load_table(&project, &TableName::new("u").unwrap())
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -117,7 +120,10 @@ async fn alter_column_type_swaps_arrow_data_type() {
         .await
         .unwrap();
     use arrow_schema::DataType;
-    assert_eq!(meta.schema.field_with_name("c").unwrap().data_type(), &DataType::Int64);
+    assert_eq!(
+        meta.schema.field_with_name("c").unwrap().data_type(),
+        &DataType::Int64
+    );
 }
 
 #[tokio::test]
@@ -257,7 +263,9 @@ async fn inherits_clause_is_dropped_pre_parse() {
     let (_dir, eng, project) = engine();
     let sess = eng.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE u (id INT)").await.unwrap();
-    sess.execute("CREATE TABLE t () INHERITS (u)").await.unwrap();
+    sess.execute("CREATE TABLE t () INHERITS (u)")
+        .await
+        .unwrap();
     eng.config()
         .catalog
         .load_table(&project, &TableName::new("t").unwrap())

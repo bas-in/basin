@@ -117,7 +117,10 @@ async fn overlaps_false_when_adjacent() {
         .as_any()
         .downcast_ref::<BooleanArray>()
         .expect("expected BooleanArray from overlaps");
-    assert!(!arr.value(0), "adjacent half-open intervals must not overlap");
+    assert!(
+        !arr.value(0),
+        "adjacent half-open intervals must not overlap"
+    );
 }
 
 // ── INFINITY TIMESTAMPS ───────────────────────────────────────────────────────
@@ -134,7 +137,10 @@ async fn infinity_timestamp_cast() {
         &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
         "'infinity'::timestamp must return Timestamp(Microsecond, None)"
     );
-    assert!(!col.is_null(0), "'infinity'::timestamp result must be non-null");
+    assert!(
+        !col.is_null(0),
+        "'infinity'::timestamp result must be non-null"
+    );
 }
 
 #[tokio::test]
@@ -148,7 +154,10 @@ async fn neg_infinity_timestamp_cast() {
         &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
         "'-infinity'::timestamp must return Timestamp(Microsecond, None)"
     );
-    assert!(!col.is_null(0), "'-infinity'::timestamp result must be non-null");
+    assert!(
+        !col.is_null(0),
+        "'-infinity'::timestamp result must be non-null"
+    );
 }
 
 #[tokio::test]
@@ -245,11 +254,7 @@ async fn array_dims_2d() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let col = one_col(
-        &sess,
-        "SELECT array_dims(ARRAY[[1,2],[3,4]])",
-    )
-    .await;
+    let col = one_col(&sess, "SELECT array_dims(ARRAY[[1,2],[3,4]])").await;
     let arr = col
         .as_any()
         .downcast_ref::<StringArray>()
@@ -272,7 +277,11 @@ async fn array_dims_1d() {
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("array_dims must return StringArray");
-    assert_eq!(arr.value(0), "[1:3]", "1-D 3-element array dims should be [1:3]");
+    assert_eq!(
+        arr.value(0),
+        "[1:3]",
+        "1-D 3-element array dims should be [1:3]"
+    );
 }
 
 // ── MULTI-DIM ARRAY ROUND-TRIP ────────────────────────────────────────────────
@@ -288,9 +297,7 @@ async fn multi_dim_array_cast_executes() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Use ARRAY[[...]] constructor — DataFusion produces List(List(Int64)).
-    let res = sess
-        .execute("SELECT ARRAY[[1,2],[3,4]]")
-        .await;
+    let res = sess.execute("SELECT ARRAY[[1,2],[3,4]]").await;
     // We only require that it executes without panicking/returning Err.
     // The result type is List(List(Int64)) — the convert.rs List arms handle
     // this recursively.

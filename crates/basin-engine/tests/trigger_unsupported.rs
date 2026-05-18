@@ -26,8 +26,7 @@ fn engine_in(dir: &TempDir) -> Engine {
         disk_cache: None,
         page_cache: None,
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     Engine::new(EngineConfig {
         storage,
         catalog,

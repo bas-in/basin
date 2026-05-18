@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, ChangeOp, QualifiedTableName, Result, SchemaName, TableName, ProjectId};
+use basin_common::{
+    BasinError, ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, TableName,
+};
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
@@ -33,10 +35,10 @@ use crate::metadata::{
     TableMetadata, UniqueConstraint,
 };
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
+use crate::project_storage_config::ProjectStorageConfig;
 use crate::reactors::{self, ReactorDef, ReactorError, ReactorOps};
 use crate::sequences::{compute_next, SequenceDef, SequenceError};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
-use crate::project_storage_config::ProjectStorageConfig;
 use crate::{Catalog, ProjectSnapshotEntry};
 
 const DEFAULT_SCHEMA: &str = "basin_catalog";
@@ -1220,7 +1222,12 @@ impl Catalog for PostgresCatalog {
                     "UPDATE {sch}.tables SET rls_enabled = $3, policies_json = $4
                      WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
-                &[&project.to_string(), &table.to_string(), &rls_enabled, &json],
+                &[
+                    &project.to_string(),
+                    &table.to_string(),
+                    &rls_enabled,
+                    &json,
+                ],
             )
             .await
             .map_err(|e| BasinError::catalog(format!("set_rls_state: {e}")))?;
@@ -1612,7 +1619,12 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self, schema), fields(project = %project, table = %table))]
-    async fn set_schema(&self, project: &ProjectId, table: &TableName, schema: Schema) -> Result<()> {
+    async fn set_schema(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        schema: Schema,
+    ) -> Result<()> {
         let sch = &self.schema;
         let schema_json = serde_json::to_value(&schema)
             .map_err(|e| BasinError::catalog(format!("serialise arrow schema: {e}")))?;
@@ -1634,7 +1646,11 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
-    async fn list_snapshots(&self, project: &ProjectId, table: &TableName) -> Result<Vec<Snapshot>> {
+    async fn list_snapshots(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<Vec<Snapshot>> {
         let sch = &self.schema;
         let project_str = project.to_string();
         let table_str = table.to_string();
@@ -3272,7 +3288,11 @@ impl Catalog for PostgresCatalog {
             None => Vec::new(),
         };
         let row_group_rows: Option<usize> = row_group_rows_pg.and_then(|v| {
-            if v >= 0 { usize::try_from(v).ok() } else { None }
+            if v >= 0 {
+                usize::try_from(v).ok()
+            } else {
+                None
+            }
         });
         let continuous_aggregate: Option<CvDef> = match continuous_aggregate_json {
             Some(v) => Some(serde_json::from_value(v).map_err(|e| {
@@ -3311,7 +3331,8 @@ impl Catalog for PostgresCatalog {
             None => Vec::new(),
         };
 
-        let snapshots = fetch_snapshots(&client, sch, &project_str, schema_name_str, &table_str).await?;
+        let snapshots =
+            fetch_snapshots(&client, sch, &project_str, schema_name_str, &table_str).await?;
         Ok(TableMetadata {
             project: *project,
             table: qtable.name.clone(),
@@ -3462,10 +3483,7 @@ impl Catalog for PostgresCatalog {
     /// List all tables across all schemas for `project`. Returns all
     /// `(schema_name, table_name)` pairs sorted by `(schema, table)`.
     #[instrument(skip(self), fields(project = %project))]
-    async fn list_tables_qualified(
-        &self,
-        project: &ProjectId,
-    ) -> Result<Vec<QualifiedTableName>> {
+    async fn list_tables_qualified(&self, project: &ProjectId) -> Result<Vec<QualifiedTableName>> {
         let sch = &self.schema;
         let client = self.client.lock().await;
         let rows = client
@@ -3483,10 +3501,12 @@ impl Catalog for PostgresCatalog {
         for row in rows {
             let schema_str: String = row.get(0);
             let table_str: String = row.get(1);
-            let sname = SchemaName::new(schema_str)
-                .map_err(|e| BasinError::catalog(format!("list_tables_qualified bad schema: {e}")))?;
-            let tname = TableName::new(table_str)
-                .map_err(|e| BasinError::catalog(format!("list_tables_qualified bad table: {e}")))?;
+            let sname = SchemaName::new(schema_str).map_err(|e| {
+                BasinError::catalog(format!("list_tables_qualified bad schema: {e}"))
+            })?;
+            let tname = TableName::new(table_str).map_err(|e| {
+                BasinError::catalog(format!("list_tables_qualified bad table: {e}"))
+            })?;
             out.push(QualifiedTableName::new(sname, tname));
         }
         Ok(out)
@@ -3868,7 +3888,7 @@ mod tests {
     use std::time::Duration;
 
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{BasinError, TableName, ProjectId};
+    use basin_common::{BasinError, ProjectId, TableName};
     use tokio_postgres::NoTls;
     use ulid::Ulid;
 
@@ -5307,10 +5327,8 @@ mod tests {
         cat.create_namespace(&project).await.unwrap();
 
         let ghost = basin_common::SchemaName::new("ghost").unwrap();
-        let qtable = basin_common::QualifiedTableName::new(
-            ghost.clone(),
-            TableName::new("t").unwrap(),
-        );
+        let qtable =
+            basin_common::QualifiedTableName::new(ghost.clone(), TableName::new("t").unwrap());
         let err = cat
             .create_table_qualified(&project, &qtable, std::sync::Arc::new(schema()))
             .await
@@ -5335,8 +5353,10 @@ mod tests {
         cat.create_schema(&project, &s1).await.unwrap();
         cat.create_schema(&project, &s2).await.unwrap();
 
-        let q1 = basin_common::QualifiedTableName::new(s1.clone(), TableName::new("events").unwrap());
-        let q2 = basin_common::QualifiedTableName::new(s2.clone(), TableName::new("events").unwrap());
+        let q1 =
+            basin_common::QualifiedTableName::new(s1.clone(), TableName::new("events").unwrap());
+        let q2 =
+            basin_common::QualifiedTableName::new(s2.clone(), TableName::new("events").unwrap());
         cat.create_table_qualified(&project, &q1, std::sync::Arc::new(schema()))
             .await
             .unwrap();
@@ -5502,13 +5522,11 @@ mod tests {
         let s2 = basin_common::SchemaName::new("schema_b").unwrap();
         cat.create_schema(&project, &s1).await.unwrap();
         cat.create_schema(&project, &s2).await.unwrap();
-        let old =
-            basin_common::QualifiedTableName::new(s1, TableName::new("cross_tbl").unwrap());
+        let old = basin_common::QualifiedTableName::new(s1, TableName::new("cross_tbl").unwrap());
         cat.create_table_qualified(&project, &old, std::sync::Arc::new(schema()))
             .await
             .unwrap();
-        let new =
-            basin_common::QualifiedTableName::new(s2, TableName::new("cross_tbl").unwrap());
+        let new = basin_common::QualifiedTableName::new(s2, TableName::new("cross_tbl").unwrap());
         let err = cat
             .rename_table_qualified(&project, &old, &new)
             .await

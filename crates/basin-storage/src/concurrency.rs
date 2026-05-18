@@ -142,7 +142,10 @@ impl ObjectStore for ProjectScopedStore {
         self.inner.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         // We collect the inner stream into a Vec under a single
         // permit + scheduler slot, then return a stream over that Vec.
         // Every caller in `basin-storage` and the engine listings

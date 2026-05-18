@@ -95,7 +95,10 @@ async fn txn_multi_statement_all_rows_visible_after_commit() {
     sess.execute("COMMIT").await.expect("COMMIT");
 
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM log").await.unwrap());
-    assert_eq!(n, 5, "5 rows inserted in transaction must all be visible after COMMIT");
+    assert_eq!(
+        n, 5,
+        "5 rows inserted in transaction must all be visible after COMMIT"
+    );
 }
 
 /// Nested SAVEPOINTs: create sp1, insert, create sp2, insert, RELEASE sp2,
@@ -108,7 +111,9 @@ async fn txn_nested_savepoints_lifecycle() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     sess.execute("BEGIN").await.expect("BEGIN");
     sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
@@ -122,7 +127,9 @@ async fn txn_nested_savepoints_lifecycle() {
     sess.execute("INSERT INTO t VALUES (3)").await.unwrap();
 
     // Release sp2 (no-op in auto-commit model).
-    sess.execute("RELEASE SAVEPOINT sp2").await.expect("RELEASE SAVEPOINT sp2");
+    sess.execute("RELEASE SAVEPOINT sp2")
+        .await
+        .expect("RELEASE SAVEPOINT sp2");
 
     // Rollback to sp1 (no-op in auto-commit model).
     sess.execute("ROLLBACK TO SAVEPOINT sp1")
@@ -173,10 +180,14 @@ async fn txn_rollback_to_savepoint_then_continue() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     sess.execute("BEGIN").await.expect("BEGIN");
-    sess.execute("SAVEPOINT sp_before").await.expect("SAVEPOINT");
+    sess.execute("SAVEPOINT sp_before")
+        .await
+        .expect("SAVEPOINT");
     sess.execute("INSERT INTO t VALUES (10)").await.unwrap();
 
     // Rollback to savepoint (no-op in auto-commit).
@@ -190,7 +201,10 @@ async fn txn_rollback_to_savepoint_then_continue() {
 
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
     // Real PG: ROLLBACK TO SAVEPOINT sp_before undoes INSERT 10; only INSERT 20 survives.
-    assert_eq!(n, 1, "real PG: ROLLBACK TO sp_before undoes INSERT 10; only INSERT 20 survives");
+    assert_eq!(
+        n, 1,
+        "real PG: ROLLBACK TO sp_before undoes INSERT 10; only INSERT 20 survives"
+    );
 }
 
 /// COMMIT after ROLLBACK: COMMIT following a bare ROLLBACK must not error
@@ -202,12 +216,18 @@ async fn txn_commit_after_rollback_accepted() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
 
     // ROLLBACK (no-op) then COMMIT (no-op) — both accepted.
-    sess.execute("ROLLBACK").await.expect("ROLLBACK must be accepted");
-    sess.execute("COMMIT").await.expect("COMMIT after ROLLBACK must be accepted");
+    sess.execute("ROLLBACK")
+        .await
+        .expect("ROLLBACK must be accepted");
+    sess.execute("COMMIT")
+        .await
+        .expect("COMMIT after ROLLBACK must be accepted");
 
     // Data must still be intact.
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
@@ -274,7 +294,9 @@ async fn txn_multi_stmt_each_auto_commit_visible_immediately() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     // Insert 3 rows.
     sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
@@ -313,7 +335,9 @@ async fn schema_alter_add_nullable_column_backfill() {
         .unwrap();
 
     // Add nullable column.
-    sess.execute("ALTER TABLE items ADD COLUMN score BIGINT").await.unwrap();
+    sess.execute("ALTER TABLE items ADD COLUMN score BIGINT")
+        .await
+        .unwrap();
 
     // Insert a new row with the new column.
     sess.execute("INSERT INTO items (id, label, score) VALUES (3, 'gamma', 77)")
@@ -332,18 +356,31 @@ async fn schema_alter_add_nullable_column_backfill() {
 
     let mut id_score: Vec<(i64, Option<i64>)> = vec![];
     for b in &batches {
-        let id_arr = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let id_arr = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let score_col = b.column_by_name("score").unwrap();
         let score_arr = score_col.as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..b.num_rows() {
             id_score.push((
                 id_arr.value(i),
-                if score_arr.is_null(i) { None } else { Some(score_arr.value(i)) },
+                if score_arr.is_null(i) {
+                    None
+                } else {
+                    Some(score_arr.value(i))
+                },
             ));
         }
     }
 
-    assert_eq!(id_score.len(), 3, "must have 3 rows after ADD COLUMN + new INSERT");
+    assert_eq!(
+        id_score.len(),
+        3,
+        "must have 3 rows after ADD COLUMN + new INSERT"
+    );
     for (id, score) in &id_score {
         if *id <= 2 {
             assert_eq!(
@@ -351,7 +388,11 @@ async fn schema_alter_add_nullable_column_backfill() {
                 "pre-ALTER row id={id} must have NULL score after ADD COLUMN"
             );
         } else {
-            assert_eq!(*score, Some(77), "post-ALTER row id={id} must have score=77");
+            assert_eq!(
+                *score,
+                Some(77),
+                "post-ALTER row id={id} must have score=77"
+            );
         }
     }
     println!("[schema] ADD COLUMN nullable backfill: {:?}", id_score);
@@ -366,7 +407,9 @@ async fn schema_alter_add_column_not_null_rejected_in_v01() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
 
     let err = sess
@@ -376,8 +419,10 @@ async fn schema_alter_add_column_not_null_rejected_in_v01() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("NOT NULL") || msg.contains("not null")
-            || msg.contains("not supported") || msg.contains("v0.1"),
+        msg.contains("NOT NULL")
+            || msg.contains("not null")
+            || msg.contains("not supported")
+            || msg.contains("v0.1"),
         "rejection message must mention NOT NULL / not supported, got: {msg}"
     );
     println!("[schema] ADD COLUMN NOT NULL rejected: {msg}");
@@ -400,9 +445,15 @@ async fn schema_multi_column_pk_enforced() {
     .unwrap();
 
     // These are all distinct composite PKs.
-    sess.execute("INSERT INTO t VALUES (1, 1, 'a')").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (1, 2, 'b')").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (2, 1, 'c')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 1, 'a')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 2, 'b')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (2, 1, 'c')")
+        .await
+        .unwrap();
 
     // Duplicate (1, 1) must be rejected.
     let err = sess
@@ -418,7 +469,10 @@ async fn schema_multi_column_pk_enforced() {
 
     // Total count must remain 3.
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-    assert_eq!(n, 3, "table must have 3 rows after rejected composite PK dup");
+    assert_eq!(
+        n, 3,
+        "table must have 3 rows after rejected composite PK dup"
+    );
     println!("[schema] multi-column PK enforced: {msg}");
 }
 
@@ -437,11 +491,17 @@ async fn schema_composite_unique_enforced() {
     .await
     .unwrap();
 
-    sess.execute("INSERT INTO t VALUES (1, 'x', 'y')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'x', 'y')")
+        .await
+        .unwrap();
     // Different col_a — allowed.
-    sess.execute("INSERT INTO t VALUES (2, 'z', 'y')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (2, 'z', 'y')")
+        .await
+        .unwrap();
     // Same col_a, different col_b — allowed.
-    sess.execute("INSERT INTO t VALUES (3, 'x', 'w')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (3, 'x', 'w')")
+        .await
+        .unwrap();
 
     // Duplicate (col_a='x', col_b='y') — must be rejected.
     let err = sess
@@ -510,8 +570,10 @@ async fn schema_check_constraint_on_insert_enforced() {
                 ),
             };
             assert!(
-                bad_msg.contains("check") || bad_msg.contains("constraint")
-                    || bad_msg.contains("violat") || bad_msg.contains("planning")
+                bad_msg.contains("check")
+                    || bad_msg.contains("constraint")
+                    || bad_msg.contains("violat")
+                    || bad_msg.contains("planning")
                     || bad_msg.contains("Invalid function"),
                 "CHECK violation or planning bug must produce an error, got: {bad_msg}"
             );
@@ -519,15 +581,20 @@ async fn schema_check_constraint_on_insert_enforced() {
         }
         Ok(_) => {
             // If valid INSERTs start working again, verify that violating INSERTs error.
-            println!("[schema] valid INSERT on CHECK table succeeded — CHECK planning bug may be fixed");
+            println!(
+                "[schema] valid INSERT on CHECK table succeeded — CHECK planning bug may be fixed"
+            );
             let err = sess
                 .execute("INSERT INTO t VALUES (2, -1)")
                 .await
                 .expect_err("violating INSERT must error when CHECK is properly enforced");
             let msg = err.to_string();
             assert!(
-                msg.contains("check") || msg.contains("constraint") || msg.contains("violat")
-                    || msg.contains("CHECK") || msg.contains("23514"),
+                msg.contains("check")
+                    || msg.contains("constraint")
+                    || msg.contains("violat")
+                    || msg.contains("CHECK")
+                    || msg.contains("23514"),
                 "CHECK violation must mention constraint/violat/check, got: {msg}"
             );
             println!("[schema] CHECK violation properly enforced on INSERT: {msg}");
@@ -572,7 +639,9 @@ async fn schema_check_constraint_on_update_enforced() {
             // Planning bug: "Invalid function 'check'" — document and skip UPDATE test.
             let msg = e.to_string();
             assert!(
-                msg.contains("check") || msg.contains("Invalid function") || msg.contains("planning"),
+                msg.contains("check")
+                    || msg.contains("Invalid function")
+                    || msg.contains("planning"),
                 "CHECK planning bug must produce a recognizable error, got: {msg}"
             );
             println!(
@@ -586,7 +655,9 @@ async fn schema_check_constraint_on_update_enforced() {
             println!("[schema] valid INSERT succeeded — CHECK planning bug may be fixed");
 
             // Valid update.
-            sess.execute("UPDATE t SET rating = 5 WHERE id = 1").await.unwrap();
+            sess.execute("UPDATE t SET rating = 5 WHERE id = 1")
+                .await
+                .unwrap();
 
             // Invalid update — rating = 0 violates CHECK.
             let err = sess
@@ -596,13 +667,19 @@ async fn schema_check_constraint_on_update_enforced() {
 
             let msg = err.to_string();
             assert!(
-                msg.contains("check") || msg.contains("constraint") || msg.contains("violat")
-                    || msg.contains("CHECK") || msg.contains("23514"),
+                msg.contains("check")
+                    || msg.contains("constraint")
+                    || msg.contains("violat")
+                    || msg.contains("CHECK")
+                    || msg.contains("23514"),
                 "CHECK violation on UPDATE must mention constraint, got: {msg}"
             );
 
             // Row must retain the last valid value (5).
-            let res = sess.execute("SELECT rating FROM t WHERE id = 1").await.unwrap();
+            let res = sess
+                .execute("SELECT rating FROM t WHERE id = 1")
+                .await
+                .unwrap();
             if let ExecResult::Rows { batches, .. } = res {
                 if !batches.is_empty() && batches[0].num_rows() > 0 {
                     let arr = batches[0]
@@ -611,7 +688,11 @@ async fn schema_check_constraint_on_update_enforced() {
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .unwrap();
-                    assert_eq!(arr.value(0), 5, "rating must remain 5 after rejected UPDATE");
+                    assert_eq!(
+                        arr.value(0),
+                        5,
+                        "rating must remain 5 after rejected UPDATE"
+                    );
                 }
             }
             println!("[schema] CHECK constraint on UPDATE enforced: {msg}");
@@ -628,17 +709,17 @@ async fn schema_default_expression_on_insert() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE t (id BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'active')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'active')")
+        .await
+        .unwrap();
 
     // Insert without specifying status — should use DEFAULT 'active'.
     sess.execute("INSERT INTO t (id) VALUES (1)").await.unwrap();
 
     // Insert with explicit status value.
-    sess.execute("INSERT INTO t VALUES (2, 'inactive')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (2, 'inactive')")
+        .await
+        .unwrap();
 
     let res = sess
         .execute("SELECT id, status FROM t ORDER BY id")
@@ -652,7 +733,12 @@ async fn schema_default_expression_on_insert() {
 
     let mut rows: Vec<(i64, String)> = vec![];
     for b in &batches {
-        let id_arr = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let id_arr = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let status_arr = b
             .column_by_name("status")
             .unwrap()
@@ -665,8 +751,14 @@ async fn schema_default_expression_on_insert() {
     }
 
     assert_eq!(rows.len(), 2, "must have 2 rows");
-    let row1 = rows.iter().find(|(id, _)| *id == 1).expect("row id=1 missing");
-    let row2 = rows.iter().find(|(id, _)| *id == 2).expect("row id=2 missing");
+    let row1 = rows
+        .iter()
+        .find(|(id, _)| *id == 1)
+        .expect("row id=1 missing");
+    let row2 = rows
+        .iter()
+        .find(|(id, _)| *id == 2)
+        .expect("row id=2 missing");
 
     assert_eq!(row1.1, "active", "id=1 must use DEFAULT 'active'");
     assert_eq!(row2.1, "inactive", "id=2 must use explicit 'inactive'");
@@ -691,12 +783,11 @@ async fn schema_generated_always_stored_computed_on_insert() {
     .unwrap();
 
     // INSERT without the generated column: total should be auto-computed.
-    sess.execute("INSERT INTO t (a, b) VALUES (3, 7)").await.unwrap();
-
-    let res = sess
-        .execute("SELECT a, b, total FROM t")
+    sess.execute("INSERT INTO t (a, b) VALUES (3, 7)")
         .await
         .unwrap();
+
+    let res = sess.execute("SELECT a, b, total FROM t").await.unwrap();
 
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
@@ -704,8 +795,18 @@ async fn schema_generated_always_stored_computed_on_insert() {
     };
 
     let b0 = &batches[0];
-    let a_arr = b0.column_by_name("a").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-    let b_arr = b0.column_by_name("b").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+    let a_arr = b0
+        .column_by_name("a")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let b_arr = b0
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     let total_arr = b0
         .column_by_name("total")
         .unwrap()
@@ -716,10 +817,14 @@ async fn schema_generated_always_stored_computed_on_insert() {
     assert_eq!(a_arr.value(0), 3);
     assert_eq!(b_arr.value(0), 7);
     assert_eq!(
-        total_arr.value(0), 10,
+        total_arr.value(0),
+        10,
         "GENERATED ALWAYS AS (a + b) must compute 3+7=10"
     );
-    println!("[schema] GENERATED ALWAYS AS stored: total={}", total_arr.value(0));
+    println!(
+        "[schema] GENERATED ALWAYS AS stored: total={}",
+        total_arr.value(0)
+    );
 }
 
 /// GENERATED ALWAYS AS: providing the generated column value in INSERT must error.
@@ -741,13 +846,12 @@ async fn schema_generated_always_explicit_insert_rejected() {
     let err = sess
         .execute("INSERT INTO t (a, b, total) VALUES (1, 2, 99)")
         .await
-        .expect_err(
-            "INSERT with explicit value for GENERATED ALWAYS column must error"
-        );
+        .expect_err("INSERT with explicit value for GENERATED ALWAYS column must error");
 
     let msg = err.to_string();
     assert!(
-        msg.contains("GENERATED") || msg.contains("generated")
+        msg.contains("GENERATED")
+            || msg.contains("generated")
             || msg.contains("cannot insert")
             || msg.contains("always"),
         "error must mention GENERATED ALWAYS, got: {msg}"
@@ -769,9 +873,15 @@ async fn schema_bigserial_auto_generates_ids() {
         .unwrap();
 
     // Insert without specifying id.
-    sess.execute("INSERT INTO t (name) VALUES ('alice')").await.unwrap();
-    sess.execute("INSERT INTO t (name) VALUES ('bob')").await.unwrap();
-    sess.execute("INSERT INTO t (name) VALUES ('carol')").await.unwrap();
+    sess.execute("INSERT INTO t (name) VALUES ('alice')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t (name) VALUES ('bob')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t (name) VALUES ('carol')")
+        .await
+        .unwrap();
 
     let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
     let batches = match res {
@@ -782,7 +892,12 @@ async fn schema_bigserial_auto_generates_ids() {
     let ids: Vec<i64> = batches
         .iter()
         .flat_map(|b| {
-            let arr = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
             (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
         })
         .collect();
@@ -796,7 +911,10 @@ async fn schema_bigserial_auto_generates_ids() {
     let unique_ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
     assert_eq!(unique_ids.len(), 3, "BIGSERIAL ids must be distinct");
     // Must be in ascending order.
-    assert!(ids.windows(2).all(|w| w[0] < w[1]), "BIGSERIAL ids must be ascending");
+    assert!(
+        ids.windows(2).all(|w| w[0] < w[1]),
+        "BIGSERIAL ids must be ascending"
+    );
     println!("[schema] BIGSERIAL auto ids: {:?}", ids);
 }
 
@@ -842,7 +960,9 @@ async fn schema_add_column_shows_in_schema() {
         .await
         .unwrap();
     // Insert a row BEFORE the ADD COLUMN.
-    sess.execute("INSERT INTO products VALUES (1, 'widget')").await.unwrap();
+    sess.execute("INSERT INTO products VALUES (1, 'widget')")
+        .await
+        .unwrap();
 
     // Add a new column.
     sess.execute("ALTER TABLE products ADD COLUMN price BIGINT")
@@ -875,8 +995,10 @@ async fn schema_add_column_shows_in_schema() {
         Err(e) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("price") || msg.contains("unknown column")
-                    || msg.contains("column") || msg.contains("storage"),
+                msg.contains("price")
+                    || msg.contains("unknown column")
+                    || msg.contains("column")
+                    || msg.contains("storage"),
                 "schema-evolution storage gap must mention 'price'/'column'/'storage', got: {msg}"
             );
             println!(
@@ -913,10 +1035,16 @@ async fn txn_savepoint_name_reuse_accepted() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("BEGIN").await.expect("BEGIN");
-    sess.execute("SAVEPOINT sp").await.expect("first SAVEPOINT sp");
+    sess.execute("SAVEPOINT sp")
+        .await
+        .expect("first SAVEPOINT sp");
     // Re-declare the same name — must be accepted.
-    sess.execute("SAVEPOINT sp").await.expect("second SAVEPOINT sp must not error");
-    sess.execute("RELEASE SAVEPOINT sp").await.expect("RELEASE SAVEPOINT sp");
+    sess.execute("SAVEPOINT sp")
+        .await
+        .expect("second SAVEPOINT sp must not error");
+    sess.execute("RELEASE SAVEPOINT sp")
+        .await
+        .expect("RELEASE SAVEPOINT sp");
     sess.execute("COMMIT").await.expect("COMMIT");
 }
 
@@ -928,7 +1056,9 @@ async fn txn_many_begin_commit_pairs_session_stable() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     for i in 1i64..=10 {
         sess.execute("BEGIN").await.expect("BEGIN");
@@ -939,5 +1069,8 @@ async fn txn_many_begin_commit_pairs_session_stable() {
     }
 
     let n = count_rows_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-    assert_eq!(n, 10, "10 rows inserted across 10 BEGIN/COMMIT pairs must all be visible");
+    assert_eq!(
+        n, 10,
+        "10 rows inserted across 10 BEGIN/COMMIT pairs must all be visible"
+    );
 }

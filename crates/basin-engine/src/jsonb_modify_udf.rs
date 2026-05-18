@@ -122,12 +122,9 @@ fn extract_json(arr: &ArrayRef, i: usize, fn_name: &str) -> DFResult<Option<Valu
                 .map_err(|e| DataFusionError::Execution(format!("{fn_name}: json decode: {e}")))
         }
         DataType::Utf8 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!("{fn_name}: not a StringArray"))
-                })?;
+            let a = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                DataFusionError::Execution(format!("{fn_name}: not a StringArray"))
+            })?;
             if a.is_null(i) {
                 return Ok(None);
             }
@@ -511,21 +508,31 @@ impl ScalarUDFImpl for JsonbSetUdf {
                 Some(ca) => {
                     match ca.data_type() {
                         DataType::Boolean => {
-                            let ba = ca.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "jsonb_set: create_missing must be Boolean".into(),
-                                )
-                            })?;
-                            if ba.is_null(i) { true } else { ba.value(i) }
+                            let ba =
+                                ca.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "jsonb_set: create_missing must be Boolean".into(),
+                                    )
+                                })?;
+                            if ba.is_null(i) {
+                                true
+                            } else {
+                                ba.value(i)
+                            }
                         }
                         // Accept Utf8 literal 'true'/'false' from query rewriting
                         DataType::Utf8 => {
-                            let sa = ca.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "jsonb_set: create_missing StringArray cast failed".into(),
-                                )
-                            })?;
-                            if sa.is_null(i) { true } else { sa.value(i) != "false" }
+                            let sa =
+                                ca.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "jsonb_set: create_missing StringArray cast failed".into(),
+                                    )
+                                })?;
+                            if sa.is_null(i) {
+                                true
+                            } else {
+                                sa.value(i) != "false"
+                            }
                         }
                         _ => true,
                     }
@@ -627,7 +634,11 @@ impl ScalarUDFImpl for JsonbInsertUdf {
                                 "jsonb_insert: insert_after must be Boolean".into(),
                             )
                         })?;
-                        if ba.is_null(i) { false } else { ba.value(i) }
+                        if ba.is_null(i) {
+                            false
+                        } else {
+                            ba.value(i)
+                        }
                     }
                     DataType::Utf8 => {
                         let sa = ia.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
@@ -635,7 +646,11 @@ impl ScalarUDFImpl for JsonbInsertUdf {
                                 "jsonb_insert: insert_after StringArray cast failed".into(),
                             )
                         })?;
-                        if sa.is_null(i) { false } else { sa.value(i) == "true" }
+                        if sa.is_null(i) {
+                            false
+                        } else {
+                            sa.value(i) == "true"
+                        }
                     }
                     _ => false,
                 },
@@ -678,7 +693,10 @@ impl ScalarUDFImpl for JsonbInsertUdf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{ArrayRef, LargeBinaryArray, ListBuilder, StringArray, StringDictionaryBuilder, StringBuilder};
+    use datafusion::arrow::array::{
+        ArrayRef, LargeBinaryArray, ListBuilder, StringArray, StringBuilder,
+        StringDictionaryBuilder,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Int32Type};
     use datafusion::logical_expr::ColumnarValue;
     use serde_json::json;
@@ -809,49 +827,63 @@ mod tests {
 
     #[test]
     fn test_typeof_object() {
-        let udf = JsonbTypeofUdf { signature: make_sig_1() };
+        let udf = JsonbTypeofUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar(r#"{"x":1}"#)]);
         assert_eq!(result, "object");
     }
 
     #[test]
     fn test_typeof_array() {
-        let udf = JsonbTypeofUdf { signature: make_sig_1() };
+        let udf = JsonbTypeofUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar(r#"[1,2,3]"#)]);
         assert_eq!(result, "array");
     }
 
     #[test]
     fn test_typeof_string() {
-        let udf = JsonbTypeofUdf { signature: make_sig_1() };
+        let udf = JsonbTypeofUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar(r#""hello""#)]);
         assert_eq!(result, "string");
     }
 
     #[test]
     fn test_typeof_number() {
-        let udf = JsonbTypeofUdf { signature: make_sig_1() };
+        let udf = JsonbTypeofUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar("42")]);
         assert_eq!(result, "number");
     }
 
     #[test]
     fn test_typeof_boolean() {
-        let udf = JsonbTypeofUdf { signature: make_sig_1() };
+        let udf = JsonbTypeofUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar("true")]);
         assert_eq!(result, "boolean");
     }
 
     #[test]
     fn test_typeof_null_json() {
-        let udf = JsonbTypeofUdf { signature: make_sig_1() };
+        let udf = JsonbTypeofUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar("null")]);
         assert_eq!(result, "null");
     }
 
     #[test]
     fn test_typeof_utf8_input() {
-        let udf = JsonbTypeofUdf { signature: make_sig_1() };
+        let udf = JsonbTypeofUdf {
+            signature: make_sig_1(),
+        };
         // Utf8 input (json string literal)
         let result = invoke_udf_str(&udf, vec![utf8_scalar(r#"{"a":1}"#)]);
         assert_eq!(result, "object");
@@ -861,7 +893,9 @@ mod tests {
 
     #[test]
     fn test_pretty_basic() {
-        let udf = JsonbPrettyUdf { signature: make_sig_1() };
+        let udf = JsonbPrettyUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar(r#"{"a":1}"#)]);
         // serde_json pretty-prints with 2-space indent
         assert!(result.contains('\n'), "should be multi-line: {result}");
@@ -872,7 +906,9 @@ mod tests {
 
     #[test]
     fn test_pretty_nested() {
-        let udf = JsonbPrettyUdf { signature: make_sig_1() };
+        let udf = JsonbPrettyUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf_str(&udf, vec![jsonb_scalar(r#"{"a":{"b":2}}"#)]);
         let reparsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(reparsed, json!({"a": {"b": 2}}));
@@ -882,7 +918,9 @@ mod tests {
 
     #[test]
     fn test_strip_nulls_basic() {
-        let udf = JsonbStripNullsUdf { signature: make_sig_1() };
+        let udf = JsonbStripNullsUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf(
             &udf,
             vec![jsonb_scalar(r#"{"a":null,"b":1,"c":{"d":null,"e":2}}"#)],
@@ -892,18 +930,19 @@ mod tests {
 
     #[test]
     fn test_strip_nulls_arrays_preserve_nulls() {
-        let udf = JsonbStripNullsUdf { signature: make_sig_1() };
+        let udf = JsonbStripNullsUdf {
+            signature: make_sig_1(),
+        };
         // Arrays keep null elements (Postgres semantics)
-        let result = invoke_udf(
-            &udf,
-            vec![jsonb_scalar(r#"{"a":[null,1,null],"b":null}"#)],
-        );
+        let result = invoke_udf(&udf, vec![jsonb_scalar(r#"{"a":[null,1,null],"b":null}"#)]);
         assert_eq!(result, json!({"a": [null, 1, null]}));
     }
 
     #[test]
     fn test_strip_nulls_no_nulls() {
-        let udf = JsonbStripNullsUdf { signature: make_sig_1() };
+        let udf = JsonbStripNullsUdf {
+            signature: make_sig_1(),
+        };
         let result = invoke_udf(&udf, vec![jsonb_scalar(r#"{"a":1,"b":"x"}"#)]);
         assert_eq!(result, json!({"a": 1, "b": "x"}));
     }
@@ -912,7 +951,9 @@ mod tests {
 
     #[test]
     fn test_set_replace_existing_key() {
-        let udf = JsonbSetUdf { signature: make_sig_any(3) };
+        let udf = JsonbSetUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_set('{"a":1}', '{a}', '2') -> {"a":2}
         let result = invoke_udf(
             &udf,
@@ -927,7 +968,9 @@ mod tests {
 
     #[test]
     fn test_set_create_missing_true() {
-        let udf = JsonbSetUdf { signature: make_sig_any(3) };
+        let udf = JsonbSetUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_set('{"a":1}', '{b}', '"x"', true) -> {"a":1,"b":"x"}
         let result = invoke_udf(
             &udf,
@@ -944,7 +987,9 @@ mod tests {
     #[test]
     #[ignore = "jsonb_set create_missing=false edge case has a logic bug (dead-agent WIP); tracked as #158 — un-ignore when fixed"]
     fn test_set_create_missing_false() {
-        let udf = JsonbSetUdf { signature: make_sig_any(3) };
+        let udf = JsonbSetUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_set('{"a":1}', '{b}', '"x"', false) -> {"a":1}  (no create)
         let result = invoke_udf(
             &udf,
@@ -960,7 +1005,9 @@ mod tests {
 
     #[test]
     fn test_set_nested_path() {
-        let udf = JsonbSetUdf { signature: make_sig_any(3) };
+        let udf = JsonbSetUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_set('{"a":{"b":1}}', '{a,b}', '99') -> {"a":{"b":99}}
         let result = invoke_udf(
             &udf,
@@ -975,7 +1022,9 @@ mod tests {
 
     #[test]
     fn test_set_array_index() {
-        let udf = JsonbSetUdf { signature: make_sig_any(3) };
+        let udf = JsonbSetUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_set('[1,2,3]', '{1}', '99') -> [1,99,3]
         let result = invoke_udf(
             &udf,
@@ -990,7 +1039,9 @@ mod tests {
 
     #[test]
     fn test_set_path_string_syntax() {
-        let udf = JsonbSetUdf { signature: make_sig_any(3) };
+        let udf = JsonbSetUdf {
+            signature: make_sig_any(3),
+        };
         // Path supplied as Postgres-style string '{a,b}'
         let result = invoke_udf(
             &udf,
@@ -1007,7 +1058,9 @@ mod tests {
 
     #[test]
     fn test_insert_before() {
-        let udf = JsonbInsertUdf { signature: make_sig_any(3) };
+        let udf = JsonbInsertUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_insert('[1,2,3]', '{1}', '99') -> [1,99,2,3]  (insert before index 1)
         let result = invoke_udf(
             &udf,
@@ -1022,7 +1075,9 @@ mod tests {
 
     #[test]
     fn test_insert_after() {
-        let udf = JsonbInsertUdf { signature: make_sig_any(3) };
+        let udf = JsonbInsertUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_insert('[1,2,3]', '{1}', '99', true) -> [1,2,99,3]  (insert after index 1)
         let result = invoke_udf(
             &udf,
@@ -1038,7 +1093,9 @@ mod tests {
 
     #[test]
     fn test_insert_object_key() {
-        let udf = JsonbInsertUdf { signature: make_sig_any(3) };
+        let udf = JsonbInsertUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_insert('{"a":1}', '{b}', '"new"') -> {"a":1,"b":"new"}
         let result = invoke_udf(
             &udf,
@@ -1053,7 +1110,9 @@ mod tests {
 
     #[test]
     fn test_insert_nested_array() {
-        let udf = JsonbInsertUdf { signature: make_sig_any(3) };
+        let udf = JsonbInsertUdf {
+            signature: make_sig_any(3),
+        };
         // jsonb_insert('{"a":[1,2]}', '{a,0}', '99') -> {"a":[99,1,2]}
         let result = invoke_udf(
             &udf,

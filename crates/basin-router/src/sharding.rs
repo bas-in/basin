@@ -147,8 +147,9 @@ pub fn parse_pins_env(s: &str) -> Result<HashMap<ProjectId, usize>, String> {
         let (project_str, idx_str) = entry
             .split_once(':')
             .ok_or_else(|| format!("pin entry {entry:?} missing ':' separator"))?;
-        let project = ProjectId::from_str(project_str.trim())
-            .map_err(|e| format!("pin entry {entry:?}: invalid project ulid {project_str:?}: {e}"))?;
+        let project = ProjectId::from_str(project_str.trim()).map_err(|e| {
+            format!("pin entry {entry:?}: invalid project ulid {project_str:?}: {e}")
+        })?;
         let idx: usize = idx_str
             .trim()
             .parse()

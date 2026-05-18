@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use basin_catalog::PartitionSpec;
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use basin_wal::Lsn;
 
 /// Catalog epoch for a table's partition spec. Bumped on every successful

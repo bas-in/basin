@@ -149,7 +149,11 @@ async fn explain_format_json_returns_json() {
         .expect("EXPLAIN (FORMAT JSON) SELECT * FROM t must not error");
 
     let lines = plan_lines(result);
-    assert_eq!(lines.len(), 1, "EXPLAIN FORMAT JSON must return exactly one row (the JSON blob)");
+    assert_eq!(
+        lines.len(),
+        1,
+        "EXPLAIN FORMAT JSON must return exactly one row (the JSON blob)"
+    );
     let json_str = &lines[0];
     // Must be valid JSON.
     let parsed: serde_json::Value =

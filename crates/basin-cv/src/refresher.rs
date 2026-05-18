@@ -42,7 +42,7 @@ use arrow_array::{
 use arrow_schema::{DataType, TimeUnit};
 use async_trait::async_trait;
 use basin_catalog::{Catalog, DataFileRef};
-use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use basin_engine::{Engine, ExecResult, ProjectSession};
 use basin_shard::CvRefreshDriver;
 use chrono::{DateTime, Duration, Utc};

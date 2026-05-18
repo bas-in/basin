@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -73,7 +73,11 @@ pub(crate) async fn request_email_verification(
     Ok(())
 }
 
-pub(crate) async fn verify_email(inner: &Inner, project: &ProjectId, raw_token: &str) -> Result<()> {
+pub(crate) async fn verify_email(
+    inner: &Inner,
+    project: &ProjectId,
+    raw_token: &str,
+) -> Result<()> {
     let h = hash_token(raw_token);
 
     let row = inner.store.find_email_token(project, &h).await?;
@@ -102,6 +106,9 @@ pub(crate) async fn verify_email(inner: &Inner, project: &ProjectId, raw_token: 
         ));
     }
 
-    inner.store.mark_email_verified(project, row.user_id).await?;
+    inner
+        .store
+        .mark_email_verified(project, row.user_id)
+        .await?;
     Ok(())
 }

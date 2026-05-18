@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tokio_postgres::Client;
@@ -21,10 +21,10 @@ use uuid::Uuid;
 
 use super::{
     ApiKeyRow, AuthMagicLinkRow, AuthStore, AuthUser, EmailTokenRow, MagicLinkEmailTokenRow,
-    RefreshRevocationRow, ProjectCredentialRow,
+    ProjectCredentialRow, RefreshRevocationRow,
 };
 use crate::{
-    api_keys::ApiKeyDescriptor, schema, project_credentials::ProjectCredentialDescriptor, UserId,
+    api_keys::ApiKeyDescriptor, project_credentials::ProjectCredentialDescriptor, schema, UserId,
 };
 
 /// Postgres-backed auth store. Wraps a `tokio_postgres::Client` in a `Mutex`
@@ -93,7 +93,11 @@ impl AuthStore for PostgresAuthStore {
         Ok(user_id)
     }
 
-    async fn find_user_by_email(&self, project: &ProjectId, email: &str) -> Result<Option<AuthUser>> {
+    async fn find_user_by_email(
+        &self,
+        project: &ProjectId,
+        email: &str,
+    ) -> Result<Option<AuthUser>> {
         let project_str = project.to_string();
         let client = self.client.lock().await;
         let row = client
@@ -202,7 +206,11 @@ impl AuthStore for PostgresAuthStore {
         Ok(())
     }
 
-    async fn mark_email_verified_if_null(&self, project: &ProjectId, user_id: UserId) -> Result<()> {
+    async fn mark_email_verified_if_null(
+        &self,
+        project: &ProjectId,
+        user_id: UserId,
+    ) -> Result<()> {
         let project_str = project.to_string();
         let client = self.client.lock().await;
         client

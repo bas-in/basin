@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use basin_catalog::InMemoryCatalog;
-use basin_common::{BasinError, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;

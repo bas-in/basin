@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use object_store::local::LocalFileSystem;

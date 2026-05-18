@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::Arc;
 
-use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, ProjectId};
+use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, ProjectId, TableName};
 use basin_net::HttpClient;
 use basin_webhooks::{
     Clock, RetryQueue, TestClock, WebhookConfig, WebhookCountersRegistry, WebhookOps,
@@ -122,7 +122,13 @@ async fn metrics_increment_on_successful_delivery() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        4,
+    );
     stack.registry.add(s).await.unwrap();
 
     for seq in 1..=5 {
@@ -154,7 +160,13 @@ async fn metrics_increment_on_retry_then_success() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        4,
+    );
     stack.registry.add(s).await.unwrap();
 
     let e = evt(project, "orders", ChangeOp::Insert, 1);
@@ -182,7 +194,13 @@ async fn metrics_dead_letter_counted() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 2);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        2,
+    );
     stack.registry.add(s).await.unwrap();
 
     let e = evt(project, "orders", ChangeOp::Insert, 1);
@@ -272,7 +290,13 @@ async fn pending_queue_depth_tracks_correctly() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        4,
+    );
     stack.registry.add(s).await.unwrap();
 
     for seq in 1..=10 {
@@ -311,7 +335,13 @@ async fn p99_latency_within_expected_bound() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        4,
+    );
     stack.registry.add(s).await.unwrap();
 
     let n: u64 = 25;

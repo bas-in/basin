@@ -250,7 +250,10 @@ async fn bug41_rollback_over_restores_rows_regression() {
         .rollback_to_snapshot_project_wide(&project, cutoff)
         .await
         .expect("rollback_to_snapshot_project_wide must not error");
-    assert!(!pairs.is_empty(), "at least one table must have been rolled back");
+    assert!(
+        !pairs.is_empty(),
+        "at least one table must have been rolled back"
+    );
 
     // 4. Post-rollback: must be 3. Bug #41: it is not.
     let n_post = count_rows(sess.execute("SELECT count(*) FROM t").await.unwrap());
@@ -357,8 +360,8 @@ async fn bug41_single_table_rollback_restores_correct_count() {
 /// measure latency itself; it only verifies the isolation invariant.
 #[tokio::test]
 async fn bug42_perf_stack_layer_isolation_invariant() {
-    use basin_storage::{Predicate, ReadOptions, ScalarValue, WriteOptions};
     use basin_common::{PartitionKey, TableName};
+    use basin_storage::{Predicate, ReadOptions, ScalarValue, WriteOptions};
     use futures::StreamExt;
 
     basin_common::telemetry::try_init_for_tests();
@@ -390,8 +393,7 @@ async fn bug42_perf_stack_layer_isolation_invariant() {
         page_cache: None,
     });
     let id_arr: arrow_array::Int64Array = [1i64, 2, 3].iter().copied().collect();
-    let payload_arr: arrow_array::StringArray =
-        arrow_array::StringArray::from(vec!["a", "b", "c"]);
+    let payload_arr: arrow_array::StringArray = arrow_array::StringArray::from(vec!["a", "b", "c"]);
     let batch = ArrowBatch::try_new(
         schema.clone(),
         vec![Arc::new(id_arr), Arc::new(payload_arr)],
@@ -491,9 +493,13 @@ async fn txn_begin_commit_data_visible() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("BEGIN").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (1), (2), (3)").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (1), (2), (3)")
+        .await
+        .unwrap();
     sess.execute("COMMIT").await.unwrap();
 
     let n = count_rows(sess.execute("SELECT count(*) FROM t").await.unwrap());
@@ -509,8 +515,12 @@ async fn txn_rollback_does_not_remove_committed_data() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (10), (20)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (10), (20)")
+        .await
+        .unwrap();
     // In auto-commit mode ROLLBACK is silently accepted; no data should disappear.
     sess.execute("ROLLBACK").await.unwrap();
 
@@ -532,7 +542,9 @@ async fn txn_savepoint_lifecycle_accepted() {
 
     sess.execute("BEGIN").await.expect("BEGIN");
     sess.execute("SAVEPOINT sp1").await.expect("SAVEPOINT");
-    sess.execute("RELEASE SAVEPOINT sp1").await.expect("RELEASE SAVEPOINT");
+    sess.execute("RELEASE SAVEPOINT sp1")
+        .await
+        .expect("RELEASE SAVEPOINT");
     sess.execute("COMMIT").await.expect("COMMIT");
 }
 
@@ -546,7 +558,9 @@ async fn txn_rollback_to_savepoint_accepted() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     sess.execute("BEGIN").await.expect("BEGIN");
-    sess.execute("SAVEPOINT sp_x").await.expect("SAVEPOINT sp_x");
+    sess.execute("SAVEPOINT sp_x")
+        .await
+        .expect("SAVEPOINT sp_x");
     sess.execute("ROLLBACK TO SAVEPOINT sp_x")
         .await
         .expect("ROLLBACK TO SAVEPOINT sp_x");
@@ -563,7 +577,9 @@ async fn txn_multiple_begin_accepted() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     for _ in 0..5 {
-        sess.execute("BEGIN").await.expect("BEGIN must always be accepted");
+        sess.execute("BEGIN")
+            .await
+            .expect("BEGIN must always be accepted");
     }
     sess.execute("COMMIT").await.expect("COMMIT");
 }
@@ -612,11 +628,25 @@ async fn schema_alter_add_column_null_backfill() {
     let mut ids: Vec<i64> = vec![];
     let mut scores: Vec<Option<i64>> = vec![];
     for b in &batches {
-        let id_arr = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let score_arr = b.column_by_name("score").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let id_arr = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let score_arr = b
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..b.num_rows() {
             ids.push(id_arr.value(i));
-            scores.push(if score_arr.is_null(i) { None } else { Some(score_arr.value(i)) });
+            scores.push(if score_arr.is_null(i) {
+                None
+            } else {
+                Some(score_arr.value(i))
+            });
         }
     }
 
@@ -648,8 +678,12 @@ async fn schema_drop_table_currently_unsupported() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE recycled (id BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO recycled VALUES (1)").await.unwrap();
+    sess.execute("CREATE TABLE recycled (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO recycled VALUES (1)")
+        .await
+        .unwrap();
 
     // DROP TABLE is now wired in the executor (fix #49, commit 25d9a5f).
     sess.execute("DROP TABLE recycled")
@@ -721,9 +755,7 @@ async fn rls_per_principal_row_isolation() {
 
     let admin = eng.open_session(project).await.unwrap();
     admin
-        .execute(
-            "CREATE TABLE msgs (id BIGINT NOT NULL, owner TEXT NOT NULL, body TEXT NOT NULL)",
-        )
+        .execute("CREATE TABLE msgs (id BIGINT NOT NULL, owner TEXT NOT NULL, body TEXT NOT NULL)")
         .await
         .unwrap();
 
@@ -745,7 +777,9 @@ async fn rls_per_principal_row_isolation() {
 
     for i in 0..4i64 {
         alice
-            .execute(&format!("INSERT INTO msgs VALUES ({i}, 'alice', 'msg-{i}')"))
+            .execute(&format!(
+                "INSERT INTO msgs VALUES ({i}, 'alice', 'msg-{i}')"
+            ))
             .await
             .unwrap();
     }
@@ -803,8 +837,13 @@ async fn rls_disable_reveals_all_rows() {
     let alice = eng.open_session_as(project, "alice").await.unwrap();
     let bob = eng.open_session_as(project, "bob").await.unwrap();
 
-    alice.execute("INSERT INTO events VALUES (1, 'alice'), (2, 'alice')").await.unwrap();
-    bob.execute("INSERT INTO events VALUES (3, 'bob')").await.unwrap();
+    alice
+        .execute("INSERT INTO events VALUES (1, 'alice'), (2, 'alice')")
+        .await
+        .unwrap();
+    bob.execute("INSERT INTO events VALUES (3, 'bob')")
+        .await
+        .unwrap();
 
     // Admin (no current_user set) with RLS active sees 0 rows (no match).
     let admin_rls_count = count_rows(admin.execute("SELECT count(*) FROM events").await.unwrap());
@@ -812,7 +851,10 @@ async fn rls_disable_reveals_all_rows() {
     // Whether it's 0 or 3 depends on implementation; we just confirm the disable path below.
 
     // Disable RLS.
-    admin.execute("ALTER TABLE events DISABLE ROW LEVEL SECURITY").await.unwrap();
+    admin
+        .execute("ALTER TABLE events DISABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
 
     let all_count = count_rows(admin.execute("SELECT count(*) FROM events").await.unwrap());
     assert_eq!(
@@ -820,9 +862,7 @@ async fn rls_disable_reveals_all_rows() {
         "after DISABLE ROW LEVEL SECURITY, admin must see all 3 rows, got {all_count}"
     );
 
-    println!(
-        "[rls] with RLS admin saw {admin_rls_count} rows; after disable saw {all_count}"
-    );
+    println!("[rls] with RLS admin saw {admin_rls_count} rows; after disable saw {all_count}");
 }
 
 /// RLS isolation is per-project: two projects with the same table name and
@@ -848,11 +888,9 @@ async fn rls_cross_project_no_leak() {
         adm.execute("ALTER TABLE secrets ENABLE ROW LEVEL SECURITY")
             .await
             .unwrap();
-        adm.execute(
-            "CREATE POLICY p ON secrets FOR ALL TO PUBLIC USING (owner = current_user)",
-        )
-        .await
-        .unwrap();
+        adm.execute("CREATE POLICY p ON secrets FOR ALL TO PUBLIC USING (owner = current_user)")
+            .await
+            .unwrap();
     }
 
     // Project A's alice inserts one row.
@@ -870,9 +908,19 @@ async fn rls_cross_project_no_leak() {
         .unwrap();
 
     // Alice in project A must see only 1 row.
-    let count_a = count_rows(alice_a.execute("SELECT count(*) FROM secrets").await.unwrap());
+    let count_a = count_rows(
+        alice_a
+            .execute("SELECT count(*) FROM secrets")
+            .await
+            .unwrap(),
+    );
     // Alice in project B must see only 1 row.
-    let count_b = count_rows(alice_b.execute("SELECT count(*) FROM secrets").await.unwrap());
+    let count_b = count_rows(
+        alice_b
+            .execute("SELECT count(*) FROM secrets")
+            .await
+            .unwrap(),
+    );
 
     // Verify there is no cross-project content leakage.
     let rows_a = match alice_a.execute("SELECT secret FROM secrets").await.unwrap() {
@@ -980,7 +1028,8 @@ async fn prepared_select_with_param_returns_matching_rows() {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(
-            id_col.value(0), target_id,
+            id_col.value(0),
+            target_id,
             "returned id must match the bound parameter"
         );
     }
@@ -1010,7 +1059,10 @@ async fn prepared_insert_row_visible_via_select() {
         let bound = sess
             .bind(
                 &handle,
-                vec![ScalarParam::Int8(i), ScalarParam::Text(format!("entry-{i}"))],
+                vec![
+                    ScalarParam::Int8(i),
+                    ScalarParam::Text(format!("entry-{i}")),
+                ],
             )
             .await
             .unwrap();
@@ -1020,7 +1072,10 @@ async fn prepared_insert_row_visible_via_select() {
     sess.close_statement(&handle).await;
 
     let n = count_rows(sess.execute("SELECT count(*) FROM log").await.unwrap());
-    assert_eq!(n, 5, "5 rows inserted via prepared INSERT must all be visible");
+    assert_eq!(
+        n, 5,
+        "5 rows inserted via prepared INSERT must all be visible"
+    );
 }
 
 /// close_statement is idempotent (calling twice must not panic or error).
@@ -1075,7 +1130,9 @@ async fn error_insert_unknown_column() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     let err = sess
         .execute("INSERT INTO t (id, bogus_col) VALUES (1, 99)")
@@ -1144,7 +1201,9 @@ async fn schema_create_table_if_not_exists_currently_errors() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE maybe (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE maybe (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO maybe VALUES (1)").await.unwrap();
 
     // IF NOT EXISTS is now honoured — must succeed silently as a no-op.
@@ -1154,7 +1213,10 @@ async fn schema_create_table_if_not_exists_currently_errors() {
 
     // Existing data must be intact.
     let n = count_rows(sess.execute("SELECT count(*) FROM maybe").await.unwrap());
-    assert_eq!(n, 1, "existing table data must survive CREATE IF NOT EXISTS no-op");
+    assert_eq!(
+        n, 1,
+        "existing table data must survive CREATE IF NOT EXISTS no-op"
+    );
     println!("[schema] CREATE TABLE IF NOT EXISTS is a no-op as expected (fix #49)");
 }
 
@@ -1167,7 +1229,9 @@ async fn dml_delete_no_match_is_ok() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1), (2)").await.unwrap();
 
     // This WHERE clause matches nothing.
@@ -1199,8 +1263,12 @@ async fn dml_update_no_match_is_ok() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, v BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (1, 100), (2, 200)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .unwrap();
 
     let _res = sess
         .execute("UPDATE t SET v = 0 WHERE id = 9999")
@@ -1250,7 +1318,9 @@ async fn select_empty_table_returns_zero_rows() {
         .unwrap();
 
     let n = count_rows(
-        sess.execute("SELECT count(*) FROM empty_tbl").await.unwrap(),
+        sess.execute("SELECT count(*) FROM empty_tbl")
+            .await
+            .unwrap(),
     );
     assert_eq!(n, 0, "SELECT count(*) from empty table must return 0");
 }
@@ -1264,8 +1334,12 @@ async fn select_limit_zero_returns_no_rows() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (1), (2), (3)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1), (2), (3)")
+        .await
+        .unwrap();
 
     let res = sess.execute("SELECT * FROM t LIMIT 0").await.unwrap();
     let rows: usize = match res {
@@ -1285,8 +1359,12 @@ async fn dml_drop_table_unsupported_in_poc() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE gone (id BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO gone VALUES (1), (2), (3)").await.unwrap();
+    sess.execute("CREATE TABLE gone (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO gone VALUES (1), (2), (3)")
+        .await
+        .unwrap();
 
     // DROP TABLE is now wired (fix #49, commit 25d9a5f).
     sess.execute("DROP TABLE gone")

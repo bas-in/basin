@@ -4146,12 +4146,31 @@ async fn sql_support_matrix() {
 
     // ── Print summary ─────────────────────────────────────────────────────────
     let total = matrix_rows.len();
-    for (pass_idx, pass_label) in [(0usize, "Default"), (1usize, "+PG_QUERY"), (2usize, "+PG_QUERY+PG_PLAN")] {
-        let ok = matrix_rows.iter().filter(|r| r.outcomes[pass_idx] == Outcome::Ok).count();
-        let exec_fail = matrix_rows.iter().filter(|r| r.outcomes[pass_idx] == Outcome::ExecFailed).count();
-        let plan_rej = matrix_rows.iter().filter(|r| r.outcomes[pass_idx] == Outcome::PlannerRejected).count();
-        let parse_rej = matrix_rows.iter().filter(|r| r.outcomes[pass_idx] == Outcome::ParserRejected).count();
-        let oos = matrix_rows.iter().filter(|r| r.outcomes[pass_idx] == Outcome::OutOfScope).count();
+    for (pass_idx, pass_label) in [
+        (0usize, "Default"),
+        (1usize, "+PG_QUERY"),
+        (2usize, "+PG_QUERY+PG_PLAN"),
+    ] {
+        let ok = matrix_rows
+            .iter()
+            .filter(|r| r.outcomes[pass_idx] == Outcome::Ok)
+            .count();
+        let exec_fail = matrix_rows
+            .iter()
+            .filter(|r| r.outcomes[pass_idx] == Outcome::ExecFailed)
+            .count();
+        let plan_rej = matrix_rows
+            .iter()
+            .filter(|r| r.outcomes[pass_idx] == Outcome::PlannerRejected)
+            .count();
+        let parse_rej = matrix_rows
+            .iter()
+            .filter(|r| r.outcomes[pass_idx] == Outcome::ParserRejected)
+            .count();
+        let oos = matrix_rows
+            .iter()
+            .filter(|r| r.outcomes[pass_idx] == Outcome::OutOfScope)
+            .count();
         println!(
             "Pass {pass_label}: ✅ {ok}  🛠 {exec_fail}  📜 {plan_rej}  ❌ {parse_rej}  🚫 {oos}  (total {total})"
         );
@@ -4168,8 +4187,8 @@ async fn sql_support_matrix() {
     let md = generate_markdown(&matrix_rows, &timestamp, total);
 
     // The docs/ dir is at workspace root; find it relative to CARGO_MANIFEST_DIR.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| "tests/integration".to_string());
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| "tests/integration".to_string());
     // Walk up from tests/integration to workspace root
     let workspace_root = std::path::PathBuf::from(&manifest_dir)
         .parent()
@@ -4194,7 +4213,10 @@ async fn sql_support_matrix() {
         "expected at least 550 SQL fragments, got {total}"
     );
     // At least some rows must succeed in the default config.
-    let default_ok = matrix_rows.iter().filter(|r| r.outcomes[0] == Outcome::Ok).count();
+    let default_ok = matrix_rows
+        .iter()
+        .filter(|r| r.outcomes[0] == Outcome::Ok)
+        .count();
     assert!(
         default_ok >= 20,
         "expected at least 20 OK rows in default config, got {default_ok}"

@@ -173,9 +173,9 @@ impl CursorRegistry {
         emit_rows: bool,
     ) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
         let mut map = self.inner.lock().await;
-        let cursor = map.get_mut(name).ok_or_else(|| {
-            BasinError::internal(format!("cursor \"{name}\" does not exist"))
-        })?;
+        let cursor = map
+            .get_mut(name)
+            .ok_or_else(|| BasinError::internal(format!("cursor \"{name}\" does not exist")))?;
 
         let schema = cursor.schema.clone();
         let batches = if emit_rows {
@@ -280,9 +280,9 @@ impl CursorDirection {
             FetchDirection::Forward { limit } => {
                 Ok(Self::Forward(limit.as_ref().map(value_to_i64).transpose()?))
             }
-            FetchDirection::Backward { limit } => {
-                Ok(Self::Backward(limit.as_ref().map(value_to_i64).transpose()?))
-            }
+            FetchDirection::Backward { limit } => Ok(Self::Backward(
+                limit.as_ref().map(value_to_i64).transpose()?,
+            )),
         }
     }
 }
@@ -290,9 +290,9 @@ impl CursorDirection {
 fn value_to_i64(v: &sqlparser::ast::Value) -> Result<i64> {
     use sqlparser::ast::Value;
     match v {
-        Value::Number(n, _) => n.parse::<i64>().map_err(|_| {
-            BasinError::internal(format!("cursor: invalid count literal: {n}"))
-        }),
+        Value::Number(n, _) => n
+            .parse::<i64>()
+            .map_err(|_| BasinError::internal(format!("cursor: invalid count literal: {n}"))),
         other => Err(BasinError::internal(format!(
             "cursor: expected integer literal, got: {other}"
         ))),
@@ -314,7 +314,9 @@ pub(crate) struct MoveIntent {
 pub(crate) fn match_move_sql(sql: &str) -> Option<MoveIntent> {
     let trimmed = sql.trim();
     // Fast path: first word must be MOVE (any case).
-    let word_end = trimmed.find(|c: char| c.is_ascii_whitespace()).unwrap_or(trimmed.len());
+    let word_end = trimmed
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(trimmed.len());
     if !trimmed[..word_end].eq_ignore_ascii_case("MOVE") {
         return None;
     }
@@ -328,7 +330,10 @@ pub(crate) fn match_move_sql(sql: &str) -> Option<MoveIntent> {
     if stmts.len() != 1 {
         return None;
     }
-    if let sqlparser::ast::Statement::Fetch { name, direction, .. } = &stmts[0] {
+    if let sqlparser::ast::Statement::Fetch {
+        name, direction, ..
+    } = &stmts[0]
+    {
         let dir = CursorDirection::from_sqlparser(direction).ok()?;
         Some(MoveIntent {
             cursor_name: name.value.clone(),

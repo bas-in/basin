@@ -203,10 +203,15 @@ fn rewrite_binary_op_to_fn(sql: &str, op: &str, func: &str) -> String {
         if i + op_len <= n && &bytes[i..i + op_len] == op_bytes {
             // Verify it's not part of a longer operator token by checking
             // the character before and after.
-            let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace()
-                || bytes[i - 1] == b')' || bytes[i - 1] == b'\'' || bytes[i - 1] == b'"';
-            let after_ok = i + op_len >= n || bytes[i + op_len].is_ascii_whitespace()
-                || bytes[i + op_len] == b'\'' || bytes[i + op_len] == b'('
+            let before_ok = i == 0
+                || bytes[i - 1].is_ascii_whitespace()
+                || bytes[i - 1] == b')'
+                || bytes[i - 1] == b'\''
+                || bytes[i - 1] == b'"';
+            let after_ok = i + op_len >= n
+                || bytes[i + op_len].is_ascii_whitespace()
+                || bytes[i + op_len] == b'\''
+                || bytes[i + op_len] == b'('
                 || bytes[i + op_len] == b'"';
 
             if before_ok && after_ok {
@@ -309,8 +314,18 @@ fn extract_lhs_from_result(result: &str) -> &str {
                     let upper = word.to_ascii_uppercase();
                     if matches!(
                         upper.as_str(),
-                        "AND" | "OR" | "NOT" | "WHERE" | "SET" | "ON" | "CASE"
-                            | "WHEN" | "THEN" | "ELSE" | "SELECT" | "HAVING"
+                        "AND"
+                            | "OR"
+                            | "NOT"
+                            | "WHERE"
+                            | "SET"
+                            | "ON"
+                            | "CASE"
+                            | "WHEN"
+                            | "THEN"
+                            | "ELSE"
+                            | "SELECT"
+                            | "HAVING"
                     ) {
                         return &trimmed[word_end..];
                     }
@@ -504,7 +519,7 @@ fn parse_path_rest(mut s: &str) -> DFResult<Vec<PathStep>> {
         match s.as_bytes()[0] {
             b'.' => {
                 s = &s[1..]; // consume '.'
-                // Recursive descent `..`
+                             // Recursive descent `..`
                 if s.starts_with('.') {
                     s = &s[1..]; // consume second '.'
                     let (key, rest) = read_key(s);
@@ -539,9 +554,9 @@ fn parse_path_rest(mut s: &str) -> DFResult<Vec<PathStep>> {
                 s = rest;
             }
             b'[' => {
-                let close = s.find(']').ok_or_else(|| {
-                    DataFusionError::Plan("Unclosed '[' in JSONPath".to_string())
-                })?;
+                let close = s
+                    .find(']')
+                    .ok_or_else(|| DataFusionError::Plan("Unclosed '[' in JSONPath".to_string()))?;
                 let inner = s[1..close].trim();
                 s = &s[close + 1..];
 
@@ -588,7 +603,11 @@ fn read_key(s: &str) -> (String, &str) {
             i += 1;
         }
         let key = s[1..i].to_string();
-        let rest = if i < bytes.len() { &s[i + 1..] } else { &s[i..] };
+        let rest = if i < bytes.len() {
+            &s[i + 1..]
+        } else {
+            &s[i..]
+        };
         return (key, rest);
     }
     let end = s
@@ -624,9 +643,9 @@ fn parse_filter_predicate(s: &str) -> DFResult<FilterPredicate> {
             cur = r;
         } else if cur_trimmed.starts_with('[') {
             // Array subscript inside filter path — handle [0] / [*]
-            let close = cur_trimmed.find(']').ok_or_else(|| {
-                DataFusionError::Plan("Unclosed '[' in filter path".to_string())
-            })?;
+            let close = cur_trimmed
+                .find(']')
+                .ok_or_else(|| DataFusionError::Plan("Unclosed '[' in filter path".to_string()))?;
             let inner = cur_trimmed[1..close].trim();
             cur = &cur_trimmed[close + 1..];
             if inner == "*" {
@@ -930,7 +949,7 @@ fn parse_top_level_predicate(path: &str) -> DFResult<Option<TopLevelPredicate>> 
                     return plan_err!("JSONPath left-hand side must start with '$': {path_part}");
                 }
                 let lhs_rest = &path_part[1..]; // drop '$'
-                // Convert path to key segments.
+                                                // Convert path to key segments.
                 let steps = parse_path_rest(lhs_rest)?;
                 let key_path = steps_to_key_path(&steps)?;
 
@@ -975,32 +994,39 @@ fn value_to_jsonb_bytes(v: &Value) -> DFResult<Vec<u8>> {
     serde_json::to_vec(v).map_err(|e| DataFusionError::Execution(format!("JSON serialize: {e}")))
 }
 
-fn extract_jsonb_value_from_array(arr: &ArrayRef, i: usize, fn_name: &str) -> DFResult<Option<Value>> {
+fn extract_jsonb_value_from_array(
+    arr: &ArrayRef,
+    i: usize,
+    fn_name: &str,
+) -> DFResult<Option<Value>> {
     if arr.is_null(i) {
         return Ok(None);
     }
     // LargeBinary
-    if let Some(lb) = arr.as_any().downcast_ref::<datafusion::arrow::array::LargeBinaryArray>() {
+    if let Some(lb) = arr
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::LargeBinaryArray>()
+    {
         let bytes = lb.value(i);
-        let v: Value = serde_json::from_slice(bytes).map_err(|e| {
-            DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}"))
-        })?;
+        let v: Value = serde_json::from_slice(bytes)
+            .map_err(|e| DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}")))?;
         return Ok(Some(v));
     }
     // Utf8
     if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
         let s = sa.value(i);
-        let v: Value = serde_json::from_str(s).map_err(|e| {
-            DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}"))
-        })?;
+        let v: Value = serde_json::from_str(s)
+            .map_err(|e| DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}")))?;
         return Ok(Some(v));
     }
     // LargeUtf8
-    if let Some(sa) = arr.as_any().downcast_ref::<datafusion::arrow::array::LargeStringArray>() {
+    if let Some(sa) = arr
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
+    {
         let s = sa.value(i);
-        let v: Value = serde_json::from_str(s).map_err(|e| {
-            DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}"))
-        })?;
+        let v: Value = serde_json::from_str(s)
+            .map_err(|e| DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}")))?;
         return Ok(Some(v));
     }
     exec_err!("{fn_name}: unsupported input type")
@@ -1013,7 +1039,10 @@ fn extract_string_from_array(arr: &ArrayRef, i: usize) -> Option<String> {
     if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
         return Some(sa.value(i).to_string());
     }
-    if let Some(sa) = arr.as_any().downcast_ref::<datafusion::arrow::array::LargeStringArray>() {
+    if let Some(sa) = arr
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
+    {
         return Some(sa.value(i).to_string());
     }
     None
@@ -1038,16 +1067,27 @@ struct JsonbPathQueryFirstUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathQueryFirstUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_query_first" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_query_first"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 2 {
-            return exec_err!("jsonb_path_query_first expects 2 arguments, got {}", args.len());
+            return exec_err!(
+                "jsonb_path_query_first expects 2 arguments, got {}",
+                args.len()
+            );
         }
         let n = row_count_from_args(args);
         let doc_arr = args[0].clone().into_array(n)?;
@@ -1057,15 +1097,20 @@ impl ScalarUDFImpl for JsonbPathQueryFirstUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value_from_array(&doc_arr, i, "jsonb_path_query_first")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let path_str = match extract_string_from_array(&path_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
-            let steps = parse_jsonpath(&path_str).map_err(|e| {
-                DataFusionError::Execution(format!("jsonb_path_query_first: {e}"))
-            })?;
+            let steps = parse_jsonpath(&path_str)
+                .map_err(|e| DataFusionError::Execution(format!("jsonb_path_query_first: {e}")))?;
             let matches = jsonpath_eval(&doc, &steps);
             match matches.into_iter().next() {
                 Some(v) => out.push(Some(value_to_jsonb_bytes(&v)?)),
@@ -1088,16 +1133,27 @@ struct JsonbPathQueryArrayUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathQueryArrayUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_query_array" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_query_array"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 2 {
-            return exec_err!("jsonb_path_query_array expects 2 arguments, got {}", args.len());
+            return exec_err!(
+                "jsonb_path_query_array expects 2 arguments, got {}",
+                args.len()
+            );
         }
         let n = row_count_from_args(args);
         let doc_arr = args[0].clone().into_array(n)?;
@@ -1107,15 +1163,20 @@ impl ScalarUDFImpl for JsonbPathQueryArrayUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value_from_array(&doc_arr, i, "jsonb_path_query_array")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let path_str = match extract_string_from_array(&path_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
-            let steps = parse_jsonpath(&path_str).map_err(|e| {
-                DataFusionError::Execution(format!("jsonb_path_query_array: {e}"))
-            })?;
+            let steps = parse_jsonpath(&path_str)
+                .map_err(|e| DataFusionError::Execution(format!("jsonb_path_query_array: {e}")))?;
             let matches = jsonpath_eval(&doc, &steps);
             let arr = Value::Array(matches);
             out.push(Some(value_to_jsonb_bytes(&arr)?));
@@ -1136,10 +1197,18 @@ struct JsonbPathMatchUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathMatchUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_match" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_match"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1155,11 +1224,17 @@ impl ScalarUDFImpl for JsonbPathMatchUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value_from_array(&doc_arr, i, "jsonb_path_match")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let pred_str = match extract_string_from_array(&pred_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
 
             // Try to parse as a top-level predicate `$.x op value`.
@@ -1181,9 +1256,7 @@ impl ScalarUDFImpl for JsonbPathMatchUdf {
                     out.push(Some(!matches.is_empty()));
                 }
                 Err(e) => {
-                    return Err(DataFusionError::Execution(format!(
-                        "jsonb_path_match: {e}"
-                    )));
+                    return Err(DataFusionError::Execution(format!("jsonb_path_match: {e}")));
                 }
             }
         }
@@ -1215,9 +1288,15 @@ struct JsonbPathQueryTable {
 
 #[async_trait::async_trait]
 impl TableProvider for JsonbPathQueryTable {
-    fn as_any(&self) -> &dyn Any { self }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> TableType { TableType::Base }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 
     async fn scan(
         &self,
@@ -1286,10 +1365,8 @@ impl TableFunctionImpl for JsonbPathQueryTf {
             true,
         )]));
 
-        let rows: Vec<Option<Vec<u8>>> = matches
-            .iter()
-            .map(|v| serde_json::to_vec(v).ok())
-            .collect();
+        let rows: Vec<Option<Vec<u8>>> =
+            matches.iter().map(|v| serde_json::to_vec(v).ok()).collect();
 
         let val_arr: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
             rows.iter().map(|o| o.as_deref()),

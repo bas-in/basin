@@ -105,7 +105,12 @@ async fn assert_true(sess: &basin_engine::ProjectSession, sql: &str) {
             let arr = col
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .unwrap_or_else(|| panic!("expected BooleanArray for [{sql}], got {:?}", col.data_type()));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected BooleanArray for [{sql}], got {:?}",
+                        col.data_type()
+                    )
+                });
             assert!(arr.value(0), "expected true from: {sql}");
         }
         Ok(other) => panic!("non-rows for {sql}: {other:?}"),
@@ -118,15 +123,42 @@ fn render_col(arr: &dyn Array, i: usize) -> String {
         return "<NULL>".into();
     }
     match arr.data_type() {
-        DataType::Utf8 => arr.as_any().downcast_ref::<StringArray>().unwrap().value(i).to_string(),
-        DataType::Int32 => arr.as_any().downcast_ref::<Int32Array>().unwrap().value(i).to_string(),
-        DataType::Int64 => arr.as_any().downcast_ref::<Int64Array>().unwrap().value(i).to_string(),
+        DataType::Utf8 => arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(i)
+            .to_string(),
+        DataType::Int32 => arr
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(i)
+            .to_string(),
+        DataType::Int64 => arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(i)
+            .to_string(),
         DataType::Float64 => {
-            let v = arr.as_any().downcast_ref::<Float64Array>().unwrap().value(i);
-            if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) }
-            else { format!("{v}") }
+            let v = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(i);
+            if v.fract() == 0.0 && v.abs() < 1e15 {
+                format!("{}", v as i64)
+            } else {
+                format!("{v}")
+            }
         }
-        DataType::Boolean => arr.as_any().downcast_ref::<BooleanArray>().unwrap().value(i).to_string(),
+        DataType::Boolean => arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(i)
+            .to_string(),
         DataType::Date32 => {
             let d = arr.as_any().downcast_ref::<Date32Array>().unwrap().value(i);
             // Date32 = days since 1970-01-01
@@ -142,7 +174,11 @@ fn render_col(arr: &dyn Array, i: usize) -> String {
             format!("<Timestamp:{:?}>", arr.data_type())
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
-            let v = arr.as_any().downcast_ref::<IntervalMonthDayNanoArray>().unwrap().value(i);
+            let v = arr
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .unwrap()
+                .value(i);
             format!("{}m{}d{}ns", v.months, v.days, v.nanoseconds)
         }
         DataType::Null => "<NULL>".into(),
@@ -163,7 +199,8 @@ async fn interval_ts_plus_interval() {
     assert_ok(
         &s,
         "SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day'",
-    ).await;
+    )
+    .await;
 }
 
 /// `timestamp - interval '2 hours'` — DataFusion arithmetic.
@@ -174,7 +211,8 @@ async fn interval_ts_minus_interval() {
     assert_ok(
         &s,
         "SELECT TIMESTAMP '2024-01-01 02:00:00' - INTERVAL '2 hours'",
-    ).await;
+    )
+    .await;
 }
 
 /// `interval + interval` — DF native.
@@ -237,7 +275,8 @@ async fn interval_chained_addition() {
     assert_ok(
         &s,
         "SELECT INTERVAL '1 day 2 hours' + INTERVAL '30 minutes'",
-    ).await;
+    )
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,7 +293,8 @@ async fn date_trunc_quarter() {
     assert_ok(
         &s,
         "SELECT date_trunc('quarter', TIMESTAMP '2024-05-09 12:34:56')",
-    ).await;
+    )
+    .await;
 }
 
 /// `date_trunc('week', ts)` — truncates to Monday.
@@ -265,7 +305,8 @@ async fn date_trunc_week() {
     assert_ok(
         &s,
         "SELECT date_trunc('week', TIMESTAMP '2024-05-09 12:34:56')",
-    ).await;
+    )
+    .await;
 }
 
 /// `date_trunc('decade', ts)` — DF native.
@@ -277,7 +318,8 @@ async fn date_trunc_decade() {
     assert_ok(
         &s,
         "SELECT date_trunc('decade', TIMESTAMP '2024-05-09 12:34:56')",
-    ).await;
+    )
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +364,11 @@ async fn extract_epoch_from_timestamp() {
     let s = e.open_session(ProjectId::new()).await.unwrap();
     // 2024-05-09 12:34:56 UTC = 1715258096 seconds
     assert_eq!(
-        one_str(&s, "SELECT extract(epoch FROM TIMESTAMP '2024-05-09 12:34:56')").await,
+        one_str(
+            &s,
+            "SELECT extract(epoch FROM TIMESTAMP '2024-05-09 12:34:56')"
+        )
+        .await,
         "1715258096"
     );
 }
@@ -386,10 +432,7 @@ async fn age_returns_interval() {
 async fn justify_days_basic() {
     let (_d, e) = open_engine().await;
     let s = e.open_session(ProjectId::new()).await.unwrap();
-    match s
-        .execute("SELECT justify_days(INTERVAL '47 days')")
-        .await
-    {
+    match s.execute("SELECT justify_days(INTERVAL '47 days')").await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap();
             let col = b.column(0);
@@ -417,10 +460,7 @@ async fn justify_days_basic() {
 async fn justify_hours_basic() {
     let (_d, e) = open_engine().await;
     let s = e.open_session(ProjectId::new()).await.unwrap();
-    match s
-        .execute("SELECT justify_hours(INTERVAL '30 hours')")
-        .await
-    {
+    match s.execute("SELECT justify_hours(INTERVAL '30 hours')").await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap();
             let arr = b
@@ -549,7 +589,7 @@ async fn timezone_function_form() {
                 matches!(
                     col.data_type(),
                     DataType::Timestamp(TimeUnit::Microsecond, Some(_))
-                    | DataType::Timestamp(TimeUnit::Nanosecond, Some(_))
+                        | DataType::Timestamp(TimeUnit::Nanosecond, Some(_))
                 ),
                 "timezone() must return timestamptz, got {:?}",
                 col.data_type()
@@ -591,10 +631,7 @@ async fn at_time_zone_sql_rewrite_form() {
     let s = e.open_session(ProjectId::new()).await.unwrap();
     // The SQL-string rewrite maps `now() AT TIME ZONE 'UTC'` to
     // `at_time_zone(now(), 'UTC')`.
-    match s
-        .execute("SELECT now() AT TIME ZONE 'UTC'")
-        .await
-    {
+    match s.execute("SELECT now() AT TIME ZONE 'UTC'").await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap();
             let col = b.column(0);
@@ -671,13 +708,12 @@ async fn date_add_int_basic() {
     let s = e.open_session(ProjectId::new()).await.unwrap();
     // CURRENT_DATE + 7 days via our UDF
     // Use a literal date cast for determinism.
-    let result = one_str(
-        &s,
-        "SELECT date_add_int(CAST('2024-01-01' AS DATE), 7)",
-    )
-    .await;
+    let result = one_str(&s, "SELECT date_add_int(CAST('2024-01-01' AS DATE), 7)").await;
     // 2024-01-01 + 7 days = 2024-01-08
-    assert_eq!(result, "2024-01-08", "date_add_int(2024-01-01, 7) should give 2024-01-08");
+    assert_eq!(
+        result, "2024-01-08",
+        "date_add_int(2024-01-01, 7) should give 2024-01-08"
+    );
 }
 
 /// `date_sub_int(date, integer)` — subtracts days from a date.
@@ -685,11 +721,7 @@ async fn date_add_int_basic() {
 async fn date_sub_int_basic() {
     let (_d, e) = open_engine().await;
     let s = e.open_session(ProjectId::new()).await.unwrap();
-    let result = one_str(
-        &s,
-        "SELECT date_sub_int(CAST('2024-01-08' AS DATE), 7)",
-    )
-    .await;
+    let result = one_str(&s, "SELECT date_sub_int(CAST('2024-01-08' AS DATE), 7)").await;
     assert_eq!(result, "2024-01-01");
 }
 
@@ -787,9 +819,7 @@ async fn interval_sql_standard_day_to_second() {
         }
         Err(e) => {
             // Document as known gap; not a test failure.
-            println!(
-                "INTERVAL 'N HH:MM:SS' DAY TO SECOND not supported natively: {e}"
-            );
+            println!("INTERVAL 'N HH:MM:SS' DAY TO SECOND not supported natively: {e}");
         }
     }
 }

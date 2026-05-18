@@ -65,8 +65,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -139,10 +138,7 @@ async fn binary_param_bool() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE boolvals (v BOOLEAN NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE boolvals (v BOOLEAN NOT NULL)", &[])
         .await
         .expect("CREATE TABLE boolvals");
 
@@ -153,7 +149,10 @@ async fn binary_param_bool() {
         .expect("prepare_typed bool INSERT");
 
     client.execute(&stmt, &[&true]).await.expect("INSERT true");
-    client.execute(&stmt, &[&false]).await.expect("INSERT false");
+    client
+        .execute(&stmt, &[&false])
+        .await
+        .expect("INSERT false");
 
     let sel = client
         .prepare_typed("SELECT v FROM boolvals ORDER BY v", &[])
@@ -180,10 +179,7 @@ async fn binary_param_int8() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE i8vals (v BIGINT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE i8vals (v BIGINT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE i8vals");
 
@@ -213,10 +209,7 @@ async fn binary_param_float8() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE f8vals (v FLOAT8 NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE f8vals (v FLOAT8 NOT NULL)", &[])
         .await
         .expect("CREATE TABLE f8vals");
 
@@ -249,10 +242,7 @@ async fn binary_param_bytea() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE byteavals (v BYTEA NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE byteavals (v BYTEA NOT NULL)", &[])
         .await
         .expect("CREATE TABLE byteavals");
 
@@ -291,10 +281,7 @@ async fn binary_param_int2() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE i2vals (v SMALLINT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE i2vals (v SMALLINT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE i2vals");
 
@@ -303,8 +290,14 @@ async fn binary_param_int2() {
         .await
         .expect("prepare_typed int2");
 
-    client.execute(&stmt, &[&-32000i16]).await.expect("INSERT -32000");
-    client.execute(&stmt, &[&32000i16]).await.expect("INSERT 32000");
+    client
+        .execute(&stmt, &[&-32000i16])
+        .await
+        .expect("INSERT -32000");
+    client
+        .execute(&stmt, &[&32000i16])
+        .await
+        .expect("INSERT 32000");
 
     let rows = client
         .query("SELECT v FROM i2vals ORDER BY v", &[])
@@ -335,10 +328,7 @@ async fn binary_param_int4() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE i4vals (v INTEGER NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE i4vals (v INTEGER NOT NULL)", &[])
         .await
         .expect("CREATE TABLE i4vals");
 
@@ -373,10 +363,7 @@ async fn binary_param_float4() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE f4vals (v FLOAT4 NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE f4vals (v FLOAT4 NOT NULL)", &[])
         .await
         .expect("CREATE TABLE f4vals");
 
@@ -385,7 +372,7 @@ async fn binary_param_float4() {
         .await
         .expect("prepare_typed float4");
 
-    let want: f32 = 3.14_f32;
+    let want: f32 = 2.5_f32;
     client.execute(&stmt, &[&want]).await.expect("INSERT f32");
 
     let rows = client
@@ -412,10 +399,7 @@ async fn binary_param_text_ascii() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE textvals_ascii (v TEXT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE textvals_ascii (v TEXT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE textvals_ascii");
 
@@ -426,7 +410,10 @@ async fn binary_param_text_ascii() {
 
     // ASCII-only string: no multi-byte chars, exercises basic binary text path.
     let want = "hello world";
-    client.execute(&stmt, &[&want]).await.expect("INSERT ASCII text");
+    client
+        .execute(&stmt, &[&want])
+        .await
+        .expect("INSERT ASCII text");
 
     let rows = client
         .query("SELECT v FROM textvals_ascii", &[])
@@ -460,10 +447,7 @@ async fn binary_param_text_multibyte_utf8() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE textvals_mb (v TEXT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE textvals_mb (v TEXT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE textvals_mb");
 
@@ -474,7 +458,10 @@ async fn binary_param_text_multibyte_utf8() {
 
     // Contains multi-byte UTF-8: em-dash (3 bytes) and checkmark (3 bytes).
     let want = "hello — world ✓";
-    client.execute(&stmt, &[&want]).await.expect("INSERT multibyte text");
+    client
+        .execute(&stmt, &[&want])
+        .await
+        .expect("INSERT multibyte text");
 
     let rows = client
         .query("SELECT v FROM textvals_mb", &[])
@@ -500,10 +487,7 @@ async fn binary_param_text_with_apostrophe() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE apos_test (v TEXT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE apos_test (v TEXT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE apos_test");
 
@@ -514,7 +498,10 @@ async fn binary_param_text_with_apostrophe() {
 
     // Binary text bypasses SQL quoting entirely: apostrophe must round-trip.
     let want = "it's O'Reilly & \"quoted\" — <test>";
-    client.execute(&stmt, &[&want]).await.expect("INSERT with apostrophe");
+    client
+        .execute(&stmt, &[&want])
+        .await
+        .expect("INSERT with apostrophe");
 
     let rows = client
         .query("SELECT v FROM apos_test", &[])
@@ -569,10 +556,7 @@ async fn null_param_binary_format() {
         .expect("INSERT with binary-format NULL");
 
     let rows = client
-        .query(
-            "SELECT val IS NULL FROM nulltest WHERE id = 1",
-            &[],
-        )
+        .query("SELECT val IS NULL FROM nulltest WHERE id = 1", &[])
         .await
         .expect("SELECT IS NULL");
 
@@ -614,10 +598,7 @@ async fn null_param_text_column() {
         .expect("INSERT text NULL");
 
     let rows = client
-        .query(
-            "SELECT label IS NULL FROM nulltest_text WHERE id = 2",
-            &[],
-        )
+        .query("SELECT label IS NULL FROM nulltest_text WHERE id = 2", &[])
         .await
         .expect("SELECT text IS NULL");
 
@@ -644,10 +625,7 @@ async fn param_desc_infers_int8_from_where_predicate() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE pred_int (col BIGINT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE pred_int (col BIGINT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE pred_int");
 
@@ -1028,10 +1006,7 @@ async fn empty_result_set_roundtrip() {
         "expected 0 rows from WHERE FALSE, got {}",
         rows.len()
     );
-    println!(
-        "[empty_result_set] ok: 0 rows, col={:?}",
-        cols[0].name()
-    );
+    println!("[empty_result_set] ok: 0 rows, col={:?}", cols[0].name());
 }
 
 /// Empty result from a table scan (not a literal `1 WHERE FALSE`).
@@ -1104,11 +1079,7 @@ async fn extended_parse_multi_statement_rejected() {
     let err = result.unwrap_err();
     if let Some(dbe) = err.as_db_error() {
         let code = dbe.code().code();
-        assert_eq!(
-            code.len(),
-            5,
-            "error code must be 5 chars, got: {code:?}"
-        );
+        assert_eq!(code.len(), 5, "error code must be 5 chars, got: {code:?}");
         println!(
             "[multi_stmt_parse_rejected] ok: SQLSTATE={code:?} msg={:?}",
             dbe.message()
@@ -1193,9 +1164,7 @@ async fn unnamed_statement_reuse_replaces_cleanly() {
         "stmt_a must still work after unnamed-slot reuse"
     );
 
-    println!(
-        "[unnamed_stmt_reuse] ok: a={val_a:?}, b={val_b:?}, a_after_reuse={val_a2:?}"
-    );
+    println!("[unnamed_stmt_reuse] ok: a={val_a:?}, b={val_b:?}, a_after_reuse={val_a2:?}");
 }
 
 /// Named statement survives being shadowed by an unnamed Parse, then can be
@@ -1206,10 +1175,7 @@ async fn named_statement_survives_unnamed_overwrite() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE survive_tbl (v BIGINT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE survive_tbl (v BIGINT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE survive_tbl");
 
@@ -1227,7 +1193,10 @@ async fn named_statement_survives_unnamed_overwrite() {
         .expect("prepare named");
 
     // Execute once.
-    let r1 = client.query(&named, &[&20i64]).await.expect("query named 20");
+    let r1 = client
+        .query(&named, &[&20i64])
+        .await
+        .expect("query named 20");
     assert_eq!(r1.len(), 1);
     assert_eq!(r1[0].get::<_, i64>(0), 20);
 
@@ -1276,10 +1245,7 @@ async fn binary_param_timestamp() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE tsvals (v TIMESTAMPTZ NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE tsvals (v TIMESTAMPTZ NOT NULL)", &[])
         .await
         .expect("CREATE TABLE tsvals");
 
@@ -1303,10 +1269,7 @@ async fn binary_param_date() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE datevals (v DATE NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE datevals (v DATE NOT NULL)", &[])
         .await
         .expect("CREATE TABLE datevals");
 

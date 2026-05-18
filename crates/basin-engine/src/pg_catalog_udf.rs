@@ -22,7 +22,8 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, String
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;

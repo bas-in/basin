@@ -35,7 +35,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -97,16 +97,21 @@ async fn view_create_and_select() {
     sess.execute("CREATE TABLE employees (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, dept TEXT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'eng'), (3, 'Carol', 'hr')")
-        .await
-        .unwrap();
+    sess.execute(
+        "INSERT INTO employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'eng'), (3, 'Carol', 'hr')",
+    )
+    .await
+    .unwrap();
 
     // Create a plain view.
     let res = sess
         .execute("CREATE VIEW eng_staff AS SELECT id, name FROM employees WHERE dept = 'eng'")
         .await
         .unwrap();
-    assert!(matches!(res, ExecResult::Empty { ref tag } if tag == "CREATE VIEW"), "got: {res:?}");
+    assert!(
+        matches!(res, ExecResult::Empty { ref tag } if tag == "CREATE VIEW"),
+        "got: {res:?}"
+    );
 
     // SELECT from the view.
     let res = sess
@@ -182,7 +187,10 @@ async fn view_drop_if_exists() {
 
     // Drop existing view.
     let res = sess.execute("DROP VIEW v").await.unwrap();
-    assert!(matches!(res, ExecResult::Empty { ref tag } if tag == "DROP VIEW"), "got: {res:?}");
+    assert!(
+        matches!(res, ExecResult::Empty { ref tag } if tag == "DROP VIEW"),
+        "got: {res:?}"
+    );
 
     // IF EXISTS on non-existent view → no error.
     let res = sess.execute("DROP VIEW IF EXISTS v").await.unwrap();
@@ -190,7 +198,10 @@ async fn view_drop_if_exists() {
 
     // Without IF EXISTS → error.
     let res = sess.execute("DROP VIEW v").await;
-    assert!(res.is_err(), "dropping non-existent view without IF EXISTS should fail");
+    assert!(
+        res.is_err(),
+        "dropping non-existent view without IF EXISTS should fail"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -272,7 +283,9 @@ async fn view_cascade_drop_ignored_v0() {
     sess.execute("CREATE VIEW v AS SELECT id FROM t")
         .await
         .unwrap();
-    sess.execute("DROP VIEW IF EXISTS v RESTRICT").await.unwrap();
+    sess.execute("DROP VIEW IF EXISTS v RESTRICT")
+        .await
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -304,10 +317,9 @@ async fn delete_using_basic() {
         .await
         .unwrap();
     match res {
-        ExecResult::Empty { ref tag } => assert!(
-            tag.starts_with("DELETE "),
-            "expected DELETE tag, got {tag}"
-        ),
+        ExecResult::Empty { ref tag } => {
+            assert!(tag.starts_with("DELETE "), "expected DELETE tag, got {tag}")
+        }
         other => panic!("unexpected: {other:?}"),
     }
 
@@ -334,9 +346,7 @@ async fn delete_using_no_match() {
     sess.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
         .await
         .unwrap();
-    sess.execute("INSERT INTO u VALUES (99)")
-        .await
-        .unwrap();
+    sess.execute("INSERT INTO u VALUES (99)").await.unwrap();
 
     let res = sess
         .execute("DELETE FROM t USING u WHERE t.id = u.id")
@@ -350,10 +360,7 @@ async fn delete_using_no_match() {
         other => panic!("unexpected: {other:?}"),
     }
 
-    let remaining = sess
-        .execute("SELECT id FROM t ORDER BY id")
-        .await
-        .unwrap();
+    let remaining = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
     assert_eq!(col_i64(&remaining, "id"), vec![1, 2]);
 }
 
@@ -363,14 +370,14 @@ async fn update_from_basic() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
+    sess.execute("CREATE TABLE products (id BIGINT NOT NULL PRIMARY KEY, price BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute(
-        "CREATE TABLE products (id BIGINT NOT NULL PRIMARY KEY, price BIGINT NOT NULL)",
+        "CREATE TABLE price_updates (id BIGINT NOT NULL PRIMARY KEY, new_price BIGINT NOT NULL)",
     )
     .await
     .unwrap();
-    sess.execute("CREATE TABLE price_updates (id BIGINT NOT NULL PRIMARY KEY, new_price BIGINT NOT NULL)")
-        .await
-        .unwrap();
     sess.execute("INSERT INTO products VALUES (1, 100), (2, 200), (3, 300)")
         .await
         .unwrap();
@@ -387,10 +394,9 @@ async fn update_from_basic() {
         .await
         .unwrap();
     match res {
-        ExecResult::Empty { ref tag } => assert!(
-            tag.starts_with("UPDATE "),
-            "expected UPDATE tag, got {tag}"
-        ),
+        ExecResult::Empty { ref tag } => {
+            assert!(tag.starts_with("UPDATE "), "expected UPDATE tag, got {tag}")
+        }
         other => panic!("unexpected: {other:?}"),
     }
 

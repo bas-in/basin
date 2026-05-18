@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use basin_common::{PartitionKey, Result, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, Result, TableName};
 use basin_wal::{Lsn, WalEntry};
 
 /// Per-shard role. Set when [`crate::Shard::new`] (leader) or

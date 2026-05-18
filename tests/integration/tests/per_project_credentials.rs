@@ -30,8 +30,8 @@ use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
 // that exercise the AuthService directly without booting the full stack.
 use basin_common::ProjectId;
 use basin_router::{
-    ServerConfig, StackedProjectResolver, StaticProjectResolver, ProjectCredentialsResolver,
-    ProjectResolver,
+    ProjectCredentialsResolver, ProjectResolver, ServerConfig, StackedProjectResolver,
+    StaticProjectResolver,
 };
 use object_store::local::LocalFileSystem;
 use serde_json::Value;
@@ -669,7 +669,10 @@ async fn per_project_credentials_isolate_cross_project_data() {
     let bodies = collect_bodies(&rows);
     assert_eq!(
         bodies,
-        vec!["project_b_secret".to_string(), "project_b_secret".to_string()],
+        vec![
+            "project_b_secret".to_string(),
+            "project_b_secret".to_string()
+        ],
         "UNION must not cross projects"
     );
     for body in &bodies {

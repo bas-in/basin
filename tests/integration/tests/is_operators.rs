@@ -506,10 +506,7 @@ async fn nullif_equal_returns_null() {
 /// `NULLIF(1, 2)` → 1
 #[tokio::test]
 async fn nullif_unequal_returns_first() {
-    assert_eq!(
-        i64_val("SELECT NULLIF(1::bigint, 2::bigint) AS v").await,
-        1
-    );
+    assert_eq!(i64_val("SELECT NULLIF(1::bigint, 2::bigint) AS v").await, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -727,11 +724,9 @@ async fn is_true_filters_table_rows() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE flags (id BIGINT NOT NULL, active BOOLEAN)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE flags (id BIGINT NOT NULL, active BOOLEAN)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO flags VALUES (1, true), (2, false), (3, NULL)")
         .await
         .unwrap();
@@ -768,11 +763,9 @@ async fn is_not_true_filters_table_rows() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE flags2 (id BIGINT NOT NULL, active BOOLEAN)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE flags2 (id BIGINT NOT NULL, active BOOLEAN)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO flags2 VALUES (1, true), (2, false), (3, NULL)")
         .await
         .unwrap();
@@ -875,9 +868,7 @@ async fn coalesce_in_where_clause() {
 
     // COALESCE(qty, 0) > 3: rows where qty > 3 or (qty is null, treated as 0, so 0 > 3 = false)
     let res = sess
-        .execute(
-            "SELECT id FROM items WHERE COALESCE(qty, 0) > 3 ORDER BY id",
-        )
+        .execute("SELECT id FROM items WHERE COALESCE(qty, 0) > 3 ORDER BY id")
         .await
         .unwrap();
     let ids: Vec<i64> = match res {

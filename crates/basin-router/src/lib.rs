@@ -61,16 +61,16 @@ mod tls;
 mod types;
 
 pub use connection_limit::{
-    ConnectionGuard, ConnectionLimiter, ConnectionLimitProvider, NoConnectionLimit,
+    ConnectionGuard, ConnectionLimitProvider, ConnectionLimiter, NoConnectionLimit,
 };
+pub use protocol::{COMMIT_CONFLICT_EXHAUSTED_COUNT, COMMIT_CONFLICT_RETRY_COUNT};
 pub use rate_limit::{from_env_qps, PgRateLimit, BURST_FACTOR, DEFAULT_SUSTAINED_QPS};
 pub use resolver::{
-    ApiKeyProjectResolver, JwtProjectResolver, StackedProjectResolver, StaticProjectResolver,
-    ProjectCredentialsResolver, ProjectResolver,
+    ApiKeyProjectResolver, JwtProjectResolver, ProjectCredentialsResolver, ProjectResolver,
+    StackedProjectResolver, StaticProjectResolver,
 };
 pub use sharding::{parse_pins_env, ShardMap};
 pub use tls::{build_acceptor, TlsConfig};
-pub use protocol::{COMMIT_CONFLICT_RETRY_COUNT, COMMIT_CONFLICT_EXHAUSTED_COUNT};
 
 use crate::protocol::{
     BasinExtendedQueryHandler, BasinHandlers, BasinSimpleQueryHandlerSlot, BasinStartupHandler,
@@ -161,7 +161,17 @@ pub async fn run_until_bound(cfg: ServerConfig) -> Result<RunningServer> {
     let tls = cfg.tls;
     let connection_limiter = cfg.connection_limiter;
     let join = tokio::spawn(async move {
-        accept_loop(listener, engine, resolver, pool, shard_endpoints, tls, connection_limiter, rx).await
+        accept_loop(
+            listener,
+            engine,
+            resolver,
+            pool,
+            shard_endpoints,
+            tls,
+            connection_limiter,
+            rx,
+        )
+        .await
     });
     Ok(RunningServer {
         local_addr,
@@ -350,7 +360,12 @@ where
     ));
     let copy_state = simple.copy_state.clone();
     let handlers = BasinHandlers {
-        startup: Arc::new(BasinStartupHandler::new(factory, resolver, slot.clone(), connection_limiter)),
+        startup: Arc::new(BasinStartupHandler::new(
+            factory,
+            resolver,
+            slot.clone(),
+            connection_limiter,
+        )),
         simple,
         extended: Arc::new(BasinExtendedQueryHandler::new(slot, rate_limit, copy_state)),
     };

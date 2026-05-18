@@ -17,7 +17,7 @@ pub mod postgres;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use basin_common::{Result, ProjectId};
+use basin_common::{ProjectId, Result};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -93,11 +93,18 @@ pub trait AuthStore: Send + Sync {
     ) -> Result<UserId>;
 
     /// Look up a user by `(project, email)`. Returns `None` if not found.
-    async fn find_user_by_email(&self, project: &ProjectId, email: &str) -> Result<Option<AuthUser>>;
+    async fn find_user_by_email(
+        &self,
+        project: &ProjectId,
+        email: &str,
+    ) -> Result<Option<AuthUser>>;
 
     /// Look up a user by `(project, user_id)`. Returns `None` if not found.
-    async fn find_user_by_id(&self, project: &ProjectId, user_id: UserId)
-        -> Result<Option<AuthUser>>;
+    async fn find_user_by_id(
+        &self,
+        project: &ProjectId,
+        user_id: UserId,
+    ) -> Result<Option<AuthUser>>;
 
     /// Return any user (from any project) matching `email`. Used by the
     /// project-agnostic email-link flow to check existence before issuing a
@@ -114,7 +121,8 @@ pub trait AuthStore: Send + Sync {
     /// Mark `email_verified_at = COALESCE(email_verified_at, now())` — sets
     /// the timestamp only if it hasn't been set yet. Used by magic-link
     /// flows where a user may already be verified.
-    async fn mark_email_verified_if_null(&self, project: &ProjectId, user_id: UserId) -> Result<()>;
+    async fn mark_email_verified_if_null(&self, project: &ProjectId, user_id: UserId)
+        -> Result<()>;
 
     /// Update the password hash for a user.
     async fn update_password(

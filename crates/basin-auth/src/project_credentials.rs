@@ -21,7 +21,7 @@
 //! using [`parse_project_from_pgwire_user`].
 
 use base64::Engine;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 

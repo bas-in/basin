@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 
 use crate::{Inner, UserId};
 

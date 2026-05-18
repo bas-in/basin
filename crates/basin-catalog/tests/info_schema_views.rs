@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 
 fn name(s: &str) -> TableName {
     TableName::new(s).unwrap()

@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };

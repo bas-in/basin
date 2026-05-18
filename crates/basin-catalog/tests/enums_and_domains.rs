@@ -13,7 +13,7 @@ use basin_catalog::{
     Catalog, DomainDef, EnumTypeDef, InMemoryCatalog, SqlArgType, BASIN_DOMAIN_KEY,
     BASIN_ENUM_TYPE_KEY,
 };
-use basin_common::{BasinError, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, TableName};
 
 fn enum_def(t: ProjectId, name: &str, labels: &[&str]) -> EnumTypeDef {
     EnumTypeDef {

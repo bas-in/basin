@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use basin_common::ProjectId;
 use basin_router::{
-    ServerConfig, StaticProjectResolver,
-    COMMIT_CONFLICT_EXHAUSTED_COUNT, COMMIT_CONFLICT_RETRY_COUNT,
+    ServerConfig, StaticProjectResolver, COMMIT_CONFLICT_EXHAUSTED_COUNT,
+    COMMIT_CONFLICT_RETRY_COUNT,
 };
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -64,8 +64,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -116,11 +115,7 @@ async fn connect(addr: SocketAddr) -> tokio_postgres::Client {
 
 /// Run `n_writers` concurrent INSERT tasks against the same table for
 /// `duration`.  Returns the total number of successful inserts.
-async fn run_concurrent_inserts(
-    addr: SocketAddr,
-    n_writers: usize,
-    duration: Duration,
-) -> u64 {
+async fn run_concurrent_inserts(addr: SocketAddr, n_writers: usize, duration: Duration) -> u64 {
     // Spawn one connection per writer.
     let mut clients = Vec::with_capacity(n_writers);
     for _ in 0..n_writers {
@@ -152,10 +147,7 @@ async fn run_concurrent_inserts(
                     Err(e) => {
                         // SQLSTATE 40001 means all retries were exhausted; the
                         // client can re-issue.  Anything else is a real error.
-                        let code = e
-                            .code()
-                            .map(|c| c.code())
-                            .unwrap_or("");
+                        let code = e.code().map(|c| c.code()).unwrap_or("");
                         if code != "40001" {
                             eprintln!("unexpected insert error (task {task_idx}): {e}");
                         }
@@ -219,8 +211,7 @@ async fn concurrent_write_smoke() {
     let retries_before_n16 = COMMIT_CONFLICT_RETRY_COUNT.load(Ordering::Relaxed);
     let ops_n16 = run_concurrent_inserts(server.addr, 16, test_duration).await;
     let tps_n16 = ops_n16 as f64 / test_duration.as_secs_f64();
-    let retries_n16 =
-        COMMIT_CONFLICT_RETRY_COUNT.load(Ordering::Relaxed) - retries_before_n16;
+    let retries_n16 = COMMIT_CONFLICT_RETRY_COUNT.load(Ordering::Relaxed) - retries_before_n16;
     let exhausted_n16 = COMMIT_CONFLICT_EXHAUSTED_COUNT.load(Ordering::Relaxed);
 
     let collapse_ratio = tps_n8 / tps_n16.max(1.0);

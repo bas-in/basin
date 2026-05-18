@@ -166,7 +166,11 @@ fn inet_contains_impl(network: &str, addr: &str) -> DFResult<bool> {
             } else {
                 let net_n = u32::from(net_v4);
                 let addr_n = u32::from(addr_v4);
-                let mask = if net_bits == 0 { 0u32 } else { !0u32 << (32 - net_bits) };
+                let mask = if net_bits == 0 {
+                    0u32
+                } else {
+                    !0u32 << (32 - net_bits)
+                };
                 (net_n & mask) == (addr_n & mask)
             }
         }
@@ -249,14 +253,11 @@ fn columnar_to_strings(cv: &ColumnarValue, n: usize) -> DFResult<Vec<Option<Stri
                     ))
                 })?,
             };
-            let str_arr = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "inet_contained_by / inet_contains: argument must be text".into(),
-                    )
-                })?;
+            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "inet_contained_by / inet_contains: argument must be text".into(),
+                )
+            })?;
             let mut out = Vec::with_capacity(n);
             for i in 0..str_arr.len() {
                 if str_arr.is_null(i) {
@@ -492,9 +493,7 @@ fn inet_extract_right(s: &str, start: usize) -> (usize, usize) {
         // Absorb an optional `::inet` / `::cidr` cast suffix.
         if i + 2 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
             i += 2;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
         }
@@ -522,9 +521,7 @@ fn inet_extract_right(s: &str, start: usize) -> (usize, usize) {
         // Absorb optional cast `::inet` / `::cidr` / `::text`.
         if i + 2 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
             i += 2;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
         }
@@ -634,7 +631,10 @@ mod tests {
     fn rewrite_contains_literal() {
         let sql = "SELECT * FROM t WHERE net >> '10.5.0.1'";
         let out = rewrite_inet_operators(sql);
-        assert!(out.contains("inet_contains"), "expected rewrite, got: {out}");
+        assert!(
+            out.contains("inet_contains"),
+            "expected rewrite, got: {out}"
+        );
         assert!(!out.contains(" >> "), "op should be gone, got: {out}");
     }
 
@@ -642,7 +642,10 @@ mod tests {
     fn rewrite_with_cast_suffix() {
         let sql = "SELECT '10.0.0.0/8'::inet >> '10.1.2.3'::inet";
         let out = rewrite_inet_operators(sql);
-        assert!(out.contains("inet_contains"), "expected rewrite, got: {out}");
+        assert!(
+            out.contains("inet_contains"),
+            "expected rewrite, got: {out}"
+        );
     }
 
     #[test]
@@ -651,7 +654,10 @@ mod tests {
         let sql = "SELECT x << 3 FROM t";
         let out = rewrite_inet_operators(sql);
         // Should be unchanged (or at worst contain the original operator form).
-        assert!(!out.contains("inet_contained_by"), "should not rewrite int shift: {out}");
+        assert!(
+            !out.contains("inet_contained_by"),
+            "should not rewrite int shift: {out}"
+        );
     }
 
     #[test]

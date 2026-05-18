@@ -33,11 +33,11 @@
 
 pub mod api_keys;
 pub mod config;
-pub mod store;
 pub mod project_credentials;
+pub mod store;
 
-pub use store::AuthStore;
 pub use project_credentials::{is_legacy_pgwire_user, ConnectionInfo, ProjectCredentialDescriptor};
+pub use store::AuthStore;
 pub mod email;
 pub mod jwt;
 pub mod password;
@@ -60,7 +60,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::{DateTime, Utc};
 use rustls::ClientConfig;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -263,7 +263,11 @@ impl AuthService {
     }
 
     #[instrument(skip(self), fields(project = %project, user_id = %user))]
-    pub async fn request_email_verification(&self, project: &ProjectId, user: UserId) -> Result<()> {
+    pub async fn request_email_verification(
+        &self,
+        project: &ProjectId,
+        user: UserId,
+    ) -> Result<()> {
         flows::signup::request_email_verification(&self.inner, project, user).await
     }
 

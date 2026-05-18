@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_integration_tests::benchmark::{
     report_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,

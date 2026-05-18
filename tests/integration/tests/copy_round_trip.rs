@@ -239,9 +239,7 @@ async fn copy_rejects_unsupported_variants_without_desync() {
     // Note: column-list / file-path / DELIMITER / NULL / QUOTE / ESCAPE
     // variants are now SUPPORTED — they're covered in `copy_extensions.rs`
     // and `copy_extras.rs`. BINARY format is still rejected.
-    for sql in [
-        "COPY t FROM STDIN WITH (FORMAT BINARY)",
-    ] {
+    for sql in ["COPY t FROM STDIN WITH (FORMAT BINARY)"] {
         let err = client
             .simple_query(sql)
             .await

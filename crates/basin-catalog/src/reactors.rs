@@ -24,7 +24,7 @@
 use bitflags::bitflags;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use basin_common::{ChangeOp, TableName, ProjectId};
+use basin_common::{ChangeOp, ProjectId, TableName};
 
 bitflags! {
     /// Mutation ops a reactor matches. Bitset so the SQL surface's

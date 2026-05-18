@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

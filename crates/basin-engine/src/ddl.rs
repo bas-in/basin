@@ -1,7 +1,7 @@
 //! CREATE TABLE: sqlparser AST → Arrow [`Schema`].
 
-use std::collections::HashMap;
 use crate::pg_ast::ObjectNamePartExt;
+use std::collections::HashMap;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::{CheckConstraint, ForeignKeyDef, PartitionSpec, RefAction, UniqueConstraint};
@@ -16,13 +16,13 @@ use crate::types::{
     arrow_data_type, basin_type_marker, charlen_marker, is_cidr_sql, is_daterange_sql, is_inet_sql,
     is_int4range_sql, is_int8range_sql, is_macaddr8_sql, is_macaddr_sql, is_money_sql,
     is_numrange_sql, is_tsrange_sql, is_tstzrange_sql, is_xml_sql, serial_kind,
-    BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY, BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS,
-    BASIN_IDENTITY, BASIN_IDENTITY_ALWAYS, BASIN_IDENTITY_BY_DEFAULT, BASIN_IDENTITY_SEQ,
-    BASIN_SOFT_DELETE_KEY, BASIN_TYPE_CIDR, BASIN_TYPE_DATERANGE, BASIN_TYPE_INET,
-    BASIN_TYPE_INT4RANGE, BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY,
+    BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY, BASIN_CHARLEN_KEY, BASIN_COLUMN_DEFAULT,
+    BASIN_GENERATED_AS, BASIN_IDENTITY, BASIN_IDENTITY_ALWAYS, BASIN_IDENTITY_BY_DEFAULT,
+    BASIN_IDENTITY_SEQ, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_CIDR, BASIN_TYPE_DATERANGE,
+    BASIN_TYPE_INET, BASIN_TYPE_INT4RANGE, BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY,
     BASIN_TYPE_MACADDR, BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE,
     BASIN_TYPE_TSQUERY, BASIN_TYPE_TSRANGE, BASIN_TYPE_TSTZRANGE, BASIN_TYPE_TSVECTOR,
-    BASIN_TYPE_UUID, BASIN_TYPE_XML, BASIN_CHARLEN_KEY,
+    BASIN_TYPE_UUID, BASIN_TYPE_XML,
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -657,9 +657,7 @@ pub(crate) fn schema_and_constraints_from_columns(
                     .map(crate::pg_ast::index_column_name)
                     .collect();
             }
-            TableConstraint::Unique(sqlparser::ast::UniqueConstraint {
-                name, columns, ..
-            }) => {
+            TableConstraint::Unique(sqlparser::ast::UniqueConstraint { name, columns, .. }) => {
                 if columns.is_empty() {
                     return Err(BasinError::InvalidSchema(
                         "UNIQUE: column list cannot be empty".into(),

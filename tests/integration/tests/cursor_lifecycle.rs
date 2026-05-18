@@ -107,7 +107,11 @@ async fn cursor_declare_fetch_close() {
     // ---- FETCH ALL ----
     let res = sess.execute("FETCH ALL FROM c").await.unwrap();
     // 20 total rows, 6 consumed above → 14 remaining.
-    assert_eq!(row_count(&res), 14, "FETCH ALL should return remaining 14 rows");
+    assert_eq!(
+        row_count(&res),
+        14,
+        "FETCH ALL should return remaining 14 rows"
+    );
 
     // ---- CLOSE ----
     let res = sess.execute("CLOSE c").await.unwrap();
@@ -209,7 +213,9 @@ async fn cursor_scroll_keyword_accepted() {
     sess.execute("CREATE TABLE t2 (x BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO t2 VALUES (1),(2),(3)").await.unwrap();
+    sess.execute("INSERT INTO t2 VALUES (1),(2),(3)")
+        .await
+        .unwrap();
 
     // SCROLL keyword must be accepted without error.
     let res = sess

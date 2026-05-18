@@ -54,7 +54,9 @@ async fn setup(dir: &TempDir, ddl: &str) -> basin_engine::ProjectSession {
     let engine = make_engine(dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     assert_empty(
-        sess.execute(ddl).await.unwrap_or_else(|e| panic!("setup failed: {e}")),
+        sess.execute(ddl)
+            .await
+            .unwrap_or_else(|e| panic!("setup failed: {e}")),
         "CREATE TABLE",
     );
     sess
@@ -159,7 +161,11 @@ async fn using_hash_accepted() {
 #[tokio::test]
 async fn multi_column_index_accepted() {
     let dir = TempDir::new().unwrap();
-    let sess = setup(&dir, "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c TEXT)").await;
+    let sess = setup(
+        &dir,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c TEXT)",
+    )
+    .await;
 
     let res = sess
         .execute("CREATE INDEX idx ON t (a, b, c)")

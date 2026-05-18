@@ -30,11 +30,11 @@
 //! and cached for the process lifetime via `OnceLock` so a query never
 //! pays a getenv on the hot path.
 
-use std::sync::OnceLock;
 use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+use std::sync::OnceLock;
 
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use sqlparser::ast::{Statement, TableFactor};
 
 /// Process-wide cost cap. `None` = unbounded; `Some(n)` = reject queries

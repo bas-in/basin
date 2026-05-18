@@ -87,7 +87,11 @@ impl HttpClient {
 
     /// `http_get(url)` — synchronous GET. Mirrors the Postgres `http`
     /// extension's signature.
-    pub async fn http_get(&self, project: &ProjectId, url: &str) -> Result<HttpResponse, HttpError> {
+    pub async fn http_get(
+        &self,
+        project: &ProjectId,
+        url: &str,
+    ) -> Result<HttpResponse, HttpError> {
         self.send(project, &HttpRequest::get(url)).await
     }
 

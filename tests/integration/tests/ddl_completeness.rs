@@ -95,9 +95,7 @@ fn fdw_create_kinds() {
         StmtKind::CreateForeignTable
     );
     assert_eq!(
-        first_kind(
-            "IMPORT FOREIGN SCHEMA remote_schema FROM SERVER myserver INTO public"
-        ),
+        first_kind("IMPORT FOREIGN SCHEMA remote_schema FROM SERVER myserver INTO public"),
         StmtKind::ImportForeignSchema
     );
 }
@@ -108,7 +106,10 @@ fn fdw_drop_kinds() {
         first_kind("DROP FOREIGN DATA WRAPPER myfdw"),
         StmtKind::DropFdw
     );
-    assert_eq!(first_kind("DROP SERVER myserver"), StmtKind::DropForeignServer);
+    assert_eq!(
+        first_kind("DROP SERVER myserver"),
+        StmtKind::DropForeignServer
+    );
     assert_eq!(
         first_kind("DROP USER MAPPING FOR alice SERVER myserver"),
         StmtKind::DropUserMapping
@@ -125,18 +126,13 @@ fn ownership_kinds() {
         first_kind("REASSIGN OWNED BY old_role TO new_role"),
         StmtKind::ReassignOwned
     );
-    assert_eq!(
-        first_kind("DROP OWNED BY old_role"),
-        StmtKind::DropOwned
-    );
+    assert_eq!(first_kind("DROP OWNED BY old_role"), StmtKind::DropOwned);
 }
 
 #[test]
 fn default_privileges_kind() {
     assert_eq!(
-        first_kind(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE alice GRANT SELECT ON TABLES TO bob"
-        ),
+        first_kind("ALTER DEFAULT PRIVILEGES FOR ROLE alice GRANT SELECT ON TABLES TO bob"),
         StmtKind::AlterDefaultPrivileges
     );
 }
@@ -256,11 +252,7 @@ async fn security_label_accepted() {
     let engine = engine_in(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    assert_noop(
-        &sess,
-        "SECURITY LABEL FOR myapp ON TABLE t IS 'sensitive'",
-    )
-    .await;
+    assert_noop(&sess, "SECURITY LABEL FOR myapp ON TABLE t IS 'sensitive'").await;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

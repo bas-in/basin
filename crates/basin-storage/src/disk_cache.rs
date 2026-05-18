@@ -732,7 +732,10 @@ impl ObjectStore for DiskCachedStore {
         self.inner.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let inner = self.inner.clone();
         let prefix = prefix.cloned();
         inner.list(prefix.as_ref())

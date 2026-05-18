@@ -39,8 +39,8 @@
 //!   so a plan upgrade propagates within the TTL.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use basin_common::ProjectId;
@@ -158,12 +158,8 @@ impl LiveCounts {
             }
             // Attempt to increment `current` → `current + 1`. If another
             // thread beat us, compare_exchange returns Err and we retry.
-            match counter.compare_exchange(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match counter.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => return Ok(ConnectionGuard { counter, project }),
                 Err(_) => continue,
             }
@@ -196,11 +192,11 @@ impl std::fmt::Debug for ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         // Saturating so a double-drop (logic error) doesn't wrap to u32::MAX.
-        let _ = self.counter.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_sub(1))
+            });
         tracing::trace!(
             project = %self.project,
             "pgwire connection closed; live count decremented",

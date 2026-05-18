@@ -1,3 +1,8 @@
 [build]
-rustc-wrapper = "sccache"
+# NOTE: do NOT set rustc-wrapper = "sccache" here. sccache was deliberately
+# reverted (see .github/workflows/ci.yml) — the GHA cache backend 400s
+# intermittently and, because rustc-wrapper propagates to every rustc
+# invocation, a missing/degraded sccache fails every build/clippy/test
+# step. CI relies on Swatinem/rust-cache instead. Set RUSTC_WRAPPER in
+# your local env if you want sccache for dev builds.
 incremental = false

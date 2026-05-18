@@ -63,11 +63,11 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
-use datafusion::arrow::array::{
-    Array, ArrayRef, Date32Array, Date32Builder, IntervalMonthDayNanoArray,
-    StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
-};
 use datafusion::arrow::array::types::IntervalMonthDayNano;
+use datafusion::arrow::array::{
+    Array, ArrayRef, Date32Array, Date32Builder, IntervalMonthDayNanoArray, StringArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
@@ -227,10 +227,7 @@ fn row_to_naive(arr: &ArrayRef, i: usize) -> DFResult<Option<NaiveDateTime>> {
             let v = a.value(i);
             let secs = v.div_euclid(1_000_000_000);
             let ns = v.rem_euclid(1_000_000_000) as u32;
-            Ok(Utc
-                .timestamp_opt(secs, ns)
-                .single()
-                .map(|d| d.naive_utc()))
+            Ok(Utc.timestamp_opt(secs, ns).single().map(|d| d.naive_utc()))
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
             use datafusion::arrow::array::TimestampMillisecondArray;
@@ -248,15 +245,9 @@ fn row_to_naive(arr: &ArrayRef, i: usize) -> DFResult<Option<NaiveDateTime>> {
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
             use datafusion::arrow::array::TimestampSecondArray;
-            let a = arr
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
+            let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
             let v = a.value(i);
-            Ok(Utc
-                .timestamp_opt(v, 0)
-                .single()
-                .map(|d| d.naive_utc()))
+            Ok(Utc.timestamp_opt(v, 0).single().map(|d| d.naive_utc()))
         }
         DataType::Date32 => {
             let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
@@ -301,10 +292,7 @@ fn row_to_micros(arr: &ArrayRef, i: usize) -> DFResult<Option<i64>> {
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
             use datafusion::arrow::array::TimestampSecondArray;
-            let a = arr
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
+            let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
             Ok(Some(a.value(i) * 1_000_000))
         }
         DataType::Date32 => {
@@ -343,10 +331,7 @@ fn interval_arg_to_micros(args: &[ColumnarValue], idx: usize, n: usize) -> DFRes
         }
         DataType::Interval(IntervalUnit::DayTime) => {
             use datafusion::arrow::array::IntervalDayTimeArray;
-            let a = arr
-                .as_any()
-                .downcast_ref::<IntervalDayTimeArray>()
-                .unwrap();
+            let a = arr.as_any().downcast_ref::<IntervalDayTimeArray>().unwrap();
             if a.is_null(0) {
                 return exec_err!("date_bin: stride must not be null");
             }
@@ -487,9 +472,15 @@ struct AgeMoreUdf {
 }
 
 impl ScalarUDFImpl for AgeMoreUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "age" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "age"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Interval(IntervalUnit::MonthDayNano))
     }
@@ -608,10 +599,18 @@ struct ToCharMoreUdf {
 }
 
 impl ScalarUDFImpl for ToCharMoreUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "to_char" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_char"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
@@ -624,9 +623,7 @@ impl ScalarUDFImpl for ToCharMoreUdf {
         let fmts = fmt_arr
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution(
-                "to_char: arg 2 must be text".into(),
-            ))?;
+            .ok_or_else(|| DataFusionError::Execution("to_char: arg 2 must be text".into()))?;
 
         let is_numeric = matches!(
             val_arr.data_type(),
@@ -643,16 +640,16 @@ impl ScalarUDFImpl for ToCharMoreUdf {
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         if is_numeric {
             // Numeric picture: cast to f64, format with basic 9/0 picture.
-            use datafusion::arrow::compute::cast;
             use datafusion::arrow::array::Float64Array;
+            use datafusion::arrow::compute::cast;
             let f64_arr = cast(&val_arr, &DataType::Float64)
                 .map_err(|e| DataFusionError::Execution(format!("to_char(numeric): {e}")))?;
             let f64_arr = f64_arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DataFusionError::Execution(
-                    "to_char(numeric): cast to f64 failed".into(),
-                ))?;
+                .ok_or_else(|| {
+                    DataFusionError::Execution("to_char(numeric): cast to f64 failed".into())
+                })?;
             for i in 0..n {
                 if f64_arr.is_null(i) || fmts.is_null(i) {
                     out.push(None);
@@ -707,7 +704,10 @@ fn format_numeric_pg(picture: &str, v: f64) -> DFResult<String> {
     let result = if fill_mode {
         // Strip trailing zeros after decimal point.
         if formatted.contains('.') {
-            formatted.trim_end_matches('0').trim_end_matches('.').to_string()
+            formatted
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
         } else {
             formatted
         }
@@ -727,10 +727,18 @@ struct ToDateMoreUdf {
 }
 
 impl ScalarUDFImpl for ToDateMoreUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "to_date" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Date32) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_date"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Date32)
+    }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
@@ -759,15 +767,16 @@ impl ScalarUDFImpl for ToDateMoreUdf {
             let chrono_fmt = pg_fmt_to_chrono(fmts.value(i));
             let date = NaiveDate::parse_from_str(txts.value(i), &chrono_fmt)
                 .or_else(|_| {
-                    NaiveDateTime::parse_from_str(txts.value(i), &chrono_fmt)
-                        .map(|dt| dt.date())
+                    NaiveDateTime::parse_from_str(txts.value(i), &chrono_fmt).map(|dt| dt.date())
                 })
-                .map_err(|e| DataFusionError::Execution(format!(
-                    "to_date: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
-                    txts.value(i),
-                    fmts.value(i),
-                    chrono_fmt,
-                )))?;
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "to_date: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
+                        txts.value(i),
+                        fmts.value(i),
+                        chrono_fmt,
+                    ))
+                })?;
             let days = (date - epoch).num_days() as i32;
             out.append_value(days);
         }
@@ -785,9 +794,15 @@ struct ToTimestampMoreUdf {
 }
 
 impl ScalarUDFImpl for ToTimestampMoreUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "to_timestamp" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_timestamp"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
     }
@@ -821,12 +836,14 @@ impl ScalarUDFImpl for ToTimestampMoreUdf {
                     NaiveDate::parse_from_str(txts.value(i), &chrono_fmt)
                         .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
                 })
-                .map_err(|e| DataFusionError::Execution(format!(
-                    "to_timestamp: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
-                    txts.value(i),
-                    fmts.value(i),
-                    chrono_fmt,
-                )))?;
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "to_timestamp: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
+                        txts.value(i),
+                        fmts.value(i),
+                        chrono_fmt,
+                    ))
+                })?;
             out.push(Utc.from_utc_datetime(&dt).timestamp_nanos_opt());
         }
         Ok(ColumnarValue::Array(Arc::new(
@@ -859,9 +876,15 @@ struct DateBinMoreUdf {
 }
 
 impl ScalarUDFImpl for DateBinMoreUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "date_bin" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "date_bin"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
     }
@@ -924,11 +947,20 @@ struct ClockTimestampUdf {
 }
 
 impl ScalarUDFImpl for ClockTimestampUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "clock_timestamp" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "clock_timestamp"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+        Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -936,11 +968,10 @@ impl ScalarUDFImpl for ClockTimestampUdf {
         let n = num_rows(args);
         // Capture a fresh now() on every UDF invocation — that is clock semantics.
         let now_us = Utc::now().timestamp_micros();
-        let mut b = datafusion::arrow::array::TimestampMicrosecondBuilder::with_capacity(n)
-            .with_data_type(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ));
+        let mut b =
+            datafusion::arrow::array::TimestampMicrosecondBuilder::with_capacity(n).with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            );
         for _ in 0..n {
             b.append_value(now_us);
         }
@@ -984,11 +1015,20 @@ impl std::hash::Hash for StmtTimestampUdf {
 }
 
 impl ScalarUDFImpl for StmtTimestampUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "statement_timestamp" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "statement_timestamp"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+        Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -996,11 +1036,10 @@ impl ScalarUDFImpl for StmtTimestampUdf {
         let n = num_rows(args);
         let ts = self.dt.statement_ts.lock().expect("statement_ts poisoned");
         let us = ts.unwrap_or_else(|| Utc::now().timestamp_micros());
-        let mut b = datafusion::arrow::array::TimestampMicrosecondBuilder::with_capacity(n)
-            .with_data_type(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ));
+        let mut b =
+            datafusion::arrow::array::TimestampMicrosecondBuilder::with_capacity(n).with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            );
         for _ in 0..n {
             b.append_value(us);
         }
@@ -1041,11 +1080,20 @@ impl std::hash::Hash for TxnTimestampUdf {
 }
 
 impl ScalarUDFImpl for TxnTimestampUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "transaction_timestamp" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "transaction_timestamp"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+        Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1057,11 +1105,10 @@ impl ScalarUDFImpl for TxnTimestampUdf {
         let us = txn
             .or(stmt)
             .unwrap_or_else(|| Utc::now().timestamp_micros());
-        let mut b = datafusion::arrow::array::TimestampMicrosecondBuilder::with_capacity(n)
-            .with_data_type(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ));
+        let mut b =
+            datafusion::arrow::array::TimestampMicrosecondBuilder::with_capacity(n).with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            );
         for _ in 0..n {
             b.append_value(us);
         }
@@ -1202,11 +1249,7 @@ mod tests {
             .expect("statement_ts should be set");
 
         tick_txn_ts(&dt);
-        let txn_ts1 = dt
-            .txn_ts
-            .lock()
-            .unwrap()
-            .expect("txn_ts should be set");
+        let txn_ts1 = dt.txn_ts.lock().unwrap().expect("txn_ts should be set");
 
         // txn_ts is idempotent (second call should not change it).
         tick_txn_ts(&dt);
@@ -1219,7 +1262,10 @@ mod tests {
 
         // txn_ts is captured <= stmt_ts (both set in rapid succession above,
         // so this just checks they were set).
-        assert!(txn_ts1 <= stmt_ts1 + 1_000_000, "timestamps should be within 1s");
+        assert!(
+            txn_ts1 <= stmt_ts1 + 1_000_000,
+            "timestamps should be within 1s"
+        );
 
         clear_txn_ts(&dt);
         let txn_after_clear = *dt.txn_ts.lock().unwrap();

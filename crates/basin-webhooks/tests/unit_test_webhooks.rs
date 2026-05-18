@@ -14,7 +14,7 @@ mod common;
 
 use std::sync::Arc;
 
-use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, ProjectId};
+use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, ProjectId, TableName};
 use basin_net::HttpClient;
 use basin_webhooks::{
     AttemptOutcome, RetryQueue, TestClock, WebhookConfig, WebhookOps, WebhookRegistry, WebhookSink,
@@ -119,7 +119,13 @@ async fn webhook_subscription_routes_event() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        4,
+    );
     let id = stack.registry.add(s).await.unwrap();
 
     let ev = evt(project, "orders", ChangeOp::Insert, 1);
@@ -162,7 +168,13 @@ async fn webhook_idempotency_key_dedupes_after_retry() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        4,
+    );
     stack.registry.add(s).await.unwrap();
 
     let ev = evt(project, "orders", ChangeOp::Insert, 7);
@@ -198,7 +210,13 @@ async fn webhook_dead_letter_after_max_retries() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 2);
+    let s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        2,
+    );
     let id = stack.registry.add(s).await.unwrap();
 
     let ev = evt(project, "orders", ChangeOp::Insert, 11);
@@ -278,7 +296,13 @@ async fn webhook_pause_skip_delivery() {
     net.allow_host(&project, "127.0.0.1").await;
 
     let stack = build_stack(net).await;
-    let mut s = sub(project, "orders", server.url("/hook"), WebhookOps::INSERT, 4);
+    let mut s = sub(
+        project,
+        "orders",
+        server.url("/hook"),
+        WebhookOps::INSERT,
+        4,
+    );
     s.paused = true;
     let _id = stack.registry.add(s).await.unwrap();
 

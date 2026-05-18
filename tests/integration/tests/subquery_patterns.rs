@@ -245,7 +245,11 @@ async fn subq_row_constructor_in() {
             // No row in orders has (id, amount) == any (order_id, price) in items
             // since amounts are 100-500 and prices are 50-90.
             let ids = i64_col(res, "id");
-            assert_eq!(ids, Vec::<i64>::new(), "expected no matching rows for row-constructor IN");
+            assert_eq!(
+                ids,
+                Vec::<i64>::new(),
+                "expected no matching rows for row-constructor IN"
+            );
             println!("✅ subq_row_constructor_in: works, 0 rows matched");
         }
         Err(e) => {
@@ -334,8 +338,10 @@ async fn subq_all_greater_eq() {
         Err(e) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("AllOp") || msg.contains("not supported") || msg.contains("plan:")
-                || msg.contains("Unsupported"),
+                msg.contains("AllOp")
+                    || msg.contains("not supported")
+                    || msg.contains("plan:")
+                    || msg.contains("Unsupported"),
                 "unexpected error message: {msg}"
             );
             println!("🛠 subq_all_greater_eq: {msg}");

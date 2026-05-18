@@ -12,7 +12,7 @@
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::DataType;
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use basin_vector::{Distance, HnswIndex, HnswIndexBuilder};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -301,7 +301,7 @@ mod tests {
     use arrow_array::types::Float32Type;
     use arrow_array::{FixedSizeListArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{PartitionKey, TableName, ProjectId};
+    use basin_common::{PartitionKey, ProjectId, TableName};
     use basin_vector::Distance;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;

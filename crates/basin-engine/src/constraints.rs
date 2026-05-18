@@ -34,7 +34,7 @@ use arrow_schema::{DataType, Schema};
 use basin_catalog::{
     Catalog, CheckConstraint, ForeignKeyDef, RefAction, TableMetadata, UniqueConstraint,
 };
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;

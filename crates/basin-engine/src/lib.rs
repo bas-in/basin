@@ -46,8 +46,8 @@ use std::sync::{Mutex, RwLock};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use basin_common::{
-    ChangeEventSink, EventSinkRegistry, Result, TableName, ProjectCounterRegistry,
-    ProjectCountersSnapshot, ProjectId,
+    ChangeEventSink, EventSinkRegistry, ProjectCounterRegistry, ProjectCountersSnapshot, ProjectId,
+    Result, TableName,
 };
 use uuid::Uuid;
 
@@ -143,13 +143,16 @@ impl Engine {
         let project_counters = Arc::new(ProjectCounterRegistry::new());
         // Share the registry with storage (and the shard's WAL when present)
         // so per-project byte counters cover engine + storage + WAL.
-        cfg.storage.attach_project_counters(project_counters.clone());
+        cfg.storage
+            .attach_project_counters(project_counters.clone());
         // Hand storage the catalog handle so the encryption call path can
         // look up per-project `ProjectStorageConfig` and route to the
         // project's CMK without owning a registry of its own.
         cfg.storage.attach_catalog(cfg.catalog.clone());
         if let Some(shard) = cfg.shard.as_ref() {
-            shard.wal().attach_project_counters(project_counters.clone());
+            shard
+                .wal()
+                .attach_project_counters(project_counters.clone());
         }
         let mut registry = EventSinkRegistry::new();
         // Opt-in debug helper: with `BASIN_TRACE_CHANGE_EVENTS=1` every
@@ -554,10 +557,6 @@ pub enum ExecResult {
 
 mod advisory_lock;
 mod alter;
-pub mod noop_accept;
-pub mod pg_ast;
-pub mod pg_plan;
-mod truncate;
 mod constraints;
 mod convert;
 mod cost_check;
@@ -583,19 +582,25 @@ mod index_extras;
 mod inet_udf;
 mod info_schema_provider;
 mod interval_tz_udf;
+mod json_build_udf;
+mod jsonb_modify_udf;
+mod jsonb_path_udf;
 mod jsonb_udf;
 mod lifecycle;
 mod net_glue;
 mod noisy_detector;
+pub mod noop_accept;
 mod pg_agg_udf;
+pub mod pg_ast;
 mod pg_catalog_udf;
 mod pg_operators;
+pub mod pg_plan;
 mod pg_scalar_aliases;
 mod prepared;
 mod procedure_ddl;
+mod range_udf;
 pub mod reactor_ddl;
 mod reactor_sink;
-mod range_udf;
 mod regex_udf;
 mod rls;
 mod schema_ddl;
@@ -606,19 +611,17 @@ mod session;
 mod sql_functions;
 mod string_dt_udf;
 mod string_more_udf;
-mod json_build_udf;
-mod jsonb_modify_udf;
-mod jsonb_path_udf;
 mod trgm_glue;
+mod truncate;
 mod type_ddl;
 mod types;
 mod udf;
 mod vector_planner;
 mod vector_search;
 mod view_ddl;
-mod window_extras;
 pub mod webhook_ddl;
 pub mod webhook_registry;
+mod window_extras;
 
 pub use webhook_ddl::{
     exec_subscribe_webhook, exec_unsubscribe_webhook, match_alter_table_subscribe_webhook,
@@ -2015,7 +2018,9 @@ mod tests {
         );
 
         // Confirm the table exists by inserting and selecting.
-        sess.execute("INSERT INTO new_tbl VALUES (1)").await.unwrap();
+        sess.execute("INSERT INTO new_tbl VALUES (1)")
+            .await
+            .unwrap();
         let rows = sess.execute("SELECT id FROM new_tbl").await.unwrap();
         if let ExecResult::Rows { batches, .. } = rows {
             let vals = col_i64(&batches, "id");
@@ -2054,13 +2059,14 @@ mod tests {
         );
 
         // Existing data must be intact — the no-op must not truncate the table.
-        let rows = sess
-            .execute("SELECT id FROM existing_t")
-            .await
-            .unwrap();
+        let rows = sess.execute("SELECT id FROM existing_t").await.unwrap();
         if let ExecResult::Rows { batches, .. } = rows {
             let vals = col_i64(&batches, "id");
-            assert_eq!(vals, vec![99], "existing row must survive IF NOT EXISTS no-op");
+            assert_eq!(
+                vals,
+                vec![99],
+                "existing row must survive IF NOT EXISTS no-op"
+            );
         } else {
             panic!("expected rows");
         }
@@ -2288,20 +2294,16 @@ mod tests {
     /// Helper: create table `t(id BIGINT PK, v BIGINT)` with rows {1,2,3}
     /// and table `u(id BIGINT)` with row {2}.
     async fn seed_correlated_tables(sess: &ProjectSession) {
-        sess.execute(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        )
-        .await
-        .unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+            .await
+            .unwrap();
         sess.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
             .await
             .unwrap();
         sess.execute("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY)")
             .await
             .unwrap();
-        sess.execute("INSERT INTO u VALUES (2)")
-            .await
-            .unwrap();
+        sess.execute("INSERT INTO u VALUES (2)").await.unwrap();
     }
 
     /// `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)`
@@ -2314,23 +2316,17 @@ mod tests {
         seed_correlated_tables(&sess).await;
 
         let res = sess
-            .execute(
-                "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
-            )
+            .execute("DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)")
             .await
             .unwrap();
         match res {
-            ExecResult::Empty { tag } => assert!(
-                tag.starts_with("DELETE 2"),
-                "expected DELETE 2, got {tag}"
-            ),
+            ExecResult::Empty { tag } => {
+                assert!(tag.starts_with("DELETE 2"), "expected DELETE 2, got {tag}")
+            }
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess
-            .execute("SELECT id FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
                 assert_eq!(
@@ -2353,23 +2349,17 @@ mod tests {
         seed_correlated_tables(&sess).await;
 
         let res = sess
-            .execute(
-                "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
-            )
+            .execute("DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)")
             .await
             .unwrap();
         match res {
-            ExecResult::Empty { tag } => assert!(
-                tag.starts_with("DELETE 1"),
-                "expected DELETE 1, got {tag}"
-            ),
+            ExecResult::Empty { tag } => {
+                assert!(tag.starts_with("DELETE 1"), "expected DELETE 1, got {tag}")
+            }
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess
-            .execute("SELECT id FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
                 assert_eq!(
@@ -2389,11 +2379,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
-        sess.execute(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        )
-        .await
-        .unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+            .await
+            .unwrap();
         sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
             .await
             .unwrap();
@@ -2403,16 +2391,13 @@ mod tests {
         // u is empty
 
         let res = sess
-            .execute(
-                "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
-            )
+            .execute("DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)")
             .await
             .unwrap();
         match res {
-            ExecResult::Empty { tag } => assert!(
-                tag.starts_with("DELETE 2"),
-                "expected DELETE 2, got {tag}"
-            ),
+            ExecResult::Empty { tag } => {
+                assert!(tag.starts_with("DELETE 2"), "expected DELETE 2, got {tag}")
+            }
             other => panic!("unexpected: {other:?}"),
         }
 
@@ -2433,11 +2418,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
-        sess.execute(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        )
-        .await
-        .unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+            .await
+            .unwrap();
         sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
             .await
             .unwrap();
@@ -2446,23 +2429,17 @@ mod tests {
             .unwrap();
 
         let res = sess
-            .execute(
-                "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
-            )
+            .execute("DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)")
             .await
             .unwrap();
         match res {
-            ExecResult::Empty { tag } => assert!(
-                tag.starts_with("DELETE 0"),
-                "expected DELETE 0, got {tag}"
-            ),
+            ExecResult::Empty { tag } => {
+                assert!(tag.starts_with("DELETE 0"), "expected DELETE 0, got {tag}")
+            }
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess
-            .execute("SELECT id FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
                 assert_eq!(col_i64(&batches, "id"), vec![1, 2]);
@@ -2481,16 +2458,13 @@ mod tests {
         seed_correlated_tables(&sess).await;
 
         let res = sess
-            .execute(
-                "UPDATE t SET v = v + 1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
-            )
+            .execute("UPDATE t SET v = v + 1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id)")
             .await
             .unwrap();
         match res {
-            ExecResult::Empty { tag } => assert!(
-                tag.starts_with("UPDATE 2"),
-                "expected UPDATE 2, got {tag}"
-            ),
+            ExecResult::Empty { tag } => {
+                assert!(tag.starts_with("UPDATE 2"), "expected UPDATE 2, got {tag}")
+            }
             other => panic!("unexpected: {other:?}"),
         }
 
@@ -2526,17 +2500,13 @@ mod tests {
             .await
             .unwrap();
         match res {
-            ExecResult::Empty { tag } => assert!(
-                tag.starts_with("DELETE 1"),
-                "expected DELETE 1, got {tag}"
-            ),
+            ExecResult::Empty { tag } => {
+                assert!(tag.starts_with("DELETE 1"), "expected DELETE 1, got {tag}")
+            }
             other => panic!("unexpected: {other:?}"),
         }
 
-        let res = sess
-            .execute("SELECT id FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let res = sess.execute("SELECT id FROM t ORDER BY id").await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
                 assert_eq!(col_i64(&batches, "id"), vec![1, 3]);
@@ -2559,7 +2529,9 @@ mod tests {
             .unwrap();
 
         let res = sess
-            .execute("WITH ins AS (INSERT INTO t VALUES (1, 'hello') RETURNING id) SELECT id FROM ins")
+            .execute(
+                "WITH ins AS (INSERT INTO t VALUES (1, 'hello') RETURNING id) SELECT id FROM ins",
+            )
             .await
             .unwrap();
         match res {
@@ -2690,9 +2662,15 @@ mod tests {
         let eng = engine_in(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
         // Two tables: src (insert target) and dst (we'll delete from it using src).
-        sess.execute("CREATE TABLE src (id BIGINT NOT NULL)").await.unwrap();
-        sess.execute("CREATE TABLE dst (id BIGINT NOT NULL)").await.unwrap();
-        sess.execute("INSERT INTO dst VALUES (10), (20), (30)").await.unwrap();
+        sess.execute("CREATE TABLE src (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("CREATE TABLE dst (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO dst VALUES (10), (20), (30)")
+            .await
+            .unwrap();
 
         // Insert 10 into src, then delete from dst WHERE id IN (SELECT id FROM src's result).
         // After execution: src has {10}, dst has {20, 30}, b has {10}.
@@ -2700,7 +2678,7 @@ mod tests {
             .execute(
                 "WITH a AS (INSERT INTO src VALUES (10) RETURNING id), \
                  b AS (DELETE FROM dst WHERE id IN (SELECT id FROM a) RETURNING id) \
-                 SELECT id FROM b"
+                 SELECT id FROM b",
             )
             .await
             .unwrap();
@@ -2712,7 +2690,10 @@ mod tests {
         }
 
         // dst should no longer contain 10.
-        let res = sess.execute("SELECT id FROM dst ORDER BY id").await.unwrap();
+        let res = sess
+            .execute("SELECT id FROM dst ORDER BY id")
+            .await
+            .unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
                 assert_eq!(col_i64(&batches, "id"), vec![20, 30]);

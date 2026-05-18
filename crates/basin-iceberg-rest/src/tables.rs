@@ -23,12 +23,12 @@ use axum::extract::{Path, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use basin_catalog::{DataFileRef, TableMetadata as BasinTableMetadata};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 
 use crate::auth;
 use crate::error::IcebergRestError;
 use crate::models::{
-    arrow_to_iceberg_type, iceberg_schema_to_arrow, synthesise_table_uuid, project_to_namespace,
+    arrow_to_iceberg_type, iceberg_schema_to_arrow, project_to_namespace, synthesise_table_uuid,
     CommitRequirement, CommitTableRequest, CommitUpdate, CreateTableRequest, IcebergPartitionSpec,
     IcebergSchema, IcebergSchemaField, IcebergSnapshot, IcebergSnapshotRef, IcebergSortOrder,
     IcebergTableMetadata, ListTablesResponse, LoadTableResponse, RegisterTableRequest,
@@ -514,7 +514,10 @@ pub(crate) fn translate_table_metadata(
     state: &State,
     meta: &BasinTableMetadata,
 ) -> LoadTableResponse {
-    let location = format!("{}{}/{}/", state.cfg.base_location, meta.project, meta.table);
+    let location = format!(
+        "{}{}/{}/",
+        state.cfg.base_location, meta.project, meta.table
+    );
 
     let fields: Vec<IcebergSchemaField> = meta
         .schema

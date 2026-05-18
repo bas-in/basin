@@ -21,7 +21,7 @@
 //! The sha256 lookup hash is still computed from the full key string.
 
 use base64::Engine;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use sha2::{Digest, Sha256};

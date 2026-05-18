@@ -232,7 +232,7 @@ fn op_text(op: basin_common::ChangeOp) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use basin_common::{ChangeOp, TableName, ProjectId};
+    use basin_common::{ChangeOp, ProjectId, TableName};
     use chrono::Utc;
     use serde_json::json;
 

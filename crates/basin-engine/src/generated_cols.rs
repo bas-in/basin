@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::DataType;
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 

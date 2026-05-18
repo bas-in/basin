@@ -163,7 +163,8 @@ mod tests {
         // must still pass on the very first call. The limiter is keyed
         // per-ProjectId; one project burning their quota cannot starve
         // another.
-        rl.check(&b).expect("project B starved by project A's burst");
+        rl.check(&b)
+            .expect("project B starved by project A's burst");
     }
 
     #[test]

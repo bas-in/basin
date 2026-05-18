@@ -10,7 +10,7 @@
 //!
 //! Format is internal to this crate. Callers see [`crate::WalEntry`] only.
 
-use basin_common::{BasinError, PartitionKey, Result, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

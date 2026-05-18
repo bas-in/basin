@@ -30,12 +30,13 @@ use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, LargeBinaryArray, StringArray,
 };
 use datafusion::arrow::datatypes::DataType;
+use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
-use datafusion::catalog::TableFunctionImpl;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -95,10 +96,7 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
     // stored JSONB columns (LargeBinary). We do runtime type dispatch inside.
     ctx.register_udf(ScalarUDF::from(JsonbSetUdf {
         signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(3),
-                TypeSignature::Any(4),
-            ],
+            vec![TypeSignature::Any(3), TypeSignature::Any(4)],
             Volatility::Immutable,
         ),
     }));
@@ -106,10 +104,7 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
     // jsonb_insert(target, path, new_value [, insert_after bool]) -> jsonb
     ctx.register_udf(ScalarUDF::from(JsonbInsertUdf {
         signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(3),
-                TypeSignature::Any(4),
-            ],
+            vec![TypeSignature::Any(3), TypeSignature::Any(4)],
             Volatility::Immutable,
         ),
     }));
@@ -253,10 +248,7 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
     // array_to_json(array [, pretty bool]) -> jsonb
     ctx.register_udf(ScalarUDF::from(ArrayToJsonUdf {
         signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(1),
-                TypeSignature::Any(2),
-            ],
+            vec![TypeSignature::Any(1), TypeSignature::Any(2)],
             Volatility::Immutable,
         ),
     }));
@@ -383,102 +375,52 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
 
     // json_get(jsonb, key_or_idx) -> jsonb   (rewrite target for ->)
     ctx.register_udf(ScalarUDF::from(JsonGetUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // json_get_text(jsonb, key_or_idx) -> text   (rewrite target for ->>)
     ctx.register_udf(ScalarUDF::from(JsonGetTextUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // json_path_extract(jsonb, path_array) -> jsonb   (rewrite target for #>)
     ctx.register_udf(ScalarUDF::from(JsonPathExtractUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // json_path_extract_text(jsonb, path_array) -> text   (rewrite target for #>>)
     ctx.register_udf(ScalarUDF::from(JsonPathExtractTextUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // jsonb_contains(jsonb, jsonb) -> bool   (rewrite target for jsonb @>)
     ctx.register_udf(ScalarUDF::from(JsonbContainsUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // jsonb_contained_by(jsonb, jsonb) -> bool   (rewrite target for <@)
     ctx.register_udf(ScalarUDF::from(JsonbContainedByUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // jsonb_has_key(jsonb, text) -> bool   (rewrite target for ?)
     ctx.register_udf(ScalarUDF::from(JsonbHasKeyUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // jsonb_has_all_keys(jsonb, text[]) -> bool   (rewrite target for ?&)
     ctx.register_udf(ScalarUDF::from(JsonbHasAllKeysUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // jsonb_has_any_key(jsonb, text[]) -> bool   (rewrite target for ?|)
     ctx.register_udf(ScalarUDF::from(JsonbHasAnyKeyUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // jsonb_concat(jsonb, jsonb) -> jsonb   (rewrite target for ||)
     ctx.register_udf(ScalarUDF::from(JsonbConcatUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
     }));
 
     // jsonb_delete_key(jsonb, text) -> jsonb   (rewrite target for jsonb - 'key')
@@ -534,17 +476,35 @@ pub(crate) fn register_jsonb_udfs(ctx: &SessionContext) {
 /// be called on every real [`SessionContext`] after it is built.
 pub(crate) fn register_jsonb_udtfs(ctx: &SessionContext) {
     ctx.register_udtf("jsonb_each", Arc::new(JsonbEachTf { text_values: false }));
-    ctx.register_udtf("jsonb_each_text", Arc::new(JsonbEachTf { text_values: true }));
-    ctx.register_udtf("jsonb_array_elements", Arc::new(JsonbArrayElementsTf { text_values: false }));
-    ctx.register_udtf("jsonb_array_elements_text", Arc::new(JsonbArrayElementsTf { text_values: true }));
+    ctx.register_udtf(
+        "jsonb_each_text",
+        Arc::new(JsonbEachTf { text_values: true }),
+    );
+    ctx.register_udtf(
+        "jsonb_array_elements",
+        Arc::new(JsonbArrayElementsTf { text_values: false }),
+    );
+    ctx.register_udtf(
+        "jsonb_array_elements_text",
+        Arc::new(JsonbArrayElementsTf { text_values: true }),
+    );
     ctx.register_udtf("jsonb_object_keys", Arc::new(JsonbObjectKeysTf {}));
     // `json`-prefixed aliases. PostgreSQL's `json_*` SRFs behave identically to
     // the `jsonb_*` ones for the row-expansion semantics we implement (Basin
     // stores both as canonical JSON text), so they reuse the same UDTFs.
     ctx.register_udtf("json_each", Arc::new(JsonbEachTf { text_values: false }));
-    ctx.register_udtf("json_each_text", Arc::new(JsonbEachTf { text_values: true }));
-    ctx.register_udtf("json_array_elements", Arc::new(JsonbArrayElementsTf { text_values: false }));
-    ctx.register_udtf("json_array_elements_text", Arc::new(JsonbArrayElementsTf { text_values: true }));
+    ctx.register_udtf(
+        "json_each_text",
+        Arc::new(JsonbEachTf { text_values: true }),
+    );
+    ctx.register_udtf(
+        "json_array_elements",
+        Arc::new(JsonbArrayElementsTf { text_values: false }),
+    );
+    ctx.register_udtf(
+        "json_array_elements_text",
+        Arc::new(JsonbArrayElementsTf { text_values: true }),
+    );
     ctx.register_udtf("json_object_keys", Arc::new(JsonbObjectKeysTf {}));
     // json_to_recordset / jsonb_to_recordset — table functions that expand a
     // JSON array of objects into rows.
@@ -566,16 +526,14 @@ fn jsonb_to_value(bytes: &[u8]) -> DFResult<Value> {
     } else {
         bytes
     };
-    serde_json::from_slice(payload).map_err(|e| {
-        DataFusionError::Execution(format!("jsonb decode error: {e}"))
-    })
+    serde_json::from_slice(payload)
+        .map_err(|e| DataFusionError::Execution(format!("jsonb decode error: {e}")))
 }
 
 /// Encode a serde_json Value to canonical JSONB bytes.
 fn value_to_jsonb(v: &Value) -> DFResult<Vec<u8>> {
-    serde_json::to_vec(v).map_err(|e| {
-        DataFusionError::Execution(format!("jsonb encode error: {e}"))
-    })
+    serde_json::to_vec(v)
+        .map_err(|e| DataFusionError::Execution(format!("jsonb encode error: {e}")))
 }
 
 /// Extract a `serde_json::Value` from a ColumnarValue row, handling both
@@ -583,9 +541,12 @@ fn value_to_jsonb(v: &Value) -> DFResult<Vec<u8>> {
 fn extract_jsonb_value(arr: &ArrayRef, i: usize, fn_name: &str) -> DFResult<Option<Value>> {
     match arr.data_type() {
         DataType::LargeBinary => {
-            let a = arr.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| {
-                DataFusionError::Execution(format!("{fn_name}: not a LargeBinaryArray"))
-            })?;
+            let a = arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a LargeBinaryArray"))
+                })?;
             if a.is_null(i) {
                 return Ok(None);
             }
@@ -691,7 +652,6 @@ fn strip_nulls(v: Value) -> Value {
     }
 }
 
-
 fn array_element_to_json(arr: &ArrayRef, i: usize) -> Value {
     if arr.is_null(i) {
         return Value::Null;
@@ -720,7 +680,8 @@ fn array_element_to_json(arr: &ArrayRef, i: usize) -> Value {
         }
         DataType::Int64 => {
             let a = arr.as_any().downcast_ref::<Int64Array>();
-            a.map(|a| Value::Number(a.value(i).into())).unwrap_or(Value::Null)
+            a.map(|a| Value::Number(a.value(i).into()))
+                .unwrap_or(Value::Null)
         }
         _ => {
             // Fallback: use Debug representation as a string
@@ -739,10 +700,18 @@ struct JsonbTypeofUdf {
 }
 
 impl ScalarUDFImpl for JsonbTypeofUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_typeof" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_typeof"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -784,10 +753,18 @@ struct JsonbPrettyUdf {
 }
 
 impl ScalarUDFImpl for JsonbPrettyUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_pretty" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_pretty"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -802,9 +779,8 @@ impl ScalarUDFImpl for JsonbPrettyUdf {
             match extract_jsonb_value(&arr, i, "jsonb_pretty")? {
                 None => out.push(None),
                 Some(v) => {
-                    let pretty = serde_json::to_string_pretty(&v).map_err(|e| {
-                        DataFusionError::Execution(format!("jsonb_pretty: {e}"))
-                    })?;
+                    let pretty = serde_json::to_string_pretty(&v)
+                        .map_err(|e| DataFusionError::Execution(format!("jsonb_pretty: {e}")))?;
                     out.push(Some(pretty));
                 }
             }
@@ -824,10 +800,18 @@ struct JsonbArrayLengthUdf {
 }
 
 impl ScalarUDFImpl for JsonbArrayLengthUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_array_length" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int64) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_array_length"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -860,10 +844,18 @@ struct JsonbStripNullsUdf {
 }
 
 impl ScalarUDFImpl for JsonbStripNullsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_strip_nulls" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_strip_nulls"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -898,10 +890,18 @@ struct JsonbSetUdf {
 }
 
 impl ScalarUDFImpl for JsonbSetUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_set" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_set"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -935,9 +935,12 @@ impl ScalarUDFImpl for JsonbSetUdf {
 
             // Extract path string
             let path_str = {
-                let path_a = path_arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::Execution("jsonb_set: path must be Utf8".into())
-                })?;
+                let path_a = path_arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("jsonb_set: path must be Utf8".into())
+                    })?;
                 if path_a.is_null(i) {
                     out.push(None);
                     continue;
@@ -949,7 +952,11 @@ impl ScalarUDFImpl for JsonbSetUdf {
                 let ba = ca.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
                     DataFusionError::Execution("jsonb_set: create_missing must be Boolean".into())
                 })?;
-                if ba.is_null(i) { true } else { ba.value(i) }
+                if ba.is_null(i) {
+                    true
+                } else {
+                    ba.value(i)
+                }
             } else {
                 true
             };
@@ -992,10 +999,18 @@ struct JsonbInsertUdf {
 }
 
 impl ScalarUDFImpl for JsonbInsertUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_insert" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_insert"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1027,9 +1042,12 @@ impl ScalarUDFImpl for JsonbInsertUdf {
             let new_val = new_val.unwrap();
 
             let path_str = {
-                let path_a = path_arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::Execution("jsonb_insert: path must be Utf8".into())
-                })?;
+                let path_a = path_arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("jsonb_insert: path must be Utf8".into())
+                    })?;
                 if path_a.is_null(i) {
                     out.push(None);
                     continue;
@@ -1041,7 +1059,11 @@ impl ScalarUDFImpl for JsonbInsertUdf {
                 let ba = ia.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
                     DataFusionError::Execution("jsonb_insert: insert_after must be Boolean".into())
                 })?;
-                if ba.is_null(i) { false } else { ba.value(i) }
+                if ba.is_null(i) {
+                    false
+                } else {
+                    ba.value(i)
+                }
             } else {
                 false
             };
@@ -1098,13 +1120,25 @@ struct JsonbExtractPathUdf {
 }
 
 impl ScalarUDFImpl for JsonbExtractPathUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str {
-        if self.return_text { "jsonb_extract_path_text" } else { "jsonb_extract_path" }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn name(&self) -> &str {
+        if self.return_text {
+            "jsonb_extract_path_text"
+        } else {
+            "jsonb_extract_path"
+        }
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        if self.return_text { Ok(DataType::Utf8) } else { Ok(DataType::LargeBinary) }
+        if self.return_text {
+            Ok(DataType::Utf8)
+        } else {
+            Ok(DataType::LargeBinary)
+        }
     }
 
     #[allow(deprecated)]
@@ -1114,7 +1148,8 @@ impl ScalarUDFImpl for JsonbExtractPathUdf {
         if args.len() < 2 {
             return exec_err!(
                 "{} requires at least 2 arguments (jsonb, key1, ...); got {}",
-                self.name(), args.len()
+                self.name(),
+                args.len()
             );
         }
         let n = row_count(args);
@@ -1164,10 +1199,17 @@ fn jsonb_extract_path_row(
     for key_arr in keys {
         let key_str = match key_arr.data_type() {
             DataType::Utf8 => {
-                let a = key_arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::Execution(format!("{fn_name}: path element not a StringArray"))
-                })?;
-                if a.is_null(row) { return Ok(None); }
+                let a = key_arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "{fn_name}: path element not a StringArray"
+                        ))
+                    })?;
+                if a.is_null(row) {
+                    return Ok(None);
+                }
                 a.value(row).to_string()
             }
             other => return exec_err!("{fn_name}: path element must be Utf8, got {other:?}"),
@@ -1204,16 +1246,27 @@ struct JsonbPopulateRecordStubUdf {
 }
 
 impl ScalarUDFImpl for JsonbPopulateRecordStubUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_populate_record" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_populate_record"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() < 2 {
-            return exec_err!("jsonb_populate_record requires 2 arguments, got {}", args.len());
+            return exec_err!(
+                "jsonb_populate_record requires 2 arguments, got {}",
+                args.len()
+            );
         }
         let n = row_count(args);
         // Return the JSON value (arg 1) as text.
@@ -1239,10 +1292,18 @@ struct JsonbPathQueryUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathQueryUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_query" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_query"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1253,9 +1314,12 @@ impl ScalarUDFImpl for JsonbPathQueryUdf {
         let n = row_count(args);
         let target_arr = args[0].clone().into_array(n)?;
         let path_arr = args[1].clone().into_array(n)?;
-        let path_a = path_arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            DataFusionError::Execution("jsonb_path_query: path must be Utf8".into())
-        })?;
+        let path_a = path_arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("jsonb_path_query: path must be Utf8".into())
+            })?;
 
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1328,10 +1392,18 @@ struct JsonbPathExistsUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathExistsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_exists" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_exists"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1342,9 +1414,12 @@ impl ScalarUDFImpl for JsonbPathExistsUdf {
         let n = row_count(args);
         let target_arr = args[0].clone().into_array(n)?;
         let path_arr = args[1].clone().into_array(n)?;
-        let path_a = path_arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            DataFusionError::Execution("jsonb_path_exists: path must be Utf8".into())
-        })?;
+        let path_a = path_arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("jsonb_path_exists: path must be Utf8".into())
+            })?;
 
         let mut out: Vec<Option<bool>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1364,20 +1439,35 @@ impl ScalarUDFImpl for JsonbPathExistsUdf {
             let mut cur = &root;
             let mut found = true;
             for seg in &segments {
-                if seg.is_empty() { continue; }
+                if seg.is_empty() {
+                    continue;
+                }
                 match cur {
                     Value::Object(map) => {
                         if let Some(v) = map.get(seg.as_str()) {
                             cur = v;
-                        } else { found = false; break; }
+                        } else {
+                            found = false;
+                            break;
+                        }
                     }
                     Value::Array(arr) => {
                         if let Ok(idx) = seg.parse::<usize>() {
-                            if idx < arr.len() { cur = &arr[idx]; }
-                            else { found = false; break; }
-                        } else { found = false; break; }
+                            if idx < arr.len() {
+                                cur = &arr[idx];
+                            } else {
+                                found = false;
+                                break;
+                            }
+                        } else {
+                            found = false;
+                            break;
+                        }
                     }
-                    _ => { found = false; break; }
+                    _ => {
+                        found = false;
+                        break;
+                    }
                 }
             }
             out.push(Some(found));
@@ -1397,10 +1487,18 @@ struct JsonbPathMatchUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathMatchUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_match" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_match"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // Delegate to the same logic as jsonb_path_exists
@@ -1421,10 +1519,18 @@ struct JsonbObjectKeysUdf {
 }
 
 impl ScalarUDFImpl for JsonbObjectKeysUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_object_keys" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_object_keys"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1463,10 +1569,18 @@ struct JsonbEachUdf {
 }
 
 impl ScalarUDFImpl for JsonbEachUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_each" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_each"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1502,10 +1616,18 @@ struct JsonbEachTextUdf {
 }
 
 impl ScalarUDFImpl for JsonbEachTextUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_each_text" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_each_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1554,16 +1676,27 @@ struct JsonbArrayElementsUdf {
 }
 
 impl ScalarUDFImpl for JsonbArrayElementsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_array_elements" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_array_elements"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 1 {
-            return exec_err!("jsonb_array_elements expects 1 argument, got {}", args.len());
+            return exec_err!(
+                "jsonb_array_elements expects 1 argument, got {}",
+                args.len()
+            );
         }
         // SRF stub: returns first element (or the whole value if not an array)
         let n = row_count(args);
@@ -1597,16 +1730,27 @@ struct JsonbArrayElementsTextUdf {
 }
 
 impl ScalarUDFImpl for JsonbArrayElementsTextUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_array_elements_text" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_array_elements_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 1 {
-            return exec_err!("jsonb_array_elements_text expects 1 argument, got {}", args.len());
+            return exec_err!(
+                "jsonb_array_elements_text expects 1 argument, got {}",
+                args.len()
+            );
         }
         let n = row_count(args);
         let arr = args[0].clone().into_array(n)?;
@@ -1644,10 +1788,18 @@ struct JsonbBuildObjectUdf {
 }
 
 impl ScalarUDFImpl for JsonbBuildObjectUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_build_object" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_build_object"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1673,7 +1825,10 @@ impl ScalarUDFImpl for JsonbBuildObjectUdf {
                 let val_val = array_element_to_json(&pair[1], i);
                 let key_str = match &key_val {
                     Value::String(s) => s.clone(),
-                    Value::Null => { null_row = true; break; }
+                    Value::Null => {
+                        null_row = true;
+                        break;
+                    }
                     other => serde_json::to_string(other).unwrap_or_default(),
                 };
                 map.insert(key_str, val_val);
@@ -1700,10 +1855,18 @@ struct JsonBuildObjectUdf {
 }
 
 impl ScalarUDFImpl for JsonBuildObjectUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_build_object" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_build_object"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1729,7 +1892,10 @@ impl ScalarUDFImpl for JsonBuildObjectUdf {
                 let val_val = array_element_to_json(&pair[1], i);
                 let key_str = match &key_val {
                     Value::String(s) => s.clone(),
-                    Value::Null => { null_row = true; break; }
+                    Value::Null => {
+                        null_row = true;
+                        break;
+                    }
                     other => serde_json::to_string(other).unwrap_or_default(),
                 };
                 map.insert(key_str, val_val);
@@ -1757,10 +1923,18 @@ struct JsonbBuildArrayUdf {
 }
 
 impl ScalarUDFImpl for JsonbBuildArrayUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_build_array" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_build_array"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1773,7 +1947,10 @@ impl ScalarUDFImpl for JsonbBuildArrayUdf {
 
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
-            let items: Vec<Value> = arrays.iter().map(|arr| array_element_to_json(arr, i)).collect();
+            let items: Vec<Value> = arrays
+                .iter()
+                .map(|arr| array_element_to_json(arr, i))
+                .collect();
             let v = Value::Array(items);
             out.push(Some(value_to_jsonb(&v)?));
         }
@@ -1792,10 +1969,18 @@ struct ToJsonbUdf {
 }
 
 impl ScalarUDFImpl for ToJsonbUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "to_jsonb" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_jsonb"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1829,10 +2014,18 @@ struct RowToJsonUdf {
 }
 
 impl ScalarUDFImpl for RowToJsonUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "row_to_json" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "row_to_json"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1863,10 +2056,18 @@ struct ArrayToJsonUdf {
 }
 
 impl ScalarUDFImpl for ArrayToJsonUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "array_to_json" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "array_to_json"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1909,10 +2110,18 @@ struct JsonbAggStubUdf {
 }
 
 impl ScalarUDFImpl for JsonbAggStubUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_agg" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_agg"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1933,10 +2142,18 @@ struct JsonbObjectAggStubUdf {
 }
 
 impl ScalarUDFImpl for JsonbObjectAggStubUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_object_agg" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_object_agg"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1980,7 +2197,9 @@ fn jsonpath_query(root: &Value, path: &str) -> Vec<Value> {
 
     while !remaining.is_empty() {
         remaining = remaining.trim_start_matches('.');
-        if remaining.is_empty() { break; }
+        if remaining.is_empty() {
+            break;
+        }
 
         // Recursive descent: **
         if remaining.starts_with("**") {
@@ -2018,7 +2237,9 @@ fn jsonpath_query(root: &Value, path: &str) -> Vec<Value> {
 
         // Handle index subscript `[n]` or `[*]`
         while remaining.starts_with('[') {
-            let close = remaining.find(']').unwrap_or(remaining.len().saturating_sub(1));
+            let close = remaining
+                .find(']')
+                .unwrap_or(remaining.len().saturating_sub(1));
             let idx_str = &remaining[1..close];
             remaining = &remaining[close + 1..];
 
@@ -2049,9 +2270,13 @@ fn jsonpath_query(root: &Value, path: &str) -> Vec<Value> {
 /// Strip a leading `? (...)` filter predicate from `s`, returning the rest.
 fn strip_filter_predicate(s: &str) -> &str {
     let s = s.trim_start();
-    if !s.starts_with('?') { return s; }
+    if !s.starts_with('?') {
+        return s;
+    }
     let s = s[1..].trim_start();
-    if !s.starts_with('(') { return s; }
+    if !s.starts_with('(') {
+        return s;
+    }
     // Find matching close paren
     let mut depth = 0usize;
     for (i, c) in s.char_indices() {
@@ -2098,24 +2323,37 @@ struct JsonbPathQueryFirstUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathQueryFirstUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_query_first" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_query_first"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 2 {
-            return exec_err!("jsonb_path_query_first expects 2 arguments, got {}", args.len());
+            return exec_err!(
+                "jsonb_path_query_first expects 2 arguments, got {}",
+                args.len()
+            );
         }
         let n = row_count(args);
         let doc_arr = args[0].clone().into_array(n)?;
         let path_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
-            match (extract_jsonb_value(&doc_arr, i, "jsonb_path_query_first")?,
-                   extract_string(&path_arr, i)) {
+            match (
+                extract_jsonb_value(&doc_arr, i, "jsonb_path_query_first")?,
+                extract_string(&path_arr, i),
+            ) {
                 (Some(doc), Some(path)) => {
                     let matches = jsonpath_query(&doc, &path);
                     if let Some(first) = matches.into_iter().next() {
@@ -2142,24 +2380,37 @@ struct JsonbPathQueryArrayUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathQueryArrayUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_path_query_array" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_path_query_array"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 2 {
-            return exec_err!("jsonb_path_query_array expects 2 arguments, got {}", args.len());
+            return exec_err!(
+                "jsonb_path_query_array expects 2 arguments, got {}",
+                args.len()
+            );
         }
         let n = row_count(args);
         let doc_arr = args[0].clone().into_array(n)?;
         let path_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
-            match (extract_jsonb_value(&doc_arr, i, "jsonb_path_query_array")?,
-                   extract_string(&path_arr, i)) {
+            match (
+                extract_jsonb_value(&doc_arr, i, "jsonb_path_query_array")?,
+                extract_string(&path_arr, i),
+            ) {
                 (Some(doc), Some(path)) => {
                     let matches = jsonpath_query(&doc, &path);
                     let arr = Value::Array(matches);
@@ -2183,10 +2434,18 @@ struct JsonTypeofUdf {
 }
 
 impl ScalarUDFImpl for JsonTypeofUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_typeof" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_typeof"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2228,10 +2487,18 @@ struct JsonStripNullsUdf {
 }
 
 impl ScalarUDFImpl for JsonStripNullsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_strip_nulls" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_strip_nulls"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2269,10 +2536,18 @@ struct ToJsonUdf {
 }
 
 impl ScalarUDFImpl for ToJsonUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "to_json" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_json"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2289,9 +2564,8 @@ impl ScalarUDFImpl for ToJsonUdf {
                 continue;
             }
             let v = array_element_to_json(&arr, i);
-            let s = serde_json::to_string(&v).map_err(|e| {
-                DataFusionError::Execution(format!("to_json encode: {e}"))
-            })?;
+            let s = serde_json::to_string(&v)
+                .map_err(|e| DataFusionError::Execution(format!("to_json encode: {e}")))?;
             out.push(Some(s));
         }
         let result = StringArray::from(out);
@@ -2309,10 +2583,18 @@ struct JsonEachUdf {
 }
 
 impl ScalarUDFImpl for JsonEachUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_each" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_each"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2329,7 +2611,9 @@ impl ScalarUDFImpl for JsonEachUdf {
                 Some(Value::Object(map)) => {
                     let pairs: Vec<String> = map
                         .iter()
-                        .map(|(k, v)| format!("{}={}", k, serde_json::to_string(v).unwrap_or_default()))
+                        .map(|(k, v)| {
+                            format!("{}={}", k, serde_json::to_string(v).unwrap_or_default())
+                        })
                         .collect();
                     out.push(Some(pairs.join(",")));
                 }
@@ -2351,10 +2635,18 @@ struct JsonEachTextUdf {
 }
 
 impl ScalarUDFImpl for JsonEachTextUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_each_text" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_each_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2399,10 +2691,18 @@ struct JsonObjectKeysUdf {
 }
 
 impl ScalarUDFImpl for JsonObjectKeysUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_object_keys" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_object_keys"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2438,10 +2738,18 @@ struct JsonArrayElementsUdf {
 }
 
 impl ScalarUDFImpl for JsonArrayElementsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_array_elements" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_array_elements"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2480,16 +2788,27 @@ struct JsonArrayElementsTextUdf {
 }
 
 impl ScalarUDFImpl for JsonArrayElementsTextUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_array_elements_text" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_array_elements_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 1 {
-            return exec_err!("json_array_elements_text expects 1 argument, got {}", args.len());
+            return exec_err!(
+                "json_array_elements_text expects 1 argument, got {}",
+                args.len()
+            );
         }
         let n = row_count(args);
         let arr = args[0].clone().into_array(n)?;
@@ -2527,10 +2846,18 @@ struct JsonGetUdf {
 }
 
 impl ScalarUDFImpl for JsonGetUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_get" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_get"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2545,23 +2872,38 @@ impl ScalarUDFImpl for JsonGetUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value(&doc_arr, i, "json_get")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let key = match extract_string(&key_arr, i) {
                 Some(k) => k,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let result = match &doc {
                 Value::Object(map) => map.get(&key).cloned(),
-                Value::Array(arr) => {
-                    key.parse::<usize>().ok().and_then(|idx| arr.get(idx).cloned())
-                        .or_else(|| key.parse::<i64>().ok().and_then(|idx| {
+                Value::Array(arr) => key
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| arr.get(idx).cloned())
+                    .or_else(|| {
+                        key.parse::<i64>().ok().and_then(|idx| {
                             if idx < 0 {
                                 let pos = arr.len() as i64 + idx;
-                                if pos >= 0 { arr.get(pos as usize).cloned() } else { None }
-                            } else { None }
-                        }))
-                }
+                                if pos >= 0 {
+                                    arr.get(pos as usize).cloned()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    }),
                 _ => None,
             };
             match result {
@@ -2584,10 +2926,18 @@ struct JsonGetTextUdf {
 }
 
 impl ScalarUDFImpl for JsonGetTextUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_get_text" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_get_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2602,23 +2952,38 @@ impl ScalarUDFImpl for JsonGetTextUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value(&doc_arr, i, "json_get_text")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let key = match extract_string(&key_arr, i) {
                 Some(k) => k,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let child = match &doc {
                 Value::Object(map) => map.get(&key).cloned(),
-                Value::Array(arr) => {
-                    key.parse::<usize>().ok().and_then(|idx| arr.get(idx).cloned())
-                        .or_else(|| key.parse::<i64>().ok().and_then(|idx| {
+                Value::Array(arr) => key
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| arr.get(idx).cloned())
+                    .or_else(|| {
+                        key.parse::<i64>().ok().and_then(|idx| {
                             if idx < 0 {
                                 let pos = arr.len() as i64 + idx;
-                                if pos >= 0 { arr.get(pos as usize).cloned() } else { None }
-                            } else { None }
-                        }))
-                }
+                                if pos >= 0 {
+                                    arr.get(pos as usize).cloned()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    }),
                 _ => None,
             };
             let text = match child {
@@ -2644,10 +3009,18 @@ struct JsonPathExtractUdf {
 }
 
 impl ScalarUDFImpl for JsonPathExtractUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_path_extract" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_path_extract"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2662,11 +3035,17 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value(&doc_arr, i, "json_path_extract")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let path_str = match extract_string(&path_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             // path_str is like '{a,b,c}' or 'a.b.c'
             let segments = parse_path(&path_str);
@@ -2675,20 +3054,19 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
             for seg in &segments {
                 let tmp = std::mem::replace(&mut cur, Value::Null);
                 let next = match tmp {
-                    Value::Object(mut map) => {
-                        map.remove(seg.as_str())
-                    }
-                    Value::Array(mut arr) => {
-                        match seg.parse::<usize>().ok() {
-                            Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
-                            _ => None,
-                        }
-                    }
+                    Value::Object(mut map) => map.remove(seg.as_str()),
+                    Value::Array(mut arr) => match seg.parse::<usize>().ok() {
+                        Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
+                        _ => None,
+                    },
                     _ => None,
                 };
                 match next {
                     Some(v) => cur = v,
-                    None => { found = false; break; }
+                    None => {
+                        found = false;
+                        break;
+                    }
                 }
             }
             if found {
@@ -2712,16 +3090,27 @@ struct JsonPathExtractTextUdf {
 }
 
 impl ScalarUDFImpl for JsonPathExtractTextUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "json_path_extract_text" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_path_extract_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 2 {
-            return exec_err!("json_path_extract_text expects 2 arguments, got {}", args.len());
+            return exec_err!(
+                "json_path_extract_text expects 2 arguments, got {}",
+                args.len()
+            );
         }
         let n = row_count(args);
         let doc_arr = args[0].clone().into_array(n)?;
@@ -2730,11 +3119,17 @@ impl ScalarUDFImpl for JsonPathExtractTextUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value(&doc_arr, i, "json_path_extract_text")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let path_str = match extract_string(&path_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let segments = parse_path(&path_str);
             let mut cur = doc;
@@ -2742,26 +3137,28 @@ impl ScalarUDFImpl for JsonPathExtractTextUdf {
             for seg in &segments {
                 let tmp = std::mem::replace(&mut cur, Value::Null);
                 let next = match tmp {
-                    Value::Object(mut map) => {
-                        map.remove(seg.as_str())
-                    }
-                    Value::Array(mut arr) => {
-                        match seg.parse::<usize>().ok() {
-                            Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
-                            _ => None,
-                        }
-                    }
+                    Value::Object(mut map) => map.remove(seg.as_str()),
+                    Value::Array(mut arr) => match seg.parse::<usize>().ok() {
+                        Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
+                        _ => None,
+                    },
                     _ => None,
                 };
                 match next {
                     Some(v) => cur = v,
-                    None => { found = false; break; }
+                    None => {
+                        found = false;
+                        break;
+                    }
                 }
             }
             if found {
                 let text = match cur {
                     Value::String(s) => s,
-                    Value::Null => { out.push(None); continue; }
+                    Value::Null => {
+                        out.push(None);
+                        continue;
+                    }
                     v => serde_json::to_string(&v).unwrap_or_default(),
                 };
                 out.push(Some(text));
@@ -2784,10 +3181,18 @@ struct JsonbContainsUdf {
 }
 
 impl ScalarUDFImpl for JsonbContainsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_contains" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_contains"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2802,11 +3207,17 @@ impl ScalarUDFImpl for JsonbContainsUdf {
         for i in 0..n {
             let left = match extract_jsonb_value(&left_arr, i, "jsonb_contains")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let right = match extract_jsonb_value(&right_arr, i, "jsonb_contains")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             out.push(Some(json_contains(&left, &right)));
         }
@@ -2818,14 +3229,12 @@ impl ScalarUDFImpl for JsonbContainsUdf {
 /// Recursive JSON containment check (`left @> right`).
 fn json_contains(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Object(lm), Value::Object(rm)) => {
-            rm.iter().all(|(k, rv)| {
-                lm.get(k).map(|lv| json_contains(lv, rv)).unwrap_or(false)
-            })
-        }
-        (Value::Array(la), Value::Array(ra)) => {
-            ra.iter().all(|rv| la.iter().any(|lv| json_contains(lv, rv)))
-        }
+        (Value::Object(lm), Value::Object(rm)) => rm
+            .iter()
+            .all(|(k, rv)| lm.get(k).map(|lv| json_contains(lv, rv)).unwrap_or(false)),
+        (Value::Array(la), Value::Array(ra)) => ra
+            .iter()
+            .all(|rv| la.iter().any(|lv| json_contains(lv, rv))),
         (l, r) => l == r,
     }
 }
@@ -2840,10 +3249,18 @@ struct JsonbContainedByUdf {
 }
 
 impl ScalarUDFImpl for JsonbContainedByUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_contained_by" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_contained_by"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2858,11 +3275,17 @@ impl ScalarUDFImpl for JsonbContainedByUdf {
         for i in 0..n {
             let left = match extract_jsonb_value(&left_arr, i, "jsonb_contained_by")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let right = match extract_jsonb_value(&right_arr, i, "jsonb_contained_by")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             // <@ is the reverse of @>
             out.push(Some(json_contains(&right, &left)));
@@ -2882,10 +3305,18 @@ struct JsonbHasKeyUdf {
 }
 
 impl ScalarUDFImpl for JsonbHasKeyUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_has_key" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_has_key"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2900,17 +3331,23 @@ impl ScalarUDFImpl for JsonbHasKeyUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value(&doc_arr, i, "jsonb_has_key")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let key = match extract_string(&key_arr, i) {
                 Some(k) => k,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let found = match &doc {
                 Value::Object(map) => map.contains_key(&key),
-                Value::Array(arr) => arr.iter().any(|v| {
-                    matches!(v, Value::String(s) if s == &key)
-                }),
+                Value::Array(arr) => arr
+                    .iter()
+                    .any(|v| matches!(v, Value::String(s) if s == &key)),
                 _ => false,
             };
             out.push(Some(found));
@@ -2930,10 +3367,18 @@ struct JsonbHasAllKeysUdf {
 }
 
 impl ScalarUDFImpl for JsonbHasAllKeysUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_has_all_keys" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_has_all_keys"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2948,12 +3393,18 @@ impl ScalarUDFImpl for JsonbHasAllKeysUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value(&doc_arr, i, "jsonb_has_all_keys")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             // keys arg: comma-separated string or JSON array
             let keys_str = match extract_string(&keys_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let keys = parse_key_list(&keys_str);
             let found = match &doc {
@@ -2977,10 +3428,18 @@ struct JsonbHasAnyKeyUdf {
 }
 
 impl ScalarUDFImpl for JsonbHasAnyKeyUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_has_any_key" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_has_any_key"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2995,11 +3454,17 @@ impl ScalarUDFImpl for JsonbHasAnyKeyUdf {
         for i in 0..n {
             let doc = match extract_jsonb_value(&doc_arr, i, "jsonb_has_any_key")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let keys_str = match extract_string(&keys_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let keys = parse_key_list(&keys_str);
             let found = match &doc {
@@ -3023,10 +3488,18 @@ struct JsonbConcatUdf {
 }
 
 impl ScalarUDFImpl for JsonbConcatUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_concat" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_concat"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -3041,11 +3514,17 @@ impl ScalarUDFImpl for JsonbConcatUdf {
         for i in 0..n {
             let left = match extract_jsonb_value(&left_arr, i, "jsonb_concat")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let right = match extract_jsonb_value(&right_arr, i, "jsonb_concat")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let merged = match (left, right) {
                 (Value::Object(mut lm), Value::Object(rm)) => {
@@ -3062,13 +3541,23 @@ impl ScalarUDFImpl for JsonbConcatUdf {
                 (l, Value::Object(rm)) => {
                     let mut map = serde_json::Map::new();
                     if let Value::Object(lm) = l {
-                        for (k, v) in lm { map.insert(k, v); }
+                        for (k, v) in lm {
+                            map.insert(k, v);
+                        }
                     }
-                    for (k, v) in rm { map.insert(k, v); }
+                    for (k, v) in rm {
+                        map.insert(k, v);
+                    }
                     Value::Object(map)
                 }
-                (Value::Array(mut la), r) => { la.push(r); Value::Array(la) }
-                (l, Value::Array(mut ra)) => { ra.insert(0, l); Value::Array(ra) }
+                (Value::Array(mut la), r) => {
+                    la.push(r);
+                    Value::Array(la)
+                }
+                (l, Value::Array(mut ra)) => {
+                    ra.insert(0, l);
+                    Value::Array(ra)
+                }
                 // Two scalars: make array
                 (l, r) => Value::Array(vec![l, r]),
             };
@@ -3089,10 +3578,18 @@ struct JsonbDeleteKeyUdf {
 }
 
 impl ScalarUDFImpl for JsonbDeleteKeyUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_delete_key" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_delete_key"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -3107,11 +3604,17 @@ impl ScalarUDFImpl for JsonbDeleteKeyUdf {
         for i in 0..n {
             let mut doc = match extract_jsonb_value(&doc_arr, i, "jsonb_delete_key")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let key = match extract_string(&key_arr, i) {
                 Some(s) => s,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             if let Value::Object(ref mut map) = doc {
                 map.remove(key.as_str());
@@ -3133,16 +3636,24 @@ struct JsonbDeleteKeysUdf {
 }
 
 impl ScalarUDFImpl for JsonbDeleteKeysUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_delete_keys" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_delete_keys"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
-        use datafusion::arrow::array::ListArray;
         use datafusion::arrow::array::LargeListArray;
+        use datafusion::arrow::array::ListArray;
         if args.len() != 2 {
             return exec_err!("jsonb_delete_keys expects 2 arguments, got {}", args.len());
         }
@@ -3153,46 +3664,86 @@ impl ScalarUDFImpl for JsonbDeleteKeysUdf {
         for i in 0..n {
             let mut doc = match extract_jsonb_value(&doc_arr, i, "jsonb_delete_keys")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let keys: Vec<String> = match keys_arr.data_type() {
                 DataType::Utf8 => {
-                    let a = keys_arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                        DataFusionError::Execution("jsonb_delete_keys: not StringArray".into())
-                    })?;
-                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    let a = keys_arr
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("jsonb_delete_keys: not StringArray".into())
+                        })?;
+                    if a.is_null(i) {
+                        out.push(Some(value_to_jsonb(&doc)?));
+                        continue;
+                    }
                     parse_key_list(a.value(i))
                 }
                 DataType::List(_) => {
-                    let a = keys_arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                        DataFusionError::Execution("jsonb_delete_keys: not ListArray".into())
-                    })?;
-                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    let a = keys_arr
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("jsonb_delete_keys: not ListArray".into())
+                        })?;
+                    if a.is_null(i) {
+                        out.push(Some(value_to_jsonb(&doc)?));
+                        continue;
+                    }
                     let values = a.value(i);
                     let sa = values.as_any().downcast_ref::<StringArray>();
                     match sa {
-                        Some(sa) => (0..sa.len()).filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) }).collect(),
+                        Some(sa) => (0..sa.len())
+                            .filter_map(|j| {
+                                if sa.is_null(j) {
+                                    None
+                                } else {
+                                    Some(sa.value(j).to_string())
+                                }
+                            })
+                            .collect(),
                         None => vec![],
                     }
                 }
                 DataType::LargeList(_) => {
-                    let a = keys_arr.as_any().downcast_ref::<LargeListArray>().ok_or_else(|| {
-                        DataFusionError::Execution("jsonb_delete_keys: not LargeListArray".into())
-                    })?;
-                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    let a = keys_arr
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "jsonb_delete_keys: not LargeListArray".into(),
+                            )
+                        })?;
+                    if a.is_null(i) {
+                        out.push(Some(value_to_jsonb(&doc)?));
+                        continue;
+                    }
                     let values = a.value(i);
                     let sa = values.as_any().downcast_ref::<StringArray>();
                     match sa {
-                        Some(sa) => (0..sa.len()).filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) }).collect(),
+                        Some(sa) => (0..sa.len())
+                            .filter_map(|j| {
+                                if sa.is_null(j) {
+                                    None
+                                } else {
+                                    Some(sa.value(j).to_string())
+                                }
+                            })
+                            .collect(),
                         None => vec![],
                     }
                 }
-                _ => {
-                    match extract_string(&keys_arr, i) {
-                        Some(s) => parse_key_list(&s),
-                        None => { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                _ => match extract_string(&keys_arr, i) {
+                    Some(s) => parse_key_list(&s),
+                    None => {
+                        out.push(Some(value_to_jsonb(&doc)?));
+                        continue;
                     }
-                }
+                },
             };
             if let Value::Object(ref mut map) = doc {
                 for k in &keys {
@@ -3216,10 +3767,18 @@ struct JsonbDeleteIndexUdf {
 }
 
 impl ScalarUDFImpl for JsonbDeleteIndexUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_delete_index" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_delete_index"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -3235,29 +3794,45 @@ impl ScalarUDFImpl for JsonbDeleteIndexUdf {
         for i in 0..n {
             let mut doc = match extract_jsonb_value(&doc_arr, i, "jsonb_delete_index")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let idx: i64 = match idx_arr.data_type() {
                 DataType::Int64 => {
-                    let a = idx_arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                        DataFusionError::Execution("jsonb_delete_index: not Int64Array".into())
-                    })?;
-                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    let a = idx_arr
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("jsonb_delete_index: not Int64Array".into())
+                        })?;
+                    if a.is_null(i) {
+                        out.push(Some(value_to_jsonb(&doc)?));
+                        continue;
+                    }
                     a.value(i)
                 }
                 DataType::Int32 => {
-                    let a = idx_arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                        DataFusionError::Execution("jsonb_delete_index: not Int32Array".into())
-                    })?;
-                    if a.is_null(i) { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                    let a = idx_arr
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("jsonb_delete_index: not Int32Array".into())
+                        })?;
+                    if a.is_null(i) {
+                        out.push(Some(value_to_jsonb(&doc)?));
+                        continue;
+                    }
                     a.value(i) as i64
                 }
-                _ => {
-                    match extract_string(&idx_arr, i) {
-                        Some(s) => s.trim().parse::<i64>().unwrap_or(0),
-                        None => { out.push(Some(value_to_jsonb(&doc)?)); continue; }
+                _ => match extract_string(&idx_arr, i) {
+                    Some(s) => s.trim().parse::<i64>().unwrap_or(0),
+                    None => {
+                        out.push(Some(value_to_jsonb(&doc)?));
+                        continue;
                     }
-                }
+                },
             };
             if let Value::Array(ref mut arr) = doc {
                 let len = arr.len() as i64;
@@ -3285,10 +3860,18 @@ struct JsonToRecordStubUdf {
 }
 
 impl ScalarUDFImpl for JsonToRecordStubUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { self.name }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -3306,7 +3889,9 @@ impl ScalarUDFImpl for JsonToRecordStubUdf {
 
 /// Extract a plain string from a StringArray or LargeBinaryArray (as UTF-8).
 fn extract_string(arr: &ArrayRef, i: usize) -> Option<String> {
-    if arr.is_null(i) { return None; }
+    if arr.is_null(i) {
+        return None;
+    }
     match arr.data_type() {
         DataType::Utf8 => {
             let a = arr.as_any().downcast_ref::<StringArray>()?;
@@ -3354,13 +3939,13 @@ fn parse_key_list(s: &str) -> Vec<String> {
 
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::Session;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::TableType;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::catalog::Session;
 
 /// Extract JSON text from a literal Expr (Utf8 or LargeBinary).
 fn json_from_expr(expr: &Expr) -> Option<String> {
@@ -3386,9 +3971,15 @@ struct JsonbEachTable {
 
 #[async_trait::async_trait]
 impl TableProvider for JsonbEachTable {
-    fn as_any(&self) -> &dyn Any { self }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> TableType { TableType::Base }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 
     async fn scan(
         &self,
@@ -3397,7 +3988,9 @@ impl TableProvider for JsonbEachTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?
+            .scan(_state, _projection, _filters, _limit)
+            .await
     }
 }
 
@@ -3439,7 +4032,10 @@ impl TableFunctionImpl for JsonbEachTf {
         let val_arr: ArrayRef = Arc::new(StringArray::from(vals));
         let batch = RecordBatch::try_new(schema.clone(), vec![key_arr, val_arr])
             .map_err(|e| DataFusionError::Plan(format!("jsonb_each: RecordBatch error: {e}")))?;
-        Ok(Arc::new(JsonbEachTable { schema, batches: vec![batch] }))
+        Ok(Arc::new(JsonbEachTable {
+            schema,
+            batches: vec![batch],
+        }))
     }
 }
 
@@ -3458,9 +4054,15 @@ struct JsonbArrayElementsTable {
 
 #[async_trait::async_trait]
 impl TableProvider for JsonbArrayElementsTable {
-    fn as_any(&self) -> &dyn Any { self }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> TableType { TableType::Base }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 
     async fn scan(
         &self,
@@ -3469,7 +4071,9 @@ impl TableProvider for JsonbArrayElementsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?
+            .scan(_state, _projection, _filters, _limit)
+            .await
     }
 }
 
@@ -3482,32 +4086,42 @@ impl TableFunctionImpl for JsonbArrayElementsTf {
             Some(s) => s,
             None => return plan_err!("jsonb_array_elements: argument must be a JSON literal"),
         };
-        let v: Value = serde_json::from_str(&json_str)
-            .map_err(|e| DataFusionError::Plan(format!("jsonb_array_elements: JSON parse error: {e}")))?;
+        let v: Value = serde_json::from_str(&json_str).map_err(|e| {
+            DataFusionError::Plan(format!("jsonb_array_elements: JSON parse error: {e}"))
+        })?;
         let arr = match v {
             Value::Array(a) => a,
             _ => return plan_err!("jsonb_array_elements: argument must be a JSON array"),
         };
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
 
-        let vals: Vec<String> = arr.iter().map(|v| {
-            if self.text_values {
-                match v {
-                    Value::String(s) => s.clone(),
-                    _ => serde_json::to_string(v).unwrap_or_default(),
+        let vals: Vec<String> = arr
+            .iter()
+            .map(|v| {
+                if self.text_values {
+                    match v {
+                        Value::String(s) => s.clone(),
+                        _ => serde_json::to_string(v).unwrap_or_default(),
+                    }
+                } else {
+                    serde_json::to_string(v).unwrap_or_default()
                 }
-            } else {
-                serde_json::to_string(v).unwrap_or_default()
-            }
-        }).collect();
+            })
+            .collect();
 
         let val_arr: ArrayRef = Arc::new(StringArray::from(vals));
-        let batch = RecordBatch::try_new(schema.clone(), vec![val_arr])
-            .map_err(|e| DataFusionError::Plan(format!("jsonb_array_elements: RecordBatch error: {e}")))?;
-        Ok(Arc::new(JsonbArrayElementsTable { schema, batches: vec![batch] }))
+        let batch = RecordBatch::try_new(schema.clone(), vec![val_arr]).map_err(|e| {
+            DataFusionError::Plan(format!("jsonb_array_elements: RecordBatch error: {e}"))
+        })?;
+        Ok(Arc::new(JsonbArrayElementsTable {
+            schema,
+            batches: vec![batch],
+        }))
     }
 }
 
@@ -3524,9 +4138,15 @@ struct JsonbObjectKeysTable {
 
 #[async_trait::async_trait]
 impl TableProvider for JsonbObjectKeysTable {
-    fn as_any(&self) -> &dyn Any { self }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> TableType { TableType::Base }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 
     async fn scan(
         &self,
@@ -3535,7 +4155,9 @@ impl TableProvider for JsonbObjectKeysTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?
+            .scan(_state, _projection, _filters, _limit)
+            .await
     }
 }
 
@@ -3548,22 +4170,29 @@ impl TableFunctionImpl for JsonbObjectKeysTf {
             Some(s) => s,
             None => return plan_err!("jsonb_object_keys: argument must be a JSON literal"),
         };
-        let v: Value = serde_json::from_str(&json_str)
-            .map_err(|e| DataFusionError::Plan(format!("jsonb_object_keys: JSON parse error: {e}")))?;
+        let v: Value = serde_json::from_str(&json_str).map_err(|e| {
+            DataFusionError::Plan(format!("jsonb_object_keys: JSON parse error: {e}"))
+        })?;
         let obj = match v {
             Value::Object(m) => m,
             _ => return plan_err!("jsonb_object_keys: argument must be a JSON object"),
         };
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("jsonb_object_keys", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "jsonb_object_keys",
+            DataType::Utf8,
+            false,
+        )]));
 
         let keys: Vec<String> = obj.keys().cloned().collect();
         let key_arr: ArrayRef = Arc::new(StringArray::from(keys));
-        let batch = RecordBatch::try_new(schema.clone(), vec![key_arr])
-            .map_err(|e| DataFusionError::Plan(format!("jsonb_object_keys: RecordBatch error: {e}")))?;
-        Ok(Arc::new(JsonbObjectKeysTable { schema, batches: vec![batch] }))
+        let batch = RecordBatch::try_new(schema.clone(), vec![key_arr]).map_err(|e| {
+            DataFusionError::Plan(format!("jsonb_object_keys: RecordBatch error: {e}"))
+        })?;
+        Ok(Arc::new(JsonbObjectKeysTable {
+            schema,
+            batches: vec![batch],
+        }))
     }
 }
 
@@ -3579,16 +4208,27 @@ struct JsonbDeletePathUdf {
 }
 
 impl ScalarUDFImpl for JsonbDeletePathUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "jsonb_delete_path" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::LargeBinary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "jsonb_delete_path"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
         if arrays.len() != 2 {
-            return exec_err!("jsonb_delete_path expects 2 arguments, got {}", arrays.len());
+            return exec_err!(
+                "jsonb_delete_path expects 2 arguments, got {}",
+                arrays.len()
+            );
         }
         let doc_arr = &arrays[0];
         let path_arr = &arrays[1];
@@ -3601,11 +4241,17 @@ impl ScalarUDFImpl for JsonbDeletePathUdf {
             }
             let mut doc_val = match extract_jsonb_value(doc_arr, i, "jsonb_delete_path")? {
                 Some(v) => v,
-                None => { out.push(None); continue; }
+                None => {
+                    out.push(None);
+                    continue;
+                }
             };
             let path_str = match extract_string(path_arr, i) {
                 Some(s) => s,
-                None => { out.push(Some(value_to_jsonb(&doc_val)?)); continue; }
+                None => {
+                    out.push(Some(value_to_jsonb(&doc_val)?));
+                    continue;
+                }
             };
             let path_parts = parse_key_list(&path_str);
             if !path_parts.is_empty() {
@@ -3625,10 +4271,14 @@ fn delete_json_path(doc: &mut Value, path: &[String]) {
     }
     if path.len() == 1 {
         match doc {
-            Value::Object(m) => { m.remove(&path[0]); }
+            Value::Object(m) => {
+                m.remove(&path[0]);
+            }
             Value::Array(a) => {
                 if let Ok(idx) = path[0].parse::<usize>() {
-                    if idx < a.len() { a.remove(idx); }
+                    if idx < a.len() {
+                        a.remove(idx);
+                    }
                 }
             }
             _ => {}
@@ -3673,9 +4323,15 @@ struct JsonToRecordsetTable {
 
 #[async_trait::async_trait]
 impl TableProvider for JsonToRecordsetTable {
-    fn as_any(&self) -> &dyn Any { self }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> TableType { TableType::Base }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 
     async fn scan(
         &self,
@@ -3684,7 +4340,9 @@ impl TableProvider for JsonToRecordsetTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?.scan(_state, _projection, _filters, _limit).await
+        MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?
+            .scan(_state, _projection, _filters, _limit)
+            .await
     }
 }
 
@@ -3697,8 +4355,9 @@ impl TableFunctionImpl for JsonToRecordsetTf {
             Some(s) => s,
             None => return plan_err!("json_to_recordset: argument must be a JSON array literal"),
         };
-        let arr: Vec<Value> = serde_json::from_str(&json_str)
-            .map_err(|e| DataFusionError::Plan(format!("json_to_recordset: JSON parse error: {e}")))?;
+        let arr: Vec<Value> = serde_json::from_str(&json_str).map_err(|e| {
+            DataFusionError::Plan(format!("json_to_recordset: JSON parse error: {e}"))
+        })?;
 
         // Collect all keys across all objects (preserving insertion order from first object).
         let mut keys: Vec<String> = Vec::new();
@@ -3715,11 +4374,16 @@ impl TableFunctionImpl for JsonToRecordsetTf {
         if keys.is_empty() {
             // Empty input or non-object rows — return empty table with one Utf8 column.
             let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
-            return Ok(Arc::new(JsonToRecordsetTable { schema, batches: vec![] }));
+            return Ok(Arc::new(JsonToRecordsetTable {
+                schema,
+                batches: vec![],
+            }));
         }
 
         let schema = Arc::new(Schema::new(
-            keys.iter().map(|k| Field::new(k.as_str(), DataType::Utf8, true)).collect::<Vec<_>>()
+            keys.iter()
+                .map(|k| Field::new(k.as_str(), DataType::Utf8, true))
+                .collect::<Vec<_>>(),
         ));
 
         // Build one StringArray per column.
@@ -3728,7 +4392,9 @@ impl TableFunctionImpl for JsonToRecordsetTf {
             let obj = match row {
                 Value::Object(m) => m,
                 _ => {
-                    for col in &mut columns { col.push(None); }
+                    for col in &mut columns {
+                        col.push(None);
+                    }
                     continue;
                 }
             };
@@ -3742,12 +4408,17 @@ impl TableFunctionImpl for JsonToRecordsetTf {
             }
         }
 
-        let arrays: Vec<ArrayRef> = columns.into_iter()
+        let arrays: Vec<ArrayRef> = columns
+            .into_iter()
             .map(|col| Arc::new(StringArray::from(col)) as ArrayRef)
             .collect();
 
-        let batch = RecordBatch::try_new(schema.clone(), arrays)
-            .map_err(|e| DataFusionError::Plan(format!("json_to_recordset: RecordBatch error: {e}")))?;
-        Ok(Arc::new(JsonToRecordsetTable { schema, batches: vec![batch] }))
+        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| {
+            DataFusionError::Plan(format!("json_to_recordset: RecordBatch error: {e}"))
+        })?;
+        Ok(Arc::new(JsonToRecordsetTable {
+            schema,
+            batches: vec![batch],
+        }))
     }
 }

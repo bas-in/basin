@@ -207,10 +207,7 @@ async fn param_bind_rebind_same_statement() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE vals (n BIGINT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE vals (n BIGINT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE vals");
 
@@ -252,18 +249,12 @@ async fn param_bind_two_params_mixed_types() {
     let client = connect(server.addr).await;
 
     client
-        .execute(
-            "CREATE TABLE kv (k BIGINT NOT NULL, v TEXT NOT NULL)",
-            &[],
-        )
+        .execute("CREATE TABLE kv (k BIGINT NOT NULL, v TEXT NOT NULL)", &[])
         .await
         .expect("CREATE TABLE kv");
 
     client
-        .execute(
-            "INSERT INTO kv VALUES ($1, $2)",
-            &[&999i64, &"hello world"],
-        )
+        .execute("INSERT INTO kv VALUES ($1, $2)", &[&999i64, &"hello world"])
         .await
         .expect("INSERT kv");
 

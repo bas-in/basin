@@ -113,8 +113,8 @@ impl S3LikeConfig {
                 "tigris" => Provider::Tigris,
                 other => {
                     return Err(format!(
-                        "S3LikeConfig::from_env: unsupported backend {other:?} (expected s3 or tigris)"
-                    ))
+                    "S3LikeConfig::from_env: unsupported backend {other:?} (expected s3 or tigris)"
+                ))
                 }
             },
             None => {
@@ -126,12 +126,10 @@ impl S3LikeConfig {
                 match ep.as_deref() {
                     Some(e) if e.contains("tigris.dev") => Provider::Tigris,
                     Some(_) => Provider::S3,
-                    None => {
-                        return Err(
-                            "BASIN_STORAGE_BACKEND not set and no AWS_ENDPOINT_URL_S3 to infer from"
-                                .into(),
-                        )
-                    }
+                    None => return Err(
+                        "BASIN_STORAGE_BACKEND not set and no AWS_ENDPOINT_URL_S3 to infer from"
+                            .into(),
+                    ),
                 }
             }
         };

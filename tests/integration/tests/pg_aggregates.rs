@@ -216,18 +216,12 @@ async fn basic_array_agg() {
     // Basin's schema converter does not currently bridge List↔PG ARRAY over
     // pgwire, but the function executes without error in the engine layer.
     // We verify it at least produces a result (non-null List column).
-    let r2 = sess
-        .execute("SELECT array_agg(v) FROM agg_arr")
-        .await;
+    let r2 = sess.execute("SELECT array_agg(v) FROM agg_arr").await;
     match r2 {
         Ok(ExecResult::Rows { batches, .. }) => {
             // May succeed or fail schema conversion — just print the outcome
             if let Some(b) = batches.first() {
-                println!(
-                    "array_agg rows={} schema={:?}",
-                    b.num_rows(),
-                    b.schema()
-                );
+                println!("array_agg rows={} schema={:?}", b.num_rows(), b.schema());
             } else {
                 println!("array_agg: no batches");
             }
@@ -241,11 +235,7 @@ async fn basic_array_agg() {
     }
 
     // array_agg ORDER BY — document whether supported
-    let r = try_one_string(
-        &sess,
-        "SELECT array_agg(v ORDER BY v) FROM agg_arr",
-    )
-    .await;
+    let r = try_one_string(&sess, "SELECT array_agg(v ORDER BY v) FROM agg_arr").await;
     match r {
         Ok(s) => println!("array_agg ORDER BY result: {s}"),
         Err(e) => println!("array_agg ORDER BY limitation: {e}"),
@@ -284,10 +274,18 @@ async fn basic_string_agg() {
 async fn basic_bool_aggregates() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    sess.execute("CREATE TABLE agg_bool (v BOOLEAN)").await.unwrap();
-    sess.execute("INSERT INTO agg_bool VALUES (true)").await.unwrap();
-    sess.execute("INSERT INTO agg_bool VALUES (true)").await.unwrap();
-    sess.execute("INSERT INTO agg_bool VALUES (false)").await.unwrap();
+    sess.execute("CREATE TABLE agg_bool (v BOOLEAN)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO agg_bool VALUES (true)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO agg_bool VALUES (true)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO agg_bool VALUES (false)")
+        .await
+        .unwrap();
 
     // bool_and — false because one row is false
     let r = try_one_string(&sess, "SELECT bool_and(v) FROM agg_bool").await;
@@ -321,10 +319,16 @@ async fn basic_bool_aggregates() {
 async fn basic_bit_aggregates() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    sess.execute("CREATE TABLE agg_bit (v BIGINT)").await.unwrap();
+    sess.execute("CREATE TABLE agg_bit (v BIGINT)")
+        .await
+        .unwrap();
     // 0b110 & 0b101 = 0b100 = 4; 0b110 | 0b101 = 0b111 = 7
-    sess.execute("INSERT INTO agg_bit VALUES (6)").await.unwrap(); // 0b110
-    sess.execute("INSERT INTO agg_bit VALUES (5)").await.unwrap(); // 0b101
+    sess.execute("INSERT INTO agg_bit VALUES (6)")
+        .await
+        .unwrap(); // 0b110
+    sess.execute("INSERT INTO agg_bit VALUES (5)")
+        .await
+        .unwrap(); // 0b101
 
     let r = try_one_string(&sess, "SELECT bit_and(v) FROM agg_bit").await;
     match r {
@@ -530,11 +534,7 @@ async fn stat_approx_percentile() {
     setup_nums(&sess).await;
 
     // DataFusion's approx_percentile_cont(x, percentile) — approx median
-    let r = try_one_string(
-        &sess,
-        "SELECT approx_percentile_cont(x, 0.5) FROM agg_nums",
-    )
-    .await;
+    let r = try_one_string(&sess, "SELECT approx_percentile_cont(x, 0.5) FROM agg_nums").await;
     match r {
         Ok(s) => {
             println!("approx_percentile_cont(0.5) = {s}");
@@ -598,7 +598,9 @@ async fn stat_mode() {
 async fn json_agg_basic() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    sess.execute("CREATE TABLE agg_json (id INT)").await.unwrap();
+    sess.execute("CREATE TABLE agg_json (id INT)")
+        .await
+        .unwrap();
     for i in [1, 2, 3] {
         sess.execute(&format!("INSERT INTO agg_json VALUES ({i})"))
             .await
@@ -625,7 +627,9 @@ async fn json_agg_basic() {
 async fn jsonb_agg_basic() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    sess.execute("CREATE TABLE agg_jsonb (id INT)").await.unwrap();
+    sess.execute("CREATE TABLE agg_jsonb (id INT)")
+        .await
+        .unwrap();
     for i in [1, 2, 3] {
         sess.execute(&format!("INSERT INTO agg_jsonb VALUES ({i})"))
             .await
@@ -652,8 +656,12 @@ async fn json_object_agg_basic() {
     sess.execute("CREATE TABLE agg_kv (k TEXT, v INT)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO agg_kv VALUES ('a', 1)").await.unwrap();
-    sess.execute("INSERT INTO agg_kv VALUES ('b', 2)").await.unwrap();
+    sess.execute("INSERT INTO agg_kv VALUES ('a', 1)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO agg_kv VALUES ('b', 2)")
+        .await
+        .unwrap();
 
     // json_object_agg(key, value) — should produce a JSON object
     let r = try_one_string(&sess, "SELECT json_object_agg(k, v) FROM agg_kv").await;
@@ -662,7 +670,10 @@ async fn json_object_agg_basic() {
             println!("json_object_agg() = {s}");
             let v: serde_json::Value = serde_json::from_str(&s)
                 .unwrap_or_else(|_| panic!("json_object_agg did not return valid JSON: {s}"));
-            assert!(v.is_object(), "json_object_agg should return object, got: {s}");
+            assert!(
+                v.is_object(),
+                "json_object_agg should return object, got: {s}"
+            );
             let obj = v.as_object().unwrap();
             assert_eq!(obj.get("a").and_then(|v| v.as_i64()), Some(1));
             assert_eq!(obj.get("b").and_then(|v| v.as_i64()), Some(2));
@@ -678,8 +689,12 @@ async fn jsonb_object_agg_basic() {
     sess.execute("CREATE TABLE agg_kv2 (k TEXT, v INT)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO agg_kv2 VALUES ('x', 10)").await.unwrap();
-    sess.execute("INSERT INTO agg_kv2 VALUES ('y', 20)").await.unwrap();
+    sess.execute("INSERT INTO agg_kv2 VALUES ('x', 10)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO agg_kv2 VALUES ('y', 20)")
+        .await
+        .unwrap();
 
     // jsonb_object_agg — same as json_object_agg
     let r = try_one_string(&sess, "SELECT jsonb_object_agg(k, v) FROM agg_kv2").await;

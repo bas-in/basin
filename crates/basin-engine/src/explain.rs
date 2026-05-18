@@ -72,11 +72,10 @@ pub(crate) async fn exec_explain(
 
     // Plan the inner SQL. We accept DataFusion planning errors as user errors
     // (invalid inner query) rather than internal errors.
-    let df = sess
-        .ctx
-        .sql(&inner_sql)
-        .await
-        .map_err(|e| BasinError::internal(format!("EXPLAIN: could not plan inner query: {e}")))?;
+    let df =
+        sess.ctx.sql(&inner_sql).await.map_err(|e| {
+            BasinError::internal(format!("EXPLAIN: could not plan inner query: {e}"))
+        })?;
 
     // Attach the Explain node. DataFusion's `.explain()` returns a new
     // DataFrame whose logical plan is `LogicalPlan::Explain { … }`.

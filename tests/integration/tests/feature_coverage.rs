@@ -143,13 +143,13 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, Int64Array, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_router::{parse_pins_env, PgRateLimit, ShardMap};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
-use tempfile::TempDir;
 use serde_json;
+use tempfile::TempDir;
 
 /// Spin a fresh in-process `Engine` against `LocalFileSystem` + `InMemoryCatalog`.
 fn engine_in(dir: &TempDir) -> Engine {
@@ -349,11 +349,18 @@ async fn range_contains_range_udf() {
         .execute("SELECT range_contains_range(int4range(1, 5), int4range(3, 7))")
         .await
         .unwrap();
-    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
-    {
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2) {
         use arrow_array::BooleanArray;
-        let contains = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
-        let no_contain = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let contains = b1[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let no_contain = b2[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(contains.value(0), "[1,10) should contain [3,7)");
         assert!(!no_contain.value(0), "[1,5) should not contain [3,7)");
     } else {
@@ -373,11 +380,18 @@ async fn range_strictly_left_operator() {
         .execute("SELECT range_strictly_left(int4range(1, 6), int4range(5, 10))")
         .await
         .unwrap();
-    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
-    {
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2) {
         use arrow_array::BooleanArray;
-        let left = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
-        let not_left = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let left = b1[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let not_left = b2[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(left.value(0), "[1,5) should be strictly left of [5,10)");
         assert!(!not_left.value(0), "[1,6) is not strictly left of [5,10)");
     } else {
@@ -397,11 +411,18 @@ async fn range_strictly_right_operator() {
         .execute("SELECT range_strictly_right(int4range(4, 10), int4range(1, 5))")
         .await
         .unwrap();
-    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
-    {
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2) {
         use arrow_array::BooleanArray;
-        let right = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
-        let not_right = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let right = b1[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let not_right = b2[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(right.value(0), "[5,10) should be strictly right of [1,5)");
         assert!(!not_right.value(0), "[4,10) is not strictly right of [1,5)");
     } else {
@@ -421,11 +442,18 @@ async fn range_adjacent_operator() {
         .execute("SELECT range_adjacent(int4range(1, 4), int4range(5, 10))")
         .await
         .unwrap();
-    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2)
-    {
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2) {
         use arrow_array::BooleanArray;
-        let adj = b1[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
-        let not_adj = b2[0].column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let adj = b1[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let not_adj = b2[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(adj.value(0), "[1,5) and [5,10) should be adjacent");
         assert!(!not_adj.value(0), "[1,4) and [5,10) should not be adjacent");
     } else {
@@ -448,7 +476,10 @@ async fn range_merge_udf() {
         assert_eq!(v["l"], 1, "merged lower should be 1");
         assert_eq!(v["u"], 10, "merged upper should be 10");
         assert_eq!(v["li"], true, "merged lower should be inclusive");
-        assert_eq!(v["ui"], false, "merged upper should be exclusive (from [3,10))");
+        assert_eq!(
+            v["ui"], false,
+            "merged upper should be exclusive (from [3,10))"
+        );
     } else {
         panic!("expected Rows result");
     }

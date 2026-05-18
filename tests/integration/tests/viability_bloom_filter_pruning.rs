@@ -36,7 +36,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
 use futures::StreamExt;

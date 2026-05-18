@@ -206,7 +206,14 @@ pub(crate) fn encode_batches(schema: &Arc<Schema>, batches: &[RecordBatch]) -> V
         for r in 0..n_rows {
             for c in 0..n_cols {
                 let col = batch.column(c);
-                encode_value(col.as_ref(), r, &mut scratch, jsonb_cols[c], uuid_cols[c], &mut sf);
+                encode_value(
+                    col.as_ref(),
+                    r,
+                    &mut scratch,
+                    jsonb_cols[c],
+                    uuid_cols[c],
+                    &mut sf,
+                );
             }
             rows.push(DataRow::new(scratch.split(), n_cols as i16));
         }
@@ -320,8 +327,11 @@ fn encode_value_binary(
     // - `Utf8` / `LargeUtf8`: result of `json_agg` / `jsonb_agg` UDAFs, which
     //   accumulate JSON text as Utf8. Apply the same 0x01 prefix so drivers see
     //   valid binary JSONB.
-    if is_jsonb && matches!(col.data_type(),
-        DataType::LargeBinary | DataType::Binary | DataType::Utf8 | DataType::LargeUtf8)
+    if is_jsonb
+        && matches!(
+            col.data_type(),
+            DataType::LargeBinary | DataType::Binary | DataType::Utf8 | DataType::LargeUtf8
+        )
     {
         let bytes: &[u8] = match col.data_type() {
             DataType::LargeBinary => col.as_binary::<i64>().value(idx),
@@ -768,15 +778,15 @@ fn encode_element_binary(elem_array: &dyn Array, j: usize, buf: &mut BytesMut) {
         DataType::Timestamp(unit, _tz) => {
             let raw: i64 = match unit {
                 TimeUnit::Second => elem_array.as_primitive::<TimestampSecondType>().value(j),
-                TimeUnit::Millisecond => {
-                    elem_array.as_primitive::<TimestampMillisecondType>().value(j)
-                }
-                TimeUnit::Microsecond => {
-                    elem_array.as_primitive::<TimestampMicrosecondType>().value(j)
-                }
-                TimeUnit::Nanosecond => {
-                    elem_array.as_primitive::<TimestampNanosecondType>().value(j)
-                }
+                TimeUnit::Millisecond => elem_array
+                    .as_primitive::<TimestampMillisecondType>()
+                    .value(j),
+                TimeUnit::Microsecond => elem_array
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .value(j),
+                TimeUnit::Nanosecond => elem_array
+                    .as_primitive::<TimestampNanosecondType>()
+                    .value(j),
             };
             let unix_micros: i64 = match unit {
                 TimeUnit::Second => raw.saturating_mul(1_000_000),
@@ -842,11 +852,11 @@ fn encode_array_binary(elem_array: &dyn Array, buf: &mut BytesMut) {
     buf.put_i32(0); // placeholder — overwritten below
 
     // Array header.
-    buf.put_i32(1);             // ndim = 1
+    buf.put_i32(1); // ndim = 1
     buf.put_i32(has_nulls);
     buf.put_u32(elem_oid);
-    buf.put_i32(n as i32);      // dim_len
-    buf.put_i32(1);             // lower_bound (1-indexed)
+    buf.put_i32(n as i32); // dim_len
+    buf.put_i32(1); // lower_bound (1-indexed)
 
     // Elements.
     for j in 0..n {
@@ -1530,9 +1540,9 @@ mod tests {
         let body_len = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
         assert!(body_len >= 8, "body_len too small: {body_len}");
         let ndigits = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
-        let weight  = i16::from_be_bytes(bytes[6..8].try_into().unwrap());
-        let sign    = u16::from_be_bytes(bytes[8..10].try_into().unwrap());
-        let dscale  = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
+        let weight = i16::from_be_bytes(bytes[6..8].try_into().unwrap());
+        let sign = u16::from_be_bytes(bytes[8..10].try_into().unwrap());
+        let dscale = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
         let mut digits = Vec::with_capacity(ndigits as usize);
         for i in 0..ndigits as usize {
             let off = 12 + i * 2;
@@ -1544,13 +1554,23 @@ mod tests {
 
     // Reconstruct the decimal value from PG numeric binary fields for
     // round-trip checking.
-    fn pg_numeric_to_f64(ndigits: u16, weight: i16, sign: u16, _dscale: u16, digits: &[u16]) -> f64 {
+    fn pg_numeric_to_f64(
+        ndigits: u16,
+        weight: i16,
+        sign: u16,
+        _dscale: u16,
+        digits: &[u16],
+    ) -> f64 {
         let mut val = 0f64;
         for (i, &d) in digits.iter().enumerate() {
             let exp = (weight as i32 - i as i32) * 4;
             val += (d as f64) * 10f64.powi(exp);
         }
-        if sign == 0x4000 { -val } else { val }
+        if sign == 0x4000 {
+            -val
+        } else {
+            val
+        }
     }
 
     // --- Test 1: zero ---
@@ -1638,7 +1658,10 @@ mod tests {
         assert_eq!(digits[1], 5678);
         assert_eq!(digits[2], 9000);
         let v = pg_numeric_to_f64(ndigits, weight, sign, dscale, &digits);
-        assert!((v - (-1234.56789)).abs() < 1e-7, "expected -1234.56789, got {v}");
+        assert!(
+            (v - (-1234.56789)).abs() < 1e-7,
+            "expected -1234.56789, got {v}"
+        );
     }
 
     // --- Test 6: SELECT 0.000001::numeric(38,10) ---
@@ -1714,7 +1737,10 @@ mod tests {
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         // NULL → 4-byte -1 prefix, no body
         assert_eq!(rows[0].data.len(), 4);
-        assert_eq!(i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap()), -1);
+        assert_eq!(
+            i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap()),
+            -1
+        );
     }
 
     // --- Test 9: round-trip via encode_batches_with_formats ---
@@ -1734,8 +1760,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
-        let (ndigits, weight, sign, dscale, digits) =
-            parse_numeric_binary(&rows[0].data);
+        let (ndigits, weight, sign, dscale, digits) = parse_numeric_binary(&rows[0].data);
         assert_eq!(sign, 0x0000);
         assert_eq!(dscale, 1);
         assert_eq!(weight, 0);
@@ -1754,11 +1779,14 @@ mod tests {
     fn parse_array_header(data: &[u8]) -> (i32, i32, u32, i32, i32, &[u8]) {
         // First 4 bytes = outer length prefix (body size).
         let body_len = i32::from_be_bytes(data[0..4].try_into().unwrap());
-        assert!(body_len >= 0, "NULL array not expected in parse_array_header");
-        let ndim      = i32::from_be_bytes(data[4..8].try_into().unwrap());
+        assert!(
+            body_len >= 0,
+            "NULL array not expected in parse_array_header"
+        );
+        let ndim = i32::from_be_bytes(data[4..8].try_into().unwrap());
         let has_nulls = i32::from_be_bytes(data[8..12].try_into().unwrap());
-        let elem_oid  = u32::from_be_bytes(data[12..16].try_into().unwrap());
-        let dim_len   = i32::from_be_bytes(data[16..20].try_into().unwrap());
+        let elem_oid = u32::from_be_bytes(data[12..16].try_into().unwrap());
+        let dim_len = i32::from_be_bytes(data[16..20].try_into().unwrap());
         let lower_bound = i32::from_be_bytes(data[20..24].try_into().unwrap());
         let elements = &data[24..4 + body_len as usize];
         (ndim, has_nulls, elem_oid, dim_len, lower_bound, elements)
@@ -1794,13 +1822,12 @@ mod tests {
         let values = Arc::new(Int32Array::from(vec![1i32, 2, 3]));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 3]));
         let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("arr", DataType::List(elem_field), true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(list)],
-        ).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "arr",
+            DataType::List(elem_field),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         let data = &rows[0].data;
         let (ndim, has_nulls, elem_oid, dim_len, lower_bound, elems_bytes) =
@@ -1828,14 +1855,15 @@ mod tests {
         let values = Arc::new(Int64Array::from(vec![Some(1i64), None, Some(3)]));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 3]));
         let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("arr", DataType::List(elem_field), true),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "arr",
+            DataType::List(elem_field),
+            true,
+        )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         let data = &rows[0].data;
-        let (ndim, has_nulls, elem_oid, dim_len, _lower, elems_bytes) =
-            parse_array_header(data);
+        let (ndim, has_nulls, elem_oid, dim_len, _lower, elems_bytes) = parse_array_header(data);
         assert_eq!(ndim, 1);
         assert_eq!(has_nulls, 1);
         assert_eq!(elem_oid, Type::INT8.oid());
@@ -1856,9 +1884,11 @@ mod tests {
         let values = Arc::new(Int32Array::from(vec![] as Vec<i32>));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0]));
         let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("arr", DataType::List(elem_field), true),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "arr",
+            DataType::List(elem_field),
+            true,
+        )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         let data = &rows[0].data;
@@ -1881,14 +1911,15 @@ mod tests {
         let values = Arc::new(StringArray::from(vec!["hello", "world"]));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2]));
         let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("arr", DataType::List(elem_field), true),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "arr",
+            DataType::List(elem_field),
+            true,
+        )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         let data = &rows[0].data;
-        let (_ndim, has_nulls, elem_oid, dim_len, _lower, elems_bytes) =
-            parse_array_header(data);
+        let (_ndim, has_nulls, elem_oid, dim_len, _lower, elems_bytes) = parse_array_header(data);
         assert_eq!(has_nulls, 0);
         assert_eq!(elem_oid, Type::TEXT.oid()); // 25
         assert_eq!(dim_len, 2);
@@ -1907,14 +1938,15 @@ mod tests {
         let values = Arc::new(Int32Array::from(vec![None::<i32>, None::<i32>]));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2]));
         let list = ArrowListArray::new(elem_field.clone(), offsets, values, None);
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("arr", DataType::List(elem_field), true),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "arr",
+            DataType::List(elem_field),
+            true,
+        )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         let data = &rows[0].data;
-        let (_ndim, has_nulls, _elem_oid, dim_len, _lower, elems_bytes) =
-            parse_array_header(data);
+        let (_ndim, has_nulls, _elem_oid, dim_len, _lower, elems_bytes) = parse_array_header(data);
         assert_eq!(has_nulls, 1);
         assert_eq!(dim_len, 2);
         let elems = parse_elements(elems_bytes);
@@ -1935,9 +1967,11 @@ mod tests {
         // Mark the single row NULL.
         let nulls = NullBuffer::from(vec![false]);
         let list = ArrowListArray::new(elem_field.clone(), offsets, values, Some(nulls));
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("arr", DataType::List(elem_field), true),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "arr",
+            DataType::List(elem_field),
+            true,
+        )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         let data = &rows[0].data;
@@ -1957,9 +1991,11 @@ mod tests {
         let values = Arc::new(Int32Array::from(vec![10i32, 20]));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 2]));
         let list = ArrowLargeListArray::new(elem_field.clone(), offsets, values, None);
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("arr", DataType::LargeList(elem_field), true),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "arr",
+            DataType::LargeList(elem_field),
+            true,
+        )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
         let rows = encode_batches_with_formats(&schema, &[batch], &[1]).unwrap();
         let data = &rows[0].data;

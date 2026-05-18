@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use basin_common::{Result, ProjectId};
+use basin_common::{ProjectId, Result};
 use basin_engine::{Engine, ExecResult};
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Mutex;
@@ -180,7 +180,11 @@ impl CronRunner {
         self.tick().await
     }
 
-    async fn tick_project(&self, project: &ProjectId, now: DateTime<Utc>) -> Result<Vec<RunOutcome>> {
+    async fn tick_project(
+        &self,
+        project: &ProjectId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<RunOutcome>> {
         let last = {
             let mut anchors = self.inner.last_tick.lock().await;
             let anchor = anchors.entry(*project).or_insert(now);

@@ -41,7 +41,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use basin_common::{Result, ProjectId};
+use basin_common::{ProjectId, Result};
 use basin_engine::{Engine, ProjectSession};
 use tokio::sync::{oneshot, Mutex};
 use tracing::instrument;
@@ -132,7 +132,10 @@ impl SessionPool {
         project: ProjectId,
         client_key: Option<String>,
     ) -> Result<PooledSession> {
-        let key = PoolKey { project, client_key };
+        let key = PoolKey {
+            project,
+            client_key,
+        };
 
         loop {
             // Step 1: try to satisfy from the cache, or detect that we
@@ -434,7 +437,10 @@ mod tests {
             .acquire(project, Some("alice".to_string()))
             .await
             .unwrap();
-        let s2 = pool.acquire(project, Some("bob".to_string())).await.unwrap();
+        let s2 = pool
+            .acquire(project, Some("bob".to_string()))
+            .await
+            .unwrap();
 
         let pool_clone = pool.clone();
         let mut blocked = tokio::spawn(async move {

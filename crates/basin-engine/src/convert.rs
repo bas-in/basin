@@ -24,9 +24,9 @@ use arrow_schema as ws_schema;
 use arrow_schema::IntervalUnit as WsIntervalUnit;
 use arrow_schema::TimeUnit as WsTimeUnit;
 // Buffer types used when constructing workspace-side ListArrays.
-use arrow::buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer, ScalarBuffer};
-use arrow::buffer::ScalarBuffer as WsScalarBuffer;
 use arrow::array::BooleanBufferBuilder as WsBooleanBufferBuilder;
+use arrow::buffer::ScalarBuffer as WsScalarBuffer;
+use arrow::buffer::{NullBuffer as WsNullBuffer, OffsetBuffer as WsOffsetBuffer, ScalarBuffer};
 
 // DataFusion-side (v53) imports.
 use datafusion::arrow::array as df_array;
@@ -131,20 +131,20 @@ fn data_type_ws_to_df(dt: &ws_schema::DataType) -> Result<df_schema::DataType> {
         ws_schema::DataType::UInt64 => df_schema::DataType::UInt64,
         ws_schema::DataType::Interval(u) => df_schema::DataType::Interval(intervalunit_ws_to_df(u)),
         ws_schema::DataType::Duration(u) => df_schema::DataType::Duration(timeunit_ws_to_df(u)),
-        ws_schema::DataType::List(child) => df_schema::DataType::List(Arc::new(
-            df_schema::Field::new(
+        ws_schema::DataType::List(child) => {
+            df_schema::DataType::List(Arc::new(df_schema::Field::new(
                 child.name().clone(),
                 data_type_ws_to_df(child.data_type())?,
                 child.is_nullable(),
-            ),
-        )),
-        ws_schema::DataType::LargeList(child) => df_schema::DataType::LargeList(Arc::new(
-            df_schema::Field::new(
+            )))
+        }
+        ws_schema::DataType::LargeList(child) => {
+            df_schema::DataType::LargeList(Arc::new(df_schema::Field::new(
                 child.name().clone(),
                 data_type_ws_to_df(child.data_type())?,
                 child.is_nullable(),
-            ),
-        )),
+            )))
+        }
         ws_schema::DataType::FixedSizeList(child, n) => df_schema::DataType::FixedSizeList(
             Arc::new(df_schema::Field::new(
                 child.name().clone(),
@@ -190,24 +190,22 @@ fn data_type_df_to_ws(dt: &df_schema::DataType) -> Result<ws_schema::DataType> {
         }
         df_schema::DataType::Decimal128(p, s) => ws_schema::DataType::Decimal128(*p, *s),
         df_schema::DataType::UInt64 => ws_schema::DataType::UInt64,
-        df_schema::DataType::Interval(u) => {
-            ws_schema::DataType::Interval(intervalunit_df_to_ws(u))
-        }
+        df_schema::DataType::Interval(u) => ws_schema::DataType::Interval(intervalunit_df_to_ws(u)),
         df_schema::DataType::Duration(u) => ws_schema::DataType::Duration(timeunit_df_to_ws(u)),
-        df_schema::DataType::List(child) => ws_schema::DataType::List(Arc::new(
-            ws_schema::Field::new(
+        df_schema::DataType::List(child) => {
+            ws_schema::DataType::List(Arc::new(ws_schema::Field::new(
                 child.name().clone(),
                 data_type_df_to_ws(child.data_type())?,
                 child.is_nullable(),
-            ),
-        )),
-        df_schema::DataType::LargeList(child) => ws_schema::DataType::LargeList(Arc::new(
-            ws_schema::Field::new(
+            )))
+        }
+        df_schema::DataType::LargeList(child) => {
+            ws_schema::DataType::LargeList(Arc::new(ws_schema::Field::new(
                 child.name().clone(),
                 data_type_df_to_ws(child.data_type())?,
                 child.is_nullable(),
-            ),
-        )),
+            )))
+        }
         df_schema::DataType::FixedSizeList(child, n) => ws_schema::DataType::FixedSizeList(
             Arc::new(ws_schema::Field::new(
                 child.name().clone(),
@@ -523,8 +521,7 @@ pub(crate) fn batch_ws_to_df(batch: &ws_array::RecordBatch) -> Result<df_array::
             }
             df_schema::DataType::Duration(unit) => {
                 use datafusion::arrow::array::types::{
-                    DurationMicrosecondType as DfDurMicros,
-                    DurationMillisecondType as DfDurMilli,
+                    DurationMicrosecondType as DfDurMicros, DurationMillisecondType as DfDurMilli,
                     DurationNanosecondType as DfDurNanos, DurationSecondType as DfDurSec,
                 };
                 let vals: Vec<Option<i64>> = match unit {
@@ -587,9 +584,9 @@ pub(crate) fn batch_ws_to_df(batch: &ws_array::RecordBatch) -> Result<df_array::
                 };
                 let dt = df_schema::DataType::Duration(*unit);
                 let arr: Arc<dyn df_array::Array> = match unit {
-                    DfTimeUnit::Second => {
-                        Arc::new(df_array::PrimitiveArray::<DfDurSec>::from(vals).with_data_type(dt))
-                    }
+                    DfTimeUnit::Second => Arc::new(
+                        df_array::PrimitiveArray::<DfDurSec>::from(vals).with_data_type(dt),
+                    ),
                     DfTimeUnit::Millisecond => Arc::new(
                         df_array::PrimitiveArray::<DfDurMilli>::from(vals).with_data_type(dt),
                     ),
@@ -614,16 +611,15 @@ pub(crate) fn batch_ws_to_df(batch: &ws_array::RecordBatch) -> Result<df_array::
                     })?;
                 // Convert child values (WS-typed) to DF-typed via a single-column batch.
                 let ws_child_type = data_type_df_to_ws(child_field.data_type())?;
-                let ws_child_schema = Arc::new(ws_schema::Schema::new(vec![ws_schema::Field::new(
-                    child_field.name().clone(),
-                    ws_child_type,
-                    child_field.is_nullable(),
-                )]));
-                let child_batch = ws_array::RecordBatch::try_new(
-                    ws_child_schema,
-                    vec![s.values().clone()],
-                )
-                .map_err(|e| BasinError::internal(format!("ListArray child batch: {e}")))?;
+                let ws_child_schema =
+                    Arc::new(ws_schema::Schema::new(vec![ws_schema::Field::new(
+                        child_field.name().clone(),
+                        ws_child_type,
+                        child_field.is_nullable(),
+                    )]));
+                let child_batch =
+                    ws_array::RecordBatch::try_new(ws_child_schema, vec![s.values().clone()])
+                        .map_err(|e| BasinError::internal(format!("ListArray child batch: {e}")))?;
                 let child_df_batch = batch_ws_to_df(&child_batch)?;
                 let df_child_arr = child_df_batch.column(0).clone();
                 // Rebuild DF offsets from raw i32 values (cross-version safe).
@@ -655,16 +651,17 @@ pub(crate) fn batch_ws_to_df(batch: &ws_array::RecordBatch) -> Result<df_array::
                         ))
                     })?;
                 let ws_child_type = data_type_df_to_ws(child_field.data_type())?;
-                let ws_child_schema = Arc::new(ws_schema::Schema::new(vec![ws_schema::Field::new(
-                    child_field.name().clone(),
-                    ws_child_type,
-                    child_field.is_nullable(),
-                )]));
-                let child_batch = ws_array::RecordBatch::try_new(
-                    ws_child_schema,
-                    vec![s.values().clone()],
-                )
-                .map_err(|e| BasinError::internal(format!("LargeListArray child batch: {e}")))?;
+                let ws_child_schema =
+                    Arc::new(ws_schema::Schema::new(vec![ws_schema::Field::new(
+                        child_field.name().clone(),
+                        ws_child_type,
+                        child_field.is_nullable(),
+                    )]));
+                let child_batch =
+                    ws_array::RecordBatch::try_new(ws_child_schema, vec![s.values().clone()])
+                        .map_err(|e| {
+                            BasinError::internal(format!("LargeListArray child batch: {e}"))
+                        })?;
                 let child_df_batch = batch_ws_to_df(&child_batch)?;
                 let df_child_arr = child_df_batch.column(0).clone();
                 let raw_offsets: Vec<i64> = s.offsets().iter().copied().collect();
@@ -813,7 +810,10 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                         .as_any()
                         .downcast_ref::<df_array::StringArray>()
                         .ok_or_else(|| {
-                            BasinError::internal(format!("expected StringArray for {}", field.name()))
+                            BasinError::internal(format!(
+                                "expected StringArray for {}",
+                                field.name()
+                            ))
                         })?;
                     let vals: Vec<Option<String>> = (0..s.len())
                         .map(|j| {
@@ -886,7 +886,10 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                         .as_any()
                         .downcast_ref::<df_array::BinaryArray>()
                         .ok_or_else(|| {
-                            BasinError::internal(format!("expected BinaryArray for {}", field.name()))
+                            BasinError::internal(format!(
+                                "expected BinaryArray for {}",
+                                field.name()
+                            ))
                         })?;
                     let vals: Vec<Option<&[u8]>> = (0..s.len())
                         .map(|j| if s.is_null(j) { None } else { Some(s.value(j)) })
@@ -1114,30 +1117,21 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                     .as_any()
                     .downcast_ref::<df_array::ListArray>()
                     .ok_or_else(|| {
-                        BasinError::internal(format!(
-                            "expected ListArray for {}",
-                            field.name()
-                        ))
+                        BasinError::internal(format!("expected ListArray for {}", field.name()))
                     })?;
 
                 // Translate the flat child values array recursively.
                 // Build a 1-column RecordBatch for the child, translate it,
                 // then extract the column back out.
-                let child_df_schema = Arc::new(df_schema::Schema::new(vec![
-                    df_schema::Field::new(
+                let child_df_schema =
+                    Arc::new(df_schema::Schema::new(vec![df_schema::Field::new(
                         ws_child_field.name(),
-                        df_list
-                            .values()
-                            .data_type()
-                            .clone(),
+                        df_list.values().data_type().clone(),
                         ws_child_field.is_nullable(),
-                    ),
-                ]));
-                let child_batch = df_array::RecordBatch::try_new(
-                    child_df_schema,
-                    vec![df_list.values().clone()],
-                )
-                .map_err(|e| BasinError::internal(format!("list child batch: {e}")))?;
+                    )]));
+                let child_batch =
+                    df_array::RecordBatch::try_new(child_df_schema, vec![df_list.values().clone()])
+                        .map_err(|e| BasinError::internal(format!("list child batch: {e}")))?;
                 let translated_child_batch = batch_df_to_ws(&child_batch)?;
                 let ws_child_values = translated_child_batch.column(0).clone();
 
@@ -1182,8 +1176,7 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
             }
             ws_schema::DataType::Duration(unit) => {
                 use arrow_array::types::{
-                    DurationMicrosecondType as WsDurMicros,
-                    DurationMillisecondType as WsDurMilli,
+                    DurationMicrosecondType as WsDurMicros, DurationMillisecondType as WsDurMilli,
                     DurationNanosecondType as WsDurNanos, DurationSecondType as WsDurSec,
                 };
                 use datafusion::arrow::array::DurationMicrosecondArray as DfDurMicros;
@@ -1264,11 +1257,12 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                         ))
                     })?;
                 let df_child_type = data_type_ws_to_df(ws_child_field.data_type())?;
-                let df_child_schema = Arc::new(df_schema::Schema::new(vec![df_schema::Field::new(
-                    ws_child_field.name().clone(),
-                    df_child_type,
-                    ws_child_field.is_nullable(),
-                )]));
+                let df_child_schema =
+                    Arc::new(df_schema::Schema::new(vec![df_schema::Field::new(
+                        ws_child_field.name().clone(),
+                        df_child_type,
+                        ws_child_field.is_nullable(),
+                    )]));
                 let child_df_batch =
                     df_array::RecordBatch::try_new(df_child_schema, vec![s.values().clone()])
                         .map_err(|e| {
@@ -1277,8 +1271,7 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 let child_ws_batch = batch_df_to_ws(&child_df_batch)?;
                 let ws_child_arr = child_ws_batch.column(0).clone();
                 let raw_offsets: Vec<i64> = s.offsets().iter().copied().collect();
-                let ws_offsets =
-                    WsOffsetBuffer::new(WsScalarBuffer::from(raw_offsets));
+                let ws_offsets = WsOffsetBuffer::new(WsScalarBuffer::from(raw_offsets));
                 let ws_nulls = s.nulls().map(|nb| {
                     let bools: Vec<bool> = (0..nb.len()).map(|i| nb.is_valid(i)).collect();
                     WsNullBuffer::from(bools)
@@ -1299,8 +1292,7 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
             // downstream pgwire encoding sees the right tick scale.
             ws_schema::DataType::Time64(ws_unit) => {
                 use arrow_array::types::{
-                    Time64MicrosecondType as WsTime64Micros,
-                    Time64NanosecondType as WsTime64Nanos,
+                    Time64MicrosecondType as WsTime64Micros, Time64NanosecondType as WsTime64Nanos,
                 };
                 use datafusion::arrow::array::Time64MicrosecondArray as DfTime64Micros;
                 use datafusion::arrow::array::Time64NanosecondArray as DfTime64Nanos;
@@ -1343,12 +1335,10 @@ pub(crate) fn batch_df_to_ws(batch: &df_array::RecordBatch) -> Result<ws_array::
                 let dt = ws_schema::DataType::Time64(*ws_unit);
                 let arr: Arc<dyn ws_array::Array> = match ws_unit {
                     WsTimeUnit::Microsecond => Arc::new(
-                        ws_array::PrimitiveArray::<WsTime64Micros>::from(vals)
-                            .with_data_type(dt),
+                        ws_array::PrimitiveArray::<WsTime64Micros>::from(vals).with_data_type(dt),
                     ),
                     WsTimeUnit::Nanosecond => Arc::new(
-                        ws_array::PrimitiveArray::<WsTime64Nanos>::from(vals)
-                            .with_data_type(dt),
+                        ws_array::PrimitiveArray::<WsTime64Nanos>::from(vals).with_data_type(dt),
                     ),
                     _ => unreachable!("filtered above"),
                 };
@@ -1389,8 +1379,11 @@ mod tests {
 
     #[test]
     fn test_schema_uint64_roundtrip() {
-        let ws_schema =
-            ws_schema::Schema::new(vec![ws_schema::Field::new("n", ws_schema::DataType::UInt64, true)]);
+        let ws_schema = ws_schema::Schema::new(vec![ws_schema::Field::new(
+            "n",
+            ws_schema::DataType::UInt64,
+            true,
+        )]);
         let df_schema = schema_ws_to_df(&ws_schema).expect("ws→df");
         assert_eq!(
             df_schema.field(0).data_type(),
@@ -1427,7 +1420,11 @@ mod tests {
 
     #[test]
     fn test_schema_list_int32_roundtrip() {
-        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Int32, true));
+        let inner = Arc::new(ws_schema::Field::new(
+            "item",
+            ws_schema::DataType::Int32,
+            true,
+        ));
         let ws_schema = ws_schema::Schema::new(vec![ws_schema::Field::new(
             "arr",
             ws_schema::DataType::List(inner),
@@ -1442,7 +1439,11 @@ mod tests {
 
     #[test]
     fn test_schema_list_utf8_roundtrip() {
-        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Utf8, true));
+        let inner = Arc::new(ws_schema::Field::new(
+            "item",
+            ws_schema::DataType::Utf8,
+            true,
+        ));
         let ws_schema = ws_schema::Schema::new(vec![ws_schema::Field::new(
             "tags",
             ws_schema::DataType::List(inner),
@@ -1520,7 +1521,11 @@ mod tests {
         builder.append(true);
         let arr = Arc::new(builder.finish());
 
-        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Int32, true));
+        let inner = Arc::new(ws_schema::Field::new(
+            "item",
+            ws_schema::DataType::Int32,
+            true,
+        ));
         let batch = ws_batch_one_col("arr", ws_schema::DataType::List(inner), arr);
 
         let df_batch = batch_ws_to_df(&batch).expect("ws→df");
@@ -1558,7 +1563,11 @@ mod tests {
         builder.append(true);
         let arr = Arc::new(builder.finish());
 
-        let inner = Arc::new(ws_schema::Field::new("item", ws_schema::DataType::Utf8, true));
+        let inner = Arc::new(ws_schema::Field::new(
+            "item",
+            ws_schema::DataType::Utf8,
+            true,
+        ));
         let batch = ws_batch_one_col("tags", ws_schema::DataType::List(inner), arr);
 
         let df_batch = batch_ws_to_df(&batch).expect("ws→df");
@@ -1585,10 +1594,15 @@ mod tests {
     #[test]
     fn test_batch_df_to_ws_uint64() {
         use datafusion::arrow::array::UInt64Array as DfUInt64Array;
-        use datafusion::arrow::datatypes::{DataType as DfDataType, Field as DfField,
-                                           Schema as DfSchema};
+        use datafusion::arrow::datatypes::{
+            DataType as DfDataType, Field as DfField, Schema as DfSchema,
+        };
 
-        let df_schema = Arc::new(DfSchema::new(vec![DfField::new("n", DfDataType::UInt64, true)]));
+        let df_schema = Arc::new(DfSchema::new(vec![DfField::new(
+            "n",
+            DfDataType::UInt64,
+            true,
+        )]));
         let vals: Vec<Option<u64>> = vec![Some(1), Some(2), None];
         let arr = Arc::new(DfUInt64Array::from(vals));
         let df_batch = datafusion::arrow::array::RecordBatch::try_new(df_schema, vec![arr as _])
@@ -1611,13 +1625,10 @@ mod tests {
     #[test]
     fn test_batch_df_to_ws_duration_second() {
         use datafusion::arrow::array::{
-            RecordBatch as DfRecordBatch,
-            types::DurationSecondType,
-            PrimitiveArray as DfPrimArray,
+            types::DurationSecondType, PrimitiveArray as DfPrimArray, RecordBatch as DfRecordBatch,
         };
         use datafusion::arrow::datatypes::{
-            DataType as DfDataType, Field as DfField, Schema as DfSchema,
-            TimeUnit as DfTimeUnit,
+            DataType as DfDataType, Field as DfField, Schema as DfSchema, TimeUnit as DfTimeUnit,
         };
 
         let df_schema = Arc::new(DfSchema::new(vec![DfField::new(
@@ -1626,9 +1637,10 @@ mod tests {
             true,
         )]));
         let vals: Vec<Option<i64>> = vec![Some(3600), None, Some(-60)];
-        let arr: Arc<dyn datafusion::arrow::array::Array> =
-            Arc::new(DfPrimArray::<DurationSecondType>::from(vals)
-                .with_data_type(DfDataType::Duration(DfTimeUnit::Second)));
+        let arr: Arc<dyn datafusion::arrow::array::Array> = Arc::new(
+            DfPrimArray::<DurationSecondType>::from(vals)
+                .with_data_type(DfDataType::Duration(DfTimeUnit::Second)),
+        );
         let df_batch = DfRecordBatch::try_new(df_schema, vec![arr]).expect("df batch");
 
         let ws_batch = batch_df_to_ws(&df_batch).expect("df→ws");
@@ -1653,20 +1665,28 @@ mod tests {
         use datafusion::arrow::array::{
             RecordBatch as DfRecordBatch, StringViewArray as DfStringViewArray,
         };
-        use datafusion::arrow::datatypes::{DataType as DfDataType, Field as DfField, Schema as DfSchema};
+        use datafusion::arrow::datatypes::{
+            DataType as DfDataType, Field as DfField, Schema as DfSchema,
+        };
 
         let df_schema = Arc::new(DfSchema::new(vec![DfField::new(
             "s",
             DfDataType::Utf8View,
             true,
         )]));
-        let arr: Arc<dyn datafusion::arrow::array::Array> = Arc::new(
-            DfStringViewArray::from(vec![Some("hello"), None, Some("world")]),
-        );
+        let arr: Arc<dyn datafusion::arrow::array::Array> =
+            Arc::new(DfStringViewArray::from(vec![
+                Some("hello"),
+                None,
+                Some("world"),
+            ]));
         let df_batch = DfRecordBatch::try_new(df_schema, vec![arr]).expect("df batch");
 
         let ws_batch = batch_df_to_ws(&df_batch).expect("df→ws Utf8View should succeed");
-        assert_eq!(ws_batch.schema().field(0).data_type(), &ws_schema::DataType::Utf8);
+        assert_eq!(
+            ws_batch.schema().field(0).data_type(),
+            &ws_schema::DataType::Utf8
+        );
         let out = ws_batch
             .column(0)
             .as_any()
@@ -1685,20 +1705,28 @@ mod tests {
         use datafusion::arrow::array::{
             BinaryViewArray as DfBinaryViewArray, RecordBatch as DfRecordBatch,
         };
-        use datafusion::arrow::datatypes::{DataType as DfDataType, Field as DfField, Schema as DfSchema};
+        use datafusion::arrow::datatypes::{
+            DataType as DfDataType, Field as DfField, Schema as DfSchema,
+        };
 
         let df_schema = Arc::new(DfSchema::new(vec![DfField::new(
             "b",
             DfDataType::BinaryView,
             true,
         )]));
-        let arr: Arc<dyn datafusion::arrow::array::Array> = Arc::new(
-            DfBinaryViewArray::from(vec![Some(b"foo" as &[u8]), None, Some(b"bar")]),
-        );
+        let arr: Arc<dyn datafusion::arrow::array::Array> =
+            Arc::new(DfBinaryViewArray::from(vec![
+                Some(b"foo" as &[u8]),
+                None,
+                Some(b"bar"),
+            ]));
         let df_batch = DfRecordBatch::try_new(df_schema, vec![arr]).expect("df batch");
 
         let ws_batch = batch_df_to_ws(&df_batch).expect("df→ws BinaryView should succeed");
-        assert_eq!(ws_batch.schema().field(0).data_type(), &ws_schema::DataType::Binary);
+        assert_eq!(
+            ws_batch.schema().field(0).data_type(),
+            &ws_schema::DataType::Binary
+        );
         let out = ws_batch
             .column(0)
             .as_any()

@@ -123,14 +123,22 @@ async fn pg_description_selectable() {
 async fn pg_stat_user_tables_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_user_tables LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_user_tables LIMIT 1",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn pg_stat_user_indexes_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_user_indexes LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_user_indexes LIMIT 1",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -165,7 +173,11 @@ async fn pg_stat_bgwriter_selectable() {
 async fn pg_stat_replication_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_replication LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_replication LIMIT 1",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -179,28 +191,44 @@ async fn pg_stat_archiver_selectable() {
 async fn pg_stat_wal_receiver_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_wal_receiver LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_wal_receiver LIMIT 1",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn pg_stat_subscription_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_subscription LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_subscription LIMIT 1",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn pg_stat_user_functions_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_user_functions LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_user_functions LIMIT 1",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn pg_stat_progress_vacuum_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_progress_vacuum LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_progress_vacuum LIMIT 1",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -218,7 +246,11 @@ async fn pg_stat_progress_create_index_selectable() {
 async fn pg_stat_progress_analyze_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(&sess, "SELECT * FROM pg_catalog.pg_stat_progress_analyze LIMIT 1").await;
+    assert_no_error(
+        &sess,
+        "SELECT * FROM pg_catalog.pg_stat_progress_analyze LIMIT 1",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

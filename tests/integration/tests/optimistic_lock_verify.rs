@@ -76,8 +76,7 @@ async fn start_server() -> TestServer {
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -325,14 +324,20 @@ async fn optimistic_lock_single_writer_baseline() {
     // Read row count and version together using aggregate to avoid any
     // per-column type-inference issues from the RETURNING path.
     let check = client
-        .query("SELECT COUNT(*) AS n, MAX(version) AS ver FROM events2 WHERE id = 1", &[])
+        .query(
+            "SELECT COUNT(*) AS n, MAX(version) AS ver FROM events2 WHERE id = 1",
+            &[],
+        )
         .await
         .expect("final check");
     assert_eq!(check.len(), 1, "aggregate must return one row");
     let count: i64 = check[0].get(0);
     let max_ver: i64 = check[0].get(1);
     assert_eq!(count, 1, "exactly one row for id=1");
-    assert_eq!(max_ver, 2, "version must be 2 after the single successful update");
+    assert_eq!(
+        max_ver, 2,
+        "version must be 2 after the single successful update"
+    );
 
     // Also verify val directly.
     let val_rows = client

@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use basin_common::{Result, ProjectId};
+use basin_common::{ProjectId, Result};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;

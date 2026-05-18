@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, QualifiedTableName, Result, SchemaName, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::instrument;
@@ -24,10 +24,10 @@ use crate::metadata::{
     TableMetadata, UniqueConstraint,
 };
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
+use crate::project_storage_config::ProjectStorageConfig;
 use crate::reactors::{self, ReactorDef, ReactorError};
 use crate::sequences::{advance_one, SequenceDef, SequenceError, SequenceState};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
-use crate::project_storage_config::ProjectStorageConfig;
 use crate::views::ViewDef;
 use crate::Catalog;
 
@@ -429,7 +429,11 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
-    async fn list_snapshots(&self, project: &ProjectId, table: &TableName) -> Result<Vec<Snapshot>> {
+    async fn list_snapshots(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<Vec<Snapshot>> {
         let qtable = QualifiedTableName::in_public(table.clone());
         self.list_snapshots_qualified(project, &qtable).await
     }
@@ -466,7 +470,8 @@ impl Catalog for InMemoryCatalog {
         spec: PartitionSpec,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_partition_spec_qualified(project, &qtable, spec).await
+        self.set_partition_spec_qualified(project, &qtable, spec)
+            .await
     }
 
     #[instrument(skip(self, policies), fields(project = %project, table = %table))]
@@ -478,7 +483,8 @@ impl Catalog for InMemoryCatalog {
         policies: Vec<Policy>,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_rls_state_qualified(project, &qtable, rls_enabled, policies).await
+        self.set_rls_state_qualified(project, &qtable, rls_enabled, policies)
+            .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -490,7 +496,8 @@ impl Catalog for InMemoryCatalog {
         cold_age_column: Option<String>,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_tier_policy_qualified(project, &qtable, cold_after_seconds, cold_age_column).await
+        self.set_tier_policy_qualified(project, &qtable, cold_after_seconds, cold_age_column)
+            .await
     }
 
     #[instrument(skip(self, columns), fields(project = %project, table = %table, n = columns.len()))]
@@ -501,7 +508,8 @@ impl Catalog for InMemoryCatalog {
         columns: Vec<String>,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_bloom_filter_columns_qualified(project, &qtable, columns).await
+        self.set_bloom_filter_columns_qualified(project, &qtable, columns)
+            .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -512,11 +520,17 @@ impl Catalog for InMemoryCatalog {
         rows: Option<usize>,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_row_group_rows_qualified(project, &qtable, rows).await
+        self.set_row_group_rows_qualified(project, &qtable, rows)
+            .await
     }
 
     #[instrument(skip(self, schema), fields(project = %project, table = %table))]
-    async fn set_schema(&self, project: &ProjectId, table: &TableName, schema: Schema) -> Result<()> {
+    async fn set_schema(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        schema: Schema,
+    ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
         self.set_schema_qualified(project, &qtable, schema).await
     }
@@ -529,7 +543,8 @@ impl Catalog for InMemoryCatalog {
         def: Option<CvDef>,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_continuous_aggregate_qualified(project, &qtable, def).await
+        self.set_continuous_aggregate_qualified(project, &qtable, def)
+            .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -540,7 +555,8 @@ impl Catalog for InMemoryCatalog {
         columns: Vec<String>,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_cluster_columns_qualified(project, &qtable, columns).await
+        self.set_cluster_columns_qualified(project, &qtable, columns)
+            .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -551,7 +567,8 @@ impl Catalog for InMemoryCatalog {
         region: Option<String>,
     ) -> Result<()> {
         let qtable = QualifiedTableName::in_public(table.clone());
-        self.set_home_region_qualified(project, &qtable, region).await
+        self.set_home_region_qualified(project, &qtable, region)
+            .await
     }
 
     #[instrument(skip(self, check_constraints, foreign_keys), fields(project = %project, table = %table))]
@@ -583,7 +600,6 @@ impl Catalog for InMemoryCatalog {
         state.unique_constraints = unique_constraints;
         Ok(())
     }
-
 
     #[instrument(skip(self, columns), fields(project = %project, table = %table, name = %name))]
     async fn create_index(
@@ -1067,7 +1083,9 @@ impl Catalog for InMemoryCatalog {
         let key = (*project, name.to_ascii_lowercase());
         let mut map = self.views.lock().await;
         if map.remove(&key).is_none() && !if_exists {
-            return Err(BasinError::NotFound(format!("view {name:?} does not exist")));
+            return Err(BasinError::NotFound(format!(
+                "view {name:?} does not exist"
+            )));
         }
         Ok(())
     }
@@ -1175,10 +1193,7 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    async fn list_tables_qualified(
-        &self,
-        project: &ProjectId,
-    ) -> Result<Vec<QualifiedTableName>> {
+    async fn list_tables_qualified(&self, project: &ProjectId) -> Result<Vec<QualifiedTableName>> {
         let tables = self.tables.lock().await;
         let mut out: Vec<QualifiedTableName> = tables
             .keys()
@@ -1707,7 +1722,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{BasinError, QualifiedTableName, SchemaName, TableName, ProjectId};
+    use basin_common::{BasinError, ProjectId, QualifiedTableName, SchemaName, TableName};
 
     use super::*;
 
@@ -2561,15 +2576,21 @@ mod tests {
             &t,
             &tbl,
             SnapshotId(1),
-            vec![file("batch_b1.parquet", 1, 5), file("batch_b2.parquet", 1, 5)],
+            vec![
+                file("batch_b1.parquet", 1, 5),
+                file("batch_b2.parquet", 1, 5),
+            ],
         )
         .await
         .unwrap();
 
         // Before rollback: live set has all three files (5 rows total).
         let before = cat.load_table(&t, &tbl).await.unwrap();
-        let mut before_paths: Vec<String> =
-            before.live_data_files().into_iter().map(|f| f.path).collect();
+        let mut before_paths: Vec<String> = before
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
         before_paths.sort();
         assert_eq!(
             before_paths,
@@ -2586,8 +2607,11 @@ mod tests {
             .unwrap();
 
         // After rollback: live set must contain ONLY batch_a.parquet.
-        let mut post_paths: Vec<String> =
-            rolled.live_data_files().into_iter().map(|f| f.path).collect();
+        let mut post_paths: Vec<String> = rolled
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
         post_paths.sort();
         assert_eq!(
             post_paths,
@@ -2597,7 +2621,10 @@ mod tests {
 
         // Row count via live_data_files should be 3 (batch A only).
         let row_count: u64 = rolled.live_data_files().iter().map(|f| f.row_count).sum();
-        assert_eq!(row_count, 3, "post-rollback row count via catalog must be 3");
+        assert_eq!(
+            row_count, 3,
+            "post-rollback row count via catalog must be 3"
+        );
     }
 
     /// Genesis snapshot → live_data_files returns empty.
@@ -2620,15 +2647,19 @@ mod tests {
         let t = ProjectId::new();
         let tbl = TableName::new("bug41_append").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
-        cat.append_data_files(&t, &tbl, SnapshotId::GENESIS, vec![file("f1.parquet", 1, 10)])
-            .await
-            .unwrap();
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("f1.parquet", 1, 10)],
+        )
+        .await
+        .unwrap();
         let meta = cat
             .append_data_files(&t, &tbl, SnapshotId(1), vec![file("f2.parquet", 2, 20)])
             .await
             .unwrap();
-        let mut paths: Vec<String> =
-            meta.live_data_files().into_iter().map(|f| f.path).collect();
+        let mut paths: Vec<String> = meta.live_data_files().into_iter().map(|f| f.path).collect();
         paths.sort();
         assert_eq!(paths, vec!["f1.parquet", "f2.parquet"]);
     }
@@ -2661,8 +2692,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut paths: Vec<String> =
-            meta.live_data_files().into_iter().map(|f| f.path).collect();
+        let mut paths: Vec<String> = meta.live_data_files().into_iter().map(|f| f.path).collect();
         paths.sort();
         // old1 removed, new1 added, old2 retained.
         assert_eq!(paths, vec!["new1.parquet", "old2.parquet"]);
@@ -2978,14 +3008,9 @@ mod tests {
         assert_eq!(dst_meta.current_snapshot, SnapshotId(1));
 
         // Subsequent write to src does not affect dst.
-        cat.append_data_files_qualified(
-            &p,
-            &src,
-            SnapshotId(1),
-            vec![file("e2.parquet", 3, 30)],
-        )
-        .await
-        .unwrap();
+        cat.append_data_files_qualified(&p, &src, SnapshotId(1), vec![file("e2.parquet", 3, 30)])
+            .await
+            .unwrap();
         let dst_reloaded = cat.load_table_qualified(&p, &dst).await.unwrap();
         assert_eq!(dst_reloaded.current_snapshot, SnapshotId(1));
     }

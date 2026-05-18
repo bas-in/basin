@@ -18,8 +18,8 @@
 //!
 //! [`ProjectHandle`]: basin_shard::ProjectHandle
 
-use std::sync::Arc;
 use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -149,7 +149,10 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // placeholders fall through to DataFusion.
     let limit = match q.ext_limit() {
         None => None,
-        Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => match s.parse::<i64>() {
+        Some(Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        })) => match s.parse::<i64>() {
             Ok(n) if n >= 0 => Some(n as usize),
             _ => return None,
         },
@@ -240,21 +243,39 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
         other => (false, other),
     };
     match inner {
-        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => {
             let parsed: i64 = s.parse().ok()?;
             Some(ScalarValue::Int64(if negate { -parsed } else { parsed }))
         }
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::DoubleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::EscapedStringLiteral(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::NationalStringLiteral(s),
+            ..
+        }) => {
             if negate {
                 None
             } else {
                 Some(ScalarValue::Utf8(s.clone()))
             }
         }
-        Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(b),
+            ..
+        }) => {
             if negate {
                 None
             } else {
@@ -577,9 +598,9 @@ mod tests {
         use std::sync::Arc;
         use std::time::Instant;
 
+        use crate::{Engine, EngineConfig};
         use basin_catalog::{Catalog, InMemoryCatalog};
         use basin_common::ProjectId;
-        use crate::{Engine, EngineConfig};
         use object_store::local::LocalFileSystem;
         use tempfile::TempDir;
 
@@ -592,7 +613,11 @@ mod tests {
             page_cache: None,
         });
         let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-        let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+        let engine = Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        });
 
         let project = ProjectId::new();
         let sess = engine.open_session(project).await.unwrap();
@@ -605,25 +630,33 @@ mod tests {
         for i in 0i64..10_000 {
             tuples.push(format!("({i}, {}, 'login', {})", i % 100, i * 1000));
         }
-        sess.execute(&format!("INSERT INTO audit_log VALUES {}", tuples.join(",")))
-            .await
-            .unwrap();
+        sess.execute(&format!(
+            "INSERT INTO audit_log VALUES {}",
+            tuples.join(",")
+        ))
+        .await
+        .unwrap();
 
         const ITERS: usize = 200;
         let mut samples: Vec<f64> = Vec::with_capacity(ITERS);
 
         // Warm up.
         for _ in 0..10 {
-            let _ = sess.execute("SELECT id, user_id FROM audit_log WHERE id = 42").await.unwrap();
+            let _ = sess
+                .execute("SELECT id, user_id FROM audit_log WHERE id = 42")
+                .await
+                .unwrap();
         }
 
         for i in 0..ITERS {
             let t0 = Instant::now();
-            let _ = sess.execute(&format!(
-                "SELECT id, user_id FROM audit_log WHERE id = {}", i as i64 % 10_000
-            ))
-            .await
-            .unwrap();
+            let _ = sess
+                .execute(&format!(
+                    "SELECT id, user_id FROM audit_log WHERE id = {}",
+                    i as i64 % 10_000
+                ))
+                .await
+                .unwrap();
             samples.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
 

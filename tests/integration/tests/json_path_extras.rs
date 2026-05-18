@@ -185,7 +185,11 @@ async fn test_jsonb_path_query_first_field() {
     let s = s.expect("jsonb_path_query_first result");
     let v: serde_json::Value =
         serde_json::from_str(&s).unwrap_or_else(|_| serde_json::Value::String(s.clone()));
-    assert_eq!(v, serde_json::json!("alice"), "path_query_first $.name: {v:?}");
+    assert_eq!(
+        v,
+        serde_json::json!("alice"),
+        "path_query_first $.name: {v:?}"
+    );
 }
 
 #[tokio::test]
@@ -267,7 +271,10 @@ async fn test_json_each_text() {
     )
     .await;
     let s = s.expect("json_each_text result");
-    assert!(s.contains("name") && s.contains("alice"), "json_each_text: {s}");
+    assert!(
+        s.contains("name") && s.contains("alice"),
+        "json_each_text: {s}"
+    );
 }
 
 // ===========================

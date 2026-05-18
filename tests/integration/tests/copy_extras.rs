@@ -192,7 +192,10 @@ async fn copy_from_stdin_custom_null_string() {
         .await
         .expect("query");
     let label: Option<&str> = row.get(0);
-    assert!(label.is_none(), "row 2 label should be NULL, got: {label:?}");
+    assert!(
+        label.is_none(),
+        "row 2 label should be NULL, got: {label:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -245,10 +248,7 @@ async fn copy_to_stdout_pipe_delimiter() {
         .expect("CREATE TABLE");
     for i in 0..3i64 {
         client
-            .execute(
-                "INSERT INTO t VALUES ($1, $2)",
-                &[&i, &format!("name-{i}")],
-            )
+            .execute("INSERT INTO t VALUES ($1, $2)", &[&i, &format!("name-{i}")])
             .await
             .expect("insert");
     }
@@ -325,10 +325,7 @@ async fn copy_query_to_stdout() {
         .expect("CREATE TABLE");
     for i in 0..5i64 {
         client
-            .execute(
-                "INSERT INTO t VALUES ($1, $2)",
-                &[&i, &format!("name-{i}")],
-            )
+            .execute("INSERT INTO t VALUES ($1, $2)", &[&i, &format!("name-{i}")])
             .await
             .expect("insert");
     }
@@ -378,10 +375,7 @@ async fn copy_query_to_stdout_with_header() {
         .expect("CREATE TABLE");
     for i in 0..3i64 {
         client
-            .execute(
-                "INSERT INTO t VALUES ($1, $2)",
-                &[&i, &format!("lbl-{i}")],
-            )
+            .execute("INSERT INTO t VALUES ($1, $2)", &[&i, &format!("lbl-{i}")])
             .await
             .expect("insert");
     }
@@ -532,7 +526,9 @@ async fn copy_from_stdin_column_list_and_delimiter() {
     let client = connect(server.addr).await;
 
     client
-        .simple_query("CREATE TABLE t (a BIGINT NOT NULL, b TEXT NOT NULL, c BIGINT NOT NULL DEFAULT 99)")
+        .simple_query(
+            "CREATE TABLE t (a BIGINT NOT NULL, b TEXT NOT NULL, c BIGINT NOT NULL DEFAULT 99)",
+        )
         .await
         .expect("CREATE TABLE");
 

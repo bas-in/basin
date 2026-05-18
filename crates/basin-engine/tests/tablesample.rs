@@ -213,8 +213,10 @@ async fn out_of_range_percentage_is_rejected() {
     let sess = open(&eng).await;
     seed_table(&sess, 10).await;
 
-    for bad in ["SELECT * FROM samp TABLESAMPLE BERNOULLI(150)",
-                "SELECT * FROM samp TABLESAMPLE SYSTEM(-5)"] {
+    for bad in [
+        "SELECT * FROM samp TABLESAMPLE BERNOULLI(150)",
+        "SELECT * FROM samp TABLESAMPLE SYSTEM(-5)",
+    ] {
         let r = sess.execute(bad).await;
         assert!(
             r.is_err(),

@@ -44,7 +44,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use basin_catalog::DataFileRef;
-use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use basin_storage::ReadOptions;
 use basin_wal::Lsn;
 use bytes::Bytes;
@@ -53,7 +53,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-    ShardBackgroundHandle, ShardConfig, ShardImpl, ShardStats, ProjectHandle, ProjectHandleImpl,
+    ProjectHandle, ProjectHandleImpl, ShardBackgroundHandle, ShardConfig, ShardImpl, ShardStats,
 };
 
 /// Per-(project, partition) in-memory state. Lives behind an `RwLock` inside
@@ -991,7 +991,7 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use basin_catalog::InMemoryCatalog;
-    use basin_common::{PartitionKey, TableName, ProjectId};
+    use basin_common::{PartitionKey, ProjectId, TableName};
     use basin_storage::{Storage, StorageConfig};
     use basin_wal::{LocalWal, Wal, WalConfig};
     use object_store::local::LocalFileSystem;

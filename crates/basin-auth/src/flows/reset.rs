@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::Utc;
 
 use crate::email::{reset_template, Outbound};

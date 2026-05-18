@@ -94,7 +94,10 @@ async fn one_json_any(sess: &basin_engine::ProjectSession, sql: &str) -> Option<
                 .unwrap_or_else(|e| panic!("json decode (text) failed for: {sql}\n  err: {e}")),
         );
     }
-    panic!("expected LargeBinary or Utf8 JSON column for: {sql}, got {:?}", col.data_type());
+    panic!(
+        "expected LargeBinary or Utf8 JSON column for: {sql}, got {:?}",
+        col.data_type()
+    );
 }
 
 /// Run a SELECT that returns one row × one Utf8 column.
@@ -169,37 +172,49 @@ async fn test_jsonb_typeof() {
 
     // Object
     assert_eq!(
-        one_text(&sess, r#"SELECT jsonb_typeof('{"a":1}')"#).await.as_deref(),
+        one_text(&sess, r#"SELECT jsonb_typeof('{"a":1}')"#)
+            .await
+            .as_deref(),
         Some("object"),
         "typeof object"
     );
     // Array
     assert_eq!(
-        one_text(&sess, r#"SELECT jsonb_typeof('[1,2,3]')"#).await.as_deref(),
+        one_text(&sess, r#"SELECT jsonb_typeof('[1,2,3]')"#)
+            .await
+            .as_deref(),
         Some("array"),
         "typeof array"
     );
     // Number
     assert_eq!(
-        one_text(&sess, r#"SELECT jsonb_typeof('42')"#).await.as_deref(),
+        one_text(&sess, r#"SELECT jsonb_typeof('42')"#)
+            .await
+            .as_deref(),
         Some("number"),
         "typeof number"
     );
     // String
     assert_eq!(
-        one_text(&sess, r#"SELECT jsonb_typeof('"hello"')"#).await.as_deref(),
+        one_text(&sess, r#"SELECT jsonb_typeof('"hello"')"#)
+            .await
+            .as_deref(),
         Some("string"),
         "typeof string"
     );
     // Boolean
     assert_eq!(
-        one_text(&sess, r#"SELECT jsonb_typeof('true')"#).await.as_deref(),
+        one_text(&sess, r#"SELECT jsonb_typeof('true')"#)
+            .await
+            .as_deref(),
         Some("boolean"),
         "typeof boolean"
     );
     // Null JSON value
     assert_eq!(
-        one_text(&sess, r#"SELECT jsonb_typeof('null')"#).await.as_deref(),
+        one_text(&sess, r#"SELECT jsonb_typeof('null')"#)
+            .await
+            .as_deref(),
         Some("null"),
         "typeof null"
     );
@@ -214,9 +229,18 @@ async fn test_jsonb_pretty() {
     let result = one_text(&sess, r#"SELECT jsonb_pretty('{"a":1,"b":2}')"#).await;
     let text = result.expect("jsonb_pretty should return text");
     // Must be multi-line and contain the keys
-    assert!(text.contains("\"a\""), "pretty output missing key a: {text}");
-    assert!(text.contains("\"b\""), "pretty output missing key b: {text}");
-    assert!(text.contains('\n'), "pretty output should be multi-line: {text}");
+    assert!(
+        text.contains("\"a\""),
+        "pretty output missing key a: {text}"
+    );
+    assert!(
+        text.contains("\"b\""),
+        "pretty output missing key b: {text}"
+    );
+    assert!(
+        text.contains('\n'),
+        "pretty output should be multi-line: {text}"
+    );
 }
 
 /// 3. jsonb_array_length — array length
@@ -270,12 +294,9 @@ async fn test_jsonb_set() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Replace existing key
-    let result = one_jsonb(
-        &sess,
-        r#"SELECT jsonb_set('{"a":1,"b":2}', '{a}', '99')"#,
-    )
-    .await
-    .expect("jsonb_set should return jsonb");
+    let result = one_jsonb(&sess, r#"SELECT jsonb_set('{"a":1,"b":2}', '{a}', '99')"#)
+        .await
+        .expect("jsonb_set should return jsonb");
 
     assert_eq!(result["a"], json!(99), "a should be updated to 99");
     assert_eq!(result["b"], json!(2), "b should be unchanged");
@@ -297,7 +318,11 @@ async fn test_jsonb_insert() {
 
     // After insert at index 1 (before), array should have 4 elements
     if let Value::Array(arr) = &result["arr"] {
-        assert_eq!(arr.len(), 4, "array should have 4 elements after insert: {result}");
+        assert_eq!(
+            arr.len(),
+            4,
+            "array should have 4 elements after insert: {result}"
+        );
         assert_eq!(arr[1], json!(99), "new element at index 1: {result}");
     } else {
         panic!("arr should be an array: {result}");
@@ -321,11 +346,7 @@ async fn test_jsonb_path_query() {
     assert_eq!(result, json!("Alice"), "should navigate to user.name");
 
     // Non-existent path returns NULL
-    let null_result = one_jsonb(
-        &sess,
-        r#"SELECT jsonb_path_query('{"a":1}', '$.missing')"#,
-    )
-    .await;
+    let null_result = one_jsonb(&sess, r#"SELECT jsonb_path_query('{"a":1}', '$.missing')"#).await;
     assert!(null_result.is_none(), "missing path should return NULL");
 }
 
@@ -336,7 +357,11 @@ async fn test_jsonb_path_exists() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     assert_eq!(
-        one_bool(&sess, r#"SELECT jsonb_path_exists('{"a":{"b":1}}', '$.a.b')"#).await,
+        one_bool(
+            &sess,
+            r#"SELECT jsonb_path_exists('{"a":{"b":1}}', '$.a.b')"#
+        )
+        .await,
         Some(true),
         "a.b should exist"
     );
@@ -366,11 +391,7 @@ async fn test_jsonb_path_match() {
 }
 
 /// Run a SELECT and return every value of column `col` (Utf8) across all rows.
-async fn col_text(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-    col: &str,
-) -> Vec<String> {
+async fn col_text(sess: &basin_engine::ProjectSession, sql: &str, col: &str) -> Vec<String> {
     let batches = match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
@@ -421,7 +442,11 @@ async fn test_jsonb_each() {
     let sql = r#"SELECT key, value FROM jsonb_each('{"a":1,"b":2}'::jsonb) ORDER BY key"#;
     let keys = col_text(&sess, sql, "key").await;
     let vals = col_text(&sess, sql, "value").await;
-    assert_eq!(keys, vec!["a", "b"], "jsonb_each must yield one row per key");
+    assert_eq!(
+        keys,
+        vec!["a", "b"],
+        "jsonb_each must yield one row per key"
+    );
     assert_eq!(vals, vec!["1", "2"], "jsonb_each value column");
 }
 
@@ -502,12 +527,9 @@ async fn test_jsonb_build_array() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let result = one_jsonb(
-        &sess,
-        r#"SELECT jsonb_build_array(1, 'two', true)"#,
-    )
-    .await
-    .expect("jsonb_build_array should return jsonb");
+    let result = one_jsonb(&sess, r#"SELECT jsonb_build_array(1, 'two', true)"#)
+        .await
+        .expect("jsonb_build_array should return jsonb");
 
     if let Value::Array(arr) = &result {
         assert_eq!(arr.len(), 3, "array should have 3 elements");
@@ -525,12 +547,14 @@ async fn test_to_jsonb() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Integer → JSONB number
-    let result = one_jsonb(&sess, r#"SELECT to_jsonb(42)"#).await
+    let result = one_jsonb(&sess, r#"SELECT to_jsonb(42)"#)
+        .await
         .expect("to_jsonb(42) should return jsonb");
     assert_eq!(result, json!(42), "to_jsonb(int)");
 
     // String → JSONB string
-    let result = one_jsonb(&sess, r#"SELECT to_jsonb('hello')"#).await
+    let result = one_jsonb(&sess, r#"SELECT to_jsonb('hello')"#)
+        .await
         .expect("to_jsonb('hello') should return jsonb");
     // String literal "hello" will be a JSON string
     assert!(
@@ -539,7 +563,8 @@ async fn test_to_jsonb() {
     );
 
     // Boolean → JSONB bool
-    let result = one_jsonb(&sess, r#"SELECT to_jsonb(true)"#).await
+    let result = one_jsonb(&sess, r#"SELECT to_jsonb(true)"#)
+        .await
         .expect("to_jsonb(true) should return jsonb");
     assert_eq!(result, json!(true), "to_jsonb(bool)");
 }
@@ -551,7 +576,8 @@ async fn test_row_to_json() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Stub accepts any scalar; should return JSONB
-    let result = one_jsonb(&sess, r#"SELECT row_to_json(42)"#).await
+    let result = one_jsonb(&sess, r#"SELECT row_to_json(42)"#)
+        .await
         .expect("row_to_json should return jsonb");
     assert_eq!(result, json!(42), "row_to_json stub with int");
 }
@@ -563,14 +589,14 @@ async fn test_array_to_json() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Pass a JSON array literal — should come back as jsonb
-    let result = one_jsonb(
-        &sess,
-        r#"SELECT array_to_json('[1,2,3]')"#,
-    )
-    .await
-    .expect("array_to_json should return jsonb");
+    let result = one_jsonb(&sess, r#"SELECT array_to_json('[1,2,3]')"#)
+        .await
+        .expect("array_to_json should return jsonb");
 
-    assert!(result.is_array(), "array_to_json should return an array: {result}");
+    assert!(
+        result.is_array(),
+        "array_to_json should return an array: {result}"
+    );
     if let Value::Array(arr) = &result {
         assert_eq!(arr.len(), 3, "array should have 3 elements: {result}");
     }
@@ -583,7 +609,11 @@ async fn test_jsonb_agg_returns_array() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let scalar = one_json_any(&sess, r#"SELECT jsonb_agg(1)"#).await;
-    assert_eq!(scalar, Some(serde_json::json!([1])), "jsonb_agg(1) must be [1]");
+    assert_eq!(
+        scalar,
+        Some(serde_json::json!([1])),
+        "jsonb_agg(1) must be [1]"
+    );
 
     let multi = one_json_any(
         &sess,
@@ -632,17 +662,16 @@ async fn test_jsonb_udf_round_trip_with_table() {
         .await
         .expect("CREATE TABLE");
 
-    sess.execute(r#"INSERT INTO docs VALUES (1, '{"name":"Alice","scores":[10,20,30],"active":true}')"#)
-        .await
-        .expect("INSERT");
-
-    // jsonb_typeof on a stored column
-    let typ = one_text(
-        &sess,
-        "SELECT jsonb_typeof(data) FROM docs WHERE id = 1",
+    sess.execute(
+        r#"INSERT INTO docs VALUES (1, '{"name":"Alice","scores":[10,20,30],"active":true}')"#,
     )
     .await
-    .expect("jsonb_typeof on column");
+    .expect("INSERT");
+
+    // jsonb_typeof on a stored column
+    let typ = one_text(&sess, "SELECT jsonb_typeof(data) FROM docs WHERE id = 1")
+        .await
+        .expect("jsonb_typeof on column");
     assert_eq!(typ, "object", "stored JSONB should be typeof object");
 
     // jsonb_array_length on nested array via jsonb_path_query
@@ -652,16 +681,19 @@ async fn test_jsonb_udf_round_trip_with_table() {
     )
     .await
     .expect("jsonb_path_query scores");
-    assert!(scores_json.is_array(), "scores should be an array: {scores_json}");
+    assert!(
+        scores_json.is_array(),
+        "scores should be an array: {scores_json}"
+    );
 
     // jsonb_pretty on stored column
-    let pretty = one_text(
-        &sess,
-        "SELECT jsonb_pretty(data) FROM docs WHERE id = 1",
-    )
-    .await
-    .expect("jsonb_pretty on column");
-    assert!(pretty.contains("Alice"), "pretty output should contain Alice: {pretty}");
+    let pretty = one_text(&sess, "SELECT jsonb_pretty(data) FROM docs WHERE id = 1")
+        .await
+        .expect("jsonb_pretty on column");
+    assert!(
+        pretty.contains("Alice"),
+        "pretty output should contain Alice: {pretty}"
+    );
 
     // jsonb_strip_nulls — add a row with nulls first
     sess.execute(r#"INSERT INTO docs VALUES (2, '{"x":1,"y":null}')"#)

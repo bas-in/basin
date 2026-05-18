@@ -618,10 +618,7 @@ impl ScalarUDFImpl for AdvisoryUnlockAllUdf {
 /// Register the per-session advisory-lock UDFs on `ctx`. Called from
 /// `session::open` *after* the stateless cache is installed, so these
 /// session-aware implementations overwrite the (now-removed) stub names.
-pub(crate) fn register_advisory_lock_udfs(
-    ctx: &SessionContext,
-    locks: Arc<AdvisorySessionLocks>,
-) {
+pub(crate) fn register_advisory_lock_udfs(ctx: &SessionContext, locks: Arc<AdvisorySessionLocks>) {
     let sig = advisory_signature();
 
     ctx.register_udf(ScalarUDF::from(TryAdvisoryLockUdf {
@@ -691,7 +688,7 @@ mod tests {
 
         assert!(a.try_lock(key, false));
         assert!(a.try_lock(key, false)); // re-entered: count == 2
-        // Still held by A after one unlock.
+                                         // Still held by A after one unlock.
         assert!(a.session_unlock(key));
         assert!(!b.try_lock(key, false));
         // Second unlock fully releases.

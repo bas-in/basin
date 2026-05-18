@@ -18,8 +18,8 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
 
 use basin_common::ProjectId;
@@ -97,6 +97,8 @@ impl ObjectStore for SlowStore {
         r
     }
 
+    // `get_range` and `head` are provided trait methods that route through
+    // `get_opts`, so instrumenting `get_opts` covers them too.
     async fn get_opts(
         &self,
         location: &ObjectPath,
@@ -109,38 +111,24 @@ impl ObjectStore for SlowStore {
         r
     }
 
-    async fn get_range(
+    // `delete` (ObjectStoreExt) routes through `delete_stream`. The tests
+    // don't measure delete concurrency, so pass straight through.
+    fn delete_stream(
         &self,
-        location: &ObjectPath,
-        range: std::ops::Range<usize>,
-    ) -> object_store::Result<Bytes> {
-        self.enter();
-        tokio::time::sleep(self.op_duration).await;
-        let r = self.inner.get_range(location, range).await;
-        self.leave();
-        r
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        self.inner.delete_stream(locations)
     }
 
-    async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
-        self.enter();
-        tokio::time::sleep(self.op_duration).await;
-        let r = self.inner.head(location).await;
-        self.leave();
-        r
-    }
-
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.enter();
-        tokio::time::sleep(self.op_duration).await;
-        let r = self.inner.delete(location).await;
-        self.leave();
-        r
-    }
-
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         // No latency injection on streaming list — the tests don't
         // exercise it.
-        self.inner.list(prefix)
+        let inner = self.inner.clone();
+        let prefix = prefix.cloned();
+        inner.list(prefix.as_ref())
     }
 
     async fn list_with_delimiter(
@@ -154,22 +142,17 @@ impl ObjectStore for SlowStore {
         r
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        self.enter();
-        tokio::time::sleep(self.op_duration).await;
-        let r = self.inner.copy(from, to).await;
-        self.leave();
-        r
-    }
-
-    async fn copy_if_not_exists(
+    // Replaces the old `copy` / `copy_if_not_exists` pair; CopyMode in
+    // `options` distinguishes overwrite vs create-only.
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
         self.enter();
         tokio::time::sleep(self.op_duration).await;
-        let r = self.inner.copy_if_not_exists(from, to).await;
+        let r = self.inner.copy_opts(from, to, options).await;
         self.leave();
         r
     }
@@ -189,7 +172,12 @@ fn storage_with_slow(slow: Arc<SlowStore>) -> Storage {
 /// Pre-populate the inner store with a key shaped under `project`'s
 /// prefix and return the path. Bytes are tunable so a test can request
 /// a small (point-shaped) or large (bulk-shaped) value.
-async fn seed_object(storage: &Storage, project: &ProjectId, name: &str, bytes: usize) -> ObjectPath {
+async fn seed_object(
+    storage: &Storage,
+    project: &ProjectId,
+    name: &str,
+    bytes: usize,
+) -> ObjectPath {
     let path = ObjectPath::from(format!("projects/{}/data/{}", project.as_prefix(), name));
     let store = storage.project_object_store(project);
     let payload = PutPayload::from(Bytes::from(vec![0u8; bytes]));

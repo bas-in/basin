@@ -1,7 +1,7 @@
 //! SQL → side-effects + result sets, dispatched by sqlparser statement kind.
 
-use std::sync::Arc;
 use crate::pg_ast::ObjectNamePartExt;
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -55,10 +55,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let raw_pg_tree: Option<crate::pg_ast::ParseTree> = crate::pg_ast::parse(sql).ok();
     if let Some(ref tree) = raw_pg_tree {
         // Collect statement kinds so we can dispatch before sqlparser.
-        let kinds: Vec<_> = tree
-            .stmts()
-            .map(|n| crate::pg_ast::stmt_kind(n))
-            .collect();
+        let kinds: Vec<_> = tree.stmts().map(|n| crate::pg_ast::stmt_kind(n)).collect();
 
         // Reject LISTEN/NOTIFY/UNLISTEN — not on the roadmap (ADR 0012 / pub/sub).
         for kind in &kinds {
@@ -88,10 +85,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // issues ROLLBACK to reset the session.
             if crate::session::tx_is_aborted(&sess.state) {
                 // ROLLBACK and ROLLBACK TO SAVEPOINT are the only exit paths.
-                let is_rollback_kind = matches!(
-                    kind,
-                    crate::pg_ast::StmtKind::Rollback
-                );
+                let is_rollback_kind = matches!(kind, crate::pg_ast::StmtKind::Rollback);
                 if !is_rollback_kind {
                     return Err(basin_common::BasinError::InvalidSchema(
                         "ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)".into()
@@ -112,7 +106,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         .map(|g| g.clone())
                         .unwrap_or_default();
                     crate::session::tx_begin(&sess.state, current_snapshots);
-                    return Ok(ExecResult::Empty { tag: "BEGIN".into() });
+                    return Ok(ExecResult::Empty {
+                        tag: "BEGIN".into(),
+                    });
                 }
                 crate::pg_ast::StmtKind::Commit => {
                     // Flush pending files to the catalog (real COMMIT).
@@ -122,7 +118,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             // Load the current snapshot id for this table.
                             let snap = {
                                 let snaps = sess.state.snapshots.lock().await;
-                                snaps.get(table).copied().unwrap_or(basin_catalog::SnapshotId(0))
+                                snaps
+                                    .get(table)
+                                    .copied()
+                                    .unwrap_or(basin_catalog::SnapshotId(0))
                             };
                             match commit_with_retry(sess, table, snap, files.clone()).await {
                                 Ok(()) => {}
@@ -144,13 +143,15 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                 &sess.ctx,
                                 &sess.state,
                                 table,
-                            ).await;
+                            )
+                            .await;
                         }
                     }
-                    return Ok(ExecResult::Empty { tag: "COMMIT".into() });
+                    return Ok(ExecResult::Empty {
+                        tag: "COMMIT".into(),
+                    });
                 }
-                crate::pg_ast::StmtKind::Rollback
-                | crate::pg_ast::StmtKind::Savepoint => {
+                crate::pg_ast::StmtKind::Rollback | crate::pg_ast::StmtKind::Savepoint => {
                     // Use libpg_query's authoritative parse to tell the
                     // transaction-control sub-forms apart and to pull the
                     // savepoint name straight from the AST.  PostgreSQL makes
@@ -158,10 +159,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // the old `contains("SAVEPOINT")` text heuristic mis-routed
                     // `ROLLBACK TO s` (no SAVEPOINT keyword) into a full
                     // transaction rollback. `txn_stmt` is exact.
-                    let txn = tree
-                        .stmts()
-                        .next()
-                        .and_then(crate::pg_ast::txn_stmt);
+                    let txn = tree.stmts().next().and_then(crate::pg_ast::txn_stmt);
                     use crate::pg_ast::TxnStmt;
                     match txn {
                         Some(TxnStmt::RollbackToSavepoint(name)) => {
@@ -186,14 +184,23 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                     // Delete abandoned files (best-effort).
                                     for (_, files) in &abandoned {
                                         for f in files {
-                                            let path = object_store::path::Path::from(f.path.as_str());
-                                            let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
+                                            let path =
+                                                object_store::path::Path::from(f.path.as_str());
+                                            let _ = sess
+                                                .engine
+                                                .config()
+                                                .storage
+                                                .delete_file(&sess.project, &path)
+                                                .await;
                                         }
                                     }
                                     // Refresh DataFusion ctx for affected tables.
                                     let touched = crate::session::tx_touched_tables(&sess.state);
                                     for table in &touched {
-                                        let pending = crate::session::tx_pending_files_for(&sess.state, table);
+                                        let pending = crate::session::tx_pending_files_for(
+                                            &sess.state,
+                                            table,
+                                        );
                                         let _ = crate::session::refresh_table_with_extra(
                                             &sess.engine,
                                             &sess.project,
@@ -201,19 +208,38 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                             &sess.state,
                                             table,
                                             &pending,
-                                        ).await;
+                                        )
+                                        .await;
                                     }
                                     // Tables where all pending files were abandoned:
                                     // restore to pre-tx catalog view.
                                     for table in abandoned.keys() {
                                         if !touched.contains(table) {
                                             if let Some(snap) = snapshots.get(table) {
-                                                let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap).await;
+                                                let _ = sess
+                                                    .engine
+                                                    .config()
+                                                    .catalog
+                                                    .rollback_to_snapshot(
+                                                        &sess.project,
+                                                        table,
+                                                        *snap,
+                                                    )
+                                                    .await;
                                             }
-                                            let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
+                                            let _ = refresh_table(
+                                                &sess.engine,
+                                                &sess.project,
+                                                &sess.ctx,
+                                                &sess.state,
+                                                table,
+                                            )
+                                            .await;
                                         }
                                     }
-                                    return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
+                                    return Ok(ExecResult::Empty {
+                                        tag: "ROLLBACK".into(),
+                                    });
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -227,15 +253,34 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             for (_, files) in &pending {
                                 for f in files {
                                     let path = object_store::path::Path::from(f.path.as_str());
-                                    let _ = sess.engine.config().storage.delete_file(&sess.project, &path).await;
+                                    let _ = sess
+                                        .engine
+                                        .config()
+                                        .storage
+                                        .delete_file(&sess.project, &path)
+                                        .await;
                                 }
                             }
                             // Restore catalog snapshot for each touched table.
                             for (table, snap_id) in &snapshots {
-                                let _ = sess.engine.config().catalog.rollback_to_snapshot(&sess.project, table, *snap_id).await;
-                                let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
+                                let _ = sess
+                                    .engine
+                                    .config()
+                                    .catalog
+                                    .rollback_to_snapshot(&sess.project, table, *snap_id)
+                                    .await;
+                                let _ = refresh_table(
+                                    &sess.engine,
+                                    &sess.project,
+                                    &sess.ctx,
+                                    &sess.state,
+                                    table,
+                                )
+                                .await;
                             }
-                            return Ok(ExecResult::Empty { tag: "ROLLBACK".into() });
+                            return Ok(ExecResult::Empty {
+                                tag: "ROLLBACK".into(),
+                            });
                         }
                         Some(TxnStmt::Savepoint(name)) => {
                             // PG: `SAVEPOINT can only be used in transaction
@@ -253,7 +298,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                 ));
                             }
                             crate::session::tx_push_savepoint(&sess.state, name);
-                            return Ok(ExecResult::Empty { tag: "SAVEPOINT".into() });
+                            return Ok(ExecResult::Empty {
+                                tag: "SAVEPOINT".into(),
+                            });
                         }
                         Some(TxnStmt::ReleaseSavepoint(name)) => {
                             // PG: outside a transaction block this is an error
@@ -275,7 +322,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             // when the name is unknown; propagate it instead
                             // of silently swallowing.
                             crate::session::tx_release_savepoint(&sess.state, &name)?;
-                            return Ok(ExecResult::Empty { tag: "RELEASE".into() });
+                            return Ok(ExecResult::Empty {
+                                tag: "RELEASE".into(),
+                            });
                         }
                         // Defensive: a transaction node we don't special-case
                         // here (e.g. PREPARE TRANSACTION) falls through to the
@@ -286,9 +335,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 _ => {}
             }
 
-            if let Some(result) =
-                crate::noop_accept::try_accept_as_noop(kind, sql)
-            {
+            if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, sql) {
                 return Ok(result);
             }
         }
@@ -1089,9 +1136,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         } => crate::schema_ddl::exec_drop_schema(sess, &names, if_exists, cascade).await,
         // ── SET search_path ─────────────────────────────────────────────
         Statement::Set(sqlparser::ast::Set::SingleAssignment {
-            variable,
-            values,
-            ..
+            variable, values, ..
         }) => {
             // Only handle `SET search_path = …`; forward everything else
             // as a silent no-op so ORM migrations that emit PG-specific
@@ -1228,7 +1273,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         }
         // ----- Cursor lifecycle ----- //
         Statement::Declare { stmts } => exec_declare(sess, stmts).await,
-        Statement::Fetch { name, direction, .. } => exec_fetch(sess, &name.value, direction).await,
+        Statement::Fetch {
+            name, direction, ..
+        } => exec_fetch(sess, &name.value, direction).await,
         Statement::Close { cursor } => exec_close(sess, cursor).await,
         Statement::Explain {
             analyze,
@@ -1662,8 +1709,7 @@ async fn exec_create_table_as(
             .enumerate()
             .map(|(i, f)| {
                 let nm = rename.get(i).cloned().unwrap_or_else(|| f.name().clone());
-                let mut nf =
-                    arrow_schema::Field::new(nm, f.data_type().clone(), f.is_nullable());
+                let mut nf = arrow_schema::Field::new(nm, f.data_type().clone(), f.is_nullable());
                 if !f.metadata().is_empty() {
                     nf = nf.with_metadata(f.metadata().clone());
                 }
@@ -1825,7 +1871,10 @@ async fn exec_create_index(
         None => {
             let col_part: String = catalog_columns
                 .iter()
-                .map(|s| s.trim_start_matches("expr:").replace(['(', ')', ' ', ','], "_"))
+                .map(|s| {
+                    s.trim_start_matches("expr:")
+                        .replace(['(', ')', ' ', ','], "_")
+                })
                 .collect::<Vec<_>>()
                 .join("_");
             format!("{table_name}_{col_part}_idx")
@@ -1843,8 +1892,7 @@ async fn exec_create_index(
     // Partial unique indexes (`WHERE ...`) and expression unique indexes
     // remain non-enforcing (out of scope) — those keep the metadata-only
     // notice so behavior does not regress.
-    let enforce_unique =
-        ci.unique && ci.predicate.is_none() && !has_expressions;
+    let enforce_unique = ci.unique && ci.predicate.is_none() && !has_expressions;
 
     // Emit notices for accepted-but-not-enforced features.
     if ci.unique && !enforce_unique {
@@ -1860,11 +1908,8 @@ async fn exec_create_index(
         }
     }
     if !ci.include.is_empty() {
-        let include_cols: Vec<String> = ci
-            .include
-            .iter()
-            .map(|ident| ident.value.clone())
-            .collect();
+        let include_cols: Vec<String> =
+            ci.include.iter().map(|ident| ident.value.clone()).collect();
         log_include_notice(&index_name, &include_cols);
     }
     for col in &parsed_cols {
@@ -1927,10 +1972,7 @@ async fn exec_create_index(
             .catalog
             .load_table(&sess.project, &table)
             .await?;
-        let already_registered = meta
-            .unique_constraints
-            .iter()
-            .any(|u| u.name == index_name);
+        let already_registered = meta.unique_constraints.iter().any(|u| u.name == index_name);
         if !already_registered {
             let mut uniques = meta.unique_constraints.clone();
             uniques.push(basin_catalog::UniqueConstraint {
@@ -1995,11 +2037,7 @@ async fn exec_drop_index(
                 // a unique index removes the uniqueness). Constraints created
                 // by an inline table-level `UNIQUE (...)` are not named after
                 // an index, so this only removes the index-derived one.
-                if meta
-                    .unique_constraints
-                    .iter()
-                    .any(|u| u.name == index_name)
-                {
+                if meta.unique_constraints.iter().any(|u| u.name == index_name) {
                     let remaining: Vec<basin_catalog::UniqueConstraint> = meta
                         .unique_constraints
                         .iter()
@@ -2011,8 +2049,7 @@ async fn exec_drop_index(
                         .catalog
                         .set_unique_constraints(&sess.project, t, remaining)
                         .await?;
-                    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t)
-                        .await?;
+                    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await?;
                 }
                 found = true;
                 break;
@@ -2043,8 +2080,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // the conflict column already has that value and route to UPDATE if so.
     if let Some(OnInsert::OnConflict(ref on_conflict)) = ins.on {
         if let OnConflictAction::DoUpdate(_) = &on_conflict.action {
-            if let Some(result) =
-                try_on_conflict_do_update(sess, &table, &ins, on_conflict).await?
+            if let Some(result) = try_on_conflict_do_update(sess, &table, &ins, on_conflict).await?
             {
                 return Ok(result);
             }
@@ -2132,7 +2168,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     if let Some(OnInsert::OnConflict(ref on_conflict)) = ins.on {
         if let OnConflictAction::DoNothing = &on_conflict.action {
             // WHERE clause form with conflict predicate is deferred.
-            if on_conflict.conflict_target
+            if on_conflict
+                .conflict_target
                 .as_ref()
                 .map(|t| matches!(t, ConflictTarget::OnConstraint(_)))
                 .unwrap_or(false)
@@ -2396,7 +2433,9 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
             &sess.state,
             &table,
             &pending,
-        ).await {
+        )
+        .await
+        {
             // If refresh fails, mark the txn aborted and propagate.
             crate::session::tx_set_aborted(&sess.state);
             return Err(e);
@@ -2432,11 +2471,18 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         &sess.state,
         &table,
         std::slice::from_ref(&file_ref),
-    ).await {
+    )
+    .await
+    {
         // Refresh failure before commit means the orphan file in storage
         // should be cleaned up.  Catalog snapshot is unchanged so no
         // catalog rollback is needed.
-        let _ = sess.engine.config().storage.delete_file(&sess.project, &df.path).await;
+        let _ = sess
+            .engine
+            .config()
+            .storage
+            .delete_file(&sess.project, &df.path)
+            .await;
         return Err(e);
     }
     if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
@@ -2701,8 +2747,15 @@ async fn exec_insert_select(
         &sess.state,
         table,
         std::slice::from_ref(&file_ref),
-    ).await {
-        let _ = sess.engine.config().storage.delete_file(&sess.project, &written.path).await;
+    )
+    .await
+    {
+        let _ = sess
+            .engine
+            .config()
+            .storage
+            .delete_file(&sess.project, &written.path)
+            .await;
         return Err(e);
     }
     if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
@@ -2858,7 +2911,8 @@ async fn exec_insert_default_values(
         &sess.state,
         &table,
         std::slice::from_ref(&file_ref),
-    ).await?;
+    )
+    .await?;
     dispatch_pre_commit(&sess.engine, &events).await?;
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
@@ -2903,8 +2957,10 @@ fn validate_conflict_target_columns(
         return Ok(());
     }
     // Normalise to lowercase for comparison.
-    let target_set: std::collections::HashSet<String> =
-        conflict_cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let target_set: std::collections::HashSet<String> = conflict_cols
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
 
     // Check against the PK.
     if !pk_columns.is_empty() {
@@ -3018,28 +3074,28 @@ async fn filter_rows_do_nothing(
     // Helper: extract the string tuple for row `r` using `idxs`.
     // Returns None if any value is NULL (a NULL in a unique column is
     // not considered a conflict under PG's default NULLS DISTINCT).
-    let extract_tuple =
-        |row: &Vec<sqlparser::ast::Expr>, idxs: &[usize]| -> Option<Vec<String>> {
-            let mut parts = Vec::with_capacity(idxs.len());
-            for &idx in idxs {
-                let val = match &row[idx] {
-                    sqlparser::ast::Expr::Value(v) => match v.value {
-                        Value::Null => return None,
-                        _ => format!("{}", row[idx]),
-                    },
-                    other => format!("{other}"),
-                };
-                parts.push(val);
-            }
-            Some(parts)
-        };
+    let extract_tuple = |row: &Vec<sqlparser::ast::Expr>, idxs: &[usize]| -> Option<Vec<String>> {
+        let mut parts = Vec::with_capacity(idxs.len());
+        for &idx in idxs {
+            let val = match &row[idx] {
+                sqlparser::ast::Expr::Value(v) => match v.value {
+                    Value::Null => return None,
+                    _ => format!("{}", row[idx]),
+                },
+                other => format!("{other}"),
+            };
+            parts.push(val);
+        }
+        Some(parts)
+    };
 
     // One `seen` set per constraint group to handle same-batch dedup.
-    let mut seen_per_group: Vec<std::collections::HashSet<Vec<String>>> =
-        constraint_groups.iter().map(|_| Default::default()).collect();
+    let mut seen_per_group: Vec<std::collections::HashSet<Vec<String>>> = constraint_groups
+        .iter()
+        .map(|_| Default::default())
+        .collect();
 
-    let mut survivors: Vec<Vec<sqlparser::ast::Expr>> =
-        Vec::with_capacity(rows_expanded.len());
+    let mut survivors: Vec<Vec<sqlparser::ast::Expr>> = Vec::with_capacity(rows_expanded.len());
 
     'row: for row in rows_expanded {
         // For each constraint group: if this row conflicts (with existing
@@ -3076,9 +3132,7 @@ async fn filter_rows_do_nothing(
             let exists = match sess.ctx.sql(&check_sql).await {
                 Ok(df) => {
                     let batches = df.collect().await.map_err(|e| {
-                        BasinError::internal(format!(
-                            "ON CONFLICT DO NOTHING existence check: {e}"
-                        ))
+                        BasinError::internal(format!("ON CONFLICT DO NOTHING existence check: {e}"))
                     })?;
                     batches.iter().any(|b| b.num_rows() > 0)
                 }
@@ -3124,9 +3178,7 @@ async fn try_on_conflict_do_update(
 
     // Extract the conflict column(s). We support the `(col)` form for v0.1.
     let conflict_cols: Vec<String> = match &on_conflict.conflict_target {
-        Some(ConflictTarget::Columns(idents)) => {
-            idents.iter().map(|i| i.value.clone()).collect()
-        }
+        Some(ConflictTarget::Columns(idents)) => idents.iter().map(|i| i.value.clone()).collect(),
         _ => {
             // No explicit target — skip upsert pre-check; fall through to
             // plain INSERT (which will surface a constraint error if needed).
@@ -3181,11 +3233,7 @@ async fn try_on_conflict_do_update(
     let where_clause = where_parts.join(" AND ");
 
     // Run the existence check.
-    let check_sql = format!(
-        "SELECT 1 FROM {} WHERE {}",
-        table.as_str(),
-        where_clause
-    );
+    let check_sql = format!("SELECT 1 FROM {} WHERE {}", table.as_str(), where_clause);
     let exists = match sess.ctx.sql(&check_sql).await {
         Ok(df) => {
             let batches = df.collect().await.map_err(|e| {
@@ -3230,11 +3278,9 @@ async fn try_on_conflict_do_update(
         .iter()
         .map(|a| {
             let col = match &a.target {
-                AssignmentTarget::ColumnName(n) => n
-                    .0
-                    .last()
-                    .map(|i| i.id_val().clone())
-                    .unwrap_or_default(),
+                AssignmentTarget::ColumnName(n) => {
+                    n.0.last().map(|i| i.id_val().clone()).unwrap_or_default()
+                }
                 AssignmentTarget::Tuple(_) => String::new(),
             };
             if col.is_empty() {
@@ -3290,19 +3336,33 @@ fn rewrite_do_update_expr(
         }
         // Recurse into binary operations (the common case: `t.hits + EXCLUDED.hits`).
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(rewrite_do_update_expr(*left, table_name_lower, excluded_map)),
+            left: Box::new(rewrite_do_update_expr(
+                *left,
+                table_name_lower,
+                excluded_map,
+            )),
             op,
-            right: Box::new(rewrite_do_update_expr(*right, table_name_lower, excluded_map)),
+            right: Box::new(rewrite_do_update_expr(
+                *right,
+                table_name_lower,
+                excluded_map,
+            )),
         },
         // Recurse into unary operations.
         Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
             op,
-            expr: Box::new(rewrite_do_update_expr(*inner, table_name_lower, excluded_map)),
+            expr: Box::new(rewrite_do_update_expr(
+                *inner,
+                table_name_lower,
+                excluded_map,
+            )),
         },
         // Recurse into parenthesised expressions.
-        Expr::Nested(inner) => {
-            Expr::Nested(Box::new(rewrite_do_update_expr(*inner, table_name_lower, excluded_map)))
-        }
+        Expr::Nested(inner) => Expr::Nested(Box::new(rewrite_do_update_expr(
+            *inner,
+            table_name_lower,
+            excluded_map,
+        ))),
         // All other expression forms (literals, bind params, functions, …) are
         // left unchanged — they either have no column references or reference
         // forms we don't need to rewrite for the DO UPDATE scope.
@@ -3639,7 +3699,10 @@ async fn apply_identity_columns(
         let catalog = &sess.engine.config().catalog;
         for row in rows.iter_mut() {
             let next = catalog.nextval(&sess.project, seq_name).await?;
-            sess.state.sequence_cache.record(sess.project, seq_name, next).await;
+            sess.state
+                .sequence_cache
+                .record(sess.project, seq_name, next)
+                .await;
             // BIGINT-shaped literal. The row builder coerces this
             // through the standard Int64 path.
             row[col_idx] = Expr::Value((Value::Number(next.to_string(), false)).into());
@@ -3779,7 +3842,11 @@ async fn commit_with_retry(
     }
 }
 
-async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) -> Result<ExecResult> {
+async fn exec_select(
+    sess: &ProjectSession,
+    sql: &str,
+    include_deleted: bool,
+) -> Result<ExecResult> {
     // Refresh the catalog-driven file set for every table before planning.
     //
     // Rationale: `refresh_table` now registers per-file `ListingTableUrl`s
@@ -3857,9 +3924,12 @@ async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) ->
     // sees a derived table rather than an unknown table name. This is a
     // no-op when the project has no registered views.
     let view_rewritten_owned;
-    let sql = if let Some(rewritten) =
-        crate::view_ddl::rewrite_view_refs(sess.engine.config().catalog.as_ref(), &sess.project, sql)
-            .await?
+    let sql = if let Some(rewritten) = crate::view_ddl::rewrite_view_refs(
+        sess.engine.config().catalog.as_ref(),
+        &sess.project,
+        sql,
+    )
+    .await?
     {
         view_rewritten_owned = rewritten;
         view_rewritten_owned.as_str()
@@ -3870,10 +3940,8 @@ async fn exec_select(sess: &ProjectSession, sql: &str, include_deleted: bool) ->
     // sees the SQL. DataFusion uses its own catalog hierarchy; Basin's tables
     // are all registered in the flat default namespace, so `schema.table`
     // would be misrouted as a DataFusion catalog-schema lookup.
-    let sql_stripped = crate::schema_ddl::strip_schema_qualifiers_for_session(
-        sql,
-        &sess.state.schema_state,
-    );
+    let sql_stripped =
+        crate::schema_ddl::strip_schema_qualifiers_for_session(sql, &sess.state.schema_state);
     let sql_for_df = sql_stripped.as_str();
 
     // Expand `json_agg(t)` / `jsonb_agg(t)` where `t` is a bare table name
@@ -4382,10 +4450,7 @@ async fn exec_declare(
             ExecResult::Rows { schema, batches } => (schema, batches),
             ExecResult::Empty { .. } => (Arc::new(Schema::empty()), vec![]),
         };
-        sess.state
-            .cursors
-            .declare(name, schema, batches)
-            .await?;
+        sess.state.cursors.declare(name, schema, batches).await?;
     }
     Ok(ExecResult::Empty {
         tag: "DECLARE".into(),
@@ -4399,11 +4464,7 @@ async fn exec_fetch(
     direction: sqlparser::ast::FetchDirection,
 ) -> Result<ExecResult> {
     let dir = crate::cursor::CursorDirection::from_sqlparser(&direction)?;
-    let (schema, batches) = sess
-        .state
-        .cursors
-        .apply(cursor_name, dir, true)
-        .await?;
+    let (schema, batches) = sess.state.cursors.apply(cursor_name, dir, true).await?;
     Ok(ExecResult::Rows { schema, batches })
 }
 
@@ -4439,9 +4500,7 @@ async fn exec_cursor_move(
         .cursors
         .apply(&intent.cursor_name, intent.direction, false)
         .await?;
-    Ok(ExecResult::Empty {
-        tag: "MOVE".into(),
-    })
+    Ok(ExecResult::Empty { tag: "MOVE".into() })
 }
 
 /// Return `true` if `sql` is one of the PG-specific identity-sequence forms
@@ -4454,10 +4513,7 @@ async fn exec_cursor_move(
 /// These are accepted as metadata-only no-ops (same policy as SET NOT NULL).
 fn match_alter_column_identity(sql: &str) -> bool {
     // Normalise: collapse whitespace, upper-case, trim trailing semicolon.
-    let norm: String = sql
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let norm: String = sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
     let upper = norm.trim_end_matches(';').trim().to_ascii_uppercase();
 
     // Must start with ALTER TABLE … ALTER COLUMN …
@@ -4504,10 +4560,7 @@ fn match_alter_column_identity(sql: &str) -> bool {
 /// explicitly in the alias list are changed.  If a field is already annotated
 /// (e.g. from `return_field` for direct GROUP BY aggregates) the function is
 /// idempotent.
-pub(crate) fn annotate_json_agg_columns(
-    ws_schema: &Arc<Schema>,
-    sql: &str,
-) -> Arc<Schema> {
+pub(crate) fn annotate_json_agg_columns(ws_schema: &Arc<Schema>, sql: &str) -> Arc<Schema> {
     // Fast exit if no json_agg / jsonb_agg in the SQL.
     let lower = sql.to_ascii_lowercase();
     if !lower.contains("json_agg(") && !lower.contains("jsonb_agg(") {
@@ -4638,10 +4691,33 @@ fn collect_json_agg_aliases(lower_sql: &str) -> std::collections::HashSet<String
             // are not aliases: FROM, WHERE, ORDER, GROUP, HAVING, LIMIT,
             // OFFSET, ON, AND, OR, NOT, NULL, AS, THEN, ELSE, END.
             const NOT_ALIAS: &[&str] = &[
-                "from", "where", "order", "group", "having", "limit", "offset",
-                "on", "and", "or", "not", "null", "as", "then", "else", "end",
-                "inner", "left", "right", "join", "cross", "lateral", "union",
-                "intersect", "except", "returning", "into",
+                "from",
+                "where",
+                "order",
+                "group",
+                "having",
+                "limit",
+                "offset",
+                "on",
+                "and",
+                "or",
+                "not",
+                "null",
+                "as",
+                "then",
+                "else",
+                "end",
+                "inner",
+                "left",
+                "right",
+                "join",
+                "cross",
+                "lateral",
+                "union",
+                "intersect",
+                "except",
+                "returning",
+                "into",
             ];
             if !NOT_ALIAS.contains(&alias.as_str()) {
                 aliases.insert(alias);
@@ -4769,7 +4845,7 @@ pub(crate) async fn rewrite_json_agg_whole_row(
         }
 
         let fn_kw_len = fn_name.len(); // "json_agg" = 8, "jsonb_agg" = 9
-        // Position of `(` — already consumed by the find pattern.
+                                       // Position of `(` — already consumed by the find pattern.
         let paren_open = abs_fn_start + fn_kw_len;
         // paren_open points at `(`.
         if paren_open >= len || bytes[paren_open] != b'(' {
@@ -4829,7 +4905,10 @@ pub(crate) async fn rewrite_json_agg_whole_row(
         // Check: is `arg` a simple identifier (no dots, spaces, parens)?
         let is_simple_ident = !arg.is_empty()
             && arg.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && arg.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_');
+            && arg
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_alphabetic() || c == '_');
 
         if !is_simple_ident {
             // Not a bare ident; emit verbatim and advance past the whole call.
@@ -4942,7 +5021,10 @@ async fn exec_dml_cte_query(
     use datafusion::datasource::memory::MemTable;
     use sqlparser::ast::{SelectItem, WildcardAdditionalOptions};
 
-    let with = query.with.as_ref().expect("caller verified query.with is Some");
+    let with = query
+        .with
+        .as_ref()
+        .expect("caller verified query.with is Some");
 
     // Reject RECURSIVE data-modifying CTEs — the interaction with our sequential
     // execution model would be incorrect.
@@ -4971,7 +5053,8 @@ async fn exec_dml_cte_query(
                     )]);
                 }
                 let result = exec_insert(sess, ins).await?;
-                let (schema, batches) = dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
+                let (schema, batches) =
+                    dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
                 register_dml_cte_memtable(sess, &cte_name, schema, batches, &mut registered)?;
             }
             SetExpr::Update(Statement::Update(sqlparser::ast::Update {
@@ -4984,9 +5067,7 @@ async fn exec_dml_cte_query(
             })) => {
                 let from_twj = from.as_ref().and_then(|f| match f {
                     sqlparser::ast::UpdateTableFromKind::BeforeSet(v)
-                    | sqlparser::ast::UpdateTableFromKind::AfterSet(v) => {
-                        v.first().cloned()
-                    }
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(v) => v.first().cloned(),
                 });
                 let user_had_returning = returning.is_some();
                 // If the user didn't supply RETURNING we force RETURNING * so
@@ -5007,7 +5088,8 @@ async fn exec_dml_cte_query(
                     effective_returning,
                 )
                 .await?;
-                let (schema, batches) = dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
+                let (schema, batches) =
+                    dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
                 register_dml_cte_memtable(sess, &cte_name, schema, batches, &mut registered)?;
             }
             SetExpr::Delete(Statement::Delete(del)) => {
@@ -5019,7 +5101,8 @@ async fn exec_dml_cte_query(
                     )]);
                 }
                 let result = crate::dml_mutate::exec_delete(sess, del).await?;
-                let (schema, batches) = dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
+                let (schema, batches) =
+                    dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
                 register_dml_cte_memtable(sess, &cte_name, schema, batches, &mut registered)?;
             }
             // Non-DML CTE body: leave it for DataFusion to handle in the outer query.
@@ -5182,11 +5265,20 @@ mod json_agg_rewrite_tests {
         let rewritten = rewrite_json_agg_whole_row(sql, &ctx).await;
         // Must contain named_struct with the column names.
         let lower = rewritten.to_ascii_lowercase();
-        assert!(lower.contains("named_struct"), "expected named_struct in: {rewritten}");
+        assert!(
+            lower.contains("named_struct"),
+            "expected named_struct in: {rewritten}"
+        );
         assert!(lower.contains("'id'"), "expected 'id' key in: {rewritten}");
-        assert!(lower.contains("'name'"), "expected 'name' key in: {rewritten}");
+        assert!(
+            lower.contains("'name'"),
+            "expected 'name' key in: {rewritten}"
+        );
         assert!(lower.contains("t.id"), "expected t.id ref in: {rewritten}");
-        assert!(lower.contains("t.name"), "expected t.name ref in: {rewritten}");
+        assert!(
+            lower.contains("t.name"),
+            "expected t.name ref in: {rewritten}"
+        );
     }
 
     #[tokio::test]
@@ -5195,8 +5287,14 @@ mod json_agg_rewrite_tests {
         let sql = "SELECT jsonb_agg(u) FROM u";
         let rewritten = rewrite_json_agg_whole_row(sql, &ctx).await;
         let lower = rewritten.to_ascii_lowercase();
-        assert!(lower.contains("named_struct"), "expected named_struct in: {rewritten}");
-        assert!(lower.contains("u.val"), "expected u.val ref in: {rewritten}");
+        assert!(
+            lower.contains("named_struct"),
+            "expected named_struct in: {rewritten}"
+        );
+        assert!(
+            lower.contains("u.val"),
+            "expected u.val ref in: {rewritten}"
+        );
     }
 
     #[tokio::test]
@@ -5224,7 +5322,10 @@ mod json_agg_rewrite_tests {
         let sql = "SELECT JSON_AGG(t) FROM t";
         let rewritten = rewrite_json_agg_whole_row(sql, &ctx).await;
         let lower = rewritten.to_ascii_lowercase();
-        assert!(lower.contains("named_struct"), "JSON_AGG uppercase should be expanded: {rewritten}");
+        assert!(
+            lower.contains("named_struct"),
+            "JSON_AGG uppercase should be expanded: {rewritten}"
+        );
         assert!(lower.contains("'x'"), "expected 'x' key: {rewritten}");
     }
 }
@@ -5252,7 +5353,9 @@ mod do_update_rewrite_tests {
             .expect("stmt");
         if let sqlparser::ast::Statement::Query(q) = stmt {
             if let sqlparser::ast::SetExpr::Select(sel) = *q.body {
-                if let sqlparser::ast::SelectItem::UnnamedExpr(e) = sel.projection.into_iter().next().expect("item") {
+                if let sqlparser::ast::SelectItem::UnnamedExpr(e) =
+                    sel.projection.into_iter().next().expect("item")
+                {
                     return e;
                 }
             }
@@ -5269,7 +5372,10 @@ mod do_update_rewrite_tests {
     }
 
     fn make_excluded(pairs: &[(&str, Expr)]) -> HashMap<String, Expr> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     // EXCLUDED.col → proposed-row literal value.
@@ -5316,7 +5422,10 @@ mod do_update_rewrite_tests {
         let s = format!("{result}");
         assert!(s.contains("hits"), "expected `hits` in result: {s}");
         assert!(s.contains('5'), "expected `5` in result: {s}");
-        assert!(!s.contains("accounts"), "table qualifier must be stripped: {s}");
+        assert!(
+            !s.contains("accounts"),
+            "table qualifier must be stripped: {s}"
+        );
         assert!(!s.contains("EXCLUDED"), "EXCLUDED must be resolved: {s}");
     }
 
@@ -5370,32 +5479,53 @@ mod do_nothing_validate_tests {
 
     #[test]
     fn pk_single_col_accepted() {
-        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id"])).is_ok());
+        assert!(
+            validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id"]))
+                .is_ok()
+        );
     }
 
     #[test]
     fn pk_composite_accepted() {
-        assert!(validate_conflict_target_columns(&pk(&["a", "b"]), &uniques(&[]), &conflict(&["a", "b"])).is_ok());
+        assert!(validate_conflict_target_columns(
+            &pk(&["a", "b"]),
+            &uniques(&[]),
+            &conflict(&["a", "b"])
+        )
+        .is_ok());
     }
 
     #[test]
     fn pk_order_independent() {
         // Reversed order — still matches PK set.
-        assert!(validate_conflict_target_columns(&pk(&["a", "b"]), &uniques(&[]), &conflict(&["b", "a"])).is_ok());
+        assert!(validate_conflict_target_columns(
+            &pk(&["a", "b"]),
+            &uniques(&[]),
+            &conflict(&["b", "a"])
+        )
+        .is_ok());
     }
 
     // --- matches UNIQUE constraint ------------------------------------------
 
     #[test]
     fn unique_constraint_single_col_accepted() {
-        assert!(validate_conflict_target_columns(&pk(&[]), &uniques(&[&["email"]]), &conflict(&["email"])).is_ok());
+        assert!(validate_conflict_target_columns(
+            &pk(&[]),
+            &uniques(&[&["email"]]),
+            &conflict(&["email"])
+        )
+        .is_ok());
     }
 
     #[test]
     fn unique_constraint_composite_accepted() {
-        assert!(
-            validate_conflict_target_columns(&pk(&[]), &uniques(&[&["org_id", "slug"]]), &conflict(&["org_id", "slug"])).is_ok()
-        );
+        assert!(validate_conflict_target_columns(
+            &pk(&[]),
+            &uniques(&[&["org_id", "slug"]]),
+            &conflict(&["org_id", "slug"])
+        )
+        .is_ok());
     }
 
     // --- mismatches → error -------------------------------------------------
@@ -5403,32 +5533,52 @@ mod do_nothing_validate_tests {
     #[test]
     fn subset_of_pk_rejected() {
         // Only one of the two PK cols — not a complete match.
-        assert!(validate_conflict_target_columns(&pk(&["a", "b"]), &uniques(&[]), &conflict(&["a"])).is_err());
+        assert!(validate_conflict_target_columns(
+            &pk(&["a", "b"]),
+            &uniques(&[]),
+            &conflict(&["a"])
+        )
+        .is_err());
     }
 
     #[test]
     fn superset_of_pk_rejected() {
-        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id", "extra"])).is_err());
+        assert!(validate_conflict_target_columns(
+            &pk(&["id"]),
+            &uniques(&[]),
+            &conflict(&["id", "extra"])
+        )
+        .is_err());
     }
 
     #[test]
     fn non_constraint_col_rejected() {
         // The combined set {email, id} is not any single constraint.
-        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[&["email"]]), &conflict(&["email", "id"])).is_err());
+        assert!(validate_conflict_target_columns(
+            &pk(&["id"]),
+            &uniques(&[&["email"]]),
+            &conflict(&["email", "id"])
+        )
+        .is_err());
     }
 
     #[test]
     fn empty_target_accepted_without_error() {
         // Empty conflict target (no columns): validated as OK; caller handles
         // the no-target case (all constraints checked).
-        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&[])).is_ok());
+        assert!(
+            validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&[])).is_ok()
+        );
     }
 
     // --- same-batch dedup semantics (PG: first row wins) --------------------
     // Structural test: validate returns Ok for a conflict target that IS a real constraint.
     #[test]
     fn same_batch_dup_target_accepted() {
-        assert!(validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id"])).is_ok());
+        assert!(
+            validate_conflict_target_columns(&pk(&["id"]), &uniques(&[]), &conflict(&["id"]))
+                .is_ok()
+        );
     }
 }
 
@@ -5499,7 +5649,10 @@ mod recursive_cte_exec_tests {
             SELECT a FROM fib";
         let vals = run_i64(sql).await.expect("fib query must succeed");
         let expected: Vec<i64> = vec![1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89];
-        assert_eq!(vals, expected, "fib(a,b) SELECT a must match PG Fibonacci sequence");
+        assert_eq!(
+            vals, expected,
+            "fib(a,b) SELECT a must match PG Fibonacci sequence"
+        );
     }
 
     /// Single-column regression: existing behaviour must be preserved.
@@ -5510,7 +5663,9 @@ mod recursive_cte_exec_tests {
              UNION ALL \
              SELECT n+1 FROM r WHERE n < 5) \
             SELECT n FROM r";
-        let vals = run_i64(sql).await.expect("single-col recursive CTE must succeed");
+        let vals = run_i64(sql)
+            .await
+            .expect("single-col recursive CTE must succeed");
         let expected: Vec<i64> = vec![1, 2, 3, 4, 5];
         assert_eq!(vals, expected, "single-col r(n) must produce 1..=5");
     }
@@ -5527,7 +5682,9 @@ mod recursive_cte_exec_tests {
              UNION ALL \
              SELECT path || '->child', depth + 1 FROM tree WHERE depth < 3) \
             SELECT path FROM tree";
-        let vals = run_str(sql).await.expect("string hierarchy CTE must succeed");
+        let vals = run_str(sql)
+            .await
+            .expect("string hierarchy CTE must succeed");
         let expected = vec![
             "root".to_string(),
             "root->child".to_string(),
@@ -5566,7 +5723,11 @@ mod auto_commit_ryow_tests {
             page_cache: None,
         });
         let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-        Engine::new(EngineConfig { storage, catalog, shard: None })
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
     }
 
     fn count_from_result(res: ExecResult) -> i64 {
@@ -5591,19 +5752,30 @@ mod auto_commit_ryow_tests {
         let eng = make_engine(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
 
         sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
         let n1 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-        assert_eq!(n1, 1, "row 1 must be visible immediately after first INSERT");
+        assert_eq!(
+            n1, 1,
+            "row 1 must be visible immediately after first INSERT"
+        );
 
         sess.execute("INSERT INTO t VALUES (2)").await.unwrap();
         let n2 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-        assert_eq!(n2, 2, "row 2 must be visible immediately after second INSERT");
+        assert_eq!(
+            n2, 2,
+            "row 2 must be visible immediately after second INSERT"
+        );
 
         sess.execute("INSERT INTO t VALUES (3)").await.unwrap();
         let n3 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-        assert_eq!(n3, 3, "row 3 must be visible immediately after third INSERT");
+        assert_eq!(
+            n3, 3,
+            "row 3 must be visible immediately after third INSERT"
+        );
     }
 
     /// Multi-row INSERT: all rows in a single statement must be visible to the
@@ -5614,11 +5786,18 @@ mod auto_commit_ryow_tests {
         let eng = make_engine(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
 
-        sess.execute("INSERT INTO t VALUES (10), (20), (30)").await.unwrap();
+        sess.execute("INSERT INTO t VALUES (10), (20), (30)")
+            .await
+            .unwrap();
         let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-        assert_eq!(n, 3, "all 3 rows from multi-row INSERT must be visible immediately");
+        assert_eq!(
+            n, 3,
+            "all 3 rows from multi-row INSERT must be visible immediately"
+        );
     }
 
     /// INSERT … RETURNING: the returned row must also appear in a subsequent
@@ -5629,16 +5808,24 @@ mod auto_commit_ryow_tests {
         let eng = make_engine(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
 
         // First INSERT: verify it's visible.
         sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
         let n1 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-        assert_eq!(n1, 1, "first INSERT must be visible before RETURNING INSERT");
+        assert_eq!(
+            n1, 1,
+            "first INSERT must be visible before RETURNING INSERT"
+        );
 
         // INSERT RETURNING: the returned id must match, and the subsequent
         // COUNT must reflect both rows.
-        let ret = sess.execute("INSERT INTO t VALUES (2) RETURNING id").await.unwrap();
+        let ret = sess
+            .execute("INSERT INTO t VALUES (2) RETURNING id")
+            .await
+            .unwrap();
         let returned_id = match ret {
             ExecResult::Rows { batches, .. } => {
                 let b = batches.first().expect("RETURNING must produce a batch");
@@ -5683,7 +5870,11 @@ mod jsonb_srf_expansion_tests {
             page_cache: None,
         });
         let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-        Engine::new(EngineConfig { storage, catalog, shard: None })
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
     }
 
     async fn rows(sess: &crate::ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
@@ -5730,7 +5921,11 @@ mod jsonb_srf_expansion_tests {
         let dir = TempDir::new().unwrap();
         let eng = make_engine(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
-        let b = rows(&sess, "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)").await;
+        let b = rows(
+            &sess,
+            "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)",
+        )
+        .await;
         assert_eq!(total_rows(&b), 3);
         assert_eq!(col_str(&b, "value"), vec!["1", "2", "3"]);
     }

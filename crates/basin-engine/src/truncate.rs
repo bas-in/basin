@@ -74,7 +74,10 @@ pub(crate) async fn exec_truncate(
             }
         };
         let name = TableName::from_str(rv.relname.as_str()).map_err(|e| {
-            BasinError::internal(format!("TRUNCATE: invalid table name {:?}: {e}", rv.relname))
+            BasinError::internal(format!(
+                "TRUNCATE: invalid table name {:?}: {e}",
+                rv.relname
+            ))
         })?;
         tables.push(name);
     }
@@ -104,7 +107,10 @@ pub(crate) async fn exec_truncate(
             .list_data_files_with_stats(&sess.project, table)
             .await?;
 
-        let removed_paths: Vec<String> = data_files.iter().map(|f| f.path.as_ref().to_string()).collect();
+        let removed_paths: Vec<String> = data_files
+            .iter()
+            .map(|f| f.path.as_ref().to_string())
+            .collect();
 
         if removed_paths.is_empty() {
             // Nothing to do for this table — it's already empty.
@@ -118,7 +124,13 @@ pub(crate) async fn exec_truncate(
         // for TRUNCATE we don't care about the content — we want empty).
         let current_snap = meta.current_snapshot;
         match catalog
-            .replace_data_files(&sess.project, table, current_snap, removed_paths.clone(), vec![])
+            .replace_data_files(
+                &sess.project,
+                table,
+                current_snap,
+                removed_paths.clone(),
+                vec![],
+            )
             .await
         {
             Ok(_) => {}
@@ -145,9 +157,7 @@ pub(crate) async fn exec_truncate(
             .fields()
             .iter()
             .filter_map(|f| match f.data_type() {
-                DataType::FixedSizeList(child, _)
-                    if *child.data_type() == DataType::Float32 =>
-                {
+                DataType::FixedSizeList(child, _) if *child.data_type() == DataType::Float32 => {
                     Some(f.name().clone())
                 }
                 _ => None,
@@ -161,15 +171,13 @@ pub(crate) async fn exec_truncate(
             }
             // HNSW sidecar sweep.
             for col in &vector_columns {
-                if let Some(sidecar_path) =
-                    basin_storage::vector_index_segment_key_for_data_file(
-                        root.as_ref(),
-                        &sess.project,
-                        table,
-                        col,
-                        path_str,
-                    )
-                {
+                if let Some(sidecar_path) = basin_storage::vector_index_segment_key_for_data_file(
+                    root.as_ref(),
+                    &sess.project,
+                    table,
+                    col,
+                    path_str,
+                ) {
                     if let Err(e) = store.delete(&sidecar_path).await {
                         tracing::debug!(path = %sidecar_path, error = %e, "TRUNCATE: sidecar delete failed (ok if missing)");
                     }
@@ -255,11 +263,7 @@ fn extract_nextval_seq_name(expr: &str) -> Option<String> {
     let name = inner
         .strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))
-        .or_else(|| {
-            inner
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-        })
+        .or_else(|| inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
         .unwrap_or(inner);
     if name.is_empty() {
         None

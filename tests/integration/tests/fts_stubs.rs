@@ -88,8 +88,7 @@ async fn to_tsvector_1arg_returns_body() {
 async fn to_tsvector_2arg_returns_body() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let col =
-        single_col(&sess, "SELECT to_tsvector('english', 'a quick brown fox')").await;
+    let col = single_col(&sess, "SELECT to_tsvector('english', 'a quick brown fox')").await;
     assert_eq!(col.data_type(), &DataType::Utf8);
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "a quick brown fox");
@@ -104,8 +103,7 @@ async fn to_tsvector_2arg_returns_body() {
 async fn to_tsquery_2arg_returns_query() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let col =
-        single_col(&sess, "SELECT to_tsquery('english', 'quick & fox')").await;
+    let col = single_col(&sess, "SELECT to_tsquery('english', 'quick & fox')").await;
     assert_eq!(col.data_type(), &DataType::Utf8);
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "quick & fox");
@@ -160,11 +158,7 @@ async fn websearch_to_tsquery_returns_text() {
 async fn ts_rank_returns_zero() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let col = single_col(
-        &sess,
-        "SELECT ts_rank(to_tsvector('a'), to_tsquery('a'))",
-    )
-    .await;
+    let col = single_col(&sess, "SELECT ts_rank(to_tsvector('a'), to_tsquery('a'))").await;
     assert_eq!(col.data_type(), &DataType::Float32);
     let floats = col.as_any().downcast_ref::<Float32Array>().unwrap();
     assert_eq!(floats.value(0), 0.0f32);
@@ -222,11 +216,7 @@ async fn ts_headline_3arg_returns_body() {
 async fn setweight_returns_first_arg() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let col = single_col(
-        &sess,
-        "SELECT setweight(to_tsvector('hello world'), 'A')",
-    )
-    .await;
+    let col = single_col(&sess, "SELECT setweight(to_tsvector('hello world'), 'A')").await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "hello world");
 }
@@ -248,8 +238,11 @@ async fn strip_returns_input() {
 async fn tsvector_length_counts_words() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let col =
-        single_col(&sess, "SELECT tsvector_length(to_tsvector('one two three'))").await;
+    let col = single_col(
+        &sess,
+        "SELECT tsvector_length(to_tsvector('one two three'))",
+    )
+    .await;
     assert_eq!(col.data_type(), &DataType::Int32);
     let ints = col.as_any().downcast_ref::<Int32Array>().unwrap();
     assert_eq!(ints.value(0), 3);
@@ -303,11 +296,7 @@ async fn tsvector_match_returns_false() {
 async fn create_table_with_tsvector_column_succeeds() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(
-        &sess,
-        "CREATE TABLE doc (body TEXT, ts TSVECTOR)",
-    )
-    .await;
+    assert_no_error(&sess, "CREATE TABLE doc (body TEXT, ts TSVECTOR)").await;
 }
 
 /// CREATE TABLE with a TSQUERY column should also succeed.

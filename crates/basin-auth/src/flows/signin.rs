@@ -6,7 +6,7 @@
 //! hash if the user doesn't exist) so the response time doesn't tell an
 //! attacker whether the email exists.
 
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::Utc;
 use uuid::Uuid;
 

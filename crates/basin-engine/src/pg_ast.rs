@@ -322,9 +322,7 @@ pub fn ctas_shape(node: &Node) -> Option<CtasShape> {
     // `CREATE MATERIALIZED VIEW` also lands on CreateTableAsStmt; that
     // form has its own dedicated path. `SELECT … INTO foo` is the
     // is_select_into shape and is likewise out of scope here.
-    if ctas.objtype == pg_query::protobuf::ObjectType::ObjectMatview as i32
-        || ctas.is_select_into
-    {
+    if ctas.objtype == pg_query::protobuf::ObjectType::ObjectMatview as i32 || ctas.is_select_into {
         return None;
     }
     let into = ctas.into.as_ref();
@@ -562,9 +560,7 @@ pub fn txn_stmt(node: &Node) -> Option<TxnStmt> {
         Ok(Tk::TransStmtBegin) | Ok(Tk::TransStmtStart) => TxnStmt::Begin,
         Ok(Tk::TransStmtCommit) | Ok(Tk::TransStmtCommitPrepared) => TxnStmt::Commit,
         Ok(Tk::TransStmtRollback) | Ok(Tk::TransStmtRollbackPrepared) => TxnStmt::Rollback,
-        Ok(Tk::TransStmtRollbackTo) => {
-            TxnStmt::RollbackToSavepoint(s.savepoint_name.clone())
-        }
+        Ok(Tk::TransStmtRollbackTo) => TxnStmt::RollbackToSavepoint(s.savepoint_name.clone()),
         Ok(Tk::TransStmtSavepoint) => TxnStmt::Savepoint(s.savepoint_name.clone()),
         Ok(Tk::TransStmtRelease) => TxnStmt::ReleaseSavepoint(s.savepoint_name.clone()),
         _ => TxnStmt::Other,
@@ -926,7 +922,11 @@ fn capture_left_unit(bytes: &[u8], i_in: usize) -> usize {
             }
         }
         // Include a preceding identifier (function name), if any.
-        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.') {
+        while i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.')
+        {
             i -= 1;
         }
     } else if last == b'\'' {
@@ -953,7 +953,11 @@ fn capture_left_unit(bytes: &[u8], i_in: usize) -> usize {
         }
     } else if last.is_ascii_alphanumeric() || last == b'_' || last == b'.' {
         // Plain identifier / number.
-        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.') {
+        while i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.')
+        {
             i -= 1;
         }
     }
@@ -1064,7 +1068,8 @@ fn capture_right_unit(bytes: &[u8], i_in: usize) -> usize {
     } else if first.is_ascii_alphanumeric() || first == b'_' {
         // Identifier / number (optional schema-qualified) with optional
         // function-call argument list.
-        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') {
+        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+        {
             i += 1;
         }
         // Optional function-call args.
@@ -1358,10 +1363,7 @@ mod tests {
     #[test]
     fn stmt_kind_dml() {
         assert_eq!(first_kind("SELECT * FROM t"), StmtKind::Select);
-        assert_eq!(
-            first_kind("INSERT INTO t (a) VALUES (1)"),
-            StmtKind::Insert
-        );
+        assert_eq!(first_kind("INSERT INTO t (a) VALUES (1)"), StmtKind::Insert);
         assert_eq!(first_kind("UPDATE t SET a = 1"), StmtKind::Update);
         assert_eq!(first_kind("DELETE FROM t"), StmtKind::Delete);
     }
@@ -1426,8 +1428,7 @@ mod tests {
 
         for (sql, label) in cases {
             let tree = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
-            let err =
-                reject_unsupported(&tree).expect_err(&format!("{sql:?} should be rejected"));
+            let err = reject_unsupported(&tree).expect_err(&format!("{sql:?} should be rejected"));
             match err {
                 BasinError::FeatureNotSupported(msg) => {
                     assert!(
@@ -1463,8 +1464,7 @@ mod tests {
         ];
         for (sql, label) in create_cases {
             let tree = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
-            let err =
-                reject_unsupported(&tree).expect_err(&format!("{sql:?} should be rejected"));
+            let err = reject_unsupported(&tree).expect_err(&format!("{sql:?} should be rejected"));
             match err {
                 BasinError::FeatureNotSupported(msg) => {
                     assert!(
@@ -1579,8 +1579,7 @@ mod tests {
     #[test]
     fn rewrite_at_at_paren_operands() {
         // Both sides parenthesised.
-        let got =
-            rewrite_tsvector_at_at("SELECT (to_tsvector('a b')) @@ (to_tsquery('a')) FROM t");
+        let got = rewrite_tsvector_at_at("SELECT (to_tsvector('a b')) @@ (to_tsquery('a')) FROM t");
         assert_eq!(
             got,
             "SELECT tsvector_match_udf((to_tsvector('a b')), (to_tsquery('a'))) FROM t"
@@ -1589,9 +1588,8 @@ mod tests {
 
     #[test]
     fn rewrite_at_at_function_call_lhs_and_rhs() {
-        let got = rewrite_tsvector_at_at(
-            "SELECT to_tsvector('a b') @@ to_tsquery('english', 'a') AS m",
-        );
+        let got =
+            rewrite_tsvector_at_at("SELECT to_tsvector('a b') @@ to_tsquery('english', 'a') AS m");
         assert_eq!(
             got,
             "SELECT tsvector_match_udf(to_tsvector('a b'), to_tsquery('english', 'a')) AS m"
@@ -1603,9 +1601,7 @@ mod tests {
         // 'a quick fox'::tsvector @@ q
         // The `::tsvector` cast is stripped (Basin stores tsvector as Utf8)
         // before the @@ rewrite captures the operand.
-        let got = rewrite_tsvector_at_at(
-            "SELECT 'a quick fox'::tsvector @@ to_tsquery('fox')",
-        );
+        let got = rewrite_tsvector_at_at("SELECT 'a quick fox'::tsvector @@ to_tsquery('fox')");
         assert_eq!(
             got,
             "SELECT tsvector_match_udf('a quick fox', to_tsquery('fox'))"
@@ -1615,13 +1611,8 @@ mod tests {
     #[test]
     fn rewrite_at_at_cast_rhs() {
         // `'fox'::tsquery` → `'fox'` after the cast strip.
-        let got = rewrite_tsvector_at_at(
-            "SELECT ts @@ 'fox'::tsquery FROM doc",
-        );
-        assert_eq!(
-            got,
-            "SELECT tsvector_match_udf(ts, 'fox') FROM doc"
-        );
+        let got = rewrite_tsvector_at_at("SELECT ts @@ 'fox'::tsquery FROM doc");
+        assert_eq!(got, "SELECT tsvector_match_udf(ts, 'fox') FROM doc");
     }
 
     #[test]
@@ -1640,9 +1631,7 @@ mod tests {
 
     #[test]
     fn rewrite_at_at_multiple_in_one_statement() {
-        let got = rewrite_tsvector_at_at(
-            "SELECT * FROM t WHERE a @@ q1 OR b @@ q2",
-        );
+        let got = rewrite_tsvector_at_at("SELECT * FROM t WHERE a @@ q1 OR b @@ q2");
         assert_eq!(
             got,
             "SELECT * FROM t WHERE tsvector_match_udf(a, q1) OR tsvector_match_udf(b, q2)"
@@ -1685,9 +1674,7 @@ mod tests {
 
     #[test]
     fn rewrite_at_at_qualified_column_lhs() {
-        let got = rewrite_tsvector_at_at(
-            "SELECT * FROM doc d WHERE d.ts @@ to_tsquery('fox')",
-        );
+        let got = rewrite_tsvector_at_at("SELECT * FROM doc d WHERE d.ts @@ to_tsquery('fox')");
         assert_eq!(
             got,
             "SELECT * FROM doc d WHERE tsvector_match_udf(d.ts, to_tsquery('fox'))"
@@ -1753,8 +1740,8 @@ mod tests {
 
     #[test]
     fn strip_only_detects_do_block_as_design_exclusion() {
-        let tree =
-            parse("DO $$ BEGIN RAISE NOTICE 'hi'; END; $$ LANGUAGE plpgsql").expect("pg_query parses DO");
+        let tree = parse("DO $$ BEGIN RAISE NOTICE 'hi'; END; $$ LANGUAGE plpgsql")
+            .expect("pg_query parses DO");
         let node = tree.stmts().next().expect("one stmt");
         assert_eq!(stmt_kind(node), StmtKind::DoBlock);
         let err = reject_unsupported(&tree).expect_err("DoBlock should be rejected");
@@ -1768,10 +1755,8 @@ mod tests {
 
     #[test]
     fn strip_only_detects_partition_of_as_design_exclusion() {
-        let tree = parse(
-            "CREATE TABLE t_2024 PARTITION OF t FOR VALUES FROM (2024) TO (2025)",
-        )
-        .expect("pg_query parses PARTITION OF");
+        let tree = parse("CREATE TABLE t_2024 PARTITION OF t FOR VALUES FROM (2024) TO (2025)")
+            .expect("pg_query parses PARTITION OF");
         let node = tree.stmts().next().expect("one stmt");
         assert_eq!(stmt_kind(node), StmtKind::CreateTablePartitionOf);
         let err = reject_unsupported(&tree).expect_err("CreateTablePartitionOf should be rejected");
@@ -1798,8 +1783,8 @@ mod tests {
 
     #[test]
     fn strip_only_detects_detach_partition_as_design_exclusion() {
-        let tree = parse("ALTER TABLE t DETACH PARTITION p")
-            .expect("pg_query parses DETACH PARTITION");
+        let tree =
+            parse("ALTER TABLE t DETACH PARTITION p").expect("pg_query parses DETACH PARTITION");
         let err = reject_unsupported(&tree).expect_err("DETACH PARTITION should be rejected");
         match err {
             BasinError::FeatureNotSupported(msg) => {
@@ -1900,9 +1885,7 @@ impl OrderByExt for sqlparser::ast::OrderBy {
 /// `TableFunction(Function)`). This helper restores the old accessor for
 /// the only form Basin supports (a plain table name), erroring cleanly on
 /// the table-function form rather than silently mis-handling it.
-pub fn insert_object_name(
-    ins: &sqlparser::ast::Insert,
-) -> Result<&sqlparser::ast::ObjectName> {
+pub fn insert_object_name(ins: &sqlparser::ast::Insert) -> Result<&sqlparser::ast::ObjectName> {
     match &ins.table {
         sqlparser::ast::TableObject::TableName(name) => Ok(name),
         sqlparser::ast::TableObject::TableFunction(_) => Err(BasinError::FeatureNotSupported(

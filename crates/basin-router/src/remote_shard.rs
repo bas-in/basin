@@ -34,7 +34,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use basin_engine::{BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};

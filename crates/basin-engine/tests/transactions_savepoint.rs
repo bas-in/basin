@@ -113,7 +113,11 @@ async fn savepoint_rollback_to_keeps_pre_savepoint_write() {
     exec(&sess, "INSERT INTO t (id) VALUES (2)").await;
 
     // Both pending writes visible inside the txn (aggregate read path).
-    assert_eq!(count(&sess).await, 2, "both rows pending before rollback-to");
+    assert_eq!(
+        count(&sess).await,
+        2,
+        "both rows pending before rollback-to"
+    );
 
     exec(&sess, "ROLLBACK TO SAVEPOINT s").await;
 

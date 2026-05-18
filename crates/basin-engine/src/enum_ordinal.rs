@@ -28,13 +28,13 @@
 //! the unresolvable cases. Resolving more shapes is a future
 //! improvement.
 
-use std::collections::HashMap;
 use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
 use basin_catalog::{Catalog, EnumTypeDef};
-use basin_common::{Result, TableName, ProjectId};
+use basin_common::{ProjectId, Result, TableName};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
@@ -398,7 +398,11 @@ async fn rewrite_ordering_pair(
 /// mismatch — it isn't our place to invent ordinals for unknown
 /// labels).
 fn rewrite_label_to_ordinal(expr: &mut Expr, def: &EnumTypeDef) {
-    if let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) = expr {
+    if let Expr::Value(ValueWithSpan {
+        value: Value::SingleQuotedString(s),
+        ..
+    }) = expr
+    {
         if let Some(idx) = def.labels.iter().position(|l| l == s) {
             *expr = Expr::Value((Value::Number(idx.to_string(), false)).into());
         }

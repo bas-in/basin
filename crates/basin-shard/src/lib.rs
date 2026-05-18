@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use basin_common::{PartitionKey, Result, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, Result, TableName};
 
 /// Knobs for [`Shard::new`].
 #[derive(Clone)]
@@ -102,7 +102,11 @@ impl Shard {
 
     /// Get a handle to `(project, partition)`. Lazy-loads the state from WAL +
     /// Parquet on first access; subsequent calls return a cheap clone.
-    pub async fn get(&self, project: &ProjectId, partition: &PartitionKey) -> Result<ProjectHandle> {
+    pub async fn get(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+    ) -> Result<ProjectHandle> {
         self.inner.get(project, partition).await
     }
 

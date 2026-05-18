@@ -121,11 +121,9 @@ async fn update_out_of_with_check_rejected_valid_ok() {
     s.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
         .await
         .unwrap();
-    s.execute(
-        "CREATE POLICY p ON t FOR ALL TO PUBLIC USING (true) WITH CHECK (amount > 0)",
-    )
-    .await
-    .unwrap();
+    s.execute("CREATE POLICY p ON t FOR ALL TO PUBLIC USING (true) WITH CHECK (amount > 0)")
+        .await
+        .unwrap();
 
     // UPDATE that keeps the row inside WITH CHECK: allowed.
     s.execute("UPDATE t SET amount = 50 WHERE id = 1")
@@ -140,7 +138,10 @@ async fn update_out_of_with_check_rejected_valid_ok() {
     assert_rls_violation(&err, "update out of WITH CHECK");
 
     // The row must retain its last valid value (50), not -1.
-    let res = s.execute("SELECT amount FROM t WHERE id = 1").await.unwrap();
+    let res = s
+        .execute("SELECT amount FROM t WHERE id = 1")
+        .await
+        .unwrap();
     let amts = collect_i64(&res, "amount");
     assert_eq!(amts, vec![50], "rejected UPDATE must not mutate the row");
 }
@@ -157,11 +158,9 @@ async fn no_rls_enabled_policy_is_inert() {
         .await
         .unwrap();
     // Policy exists but ROW LEVEL SECURITY is never enabled.
-    s.execute(
-        "CREATE POLICY p ON t FOR ALL TO PUBLIC USING (true) WITH CHECK (amount > 0)",
-    )
-    .await
-    .unwrap();
+    s.execute("CREATE POLICY p ON t FOR ALL TO PUBLIC USING (true) WITH CHECK (amount > 0)")
+        .await
+        .unwrap();
 
     // Would violate WITH CHECK, but RLS is disabled → write proceeds.
     s.execute("INSERT INTO t VALUES (1, -99)")
@@ -283,11 +282,9 @@ async fn insert_select_enforces_with_check() {
     s.execute("ALTER TABLE dst ENABLE ROW LEVEL SECURITY")
         .await
         .unwrap();
-    s.execute(
-        "CREATE POLICY p ON dst FOR ALL TO PUBLIC USING (true) WITH CHECK (amount > 0)",
-    )
-    .await
-    .unwrap();
+    s.execute("CREATE POLICY p ON dst FOR ALL TO PUBLIC USING (true) WITH CHECK (amount > 0)")
+        .await
+        .unwrap();
 
     // The -7 row violates WITH CHECK; the whole statement must be rejected.
     let err = s

@@ -91,18 +91,13 @@ impl DifferentialRunner {
 
         let (pg, pg_schema) = match std::env::var("PG_DIFF_TEST_DSN") {
             Ok(dsn) if !dsn.trim().is_empty() => {
-                let (client, connection) =
-                    tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                        .await
-                        .expect("PG_DIFF_TEST_DSN connect");
+                let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .expect("PG_DIFF_TEST_DSN connect");
                 tokio::spawn(async move {
                     let _ = connection.await;
                 });
-                let schema = format!(
-                    "basin_diff_{}_{}",
-                    case_tag,
-                    std::process::id()
-                );
+                let schema = format!("basin_diff_{}_{}", case_tag, std::process::id());
                 client
                     .batch_execute(&format!(
                         "DROP SCHEMA IF EXISTS {schema} CASCADE; \
@@ -171,10 +166,7 @@ impl DifferentialRunner {
             Ok(ExecResult::Rows { batches, .. }) => {
                 let b = &batches[0];
                 let col = b.column(0);
-                if let Some(a) = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                {
+                if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
                     a.value(0)
                 } else {
                     let a = col
@@ -230,9 +222,9 @@ async fn diff_create_unique_index_duplicate_insert() {
     r.setup("INSERT INTO users (id, email) VALUES (1, 'ada@example.com')")
         .await;
 
-    let (basin, pg) =
-        r.probe("INSERT INTO users (id, email) VALUES (2, 'ada@example.com')")
-            .await;
+    let (basin, pg) = r
+        .probe("INSERT INTO users (id, email) VALUES (2, 'ada@example.com')")
+        .await;
 
     // basin leg (always runs): the duplicate must be rejected with 23505.
     assert_eq!(
@@ -262,9 +254,9 @@ async fn diff_create_unique_index_distinct_values_ok() {
     r.setup("INSERT INTO users (id, email) VALUES (1, 'a@x.com')")
         .await;
 
-    let (basin, pg) =
-        r.probe("INSERT INTO users (id, email) VALUES (2, 'b@x.com')")
-            .await;
+    let (basin, pg) = r
+        .probe("INSERT INTO users (id, email) VALUES (2, 'b@x.com')")
+        .await;
 
     assert_eq!(basin, Outcome::Ok, "distinct values must succeed in basin");
     if let Some(pg) = pg {
@@ -316,7 +308,8 @@ async fn diff_varchar_overlength_insert_rejected() {
     r.setup("CREATE TABLE t (id BIGINT PRIMARY KEY, code VARCHAR(5))")
         .await;
     // Exactly-n is accepted on both backends.
-    r.setup("INSERT INTO t (id, code) VALUES (1, 'abcde')").await;
+    r.setup("INSERT INTO t (id, code) VALUES (1, 'abcde')")
+        .await;
 
     let (basin, pg) = r
         .probe("INSERT INTO t (id, code) VALUES (2, 'toolong')")
@@ -346,9 +339,7 @@ async fn diff_char_overlength_insert_rejected() {
         .await;
     r.setup("INSERT INTO t (id, code) VALUES (1, 'ab')").await;
 
-    let (basin, pg) = r
-        .probe("INSERT INTO t (id, code) VALUES (2, 'abcd')")
-        .await;
+    let (basin, pg) = r.probe("INSERT INTO t (id, code) VALUES (2, 'abcd')").await;
 
     assert_eq!(
         basin,
@@ -391,9 +382,7 @@ async fn diff_tablesample_bernoulli_count_in_band() {
     // Binomial(10000, 0.1) (σ ≈ 30) — it will not flake, yet rejects the
     // all-rows bug (10000) and the empty-result failure mode.
     let (b, p) = r
-        .count_both(
-            "SELECT count(*) FROM samp TABLESAMPLE BERNOULLI(10) REPEATABLE(12345)",
-        )
+        .count_both("SELECT count(*) FROM samp TABLESAMPLE BERNOULLI(10) REPEATABLE(12345)")
         .await;
     assert!(
         (600..=1400).contains(&b),
@@ -562,15 +551,17 @@ async fn diff_rls_with_check_violation_rejected_by_basin() {
 
     r.setup("CREATE TABLE orders (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL)")
         .await;
-    r.setup("ALTER TABLE orders ENABLE ROW LEVEL SECURITY").await;
+    r.setup("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await;
     r.setup(
         "CREATE POLICY p ON orders FOR ALL TO PUBLIC \
          USING (true) WITH CHECK (amount > 0)",
     )
     .await;
 
-    let (basin, pg) =
-        r.probe("INSERT INTO orders (id, amount) VALUES (1, -5)").await;
+    let (basin, pg) = r
+        .probe("INSERT INTO orders (id, amount) VALUES (1, -5)")
+        .await;
 
     // basin leg (always runs): must reject with the RLS 42501 class.
     assert_eq!(
@@ -597,15 +588,17 @@ async fn diff_rls_with_check_satisfied_accepted_both() {
 
     r.setup("CREATE TABLE orders (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL)")
         .await;
-    r.setup("ALTER TABLE orders ENABLE ROW LEVEL SECURITY").await;
+    r.setup("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await;
     r.setup(
         "CREATE POLICY p ON orders FOR ALL TO PUBLIC \
          USING (true) WITH CHECK (amount > 0)",
     )
     .await;
 
-    let (basin, pg) =
-        r.probe("INSERT INTO orders (id, amount) VALUES (1, 10)").await;
+    let (basin, pg) = r
+        .probe("INSERT INTO orders (id, amount) VALUES (1, 10)")
+        .await;
 
     assert_eq!(
         basin,
@@ -688,8 +681,7 @@ impl DifferentialRunner {
                     let get = |c: &std::sync::Arc<dyn arrow_array::Array>, r: usize| -> i64 {
                         if let Some(a) = c.as_any().downcast_ref::<arrow_array::Int64Array>() {
                             a.value(r)
-                        } else if let Some(a) =
-                            c.as_any().downcast_ref::<arrow_array::Int32Array>()
+                        } else if let Some(a) = c.as_any().downcast_ref::<arrow_array::Int32Array>()
                         {
                             a.value(r) as i64
                         } else {
@@ -866,8 +858,9 @@ async fn diff_rls_disabled_policy_inert_both_accept() {
     )
     .await;
 
-    let (basin, pg) =
-        r.probe("INSERT INTO orders (id, amount) VALUES (1, -99)").await;
+    let (basin, pg) = r
+        .probe("INSERT INTO orders (id, amount) VALUES (1, -99)")
+        .await;
 
     assert_eq!(
         basin,
@@ -919,7 +912,11 @@ async fn diff_ctas_with_no_data_is_schema_only() {
     let (basin_i, pg_i) = r
         .probe("INSERT INTO clone_empty (id, label) VALUES (9, 'z')")
         .await;
-    assert_eq!(basin_i, Outcome::Ok, "WITH NO DATA clone must be insertable");
+    assert_eq!(
+        basin_i,
+        Outcome::Ok,
+        "WITH NO DATA clone must be insertable"
+    );
     if let Some(pg_i) = pg_i {
         assert_eq!(basin_i, pg_i, "basin/PG disagree on post-CTAS insert");
     }
@@ -1003,9 +1000,10 @@ async fn diff_lateral_generate_series_per_row_expansion() {
     // Regression guard: the non-correlated `generate_series(1, 3)` form is
     // NOT rewritten and still works (cross join, 2 t-rows × 3 series = 6).
     let (bc, _pc) = r
-        .count_both(
-            "SELECT count(*) FROM t CROSS JOIN LATERAL generate_series(1, 3) g",
-        )
+        .count_both("SELECT count(*) FROM t CROSS JOIN LATERAL generate_series(1, 3) g")
         .await;
-    assert_eq!(bc, 6, "non-correlated generate_series(1,3) must be unaffected");
+    assert_eq!(
+        bc, 6,
+        "non-correlated generate_series(1,3) must be unaffected"
+    );
 }

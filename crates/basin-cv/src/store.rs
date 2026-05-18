@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use basin_catalog::{CvDef, DataFileRef, SnapshotId, TableMetadata};
-use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use basin_engine::{Engine, ExecResult};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -137,7 +137,9 @@ impl CvStore {
 
         // 2. Create the CV's catalog table.
         let catalog = self.inner.engine.config().catalog.clone();
-        let _meta = catalog.create_table(project, &name, schema.as_ref()).await?;
+        let _meta = catalog
+            .create_table(project, &name, schema.as_ref())
+            .await?;
 
         // 3. Write the bootstrap result as the CV's first Parquet file.
         let merged = concat_batches(&schema, &batches)?;

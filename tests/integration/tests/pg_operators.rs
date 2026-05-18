@@ -56,11 +56,10 @@ fn make_engine(dir: &TempDir) -> Engine {
 }
 
 /// Execute a SQL statement and return the result.
-async fn exec(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> ExecResult {
-    sess.execute(sql).await.unwrap_or_else(|e| panic!("SQL failed: {sql:?}\nError: {e}"))
+async fn exec(sess: &basin_engine::ProjectSession, sql: &str) -> ExecResult {
+    sess.execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("SQL failed: {sql:?}\nError: {e}"))
 }
 
 /// Execute a SQL statement, expect it to return rows, and return the first
@@ -130,7 +129,11 @@ async fn is_distinct_from_basic() {
 
     // NULL IS DISTINCT FROM NULL → false (both null, so not distinct)
     let vals = scalar_bools(&sess, "SELECT NULL IS DISTINCT FROM NULL").await;
-    assert_eq!(vals, vec![false], "NULL IS DISTINCT FROM NULL should be false");
+    assert_eq!(
+        vals,
+        vec![false],
+        "NULL IS DISTINCT FROM NULL should be false"
+    );
 
     // 1 IS DISTINCT FROM 2 → true
     let vals = scalar_bools(&sess, "SELECT 1 IS DISTINCT FROM 2").await;
@@ -210,7 +213,11 @@ async fn between_symmetric_high_low() {
     exec(&sess, "INSERT INTO nums VALUES (1), (5), (10), (15), (20)").await;
 
     // BETWEEN SYMMETRIC 15 AND 5 = BETWEEN 5 AND 15 (bounds swapped)
-    let n = row_count(&sess, "SELECT * FROM nums WHERE n BETWEEN SYMMETRIC 15 AND 5").await;
+    let n = row_count(
+        &sess,
+        "SELECT * FROM nums WHERE n BETWEEN SYMMETRIC 15 AND 5",
+    )
+    .await;
     assert_eq!(n, 3, "BETWEEN SYMMETRIC 15 AND 5 should match 5, 10, 15");
 }
 
@@ -223,7 +230,11 @@ async fn not_between_symmetric() {
     exec(&sess, "CREATE TABLE nums (n INT NOT NULL)").await;
     exec(&sess, "INSERT INTO nums VALUES (1), (5), (10), (15), (20)").await;
 
-    let n = row_count(&sess, "SELECT * FROM nums WHERE n NOT BETWEEN SYMMETRIC 15 AND 5").await;
+    let n = row_count(
+        &sess,
+        "SELECT * FROM nums WHERE n NOT BETWEEN SYMMETRIC 15 AND 5",
+    )
+    .await;
     assert_eq!(n, 2, "NOT BETWEEN SYMMETRIC 15 AND 5 should match 1, 20");
 }
 
@@ -238,7 +249,11 @@ async fn posix_tilde_match() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
-    exec(&sess, "INSERT INTO words VALUES ('apple'), ('banana'), ('cherry')").await;
+    exec(
+        &sess,
+        "INSERT INTO words VALUES ('apple'), ('banana'), ('cherry')",
+    )
+    .await;
 
     // ~ (case-sensitive match)
     let n = row_count(&sess, "SELECT * FROM words WHERE w ~ '^a'").await;
@@ -252,7 +267,11 @@ async fn posix_bang_tilde_no_match() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
-    exec(&sess, "INSERT INTO words VALUES ('apple'), ('banana'), ('cherry')").await;
+    exec(
+        &sess,
+        "INSERT INTO words VALUES ('apple'), ('banana'), ('cherry')",
+    )
+    .await;
 
     // !~ (negative match)
     let n = row_count(&sess, "SELECT * FROM words WHERE w !~ '^a'").await;
@@ -266,7 +285,11 @@ async fn posix_tilde_star_case_insensitive() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
-    exec(&sess, "INSERT INTO words VALUES ('Apple'), ('banana'), ('cherry')").await;
+    exec(
+        &sess,
+        "INSERT INTO words VALUES ('Apple'), ('banana'), ('cherry')",
+    )
+    .await;
 
     // ~* (case-insensitive match)
     let n = row_count(&sess, "SELECT * FROM words WHERE w ~* '^a'").await;
@@ -280,7 +303,11 @@ async fn posix_bang_tilde_star_case_insensitive_no_match() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE words (w TEXT NOT NULL)").await;
-    exec(&sess, "INSERT INTO words VALUES ('Apple'), ('Banana'), ('Cherry')").await;
+    exec(
+        &sess,
+        "INSERT INTO words VALUES ('Apple'), ('Banana'), ('Cherry')",
+    )
+    .await;
 
     // !~* (case-insensitive negative match)
     let n = row_count(&sess, "SELECT * FROM words WHERE w !~* '^a'").await;

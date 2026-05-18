@@ -13,7 +13,7 @@ use std::sync::Arc;
 use arrow_array::{BooleanArray, StringArray};
 use arrow_schema::DataType;
 use basin_catalog::InMemoryCatalog;
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_storage::{Storage, StorageConfig};
 use object_store::local::LocalFileSystem;
@@ -46,15 +46,24 @@ impl Harness {
             shard: None,
         });
         let project = ProjectId::new();
-        Harness { engine, catalog, project }
+        Harness {
+            engine,
+            catalog,
+            project,
+        }
     }
 
     async fn session(&self) -> basin_engine::ProjectSession {
-        self.engine.open_session(self.project.clone()).await.unwrap()
+        self.engine
+            .open_session(self.project.clone())
+            .await
+            .unwrap()
     }
 
     async fn exec_ok(&self, sess: &basin_engine::ProjectSession, sql: &str) -> ExecResult {
-        sess.execute(sql).await.unwrap_or_else(|e| panic!("SQL failed: {e}\nSQL: {sql}"))
+        sess.execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("SQL failed: {e}\nSQL: {sql}"))
     }
 
     async fn field_for(&self, table: &str, col: &str) -> arrow_schema::Field {
@@ -72,7 +81,8 @@ impl Harness {
 async fn ddl_accepts_inet_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_inet (id BIGINT, addr INET)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_inet (id BIGINT, addr INET)")
+        .await;
     let f = h.field_for("t_inet", "addr").await;
     assert_eq!(f.data_type(), &DataType::Utf8, "INET must be Utf8");
     assert_eq!(
@@ -85,7 +95,8 @@ async fn ddl_accepts_inet_column() {
 async fn ddl_accepts_cidr_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_cidr (id BIGINT, net CIDR)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_cidr (id BIGINT, net CIDR)")
+        .await;
     let f = h.field_for("t_cidr", "net").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -98,7 +109,8 @@ async fn ddl_accepts_cidr_column() {
 async fn ddl_accepts_macaddr_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_mac (id BIGINT, mac MACADDR)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_mac (id BIGINT, mac MACADDR)")
+        .await;
     let f = h.field_for("t_mac", "mac").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -111,7 +123,8 @@ async fn ddl_accepts_macaddr_column() {
 async fn ddl_accepts_macaddr8_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_mac8 (id BIGINT, mac MACADDR8)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_mac8 (id BIGINT, mac MACADDR8)")
+        .await;
     let f = h.field_for("t_mac8", "mac").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -128,7 +141,8 @@ async fn ddl_accepts_macaddr8_column() {
 async fn ddl_accepts_money_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_money (id BIGINT, price MONEY)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_money (id BIGINT, price MONEY)")
+        .await;
     let f = h.field_for("t_money", "price").await;
     assert_eq!(
         f.data_type(),
@@ -149,7 +163,8 @@ async fn ddl_accepts_money_column() {
 async fn ddl_accepts_xml_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_xml (id BIGINT, doc XML)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_xml (id BIGINT, doc XML)")
+        .await;
     let f = h.field_for("t_xml", "doc").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -166,7 +181,8 @@ async fn ddl_accepts_xml_column() {
 async fn ddl_accepts_int4range_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_int4r (id BIGINT, r INT4RANGE)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_int4r (id BIGINT, r INT4RANGE)")
+        .await;
     let f = h.field_for("t_int4r", "r").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -179,7 +195,8 @@ async fn ddl_accepts_int4range_column() {
 async fn ddl_accepts_int8range_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_int8r (id BIGINT, r INT8RANGE)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_int8r (id BIGINT, r INT8RANGE)")
+        .await;
     let f = h.field_for("t_int8r", "r").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -192,7 +209,8 @@ async fn ddl_accepts_int8range_column() {
 async fn ddl_accepts_numrange_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_numr (id BIGINT, r NUMRANGE)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_numr (id BIGINT, r NUMRANGE)")
+        .await;
     let f = h.field_for("t_numr", "r").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -205,7 +223,8 @@ async fn ddl_accepts_numrange_column() {
 async fn ddl_accepts_daterange_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_dr (id BIGINT, r DATERANGE)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_dr (id BIGINT, r DATERANGE)")
+        .await;
     let f = h.field_for("t_dr", "r").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -218,7 +237,8 @@ async fn ddl_accepts_daterange_column() {
 async fn ddl_accepts_tsrange_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_tsr (id BIGINT, r TSRANGE)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_tsr (id BIGINT, r TSRANGE)")
+        .await;
     let f = h.field_for("t_tsr", "r").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -231,7 +251,8 @@ async fn ddl_accepts_tsrange_column() {
 async fn ddl_accepts_tstzrange_column() {
     let h = Harness::new();
     let sess = h.session().await;
-    h.exec_ok(&sess, "CREATE TABLE t_tstzr (id BIGINT, r TSTZRANGE)").await;
+    h.exec_ok(&sess, "CREATE TABLE t_tstzr (id BIGINT, r TSTZRANGE)")
+        .await;
     let f = h.field_for("t_tstzr", "r").await;
     assert_eq!(f.data_type(), &DataType::Utf8);
     assert_eq!(
@@ -268,7 +289,10 @@ async fn range_lower_upper_via_sql() {
     let h = Harness::new();
     let sess = h.session().await;
     let result = h
-        .exec_ok(&sess, "SELECT lower(int4range(5, 20)), upper(int4range(5, 20))")
+        .exec_ok(
+            &sess,
+            "SELECT lower(int4range(5, 20)), upper(int4range(5, 20))",
+        )
         .await;
     if let ExecResult::Rows { batches, .. } = result {
         let lo_sa = batches[0]
@@ -309,8 +333,14 @@ async fn range_lower_inc_upper_inc_via_sql() {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        assert!(li_ba.value(0), "lower_inc should be true for default [) range");
-        assert!(!ui_ba.value(0), "upper_inc should be false for default [) range");
+        assert!(
+            li_ba.value(0),
+            "lower_inc should be true for default [) range"
+        );
+        assert!(
+            !ui_ba.value(0),
+            "upper_inc should be false for default [) range"
+        );
     } else {
         panic!("expected Rows result");
     }
@@ -328,11 +358,7 @@ async fn range_contains_elem_via_sql() {
     let r2 = h
         .exec_ok(&sess, "SELECT range_contains_elem(int4range(1, 10), 10)")
         .await;
-    if let (
-        ExecResult::Rows { batches: b1, .. },
-        ExecResult::Rows { batches: b2, .. },
-    ) = (r1, r2)
-    {
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2) {
         let in_range = b1[0]
             .column(0)
             .as_any()
@@ -368,11 +394,7 @@ async fn range_overlaps_via_sql() {
             "SELECT range_overlaps(int4range(1, 5), int4range(5, 10))",
         )
         .await;
-    if let (
-        ExecResult::Rows { batches: b1, .. },
-        ExecResult::Rows { batches: b2, .. },
-    ) = (r1, r2)
-    {
+    if let (ExecResult::Rows { batches: b1, .. }, ExecResult::Rows { batches: b2, .. }) = (r1, r2) {
         let overlaps = b1[0]
             .column(0)
             .as_any()

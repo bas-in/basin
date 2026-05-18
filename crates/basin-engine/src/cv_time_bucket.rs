@@ -32,8 +32,8 @@
 //!   GROUP BY expressions where none is a time-bucket, etc.) — falls back
 //!   to full re-execution. The CV is still correct, just not incremental.
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use crate::pg_ast::ObjectNamePartExt;
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, SelectItem, SetExpr,
@@ -164,7 +164,11 @@ pub fn detect_time_bucket(query_sql: &str) -> Option<BucketInfo> {
     // pair. The first match wins.
     for ge in group_exprs {
         // GROUP BY 1 / 2 / ...
-        if let Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) = ge {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) = ge
+        {
             if let Ok(idx) = n.parse::<usize>() {
                 if idx > 0 && idx <= projections.len() {
                     let (alias_opt, expr) = &projections[idx - 1];
@@ -293,9 +297,15 @@ fn literal_string(arg: &FunctionArg) -> Option<String> {
         _ => return None,
     };
     match expr {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s.clone()),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => Some(s.clone()),
         Expr::Interval(iv) => match iv.value.as_ref() {
-            Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }) => {
                 // INTERVAL '5 minutes' — sqlparser stores the raw text.
                 Some(s.clone())
             }

@@ -25,7 +25,7 @@
 //! Sign-out (`signout()`) revokes a single jti without writing a sentinel
 //! — there's no peer "newer" jti to imply leak.
 
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 

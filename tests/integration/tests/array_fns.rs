@@ -75,10 +75,7 @@ async fn open_engine() -> (TempDir, Engine) {
 
 /// Execute `sql`, expect exactly one row × one column. Return the single
 /// `ArrayRef` from that batch.
-async fn single_col(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> arrow_array::ArrayRef {
+async fn single_col(sess: &basin_engine::ProjectSession, sql: &str) -> arrow_array::ArrayRef {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches
@@ -113,7 +110,10 @@ async fn one_int(sess: &basin_engine::ProjectSession, sql: &str) -> i64 {
     if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
         return a.value(0) as i64;
     }
-    panic!("not Int64 / Int32 / UInt64 for: {sql} (type={:?})", col.data_type())
+    panic!(
+        "not Int64 / Int32 / UInt64 for: {sql} (type={:?})",
+        col.data_type()
+    )
 }
 
 /// Extract string from single-cell result.
@@ -273,7 +273,10 @@ async fn array_upper_via_array_length() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // array_upper(arr, 1) == array_length(arr, 1) for standard 1-based arrays.
     let n = one_int(&sess, "SELECT array_length(ARRAY[10, 20, 30], 1)").await;
-    assert_eq!(n, 3, "array_length(arr, 1) is the upper bound for 1-based arrays");
+    assert_eq!(
+        n, 3,
+        "array_length(arr, 1) is the upper bound for 1-based arrays"
+    );
 }
 
 /// `array_dims(arr)` — returns text description like `[1:3]`.
@@ -310,7 +313,10 @@ async fn array_slice_range() {
         "SELECT cardinality(array_slice(ARRAY[10, 20, 30, 40, 50], 2, 4))",
     )
     .await;
-    assert_eq!(n, 3, "slice [2:4] of 5-element array should give 3 elements");
+    assert_eq!(
+        n, 3,
+        "slice [2:4] of 5-element array should give 3 elements"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -322,11 +328,7 @@ async fn array_slice_range() {
 async fn array_append_test() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let n = one_int(
-        &sess,
-        "SELECT cardinality(array_append(ARRAY[1, 2, 3], 4))",
-    )
-    .await;
+    let n = one_int(&sess, "SELECT cardinality(array_append(ARRAY[1, 2, 3], 4))").await;
     assert_eq!(n, 4);
 }
 
@@ -415,11 +417,7 @@ async fn array_positions_test() {
 async fn array_position_test() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let pos = one_int(
-        &sess,
-        "SELECT array_position(ARRAY[10, 20, 30], 20)",
-    )
-    .await;
+    let pos = one_int(&sess, "SELECT array_position(ARRAY[10, 20, 30], 20)").await;
     assert_eq!(pos, 2, "20 is at position 2");
 }
 
@@ -454,19 +452,17 @@ async fn all_operator_semantics() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     // All elements are 2 in [2,2,2]: removing 2 leaves cardinality 0
-    let n = one_int(
-        &sess,
-        "SELECT cardinality(array_remove(ARRAY[2, 2, 2], 2))",
-    )
-    .await;
-    assert_eq!(n, 0, "after removing 2 from [2,2,2], zero elements remain = all were 2");
+    let n = one_int(&sess, "SELECT cardinality(array_remove(ARRAY[2, 2, 2], 2))").await;
+    assert_eq!(
+        n, 0,
+        "after removing 2 from [2,2,2], zero elements remain = all were 2"
+    );
     // Not all elements are 2 in [2,3,2]: removing 2 leaves cardinality > 0
-    let n2 = one_int(
-        &sess,
-        "SELECT cardinality(array_remove(ARRAY[2, 3, 2], 2))",
-    )
-    .await;
-    assert_eq!(n2, 1, "after removing 2 from [2,3,2], one element (3) remains");
+    let n2 = one_int(&sess, "SELECT cardinality(array_remove(ARRAY[2, 3, 2], 2))").await;
+    assert_eq!(
+        n2, 1,
+        "after removing 2 from [2,3,2], one element (3) remains"
+    );
 }
 
 /// `arr1 @> arr2` — array contains (type-discriminated: List only, not range).
@@ -504,11 +500,7 @@ async fn array_overlap_operator() {
     )
     .await;
     assert!(b, "[1,2,3] && [3,4,5] should overlap on 3");
-    let b2 = one_bool(
-        &sess,
-        "SELECT array_has_any(ARRAY[1, 2], ARRAY[4, 5])",
-    )
-    .await;
+    let b2 = one_bool(&sess, "SELECT array_has_any(ARRAY[1, 2], ARRAY[4, 5])").await;
     assert!(!b2, "[1,2] && [4,5] should not overlap");
 }
 
@@ -522,7 +514,11 @@ async fn unnest_srf() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let rows = multi_str(&sess, "SELECT unnest(ARRAY[10, 20, 30])").await;
-    assert_eq!(rows, vec!["10", "20", "30"], "unnest should expand array to rows");
+    assert_eq!(
+        rows,
+        vec!["10", "20", "30"],
+        "unnest should expand array to rows"
+    );
 }
 
 /// `array_to_string(arr, delim)` — joins array elements with delimiter.
@@ -530,11 +526,7 @@ async fn unnest_srf() {
 async fn array_to_string_test() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let s = one_str(
-        &sess,
-        "SELECT array_to_string(ARRAY['a', 'b', 'c'], ',')",
-    )
-    .await;
+    let s = one_str(&sess, "SELECT array_to_string(ARRAY['a', 'b', 'c'], ',')").await;
     assert_eq!(s, "a,b,c");
 }
 
@@ -543,11 +535,7 @@ async fn array_to_string_test() {
 async fn string_to_array_test() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let n = one_int(
-        &sess,
-        "SELECT cardinality(string_to_array('a,b,c,d', ','))",
-    )
-    .await;
+    let n = one_int(&sess, "SELECT cardinality(string_to_array('a,b,c,d', ','))").await;
     assert_eq!(n, 4, "string_to_array should split into 4 parts");
 }
 

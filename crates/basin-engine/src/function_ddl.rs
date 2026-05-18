@@ -21,8 +21,8 @@
 //! procedures are explicitly out of scope per ADR 0012; each is rejected
 //! with a SQLSTATE-tagged message pointing at the right follow-up phase.
 
-use std::sync::Arc;
 use crate::pg_ast::ObjectNamePartExt;
+use std::sync::Arc;
 
 use basin_catalog::{
     Catalog, SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
@@ -388,16 +388,20 @@ fn extract_body_text(body: &Option<CreateFunctionBody>, fn_name: &str) -> Result
     })?;
     match body {
         CreateFunctionBody::AsBeforeOptions { body: expr, .. }
-        | CreateFunctionBody::AsAfterOptions(expr) => {
-            match expr {
-                Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(s), .. }) => Ok(s.value.clone()),
-                Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Ok(s.clone()),
-                other => Err(BasinError::InvalidSchema(format!(
-                    "CREATE FUNCTION {fn_name}: function body must be a dollar-quoted \
+        | CreateFunctionBody::AsAfterOptions(expr) => match expr {
+            Expr::Value(ValueWithSpan {
+                value: Value::DollarQuotedString(s),
+                ..
+            }) => Ok(s.value.clone()),
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }) => Ok(s.clone()),
+            other => Err(BasinError::InvalidSchema(format!(
+                "CREATE FUNCTION {fn_name}: function body must be a dollar-quoted \
                      or single-quoted string literal containing a single SELECT; got {other}"
-                ))),
-            }
-        }
+            ))),
+        },
         _ => Err(BasinError::InvalidSchema(format!(
             "CREATE FUNCTION {fn_name}: SQL/PSM `RETURN <expr>` / `BEGIN … END` body \
              forms are not supported in v0.1; use `AS $$ SELECT <expr> $$`"

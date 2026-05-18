@@ -125,7 +125,8 @@ struct TsVector {
 impl TsVector {
     fn from_text_document(text: &str, config: Option<&str>) -> Self {
         let drop_sw = config_drops_stopwords(config);
-        let mut map: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+        let mut map: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
         let mut pos: u32 = 0;
         for tok in tokenize(text) {
             pos += 1; // PG advances the position counter even for stopwords
@@ -205,10 +206,7 @@ impl TsVector {
                 buf
             } else {
                 let start = i;
-                while i < bytes.len()
-                    && !bytes[i].is_ascii_whitespace()
-                    && bytes[i] != b':'
-                {
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b':' {
                     i += 1;
                 }
                 s[start..i].to_string()
@@ -274,11 +272,16 @@ impl TsVector {
     }
 
     fn contains(&self, lexeme: &str) -> bool {
-        self.entries.binary_search_by(|(l, _)| l.as_str().cmp(lexeme)).is_ok()
+        self.entries
+            .binary_search_by(|(l, _)| l.as_str().cmp(lexeme))
+            .is_ok()
     }
 
     fn positions(&self, lexeme: &str) -> &[u32] {
-        match self.entries.binary_search_by(|(l, _)| l.as_str().cmp(lexeme)) {
+        match self
+            .entries
+            .binary_search_by(|(l, _)| l.as_str().cmp(lexeme))
+        {
             Ok(idx) => &self.entries[idx].1,
             Err(_) => &[],
         }
@@ -328,7 +331,10 @@ impl TsQuery {
         let mut p = QParser { toks, pos: 0 };
         let q = p.parse_or()?;
         if p.pos != p.toks.len() {
-            return Err(format!("unexpected token in tsquery near {:?}", p.toks.get(p.pos)));
+            return Err(format!(
+                "unexpected token in tsquery near {:?}",
+                p.toks.get(p.pos)
+            ));
         }
         Ok(Some(q))
     }
@@ -354,9 +360,7 @@ impl TsQuery {
         for t in iter {
             acc = match kind {
                 JoinKind::And => TsQuery::And(Box::new(acc), Box::new(TsQuery::Term(t))),
-                JoinKind::Phrase => {
-                    TsQuery::Phrase(Box::new(acc), Box::new(TsQuery::Term(t)), 1)
-                }
+                JoinKind::Phrase => TsQuery::Phrase(Box::new(acc), Box::new(TsQuery::Term(t)), 1),
             };
         }
         Some(acc)
@@ -636,10 +640,7 @@ fn lex_query(input: &str) -> Result<Vec<QTok>, String> {
                     }
                 }
                 if start == i {
-                    return Err(format!(
-                        "unexpected character {:?} in tsquery",
-                        c as char
-                    ));
+                    return Err(format!("unexpected character {:?} in tsquery", c as char));
                 }
                 out.push(QTok::Term(input[start..i].to_lowercase()));
             }
@@ -818,10 +819,7 @@ pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
     }));
 
     ctx.register_udf(ScalarUDF::from(TsqueryPhraseUdf {
-        signature: Signature::one_of(
-            vec![ts2.clone(), ts3.clone()],
-            Volatility::Immutable,
-        ),
+        signature: Signature::one_of(vec![ts2.clone(), ts3.clone()], Volatility::Immutable),
     }));
 
     // Simplified deterministic ranking (NOT cover density).
@@ -837,12 +835,16 @@ pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
     // ts_headline — STUB (out of scope): returns the body unchanged.
     ctx.register_udf(ScalarUDF::from(TsHeadlineUdf {
         signature: Signature::one_of(
-            vec![ts2.clone(), ts3.clone(), TypeSignature::Exact(vec![
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-            ])],
+            vec![
+                ts2.clone(),
+                ts3.clone(),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]),
+            ],
             Volatility::Immutable,
         ),
     }));
@@ -944,9 +946,10 @@ impl ScalarUDFImpl for ToTsvectorUdf {
                 out.push(None);
                 continue;
             }
-            let cfg = config_arr
-                .as_ref()
-                .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+            let cfg =
+                config_arr
+                    .as_ref()
+                    .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
             let tv = TsVector::from_text_document(body_arr.value(i), cfg);
             out.push(Some(tv.to_canonical()));
         }
@@ -992,15 +995,14 @@ impl ScalarUDFImpl for ToTsqueryUdf {
                 out.push(None);
                 continue;
             }
-            let cfg = config_arr
-                .as_ref()
-                .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+            let cfg =
+                config_arr
+                    .as_ref()
+                    .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
             let text = body_arr.value(i);
             let q: Option<TsQuery> = match self.name.as_str() {
                 "to_tsquery" => TsQuery::parse_to_tsquery(text).map_err(|e| {
-                    datafusion::common::DataFusionError::Execution(format!(
-                        "to_tsquery: {e}"
-                    ))
+                    datafusion::common::DataFusionError::Execution(format!("to_tsquery: {e}"))
                 })?,
                 "phraseto_tsquery" => TsQuery::phraseto(text, cfg),
                 // plainto / websearch (best-effort) → implicit AND.
@@ -1120,9 +1122,7 @@ impl ScalarUDFImpl for TsvectorToArrayUdf {
             Some(nulls.into()),
         )
         .map_err(|e| {
-            datafusion::common::DataFusionError::Execution(format!(
-                "tsvector_to_array: {e}"
-            ))
+            datafusion::common::DataFusionError::Execution(format!("tsvector_to_array: {e}"))
         })?;
         Ok(ColumnarValue::Array(Arc::new(list)))
     }
@@ -1232,10 +1232,7 @@ impl ScalarUDFImpl for TsRankUdf {
             let score = match q {
                 Some(q) if q.matches(&v) => {
                     let total = v.entries.len().max(1) as f32;
-                    let hits = query_terms(&q)
-                        .iter()
-                        .filter(|t| v.contains(t))
-                        .count() as f32;
+                    let hits = query_terms(&q).iter().filter(|t| v.contains(t)).count() as f32;
                     hits / total
                 }
                 _ => 0.0,
@@ -1506,7 +1503,10 @@ mod tests {
 
     #[test]
     fn tokenization_and_stopwords() {
-        assert_eq!(tokenize("A Quick, Brown-Fox!"), vec!["a", "quick", "brown", "fox"]);
+        assert_eq!(
+            tokenize("A Quick, Brown-Fox!"),
+            vec!["a", "quick", "brown", "fox"]
+        );
         assert!(is_stopword("the"));
         assert!(is_stopword("a"));
         assert!(!is_stopword("fox"));
@@ -1577,7 +1577,7 @@ mod tests {
         assert!(mtch("the quick brown fox", "quick <2> fox")); // exactly 2 apart
         assert!(mtch("the quick brown fox", "brown <-> fox")); // adjacent
         assert!(!mtch("the quick brown fox", "fox <-> brown")); // wrong order
-        // chained phrase composes via end-positions
+                                                                // chained phrase composes via end-positions
         assert!(mtch("the quick brown fox", "quick <-> brown <-> fox"));
         assert!(!mtch("the quick brown fox", "quick <-> fox <-> brown"));
         // phrase against a position-less bare cast cannot be verified → false
@@ -1628,7 +1628,9 @@ mod tests {
         let reparsed = TsVector::parse(&canon);
         assert_eq!(reparsed.to_canonical(), canon);
         // phrase still works after a canonical round-trip
-        let q = TsQuery::parse_to_tsquery("quick <-> brown").unwrap().unwrap();
+        let q = TsQuery::parse_to_tsquery("quick <-> brown")
+            .unwrap()
+            .unwrap();
         assert!(q.matches(&reparsed));
     }
 

@@ -11,7 +11,7 @@
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 
 fn name(s: &str) -> TableName {
     TableName::new(s).unwrap()

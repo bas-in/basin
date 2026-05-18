@@ -424,10 +424,7 @@ async fn create_unique_index_multi_column_enforces_on_tuple() {
         .unwrap_err();
     assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
     let msg = err.to_string();
-    assert!(
-        msg.contains("memberships_org_user_uidx"),
-        "msg = {msg}"
-    );
+    assert!(msg.contains("memberships_org_user_uidx"), "msg = {msg}");
 }
 
 #[tokio::test]

@@ -73,9 +73,7 @@ async fn pairs(sess: &ProjectSession, sql: &str) -> Vec<(i64, i64)> {
 
 async fn count_rows(sess: &ProjectSession, sql: &str) -> usize {
     match sess.execute(sql).await {
-        Ok(ExecResult::Rows { batches, .. }) => {
-            batches.iter().map(|b| b.num_rows()).sum()
-        }
+        Ok(ExecResult::Rows { batches, .. }) => batches.iter().map(|b| b.num_rows()).sum(),
         other => panic!("expected rows from {sql:?}, got {other:?}"),
     }
 }
@@ -85,7 +83,9 @@ async fn cross_join_lateral_per_row_expansion() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    sess.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (2), (3)").await.unwrap();
 
     // 2 → {1,2}, 3 → {1,2,3}.
@@ -104,7 +104,9 @@ async fn comma_lateral_with_column_alias_list() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    sess.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1), (4)").await.unwrap();
 
     // Comma form + `AS gs(i)` column-alias list (we still expose `value`).
@@ -123,7 +125,9 @@ async fn empty_table_yields_no_rows() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    sess.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
 
     let n = count_rows(
         &sess,
@@ -159,7 +163,9 @@ async fn explicit_step_one_variant() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    sess.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (3)").await.unwrap();
 
     // 3-arg form with literal step 1 is supported (same as the 2-arg form).
@@ -178,7 +184,9 @@ async fn lower_bound_other_than_one() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    sess.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (5)").await.unwrap();
 
     // generate_series(3, 5) ⇒ {3,4,5}.
@@ -197,7 +205,9 @@ async fn outer_where_and_other_join_preserved() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    sess.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (2), (3), (4)")
         .await
         .unwrap();
@@ -224,8 +234,12 @@ async fn non_correlated_generate_series_unaffected() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    sess.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (10), (20)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (10), (20)")
+        .await
+        .unwrap();
 
     // 2 t-rows × series {1,2,3} = 6 rows; series values independent of t.id.
     let got = pairs(

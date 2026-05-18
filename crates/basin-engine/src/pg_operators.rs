@@ -113,8 +113,7 @@ fn rewrite_between_symmetric_inner(sql: &str, not_form: bool) -> String {
         // Determine if this is a NOT form.
         let before = lower[..bs_pos].trim_end();
         let has_not = before.ends_with("not")
-            && (before.len() == 3
-                || !before.as_bytes()[before.len() - 4].is_ascii_alphanumeric());
+            && (before.len() == 3 || !before.as_bytes()[before.len() - 4].is_ascii_alphanumeric());
         if not_form != has_not {
             // Not the form we're rewriting in this pass — skip over this
             // occurrence to avoid an infinite loop.
@@ -251,11 +250,11 @@ fn find_and_after(lower: &str, start: usize) -> Option<usize> {
                 // Continuation bytes (0x80–0xBF) advance by 1; lead bytes
                 // advance by their declared width.
                 let char_len = match lb[i] {
-                    b if b < 0x80 => 1,           // ASCII
-                    b if b < 0xC0 => 1,           // UTF-8 continuation byte — step by 1
-                    b if b < 0xE0 => 2,           // 2-byte lead
-                    b if b < 0xF0 => 3,           // 3-byte lead
-                    _ => 4,                        // 4-byte lead
+                    b if b < 0x80 => 1, // ASCII
+                    b if b < 0xC0 => 1, // UTF-8 continuation byte — step by 1
+                    b if b < 0xE0 => 2, // 2-byte lead
+                    b if b < 0xF0 => 3, // 3-byte lead
+                    _ => 4,             // 4-byte lead
                 };
                 i += char_len;
                 continue;
@@ -599,8 +598,18 @@ fn find_rhs_terminal(s: &str, start: usize) -> usize {
             _ => {
                 if depth == 0 {
                     for kw in &[
-                        "and ", "or ", "where ", "having ", "order ", "group ",
-                        "limit ", "offset ", "union ", "except ", "intersect ", "on ",
+                        "and ",
+                        "or ",
+                        "where ",
+                        "having ",
+                        "order ",
+                        "group ",
+                        "limit ",
+                        "offset ",
+                        "union ",
+                        "except ",
+                        "intersect ",
+                        "on ",
                     ] {
                         if lower[i..].starts_with(kw) {
                             let pre_ok = i == 0 || !lb[i - 1].is_ascii_alphanumeric();
@@ -666,7 +675,12 @@ fn find_lhs_start(s: &str, end: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 const RANGE_CTOR_PREFIXES: &[&str] = &[
-    "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+    "int4range",
+    "int8range",
+    "numrange",
+    "daterange",
+    "tsrange",
+    "tstzrange",
 ];
 
 /// Return `true` if `expr` looks like an array literal or array-typed value:
@@ -984,12 +998,12 @@ fn rewrite_any_cmp_subquery(sql: &str) -> String {
     const OPS: &[(&str, &str)] = &[
         (">= any", "MIN"),
         ("<= any", "MAX"),
-        ("> any",  "MIN"),
-        ("< any",  "MAX"),
+        ("> any", "MIN"),
+        ("< any", "MAX"),
         (">= some", "MIN"),
         ("<= some", "MAX"),
-        ("> some",  "MIN"),
-        ("< some",  "MAX"),
+        ("> some", "MIN"),
+        ("< some", "MAX"),
     ];
     for (op_lower, agg) in OPS {
         s = rewrite_one_any_op(&s, op_lower, agg);
@@ -1002,7 +1016,9 @@ fn rewrite_one_any_op(sql: &str, op_lower: &str, agg: &str) -> String {
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
-        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let Some(rel) = lower[search_from..].find(op_lower) else {
+            break;
+        };
         let kw_start = search_from + rel;
         let kw_end = kw_start + op_lower.len();
         let bytes = s.as_bytes();
@@ -1019,7 +1035,9 @@ fn rewrite_one_any_op(sql: &str, op_lower: &str, agg: &str) -> String {
 
         // After keyword, skip whitespace and find `(`.
         let mut j = kw_end;
-        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || s.as_bytes()[j] != b'(' {
             search_from = kw_end;
             continue;
@@ -1051,7 +1069,11 @@ fn rewrite_one_any_op(sql: &str, op_lower: &str, agg: &str) -> String {
         }
 
         let after_select = subq_body.trim_start();
-        let sel_offset = after_select.to_ascii_lowercase().find("select ").unwrap_or(0) + 7;
+        let sel_offset = after_select
+            .to_ascii_lowercase()
+            .find("select ")
+            .unwrap_or(0)
+            + 7;
         let from_lower = after_select.to_ascii_lowercase();
         let Some(from_pos) = find_from_at_depth0(&from_lower, sel_offset) else {
             search_from = kw_end;
@@ -1086,8 +1108,8 @@ fn rewrite_all_subquery(sql: &str) -> String {
     const OPS: &[(&str, &str)] = &[
         (">= all", "MAX"),
         ("<= all", "MIN"),
-        ("> all",  "MAX"),
-        ("< all",  "MIN"),
+        ("> all", "MAX"),
+        ("< all", "MIN"),
         // <> ALL / != ALL → NOT IN
         ("<> all", "NOT_IN"),
         ("!= all", "NOT_IN"),
@@ -1103,7 +1125,9 @@ fn rewrite_one_all_op(sql: &str, op_lower: &str, agg: &str) -> String {
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
-        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let Some(rel) = lower[search_from..].find(op_lower) else {
+            break;
+        };
         let kw_start = search_from + rel;
         let kw_end = kw_start + op_lower.len();
         let bytes = s.as_bytes();
@@ -1120,7 +1144,9 @@ fn rewrite_one_all_op(sql: &str, op_lower: &str, agg: &str) -> String {
 
         // After keyword, skip whitespace and find `(`.
         let mut j = kw_end;
-        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || s.as_bytes()[j] != b'(' {
             search_from = kw_end;
             continue;
@@ -1166,7 +1192,11 @@ fn rewrite_one_all_op(sql: &str, op_lower: &str, agg: &str) -> String {
         // Extract the SELECT expression (between `SELECT ` and `FROM `).
         // Naive: find `FROM` at depth 0 after `SELECT`.
         let after_select = subq_body.trim_start();
-        let sel_offset = after_select.to_ascii_lowercase().find("select ").unwrap_or(0) + 7;
+        let sel_offset = after_select
+            .to_ascii_lowercase()
+            .find("select ")
+            .unwrap_or(0)
+            + 7;
         let from_lower = after_select.to_ascii_lowercase();
         let Some(from_pos) = find_from_at_depth0(&from_lower, sel_offset) else {
             search_from = kw_end;
@@ -1192,13 +1222,21 @@ fn find_from_at_depth0(lower: &str, offset: usize) -> Option<usize> {
     while i < lower.len() {
         match bytes[i] {
             b'(' => depth += 1,
-            b')' => { if depth > 0 { depth -= 1; } }
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
             b'\'' => {
                 i += 1;
                 while i < lower.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
@@ -1207,7 +1245,9 @@ fn find_from_at_depth0(lower: &str, offset: usize) -> Option<usize> {
             _ => {
                 if depth == 0 && lower[i..].starts_with("from ") {
                     let pre_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-                    if pre_ok { return Some(i); }
+                    if pre_ok {
+                        return Some(i);
+                    }
                 }
             }
         }
@@ -1223,7 +1263,9 @@ fn rewrite_quantified_op(sql: &str, op_kw: &str, new_op: &str) -> String {
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
-        let Some(rel) = lower[search_from..].find(op_kw) else { break; };
+        let Some(rel) = lower[search_from..].find(op_kw) else {
+            break;
+        };
         let kw_start = search_from + rel;
         let kw_end = kw_start + op_kw.len();
         let bytes = s.as_bytes();
@@ -1252,7 +1294,9 @@ fn rewrite_quantified_op(sql: &str, op_kw: &str, new_op: &str) -> String {
 
         // After keyword, skip whitespace and find `(`.
         let mut j = kw_end;
-        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || s.as_bytes()[j] != b'(' {
             search_from = kw_end;
             continue;
@@ -1298,7 +1342,9 @@ fn rewrite_one_any_array(sql: &str, op_lower: &str, negate: bool) -> String {
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
-        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let Some(rel) = lower[search_from..].find(op_lower) else {
+            break;
+        };
         let kw_start = search_from + rel;
         let kw_end = kw_start + op_lower.len();
         let bytes = s.as_bytes();
@@ -1324,7 +1370,9 @@ fn rewrite_one_any_array(sql: &str, op_lower: &str, negate: bool) -> String {
 
         // Skip whitespace after the keyword and find `(`.
         let mut j = kw_end;
-        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || bytes[j] != b'(' {
             search_from = kw_end;
             continue;
@@ -1393,8 +1441,8 @@ pub(crate) fn rewrite_all_array(sql: &str) -> String {
     const OPS: &[(&str, &str)] = &[
         (">= all", "array_max"),
         ("<= all", "array_min"),
-        ("> all",  "array_max"),
-        ("< all",  "array_min"),
+        ("> all", "array_max"),
+        ("< all", "array_min"),
     ];
     let mut s = sql.to_string();
     for (op, agg) in OPS {
@@ -1408,7 +1456,9 @@ fn rewrite_one_all_array(sql: &str, op_lower: &str, agg_fn: &str) -> String {
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
-        let Some(rel) = lower[search_from..].find(op_lower) else { break; };
+        let Some(rel) = lower[search_from..].find(op_lower) else {
+            break;
+        };
         let kw_start = search_from + rel;
         let kw_end = kw_start + op_lower.len();
         let bytes = s.as_bytes();
@@ -1435,7 +1485,9 @@ fn rewrite_one_all_array(sql: &str, op_lower: &str, agg_fn: &str) -> String {
 
         // Skip whitespace and find `(`.
         let mut j = kw_end;
-        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || bytes[j] != b'(' {
             search_from = kw_end;
             continue;
@@ -1468,7 +1520,9 @@ fn rewrite_one_all_array(sql: &str, op_lower: &str, agg_fn: &str) -> String {
 /// Find the matching `]` for the `[` at `start` in `s`.
 fn find_matching_close_bracket(s: &str, start: usize) -> Option<usize> {
     let bytes = s.as_bytes();
-    if bytes.get(start) != Some(&b'[') { return None; }
+    if bytes.get(start) != Some(&b'[') {
+        return None;
+    }
     let mut depth = 1i32;
     let mut i = start + 1;
     while i < bytes.len() {
@@ -1476,14 +1530,19 @@ fn find_matching_close_bracket(s: &str, start: usize) -> Option<usize> {
             b'[' => depth += 1,
             b']' => {
                 depth -= 1;
-                if depth == 0 { return Some(i); }
+                if depth == 0 {
+                    return Some(i);
+                }
             }
             b'\'' => {
                 // Skip string literals.
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
                         break;
                     }
                     i += 1;
@@ -1506,7 +1565,9 @@ fn find_matching_close_bracket(s: &str, start: usize) -> Option<usize> {
 /// functions) are left untouched.
 pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
-    if !lower.contains("lateral") { return sql.to_string(); }
+    if !lower.contains("lateral") {
+        return sql.to_string();
+    }
 
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -1519,7 +1580,10 @@ pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
             i += 1;
             while i < sql.len() {
                 if bytes[i] == b'\'' {
-                    if i + 1 < sql.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                    if i + 1 < sql.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
                     i += 1;
                     break;
                 }
@@ -1532,8 +1596,12 @@ pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
         if bytes[i] == b'"' {
             let start = i;
             i += 1;
-            while i < sql.len() && bytes[i] != b'"' { i += 1; }
-            if i < sql.len() { i += 1; }
+            while i < sql.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < sql.len() {
+                i += 1;
+            }
             out.push_str(&sql[start..i]);
             continue;
         }
@@ -1541,14 +1609,16 @@ pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
         let lower_slice = &lower[i..];
         if lower_slice.starts_with("lateral") {
             let lat_end = i + 7; // len("lateral")
-            // Word boundary before.
+                                 // Word boundary before.
             let pre_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             // Word boundary after: must be whitespace or end-of-string.
             let post_ok = lat_end >= sql.len() || !bytes[lat_end].is_ascii_alphanumeric();
             if pre_ok && post_ok {
                 // Skip whitespace after LATERAL.
                 let mut j = lat_end;
-                while j < sql.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+                while j < sql.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
                 // Check if what follows is `unnest` (case-insensitive, word boundary).
                 if j < sql.len() && lower[j..].starts_with("unnest") {
                     let u_end = j + 6; // len("unnest")
@@ -1602,14 +1672,18 @@ pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
 /// - Nested LATERAL (LATERAL inside another LATERAL subquery) is not handled.
 pub(crate) fn rewrite_lateral_uncorrelated(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
-    if !lower.contains("lateral") { return sql.to_string(); }
+    if !lower.contains("lateral") {
+        return sql.to_string();
+    }
 
     let mut s = sql.to_string();
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
         // Find `lateral` keyword (case-insensitive).
-        let Some(rel) = lower[search_from..].find("lateral") else { break; };
+        let Some(rel) = lower[search_from..].find("lateral") else {
+            break;
+        };
         let lat_start = search_from + rel;
         let lat_end = lat_start + 7; // len("lateral")
         let bytes = s.as_bytes();
@@ -1617,9 +1691,8 @@ pub(crate) fn rewrite_lateral_uncorrelated(sql: &str) -> String {
         // Word boundary before LATERAL.
         let pre_ok = lat_start == 0 || !bytes[lat_start - 1].is_ascii_alphanumeric();
         // Word boundary after LATERAL: must be whitespace or `(`.
-        let post_ok = lat_end >= s.len()
-            || bytes[lat_end].is_ascii_whitespace()
-            || bytes[lat_end] == b'(';
+        let post_ok =
+            lat_end >= s.len() || bytes[lat_end].is_ascii_whitespace() || bytes[lat_end] == b'(';
         if !pre_ok || !post_ok {
             search_from = lat_end;
             continue;
@@ -1627,7 +1700,9 @@ pub(crate) fn rewrite_lateral_uncorrelated(sql: &str) -> String {
 
         // Skip whitespace after LATERAL.
         let mut j = lat_end;
-        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
 
         // Only handle LATERAL (subquery) form — not LATERAL function_call().
         if j >= s.len() || bytes[j] != b'(' {
@@ -1699,8 +1774,12 @@ fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
             i += 1;
             while i < lower.len() {
                 if bytes[i] == b'\'' {
-                    if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                    i += 1; break;
+                    if i + 1 < lower.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
                 }
                 i += 1;
             }
@@ -1709,16 +1788,26 @@ fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
         // Skip double-quoted identifiers.
         if bytes[i] == b'"' {
             i += 1;
-            while i < lower.len() && bytes[i] != b'"' { i += 1; }
-            if i < lower.len() { i += 1; }
+            while i < lower.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < lower.len() {
+                i += 1;
+            }
             continue;
         }
 
         // Look for `from ` or `join ` keyword.
         let slice = &lower[i..];
-        let kw_len = if slice.starts_with("from ") || slice.starts_with("from\t") || slice.starts_with("from\n") {
+        let kw_len = if slice.starts_with("from ")
+            || slice.starts_with("from\t")
+            || slice.starts_with("from\n")
+        {
             5
-        } else if slice.starts_with("join ") || slice.starts_with("join\t") || slice.starts_with("join\n") {
+        } else if slice.starts_with("join ")
+            || slice.starts_with("join\t")
+            || slice.starts_with("join\n")
+        {
             5
         } else {
             i += 1;
@@ -1737,7 +1826,9 @@ fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
 
         // Skip whitespace after keyword.
         let mut j = i + kw_len;
-        while j < lower.len() && lower.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        while j < lower.len() && lower.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
         // Skip over `(` (subquery in FROM — not a table name).
         if j < lower.len() && lower.as_bytes()[j] == b'(' {
             i = j + 1;
@@ -1745,23 +1836,34 @@ fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
         }
         // Extract the identifier (table name).
         let id_start = j;
-        while j < lower.len() && (lower.as_bytes()[j].is_ascii_alphanumeric() || lower.as_bytes()[j] == b'_') {
+        while j < lower.len()
+            && (lower.as_bytes()[j].is_ascii_alphanumeric() || lower.as_bytes()[j] == b'_')
+        {
             j += 1;
         }
         if j > id_start {
             let table_name = lower[id_start..j].to_string();
             // Skip known SQL keywords that appear after FROM/JOIN.
-            if !matches!(table_name.as_str(), "select" | "with" | "lateral" | "only" | "values") {
+            if !matches!(
+                table_name.as_str(),
+                "select" | "with" | "lateral" | "only" | "values"
+            ) {
                 names.push(table_name.clone());
             }
             // Check for optional `AS alias` or bare alias after the table name.
             let mut k = j;
-            while k < lower.len() && lower.as_bytes()[k].is_ascii_whitespace() { k += 1; }
+            while k < lower.len() && lower.as_bytes()[k].is_ascii_whitespace() {
+                k += 1;
+            }
             if lower[k..].starts_with("as ") || lower[k..].starts_with("as\t") {
                 k += 3;
-                while k < lower.len() && lower.as_bytes()[k].is_ascii_whitespace() { k += 1; }
+                while k < lower.len() && lower.as_bytes()[k].is_ascii_whitespace() {
+                    k += 1;
+                }
                 let alias_start = k;
-                while k < lower.len() && (lower.as_bytes()[k].is_ascii_alphanumeric() || lower.as_bytes()[k] == b'_') {
+                while k < lower.len()
+                    && (lower.as_bytes()[k].is_ascii_alphanumeric() || lower.as_bytes()[k] == b'_')
+                {
                     k += 1;
                 }
                 if k > alias_start {
@@ -1780,12 +1882,27 @@ fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
             {
                 let alias_start = k;
                 let mut kk = k;
-                while kk < lower.len() && (lower.as_bytes()[kk].is_ascii_alphanumeric() || lower.as_bytes()[kk] == b'_') {
+                while kk < lower.len()
+                    && (lower.as_bytes()[kk].is_ascii_alphanumeric()
+                        || lower.as_bytes()[kk] == b'_')
+                {
                     kk += 1;
                 }
                 if kk > alias_start {
                     let alias = lower[alias_start..kk].to_string();
-                    if !matches!(alias.as_str(), "on" | "where" | "inner" | "left" | "right" | "full" | "cross" | "join" | "natural" | "using" | "set") {
+                    if !matches!(
+                        alias.as_str(),
+                        "on" | "where"
+                            | "inner"
+                            | "left"
+                            | "right"
+                            | "full"
+                            | "cross"
+                            | "join"
+                            | "natural"
+                            | "using"
+                            | "set"
+                    ) {
                         names.push(alias);
                     }
                 }
@@ -1856,14 +1973,18 @@ fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
 ///   etc.) → DataFusion upstream limitation; left failing with original error.
 pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
     let lower_check = sql.to_ascii_lowercase();
-    if !lower_check.contains("lateral") { return sql.to_string(); }
+    if !lower_check.contains("lateral") {
+        return sql.to_string();
+    }
 
     let mut s = sql.to_string();
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
         // Look for `left join lateral` sequence.
-        let Some(rel) = lower[search_from..].find("left join lateral") else { break; };
+        let Some(rel) = lower[search_from..].find("left join lateral") else {
+            break;
+        };
         let ljl_start = search_from + rel;
         let ljl_end = ljl_start + 17; // len("left join lateral")
         let bytes = s.as_bytes();
@@ -1871,9 +1992,8 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
         // Word boundary before.
         let pre_ok = ljl_start == 0 || !bytes[ljl_start - 1].is_ascii_alphanumeric();
         // Word boundary after "lateral": whitespace or `(`.
-        let post_ok = ljl_end >= s.len()
-            || bytes[ljl_end].is_ascii_whitespace()
-            || bytes[ljl_end] == b'(';
+        let post_ok =
+            ljl_end >= s.len() || bytes[ljl_end].is_ascii_whitespace() || bytes[ljl_end] == b'(';
         if !pre_ok || !post_ok {
             search_from = ljl_end;
             continue;
@@ -1881,7 +2001,9 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
 
         // Skip whitespace after `lateral`.
         let mut j = ljl_end;
-        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || bytes[j] != b'(' {
             search_from = ljl_end;
             continue;
@@ -1913,7 +2035,10 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
                 let after = p + 5; // len("order")
                 let rest = body_lower[after..].trim_start();
                 rest.starts_with("by")
-                    && rest.as_bytes().get(2).map_or(true, |b| !b.is_ascii_alphanumeric())
+                    && rest
+                        .as_bytes()
+                        .get(2)
+                        .map_or(true, |b| !b.is_ascii_alphanumeric())
             })
             .unwrap_or(false);
         let has_top_level_limit = find_keyword_at_depth0(&body_lower, "limit", 0).is_some();
@@ -1924,12 +2049,13 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
 
         // Parse the subquery: find the SELECT projection, FROM table, WHERE clause.
         let after_select = body_lower.trim_start();
-        let sel_body_offset = if after_select.starts_with("select ") || after_select.starts_with("select\t") {
-            7
-        } else {
-            search_from = ljl_end;
-            continue;
-        };
+        let sel_body_offset =
+            if after_select.starts_with("select ") || after_select.starts_with("select\t") {
+                7
+            } else {
+                search_from = ljl_end;
+                continue;
+            };
 
         // Find FROM keyword at depth 0.
         let Some(from_pos) = find_from_at_depth0(&body_lower, sel_body_offset) else {
@@ -2004,7 +2130,9 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
             }
         }
         let mut alias_end = alias_start;
-        while alias_end < s.len() && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_') {
+        while alias_end < s.len()
+            && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_')
+        {
             alias_end += 1;
         }
         if alias_end == alias_start {
@@ -2016,14 +2144,18 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
 
         // Find `ON true` after the alias.
         let mut on_start = alias_end;
-        while on_start < s.len() && bytes[on_start].is_ascii_whitespace() { on_start += 1; }
+        while on_start < s.len() && bytes[on_start].is_ascii_whitespace() {
+            on_start += 1;
+        }
         if !lower[on_start..].starts_with("on ") && !lower[on_start..].starts_with("on\t") {
             search_from = ljl_end;
             continue;
         }
         let on_kw_end = on_start + 3;
         let mut on_val_start = on_kw_end;
-        while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() { on_val_start += 1; }
+        while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() {
+            on_val_start += 1;
+        }
         // Must be `ON true`.
         let on_lower = lower[on_val_start..].trim_start();
         if !on_lower.starts_with("true") {
@@ -2053,13 +2185,9 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
         } else {
             child_table.clone()
         };
-        let new_body = format!(
-            "SELECT {fk_ref}, {proj_str} FROM {child_decl} GROUP BY {fk_ref}",
-        );
+        let new_body = format!("SELECT {fk_ref}, {proj_str} FROM {child_decl} GROUP BY {fk_ref}",);
         let new_on = format!("{sub_alias}.{} = {}", corr.child_col, corr.outer_ref);
-        let replacement = format!(
-            "LEFT JOIN ({new_body}) {sub_alias} ON {new_on}",
-        );
+        let replacement = format!("LEFT JOIN ({new_body}) {sub_alias} ON {new_on}",);
 
         // Replace from `left join lateral` start through `on true` end.
         s.replace_range(ljl_start..on_true_end, &replacement);
@@ -2128,7 +2256,9 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
 /// the extra join-key column is exposed under the `sub` alias and accessible.
 pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
     let lower_check = sql.to_ascii_lowercase();
-    if !lower_check.contains("lateral") { return sql.to_string(); }
+    if !lower_check.contains("lateral") {
+        return sql.to_string();
+    }
 
     let mut s = sql.to_string();
     let mut search_from = 0usize;
@@ -2142,16 +2272,17 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
         //   3. "join lateral" (but not "left join lateral" or "cross join lateral")
         //
         // We scan for the LATERAL keyword and inspect what precedes it.
-        let Some(rel) = lower[search_from..].find("lateral") else { break; };
+        let Some(rel) = lower[search_from..].find("lateral") else {
+            break;
+        };
         let lat_start = search_from + rel;
         let lat_end = lat_start + 7; // len("lateral")
         let bytes = s.as_bytes();
 
         // Word boundary before and after LATERAL.
         let pre_ok = lat_start == 0 || !bytes[lat_start - 1].is_ascii_alphanumeric();
-        let post_ok = lat_end >= s.len()
-            || bytes[lat_end].is_ascii_whitespace()
-            || bytes[lat_end] == b'(';
+        let post_ok =
+            lat_end >= s.len() || bytes[lat_end].is_ascii_whitespace() || bytes[lat_end] == b'(';
         if !pre_ok || !post_ok {
             search_from = lat_end;
             continue;
@@ -2159,7 +2290,9 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
 
         // Skip whitespace after LATERAL; must be followed by `(`.
         let mut j = lat_end;
-        while j < s.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || bytes[j] != b'(' {
             // Not a subquery form (table function etc.) — skip.
             search_from = lat_end;
@@ -2191,12 +2324,13 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
 
         // Parse SELECT projection.
         let after_select = body_lower.trim_start();
-        let sel_body_offset = if after_select.starts_with("select ") || after_select.starts_with("select\t") {
-            7
-        } else {
-            search_from = lat_end;
-            continue;
-        };
+        let sel_body_offset =
+            if after_select.starts_with("select ") || after_select.starts_with("select\t") {
+                7
+            } else {
+                search_from = lat_end;
+                continue;
+            };
 
         // Find FROM keyword at depth 0.
         let Some(from_pos) = find_from_at_depth0(&body_lower, sel_body_offset) else {
@@ -2207,7 +2341,8 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
 
         // Find WHERE keyword after FROM at depth 0.
         let after_from_offset = from_pos + 5; // skip "from "
-        let Some(where_pos) = find_keyword_at_depth0(&body_lower, "where", after_from_offset) else {
+        let Some(where_pos) = find_keyword_at_depth0(&body_lower, "where", after_from_offset)
+        else {
             // No WHERE → no correlation predicate → not our pattern.
             search_from = lat_end;
             continue;
@@ -2258,7 +2393,10 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
             // Matches "join", "inner join". Must not be "left join" (already
             // caught above), "right join", "full join", or "cross join".
             let before_join = pre_text[..pre_text.len() - 4].trim_end();
-            if before_join.ends_with("right") || before_join.ends_with("full") || before_join.ends_with("cross") {
+            if before_join.ends_with("right")
+                || before_join.ends_with("full")
+                || before_join.ends_with("cross")
+            {
                 // Right/full/cross LATERAL — not supported by this rewriter.
                 search_from = lat_end;
                 continue;
@@ -2289,7 +2427,9 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
             }
         }
         let mut alias_end = alias_start;
-        while alias_end < s.len() && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_') {
+        while alias_end < s.len()
+            && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_')
+        {
             alias_end += 1;
         }
         if alias_end == alias_start {
@@ -2304,14 +2444,18 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
         match join_type {
             "INNER JOIN" | "LEFT JOIN" => {
                 let mut on_start = alias_end;
-                while on_start < s.len() && bytes[on_start].is_ascii_whitespace() { on_start += 1; }
+                while on_start < s.len() && bytes[on_start].is_ascii_whitespace() {
+                    on_start += 1;
+                }
                 if !lower[on_start..].starts_with("on ") && !lower[on_start..].starts_with("on\t") {
                     search_from = lat_end;
                     continue;
                 }
                 let on_kw_end = on_start + 3;
                 let mut on_val_start = on_kw_end;
-                while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() { on_val_start += 1; }
+                while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() {
+                    on_val_start += 1;
+                }
                 let on_lower_slice = lower[on_val_start..].trim_start().to_string();
                 if !on_lower_slice.starts_with("true") {
                     search_from = lat_end;
@@ -2396,7 +2540,10 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
                     search_from = lat_end;
                     continue;
                 };
-                (join_marker_start, format!("INNER JOIN {new_subquery} ON {new_on}"))
+                (
+                    join_marker_start,
+                    format!("INNER JOIN {new_subquery} ON {new_on}"),
+                )
             }
             _ => {
                 // COMMA: replace from "," before lat_start through alias_end.
@@ -2407,7 +2554,10 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
                     continue;
                 };
                 let comma_start = comma_rel;
-                (comma_start, format!(" INNER JOIN {new_subquery} ON {new_on}"))
+                (
+                    comma_start,
+                    format!(" INNER JOIN {new_subquery} ON {new_on}"),
+                )
             }
         };
 
@@ -2509,9 +2659,7 @@ pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
         let ls = search + rel;
         let le = ls + 7;
         let pre_ok = ls == 0 || !bytes[ls - 1].is_ascii_alphanumeric();
-        let post_ok = le >= sql.len()
-            || bytes[le].is_ascii_whitespace()
-            || bytes[le] == b'(';
+        let post_ok = le >= sql.len() || bytes[le].is_ascii_whitespace() || bytes[le] == b'(';
         if !pre_ok || !post_ok {
             search = le;
             continue;
@@ -2550,9 +2698,7 @@ pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
             }
         }
         let as_start = a;
-        while a < sql.len()
-            && (bytes[a].is_ascii_alphanumeric() || bytes[a] == b'_')
-        {
+        while a < sql.len() && (bytes[a].is_ascii_alphanumeric() || bytes[a] == b'_') {
             a += 1;
         }
         if a == as_start {
@@ -2617,11 +2763,8 @@ pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
     // Re-extract original-case `tbl.col` from `hi_raw` for emitted SQL.
     let hi_ref = hi_raw.to_string();
     // Validate identifiers (defensive: parse_dotted_ref already rejects spaces).
-    let ident_ok = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    };
+    let ident_ok =
+        |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     if !ident_ok(tbl) || !ident_ok(col) {
         return sql.to_string();
     }
@@ -2637,10 +2780,7 @@ pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
     } else if pre.ends_with("join") {
         // Plain JOIN (not left/right/full — those change row semantics here).
         let bj = pre[..pre.len() - 4].trim_end();
-        if bj.ends_with("left")
-            || bj.ends_with("right")
-            || bj.ends_with("full")
-        {
+        if bj.ends_with("left") || bj.ends_with("right") || bj.ends_with("full") {
             return sql.to_string();
         }
         (lower[..lat_start].rfind("join").unwrap(), "JOIN")
@@ -2750,15 +2890,20 @@ fn find_bare_eq(lower: &str) -> Option<usize> {
                 i += 1;
                 while i < lower.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
             }
             b'=' => {
                 // Not `!=`, `<=`, `>=`.
-                let prev_ok = i == 0 || (bytes[i - 1] != b'!' && bytes[i - 1] != b'<' && bytes[i - 1] != b'>');
+                let prev_ok = i == 0
+                    || (bytes[i - 1] != b'!' && bytes[i - 1] != b'<' && bytes[i - 1] != b'>');
                 let next_ok = i + 1 >= lower.len() || bytes[i + 1] != b'>';
                 if prev_ok && next_ok {
                     return Some(i);
@@ -2776,9 +2921,13 @@ fn parse_dotted_ref(s: &str) -> Option<(&str, &str)> {
     let dot = s.find('.')?;
     let tbl = s[..dot].trim();
     let col = s[dot + 1..].trim();
-    if tbl.is_empty() || col.is_empty() { return None; }
+    if tbl.is_empty() || col.is_empty() {
+        return None;
+    }
     // Column must not contain further dots or spaces (simple identifier).
-    if col.contains('.') || col.contains(' ') { return None; }
+    if col.contains('.') || col.contains(' ') {
+        return None;
+    }
     Some((tbl, col))
 }
 
@@ -2788,29 +2937,40 @@ fn parse_dotted_ref(s: &str) -> Option<(&str, &str)> {
 fn parse_simple_table_ref(clause: &str) -> Option<(String, String)> {
     let lower = clause.to_ascii_lowercase();
     // Reject subqueries, JOINs.
-    if lower.contains('(')
-        || lower.contains("join")
-        || lower.contains(',')
-    {
+    if lower.contains('(') || lower.contains("join") || lower.contains(',') {
         return None;
     }
     let bytes = lower.as_bytes();
     let mut i = 0usize;
-    while i < lower.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    while i < lower.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
     let name_start = i;
-    while i < lower.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') { i += 1; }
-    if i == name_start { return None; }
+    while i < lower.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+    {
+        i += 1;
+    }
+    if i == name_start {
+        return None;
+    }
     let table_name = lower[name_start..i].to_string();
 
     // Skip whitespace.
-    while i < lower.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    while i < lower.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
     // Optional `AS`.
     if lower[i..].starts_with("as ") || lower[i..].starts_with("as\t") {
         i += 3;
-        while i < lower.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        while i < lower.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
     }
     let alias_start = i;
-    while i < lower.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+    while i < lower.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
     let alias = if i > alias_start {
         lower[alias_start..i].to_string()
     } else {
@@ -2830,14 +2990,31 @@ fn parse_simple_table_ref(clause: &str) -> Option<(String, String)> {
 /// A lone `*` (SELECT *) is rejected — not an aggregate.
 fn all_projections_are_aggregates(proj_lower: &str) -> bool {
     const AGG_NAMES: &[&str] = &[
-        "json_agg", "jsonb_agg", "array_agg", "count", "sum", "avg", "min",
-        "max", "bool_and", "bool_or", "string_agg", "array_to_string",
-        "every", "variance", "stddev", "var_pop", "var_samp",
-        "stddev_pop", "stddev_samp",
+        "json_agg",
+        "jsonb_agg",
+        "array_agg",
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "bool_and",
+        "bool_or",
+        "string_agg",
+        "array_to_string",
+        "every",
+        "variance",
+        "stddev",
+        "var_pop",
+        "var_samp",
+        "stddev_pop",
+        "stddev_samp",
     ];
     // Split projection at depth-0 commas.
     let items = split_at_depth0_commas(proj_lower);
-    if items.is_empty() { return false; }
+    if items.is_empty() {
+        return false;
+    }
     for item in &items {
         let trimmed = item.trim();
         // Strip trailing `AS alias`.
@@ -2852,7 +3029,9 @@ fn all_projections_are_aggregates(proj_lower: &str) -> bool {
                 false
             }
         });
-        if !is_agg { return false; }
+        if !is_agg {
+            return false;
+        }
     }
     true
 }
@@ -2867,13 +3046,21 @@ fn split_at_depth0_commas(s: &str) -> Vec<&str> {
     while i < s.len() {
         match bytes[i] {
             b'(' => depth += 1,
-            b')' => { if depth > 0 { depth -= 1; } }
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
             b'\'' => {
                 i += 1;
                 while i < s.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < s.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < s.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
@@ -2903,13 +3090,21 @@ fn strip_trailing_alias(s: &str) -> &str {
     while i < lower.len() {
         match bytes[i] {
             b'(' => depth += 1,
-            b')' => { if depth > 0 { depth -= 1; } }
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
             b'\'' => {
                 i += 1;
                 while i < lower.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
@@ -2926,10 +3121,7 @@ fn strip_trailing_alias(s: &str) -> &str {
     if let Some(pos) = last_as {
         // Verify the identifier after `AS` is simple (no spaces, no parens).
         let after_as = s[pos + 4..].trim();
-        if !after_as.is_empty()
-            && !after_as.contains(' ')
-            && !after_as.contains('(')
-        {
+        if !after_as.is_empty() && !after_as.contains(' ') && !after_as.contains('(') {
             return &s[..pos];
         }
     }
@@ -2945,13 +3137,21 @@ fn find_keyword_at_depth0(lower: &str, keyword: &str, offset: usize) -> Option<u
     while i < lower.len() {
         match bytes[i] {
             b'(' => depth += 1,
-            b')' => { if depth > 0 { depth -= 1; } }
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
             b'\'' => {
                 i += 1;
                 while i < lower.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < lower.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
@@ -2962,7 +3162,9 @@ fn find_keyword_at_depth0(lower: &str, keyword: &str, offset: usize) -> Option<u
                     let pre_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
                     let after = i + klen;
                     let post_ok = after >= lower.len() || !bytes[after].is_ascii_alphanumeric();
-                    if pre_ok && post_ok { return Some(i); }
+                    if pre_ok && post_ok {
+                        return Some(i);
+                    }
                 }
             }
         }
@@ -3028,7 +3230,9 @@ fn rewrite_bitwise_xor_hash(sql: &str) -> String {
             while i < bytes.len() && bytes[i] != b'"' {
                 i += 1;
             }
-            if i < bytes.len() { i += 1; }
+            if i < bytes.len() {
+                i += 1;
+            }
             out.push_str(&sql[start..i]);
             continue;
         }
@@ -3081,8 +3285,12 @@ fn rewrite_unary_bitwise_not(sql: &str) -> String {
         if bytes[i] == b'"' {
             let start = i;
             i += 1;
-            while i < len && bytes[i] != b'"' { i += 1; }
-            if i < len { i += 1; }
+            while i < len && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
             out.push_str(&sql[start..i]);
             continue;
         }
@@ -3102,7 +3310,9 @@ fn rewrite_unary_bitwise_not(sql: &str) -> String {
                 let expr_start = i + 1;
                 // Skip whitespace.
                 let mut j = expr_start;
-                while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
                 // Collect the operand expression: parenthesised group or simple token.
                 let (_, expr_end) = array_extract_right_pub(sql, j);
                 let operand = sql[j..expr_end].trim();
@@ -3165,7 +3375,9 @@ pub(crate) fn rewrite_overlaps(sql: &str) -> String {
 
         // Require `(expr, expr)` on the right.
         let mut j = kw_end;
-        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || s.as_bytes()[j] != b'(' {
             search_from = kw_end;
             continue;
@@ -3186,8 +3398,7 @@ pub(crate) fn rewrite_overlaps(sql: &str) -> String {
         }
         // Find the matching opening `(` for the left tuple.
         let lhs_paren_end_in_full = kw_start - (before.len() - trimmed_before.len()); // exclusive
-        let Some(lhs_paren_start) =
-            find_matching_open_paren(&s, lhs_paren_end_in_full - 1) else {
+        let Some(lhs_paren_start) = find_matching_open_paren(&s, lhs_paren_end_in_full - 1) else {
             search_from = kw_end;
             continue;
         };
@@ -3213,7 +3424,9 @@ fn parse_two_tuple(s: &str, start: usize) -> Option<(String, String, usize)> {
     }
     let mut i = start + 1;
     // Skip whitespace.
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
     // Parse first expression up to `,` at depth 0.
     let e1_start = i;
     let mut depth = 0i32;
@@ -3221,7 +3434,9 @@ fn parse_two_tuple(s: &str, start: usize) -> Option<(String, String, usize)> {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => {
-                if depth == 0 { return None; } // no comma found
+                if depth == 0 {
+                    return None;
+                } // no comma found
                 depth -= 1;
             }
             b',' if depth == 0 => break,
@@ -3229,8 +3444,12 @@ fn parse_two_tuple(s: &str, start: usize) -> Option<(String, String, usize)> {
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
@@ -3240,25 +3459,35 @@ fn parse_two_tuple(s: &str, start: usize) -> Option<(String, String, usize)> {
         }
         i += 1;
     }
-    if i >= bytes.len() || bytes[i] != b',' { return None; }
+    if i >= bytes.len() || bytes[i] != b',' {
+        return None;
+    }
     let e1 = s[e1_start..i].trim().to_string();
     i += 1; // skip comma
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
     let e2_start = i;
     depth = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => {
-                if depth == 0 { break; }
+                if depth == 0 {
+                    break;
+                }
                 depth -= 1;
             }
             b'\'' => {
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
@@ -3268,7 +3497,9 @@ fn parse_two_tuple(s: &str, start: usize) -> Option<(String, String, usize)> {
         }
         i += 1;
     }
-    if i >= bytes.len() || bytes[i] != b')' { return None; }
+    if i >= bytes.len() || bytes[i] != b')' {
+        return None;
+    }
     let e2 = s[e2_start..i].trim().to_string();
     Some((e1, e2, i + 1))
 }
@@ -3276,7 +3507,9 @@ fn parse_two_tuple(s: &str, start: usize) -> Option<(String, String, usize)> {
 /// Walk backwards from `close_paren` (index of the `)`) to find the matching `(`.
 fn find_matching_open_paren(s: &str, close_paren: usize) -> Option<usize> {
     let bytes = s.as_bytes();
-    if bytes.get(close_paren) != Some(&b')') { return None; }
+    if bytes.get(close_paren) != Some(&b')') {
+        return None;
+    }
     let mut depth = 1i32;
     let mut i = close_paren;
     while i > 0 {
@@ -3285,7 +3518,9 @@ fn find_matching_open_paren(s: &str, close_paren: usize) -> Option<usize> {
             b')' => depth += 1,
             b'(' => {
                 depth -= 1;
-                if depth == 0 { return Some(i); }
+                if depth == 0 {
+                    return Some(i);
+                }
             }
             _ => {}
         }
@@ -3322,7 +3557,9 @@ pub(crate) fn rewrite_aggregate_filter(sql: &str) -> String {
     loop {
         let lower = s.to_ascii_lowercase();
         // Find `FILTER` keyword at or after `search_from`.
-        let Some(rel) = lower[search_from..].find("filter") else { break; };
+        let Some(rel) = lower[search_from..].find("filter") else {
+            break;
+        };
         let kw_start = search_from + rel;
         let kw_end = kw_start + 6;
         let bytes = s.as_bytes();
@@ -3344,20 +3581,24 @@ pub(crate) fn rewrite_aggregate_filter(sql: &str) -> String {
 
         // After FILTER there must be `(WHERE ...)`.
         let mut j = kw_end;
-        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || s.as_bytes()[j] != b'(' {
             search_from = kw_end;
             continue;
         }
         let filter_paren_start = j;
         let filter_lower = s.to_ascii_lowercase();
-        if !filter_lower[filter_paren_start + 1..].trim_start().starts_with("where") {
+        if !filter_lower[filter_paren_start + 1..]
+            .trim_start()
+            .starts_with("where")
+        {
             search_from = kw_end;
             continue;
         }
         // Find the matching `)` for the FILTER clause.
-        let Some(filter_paren_end) =
-            find_matching_close_paren(&s, filter_paren_start) else {
+        let Some(filter_paren_end) = find_matching_close_paren(&s, filter_paren_start) else {
             search_from = kw_end;
             continue;
         };
@@ -3383,7 +3624,9 @@ pub(crate) fn rewrite_aggregate_filter(sql: &str) -> String {
         let func_start = {
             let fb = func_name.as_bytes();
             let mut k = func_name.len();
-            while k > 0 && (fb[k-1].is_ascii_alphanumeric() || fb[k-1] == b'_') { k -= 1; }
+            while k > 0 && (fb[k - 1].is_ascii_alphanumeric() || fb[k - 1] == b'_') {
+                k -= 1;
+            }
             k
         };
         let fname = &func_name[func_start..];
@@ -3411,7 +3654,9 @@ pub(crate) fn rewrite_aggregate_filter(sql: &str) -> String {
 /// Find the matching `)` for an opening `(` at `open_paren`.
 fn find_matching_close_paren(s: &str, open_paren: usize) -> Option<usize> {
     let bytes = s.as_bytes();
-    if bytes.get(open_paren) != Some(&b'(') { return None; }
+    if bytes.get(open_paren) != Some(&b'(') {
+        return None;
+    }
     let mut depth = 1i32;
     let mut i = open_paren + 1;
     while i < bytes.len() && depth > 0 {
@@ -3422,8 +3667,12 @@ fn find_matching_close_paren(s: &str, open_paren: usize) -> Option<usize> {
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                        i += 1; break;
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
                     i += 1;
                 }
@@ -3433,7 +3682,11 @@ fn find_matching_close_paren(s: &str, open_paren: usize) -> Option<usize> {
         }
         i += 1;
     }
-    if depth == 0 { Some(i - 1) } else { None }
+    if depth == 0 {
+        Some(i - 1)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3464,7 +3717,9 @@ fn rewrite_cte_keyword(sql: &str, needle_lower: &str, replacement: &str) -> Stri
     let mut s = sql.to_string();
     loop {
         let lower = s.to_ascii_lowercase();
-        let Some(pos) = lower.find(needle_lower) else { break; };
+        let Some(pos) = lower.find(needle_lower) else {
+            break;
+        };
         // Word boundary before `as`.
         let pre_ok = pos == 0 || !s.as_bytes()[pos - 1].is_ascii_alphanumeric();
         if !pre_ok {
@@ -3559,21 +3814,33 @@ pub(crate) fn rewrite_recursive_cte_column_aliases(sql: &str) -> String {
     let mut paren_depth = 1i32;
     while i < bytes.len() && paren_depth > 0 {
         match bytes[i] {
-            b'(' => { paren_depth += 1; i += 1; }
-            b')' => { paren_depth -= 1; i += 1; }
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth -= 1;
+                i += 1;
+            }
             b'\'' => {
                 // skip string literal
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
                         i += 1;
-                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
                     } else {
                         i += 1;
                     }
                 }
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     let col_list_end = i - 1; // position of closing ')'
@@ -3621,7 +3888,9 @@ pub(crate) fn rewrite_recursive_cte_column_aliases(sql: &str) -> String {
     }
     let select_kw_end = i + "select".len();
     // Check word boundary after SELECT.
-    if select_kw_end < bytes.len() && (bytes[select_kw_end].is_ascii_alphanumeric() || bytes[select_kw_end] == b'_') {
+    if select_kw_end < bytes.len()
+        && (bytes[select_kw_end].is_ascii_alphanumeric() || bytes[select_kw_end] == b'_')
+    {
         return sql.to_string();
     }
     i = select_kw_end;
@@ -3718,7 +3987,10 @@ fn find_union_in_base_select(sql: &str, from: usize) -> Option<usize> {
 
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => { depth += 1; i += 1; }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
             b')' => {
                 if depth == 0 {
                     // Hit the closing paren of the CTE body without finding UNION.
@@ -3732,13 +4004,21 @@ fn find_union_in_base_select(sql: &str, from: usize) -> Option<usize> {
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
                         i += 1;
-                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
-                    } else { i += 1; }
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
                 }
             }
             b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
                 // Line comment — skip to end of line.
-                while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
             }
             _ => {
                 if depth == 0 && lower[i..].starts_with("union") {
@@ -3801,15 +4081,27 @@ fn expr_has_alias(expr: &str) -> bool {
     let mut depth = 0i32;
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => { depth += 1; i += 1; }
-            b')' => { depth -= 1; i += 1; }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
             b'\'' => {
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
                         i += 1;
-                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
-                    } else { i += 1; }
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
                 }
             }
             _ => {
@@ -3834,15 +4126,27 @@ fn strip_expr_alias(expr: &str) -> &str {
     let mut alias_start: Option<usize> = None;
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => { depth += 1; i += 1; }
-            b')' => { depth -= 1; i += 1; }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
             b'\'' => {
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
                         i += 1;
-                        if i < bytes.len() && bytes[i] == b'\'' { i += 1; } else { break; }
-                    } else { i += 1; }
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
                 }
             }
             _ => {
@@ -3858,7 +4162,6 @@ fn strip_expr_alias(expr: &str) -> &str {
         None => expr,
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // UUID cast rewriter
@@ -3894,7 +4197,11 @@ pub(crate) fn rewrite_uuid_cast(sql: &str) -> String {
         // Only replace if the character after `::uuid` is NOT alphanumeric or `_`
         // (so `::uuidarray` isn't mangled).
         let end_pos = abs + 6; // len("::uuid") == 6
-        let next_is_ident = out.as_bytes().get(end_pos).map(|&c| c.is_ascii_alphanumeric() || c == b'_').unwrap_or(false);
+        let next_is_ident = out
+            .as_bytes()
+            .get(end_pos)
+            .map(|&c| c.is_ascii_alphanumeric() || c == b'_')
+            .unwrap_or(false);
         if !next_is_ident {
             positions.push(abs);
         }
@@ -3973,8 +4280,10 @@ pub(crate) fn rewrite_bit_string_literal(sql: &str) -> String {
                 bits.push(chars[i]);
                 i += 1;
             }
-            if i < n { i += 1; } // skip closing `'`
-            // Emit as plain single-quoted string.
+            if i < n {
+                i += 1;
+            } // skip closing `'`
+              // Emit as plain single-quoted string.
             out.push('\'');
             out.push_str(&bits);
             out.push('\'');
@@ -4025,7 +4334,7 @@ pub(crate) fn rewrite_interval_hms_cast(sql: &str) -> String {
 
         // Scan the quoted string content.
         let str_start = i; // byte offset of opening `'`
-        i += 1;            // skip opening `'`
+        i += 1; // skip opening `'`
         let content_start = i;
 
         // Find closing `'`, handling `''` PG escape inside the string.
@@ -4043,7 +4352,9 @@ pub(crate) fn rewrite_interval_hms_cast(sql: &str) -> String {
         // i points at closing `'` (or n if unterminated — shouldn't happen in valid SQL).
         let content = &sql[content_start..i];
         let str_end_inclusive = if i < n { i + 1 } else { n }; // one past closing `'`
-        if i < n { i += 1; } // skip closing `'`
+        if i < n {
+            i += 1;
+        } // skip closing `'`
 
         // Check if what follows (in original position i) is `::interval`.
         let suffix_lower = &lower[i..];
@@ -4124,7 +4435,9 @@ pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
         i += 1;
         let str_content_start = i;
         // Skip past optional leading whitespace to check for `{`.
-        while i < bytes.len() && bytes[i] == b' ' { i += 1; }
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
         let is_curly = i < bytes.len() && bytes[i] == b'{';
         i = str_content_start; // reset scan position
 
@@ -4188,9 +4501,7 @@ pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
 
         // Check for multi-dim `[][]` — leave as-is.
         let after_bracket = type_end + 2;
-        if after_bracket < sql.len()
-            && sql.as_bytes()[after_bracket] == b'['
-        {
+        if after_bracket < sql.len() && sql.as_bytes()[after_bracket] == b'[' {
             out.push_str(&sql[str_start..str_end + 1]);
             i = str_end + 1;
             continue;
@@ -4198,14 +4509,22 @@ pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
 
         // Validate the type name.
         let type_lower = type_name.to_ascii_lowercase();
-        let is_text_type = matches!(
-            type_lower.as_str(),
-            "text" | "varchar" | "char" | "bpchar"
-        );
+        let is_text_type = matches!(type_lower.as_str(), "text" | "varchar" | "char" | "bpchar");
         let is_numeric_type = matches!(
             type_lower.as_str(),
-            "int" | "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint"
-            | "float4" | "float8" | "real" | "numeric" | "bool" | "boolean"
+            "int"
+                | "int2"
+                | "int4"
+                | "int8"
+                | "integer"
+                | "bigint"
+                | "smallint"
+                | "float4"
+                | "float8"
+                | "real"
+                | "numeric"
+                | "bool"
+                | "boolean"
         );
         if !is_text_type && !is_numeric_type {
             out.push_str(&sql[str_start..str_end + 1]);
@@ -4215,13 +4534,18 @@ pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
 
         // Parse the curly-brace list: strip outer `{` and `}`, split on `,`.
         let inner = str_inner.trim();
-        let inner = inner.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(inner);
+        let inner = inner
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(inner);
         let items: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
 
         // Build `make_array(...)`.
         let mut args = String::new();
         for (idx, item) in items.iter().enumerate() {
-            if idx > 0 { args.push_str(", "); }
+            if idx > 0 {
+                args.push_str(", ");
+            }
             if is_text_type {
                 // Quote the item as a string literal.
                 args.push('\'');
@@ -4345,7 +4669,9 @@ pub(crate) fn rewrite_json_to_record(sql: &str) -> String {
 
         // Skip to the opening `(` of the function call.
         let mut j = i + fn_name_len;
-        while j < sql.len() && sql.as_bytes()[j] == b' ' { j += 1; }
+        while j < sql.len() && sql.as_bytes()[j] == b' ' {
+            j += 1;
+        }
         if j >= sql.len() || sql.as_bytes()[j] != b'(' {
             // Unexpected — emit as-is.
             out.push(sql.as_bytes()[i] as char);
@@ -4365,7 +4691,9 @@ pub(crate) fn rewrite_json_to_record(sql: &str) -> String {
 
         // Now scan past any whitespace after `)` to find `AS`.
         let mut after = arg_close + 1;
-        while after < sql.len() && sql.as_bytes()[after] == b' ' { after += 1; }
+        while after < sql.len() && sql.as_bytes()[after] == b' ' {
+            after += 1;
+        }
 
         let rest_after_lower = lower[after..].to_ascii_lowercase();
         if !rest_after_lower.starts_with("as ") && !rest_after_lower.starts_with("as\t") {
@@ -4377,7 +4705,9 @@ pub(crate) fn rewrite_json_to_record(sql: &str) -> String {
 
         // Skip "AS".
         after += 2;
-        while after < sql.len() && sql.as_bytes()[after] == b' ' { after += 1; }
+        while after < sql.len() && sql.as_bytes()[after] == b' ' {
+            after += 1;
+        }
 
         // Read the alias name (identifier).
         let alias_start = after;
@@ -4395,7 +4725,9 @@ pub(crate) fn rewrite_json_to_record(sql: &str) -> String {
         let alias = &sql[alias_start..after];
 
         // Skip whitespace.
-        while after < sql.len() && sql.as_bytes()[after] == b' ' { after += 1; }
+        while after < sql.len() && sql.as_bytes()[after] == b' ' {
+            after += 1;
+        }
 
         // Must have `(coldef-list)` next.
         if after >= sql.len() || sql.as_bytes()[after] != b'(' {
@@ -4506,14 +4838,18 @@ fn rewrite_scalar_select_to_from_recordset(sql: &str) -> String {
 
         // Skip whitespace after SELECT.
         let mut j = after_select;
-        while j < sql.len() && (sql.as_bytes()[j] == b' ' || sql.as_bytes()[j] == b'\n' || sql.as_bytes()[j] == b'\t') {
+        while j < sql.len()
+            && (sql.as_bytes()[j] == b' '
+                || sql.as_bytes()[j] == b'\n'
+                || sql.as_bytes()[j] == b'\t')
+        {
             j += 1;
         }
 
         // Check for `json[b]_to_recordset(` immediately after SELECT + whitespace.
         let from_j = &lower[j..];
-        let is_match = from_j.starts_with("json_to_recordset(")
-            || from_j.starts_with("jsonb_to_recordset(");
+        let is_match =
+            from_j.starts_with("json_to_recordset(") || from_j.starts_with("jsonb_to_recordset(");
 
         if !is_match {
             // Not our pattern — copy the SELECT keyword and advance.
@@ -4827,7 +5163,10 @@ mod tests {
     fn regex_bang_tilde_star_rewrites_case_insensitive_negative() {
         let sql = "SELECT * FROM t WHERE name !~* '^A'";
         let out = rewrite_posix_regex_operators(sql);
-        assert!(out.contains("NOT regexp_like(name, '^A', 'i')"), "got: {out}");
+        assert!(
+            out.contains("NOT regexp_like(name, '^A', 'i')"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -4844,8 +5183,14 @@ mod tests {
     #[test]
     fn find_word_sequence_ascii_match() {
         // Basic sanity: still finds needle in ASCII-only input.
-        assert_eq!(find_word_sequence("between symmetric", "between symmetric"), Some(0));
-        assert_eq!(find_word_sequence("select between symmetric foo", "between symmetric"), Some(7));
+        assert_eq!(
+            find_word_sequence("between symmetric", "between symmetric"),
+            Some(0)
+        );
+        assert_eq!(
+            find_word_sequence("select between symmetric foo", "between symmetric"),
+            Some(7)
+        );
     }
 
     #[test]
@@ -4875,9 +5220,15 @@ mod tests {
         let lower = "caf\u{00E9} between symmetric 1 and 10";
         // "café" is 5 bytes (c-a-f + 2-byte U+00E9), so "between" starts at 6.
         let pos = find_word_sequence(lower, "between symmetric");
-        assert!(pos.is_some(), "should find 'between symmetric' after multibyte prefix");
+        assert!(
+            pos.is_some(),
+            "should find 'between symmetric' after multibyte prefix"
+        );
         // Verify the returned position is actually a char boundary.
-        assert!(lower.is_char_boundary(pos.unwrap()), "returned offset must be a char boundary");
+        assert!(
+            lower.is_char_boundary(pos.unwrap()),
+            "returned offset must be a char boundary"
+        );
     }
 
     // ── BETWEEN SYMMETRIC rewriter ──────────────────────────────────────────
@@ -4888,7 +5239,10 @@ mod tests {
         let out = rewrite_between_symmetric(sql);
         // Should contain two BETWEEN clauses.
         assert!(out.contains("BETWEEN"), "got: {out}");
-        assert!(!out.to_uppercase().contains("SYMMETRIC"), "SYMMETRIC should be gone: {out}");
+        assert!(
+            !out.to_uppercase().contains("SYMMETRIC"),
+            "SYMMETRIC should be gone: {out}"
+        );
     }
 
     #[test]
@@ -4905,15 +5259,24 @@ mod tests {
     fn uuid_cast_rewrite_basic() {
         let sql = "SELECT 'a6c5e8f0-1234-5678-abcd-000000000000'::UUID";
         let out = rewrite_uuid_cast(sql);
-        assert!(out.contains("::VARCHAR") || out.contains("::varchar"), "got: {out}");
-        assert!(!out.to_uppercase().contains("::UUID"), "UUID should be gone: {out}");
+        assert!(
+            out.contains("::VARCHAR") || out.contains("::varchar"),
+            "got: {out}"
+        );
+        assert!(
+            !out.to_uppercase().contains("::UUID"),
+            "UUID should be gone: {out}"
+        );
     }
 
     #[test]
     fn uuid_cast_rewrite_case_insensitive() {
         let sql = "SELECT 'a6c5e8f0-1234-5678-abcd-000000000000'::uuid";
         let out = rewrite_uuid_cast(sql);
-        assert!(!out.to_uppercase().contains("::UUID"), "uuid should be gone: {out}");
+        assert!(
+            !out.to_uppercase().contains("::UUID"),
+            "uuid should be gone: {out}"
+        );
     }
 
     #[test]
@@ -4954,7 +5317,10 @@ mod tests {
         let sql = "SELECT '00:01:00'::INTERVAL";
         let out = rewrite_interval_hms_cast(sql);
         // 0*3600 + 1*60 + 0 = 60 seconds
-        assert!(out.contains("'60 seconds'") || out.contains("'60 second'"), "got: {out}");
+        assert!(
+            out.contains("'60 seconds'") || out.contains("'60 second'"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -4962,7 +5328,10 @@ mod tests {
         let sql = "SELECT '01:30:15'::interval";
         let out = rewrite_interval_hms_cast(sql);
         // 1*3600 + 30*60 + 15 = 5415 seconds
-        assert!(out.contains("'5415 seconds'") || out.contains("'5415 second'"), "got: {out}");
+        assert!(
+            out.contains("'5415 seconds'") || out.contains("'5415 second'"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -5007,7 +5376,10 @@ mod tests {
         let sql = "SELECT * FROM t WHERE a && b";
         let out = rewrite_array_operators(sql);
         // Should not introduce arrays_overlap.
-        assert!(!out.contains("arrays_overlap"), "should not rewrite plain cols: {out}");
+        assert!(
+            !out.contains("arrays_overlap"),
+            "should not rewrite plain cols: {out}"
+        );
     }
 
     // ── = ANY(ARRAY[...]) rewriter ──────────────────────────────────────────
@@ -5087,8 +5459,14 @@ mod tests {
     fn lateral_unnest_case_insensitive() {
         let sql = "SELECT * FROM t, lateral UNNEST(ARRAY[1,2,3]) tag";
         let out = rewrite_lateral_unnest(sql);
-        assert!(!out.to_ascii_lowercase().contains("lateral unnest"), "LATERAL should be gone: {out}");
-        assert!(out.to_ascii_lowercase().contains("unnest("), "unnest should remain: {out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("lateral unnest"),
+            "LATERAL should be gone: {out}"
+        );
+        assert!(
+            out.to_ascii_lowercase().contains("unnest("),
+            "unnest should remain: {out}"
+        );
     }
 
     #[test]
@@ -5114,8 +5492,14 @@ mod tests {
         // No outer column reference → strip LATERAL.
         let sql = "SELECT t.id, sub.c FROM t, LATERAL (SELECT 42 AS c) sub";
         let out = rewrite_lateral_uncorrelated(sql);
-        assert!(!out.to_ascii_lowercase().contains("lateral"), "LATERAL should be stripped: {out}");
-        assert!(out.contains("(SELECT 42 AS c)"), "subquery body must remain: {out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("lateral"),
+            "LATERAL should be stripped: {out}"
+        );
+        assert!(
+            out.contains("(SELECT 42 AS c)"),
+            "subquery body must remain: {out}"
+        );
     }
 
     #[test]
@@ -5123,16 +5507,26 @@ mod tests {
         // Uncorrelated LEFT JOIN LATERAL — strip LATERAL.
         let sql = "SELECT t.id FROM t LEFT JOIN LATERAL (SELECT 1 AS n) sub ON true";
         let out = rewrite_lateral_uncorrelated(sql);
-        assert!(!out.to_ascii_lowercase().contains("lateral"), "LATERAL should be stripped: {out}");
-        assert!(out.contains("(SELECT 1 AS n)"), "subquery body must remain: {out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("lateral"),
+            "LATERAL should be stripped: {out}"
+        );
+        assert!(
+            out.contains("(SELECT 1 AS n)"),
+            "subquery body must remain: {out}"
+        );
     }
 
     #[test]
     fn lateral_correlated_subquery_preserved() {
         // Correlated (references t.id) → must NOT strip LATERAL.
-        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true";
+        let sql =
+            "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true";
         let out = rewrite_lateral_uncorrelated(sql);
-        assert!(out.to_ascii_lowercase().contains("lateral"), "correlated LATERAL must be preserved: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "correlated LATERAL must be preserved: {out}"
+        );
     }
 
     #[test]
@@ -5140,7 +5534,10 @@ mod tests {
         // Correlated comma-LATERAL — must NOT strip.
         let sql = "SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub";
         let out = rewrite_lateral_uncorrelated(sql);
-        assert!(out.to_ascii_lowercase().contains("lateral"), "correlated LATERAL must be preserved: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "correlated LATERAL must be preserved: {out}"
+        );
     }
 
     #[test]
@@ -5149,7 +5546,10 @@ mod tests {
         let sql = "SELECT sub.x FROM LATERAL (SELECT 5 AS x) sub";
         let out = rewrite_lateral_uncorrelated(sql);
         // No outer names detected → treated as uncorrelated → LATERAL stripped.
-        assert!(!out.to_ascii_lowercase().contains("lateral"), "should strip: {out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("lateral"),
+            "should strip: {out}"
+        );
     }
 
     // ── Nested-aggregate ORM LATERAL rewrite ────────────────────────────────
@@ -5161,13 +5561,22 @@ mod tests {
         let out = rewrite_lateral_nested_agg(&sql);
         let out_lower = out.to_ascii_lowercase();
         // Must not contain LATERAL any more.
-        assert!(!out_lower.contains("lateral"), "LATERAL should be rewritten: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL should be rewritten: {out}"
+        );
         // Must contain a GROUP BY on the FK column.
         assert!(out_lower.contains("group by"), "must have GROUP BY: {out}");
         // The ON condition must reference the subquery alias.
-        assert!(out_lower.contains("on agg."), "ON clause must reference sub alias: {out}");
+        assert!(
+            out_lower.contains("on agg."),
+            "ON clause must reference sub alias: {out}"
+        );
         // Original ON true must be gone.
-        assert!(!out_lower.contains("on true"), "ON true must be replaced: {out}");
+        assert!(
+            !out_lower.contains("on true"),
+            "ON true must be replaced: {out}"
+        );
     }
 
     #[test]
@@ -5190,10 +5599,19 @@ mod tests {
         let out = rewrite_lateral_nested_agg(&sql);
         let out_lower = out.to_ascii_lowercase();
         // LATERAL must be gone — the rewrite happened.
-        assert!(!out_lower.contains("lateral"), "ORDER BY inside agg must not prevent rewrite: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "ORDER BY inside agg must not prevent rewrite: {out}"
+        );
         // The aggregate's ORDER BY is preserved inside the rewritten subquery.
-        assert!(out_lower.contains("order by"), "aggregate ORDER BY must be preserved after rewrite: {out}");
-        assert!(out_lower.contains("group by"), "GROUP BY must be present after rewrite: {out}");
+        assert!(
+            out_lower.contains("order by"),
+            "aggregate ORDER BY must be preserved after rewrite: {out}"
+        );
+        assert!(
+            out_lower.contains("group by"),
+            "GROUP BY must be present after rewrite: {out}"
+        );
     }
 
     #[test]
@@ -5204,7 +5622,10 @@ mod tests {
         let out = rewrite_lateral_nested_agg(&sql);
         let out_lower = out.to_ascii_lowercase();
         // Must be left untouched (still has LATERAL).
-        assert!(out_lower.contains("lateral"), "top-level ORDER BY must prevent rewrite: {out}");
+        assert!(
+            out_lower.contains("lateral"),
+            "top-level ORDER BY must prevent rewrite: {out}"
+        );
     }
 
     #[test]
@@ -5212,7 +5633,10 @@ mod tests {
         // Non-aggregate projection (bare `id`) → must NOT rewrite.
         let sql = "SELECT t.id FROM t LEFT JOIN LATERAL (SELECT u.id FROM u WHERE u.id = t.id) sub ON true";
         let out = rewrite_lateral_nested_agg(&sql);
-        assert!(out.to_ascii_lowercase().contains("lateral"), "non-aggregate projection must not be rewritten: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "non-aggregate projection must not be rewritten: {out}"
+        );
     }
 
     #[test]
@@ -5220,7 +5644,10 @@ mod tests {
         // JOIN condition is not `ON true` → must NOT rewrite.
         let sql = "SELECT t.id FROM t LEFT JOIN LATERAL (SELECT count(*) AS c FROM u WHERE u.tid = t.id) sub ON sub.c > 0";
         let out = rewrite_lateral_nested_agg(&sql);
-        assert!(out.to_ascii_lowercase().contains("lateral"), "non-ON-true must not be rewritten: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "non-ON-true must not be rewritten: {out}"
+        );
     }
 
     #[test]
@@ -5231,12 +5658,16 @@ mod tests {
         let sql = "SELECT u.id, agg.posts FROM users u LEFT JOIN LATERAL (SELECT json_agg(p.title) AS posts FROM posts p WHERE p.author_id = u.id) agg ON true ORDER BY u.id";
         let out = rewrite_lateral_correlated_row(sql);
         // Row-rewriter must not touch it (all projections are aggregates).
-        assert!(out.to_ascii_lowercase().contains("lateral"),
-            "nested-agg shape must not be stolen by row-rewriter: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "nested-agg shape must not be stolen by row-rewriter: {out}"
+        );
         // But nested_agg rewriter handles it.
         let out2 = rewrite_lateral_nested_agg(&out);
-        assert!(!out2.to_ascii_lowercase().contains("lateral"),
-            "nested_agg rewriter must still handle the ORM shape: {out2}");
+        assert!(
+            !out2.to_ascii_lowercase().contains("lateral"),
+            "nested_agg rewriter must still handle the ORM shape: {out2}"
+        );
     }
 
     // ── Correlated row-returning LATERAL → JOIN decorrelation ────────────────
@@ -5249,25 +5680,50 @@ mod tests {
         let sql = "SELECT * FROM t, LATERAL (SELECT id FROM u WHERE u.id = t.id) sub";
         let out = rewrite_lateral_correlated_row(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
-        assert!(out_lower.contains("inner join"), "must become INNER JOIN: {out}");
-        assert!(out_lower.contains("on sub.id = t.id"), "ON clause must be correct: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL must be gone: {out}"
+        );
+        assert!(
+            out_lower.contains("inner join"),
+            "must become INNER JOIN: {out}"
+        );
+        assert!(
+            out_lower.contains("on sub.id = t.id"),
+            "ON clause must be correct: {out}"
+        );
         // The original subquery body projection must be preserved.
-        assert!(out.contains("SELECT id FROM u") || out.contains("SELECT id FROM u"), "body must be preserved: {out}");
+        assert!(
+            out.contains("SELECT id FROM u") || out.contains("SELECT id FROM u"),
+            "body must be preserved: {out}"
+        );
     }
 
     #[test]
     fn lateral_corr_row_left_join_simple_col() {
         // LEFT JOIN LATERAL with single-column correlated body and ON true.
         // → rewrite to LEFT JOIN ... ON correlation_predicate.
-        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true";
+        let sql =
+            "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id) sub ON true";
         let out = rewrite_lateral_correlated_row(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
-        assert!(out_lower.contains("left join"), "must remain LEFT JOIN: {out}");
-        assert!(out_lower.contains("on sub.id = t.id"), "ON clause must be correct: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL must be gone: {out}"
+        );
+        assert!(
+            out_lower.contains("left join"),
+            "must remain LEFT JOIN: {out}"
+        );
+        assert!(
+            out_lower.contains("on sub.id = t.id"),
+            "ON clause must be correct: {out}"
+        );
         // Must not contain ON true any more.
-        assert!(!out_lower.contains("on true"), "ON true must be replaced: {out}");
+        assert!(
+            !out_lower.contains("on true"),
+            "ON true must be replaced: {out}"
+        );
     }
 
     #[test]
@@ -5277,13 +5733,28 @@ mod tests {
         let sql = "SELECT * FROM t JOIN LATERAL (SELECT id * 2 AS dbl FROM u WHERE u.id = t.id) sub ON true";
         let out = rewrite_lateral_correlated_row(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
-        assert!(out_lower.contains("inner join"), "must become INNER JOIN: {out}");
-        assert!(out_lower.contains("on sub.id = t.id"), "ON clause must be correct: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL must be gone: {out}"
+        );
+        assert!(
+            out_lower.contains("inner join"),
+            "must become INNER JOIN: {out}"
+        );
+        assert!(
+            out_lower.contains("on sub.id = t.id"),
+            "ON clause must be correct: {out}"
+        );
         // The correlation key must be prepended to the subquery projection.
-        assert!(out_lower.contains("u.id"), "join key u.id must appear in sub projection: {out}");
+        assert!(
+            out_lower.contains("u.id"),
+            "join key u.id must appear in sub projection: {out}"
+        );
         // The computed expression must still be present.
-        assert!(out.contains("id * 2 AS dbl") || out.contains("id * 2 as dbl"), "computed expr must be preserved: {out}");
+        assert!(
+            out.contains("id * 2 AS dbl") || out.contains("id * 2 as dbl"),
+            "computed expr must be preserved: {out}"
+        );
     }
 
     #[test]
@@ -5291,8 +5762,10 @@ mod tests {
         // LIMIT inside LATERAL body → must NOT rewrite (LIMIT changes top-N semantics).
         let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id LIMIT 1) sub ON true";
         let out = rewrite_lateral_correlated_row(sql);
-        assert!(out.to_ascii_lowercase().contains("lateral"),
-            "LIMIT inside body must prevent rewrite: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "LIMIT inside body must prevent rewrite: {out}"
+        );
     }
 
     #[test]
@@ -5300,8 +5773,10 @@ mod tests {
         // ORDER BY inside LATERAL body → must NOT rewrite.
         let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id ORDER BY id) sub ON true";
         let out = rewrite_lateral_correlated_row(sql);
-        assert!(out.to_ascii_lowercase().contains("lateral"),
-            "ORDER BY inside body must prevent rewrite: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "ORDER BY inside body must prevent rewrite: {out}"
+        );
     }
 
     #[test]
@@ -5311,11 +5786,16 @@ mod tests {
         let sql = "SELECT t.id, sub.c FROM t, LATERAL (SELECT 42 AS c) sub";
         // uncorrelated rewriter strips LATERAL first.
         let out1 = rewrite_lateral_uncorrelated(sql);
-        assert!(!out1.to_ascii_lowercase().contains("lateral"),
-            "uncorrelated strip must remove LATERAL first: {out1}");
+        assert!(
+            !out1.to_ascii_lowercase().contains("lateral"),
+            "uncorrelated strip must remove LATERAL first: {out1}"
+        );
         // row-rewriter sees no LATERAL → identity.
         let out2 = rewrite_lateral_correlated_row(&out1);
-        assert!(!out2.to_ascii_lowercase().contains("lateral"), "still no LATERAL after row-rewriter: {out2}");
+        assert!(
+            !out2.to_ascii_lowercase().contains("lateral"),
+            "still no LATERAL after row-rewriter: {out2}"
+        );
     }
 
     #[test]
@@ -5323,8 +5803,10 @@ mod tests {
         // Multiple WHERE predicates (AND) → must NOT rewrite.
         let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id AND u.active = true) sub ON true";
         let out = rewrite_lateral_correlated_row(sql);
-        assert!(out.to_ascii_lowercase().contains("lateral"),
-            "multi-predicate WHERE must prevent rewrite: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "multi-predicate WHERE must prevent rewrite: {out}"
+        );
     }
 
     // ── WITH RECURSIVE column alias rewriter ────────────────────────────────
@@ -5335,7 +5817,10 @@ mod tests {
         let out = rewrite_recursive_cte_column_aliases(sql);
         assert!(out.contains("SELECT 1 AS n"), "expected AS alias: {out}");
         // Ensure a space separates the alias from UNION (no `nUNION` token merge).
-        assert!(out.contains("1 AS n UNION"), "expected space before UNION: {out}");
+        assert!(
+            out.contains("1 AS n UNION"),
+            "expected space before UNION: {out}"
+        );
     }
 
     #[test]
@@ -5345,9 +5830,15 @@ mod tests {
         // First expression is wrapped in a scalar subquery (DataFusion 53 optimizer
         // bug workaround: triggers the plan_contains_other_subqueries escape hatch
         // in optimize_projections so the recursive CTE's columns are not pruned).
-        assert!(out.contains("(SELECT 1) AS a"), "expected scalar-subquery wrap for first col: {out}");
+        assert!(
+            out.contains("(SELECT 1) AS a"),
+            "expected scalar-subquery wrap for first col: {out}"
+        );
         // Second expression gets a plain alias.
-        assert!(out.contains("1 AS b"), "expected plain alias for second col: {out}");
+        assert!(
+            out.contains("1 AS b"),
+            "expected plain alias for second col: {out}"
+        );
     }
 
     #[test]
@@ -5356,7 +5847,10 @@ mod tests {
         let sql = "WITH RECURSIVE fib(a, b) AS (SELECT 1 AS a, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib";
         let out = rewrite_recursive_cte_column_aliases(sql);
         // First expression `1 AS a` → strip alias → `1` → `(SELECT 1) AS a`
-        assert!(out.contains("(SELECT 1) AS a"), "pre-aliased first col must be re-wrapped: {out}");
+        assert!(
+            out.contains("(SELECT 1) AS a"),
+            "pre-aliased first col must be re-wrapped: {out}"
+        );
         assert!(out.contains("1 AS b"), "second col gets plain alias: {out}");
     }
 
@@ -5409,15 +5903,33 @@ mod tests {
         let sql = r#"SELECT json_to_record('{"a":1,"b":"foo"}'::json) AS t(a int, b text)"#;
         let out = rewrite_json_to_record(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(out_lower.contains("json_to_recordset"), "must use recordset fn: {out}");
-        assert!(out_lower.contains("select * from"), "must restructure to SELECT * FROM: {out}");
-        assert!(out_lower.contains("as t(a int, b text)"), "coldef list must be preserved: {out}");
+        assert!(
+            out_lower.contains("json_to_recordset"),
+            "must use recordset fn: {out}"
+        );
+        assert!(
+            out_lower.contains("select * from"),
+            "must restructure to SELECT * FROM: {out}"
+        );
+        assert!(
+            out_lower.contains("as t(a int, b text)"),
+            "coldef list must be preserved: {out}"
+        );
         // The JSON literal must be wrapped in a single-element array.
-        assert!(out.contains(r#"'[{"a":1,"b":"foo"}]'"#), "JSON must be wrapped in array: {out}");
+        assert!(
+            out.contains(r#"'[{"a":1,"b":"foo"}]'"#),
+            "JSON must be wrapped in array: {out}"
+        );
         // The ::json cast must be preserved.
-        assert!(out.contains("::json"), "cast suffix must be preserved: {out}");
+        assert!(
+            out.contains("::json"),
+            "cast suffix must be preserved: {out}"
+        );
         // Must not contain the original json_to_record (not recordset) as the function.
-        assert!(!out_lower.contains("json_to_record("), "original fn must be gone: {out}");
+        assert!(
+            !out_lower.contains("json_to_record("),
+            "original fn must be gone: {out}"
+        );
     }
 
     #[test]
@@ -5426,10 +5938,22 @@ mod tests {
         let sql = r#"SELECT jsonb_to_record('{"a":1,"b":"foo"}'::jsonb) AS t(a int, b text)"#;
         let out = rewrite_json_to_record(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(out_lower.contains("jsonb_to_recordset"), "must use jsonb_to_recordset: {out}");
-        assert!(out_lower.contains("select * from"), "must restructure to SELECT * FROM: {out}");
-        assert!(out_lower.contains("as t(a int, b text)"), "coldef list preserved: {out}");
-        assert!(out.contains(r#"'[{"a":1,"b":"foo"}]'"#), "JSON wrapped in array: {out}");
+        assert!(
+            out_lower.contains("jsonb_to_recordset"),
+            "must use jsonb_to_recordset: {out}"
+        );
+        assert!(
+            out_lower.contains("select * from"),
+            "must restructure to SELECT * FROM: {out}"
+        );
+        assert!(
+            out_lower.contains("as t(a int, b text)"),
+            "coldef list preserved: {out}"
+        );
+        assert!(
+            out.contains(r#"'[{"a":1,"b":"foo"}]'"#),
+            "JSON wrapped in array: {out}"
+        );
         assert!(out.contains("::jsonb"), "jsonb cast preserved: {out}");
     }
 
@@ -5439,10 +5963,19 @@ mod tests {
         let sql = r#"SELECT json_to_record('{"a":1}'::json) AS t(a int, b text)"#;
         let out = rewrite_json_to_record(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(out_lower.contains("json_to_recordset"), "must use recordset fn: {out}");
-        assert!(out_lower.contains("select * from"), "must be FROM form: {out}");
+        assert!(
+            out_lower.contains("json_to_recordset"),
+            "must use recordset fn: {out}"
+        );
+        assert!(
+            out_lower.contains("select * from"),
+            "must be FROM form: {out}"
+        );
         // The coldef list (a int, b text) must remain for DataFusion to apply casts.
-        assert!(out_lower.contains("as t(a int, b text)"), "coldef list must survive: {out}");
+        assert!(
+            out_lower.contains("as t(a int, b text)"),
+            "coldef list must survive: {out}"
+        );
         // The wrapped array must contain just the one object.
         assert!(out.contains(r#"'[{"a":1}]'"#), "JSON wrapped: {out}");
     }
@@ -5453,8 +5986,14 @@ mod tests {
         let sql = r#"SELECT json_to_record('{"a":"42"}'::json) AS t(a int)"#;
         let out = rewrite_json_to_record(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(out_lower.contains("json_to_recordset"), "must use recordset: {out}");
-        assert!(out_lower.contains("select * from"), "must be FROM form: {out}");
+        assert!(
+            out_lower.contains("json_to_recordset"),
+            "must use recordset: {out}"
+        );
+        assert!(
+            out_lower.contains("select * from"),
+            "must be FROM form: {out}"
+        );
         assert!(out_lower.contains("as t(a int)"), "coldef preserved: {out}");
     }
 
@@ -5464,9 +6003,18 @@ mod tests {
         let sql = r#"SELECT * FROM json_to_record('{"a":1}'::json) AS t(a int, b text)"#;
         let out = rewrite_json_to_record(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(out_lower.contains("json_to_recordset"), "must use recordset: {out}");
-        assert!(!out_lower.contains("json_to_record("), "original fn must be gone: {out}");
-        assert!(out_lower.contains("as t(a int, b text)"), "coldef list preserved: {out}");
+        assert!(
+            out_lower.contains("json_to_recordset"),
+            "must use recordset: {out}"
+        );
+        assert!(
+            !out_lower.contains("json_to_record("),
+            "original fn must be gone: {out}"
+        );
+        assert!(
+            out_lower.contains("as t(a int, b text)"),
+            "coldef list preserved: {out}"
+        );
         // The FROM keyword should be present (was already there).
         assert!(out_lower.contains("from"), "FROM must remain: {out}");
     }
@@ -5477,7 +6025,10 @@ mod tests {
         let sql = r#"SELECT json_to_record('{"a":1}'::json) AS result"#;
         let out = rewrite_json_to_record(sql);
         // Should not be rewritten (no coldef list after the alias).
-        assert!(!out.to_ascii_lowercase().contains("recordset"), "no rewrite without coldef list: {out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("recordset"),
+            "no rewrite without coldef list: {out}"
+        );
     }
 
     #[test]
@@ -5494,8 +6045,14 @@ mod tests {
         let sql = r#"SELECT * FROM jsonb_to_record('{"x":"hello"}'::jsonb) AS t(x text)"#;
         let out = rewrite_json_to_record(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(out_lower.contains("jsonb_to_recordset"), "must use jsonb_to_recordset: {out}");
-        assert!(out_lower.contains("as t(x text)"), "coldef preserved: {out}");
+        assert!(
+            out_lower.contains("jsonb_to_recordset"),
+            "must use jsonb_to_recordset: {out}"
+        );
+        assert!(
+            out_lower.contains("as t(x text)"),
+            "coldef preserved: {out}"
+        );
         assert!(out.contains("::jsonb"), "cast preserved: {out}");
     }
 
@@ -5507,7 +6064,10 @@ mod tests {
         let out = rewrite_json_to_record(sql);
         // The embedded `''` must survive in the wrapped form.
         assert!(out.contains("it''s"), "escaped quotes must survive: {out}");
-        assert!(out.to_ascii_lowercase().contains("json_to_recordset"), "must use recordset: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("json_to_recordset"),
+            "must use recordset: {out}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5520,8 +6080,11 @@ mod tests {
     #[test]
     fn fast_exit_bit_string_literal_plain_select() {
         let sql = "SELECT id, name FROM events WHERE id = 42";
-        assert_eq!(rewrite_bit_string_literal(sql), sql,
-            "rewrite_bit_string_literal must be a no-op when no B' sequence is present");
+        assert_eq!(
+            rewrite_bit_string_literal(sql),
+            sql,
+            "rewrite_bit_string_literal must be a no-op when no B' sequence is present"
+        );
     }
 
     #[test]
@@ -5530,63 +6093,90 @@ mod tests {
         let sql = "SELECT B'1010'";
         let out = rewrite_bit_string_literal(sql);
         // The rewriter should turn B'...' into a different form.
-        assert_ne!(out, sql, "rewrite_bit_string_literal should transform B'...' literals");
+        assert_ne!(
+            out, sql,
+            "rewrite_bit_string_literal should transform B'...' literals"
+        );
     }
 
     #[test]
     fn fast_exit_any_array_plain_select() {
         let sql = "SELECT id FROM t WHERE id = 1";
-        assert_eq!(rewrite_any_array(sql), sql,
-            "rewrite_any_array must be a no-op when 'any'/'some' is absent");
+        assert_eq!(
+            rewrite_any_array(sql),
+            sql,
+            "rewrite_any_array must be a no-op when 'any'/'some' is absent"
+        );
     }
 
     #[test]
     fn fast_exit_all_array_plain_select() {
         let sql = "SELECT id FROM t WHERE id = 1";
-        assert_eq!(rewrite_all_array(sql), sql,
-            "rewrite_all_array must be a no-op when ' all' is absent");
+        assert_eq!(
+            rewrite_all_array(sql),
+            sql,
+            "rewrite_all_array must be a no-op when ' all' is absent"
+        );
     }
 
     #[test]
     fn fast_exit_uuid_cast_plain_select() {
         let sql = "SELECT id, value FROM events WHERE id = 42";
-        assert_eq!(rewrite_uuid_cast(sql), sql,
-            "rewrite_uuid_cast must be a no-op when 'uuid' is absent");
+        assert_eq!(
+            rewrite_uuid_cast(sql),
+            sql,
+            "rewrite_uuid_cast must be a no-op when 'uuid' is absent"
+        );
     }
 
     #[test]
     fn fast_exit_overlaps_plain_select() {
         let sql = "SELECT id, ts FROM events WHERE id = 42";
-        assert_eq!(rewrite_overlaps(sql), sql,
-            "rewrite_overlaps must be a no-op when 'overlaps' is absent");
+        assert_eq!(
+            rewrite_overlaps(sql),
+            sql,
+            "rewrite_overlaps must be a no-op when 'overlaps' is absent"
+        );
     }
 
     #[test]
     fn fast_exit_aggregate_filter_plain_select() {
         let sql = "SELECT count(*) FROM events WHERE id = 42";
-        assert_eq!(rewrite_aggregate_filter(sql), sql,
-            "rewrite_aggregate_filter must be a no-op when 'filter' is absent");
+        assert_eq!(
+            rewrite_aggregate_filter(sql),
+            sql,
+            "rewrite_aggregate_filter must be a no-op when 'filter' is absent"
+        );
     }
 
     #[test]
     fn fast_exit_cte_materialized_plain_select() {
         let sql = "WITH cte AS (SELECT id FROM t) SELECT * FROM cte";
-        assert_eq!(rewrite_cte_materialized(sql), sql,
-            "rewrite_cte_materialized must be a no-op when 'materialized' is absent");
+        assert_eq!(
+            rewrite_cte_materialized(sql),
+            sql,
+            "rewrite_cte_materialized must be a no-op when 'materialized' is absent"
+        );
     }
 
     #[test]
     fn fast_exit_interval_hms_cast_plain_select() {
         let sql = "SELECT id, created_at FROM events WHERE id = 42";
-        assert_eq!(rewrite_interval_hms_cast(sql), sql,
-            "rewrite_interval_hms_cast must be a no-op when 'interval' is absent");
+        assert_eq!(
+            rewrite_interval_hms_cast(sql),
+            sql,
+            "rewrite_interval_hms_cast must be a no-op when 'interval' is absent"
+        );
     }
 
     #[test]
     fn fast_exit_any_some_subquery_plain_select() {
         let sql = "SELECT id FROM t WHERE id = 1";
-        assert_eq!(rewrite_any_some_subquery(sql), sql,
-            "rewrite_any_some_subquery must be a no-op when any/some/all are absent");
+        assert_eq!(
+            rewrite_any_some_subquery(sql),
+            sql,
+            "rewrite_any_some_subquery must be a no-op when any/some/all are absent"
+        );
     }
 
     // ── rewrite_jsonb_srf_scalar_select (BUG #139) ──────────────────────────
@@ -5602,7 +6192,10 @@ mod tests {
     fn jsonb_srf_scalar_with_alias_rewritten() {
         let sql = "SELECT jsonb_array_elements('[1,2,3]'::jsonb) AS v";
         let out = rewrite_jsonb_srf_scalar_select(sql);
-        assert_eq!(out, "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS v");
+        assert_eq!(
+            out,
+            "SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS v"
+        );
     }
 
     #[test]
@@ -5677,8 +6270,11 @@ mod tests {
     #[test]
     fn jsonb_srf_no_match_fast_exit() {
         let sql = "SELECT id, name FROM users WHERE id = 1";
-        assert_eq!(rewrite_jsonb_srf_scalar_select(sql), sql,
-            "must be a no-op when no jsonb SRF name is present");
+        assert_eq!(
+            rewrite_jsonb_srf_scalar_select(sql),
+            sql,
+            "must be a no-op when no jsonb SRF name is present"
+        );
     }
 
     #[test]
@@ -5697,16 +6293,27 @@ mod tests {
         let out = rlgs(sql);
         let lo = out.to_ascii_lowercase();
         assert!(!lo.contains("lateral"), "LATERAL must be removed: {out}");
-        assert!(lo.contains("with recursive __basin_gs_g(value)"),
-            "recursive CTE must be emitted: {out}");
+        assert!(
+            lo.contains("with recursive __basin_gs_g(value)"),
+            "recursive CTE must be emitted: {out}"
+        );
         assert!(lo.contains("union all"), "recursive term required: {out}");
-        assert!(lo.contains("(select max(t.id) from t)"),
-            "bound must be table max of correlated col: {out}");
-        assert!(lo.contains("join __basin_gs_g g"), "plain JOIN required: {out}");
-        assert!(lo.contains("g.value >= 1 and g.value <= t.id"),
-            "per-row range predicate required: {out}");
-        assert!(lo.contains("select * from t"),
-            "outer projection/from must be preserved: {out}");
+        assert!(
+            lo.contains("(select max(t.id) from t)"),
+            "bound must be table max of correlated col: {out}"
+        );
+        assert!(
+            lo.contains("join __basin_gs_g g"),
+            "plain JOIN required: {out}"
+        );
+        assert!(
+            lo.contains("g.value >= 1 and g.value <= t.id"),
+            "per-row range predicate required: {out}"
+        );
+        assert!(
+            lo.contains("select * from t"),
+            "outer projection/from must be preserved: {out}"
+        );
     }
 
     #[test]
@@ -5717,8 +6324,10 @@ mod tests {
         assert!(!lo.contains("lateral"), "comma-LATERAL removed: {out}");
         assert!(lo.contains("with recursive __basin_gs_gs(value)"), "{out}");
         assert!(lo.contains("(select max(t.n) from t)"), "{out}");
-        assert!(lo.contains("join __basin_gs_gs gs"),
-            "comma form becomes JOIN: {out}");
+        assert!(
+            lo.contains("join __basin_gs_gs gs"),
+            "comma form becomes JOIN: {out}"
+        );
         assert!(lo.contains("gs.value >= 1 and gs.value <= t.n"), "{out}");
         // The leading comma must be gone (replaced by JOIN).
         assert!(!out.contains("t, "), "comma join lead-in replaced: {out}");
@@ -5748,15 +6357,19 @@ mod tests {
         let sql = "SELECT * FROM t CROSS JOIN LATERAL generate_series(2, t.id) g";
         let out = rlgs(sql).to_ascii_lowercase();
         assert!(out.contains("select cast(2 as bigint)"), "seed = lo: {out}");
-        assert!(out.contains("g.value >= 2 and g.value <= t.id"),
-            "floor = lo literal: {out}");
+        assert!(
+            out.contains("g.value >= 2 and g.value <= t.id"),
+            "floor = lo literal: {out}"
+        );
     }
 
     #[test]
     fn lgs_step_one_ok_other_step_noop() {
         let ok = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id, 1) g";
-        assert!(!rlgs(ok).to_ascii_lowercase().contains("lateral"),
-            "step=1 supported");
+        assert!(
+            !rlgs(ok).to_ascii_lowercase().contains("lateral"),
+            "step=1 supported"
+        );
         let bad = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id, 2) g";
         assert_eq!(rlgs(bad), bad, "step != 1 must be a conservative no-op");
         let neg = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id, -1) g";
@@ -5765,7 +6378,8 @@ mod tests {
 
     #[test]
     fn lgs_existing_with_clause_deferred() {
-        let sql = "WITH c AS (SELECT 1) SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g";
+        let sql =
+            "WITH c AS (SELECT 1) SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g";
         assert_eq!(rlgs(sql), sql, "existing WITH → defer (no merge)");
     }
 
@@ -5791,10 +6405,14 @@ mod tests {
     fn lgs_preserves_outer_where_and_projection() {
         let sql = "SELECT t.id AS tid, g.value v FROM t CROSS JOIN LATERAL generate_series(1, t.id) g WHERE t.id > 1 ORDER BY t.id";
         let out = rlgs(sql);
-        assert!(out.contains("t.id AS tid, g.value v"),
-            "projection preserved verbatim: {out}");
-        assert!(out.contains("WHERE t.id > 1 ORDER BY t.id"),
-            "trailing WHERE/ORDER BY preserved: {out}");
+        assert!(
+            out.contains("t.id AS tid, g.value v"),
+            "projection preserved verbatim: {out}"
+        );
+        assert!(
+            out.contains("WHERE t.id > 1 ORDER BY t.id"),
+            "trailing WHERE/ORDER BY preserved: {out}"
+        );
         assert!(!out.to_ascii_lowercase().contains("lateral"), "{out}");
     }
 
@@ -5802,7 +6420,10 @@ mod tests {
     fn lgs_multiple_correlated_lateral_deferred() {
         let sql = "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.a) g \
                    CROSS JOIN LATERAL generate_series(1, t.b) h";
-        assert_eq!(rlgs(sql), sql,
-            "more than one correlated generate_series LATERAL → defer");
+        assert_eq!(
+            rlgs(sql),
+            sql,
+            "more than one correlated generate_series LATERAL → defer"
+        );
     }
 }

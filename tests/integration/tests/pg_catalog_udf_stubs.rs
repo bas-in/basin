@@ -91,7 +91,10 @@ async fn pg_table_is_visible_schema_qualified() {
     let col = single_col(&sess, "SELECT pg_catalog.pg_table_is_visible('foo'::text)").await;
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert_eq!(bools.len(), 1);
-    assert!(bools.value(0), "pg_catalog.pg_table_is_visible should return true");
+    assert!(
+        bools.value(0),
+        "pg_catalog.pg_table_is_visible should return true"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -106,9 +109,15 @@ async fn pg_get_userbyid_returns_text() {
     assert_eq!(col.data_type(), &DataType::Utf8);
     assert_eq!(col.len(), 1);
     // We don't assert a specific value — just that it returns something without error.
-    assert!(!col.is_null(0), "pg_get_userbyid should return non-null text");
+    assert!(
+        !col.is_null(0),
+        "pg_get_userbyid should return non-null text"
+    );
     let s = col.as_any().downcast_ref::<StringArray>().unwrap();
-    assert!(!s.value(0).is_empty(), "pg_get_userbyid returned empty string");
+    assert!(
+        !s.value(0).is_empty(),
+        "pg_get_userbyid returned empty string"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +265,11 @@ async fn pg_get_partkeydef_returns_null() {
 async fn has_table_privilege_returns_true() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let col = single_col(&sess, "SELECT has_table_privilege('alice', 'pg_class', 'SELECT')").await;
+    let col = single_col(
+        &sess,
+        "SELECT has_table_privilege('alice', 'pg_class', 'SELECT')",
+    )
+    .await;
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(bools.value(0));
 }
@@ -265,7 +278,11 @@ async fn has_table_privilege_returns_true() {
 async fn has_schema_privilege_returns_true() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let col = single_col(&sess, "SELECT has_schema_privilege('alice', 'public', 'USAGE')").await;
+    let col = single_col(
+        &sess,
+        "SELECT has_schema_privilege('alice', 'public', 'USAGE')",
+    )
+    .await;
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(bools.value(0));
 }

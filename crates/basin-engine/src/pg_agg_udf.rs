@@ -33,8 +33,8 @@ use datafusion::arrow::array::{
     Array, ArrayRef, LargeBinaryArray, ListArray, StringArray, StructArray,
 };
 use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{exec_err, plan_err, Result as DFResult};
 use datafusion::logical_expr::{
@@ -102,11 +102,17 @@ impl AggregateUDFImpl for JsonAggUdaf {
         Ok(json_agg_return_field(self.name))
     }
 
-    fn accumulator(&self, _args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+    fn accumulator(
+        &self,
+        _args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
         Ok(Box::new(JsonAggAccumulator { values: vec![] }))
     }
 
-    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<datafusion::arrow::datatypes::FieldRef>> {
+    fn state_fields(
+        &self,
+        args: StateFieldsArgs,
+    ) -> DFResult<Vec<datafusion::arrow::datatypes::FieldRef>> {
         Ok(vec![std::sync::Arc::new(Field::new(
             format!("{}_state", args.name),
             DataType::Utf8,
@@ -214,13 +220,17 @@ impl AggregateUDFImpl for JsonObjectAggUdaf {
         Ok(json_agg_return_field(self.name))
     }
 
-    fn accumulator(&self, _args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
-        Ok(Box::new(JsonObjectAggAccumulator {
-            pairs: vec![],
-        }))
+    fn accumulator(
+        &self,
+        _args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        Ok(Box::new(JsonObjectAggAccumulator { pairs: vec![] }))
     }
 
-    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<datafusion::arrow::datatypes::FieldRef>> {
+    fn state_fields(
+        &self,
+        args: StateFieldsArgs,
+    ) -> DFResult<Vec<datafusion::arrow::datatypes::FieldRef>> {
         Ok(vec![std::sync::Arc::new(Field::new(
             format!("{}_state", args.name),
             DataType::Utf8,
@@ -355,16 +365,12 @@ fn arrow_scalar_to_json(arr: &dyn Array, i: usize) -> JValue {
         DataType::Float32 => arr
             .as_any()
             .downcast_ref::<Float32Array>()
-            .and_then(|a| {
-                serde_json::Number::from_f64(a.value(i) as f64).map(JValue::Number)
-            })
+            .and_then(|a| serde_json::Number::from_f64(a.value(i) as f64).map(JValue::Number))
             .unwrap_or(JValue::Null),
         DataType::Float64 => arr
             .as_any()
             .downcast_ref::<Float64Array>()
-            .and_then(|a| {
-                serde_json::Number::from_f64(a.value(i)).map(JValue::Number)
-            })
+            .and_then(|a| serde_json::Number::from_f64(a.value(i)).map(JValue::Number))
             .unwrap_or(JValue::Null),
         // Struct arrays — produced by `named_struct(...)` calls.
         // Convert each field to a JSON object key→value pair.
@@ -476,9 +482,7 @@ mod tests {
     /// Struct with a null row should produce `null`.
     #[test]
     fn struct_to_json_null_row() {
-        let fields = Fields::from(vec![
-            Arc::new(Field::new("x", DataType::Int32, true)),
-        ]);
+        let fields = Fields::from(vec![Arc::new(Field::new("x", DataType::Int32, true))]);
         let x_arr: ArrayRef = Arc::new(Int32Array::from(vec![Some(42i32), None]));
         // Mark the first struct element as null.
         let validity = datafusion::arrow::buffer::NullBuffer::from(vec![false, true]);
@@ -489,7 +493,10 @@ mod tests {
         assert_eq!(v0, JValue::Null, "null struct row should yield null");
 
         let v1 = arrow_scalar_to_json(arr_ref.as_ref(), 1);
-        assert!(matches!(&v1, JValue::Object(_)), "non-null struct row should be object");
+        assert!(
+            matches!(&v1, JValue::Object(_)),
+            "non-null struct row should be object"
+        );
     }
 
     // ── json_agg accumulator ────────────────────────────────────────────────
@@ -499,7 +506,11 @@ mod tests {
     fn json_agg_empty_returns_null() {
         let mut acc = JsonAggAccumulator { values: vec![] };
         let result = acc.evaluate().unwrap();
-        assert_eq!(result, ScalarValue::Utf8(None), "json_agg over 0 rows should be NULL");
+        assert_eq!(
+            result,
+            ScalarValue::Utf8(None),
+            "json_agg over 0 rows should be NULL"
+        );
     }
 
     /// `json_agg` over two integer rows must produce a JSON array.
@@ -512,7 +523,10 @@ mod tests {
         match result {
             ScalarValue::Utf8(Some(s)) => {
                 let v: JValue = serde_json::from_str(&s).expect("must be valid JSON");
-                assert_eq!(v, JValue::Array(vec![JValue::Number(1.into()), JValue::Number(2.into())]));
+                assert_eq!(
+                    v,
+                    JValue::Array(vec![JValue::Number(1.into()), JValue::Number(2.into())])
+                );
             }
             other => panic!("expected Utf8(Some(...)), got {other:?}"),
         }
@@ -536,12 +550,20 @@ mod tests {
         match result {
             ScalarValue::Utf8(Some(s)) => {
                 let v: JValue = serde_json::from_str(&s).expect("must be valid JSON");
-                let JValue::Array(arr) = v else { panic!("expected array, got {s}") };
+                let JValue::Array(arr) = v else {
+                    panic!("expected array, got {s}")
+                };
                 assert_eq!(arr.len(), 2, "expected 2 elements");
-                assert!(matches!(&arr[0], JValue::Object(m) if m.len() == 2),
-                    "first element should be a 2-key object, got {:?}", arr[0]);
-                assert!(matches!(&arr[1], JValue::Object(m) if m.len() == 2),
-                    "second element should be a 2-key object, got {:?}", arr[1]);
+                assert!(
+                    matches!(&arr[0], JValue::Object(m) if m.len() == 2),
+                    "first element should be a 2-key object, got {:?}",
+                    arr[0]
+                );
+                assert!(
+                    matches!(&arr[1], JValue::Object(m) if m.len() == 2),
+                    "second element should be a 2-key object, got {:?}",
+                    arr[1]
+                );
                 if let JValue::Object(m) = &arr[0] {
                     assert_eq!(m["id"], JValue::Number(10.into()));
                     assert_eq!(m["val"], JValue::String("x".into()));
@@ -615,7 +637,11 @@ mod ordered_set_tests {
         let arr: ArrayRef = Arc::new(Int32Array::from(vec![1i32, 2, 3, 4]));
         acc.update_batch(&[arr]).unwrap();
         let result = acc.evaluate().unwrap();
-        assert_eq!(result, ScalarValue::Int32(Some(2)), "p50 of {{1,2,3,4}} must be 2");
+        assert_eq!(
+            result,
+            ScalarValue::Int32(Some(2)),
+            "p50 of {{1,2,3,4}} must be 2"
+        );
     }
 
     /// `percentile_disc(0.5) WITHIN GROUP (ORDER BY x)` over {1,2,3,4,5} → 3
@@ -626,7 +652,11 @@ mod ordered_set_tests {
         let arr: ArrayRef = Arc::new(Int32Array::from(vec![3i32, 1, 5, 2, 4])); // unsorted input
         acc.update_batch(&[arr]).unwrap();
         let result = acc.evaluate().unwrap();
-        assert_eq!(result, ScalarValue::Int32(Some(3)), "p50 of {{1,2,3,4,5}} must be 3");
+        assert_eq!(
+            result,
+            ScalarValue::Int32(Some(3)),
+            "p50 of {{1,2,3,4,5}} must be 3"
+        );
     }
 
     /// Single element: always returns that element.
@@ -648,11 +678,19 @@ mod ordered_set_tests {
 
         let mut acc_min = make_pd_acc(vec![0.0]);
         acc_min.update_batch(&[data.clone()]).unwrap();
-        assert_eq!(acc_min.evaluate().unwrap(), ScalarValue::Int32(Some(1)), "fraction=0 → min");
+        assert_eq!(
+            acc_min.evaluate().unwrap(),
+            ScalarValue::Int32(Some(1)),
+            "fraction=0 → min"
+        );
 
         let mut acc_max = make_pd_acc(vec![1.0]);
         acc_max.update_batch(&[data.clone()]).unwrap();
-        assert_eq!(acc_max.evaluate().unwrap(), ScalarValue::Int32(Some(9)), "fraction=1 → max");
+        assert_eq!(
+            acc_max.evaluate().unwrap(),
+            ScalarValue::Int32(Some(9)),
+            "fraction=1 → max"
+        );
     }
 
     /// Empty group (no rows) → NULL.
@@ -678,10 +716,20 @@ mod ordered_set_tests {
     fn percentile_disc_excludes_nulls() {
         let mut acc = make_pd_acc(vec![0.5]);
         // Non-NULL values: {5, 7} (2 values); p50 = ceil(0.5*2)=1 → 1st = 5
-        let arr: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(5i32), None, Some(7), None]));
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![
+            None,
+            Some(5i32),
+            None,
+            Some(7),
+            None,
+        ]));
         acc.update_batch(&[arr]).unwrap();
         let result = acc.evaluate().unwrap();
-        assert_eq!(result, ScalarValue::Int32(Some(5)), "NULLs excluded; p50 of {{5,7}} = 5");
+        assert_eq!(
+            result,
+            ScalarValue::Int32(Some(5)),
+            "NULLs excluded; p50 of {{5,7}} = 5"
+        );
     }
 
     // ── array variant ───────────────────────────────────────────────────────
@@ -731,14 +779,27 @@ mod ordered_set_tests {
         // Merge into a fresh accumulator.
         let mut merged = make_pd_acc(vec![0.5]);
         // Build a StringArray from both state values.
-        let s1 = match &state1[0] { ScalarValue::Utf8(Some(s)) => s.clone(), _ => panic!() };
-        let s2 = match &state2[0] { ScalarValue::Utf8(Some(s)) => s.clone(), _ => panic!() };
-        let states_arr: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(vec![s1.as_str(), s2.as_str()]));
+        let s1 = match &state1[0] {
+            ScalarValue::Utf8(Some(s)) => s.clone(),
+            _ => panic!(),
+        };
+        let s2 = match &state2[0] {
+            ScalarValue::Utf8(Some(s)) => s.clone(),
+            _ => panic!(),
+        };
+        let states_arr: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(vec![
+            s1.as_str(),
+            s2.as_str(),
+        ]));
         merged.merge_batch(&[states_arr]).unwrap();
 
         // p50 of {1,2,3,4,5} = 3.
         let result = merged.evaluate().unwrap();
-        assert_eq!(result, ScalarValue::Int32(Some(3)), "merge: p50 of {{1..5}} = 3");
+        assert_eq!(
+            result,
+            ScalarValue::Int32(Some(3)),
+            "merge: p50 of {{1..5}} = 3"
+        );
     }
 
     // ── mode ───────────────────────────────────────────────────────────────
@@ -765,15 +826,24 @@ mod ordered_set_tests {
         let mut acc = make_mode_acc();
         let arr: ArrayRef = Arc::new(Int32Array::from(vec![2i32, 1, 2, 1])); // unsorted input
         acc.update_batch(&[arr]).unwrap();
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(1)),
-            "tie between 1 and 2: first in sort order (1) wins");
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Int32(Some(1)),
+            "tie between 1 and 2: first in sort order (1) wins"
+        );
     }
 
     /// NULLs are excluded; {NULL, 5, 5, NULL, 7} → 5.
     #[test]
     fn mode_excludes_nulls() {
         let mut acc = make_mode_acc();
-        let arr: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(5i32), Some(5), None, Some(7)]));
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![
+            None,
+            Some(5i32),
+            Some(5),
+            None,
+            Some(7),
+        ]));
         acc.update_batch(&[arr]).unwrap();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(5)));
     }
@@ -817,9 +887,18 @@ mod ordered_set_tests {
         let state2 = acc2.state().unwrap();
 
         let mut merged = make_mode_acc();
-        let s1 = match &state1[0] { ScalarValue::Utf8(Some(s)) => s.clone(), _ => panic!() };
-        let s2 = match &state2[0] { ScalarValue::Utf8(Some(s)) => s.clone(), _ => panic!() };
-        let states_arr: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(vec![s1.as_str(), s2.as_str()]));
+        let s1 = match &state1[0] {
+            ScalarValue::Utf8(Some(s)) => s.clone(),
+            _ => panic!(),
+        };
+        let s2 = match &state2[0] {
+            ScalarValue::Utf8(Some(s)) => s.clone(),
+            _ => panic!(),
+        };
+        let states_arr: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(vec![
+            s1.as_str(),
+            s2.as_str(),
+        ]));
         merged.merge_batch(&[states_arr]).unwrap();
 
         // Combined: {1, 2, 2, 2, 3, 3} → mode = 2
@@ -922,9 +1001,9 @@ impl AggregateUDFImpl for PercentileDiscUdaf {
         let data_type = arg_types.first().cloned().unwrap_or(DataType::Null);
         match arg_types.get(1) {
             // Array variant → return List<data_type>
-            Some(DataType::List(_)) | Some(DataType::LargeList(_)) => {
-                Ok(DataType::List(Arc::new(Field::new_list_field(data_type, true))))
-            }
+            Some(DataType::List(_)) | Some(DataType::LargeList(_)) => Ok(DataType::List(Arc::new(
+                Field::new_list_field(data_type, true),
+            ))),
             // Scalar variant → return data_type unchanged (discrete means same type)
             _ => Ok(data_type),
         }
@@ -939,9 +1018,14 @@ impl AggregateUDFImpl for PercentileDiscUdaf {
         ))])
     }
 
-    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
         let fractions = extract_fractions(args.exprs.get(1))?;
-        let data_type = args.expr_fields.first()
+        let data_type = args
+            .expr_fields
+            .first()
             .map(|f| f.data_type().clone())
             .unwrap_or(DataType::Null);
         let is_array_mode = matches!(
@@ -958,7 +1042,9 @@ impl AggregateUDFImpl for PercentileDiscUdaf {
 }
 
 /// Extract fraction(s) from the second physical expression (must be a literal).
-fn extract_fractions(expr: Option<&Arc<dyn datafusion::physical_expr::PhysicalExpr>>) -> DFResult<Vec<f64>> {
+fn extract_fractions(
+    expr: Option<&Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+) -> DFResult<Vec<f64>> {
     let Some(expr) = expr else {
         return plan_err!("percentile_disc requires a fraction argument");
     };
@@ -987,7 +1073,9 @@ fn extract_fractions(expr: Option<&Arc<dyn datafusion::physical_expr::PhysicalEx
                 let sv = ScalarValue::try_from_array(&values, i)?;
                 let f = scalar_to_f64(&sv)?;
                 if !(0.0..=1.0).contains(&f) {
-                    return plan_err!("percentile_disc: fraction must be between 0.0 and 1.0, got {f}");
+                    return plan_err!(
+                        "percentile_disc: fraction must be between 0.0 and 1.0, got {f}"
+                    );
                 }
                 fracs.push(f);
             }
@@ -1065,7 +1153,8 @@ impl datafusion::logical_expr::Accumulator for PercentileDiscAccumulator {
             if arr.is_null(i) {
                 continue; // Exclude NULLs per Postgres spec.
             }
-            self.values.push(ScalarValue::try_from_array(arr.as_ref(), i)?);
+            self.values
+                .push(ScalarValue::try_from_array(arr.as_ref(), i)?);
         }
         Ok(())
     }
@@ -1089,12 +1178,15 @@ impl datafusion::logical_expr::Accumulator for PercentileDiscAccumulator {
 
         if self.is_array_mode {
             // Array variant: one result per fraction.
-            let results: Vec<ScalarValue> = self.fractions.iter()
+            let results: Vec<ScalarValue> = self
+                .fractions
+                .iter()
                 .map(|&f| sorted[percentile_disc_index(n, f)].clone())
                 .collect();
             // Build a ListArray with one list element containing all results.
             let element_array = ScalarValue::iter_to_array(results.into_iter())?;
-            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, element_array.len() as i32]));
+            let offsets =
+                OffsetBuffer::new(ScalarBuffer::from(vec![0i32, element_array.len() as i32]));
             let list_array = ListArray::new(
                 Arc::new(Field::new_list_field(self.data_type.clone(), true)),
                 offsets,
@@ -1120,9 +1212,7 @@ impl datafusion::logical_expr::Accumulator for PercentileDiscAccumulator {
     /// matches the design used by `JsonAggAccumulator` so that `merge_batch`
     /// can simply deserialise and concatenate.
     fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
-        let json_vals: Vec<JValue> = self.values.iter()
-            .map(scalar_value_to_json)
-            .collect();
+        let json_vals: Vec<JValue> = self.values.iter().map(scalar_value_to_json).collect();
         let s = JValue::Array(json_vals).to_string();
         Ok(vec![ScalarValue::Utf8(Some(s))])
     }
@@ -1202,8 +1292,13 @@ impl AggregateUDFImpl for ModeUdaf {
         ))])
     }
 
-    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
-        let data_type = args.expr_fields.first()
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        let data_type = args
+            .expr_fields
+            .first()
             .map(|f| f.data_type().clone())
             .unwrap_or(DataType::Null);
         Ok(Box::new(ModeAccumulator {
@@ -1226,7 +1321,8 @@ impl datafusion::logical_expr::Accumulator for ModeAccumulator {
             if arr.is_null(i) {
                 continue;
             }
-            self.values.push(ScalarValue::try_from_array(arr.as_ref(), i)?);
+            self.values
+                .push(ScalarValue::try_from_array(arr.as_ref(), i)?);
         }
         Ok(())
     }
@@ -1269,9 +1365,9 @@ impl datafusion::logical_expr::Accumulator for ModeAccumulator {
         }
         let _ = best_count;
 
-        Ok(best_val.cloned().unwrap_or_else(|| {
-            ScalarValue::try_from(&self.data_type).unwrap_or(ScalarValue::Null)
-        }))
+        Ok(best_val
+            .cloned()
+            .unwrap_or_else(|| ScalarValue::try_from(&self.data_type).unwrap_or(ScalarValue::Null)))
     }
 
     fn size(&self) -> usize {
@@ -1279,9 +1375,7 @@ impl datafusion::logical_expr::Accumulator for ModeAccumulator {
     }
 
     fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
-        let json_vals: Vec<JValue> = self.values.iter()
-            .map(scalar_value_to_json)
-            .collect();
+        let json_vals: Vec<JValue> = self.values.iter().map(scalar_value_to_json).collect();
         let s = JValue::Array(json_vals).to_string();
         Ok(vec![ScalarValue::Utf8(Some(s))])
     }
@@ -1319,19 +1413,13 @@ fn scalar_value_to_json(sv: &ScalarValue) -> JValue {
         ScalarValue::UInt16(Some(v)) => JValue::Number((*v).into()),
         ScalarValue::UInt32(Some(v)) => JValue::Number((*v).into()),
         ScalarValue::UInt64(Some(v)) => JValue::Number((*v).into()),
-        ScalarValue::Float32(Some(v)) => {
-            serde_json::Number::from_f64(*v as f64)
-                .map(JValue::Number)
-                .unwrap_or(JValue::Null)
-        }
-        ScalarValue::Float64(Some(v)) => {
-            serde_json::Number::from_f64(*v)
-                .map(JValue::Number)
-                .unwrap_or(JValue::Null)
-        }
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-            JValue::String(s.clone())
-        }
+        ScalarValue::Float32(Some(v)) => serde_json::Number::from_f64(*v as f64)
+            .map(JValue::Number)
+            .unwrap_or(JValue::Null),
+        ScalarValue::Float64(Some(v)) => serde_json::Number::from_f64(*v)
+            .map(JValue::Number)
+            .unwrap_or(JValue::Null),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => JValue::String(s.clone()),
         ScalarValue::Boolean(Some(b)) => JValue::Bool(*b),
         ScalarValue::Date32(Some(d)) => JValue::Number((*d).into()),
         ScalarValue::TimestampMicrosecond(Some(ts), _) => JValue::Number((*ts).into()),
@@ -1353,29 +1441,33 @@ fn json_value_to_scalar(v: &JValue, dt: &DataType) -> DFResult<ScalarValue> {
         (JValue::Number(n), DataType::UInt16) => ScalarValue::UInt16(n.as_u64().map(|x| x as u16)),
         (JValue::Number(n), DataType::UInt32) => ScalarValue::UInt32(n.as_u64().map(|x| x as u32)),
         (JValue::Number(n), DataType::UInt64) => ScalarValue::UInt64(n.as_u64()),
-        (JValue::Number(n), DataType::Float32) => ScalarValue::Float32(n.as_f64().map(|x| x as f32)),
+        (JValue::Number(n), DataType::Float32) => {
+            ScalarValue::Float32(n.as_f64().map(|x| x as f32))
+        }
         (JValue::Number(n), DataType::Float64) => ScalarValue::Float64(n.as_f64()),
         (JValue::String(s), DataType::Utf8) => ScalarValue::Utf8(Some(s.clone())),
         (JValue::String(s), DataType::LargeUtf8) => ScalarValue::LargeUtf8(Some(s.clone())),
         (JValue::Bool(b), DataType::Boolean) => ScalarValue::Boolean(Some(*b)),
         (JValue::Number(n), DataType::Date32) => ScalarValue::Date32(n.as_i64().map(|x| x as i32)),
-        (JValue::Number(n), DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, tz)) => {
-            ScalarValue::TimestampMicrosecond(n.as_i64(), tz.clone())
-        }
-        (JValue::Number(n), DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, tz)) => {
-            ScalarValue::TimestampMillisecond(n.as_i64(), tz.clone())
-        }
-        (JValue::Number(n), DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Second, tz)) => {
-            ScalarValue::TimestampSecond(n.as_i64(), tz.clone())
-        }
-        (JValue::Number(n), DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, tz)) => {
-            ScalarValue::TimestampNanosecond(n.as_i64(), tz.clone())
-        }
+        (
+            JValue::Number(n),
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, tz),
+        ) => ScalarValue::TimestampMicrosecond(n.as_i64(), tz.clone()),
+        (
+            JValue::Number(n),
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, tz),
+        ) => ScalarValue::TimestampMillisecond(n.as_i64(), tz.clone()),
+        (
+            JValue::Number(n),
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Second, tz),
+        ) => ScalarValue::TimestampSecond(n.as_i64(), tz.clone()),
+        (
+            JValue::Number(n),
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, tz),
+        ) => ScalarValue::TimestampNanosecond(n.as_i64(), tz.clone()),
         (JValue::Null, _) => ScalarValue::try_from(dt)?,
         _ => {
-            return exec_err!(
-                "json_value_to_scalar: cannot convert {v:?} to {dt:?}"
-            );
+            return exec_err!("json_value_to_scalar: cannot convert {v:?} to {dt:?}");
         }
     })
 }

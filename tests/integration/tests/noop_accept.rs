@@ -225,7 +225,12 @@ async fn create_extension_is_accepted() {
     // vector(N), PostGIS subset → basin-geo, pg_trgm → basin-trgm, etc.).
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    assert_noop(&sess, "CREATE EXTENSION IF NOT EXISTS pgcrypto", "CREATE EXTENSION").await;
+    assert_noop(
+        &sess,
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+        "CREATE EXTENSION",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -252,12 +257,14 @@ async fn merge_basic_is_honestly_rejected() {
     // instead of silently-empty results.
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    let result = sess.execute(
-        "MERGE INTO target t \
+    let result = sess
+        .execute(
+            "MERGE INTO target t \
          USING source s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET val = s.val \
          WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)",
-    ).await;
+        )
+        .await;
     assert!(
         result.is_err(),
         "MERGE must fail honestly, not silent-succeed (was a correctness bomb). got: {result:?}"
@@ -268,14 +275,13 @@ async fn merge_basic_is_honestly_rejected() {
 async fn merge_matched_only_is_honestly_rejected() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    let result = sess.execute(
-        "MERGE INTO t USING s ON t.id = s.id \
+    let result = sess
+        .execute(
+            "MERGE INTO t USING s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET val = s.val",
-    ).await;
-    assert!(
-        result.is_err(),
-        "MERGE must fail honestly. got: {result:?}"
-    );
+        )
+        .await;
+    assert!(result.is_err(), "MERGE must fail honestly. got: {result:?}");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -515,7 +521,9 @@ async fn show_tables_still_works() {
     // SHOW TABLES must NOT be intercepted by noop_accept — it returns the real
     // table list via the existing sqlparser/DataFusion path.
     let (_dir, sess) = open_session().await;
-    sess.execute("CREATE TABLE alpha (id BIGINT)").await.unwrap();
+    sess.execute("CREATE TABLE alpha (id BIGINT)")
+        .await
+        .unwrap();
     match sess.execute("SHOW TABLES").await {
         Ok(ExecResult::Rows { batches, .. }) => {
             assert!(!batches.is_empty(), "SHOW TABLES should return rows");

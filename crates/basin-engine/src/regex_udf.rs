@@ -334,7 +334,7 @@ fn split_on_from_regex<'a>(inner: &'a str, inner_upper: &str) -> Option<(&'a str
                 // Check for top-level FROM keyword at position i.
                 if inner_upper[i..].starts_with("FROM") {
                     let from_end = i + 4; // "FROM".len()
-                    // FROM must be preceded by whitespace or start of string.
+                                          // FROM must be preceded by whitespace or start of string.
                     let preceded_by_ws = i == 0 || bytes[i - 1].is_ascii_whitespace();
                     // FROM must be followed by whitespace.
                     let followed_by_ws = from_end < len && bytes[from_end].is_ascii_whitespace();
@@ -405,7 +405,7 @@ fn arg_strings(arg: &ColumnarValue, n: usize) -> DFResult<StringArray> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use super::{register_regex_udfs, rewrite_substring_regex, SubstringRegexUdf};
     use datafusion::arrow::array::{Array as _, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::config::ConfigOptions;
@@ -413,7 +413,7 @@ mod tests {
         ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
     };
     use datafusion::prelude::SessionContext;
-    use super::{SubstringRegexUdf, register_regex_udfs, rewrite_substring_regex};
+    use std::sync::Arc;
 
     // -----------------------------------------------------------------------
     // Direct UDF invocation helpers
@@ -474,7 +474,10 @@ mod tests {
     /// No capture groups → return the whole match.
     #[test]
     fn basic_no_capture_group() {
-        assert_eq!(substring_regex(Some("abcdef"), Some("[a-c]+")), Some("abc".into()));
+        assert_eq!(
+            substring_regex(Some("abcdef"), Some("[a-c]+")),
+            Some("abc".into())
+        );
     }
 
     /// `SUBSTRING('user@example.com' FROM '([a-z]+)@')` → `'user'`
@@ -542,7 +545,10 @@ mod tests {
     /// `.*` on "hello" matches "hello" (greedy), so result is "hello".
     #[test]
     fn greedy_match_returns_full_string() {
-        assert_eq!(substring_regex(Some("hello"), Some(".*")), Some("hello".into()));
+        assert_eq!(
+            substring_regex(Some("hello"), Some(".*")),
+            Some("hello".into())
+        );
     }
 
     /// Pattern that matches only part of the string (first match only).

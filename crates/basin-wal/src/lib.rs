@@ -41,7 +41,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basin_common::{PartitionKey, Result, ProjectCounterRegistry, ProjectId};
+use basin_common::{PartitionKey, ProjectCounterRegistry, ProjectId, Result};
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -148,8 +148,12 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
     /// Drop all entries for `(project, partition)` whose LSN is strictly
     /// less than or equal to `up_to`. Called by the compactor after the
     /// segment has been merged into Parquet and committed to the catalog.
-    async fn truncate(&self, project: &ProjectId, partition: &PartitionKey, up_to: Lsn)
-        -> Result<()>;
+    async fn truncate(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        up_to: Lsn,
+    ) -> Result<()>;
 
     /// Stop background tasks and drain. Idempotent.
     async fn close(&self) -> Result<()>;
@@ -268,8 +272,12 @@ pub(crate) trait WalImpl: Send + Sync {
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>>;
     async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn>;
-    async fn truncate(&self, project: &ProjectId, partition: &PartitionKey, up_to: Lsn)
-        -> Result<()>;
+    async fn truncate(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        up_to: Lsn,
+    ) -> Result<()>;
     async fn close(&self) -> Result<()>;
 }
 

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_real_postgres_compare, CompareMetric, WhichWins};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};

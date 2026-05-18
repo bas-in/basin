@@ -38,7 +38,7 @@
 //!   field when catalog-persistence lands.
 //! - Schema-qualified table names are out of scope.
 
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, PartitionKey, Result, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, Result};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;

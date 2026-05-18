@@ -33,17 +33,17 @@ pub mod info_schema;
 mod metadata;
 mod postgres;
 mod procedures;
+mod project_storage_config;
 mod reactors;
 mod rest;
 mod sequences;
 mod snapshot;
-mod project_storage_config;
 mod views;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use basin_common::{ChangeOp, QualifiedTableName, Result, SchemaName, TableName, ProjectId};
+use basin_common::{ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
@@ -57,11 +57,11 @@ pub use metadata::{
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
+pub use project_storage_config::ProjectStorageConfig;
 pub use reactors::{ReactorDef, ReactorError, ReactorOps};
 pub use rest::RestCatalog;
 pub use sequences::SequenceDef;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
-pub use project_storage_config::ProjectStorageConfig;
 pub use views::ViewDef;
 
 /// One row in the project-wide snapshot timeline returned by
@@ -236,7 +236,8 @@ pub trait Catalog: Send + Sync {
 
     /// Snapshots in commit order (oldest first). Used by point-in-time-restore
     /// and the analytical reader.
-    async fn list_snapshots(&self, project: &ProjectId, table: &TableName) -> Result<Vec<Snapshot>>;
+    async fn list_snapshots(&self, project: &ProjectId, table: &TableName)
+        -> Result<Vec<Snapshot>>;
 
     /// Copy-on-write table fork. Creates `dst_table` for `project` as a
     /// clone of `src_table`'s current state: same schema, same snapshot
@@ -434,7 +435,9 @@ pub trait Catalog: Send + Sync {
                 .max_by_key(|s| s.committed_at);
             let Some(target) = target else { continue };
             let target_id = target.id;
-            let meta = self.rollback_to_snapshot(project, &table, target_id).await?;
+            let meta = self
+                .rollback_to_snapshot(project, &table, target_id)
+                .await?;
             out.push((table, meta.current_snapshot));
         }
         Ok(out)
@@ -671,7 +674,8 @@ pub trait Catalog: Send + Sync {
                 qtable.schema
             )));
         }
-        self.create_table(project, &qtable.name, schema.as_ref()).await
+        self.create_table(project, &qtable.name, schema.as_ref())
+            .await
     }
 
     /// Schema-qualified variant of [`Catalog::load_table`].
@@ -723,10 +727,7 @@ pub trait Catalog: Send + Sync {
     /// [`QualifiedTableName`] entries. The old [`Catalog::list_tables`] method
     /// continues to return only public-schema tables (for back-compat). Use
     /// this method when schema-aware enumeration is needed.
-    async fn list_tables_qualified(
-        &self,
-        project: &ProjectId,
-    ) -> Result<Vec<QualifiedTableName>> {
+    async fn list_tables_qualified(&self, project: &ProjectId) -> Result<Vec<QualifiedTableName>> {
         // Default: wrap every TableName from list_tables as public-schema.
         let names = self.list_tables(project).await?;
         Ok(names
@@ -1028,11 +1029,7 @@ pub trait Catalog: Send + Sync {
     /// again is a no-op. Default impl returns
     /// [`basin_common::BasinError::FeatureNotSupported`] for any schema other
     /// than `public`; backends that support multi-schema override this.
-    async fn create_schema(
-        &self,
-        project: &ProjectId,
-        schema: &SchemaName,
-    ) -> Result<()> {
+    async fn create_schema(&self, project: &ProjectId, schema: &SchemaName) -> Result<()> {
         if schema == &SchemaName::public() {
             return Ok(());
         }

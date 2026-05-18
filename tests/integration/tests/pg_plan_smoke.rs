@@ -13,7 +13,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -133,10 +133,7 @@ async fn pg_plan_smoke_select_with_where() {
     let count_before = engine.pg_plan_routing_count();
 
     // Run a SELECT that the Phase 2 translator supports.
-    let result = sess
-        .execute("SELECT a FROM t WHERE b = 2")
-        .await
-        .unwrap();
+    let result = sess.execute("SELECT a FROM t WHERE b = 2").await.unwrap();
 
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,

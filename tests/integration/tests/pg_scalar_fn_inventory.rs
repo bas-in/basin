@@ -159,18 +159,9 @@ async fn string_concat_and_concat_ws() {
 async fn string_lpad_rpad() {
     let (_d, e) = open_engine().await;
     let s = e.open_session(ProjectId::new()).await.unwrap();
-    assert_eq!(
-        one_str(&s, "SELECT lpad('hi', 5, '*')").await,
-        "***hi"
-    );
-    assert_eq!(
-        one_str(&s, "SELECT rpad('hi', 5, '-')").await,
-        "hi---"
-    );
-    assert_eq!(
-        one_str(&s, "SELECT lpad('hello', 3)").await,
-        "hel"
-    );
+    assert_eq!(one_str(&s, "SELECT lpad('hi', 5, '*')").await, "***hi");
+    assert_eq!(one_str(&s, "SELECT rpad('hi', 5, '-')").await, "hi---");
+    assert_eq!(one_str(&s, "SELECT lpad('hello', 3)").await, "hel");
 }
 
 #[tokio::test]
@@ -181,10 +172,7 @@ async fn string_initcap() {
         one_str(&s, "SELECT initcap('hello world')").await,
         "Hello World"
     );
-    assert_eq!(
-        one_str(&s, "SELECT initcap('FOO BAR')").await,
-        "Foo Bar"
-    );
+    assert_eq!(one_str(&s, "SELECT initcap('FOO BAR')").await, "Foo Bar");
 }
 
 #[tokio::test]
@@ -216,18 +204,9 @@ async fn string_ascii_chr() {
 async fn string_split_part() {
     let (_d, e) = open_engine().await;
     let s = e.open_session(ProjectId::new()).await.unwrap();
-    assert_eq!(
-        one_str(&s, "SELECT split_part('a,b,c', ',', 2)").await,
-        "b"
-    );
-    assert_eq!(
-        one_str(&s, "SELECT split_part('a,b,c', ',', 1)").await,
-        "a"
-    );
-    assert_eq!(
-        one_str(&s, "SELECT split_part('a,b,c', ',', 4)").await,
-        ""
-    );
+    assert_eq!(one_str(&s, "SELECT split_part('a,b,c', ',', 2)").await, "b");
+    assert_eq!(one_str(&s, "SELECT split_part('a,b,c', ',', 1)").await, "a");
+    assert_eq!(one_str(&s, "SELECT split_part('a,b,c', ',', 4)").await, "");
 }
 
 #[tokio::test]
@@ -485,22 +464,10 @@ async fn null_coalesce_nullif_greatest_least() {
     // Already covered in viability_pg_compat_funcs.rs — brief smoke test only.
     let (_d, e) = open_engine().await;
     let s = e.open_session(ProjectId::new()).await.unwrap();
-    assert_eq!(
-        one_str(&s, "SELECT coalesce(NULL, 'x')").await,
-        "x"
-    );
-    assert_eq!(
-        one_str(&s, "SELECT nullif(5, 5)").await,
-        "<NULL>"
-    );
-    assert_eq!(
-        one_str(&s, "SELECT greatest(1, 2, 3)").await,
-        "3"
-    );
-    assert_eq!(
-        one_str(&s, "SELECT least(1, 2, 3)").await,
-        "1"
-    );
+    assert_eq!(one_str(&s, "SELECT coalesce(NULL, 'x')").await, "x");
+    assert_eq!(one_str(&s, "SELECT nullif(5, 5)").await, "<NULL>");
+    assert_eq!(one_str(&s, "SELECT greatest(1, 2, 3)").await, "3");
+    assert_eq!(one_str(&s, "SELECT least(1, 2, 3)").await, "1");
 }
 
 // ── Type / format functions ───────────────────────────────────────────────────
@@ -514,10 +481,7 @@ async fn type_to_number() {
         one_str(&s, "SELECT to_number('12345.67', '99999.99')").await,
         "12345.67"
     );
-    assert_eq!(
-        one_str(&s, "SELECT to_number('-42', '99')").await,
-        "-42"
-    );
+    assert_eq!(one_str(&s, "SELECT to_number('-42', '99')").await, "-42");
 }
 
 #[tokio::test]
@@ -597,7 +561,9 @@ async fn agg_bit_and_or() {
     s.execute("CREATE TABLE bit_t (v BIGINT NOT NULL)")
         .await
         .unwrap();
-    s.execute("INSERT INTO bit_t VALUES (7), (3), (5)").await.unwrap();
+    s.execute("INSERT INTO bit_t VALUES (7), (3), (5)")
+        .await
+        .unwrap();
     // bit_and(7,3,5) = 7 & 3 & 5 = 1
     assert_eq!(one_str(&s, "SELECT bit_and(v) FROM bit_t").await, "1");
     // bit_or(7,3,5) = 7 | 3 | 5 = 7

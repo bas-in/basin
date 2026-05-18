@@ -20,7 +20,7 @@
 //! the integration test harness, so the effect is correct anyway).
 
 use basin_catalog::{Catalog, ViewDef};
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 

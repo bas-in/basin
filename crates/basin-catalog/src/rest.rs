@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
-use basin_common::{Result, TableName, ProjectId};
+use basin_common::{ProjectId, Result, TableName};
 
 use crate::metadata::{DataFileRef, PartitionSpec, TableMetadata};
 use crate::snapshot::{Snapshot, SnapshotId};

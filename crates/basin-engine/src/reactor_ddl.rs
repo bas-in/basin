@@ -79,7 +79,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, ReactorDef, ReactorOps};
-use basin_common::{BasinError, ChangeOp, Result, TableName, ProjectId};
+use basin_common::{BasinError, ChangeOp, ProjectId, Result, TableName};
 
 /// Parsed `ALTER TABLE ... REACT ON ... EXECUTE <body>` statement.
 #[derive(Clone, Debug, PartialEq, Eq)]

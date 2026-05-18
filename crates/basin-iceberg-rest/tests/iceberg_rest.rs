@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_iceberg_rest::{
     router_with_config, IcebergRestConfig, ListNamespacesResponse, ListTablesResponse,
     LoadTableResponse,

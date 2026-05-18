@@ -209,11 +209,9 @@ async fn update_set_now_timestamp() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMPTZ)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMPTZ)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO events VALUES (1, NULL)")
         .await
         .unwrap();
@@ -297,10 +295,7 @@ async fn delete_returning_star() {
     }
 
     // Confirm the row is actually gone.
-    let remaining = int64_col(
-        sess.execute("SELECT id FROM items").await.unwrap(),
-        "id",
-    );
+    let remaining = int64_col(sess.execute("SELECT id FROM items").await.unwrap(), "id");
     let mut remaining = remaining.clone();
     remaining.sort();
     assert_eq!(remaining, vec![1, 3]);
@@ -335,10 +330,7 @@ async fn delete_returning_column_subset() {
     assert_eq!(ids, vec![20, 30]);
 
     // Confirm remaining.
-    let remaining = int64_col(
-        sess.execute("SELECT id FROM things").await.unwrap(),
-        "id",
-    );
+    let remaining = int64_col(sess.execute("SELECT id FROM things").await.unwrap(), "id");
     assert_eq!(remaining, vec![10]);
 }
 
@@ -371,9 +363,6 @@ async fn delete_all_returning() {
     assert_eq!(ids.len(), 3, "should have returned all 3 deleted rows");
 
     // Table should now be empty.
-    let remaining = int64_col(
-        sess.execute("SELECT id FROM scratch").await.unwrap(),
-        "id",
-    );
+    let remaining = int64_col(sess.execute("SELECT id FROM scratch").await.unwrap(), "id");
     assert!(remaining.is_empty());
 }

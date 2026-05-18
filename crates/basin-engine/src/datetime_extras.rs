@@ -30,12 +30,13 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Builder, ListArray, StringArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Int64Builder, ListArray, StringArray, TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::prelude::SessionContext;
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -62,17 +63,33 @@ pub(crate) fn register_datetime_extras(ctx: &SessionContext) {
     }));
 
     // array_lower(arr, dim) -> Int64  — stub returning 1 (all PG arrays are 1-indexed)
-    ctx.register_udf(ScalarUDF::from(ArrayBoundUdf { name: "array_lower", lower: true, signature: Signature::any(2, Volatility::Immutable) }));
+    ctx.register_udf(ScalarUDF::from(ArrayBoundUdf {
+        name: "array_lower",
+        lower: true,
+        signature: Signature::any(2, Volatility::Immutable),
+    }));
     // array_upper(arr, dim) -> Int64  — returns the length of the requested dimension
-    ctx.register_udf(ScalarUDF::from(ArrayBoundUdf { name: "array_upper", lower: false, signature: Signature::any(2, Volatility::Immutable) }));
+    ctx.register_udf(ScalarUDF::from(ArrayBoundUdf {
+        name: "array_upper",
+        lower: false,
+        signature: Signature::any(2, Volatility::Immutable),
+    }));
     // generate_subscripts(arr, dim) — stub: returns 1..length for dim=1
-    ctx.register_udf(ScalarUDF::from(GenerateSubscriptsUdf { signature: Signature::any(2, Volatility::Immutable) }));
+    ctx.register_udf(ScalarUDF::from(GenerateSubscriptsUdf {
+        signature: Signature::any(2, Volatility::Immutable),
+    }));
     // array_contains(lhs, rhs) — lhs @> rhs: lhs contains all elements of rhs
-    ctx.register_udf(ScalarUDF::from(ArrayContainsUdf { signature: Signature::any(2, Volatility::Immutable) }));
+    ctx.register_udf(ScalarUDF::from(ArrayContainsUdf {
+        signature: Signature::any(2, Volatility::Immutable),
+    }));
     // arrays_overlap(lhs, rhs) — lhs && rhs: at least one element in common
-    ctx.register_udf(ScalarUDF::from(ArraysOverlapUdf { signature: Signature::any(2, Volatility::Immutable) }));
+    ctx.register_udf(ScalarUDF::from(ArraysOverlapUdf {
+        signature: Signature::any(2, Volatility::Immutable),
+    }));
     // int4multirange(r1, r2, ...) — stub returning text of first arg
-    ctx.register_udf(ScalarUDF::from(Int4MultirangeUdf { signature: Signature::variadic_any(Volatility::Immutable) }));
+    ctx.register_udf(ScalarUDF::from(Int4MultirangeUdf {
+        signature: Signature::variadic_any(Volatility::Immutable),
+    }));
 }
 
 // ── overlaps ─────────────────────────────────────────────────────────────────
@@ -121,10 +138,7 @@ impl ScalarUDFImpl for OverlapsUdf {
                     return None;
                 }
                 // Try microseconds first.
-                if let Some(a) = arr
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                {
+                if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
                     return Some(a.value(i));
                 }
                 // Try nanoseconds (DataFusion coerces NOW() to Nanosecond).
@@ -191,10 +205,9 @@ impl ScalarUDFImpl for InfinityTimestampUdf {
             );
         }
         let arr = args[0].clone().into_array(1)?;
-        let strings = arr
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("cast_infinity_timestamp: expected Utf8 input".into()))?;
+        let strings = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            DataFusionError::Execution("cast_infinity_timestamp: expected Utf8 input".into())
+        })?;
 
         let len = strings.len();
         let mut out: Vec<Option<i64>> = Vec::with_capacity(len);
@@ -215,9 +228,7 @@ impl ScalarUDFImpl for InfinityTimestampUdf {
             }
         }
 
-        let result: Arc<dyn Array> = Arc::new(
-            TimestampMicrosecondArray::from(out),
-        );
+        let result: Arc<dyn Array> = Arc::new(TimestampMicrosecondArray::from(out));
         Ok(ColumnarValue::Array(result))
     }
 }
@@ -554,10 +565,14 @@ impl ScalarUDFImpl for Int4MultirangeUdf {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
-        let n = args.iter().filter_map(|a| match a {
-            ColumnarValue::Array(arr) => Some(arr.len()),
-            _ => None,
-        }).max().unwrap_or(1);
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
         // Stub: return a placeholder multirange string.
         let out: Vec<Option<String>> = (0..n).map(|_| Some("{[,)}".to_string())).collect();
         Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
@@ -581,10 +596,22 @@ pub(crate) fn rewrite_infinity_timestamp(sql: &str) -> String {
     //   'infinity'::timestamptz   →  cast_infinity_timestamp('infinity')
     //   'infinity'::timestamp     →  cast_infinity_timestamp('infinity')
     let patterns: &[(&str, &str)] = &[
-        ("'-infinity'::timestamptz", "cast_infinity_timestamp('-infinity')"),
-        ("'-infinity'::timestamp",   "cast_infinity_timestamp('-infinity')"),
-        ("'infinity'::timestamptz",  "cast_infinity_timestamp('infinity')"),
-        ("'infinity'::timestamp",    "cast_infinity_timestamp('infinity')"),
+        (
+            "'-infinity'::timestamptz",
+            "cast_infinity_timestamp('-infinity')",
+        ),
+        (
+            "'-infinity'::timestamp",
+            "cast_infinity_timestamp('-infinity')",
+        ),
+        (
+            "'infinity'::timestamptz",
+            "cast_infinity_timestamp('infinity')",
+        ),
+        (
+            "'infinity'::timestamp",
+            "cast_infinity_timestamp('infinity')",
+        ),
     ];
     let mut s = sql.to_string();
     for (needle, replacement) in patterns {

@@ -117,9 +117,7 @@ fn arrow_elem_to_json(arr: &ArrayRef, i: usize) -> Value {
             a.map(|a| Value::Bool(a.value(i))).unwrap_or(Value::Null)
         }
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-            use datafusion::arrow::array::{
-                Int16Array, Int32Array, Int64Array, Int8Array,
-            };
+            use datafusion::arrow::array::{Int16Array, Int32Array, Int64Array, Int8Array};
             let n = match arr.data_type() {
                 DataType::Int8 => arr
                     .as_any()
@@ -171,8 +169,7 @@ fn arrow_elem_to_json(arr: &ArrayRef, i: usize) -> Value {
 
 /// Encode a `serde_json::Value` to canonical JSONB bytes (no version prefix).
 fn to_jsonb_bytes(v: &Value) -> DFResult<Vec<u8>> {
-    serde_json::to_vec(v)
-        .map_err(|e| DataFusionError::Execution(format!("json encode error: {e}")))
+    serde_json::to_vec(v).map_err(|e| DataFusionError::Execution(format!("json encode error: {e}")))
 }
 
 /// Return the row count from a slice of `ColumnarValue`s (max array length, or
@@ -194,9 +191,10 @@ fn utf8_at(arr: &ArrayRef, i: usize) -> DFResult<Option<String>> {
     }
     match arr.data_type() {
         DataType::Utf8 => {
-            let a = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                DataFusionError::Execution("expected StringArray".to_string())
-            })?;
+            let a = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DataFusionError::Execution("expected StringArray".to_string()))?;
             Ok(Some(a.value(i).to_string()))
         }
         other => exec_err!("expected Utf8 array, got {other:?}"),
@@ -225,9 +223,12 @@ fn list_utf8_at(arr: &ArrayRef, i: usize) -> DFResult<Vec<Option<String>>> {
         } else {
             match values.data_type() {
                 DataType::Utf8 => {
-                    let sa = values.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                        DataFusionError::Execution("expected StringArray in list".to_string())
-                    })?;
+                    let sa = values
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("expected StringArray in list".to_string())
+                        })?;
                     out.push(Some(sa.value(idx).to_string()));
                 }
                 other => {
@@ -375,9 +376,7 @@ impl JsonObjectUdf {
             let key = match k_opt {
                 Some(s) => s.clone(),
                 None => {
-                    return exec_err!(
-                        "{fn_name}: null value not allowed for object key"
-                    );
+                    return exec_err!("{fn_name}: null value not allowed for object key");
                 }
             };
             let val = match v_opt {
@@ -413,8 +412,7 @@ impl JsonObjectUdf {
                 let v = self.build_object(&keys, &vals, fn_name)?;
                 out.push(Some(self.emit(&v)?));
             }
-            let result =
-                LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+            let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
             Ok(ColumnarValue::Array(Arc::new(result)))
         } else {
             let mut out: Vec<Option<String>> = Vec::with_capacity(n);
@@ -422,9 +420,8 @@ impl JsonObjectUdf {
                 let keys = list_utf8_at(key_arr, i)?;
                 let vals = list_utf8_at(val_arr, i)?;
                 let v = self.build_object(&keys, &vals, fn_name)?;
-                let s = serde_json::to_string(&v).map_err(|e| {
-                    DataFusionError::Execution(format!("json encode: {e}"))
-                })?;
+                let s = serde_json::to_string(&v)
+                    .map_err(|e| DataFusionError::Execution(format!("json encode: {e}")))?;
                 out.push(Some(s));
             }
             let result = StringArray::from(out);
@@ -439,37 +436,27 @@ impl JsonObjectUdf {
             for i in 0..n {
                 let flat = list_utf8_at(arr, i)?;
                 if flat.len() % 2 != 0 {
-                    return exec_err!(
-                        "{fn_name}: flat array must have an even number of elements"
-                    );
+                    return exec_err!("{fn_name}: flat array must have an even number of elements");
                 }
-                let keys: Vec<Option<String>> =
-                    flat.iter().step_by(2).cloned().collect();
-                let vals: Vec<Option<String>> =
-                    flat.iter().skip(1).step_by(2).cloned().collect();
+                let keys: Vec<Option<String>> = flat.iter().step_by(2).cloned().collect();
+                let vals: Vec<Option<String>> = flat.iter().skip(1).step_by(2).cloned().collect();
                 let v = self.build_object(&keys, &vals, fn_name)?;
                 out.push(Some(self.emit(&v)?));
             }
-            let result =
-                LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+            let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
             Ok(ColumnarValue::Array(Arc::new(result)))
         } else {
             let mut out: Vec<Option<String>> = Vec::with_capacity(n);
             for i in 0..n {
                 let flat = list_utf8_at(arr, i)?;
                 if flat.len() % 2 != 0 {
-                    return exec_err!(
-                        "{fn_name}: flat array must have an even number of elements"
-                    );
+                    return exec_err!("{fn_name}: flat array must have an even number of elements");
                 }
-                let keys: Vec<Option<String>> =
-                    flat.iter().step_by(2).cloned().collect();
-                let vals: Vec<Option<String>> =
-                    flat.iter().skip(1).step_by(2).cloned().collect();
+                let keys: Vec<Option<String>> = flat.iter().step_by(2).cloned().collect();
+                let vals: Vec<Option<String>> = flat.iter().skip(1).step_by(2).cloned().collect();
                 let v = self.build_object(&keys, &vals, fn_name)?;
-                let s = serde_json::to_string(&v).map_err(|e| {
-                    DataFusionError::Execution(format!("json encode: {e}"))
-                })?;
+                let s = serde_json::to_string(&v)
+                    .map_err(|e| DataFusionError::Execution(format!("json encode: {e}")))?;
                 out.push(Some(s));
             }
             let result = StringArray::from(out);
@@ -510,10 +497,7 @@ mod tests {
         let udf = JsonBuildArrayUdf {
             signature: Signature::variadic_any(Volatility::Immutable),
         };
-        let cv: Vec<ColumnarValue> = arrays
-            .into_iter()
-            .map(ColumnarValue::Array)
-            .collect();
+        let cv: Vec<ColumnarValue> = arrays.into_iter().map(ColumnarValue::Array).collect();
         let arg_fields: Vec<datafusion::arrow::datatypes::FieldRef> = cv
             .iter()
             .enumerate()
@@ -541,7 +525,13 @@ mod tests {
             ColumnarValue::Array(arr) => {
                 let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
                 (0..sa.len())
-                    .map(|i| if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) })
+                    .map(|i| {
+                        if sa.is_null(i) {
+                            None
+                        } else {
+                            Some(sa.value(i).to_string())
+                        }
+                    })
                     .collect()
             }
             ColumnarValue::Scalar(_) => panic!("expected array result"),
@@ -592,10 +582,7 @@ mod tests {
     /// `json_build_array(1, NULL::text)` → `[1,null]`
     #[test]
     fn test_json_build_array_null_element() {
-        let result = invoke_build_array(vec![
-            make_int_arr(&[Some(1)]),
-            make_str_arr(&[None]),
-        ]);
+        let result = invoke_build_array(vec![make_int_arr(&[Some(1)]), make_str_arr(&[None])]);
         assert_eq!(result.len(), 1);
         let v: Value = serde_json::from_str(result[0].as_ref().unwrap()).unwrap();
         assert_eq!(v, json!([1, null]));
@@ -660,10 +647,7 @@ mod tests {
 
         let json_str_arr = make_str_arr(&[Some(r#"{"a":1}"#)]);
         // A value that parses as JSON is returned as a JSON object
-        assert_eq!(
-            arrow_elem_to_json(&json_str_arr, 0),
-            json!({"a": 1})
-        );
+        assert_eq!(arrow_elem_to_json(&json_str_arr, 0), json!({"a": 1}));
     }
 
     // ── json_object / jsonb_object unit tests ─────────────────────────────────

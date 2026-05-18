@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog, SnapshotId, SnapshotOperation};
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;

@@ -178,7 +178,13 @@ fn arg_as_i64(arg: &ColumnarValue, n: usize) -> DFResult<Vec<Option<i64>>> {
         .downcast_ref::<datafusion::arrow::array::Int64Array>()
         .expect("cast to Int64 yields Int64Array");
     Ok((0..n)
-        .map(|i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
+        .map(|i| {
+            if int_arr.is_null(i) {
+                None
+            } else {
+                Some(int_arr.value(i))
+            }
+        })
         .collect())
 }
 
@@ -209,7 +215,10 @@ impl ScalarUDFImpl for RegexpReplaceUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() < 3 || args.len() > 4 {
-            return exec_err!("regexp_replace expects 3 or 4 arguments, got {}", args.len());
+            return exec_err!(
+                "regexp_replace expects 3 or 4 arguments, got {}",
+                args.len()
+            );
         }
         let n = num_rows(args);
         let strings = arg_as_strings(&args[0], n)?;
@@ -345,8 +354,7 @@ impl ScalarUDFImpl for FormatMoreUdf {
                 continue;
             }
             let fmt_str = fmts.value(i);
-            let row_args: Vec<Option<&str>> =
-                rest.iter().map(|col| col[i].as_deref()).collect();
+            let row_args: Vec<Option<&str>> = rest.iter().map(|col| col[i].as_deref()).collect();
             out.push(Some(apply_format(fmt_str, &row_args)?));
         }
         Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
@@ -682,9 +690,7 @@ impl ScalarUDFImpl for DecodeUdf {
 
 fn decode_bytes(fmt: &str, s: &str) -> DFResult<Vec<u8>> {
     match fmt {
-        "hex" => {
-            hex::decode(s).map_err(|e| DataFusionError::Execution(format!("decode hex: {e}")))
-        }
+        "hex" => hex::decode(s).map_err(|e| DataFusionError::Execution(format!("decode hex: {e}"))),
         "base64" => base64::engine::general_purpose::STANDARD
             .decode(s)
             .map_err(|e| DataFusionError::Execution(format!("decode base64: {e}"))),
@@ -747,9 +753,9 @@ mod tests {
     use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
 
     use super::{
-        decode_bytes, encode_bytes, escape_decode, escape_encode, translate_backrefs,
-        apply_format, pg_quote_ident, pg_quote_literal,
-        DecodeUdf, EncodeUdf, FormatMoreUdf, LeftRightUdf, RegexpReplaceUdf, Side,
+        apply_format, decode_bytes, encode_bytes, escape_decode, escape_encode, pg_quote_ident,
+        pg_quote_literal, translate_backrefs, DecodeUdf, EncodeUdf, FormatMoreUdf, LeftRightUdf,
+        RegexpReplaceUdf, Side,
     };
     use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
 
@@ -765,8 +771,7 @@ mod tests {
         args: Vec<ColumnarValue>,
         return_field: Arc<Field>,
     ) -> DFResult<ColumnarValue>
-    where
-    {
+where {
         let n = args
             .iter()
             .filter_map(|a| match a {
@@ -789,7 +794,9 @@ mod tests {
     }
 
     fn int64_arg(v: i64) -> ColumnarValue {
-        ColumnarValue::Array(Arc::new(datafusion::arrow::array::Int64Array::from(vec![v])))
+        ColumnarValue::Array(Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+            v,
+        ])))
     }
 
     fn binary_arg(v: &[u8]) -> ColumnarValue {
@@ -857,7 +864,11 @@ mod tests {
         let udf = regexp_replace_udf();
         let cv = call_udf(
             &udf,
-            vec![str_arg(Some("hello world")), str_arg(Some("o")), str_arg(Some("X"))],
+            vec![
+                str_arg(Some("hello world")),
+                str_arg(Some("o")),
+                str_arg(Some("X")),
+            ],
             utf8_field(),
         )
         .unwrap();
@@ -966,7 +977,10 @@ mod tests {
             utf8_field(),
         )
         .unwrap();
-        assert_eq!(result_str(cv, 0), Some(r#"SELECT * FROM "my table""#.into()));
+        assert_eq!(
+            result_str(cv, 0),
+            Some(r#"SELECT * FROM "my table""#.into())
+        );
     }
 
     #[test]
@@ -975,10 +989,7 @@ mod tests {
         let udf = format_udf();
         let cv = call_udf(
             &udf,
-            vec![
-                str_arg(Some("WHERE name = %L")),
-                str_arg(Some("O'Brien")),
-            ],
+            vec![str_arg(Some("WHERE name = %L")), str_arg(Some("O'Brien"))],
             utf8_field(),
         )
         .unwrap();
@@ -1022,8 +1033,12 @@ mod tests {
     fn left_positive_n() {
         // left('abcde', 3) → 'abc'
         let udf = left_udf();
-        let cv =
-            call_udf(&udf, vec![str_arg(Some("abcde")), int64_arg(3)], utf8_field()).unwrap();
+        let cv = call_udf(
+            &udf,
+            vec![str_arg(Some("abcde")), int64_arg(3)],
+            utf8_field(),
+        )
+        .unwrap();
         assert_eq!(result_str(cv, 0), Some("abc".into()));
     }
 
@@ -1031,8 +1046,12 @@ mod tests {
     fn left_negative_n_omits_last() {
         // left('abcde', -2) → 'abc'  (all but last 2)
         let udf = left_udf();
-        let cv =
-            call_udf(&udf, vec![str_arg(Some("abcde")), int64_arg(-2)], utf8_field()).unwrap();
+        let cv = call_udf(
+            &udf,
+            vec![str_arg(Some("abcde")), int64_arg(-2)],
+            utf8_field(),
+        )
+        .unwrap();
         assert_eq!(result_str(cv, 0), Some("abc".into()));
     }
 
@@ -1040,8 +1059,12 @@ mod tests {
     fn right_positive_n() {
         // right('abcde', 3) → 'cde'
         let udf = right_udf();
-        let cv =
-            call_udf(&udf, vec![str_arg(Some("abcde")), int64_arg(3)], utf8_field()).unwrap();
+        let cv = call_udf(
+            &udf,
+            vec![str_arg(Some("abcde")), int64_arg(3)],
+            utf8_field(),
+        )
+        .unwrap();
         assert_eq!(result_str(cv, 0), Some("cde".into()));
     }
 
@@ -1049,8 +1072,12 @@ mod tests {
     fn right_negative_n_omits_first() {
         // right('abcde', -2) → 'cde'  (all but first 2)
         let udf = right_udf();
-        let cv =
-            call_udf(&udf, vec![str_arg(Some("abcde")), int64_arg(-2)], utf8_field()).unwrap();
+        let cv = call_udf(
+            &udf,
+            vec![str_arg(Some("abcde")), int64_arg(-2)],
+            utf8_field(),
+        )
+        .unwrap();
         assert_eq!(result_str(cv, 0), Some("cde".into()));
     }
 
@@ -1058,8 +1085,12 @@ mod tests {
     fn left_n_larger_than_length() {
         // left('hi', 100) → 'hi'
         let udf = left_udf();
-        let cv =
-            call_udf(&udf, vec![str_arg(Some("hi")), int64_arg(100)], utf8_field()).unwrap();
+        let cv = call_udf(
+            &udf,
+            vec![str_arg(Some("hi")), int64_arg(100)],
+            utf8_field(),
+        )
+        .unwrap();
         assert_eq!(result_str(cv, 0), Some("hi".into()));
     }
 

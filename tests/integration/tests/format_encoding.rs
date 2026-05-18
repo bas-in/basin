@@ -100,11 +100,7 @@ fn render_scalar(arr: &dyn Array, i: usize) -> String {
             .value(i)
             .to_string(),
         DataType::Binary => {
-            let bytes = arr
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap()
-                .value(i);
+            let bytes = arr.as_any().downcast_ref::<BinaryArray>().unwrap().value(i);
             // Render as hex for stable test comparison.
             bytes_to_hex(bytes)
         }
@@ -224,11 +220,17 @@ async fn to_char_numeric() {
     // Basic integer formatting.  PG pads to template width with spaces.
     // We just assert the digits are present and no error is raised.
     let v = one_string(&sess, "SELECT to_char(1234, '9999')").await;
-    assert!(v.contains("1234"), "to_char(1234,'9999') should contain 1234: {v}");
+    assert!(
+        v.contains("1234"),
+        "to_char(1234,'9999') should contain 1234: {v}"
+    );
 
     // Decimal digits.
     let v = one_string(&sess, "SELECT to_char(1234.5, '9999.99')").await;
-    assert!(v.contains("1234.50") || v.contains("1234.5"), "decimal: {v}");
+    assert!(
+        v.contains("1234.50") || v.contains("1234.5"),
+        "decimal: {v}"
+    );
 
     // Hex output (XXX).
     // 255 decimal = FF hex.
@@ -347,20 +349,12 @@ async fn encode_decode_formats() {
     );
 
     // escape: encode a simple ASCII byte.
-    let escaped = one_string(
-        &sess,
-        "SELECT encode(convert_to('A', 'UTF8'), 'escape')",
-    )
-    .await;
+    let escaped = one_string(&sess, "SELECT encode(convert_to('A', 'UTF8'), 'escape')").await;
     assert_eq!(escaped, "A", "escape of ASCII 'A': {escaped}");
 
     // decode hex → binary → re-encode as hex.
     assert_eq!(
-        one_string(
-            &sess,
-            "SELECT encode(digest('hello', 'md5'), 'hex')"
-        )
-        .await,
+        one_string(&sess, "SELECT encode(digest('hello', 'md5'), 'hex')").await,
         "5d41402abc4b2a76b9719d911017c592"
     );
 }
@@ -422,11 +416,7 @@ async fn length_bytea() {
 
     // Three-byte UTF-8 sequences.  '€' is U+20AC = 3 bytes in UTF-8.
     // We just assert the result is an integer greater than 1.
-    let raw = one_string(
-        &sess,
-        "SELECT length(convert_to('\u{20AC}', 'UTF8'))",
-    )
-    .await;
+    let raw = one_string(&sess, "SELECT length(convert_to('\u{20AC}', 'UTF8'))").await;
     let n: i32 = raw.trim().parse().unwrap_or(-1);
     assert!(n > 1, "€ should be >1 byte: {raw}");
 }
@@ -441,22 +431,13 @@ async fn bit_and_octet_length() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // bit_length('hello') = 5 * 8 = 40.
-    assert_eq!(
-        one_string(&sess, "SELECT bit_length('hello')").await,
-        "40"
-    );
+    assert_eq!(one_string(&sess, "SELECT bit_length('hello')").await, "40");
 
     // octet_length('hello') = 5.
-    assert_eq!(
-        one_string(&sess, "SELECT octet_length('hello')").await,
-        "5"
-    );
+    assert_eq!(one_string(&sess, "SELECT octet_length('hello')").await, "5");
 
     // octet_length('') = 0.
-    assert_eq!(
-        one_string(&sess, "SELECT octet_length('')").await,
-        "0"
-    );
+    assert_eq!(one_string(&sess, "SELECT octet_length('')").await, "0");
 }
 
 // ---------------------------------------------------------------------------
@@ -480,11 +461,7 @@ async fn overlay_function() {
 
     // overlay('abcdef' PLACING 'XY' FROM 3) = 'abXYef'  (no FOR)
     assert_eq!(
-        one_string(
-            &sess,
-            "SELECT overlay('abcdef' PLACING 'XY' FROM 3)"
-        )
-        .await,
+        one_string(&sess, "SELECT overlay('abcdef' PLACING 'XY' FROM 3)").await,
         "abXYef"
     );
 }
@@ -598,8 +575,5 @@ async fn format_function() {
     );
 
     // %% — literal percent.
-    assert_eq!(
-        one_string(&sess, "SELECT format('100%%')").await,
-        "100%"
-    );
+    assert_eq!(one_string(&sess, "SELECT format('100%%')").await, "100%");
 }

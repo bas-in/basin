@@ -31,12 +31,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use basin_common::{Result, ProjectId};
+use basin_common::{ProjectId, Result};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use crate::resolver::{StaticProjectResolver, ProjectResolver};
+use crate::resolver::{ProjectResolver, StaticProjectResolver};
 use crate::{run_until_bound, RunningServer, ServerConfig};
 
 /// A single in-process Basin shard owner. Listens on an ephemeral port and
@@ -283,7 +283,7 @@ pub async fn start_n_shards_with_storage(
             pool: None,
             shard_endpoints: None,
             tls: None,
-        connection_limiter: None,
+            connection_limiter: None,
         })
         .await
         .expect("spawn shard listener");

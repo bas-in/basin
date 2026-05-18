@@ -39,8 +39,8 @@
 //!    on project A's `orders` is invisible to project B's session. The
 //!    integration test `viability_rls_isolation` is the back-stop.
 
-use std::collections::HashMap;
 use crate::pg_ast::ObjectNamePartExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
@@ -636,7 +636,10 @@ pub(crate) async fn enforce_with_check(
     // present, else USING (Postgres fallback).
     let mut preds: Vec<String> = Vec::with_capacity(applicable.len());
     for p in &applicable {
-        let raw = p.with_check_expr.as_deref().unwrap_or(p.using_expr.as_str());
+        let raw = p
+            .with_check_expr
+            .as_deref()
+            .unwrap_or(p.using_expr.as_str());
         preds.push(substitute_current_user(raw, current_user));
     }
 

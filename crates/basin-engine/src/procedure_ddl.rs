@@ -36,8 +36,8 @@
 //! * Control flow (`IF`, `LOOP`, variables) — needs the PL/pgSQL
 //!   interpreter Basin explicitly skips.
 
-use std::collections::HashMap;
 use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SqlArgType, SqlFunctionArg, SqlProcedureDef};
@@ -68,7 +68,11 @@ pub(crate) async fn exec_create_procedure(
         body: body.to_string(),
     };
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
-    if catalog.lookup_procedure(&sess.project, name).await.is_some() {
+    if catalog
+        .lookup_procedure(&sess.project, name)
+        .await
+        .is_some()
+    {
         return Err(BasinError::InvalidSchema(format!(
             "CREATE PROCEDURE: procedure {name:?} already exists; \
              drop it first (v0.1 has no CREATE OR REPLACE PROCEDURE)"

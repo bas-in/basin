@@ -43,7 +43,8 @@ use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -227,10 +228,7 @@ pub(crate) fn register_string_dt_udfs(ctx: &SessionContext) {
 
     // ---- convert_to(text, encoding) → bytea ----
     ctx.register_udf(ScalarUDF::from(ConvertToUdf {
-        signature: Signature::exact(
-            vec![DataType::Utf8, DataType::Utf8],
-            Volatility::Immutable,
-        ),
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
 
     // ---- isfinite(timestamp) → bool ---- (always true in v0.1)
@@ -280,15 +278,9 @@ fn num_rows(args: &[ColumnarValue]) -> usize {
 
 fn to_str_vec(args: &[ColumnarValue], idx: usize, n: usize) -> DFResult<Vec<Option<String>>> {
     let arr = args[idx].clone().into_array(n)?;
-    let strings = arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "arg {idx} must be Utf8, got {:?}",
-                arr.data_type()
-            ))
-        })?;
+    let strings = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        DataFusionError::Execution(format!("arg {idx} must be Utf8, got {:?}", arr.data_type()))
+    })?;
     Ok((0..n)
         .map(|i| {
             if strings.is_null(i) {
@@ -316,10 +308,18 @@ struct SplitPartUdf {
 }
 
 impl ScalarUDFImpl for SplitPartUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "split_part" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "split_part"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -330,15 +330,30 @@ impl ScalarUDFImpl for SplitPartUdf {
         let parts_arr = args[2].clone().into_array(n)?;
 
         // Collect positions as i64 regardless of whether arg3 is Int32 or Int64.
-        let positions: Vec<Option<i64>> = if let Some(arr) =
-            parts_arr.as_any().downcast_ref::<Int32Array>()
-        {
-            (0..n).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i) as i64) }).collect()
-        } else if let Some(arr) = parts_arr.as_any().downcast_ref::<Int64Array>() {
-            (0..n).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) }).collect()
-        } else {
-            return exec_err!("split_part: arg 3 must be Int32 or Int64");
-        };
+        let positions: Vec<Option<i64>> =
+            if let Some(arr) = parts_arr.as_any().downcast_ref::<Int32Array>() {
+                (0..n)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i) as i64)
+                        }
+                    })
+                    .collect()
+            } else if let Some(arr) = parts_arr.as_any().downcast_ref::<Int64Array>() {
+                (0..n)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    })
+                    .collect()
+            } else {
+                return exec_err!("split_part: arg 3 must be Int32 or Int64");
+            };
 
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -356,7 +371,11 @@ impl ScalarUDFImpl for SplitPartUdf {
                     }
                     let pieces: Vec<&str> = s.split(d.as_str()).collect();
                     let result = if p > 0 {
-                        pieces.get((p as usize) - 1).copied().unwrap_or("").to_string()
+                        pieces
+                            .get((p as usize) - 1)
+                            .copied()
+                            .unwrap_or("")
+                            .to_string()
                     } else {
                         let idx = pieces.len() as i64 + p;
                         if idx >= 0 {
@@ -392,10 +411,18 @@ struct SimpleStrUdf {
 }
 
 impl ScalarUDFImpl for SimpleStrUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -436,10 +463,18 @@ struct FormatUdf {
 }
 
 impl ScalarUDFImpl for FormatUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "format" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "format"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -460,10 +495,8 @@ impl ScalarUDFImpl for FormatUdf {
             match &fmts[i] {
                 None => out.push(None),
                 Some(fmt_str) => {
-                    let row_args: Vec<Option<&str>> = rest
-                        .iter()
-                        .map(|col| col[i].as_deref())
-                        .collect();
+                    let row_args: Vec<Option<&str>> =
+                        rest.iter().map(|col| col[i].as_deref()).collect();
                     out.push(Some(apply_format(fmt_str, &row_args)?));
                 }
             }
@@ -529,10 +562,18 @@ struct QuoteNullableUdf {
 }
 
 impl ScalarUDFImpl for QuoteNullableUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "quote_nullable" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "quote_nullable"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -582,9 +623,15 @@ struct RegexpMatchUdf {
 }
 
 impl ScalarUDFImpl for RegexpMatchUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::List(Arc::new(Field::new(
             "item",
@@ -615,10 +662,7 @@ impl ScalarUDFImpl for RegexpMatchUdf {
                     offsets.push(start);
                 }
                 (Some(s), Some(pat)) => {
-                    let flag_str = flags
-                        .as_ref()
-                        .and_then(|f| f[i].as_deref())
-                        .unwrap_or("");
+                    let flag_str = flags.as_ref().and_then(|f| f[i].as_deref()).unwrap_or("");
                     let re = build_regex(pat, flag_str)?;
                     if let Some(caps) = re.captures(s) {
                         let groups: Vec<Option<String>> = if caps.len() == 1 {
@@ -660,9 +704,15 @@ struct RegexpSplitToArrayUdf {
 }
 
 impl ScalarUDFImpl for RegexpSplitToArrayUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::List(Arc::new(Field::new(
             "item",
@@ -693,10 +743,7 @@ impl ScalarUDFImpl for RegexpSplitToArrayUdf {
                     offsets.push(start);
                 }
                 (Some(s), Some(pat)) => {
-                    let flag_str = flags
-                        .as_ref()
-                        .and_then(|f| f[i].as_deref())
-                        .unwrap_or("");
+                    let flag_str = flags.as_ref().and_then(|f| f[i].as_deref()).unwrap_or("");
                     let re = build_regex(pat, flag_str)?;
                     let parts: Vec<Option<String>> =
                         re.split(s).map(|p| Some(p.to_string())).collect();
@@ -727,10 +774,18 @@ struct RegexpSplitToTableStubUdf {
 }
 
 impl ScalarUDFImpl for RegexpSplitToTableStubUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "regexp_split_to_table" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "regexp_split_to_table"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -751,10 +806,18 @@ struct ChrUdf {
 }
 
 impl ScalarUDFImpl for ChrUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "chr" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "chr"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -807,10 +870,18 @@ struct AsciiUdf {
 }
 
 impl ScalarUDFImpl for AsciiUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "ascii" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int32) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "ascii"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int32)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -820,9 +891,8 @@ impl ScalarUDFImpl for AsciiUdf {
         let out: Vec<Option<i32>> = strings
             .iter()
             .map(|opt| {
-                opt.as_deref().map(|s| {
-                    s.chars().next().map(|c| c as i32).unwrap_or(0)
-                })
+                opt.as_deref()
+                    .map(|s| s.chars().next().map(|c| c as i32).unwrap_or(0))
             })
             .collect();
         Ok(ColumnarValue::Array(Arc::new(Int32Array::from(out))))
@@ -839,10 +909,18 @@ struct TranslateUdf {
 }
 
 impl ScalarUDFImpl for TranslateUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "translate" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "translate"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -897,10 +975,18 @@ struct TrimCharsUdf {
 }
 
 impl ScalarUDFImpl for TrimCharsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -951,10 +1037,18 @@ struct ConvertFromUdf {
 }
 
 impl ScalarUDFImpl for ConvertFromUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "convert_from" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "convert_from"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -991,10 +1085,18 @@ struct ConvertToUdf {
 }
 
 impl ScalarUDFImpl for ConvertToUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "convert_to" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Binary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "convert_to"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Binary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1021,10 +1123,18 @@ struct IsFiniteUdf {
 }
 
 impl ScalarUDFImpl for IsFiniteUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "isfinite" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "isfinite"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1043,17 +1153,23 @@ fn build_regex(pattern: &str, flags: &str) -> DFResult<regex::Regex> {
     let mut builder = regex::RegexBuilder::new(pattern);
     for f in flags.chars() {
         match f {
-            'i' => { builder.case_insensitive(true); }
-            's' => { builder.dot_matches_new_line(true); }
-            'x' => { builder.ignore_whitespace(true); }
-            'm' => { builder.multi_line(true); }
+            'i' => {
+                builder.case_insensitive(true);
+            }
+            's' => {
+                builder.dot_matches_new_line(true);
+            }
+            'x' => {
+                builder.ignore_whitespace(true);
+            }
+            'm' => {
+                builder.multi_line(true);
+            }
             'g' => {} // global handled by caller
             _ => {}   // unknown flags silently ignored
         }
     }
     builder.build().map_err(|e| {
-        DataFusionError::Execution(format!(
-            "regexp: invalid pattern {pattern:?}: {e}"
-        ))
+        DataFusionError::Execution(format!("regexp: invalid pattern {pattern:?}: {e}"))
     })
 }

@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use basin_catalog::Catalog;
-use basin_common::{Result, TableName, ProjectCounterRegistry, ProjectId};
+use basin_common::{ProjectCounterRegistry, ProjectId, Result, TableName};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -47,7 +47,7 @@ pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
     CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
 };
-pub use scheduler::{Scheduler, ProjectIoStats, DEFAULT_GLOBAL_BUDGET};
+pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 pub use writer::WriteOptions;
@@ -742,7 +742,11 @@ impl Storage {
     /// Files already in the cold tier are returned unchanged (the descriptor
     /// is rebuilt by re-stat'ing the cold object).
     #[tracing::instrument(skip(self), fields(project=%project, from=%from))]
-    pub async fn migrate_to_cold(&self, project: &ProjectId, from: &ObjectPath) -> Result<DataFile> {
+    pub async fn migrate_to_cold(
+        &self,
+        project: &ProjectId,
+        from: &ObjectPath,
+    ) -> Result<DataFile> {
         // Already cold? Re-stat and return without touching anything.
         if matches!(Tier::from_path(from.as_ref()), Tier::Cold) {
             let store = self.project_store(project);
@@ -1188,9 +1192,9 @@ mod tests {
 
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use basin_common::{PartitionKey, TableName, ProjectId};
-    use futures::StreamExt;
+    use basin_common::{PartitionKey, ProjectId, TableName};
     use futures::stream::BoxStream;
+    use futures::StreamExt;
     use object_store::local::LocalFileSystem;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -1234,7 +1238,10 @@ mod tests {
         let part = PartitionKey::default_key();
 
         let batch = small_batch(0, 1_000, "row-");
-        let df = s.write_batch(&project, &table, &part, &batch).await.unwrap();
+        let df = s
+            .write_batch(&project, &table, &part, &batch)
+            .await
+            .unwrap();
         assert_eq!(df.row_count, 1_000);
         assert!(df.path.as_ref().contains(&format!("projects/{project}/")));
 
@@ -1336,7 +1343,9 @@ mod tests {
             ],
         )
         .unwrap();
-        s.write_batch(&project, &table, &part, &batch).await.unwrap();
+        s.write_batch(&project, &table, &part, &batch)
+            .await
+            .unwrap();
 
         let opts = ReadOptions {
             projection: Some(vec!["a".into(), "c".into()]),
@@ -1397,8 +1406,10 @@ mod tests {
             if let Some(r) = options.range.as_ref() {
                 self.range_gets.fetch_add(1, Ordering::Relaxed);
                 if let object_store::GetRange::Bounded(rng) = r {
-                    self.range_bytes
-                        .fetch_add(rng.end.saturating_sub(rng.start) as usize, Ordering::Relaxed);
+                    self.range_bytes.fetch_add(
+                        rng.end.saturating_sub(rng.start) as usize,
+                        Ordering::Relaxed,
+                    );
                 }
             }
             self.inner.get_opts(location, options).await
@@ -1461,7 +1472,9 @@ mod tests {
         // cap is 65_536, so 200_000 rows splits into ~3 groups; a point
         // query for the last id lands in only one of them.
         let batch = small_batch(0, 200_000, "v");
-        s.write_batch(&project, &table, &part, &batch).await.unwrap();
+        s.write_batch(&project, &table, &part, &batch)
+            .await
+            .unwrap();
 
         // Reset counters so we measure only the read path.
         counting.range_gets.store(0, Ordering::Relaxed);

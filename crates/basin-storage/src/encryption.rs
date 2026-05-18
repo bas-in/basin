@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use basin_catalog::ProjectStorageConfig;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use bytes::Bytes;
 use futures::future::FutureExt;
 

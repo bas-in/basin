@@ -30,15 +30,15 @@
 //! `CREATE SCHEMA AUTHORIZATION alice` is accepted. The owner is ignored —
 //! Basin's auth model is JWT-based, not role-based.
 
-use std::collections::HashSet;
 use crate::pg_ast::ObjectNamePartExt;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_common::{BasinError, Result};
-use sqlparser::ast::{ObjectName, SchemaName};
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{ObjectName, SchemaName};
 
 use crate::{ExecResult, ProjectSession};
 
@@ -127,9 +127,7 @@ pub(crate) fn table_name_from_object(
 ) -> Result<String> {
     let resolved = resolve_object_name(name)?;
     if let Some(schema) = &resolved.schema {
-        let st = schema_state
-            .read()
-            .expect("schema_state lock poisoned");
+        let st = schema_state.read().expect("schema_state lock poisoned");
         if !st.contains(schema) {
             return Err(BasinError::NotFound(format!(
                 "schema {schema:?} does not exist"
@@ -233,10 +231,7 @@ pub(crate) async fn exec_drop_schema(
 /// `(old_name, new_name)` on success; `None` when the SQL isn't this shape.
 pub(crate) fn match_alter_schema_rename(sql: &str) -> Option<(String, String)> {
     // Normalise: collapse runs of whitespace to single space, trim.
-    let norm: String = sql
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let norm: String = sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
     // Expected shape (case-insensitive):
     //   ALTER SCHEMA <old> RENAME TO <new>
     let upper = norm.to_ascii_uppercase();
@@ -248,7 +243,11 @@ pub(crate) fn match_alter_schema_rename(sql: &str) -> Option<(String, String)> {
     let upper_rest = rest.to_ascii_uppercase();
     let pivot = upper_rest.find(" RENAME TO ")?;
     let old = rest[..pivot].trim().to_string();
-    let new = rest[pivot + " RENAME TO ".len()..].trim().trim_end_matches(';').trim().to_string();
+    let new = rest[pivot + " RENAME TO ".len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
     if old.is_empty() || new.is_empty() {
         return None;
     }
@@ -356,8 +355,14 @@ pub(crate) fn exec_set_search_path(
     for v in values {
         let name = match v {
             Expr::Identifier(id) => id.value.to_ascii_lowercase(),
-            Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => s.to_ascii_lowercase(),
-            Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. }) => s.to_ascii_lowercase(),
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }) => s.to_ascii_lowercase(),
+            Expr::Value(ValueWithSpan {
+                value: Value::DoubleQuotedString(s),
+                ..
+            }) => s.to_ascii_lowercase(),
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "SET search_path: unsupported value {other}"
@@ -379,9 +384,7 @@ pub(crate) fn exec_set_search_path(
         .expect("schema_state lock poisoned")
         .search_path = path;
 
-    Ok(ExecResult::Empty {
-        tag: "SET".into(),
-    })
+    Ok(ExecResult::Empty { tag: "SET".into() })
 }
 
 // ─── Schema-qualifier stripping (for DataFusion) ─────────────────────────────

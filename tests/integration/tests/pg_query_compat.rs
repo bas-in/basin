@@ -103,7 +103,11 @@ fn alter_function_rename_is_accepted() {
     let node = tree.stmts().next().expect("at least one statement");
     let kind = pg_ast::stmt_kind(node);
     // Accepted by the parser; falls into Other (RenameStmt) pending Phase 2.
-    assert_eq!(kind, StmtKind::Other, "expected Other (RenameStmt path) for ALTER FUNCTION RENAME TO in Phase 1");
+    assert_eq!(
+        kind,
+        StmtKind::Other,
+        "expected Other (RenameStmt path) for ALTER FUNCTION RENAME TO in Phase 1"
+    );
 }
 
 #[test]
@@ -155,9 +159,7 @@ fn insert_on_conflict_do_update_is_accepted() {
     // parsed but ignored at execution time). This test proves the parser
     // accepts it, which is the precondition for Phase 2 execution support.
     assert_eq!(
-        first_kind(
-            "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET c = excluded.c"
-        ),
+        first_kind("INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET c = excluded.c"),
         StmtKind::Insert,
     );
 }
@@ -180,8 +182,8 @@ fn cte_select_is_accepted() {
 /// whose message contains "0A000".
 fn assert_rejected(sql: &str) {
     let tree = pg_ast::parse(sql).unwrap_or_else(|e| panic!("parse {sql:?} failed: {e}"));
-    let err = pg_ast::reject_unsupported(&tree)
-        .expect_err(&format!("{sql:?} should have been rejected"));
+    let err =
+        pg_ast::reject_unsupported(&tree).expect_err(&format!("{sql:?} should have been rejected"));
     match err {
         BasinError::FeatureNotSupported(msg) => {
             assert!(

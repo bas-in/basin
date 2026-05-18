@@ -127,17 +127,16 @@ pub(crate) fn rewrite_tablesample(sql: &str) -> Result<Cow<'_, str>, TableSample
         //   FROM tbl AS alias TABLESAMPLE ...
         //   JOIN tbl [AS] alias TABLESAMPLE ...
         // Anything else (subquery before TABLESAMPLE, etc.) is left alone.
-        let (table_start, table_ref, alias) =
-            match split_preceding_table_ref(sql, &upper, ts_pos) {
-                Some(v) => v,
-                None => {
-                    // Can't safely wrap; emit text up to and including the
-                    // keyword unchanged and keep scanning.
-                    result.push_str(&sql[idx..ts_pos + "TABLESAMPLE".len()]);
-                    idx = ts_pos + "TABLESAMPLE".len();
-                    continue;
-                }
-            };
+        let (table_start, table_ref, alias) = match split_preceding_table_ref(sql, &upper, ts_pos) {
+            Some(v) => v,
+            None => {
+                // Can't safely wrap; emit text up to and including the
+                // keyword unchanged and keep scanning.
+                result.push_str(&sql[idx..ts_pos + "TABLESAMPLE".len()]);
+                idx = ts_pos + "TABLESAMPLE".len();
+                continue;
+            }
+        };
 
         // Parse `{ BERNOULLI | SYSTEM } ( <pct> ) [ REPEATABLE ( <seed> ) ]`.
         let after_kw = ts_pos + "TABLESAMPLE".len();
@@ -178,9 +177,7 @@ pub(crate) fn rewrite_tablesample(sql: &str) -> Result<Cow<'_, str>, TableSample
             Some(a) => a.clone(),
             None => default_alias(table_ref),
         };
-        result.push_str(&format!(
-            "(SELECT * FROM {table_ref} WHERE {pred}) {bind}"
-        ));
+        result.push_str(&format!("(SELECT * FROM {table_ref} WHERE {pred}) {bind}"));
 
         idx = parsed.end; // resume right after the (REPEATABLE) clause
         rewrote = true;
@@ -225,7 +222,10 @@ fn parse_tablesample_args(sql: &str, upper: &str, pos: usize) -> Option<ParsedSa
     let ws = pos + count_ws(&sql[pos..]);
     let rest_upper = &upper[ws..];
     let (system, after_method) = if let Some(r) = rest_upper.strip_prefix("BERNOULLI") {
-        (false, ws + "BERNOULLI".len() + (r.len() - r.trim_start().len()))
+        (
+            false,
+            ws + "BERNOULLI".len() + (r.len() - r.trim_start().len()),
+        )
     } else if let Some(r) = rest_upper.strip_prefix("SYSTEM") {
         (true, ws + "SYSTEM".len() + (r.len() - r.trim_start().len()))
     } else {
@@ -370,9 +370,10 @@ fn is_ident_like(tok: &str) -> bool {
     }
     tok.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-        && tok.chars().next().is_some_and(|c| {
-            c.is_ascii_alphabetic() || c == '_'
-        })
+        && tok
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
 /// Count leading ASCII-whitespace bytes.
@@ -408,7 +409,7 @@ fn prev_token(sql: &str, before: usize) -> Option<(usize, usize)> {
             s -= 1;
         }
         s = s.saturating_sub(1); // include the opening quote
-        // absorb `ident.` prefix
+                                 // absorb `ident.` prefix
         while s > 0
             && (bytes[s - 1].is_ascii_alphanumeric()
                 || bytes[s - 1] == b'_'
@@ -575,8 +576,7 @@ pub(crate) fn rewrite_for_no_key_update_and_key_share(sql: &str) -> Cow<'_, str>
                     && sql.as_bytes()[abs - 1] != b'_';
             let end = abs + "FOR NO KEY UPDATE".len();
             let after_ok = end >= sql.len()
-                || !sql.as_bytes()[end].is_ascii_alphanumeric()
-                    && sql.as_bytes()[end] != b'_';
+                || !sql.as_bytes()[end].is_ascii_alphanumeric() && sql.as_bytes()[end] != b'_';
             if before_ok && after_ok {
                 result.push_str(&sql[pos..abs]);
                 result.push_str("FOR UPDATE");
@@ -593,8 +593,7 @@ pub(crate) fn rewrite_for_no_key_update_and_key_share(sql: &str) -> Cow<'_, str>
                     && sql.as_bytes()[abs - 1] != b'_';
             let end = abs + "FOR KEY SHARE".len();
             let after_ok = end >= sql.len()
-                || !sql.as_bytes()[end].is_ascii_alphanumeric()
-                    && sql.as_bytes()[end] != b'_';
+                || !sql.as_bytes()[end].is_ascii_alphanumeric() && sql.as_bytes()[end] != b'_';
             if before_ok && after_ok {
                 result.push_str(&sql[pos..abs]);
                 result.push_str("FOR SHARE");
@@ -644,9 +643,7 @@ fn find_whole_word(haystack: &str, word: &str) -> Option<usize> {
 
 /// Split `s` into a leading decimal-digit run and the remainder.
 fn split_integer(s: &str) -> (&str, &str) {
-    let end = s
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len());
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     (&s[..end], &s[end..])
 }
 
@@ -735,10 +732,7 @@ mod tests {
 
     #[test]
     fn table_shorthand_with_semicolon() {
-        assert_eq!(
-            rewrite_table_shorthand("TABLE foo;"),
-            "SELECT * FROM foo"
-        );
+        assert_eq!(rewrite_table_shorthand("TABLE foo;"), "SELECT * FROM foo");
     }
 
     #[test]
@@ -890,10 +884,7 @@ mod tests {
         let sql = "SELECT * FROM t FOR NO KEY UPDATE";
         let out = rewrite_for_no_key_update_and_key_share(sql);
         assert!(out.contains("FOR UPDATE"), "expected FOR UPDATE: {out}");
-        assert!(
-            !out.contains("NO KEY"),
-            "NO KEY should be gone: {out}"
-        );
+        assert!(!out.contains("NO KEY"), "NO KEY should be gone: {out}");
     }
 
     #[test]

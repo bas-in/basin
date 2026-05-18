@@ -1,7 +1,7 @@
 //! sqlparser → Arrow type bridging for the PoC.
 
-use std::sync::Arc;
 use crate::pg_ast::ObjectNamePartExt;
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, TimeUnit};
 use basin_common::{BasinError, Result};
@@ -54,7 +54,6 @@ pub const BASIN_TYPE_VARBIT_PREFIX: &str = "VARBIT";
 /// closest lossless Arrow representation for the range and scale PG
 /// guarantees (`-92233720368547758.08` to `+92233720368547758.07`).
 pub const BASIN_TYPE_MONEY: &str = "MONEY";
-
 
 // XML — UTF-8 text with marker for OID 142.
 pub const BASIN_TYPE_XML: &str = "XML";
@@ -561,9 +560,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
     }
     match sql {
         // INT / INTEGER / INT4  → 32-bit (PG default integer width, OID 23).
-        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
-            Ok(DataType::Int32)
-        }
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(DataType::Int32),
 
         // BIGINT / INT8 → 64-bit (OID 20). Unchanged.
         SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(DataType::Int64),
@@ -801,9 +798,7 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                             ))
                         })?;
                         if n == 0 {
-                            return Err(BasinError::InvalidSchema(
-                                "BIT(n): n must be >= 1".into(),
-                            ));
+                            return Err(BasinError::InvalidSchema("BIT(n): n must be >= 1".into()));
                         }
                     }
                     Ok(DataType::Utf8)

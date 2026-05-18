@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{Snapshot, SnapshotId};

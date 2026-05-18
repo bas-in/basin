@@ -138,7 +138,10 @@ async fn insert_returning_extended_protocol_yields_correct_columns() {
     let id: i64 = rows[0].get(0);
     let name: &str = rows[0].get(1);
     assert_eq!(id, 42, "RETURNING id must equal the inserted value");
-    assert_eq!(name, "widget", "RETURNING name must equal the inserted value");
+    assert_eq!(
+        name, "widget",
+        "RETURNING name must equal the inserted value"
+    );
 }
 
 /// `UPDATE … RETURNING` via extended protocol — fix must surface the new
@@ -149,9 +152,7 @@ async fn update_returning_extended_protocol_yields_correct_columns() {
     let client = connect(server.addr).await;
 
     client
-        .simple_query(
-            "CREATE TABLE counters (id BIGINT NOT NULL, val BIGINT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE counters (id BIGINT NOT NULL, val BIGINT NOT NULL)")
         .await
         .expect("create table");
     client
@@ -192,10 +193,7 @@ async fn delete_returning_extended_protocol_yields_correct_columns() {
         .expect("seed");
 
     let rows = client
-        .query(
-            "DELETE FROM events WHERE id = $1 RETURNING id",
-            &[&7_i64],
-        )
+        .query("DELETE FROM events WHERE id = $1 RETURNING id", &[&7_i64])
         .await
         .expect("DELETE ... RETURNING via extended protocol must not error");
 

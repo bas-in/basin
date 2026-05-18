@@ -35,7 +35,7 @@ use std::time::Duration;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{ReadOptions, Storage, StorageConfig};
 use chrono::Utc;

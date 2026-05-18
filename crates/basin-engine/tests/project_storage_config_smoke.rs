@@ -11,7 +11,7 @@ use std::sync::Arc;
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
-use basin_storage::{Storage, StorageConfig, ProjectStorageConfig};
+use basin_storage::{ProjectStorageConfig, Storage, StorageConfig};
 use object_store::memory::InMemory;
 
 #[tokio::test]

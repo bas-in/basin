@@ -375,9 +375,7 @@ async fn schema_qualified_create_and_select() {
 
     // CREATE TABLE with schema qualifier.
     client
-        .simple_query(
-            "CREATE TABLE myschema.items (id BIGINT NOT NULL, label TEXT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE myschema.items (id BIGINT NOT NULL, label TEXT NOT NULL)")
         .await
         .expect("CREATE TABLE myschema.items should succeed");
 

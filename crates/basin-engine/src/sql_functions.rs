@@ -29,12 +29,12 @@
 //!   persisted. The inliner's [`MAX_INLINE_DEPTH`] is now purely a
 //!   defensive backstop.
 
-use std::collections::HashMap;
 use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType};
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, Select, SelectItem,
     SetExpr, Statement,

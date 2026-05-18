@@ -24,7 +24,7 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::{DataType, Field, IntervalUnit, Schema};
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 
 use crate::functions::{SqlArgType, SqlReturnType};
 use crate::Catalog;
@@ -1248,7 +1248,10 @@ impl InfoSchemaQuery {
     ///
     /// Cross-project leak is a P0 invariant: only [`Catalog::list_tables`]
     /// / [`Catalog::load_table`] for `project`.
-    pub async fn key_column_usage(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+    pub async fn key_column_usage(
+        catalog: &dyn Catalog,
+        project: &ProjectId,
+    ) -> Result<RecordBatch> {
         let names = catalog.list_tables(project).await?;
 
         let mut constraint_catalogs: Vec<&str> = Vec::new();
@@ -1744,7 +1747,9 @@ impl InfoSchemaQuery {
                 let cols = meta.pk_columns.join(", ");
                 indexdefs.push(Some(format!(
                     "CREATE UNIQUE INDEX {}_pkey ON {} ({})",
-                    name.as_str(), name.as_str(), cols
+                    name.as_str(),
+                    name.as_str(),
+                    cols
                 )));
             }
         }
@@ -1847,15 +1852,132 @@ impl InfoSchemaQuery {
     pub async fn pg_settings(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
         // A minimal GUC list that ORMs and admin tools commonly probe.
         // Tuple: (name, setting, unit, category, short_desc, context, vartype, source, min, max, boot, reset)
-        let rows: &[(&str, &str, Option<&str>, &str, &str, &str, &str, &str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
-            ("server_version", "15.0", None, "Preset Options", "Shows the server version.", "internal", "string", "default", None, None, Some("15.0"), Some("15.0")),
-            ("server_version_num", "150000", None, "Preset Options", "Shows the server version as an integer.", "internal", "integer", "default", Some("0"), Some("2147483647"), Some("150000"), Some("150000")),
-            ("max_connections", "100", None, "Connections and Authentication / Connection Settings", "Sets the maximum number of concurrent connections.", "postmaster", "integer", "default", Some("1"), Some("262143"), Some("100"), Some("100")),
-            ("TimeZone", "UTC", None, "Client Connection Defaults / Locale and Formatting", "Sets the time zone for displaying and interpreting time stamps.", "user", "string", "default", None, None, Some("UTC"), Some("UTC")),
-            ("client_encoding", "UTF8", None, "Client Connection Defaults / Locale and Formatting", "Sets the client's character set encoding.", "user", "string", "default", None, None, Some("UTF8"), Some("UTF8")),
-            ("standard_conforming_strings", "on", None, "Version and Platform Compatibility / Previous PostgreSQL Versions", "Causes '...' strings to treat backslashes literally.", "user", "bool", "default", None, None, Some("on"), Some("on")),
-            ("search_path", "public", None, "Client Connection Defaults / Statement Behavior", "Sets the schema search order for names that are not schema-qualified.", "user", "string", "default", None, None, Some("public"), Some("public")),
-            ("default_transaction_isolation", "read committed", None, "Client Connection Defaults / Statement Behavior", "Sets the transaction isolation level of each new transaction.", "user", "enum", "default", None, None, Some("read committed"), Some("read committed")),
+        let rows: &[(
+            &str,
+            &str,
+            Option<&str>,
+            &str,
+            &str,
+            &str,
+            &str,
+            &str,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        )] = &[
+            (
+                "server_version",
+                "15.0",
+                None,
+                "Preset Options",
+                "Shows the server version.",
+                "internal",
+                "string",
+                "default",
+                None,
+                None,
+                Some("15.0"),
+                Some("15.0"),
+            ),
+            (
+                "server_version_num",
+                "150000",
+                None,
+                "Preset Options",
+                "Shows the server version as an integer.",
+                "internal",
+                "integer",
+                "default",
+                Some("0"),
+                Some("2147483647"),
+                Some("150000"),
+                Some("150000"),
+            ),
+            (
+                "max_connections",
+                "100",
+                None,
+                "Connections and Authentication / Connection Settings",
+                "Sets the maximum number of concurrent connections.",
+                "postmaster",
+                "integer",
+                "default",
+                Some("1"),
+                Some("262143"),
+                Some("100"),
+                Some("100"),
+            ),
+            (
+                "TimeZone",
+                "UTC",
+                None,
+                "Client Connection Defaults / Locale and Formatting",
+                "Sets the time zone for displaying and interpreting time stamps.",
+                "user",
+                "string",
+                "default",
+                None,
+                None,
+                Some("UTC"),
+                Some("UTC"),
+            ),
+            (
+                "client_encoding",
+                "UTF8",
+                None,
+                "Client Connection Defaults / Locale and Formatting",
+                "Sets the client's character set encoding.",
+                "user",
+                "string",
+                "default",
+                None,
+                None,
+                Some("UTF8"),
+                Some("UTF8"),
+            ),
+            (
+                "standard_conforming_strings",
+                "on",
+                None,
+                "Version and Platform Compatibility / Previous PostgreSQL Versions",
+                "Causes '...' strings to treat backslashes literally.",
+                "user",
+                "bool",
+                "default",
+                None,
+                None,
+                Some("on"),
+                Some("on"),
+            ),
+            (
+                "search_path",
+                "public",
+                None,
+                "Client Connection Defaults / Statement Behavior",
+                "Sets the schema search order for names that are not schema-qualified.",
+                "user",
+                "string",
+                "default",
+                None,
+                None,
+                Some("public"),
+                Some("public"),
+            ),
+            (
+                "default_transaction_isolation",
+                "read committed",
+                None,
+                "Client Connection Defaults / Statement Behavior",
+                "Sets the transaction isolation level of each new transaction.",
+                "user",
+                "enum",
+                "default",
+                None,
+                None,
+                Some("read committed"),
+                Some("read committed"),
+            ),
         ];
         let schema = Self::pg_settings_schema();
         let n = rows.len();
@@ -1876,7 +1998,21 @@ impl InfoSchemaQuery {
         let mut sourcefiles: Vec<Option<&str>> = Vec::with_capacity(n);
         let mut sourcelines: Vec<Option<i32>> = Vec::with_capacity(n);
         let mut pending: Vec<bool> = Vec::with_capacity(n);
-        for (name, setting, unit, category, short_desc, context, vartype, source, min, max, boot, reset) in rows {
+        for (
+            name,
+            setting,
+            unit,
+            category,
+            short_desc,
+            context,
+            vartype,
+            source,
+            min,
+            max,
+            boot,
+            reset,
+        ) in rows
+        {
             names.push(*name);
             settings.push(*setting);
             units.push(*unit);
@@ -2238,7 +2374,7 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(vec![None::<String>])), // state_change
             Arc::new(StringArray::from(vec![None::<String>])), // wait_event_type
             Arc::new(StringArray::from(vec![None::<String>])), // wait_event
-            Arc::new(StringArray::from(vec![Some("active")])),  // state
+            Arc::new(StringArray::from(vec![Some("active")])), // state
             Arc::new(Int64Array::from(vec![None::<i64>])),     // backend_xid
             Arc::new(Int64Array::from(vec![None::<i64>])),     // backend_xmin
             Arc::new(StringArray::from(vec![None::<String>])), // query
@@ -2477,8 +2613,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_wal_receiver build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("pg_catalog.pg_stat_wal_receiver build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2515,8 +2652,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_subscription build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("pg_catalog.pg_stat_subscription build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2547,8 +2685,9 @@ impl InfoSchemaQuery {
             Arc::new(Float32Array::from(Vec::<f32>::new())),
             Arc::new(Float32Array::from(Vec::<f32>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_user_functions build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("pg_catalog.pg_stat_user_functions build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2589,8 +2728,9 @@ impl InfoSchemaQuery {
             Arc::new(Int64Array::from(Vec::<i64>::new())),
             Arc::new(Int64Array::from(Vec::<i64>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_progress_vacuum build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("pg_catalog.pg_stat_progress_vacuum build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2635,8 +2775,11 @@ impl InfoSchemaQuery {
             Arc::new(Int64Array::from(Vec::<i64>::new())),
             Arc::new(Int64Array::from(Vec::<i64>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_progress_create_index build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!(
+                "pg_catalog.pg_stat_progress_create_index build: {e}"
+            ))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2677,8 +2820,9 @@ impl InfoSchemaQuery {
             Arc::new(Int64Array::from(Vec::<i64>::new())),
             Arc::new(Int64Array::from(Vec::<i64>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_stat_progress_analyze build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("pg_catalog.pg_stat_progress_analyze build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2709,8 +2853,7 @@ impl InfoSchemaQuery {
             for field in arrow_schema.fields() {
                 // Basin encodes CHECK constraints as field metadata
                 if let Some(check) = field.metadata().get("BASIN_CHECK") {
-                    let constraint_name =
-                        format!("{}_{}_check", name.as_str(), field.name());
+                    let constraint_name = format!("{}_{}_check", name.as_str(), field.name());
                     constraint_catalogs.push(BASIN_CATALOG_NAME);
                     constraint_schemas.push(DEFAULT_SCHEMA);
                     constraint_names.push(constraint_name);
@@ -2725,8 +2868,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(constraint_names)),
             Arc::new(StringArray::from(check_clauses)),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.check_constraints build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.check_constraints build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3086,8 +3230,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.usage_privileges build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.usage_privileges build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3122,8 +3267,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.role_table_grants build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.role_table_grants build: {e}"))
+        })
     }
 
     pub async fn table_privileges(
@@ -3133,7 +3279,15 @@ impl InfoSchemaQuery {
         // Return one row per privilege type per table owned by the project.
         let names = catalog.list_tables(project).await?;
         let grantee = project.to_string();
-        let privs = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
+        let privs = [
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "TRUNCATE",
+            "REFERENCES",
+            "TRIGGER",
+        ];
         let mut grantors: Vec<Option<String>> = Vec::new();
         let mut grantees: Vec<String> = Vec::new();
         let mut catalogs: Vec<&str> = Vec::new();
@@ -3165,8 +3319,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(is_grantables)),
             Arc::new(StringArray::from(with_hierarchies)),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.table_privileges build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.table_privileges build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3202,8 +3357,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.role_table_grants build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.role_table_grants build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3259,8 +3415,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(is_instantiables)),
             Arc::new(StringArray::from(is_finals)),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.user_defined_types build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.user_defined_types build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3333,8 +3490,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(table_names)),
             Arc::new(StringArray::from(column_names)),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.column_domain_usage build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.column_domain_usage build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3391,8 +3549,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(table_names)),
             Arc::new(StringArray::from(column_names)),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.column_udt_usage build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.column_udt_usage build: {e}"))
+        })
     }
 
     pub async fn role_column_grants(
@@ -3410,8 +3569,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.role_column_grants build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.role_column_grants build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3450,8 +3610,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.role_routine_grants build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.role_routine_grants build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3477,8 +3638,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(vec![rolname.as_str()])),
             Arc::new(StringArray::from(vec!["YES"])),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.applicable_roles build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.applicable_roles build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3486,22 +3648,20 @@ impl InfoSchemaQuery {
     // -----------------------------------------------------------------------
 
     pub fn enabled_roles_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("role_name", DataType::Utf8, false),
-        ]))
+        Arc::new(Schema::new(vec![Field::new(
+            "role_name",
+            DataType::Utf8,
+            false,
+        )]))
     }
 
-    pub async fn enabled_roles(
-        _catalog: &dyn Catalog,
-        project: &ProjectId,
-    ) -> Result<RecordBatch> {
+    pub async fn enabled_roles(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
         let rolname = project.to_string();
         let schema = Self::enabled_roles_schema();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![rolname.as_str()])),
-        ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.enabled_roles build: {e}")))
+        let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![rolname.as_str()]))];
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.enabled_roles build: {e}"))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3530,8 +3690,11 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.foreign_data_wrappers build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!(
+                "information_schema.foreign_data_wrappers build: {e}"
+            ))
+        })
     }
 
     pub fn foreign_data_wrapper_options_schema() -> Arc<Schema> {
@@ -3554,8 +3717,11 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.foreign_data_wrapper_options build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!(
+                "information_schema.foreign_data_wrapper_options build: {e}"
+            ))
+        })
     }
 
     pub fn foreign_servers_schema() -> Arc<Schema> {
@@ -3584,8 +3750,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.foreign_servers build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.foreign_servers build: {e}"))
+        })
     }
 
     pub fn foreign_server_options_schema() -> Arc<Schema> {
@@ -3608,8 +3775,11 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.foreign_server_options build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!(
+                "information_schema.foreign_server_options build: {e}"
+            ))
+        })
     }
 
     pub fn foreign_tables_schema() -> Arc<Schema> {
@@ -3634,8 +3804,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.foreign_tables build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.foreign_tables build: {e}"))
+        })
     }
 
     pub fn foreign_table_options_schema() -> Arc<Schema> {
@@ -3660,8 +3831,11 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.foreign_table_options build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!(
+                "information_schema.foreign_table_options build: {e}"
+            ))
+        })
     }
 
     pub fn user_mappings_schema() -> Arc<Schema> {
@@ -3682,8 +3856,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<&str>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.user_mappings build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!("information_schema.user_mappings build: {e}"))
+        })
     }
 
     pub fn user_mapping_options_schema() -> Arc<Schema> {
@@ -3708,8 +3883,11 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(Vec::<&str>::new())),
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
         ];
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| BasinError::internal(format!("information_schema.user_mapping_options build: {e}")))
+        RecordBatch::try_new(schema, columns).map_err(|e| {
+            BasinError::internal(format!(
+                "information_schema.user_mapping_options build: {e}"
+            ))
+        })
     }
 }
 

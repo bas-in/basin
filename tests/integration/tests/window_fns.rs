@@ -55,7 +55,11 @@ fn collect_i64(res: ExecResult, col: &str) -> Vec<Option<i64>> {
             .downcast_ref::<Int64Array>()
             .unwrap_or_else(|| panic!("column '{col}' is not Int64Array"));
         for i in 0..arr.len() {
-            out.push(if arr.is_null(i) { None } else { Some(arr.value(i)) });
+            out.push(if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            });
         }
     }
     out
@@ -75,7 +79,11 @@ fn collect_f64(res: ExecResult, col: &str) -> Vec<Option<f64>> {
             .downcast_ref::<Float64Array>()
             .unwrap_or_else(|| panic!("column '{col}' is not Float64Array"));
         for i in 0..arr.len() {
-            out.push(if arr.is_null(i) { None } else { Some(arr.value(i)) });
+            out.push(if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            });
         }
     }
     out
@@ -99,11 +107,9 @@ async fn setup_sales(dir: &TempDir) -> (Engine, ProjectId) {
     let engine = engine_in(dir);
     let tid = ProjectId::new();
     let s = engine.open_session(tid.clone()).await.unwrap();
-    s.execute(
-        "CREATE TABLE sales (dept TEXT NOT NULL, emp TEXT NOT NULL, amount BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    s.execute("CREATE TABLE sales (dept TEXT NOT NULL, emp TEXT NOT NULL, amount BIGINT NOT NULL)")
+        .await
+        .unwrap();
     s.execute(
         "INSERT INTO sales VALUES \
          ('A','alice',300),\
@@ -351,7 +357,14 @@ async fn lag_with_offset_and_default() {
     // dept A: -1,100,200; dept B: -1,100,400
     assert_eq!(
         vals,
-        vec![Some(-1), Some(100), Some(200), Some(-1), Some(100), Some(400)],
+        vec![
+            Some(-1),
+            Some(100),
+            Some(200),
+            Some(-1),
+            Some(100),
+            Some(400)
+        ],
         "lag+default mismatch: {vals:?}"
     );
 }
@@ -399,7 +412,14 @@ async fn first_value_partition_by() {
     // dept A min=100, dept B min=100
     assert_eq!(
         vals,
-        vec![Some(100), Some(100), Some(100), Some(100), Some(100), Some(100)],
+        vec![
+            Some(100),
+            Some(100),
+            Some(100),
+            Some(100),
+            Some(100),
+            Some(100)
+        ],
         "first_value mismatch: {vals:?}"
     );
 }
@@ -425,7 +445,14 @@ async fn last_value_full_frame() {
     // dept A max=300, dept B max=400
     assert_eq!(
         vals,
-        vec![Some(300), Some(300), Some(300), Some(400), Some(400), Some(400)],
+        vec![
+            Some(300),
+            Some(300),
+            Some(300),
+            Some(400),
+            Some(400),
+            Some(400)
+        ],
         "last_value full-frame mismatch: {vals:?}"
     );
 }
@@ -452,7 +479,14 @@ async fn nth_value_partition_by() {
     // dept B sorted: 100,400,400 → 2nd = 400
     assert_eq!(
         vals,
-        vec![Some(200), Some(200), Some(200), Some(400), Some(400), Some(400)],
+        vec![
+            Some(200),
+            Some(200),
+            Some(200),
+            Some(400),
+            Some(400),
+            Some(400)
+        ],
         "nth_value mismatch: {vals:?}"
     );
 }
@@ -482,7 +516,14 @@ async fn frame_rows_unbounded_preceding_current_row() {
     // running sums: 100,200,400,700,1100,1500
     assert_eq!(
         vals,
-        vec![Some(100), Some(200), Some(400), Some(700), Some(1100), Some(1500)],
+        vec![
+            Some(100),
+            Some(200),
+            Some(400),
+            Some(700),
+            Some(1100),
+            Some(1500)
+        ],
         "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW mismatch: {vals:?}"
     );
 }
@@ -507,7 +548,14 @@ async fn frame_range_unbounded_preceding_unbounded_following() {
     // dept A: 100+200+300=600, dept B: 100+400+400=900
     assert_eq!(
         vals,
-        vec![Some(600), Some(600), Some(600), Some(900), Some(900), Some(900)],
+        vec![
+            Some(600),
+            Some(600),
+            Some(600),
+            Some(900),
+            Some(900),
+            Some(900)
+        ],
         "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING mismatch: {vals:?}"
     );
 }
@@ -536,7 +584,14 @@ async fn named_window_clause() {
     // dept A sum=600, dept B sum=900
     assert_eq!(
         vals,
-        vec![Some(600), Some(600), Some(600), Some(900), Some(900), Some(900)],
+        vec![
+            Some(600),
+            Some(600),
+            Some(600),
+            Some(900),
+            Some(900),
+            Some(900)
+        ],
         "named window (SUM OVER w) mismatch: {vals:?}"
     );
 }
@@ -562,7 +617,14 @@ async fn window_sum_partition_by() {
     let vals = collect_i64(res, "dept_sum");
     assert_eq!(
         vals,
-        vec![Some(600), Some(600), Some(600), Some(900), Some(900), Some(900)],
+        vec![
+            Some(600),
+            Some(600),
+            Some(600),
+            Some(900),
+            Some(900),
+            Some(900)
+        ],
         "window sum mismatch: {vals:?}"
     );
 }
@@ -643,7 +705,14 @@ async fn window_min_partition_by() {
     // dept A min=100, dept B min=100
     assert_eq!(
         vals,
-        vec![Some(100), Some(100), Some(100), Some(100), Some(100), Some(100)],
+        vec![
+            Some(100),
+            Some(100),
+            Some(100),
+            Some(100),
+            Some(100),
+            Some(100)
+        ],
         "window min mismatch: {vals:?}"
     );
 }
@@ -666,7 +735,14 @@ async fn window_max_partition_by() {
     // dept A max=300, dept B max=400
     assert_eq!(
         vals,
-        vec![Some(300), Some(300), Some(300), Some(400), Some(400), Some(400)],
+        vec![
+            Some(300),
+            Some(300),
+            Some(300),
+            Some(400),
+            Some(400),
+            Some(400)
+        ],
         "window max mismatch: {vals:?}"
     );
 }

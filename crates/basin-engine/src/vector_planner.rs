@@ -37,13 +37,13 @@
 //! matching rows. This trades a constant-factor overhead at the storage
 //! tier for keeping the storage API stable.
 
-use std::sync::Arc;
 use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use basin_storage::{evaluate_predicate, Predicate, ScalarValue};
 use basin_vector::Distance;
 use sqlparser::ast::ValueWithSpan;
@@ -145,7 +145,10 @@ pub async fn rewrite_vector_order_by(
     // Criterion 5 (LIMIT must be a constant integer) is checked first
     // because failures are common and cheap to spot.
     let k = match query.ext_limit() {
-        Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => match s.parse::<i64>() {
+        Some(Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        })) => match s.parse::<i64>() {
             Ok(n) if n > 0 => n as usize,
             _ => return Ok(None),
         },
@@ -413,18 +416,27 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
         other => (false, other),
     };
     match inner {
-        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => {
             let n: i64 = s.parse().ok()?;
             Some(ScalarValue::Int64(if negate { -n } else { n }))
         }
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => {
             if negate {
                 None
             } else {
                 Some(ScalarValue::Utf8(s.clone()))
             }
         }
-        Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(b),
+            ..
+        }) => {
             if negate {
                 None
             } else {
@@ -650,7 +662,10 @@ fn extract_distance_call(expr: &Expr) -> Option<(String, DistanceOp, Vec<f32>)> 
         _ => return None,
     };
     let lit = match lit_expr {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => s.as_str(),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => s.as_str(),
         _ => return None,
     };
     let v = parse_vector_literal(lit).ok()?;

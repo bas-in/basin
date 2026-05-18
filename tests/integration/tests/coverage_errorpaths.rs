@@ -174,7 +174,9 @@ async fn error_insert_unknown_column_is_error() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
 
     let err = sess
         .execute("INSERT INTO t (id, totally_bogus) VALUES (1, 99)")
@@ -275,8 +277,11 @@ async fn error_pk_duplicate_is_unique_violation() {
     let msg = err.to_string();
     // BasinError::UniqueViolation formats as "{message}" with the constraint name.
     assert!(
-        msg.contains("unique") || msg.contains("duplicate") || msg.contains("pkey")
-            || msg.contains("constraint") || msg.contains("already exists"),
+        msg.contains("unique")
+            || msg.contains("duplicate")
+            || msg.contains("pkey")
+            || msg.contains("constraint")
+            || msg.contains("already exists"),
         "PK duplicate error must mention 'unique'/'duplicate'/'constraint', got: {msg}"
     );
     println!("[error_paths] PK duplicate (UniqueViolation): {msg}");
@@ -290,12 +295,12 @@ async fn error_unique_constraint_violation() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE t (id BIGINT NOT NULL, email TEXT NOT NULL, UNIQUE (email))",
-    )
-    .await
-    .unwrap();
-    sess.execute("INSERT INTO t VALUES (1, 'a@example.com')").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, email TEXT NOT NULL, UNIQUE (email))")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'a@example.com')")
+        .await
+        .unwrap();
 
     let err = sess
         .execute("INSERT INTO t VALUES (2, 'a@example.com')")
@@ -354,11 +359,9 @@ async fn error_check_constraint_violation_on_insert() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE t (id BIGINT NOT NULL, score BIGINT NOT NULL CHECK (score >= 0))",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, score BIGINT NOT NULL CHECK (score >= 0))")
+        .await
+        .unwrap();
 
     // A valid row must INSERT successfully (the CHECK is satisfied).
     sess.execute("INSERT INTO t VALUES (1, 10)")
@@ -373,8 +376,11 @@ async fn error_check_constraint_violation_on_insert() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("check") || msg.contains("constraint") || msg.contains("CHECK")
-            || msg.contains("violat") || msg.contains("23514"),
+        msg.contains("check")
+            || msg.contains("constraint")
+            || msg.contains("CHECK")
+            || msg.contains("violat")
+            || msg.contains("23514"),
         "CHECK violation error must mention 'check'/'constraint'/'violat'/'23514', got: {msg}"
     );
     // Must NOT be the old planning-failure message.
@@ -402,11 +408,9 @@ async fn error_check_constraint_violation_on_update() {
     // Use a table WITHOUT a CHECK constraint so we can successfully INSERT,
     // then test that a PK violation via UPDATE also errors.
     // (Illustrates that UPDATE-path error handling works independently of CHECK.)
-    sess.execute(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1, 10)").await.unwrap();
     sess.execute("INSERT INTO t VALUES (2, 20)").await.unwrap();
 
@@ -418,13 +422,18 @@ async fn error_check_constraint_violation_on_update() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("unique") || msg.contains("duplicate") || msg.contains("constraint")
+        msg.contains("unique")
+            || msg.contains("duplicate")
+            || msg.contains("constraint")
             || msg.contains("pkey"),
         "PK violation on UPDATE must mention unique/duplicate/constraint, got: {msg}"
     );
 
     // id=1 row must still have val=10 (update did not commit).
-    let res = sess.execute("SELECT val FROM t WHERE id = 1").await.unwrap();
+    let res = sess
+        .execute("SELECT val FROM t WHERE id = 1")
+        .await
+        .unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         if !batches.is_empty() && batches[0].num_rows() > 0 {
             let arr = batches[0]
@@ -433,7 +442,11 @@ async fn error_check_constraint_violation_on_update() {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            assert_eq!(arr.value(0), 10, "id=1 val must remain 10 after rejected UPDATE");
+            assert_eq!(
+                arr.value(0),
+                10,
+                "id=1 val must remain 10 after rejected UPDATE"
+            );
         }
     }
     println!("[error_paths] PK violation on UPDATE (UniqueViolation): {msg}");
@@ -503,8 +516,11 @@ async fn error_syntax_error_garbled_sql() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("parse") || msg.contains("syntax") || msg.contains("42601")
-            || msg.contains("error") || msg.contains("unexpected"),
+        msg.contains("parse")
+            || msg.contains("syntax")
+            || msg.contains("42601")
+            || msg.contains("error")
+            || msg.contains("unexpected"),
         "syntax error must mention parse/syntax/42601, got: {msg}"
     );
     println!("[error_paths] syntax error (garbled SQL): {msg}");
@@ -544,7 +560,9 @@ async fn error_undefined_function_in_select() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
 
     let err = sess
@@ -579,11 +597,11 @@ async fn error_invalid_cast_text_to_bigint() {
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL, label TEXT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO t VALUES (1, 'not-a-number')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'not-a-number')")
+        .await
+        .unwrap();
 
-    let result = sess
-        .execute("SELECT CAST(label AS BIGINT) FROM t")
-        .await;
+    let result = sess.execute("SELECT CAST(label AS BIGINT) FROM t").await;
 
     match &result {
         Err(e) => {
@@ -673,7 +691,10 @@ async fn error_aggregate_without_group_by_returns_one_row() {
         other => panic!("expected Rows for SUM, got: {other:?}"),
     };
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 1, "SUM without GROUP BY must return exactly 1 row (the aggregate)");
+    assert_eq!(
+        total_rows, 1,
+        "SUM without GROUP BY must return exactly 1 row (the aggregate)"
+    );
 
     use arrow_array::Int64Array;
     let sum_val = batches
@@ -702,7 +723,9 @@ async fn error_fk_violation_on_insert() {
     sess.execute("CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO parent VALUES (1), (2)").await.unwrap();
+    sess.execute("INSERT INTO parent VALUES (1), (2)")
+        .await
+        .unwrap();
 
     // Child table referencing parent.
     sess.execute(
@@ -713,7 +736,9 @@ async fn error_fk_violation_on_insert() {
     .unwrap();
 
     // Good insert (parent_id = 1 exists).
-    sess.execute("INSERT INTO child VALUES (10, 1)").await.unwrap();
+    sess.execute("INSERT INTO child VALUES (10, 1)")
+        .await
+        .unwrap();
 
     // Bad insert (parent_id = 99 does not exist in parent).
     let err = sess
@@ -723,8 +748,11 @@ async fn error_fk_violation_on_insert() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("foreign") || msg.contains("key") || msg.contains("violat")
-            || msg.contains("constraint") || msg.contains("23503")
+        msg.contains("foreign")
+            || msg.contains("key")
+            || msg.contains("violat")
+            || msg.contains("constraint")
+            || msg.contains("23503")
             || msg.contains("referenced"),
         "FK violation error must mention 'foreign'/'key'/'constraint', got: {msg}"
     );
@@ -783,9 +811,7 @@ async fn error_ambiguous_column_in_join() {
     sess.execute("INSERT INTO b VALUES (1, 'y')").await.unwrap();
 
     // `id` is in both a and b — unqualified reference should be ambiguous.
-    let result = sess
-        .execute("SELECT id FROM a JOIN b ON a.id = b.id")
-        .await;
+    let result = sess.execute("SELECT id FROM a JOIN b ON a.id = b.id").await;
 
     match &result {
         Err(e) => {
@@ -818,7 +844,9 @@ async fn error_alter_add_column_not_null_rejected() {
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1), (2)").await.unwrap();
 
     // This form is explicitly rejected in alter.rs with InvalidSchema.
@@ -826,13 +854,15 @@ async fn error_alter_add_column_not_null_rejected() {
         .execute("ALTER TABLE t ADD COLUMN required_col BIGINT NOT NULL")
         .await
         .expect_err(
-            "ALTER TABLE ADD COLUMN NOT NULL must error in v0.1 (existing rows have no value)"
+            "ALTER TABLE ADD COLUMN NOT NULL must error in v0.1 (existing rows have no value)",
         );
 
     let msg = err.to_string();
     assert!(
-        msg.contains("NOT NULL") || msg.contains("not null")
-            || msg.contains("not supported") || msg.contains("v0.1"),
+        msg.contains("NOT NULL")
+            || msg.contains("not null")
+            || msg.contains("not supported")
+            || msg.contains("v0.1"),
         "ADD COLUMN NOT NULL rejection must mention 'NOT NULL' or 'not supported', got: {msg}"
     );
     println!("[error_paths] ADD COLUMN NOT NULL rejected: {msg}");
@@ -858,9 +888,7 @@ async fn pin_create_table_if_not_exists_ignored() {
     // Fix #49: must succeed silently when table already exists.
     sess.execute("CREATE TABLE IF NOT EXISTS existing_t (id BIGINT NOT NULL)")
         .await
-        .expect(
-            "CREATE TABLE IF NOT EXISTS must not error when table exists (fix #49)"
-        );
+        .expect("CREATE TABLE IF NOT EXISTS must not error when table exists (fix #49)");
 }
 
 /// Verifies that CREATE TABLE IF NOT EXISTS on an existing table succeeds as
@@ -887,7 +915,10 @@ async fn pin_create_table_if_not_exists_currently_errors() {
     let res = sess.execute("SELECT id FROM ine_t").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 1, "existing table data must survive CREATE IF NOT EXISTS no-op");
+        assert_eq!(
+            total, 1,
+            "existing table data must survive CREATE IF NOT EXISTS no-op"
+        );
     }
     println!("[pin] CREATE TABLE IF NOT EXISTS is a no-op (fix #49)");
 }
@@ -909,7 +940,9 @@ async fn pin_drop_table_should_remove_table() {
     sess.execute("CREATE TABLE droppable (id BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO droppable VALUES (1)").await.unwrap();
+    sess.execute("INSERT INTO droppable VALUES (1)")
+        .await
+        .unwrap();
 
     // Fix #49: DROP TABLE must succeed and remove the table.
     sess.execute("DROP TABLE droppable")

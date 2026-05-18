@@ -45,13 +45,13 @@
 //! string-rewrite machinery the top-level executor pre-screen uses
 //! for inline `nextval(...)` calls — no separate UDF bridge.
 
-use std::sync::Arc;
 use crate::pg_ast::ObjectNamePartExt;
+use std::sync::Arc;
 
 use basin_catalog::{Catalog, SequenceDef};
-use basin_common::{BasinError, Result, ProjectId};
-use sqlparser::ast::{Expr, ObjectName, SequenceOptions, UnaryOperator, Value};
+use basin_common::{BasinError, ProjectId, Result};
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{Expr, ObjectName, SequenceOptions, UnaryOperator, Value};
 
 use crate::{ExecResult, ProjectSession};
 
@@ -245,7 +245,10 @@ fn apply_options(def: &mut SequenceDef, options: &[SequenceOptions]) -> Result<(
 /// with a clear error.
 fn parse_signed_int(expr: &Expr, opt_name: &str) -> Result<i64> {
     match expr {
-        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().map_err(|e| {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => s.parse::<i64>().map_err(|e| {
             BasinError::InvalidSchema(format!(
                 "CREATE SEQUENCE {opt_name}: invalid integer {s:?} ({e})"
             ))
@@ -254,7 +257,10 @@ fn parse_signed_int(expr: &Expr, opt_name: &str) -> Result<i64> {
             op: UnaryOperator::Minus,
             expr: inner,
         } => match inner.as_ref() {
-            Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => {
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }) => {
                 let n: i64 = s.parse().map_err(|e| {
                     BasinError::InvalidSchema(format!(
                         "CREATE SEQUENCE {opt_name}: invalid integer {s:?} ({e})"
@@ -688,7 +694,10 @@ pub(crate) fn match_alter_sequence(sql: &str) -> Result<Option<AlterSequenceInte
             // original start value" — we encode that as Start(i64::MIN)
             // as a sentinel (exec_alter_sequence recognises this).
             let first_byte = after.bytes().next();
-            if first_byte.map(|b| b.is_ascii_digit() || b == b'-' || b == b'+').unwrap_or(false) {
+            if first_byte
+                .map(|b| b.is_ascii_digit() || b == b'-' || b == b'+')
+                .unwrap_or(false)
+            {
                 let (n, next) = read_signed_int(after, "RESTART")?;
                 options.push(SequenceOption::Start(n));
                 rest = next.trim_start();
@@ -781,9 +790,7 @@ pub(crate) async fn exec_alter_sequence(
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
 
     // Check existence before applying any option.
-    let def = catalog
-        .lookup_sequence(&sess.project, &intent.name)
-        .await;
+    let def = catalog.lookup_sequence(&sess.project, &intent.name).await;
     if def.is_none() {
         if intent.if_exists {
             return Ok(ExecResult::Empty {

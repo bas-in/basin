@@ -105,11 +105,7 @@ async fn basic_at_at_between_function_calls() {
 async fn at_at_with_parenthesised_operands() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let got = single_bool(
-        &sess,
-        "SELECT (to_tsvector('a b c')) @@ (to_tsquery('b'))",
-    )
-    .await;
+    let got = single_bool(&sess, "SELECT (to_tsvector('a b c')) @@ (to_tsquery('b'))").await;
     assert!(got);
 }
 
@@ -131,11 +127,7 @@ async fn at_at_with_cast_lhs() {
 async fn at_at_with_cast_rhs() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    let got = single_bool(
-        &sess,
-        "SELECT to_tsvector('a quick fox') @@ 'fox'::tsquery",
-    )
-    .await;
+    let got = single_bool(&sess, "SELECT to_tsvector('a quick fox') @@ 'fox'::tsquery").await;
     assert!(got);
 }
 
@@ -162,10 +154,7 @@ async fn triple_at_is_not_rewritten() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let result = sess.execute("SELECT 1 @@@ 2").await;
-    assert!(
-        result.is_err(),
-        "@@@ should error, got: {result:?}"
-    );
+    assert!(result.is_err(), "@@@ should error, got: {result:?}");
 }
 
 /// `@@` inside a single-quoted string literal is data, not an operator.

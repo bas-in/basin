@@ -340,10 +340,7 @@ async fn where_in_literal_list() {
 
     // Partial overlap.
     let rows = client
-        .query(
-            "SELECT id FROM users WHERE id IN (2, 99) ORDER BY id",
-            &[],
-        )
+        .query("SELECT id FROM users WHERE id IN (2, 99) ORDER BY id", &[])
         .await
         .expect("literal IN (partial)");
     let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
@@ -646,10 +643,7 @@ async fn insert_update_delete_returning() {
 
     // DELETE ... RETURNING the deleted row.
     let row = client
-        .query_one(
-            "DELETE FROM users WHERE id = $1 RETURNING id",
-            &[&102_i64],
-        )
+        .query_one("DELETE FROM users WHERE id = $1 RETURNING id", &[&102_i64])
         .await
         .expect("DELETE ... RETURNING");
     assert_eq!(row.get::<_, i64>(0), 102);
@@ -695,10 +689,7 @@ async fn upsert_on_conflict_do_nothing() {
         .await
         .expect("first insert (no conflict)");
     let hits = client
-        .query_one(
-            "SELECT hits FROM accounts WHERE email = $1",
-            &[&"u@x.com"],
-        )
+        .query_one("SELECT hits FROM accounts WHERE email = $1", &[&"u@x.com"])
         .await
         .expect("read")
         .get::<_, i64>(0);
@@ -714,10 +705,7 @@ async fn upsert_on_conflict_do_nothing() {
         .await
         .expect("second insert (conflict)");
     let hits = client
-        .query_one(
-            "SELECT hits FROM accounts WHERE email = $1",
-            &[&"u@x.com"],
-        )
+        .query_one("SELECT hits FROM accounts WHERE email = $1", &[&"u@x.com"])
         .await
         .expect("read after conflict")
         .get::<_, i64>(0);
@@ -774,16 +762,15 @@ async fn upsert_on_conflict_do_update() {
         .expect("upsert conflict");
 
     let hits = client
-        .query_one(
-            "SELECT hits FROM accounts WHERE email = $1",
-            &[&"u@x.com"],
-        )
+        .query_one("SELECT hits FROM accounts WHERE email = $1", &[&"u@x.com"])
         .await
         .expect("read after conflict")
         .get::<_, i64>(0);
-    assert_eq!(hits, 42, "conflict → DO UPDATE overwrote hits with EXCLUDED.hits");
+    assert_eq!(
+        hits, 42,
+        "conflict → DO UPDATE overwrote hits with EXCLUDED.hits"
+    );
 }
-
 
 // =============================================================================
 // 4. Transactions — every ORM wraps writes in BEGIN/COMMIT or BEGIN/ROLLBACK.
@@ -822,10 +809,7 @@ async fn transaction_commit_visibility_and_savepoint() {
     }
     // Both rows visible after COMMIT — the guarantee every ORM relies on.
     let n = client
-        .query_one(
-            "SELECT COUNT(*) FROM users WHERE id IN (200, 201)",
-            &[],
-        )
+        .query_one("SELECT COUNT(*) FROM users WHERE id IN (200, 201)", &[])
         .await
         .expect("post-commit count")
         .get::<_, i64>(0);

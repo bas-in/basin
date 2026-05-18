@@ -152,9 +152,13 @@ fn rewrite_one_pass(sql: &str, window_fns: &[&str]) -> String {
 
             // Look for IGNORE NULLS or RESPECT NULLS inside the argument list,
             // making sure it is not inside a nested string literal.
-            let modifier = if let Some(pos) = find_null_modifier(inner, inner_upper.as_str(), "IGNORE NULLS") {
+            let modifier = if let Some(pos) =
+                find_null_modifier(inner, inner_upper.as_str(), "IGNORE NULLS")
+            {
                 Some(("IGNORE NULLS", pos))
-            } else if let Some(pos) = find_null_modifier(inner, inner_upper.as_str(), "RESPECT NULLS") {
+            } else if let Some(pos) =
+                find_null_modifier(inner, inner_upper.as_str(), "RESPECT NULLS")
+            {
                 Some(("RESPECT NULLS", pos))
             } else {
                 None
@@ -175,8 +179,11 @@ fn rewrite_one_pass(sql: &str, window_fns: &[&str]) -> String {
                 // suffix: ')' optionally whitespace then rest of SQL.
                 // `&suffix[..1]` is the closing ')'; we re-emit it and then
                 // insert ' MODIFIER' right after it, followed by the rest.
-                let new_sql =
-                    format!("{prefix}{new_inner}{} {modifier_kw}{}", &suffix[..1], &suffix[1..]);
+                let new_sql = format!(
+                    "{prefix}{new_inner}{} {modifier_kw}{}",
+                    &suffix[..1],
+                    &suffix[1..]
+                );
 
                 return new_sql;
             }
@@ -371,14 +378,20 @@ mod tests {
             out.contains("FIRST_VALUE(x) IGNORE NULLS OVER"),
             "got: {out}"
         );
-        assert!(!out.contains("IGNORE NULLS)"), "modifier still inside: {out}");
+        assert!(
+            !out.contains("IGNORE NULLS)"),
+            "modifier still inside: {out}"
+        );
     }
 
     #[test]
     fn last_value_ignore_nulls_in_args_rewritten() {
         let sql = "SELECT LAST_VALUE(col IGNORE NULLS) OVER (ORDER BY ts) FROM t";
         let out = rewrite_ignore_nulls_in_args(sql);
-        assert!(out.contains("LAST_VALUE(col) IGNORE NULLS OVER"), "got: {out}");
+        assert!(
+            out.contains("LAST_VALUE(col) IGNORE NULLS OVER"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -390,7 +403,10 @@ mod tests {
             out.contains("LEAD(val, 1, 0) IGNORE NULLS OVER"),
             "got: {out}"
         );
-        assert!(!out.contains("IGNORE NULLS)"), "modifier still inside: {out}");
+        assert!(
+            !out.contains("IGNORE NULLS)"),
+            "modifier still inside: {out}"
+        );
     }
 
     #[test]
@@ -431,7 +447,10 @@ mod tests {
         let sql = "select first_value(x ignore nulls) over (order by t) from t";
         let out = rewrite_ignore_nulls_in_args(sql);
         // The function name casing is preserved; only the modifier is moved
-        assert!(out.contains("first_value(x)"), "arg should be stripped: {out}");
+        assert!(
+            out.contains("first_value(x)"),
+            "arg should be stripped: {out}"
+        );
         assert!(
             out.to_uppercase().contains("IGNORE NULLS OVER"),
             "modifier should be outside: {out}"

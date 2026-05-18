@@ -244,12 +244,27 @@ fn hash_one_predicate(h: &mut std::collections::hash_map::DefaultHasher, p: &Pre
 /// Hash a scalar directly without formatting it as a String.
 fn hash_scalar(h: &mut std::collections::hash_map::DefaultHasher, v: &ScalarValue) {
     match v {
-        ScalarValue::Int64(x) => { 0u8.hash(h); x.hash(h); }
-        ScalarValue::UInt64(x) => { 1u8.hash(h); x.hash(h); }
+        ScalarValue::Int64(x) => {
+            0u8.hash(h);
+            x.hash(h);
+        }
+        ScalarValue::UInt64(x) => {
+            1u8.hash(h);
+            x.hash(h);
+        }
         // Hash f64 via its bit representation so NaN is deterministic.
-        ScalarValue::Float64(x) => { 2u8.hash(h); x.to_bits().hash(h); }
-        ScalarValue::Utf8(s) => { 3u8.hash(h); s.hash(h); }
-        ScalarValue::Boolean(b) => { 4u8.hash(h); b.hash(h); }
+        ScalarValue::Float64(x) => {
+            2u8.hash(h);
+            x.to_bits().hash(h);
+        }
+        ScalarValue::Utf8(s) => {
+            3u8.hash(h);
+            s.hash(h);
+        }
+        ScalarValue::Boolean(b) => {
+            4u8.hash(h);
+            b.hash(h);
+        }
     }
 }
 

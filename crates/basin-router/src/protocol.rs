@@ -32,12 +32,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::TimeZone as _; // for Utc.timestamp_opt()
 use basin_common::Result;
 use basin_engine::{
-    AuthContext, BoundStatement, ExecResult, ScalarParam, StatementHandle, StatementSchema,
-    ProjectSession,
+    AuthContext, BoundStatement, ExecResult, ProjectSession, ScalarParam, StatementHandle,
+    StatementSchema,
 };
+use chrono::TimeZone as _; // for Utc.timestamp_opt()
 use futures::sink::{Sink, SinkExt};
 use pgwire::api::auth::{
     finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
@@ -725,24 +725,25 @@ fn decode_param_binary(
             // PG epoch: 2000-01-01 00:00:00 UTC
             // Unix epoch: 1970-01-01 00:00:00 UTC  →  delta = 10957 days
             const PG_EPOCH_DELTA_USEC: i64 = 10_957 * 86_400 * 1_000_000;
-            let unix_usec = pg_usec
-                .checked_add(PG_EPOCH_DELTA_USEC)
+            let unix_usec = pg_usec.checked_add(PG_EPOCH_DELTA_USEC).ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P03".to_owned(),
+                    "timestamp binary value overflows i64 microseconds".to_owned(),
+                )))
+            })?;
+            let secs = unix_usec.div_euclid(1_000_000);
+            let nanos = (unix_usec.rem_euclid(1_000_000) * 1_000) as u32;
+            let dt = chrono::Utc
+                .timestamp_opt(secs, nanos)
+                .single()
                 .ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_owned(),
                         "22P03".to_owned(),
-                        "timestamp binary value overflows i64 microseconds".to_owned(),
+                        format!("timestamp binary value out of range: pg_usec={pg_usec}"),
                     )))
                 })?;
-            let secs = unix_usec.div_euclid(1_000_000);
-            let nanos = (unix_usec.rem_euclid(1_000_000) * 1_000) as u32;
-            let dt = chrono::Utc.timestamp_opt(secs, nanos).single().ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "22P03".to_owned(),
-                    format!("timestamp binary value out of range: pg_usec={pg_usec}"),
-                )))
-            })?;
             let s = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
             Ok(ScalarParam::Text(s))
         }
@@ -812,47 +813,47 @@ where
     let stmt = stmts.into_iter().next()?;
 
     // Extract (table_name_sql, returning_items, dml_verb).
-    let (table_sql, returning_items, dml_verb): (String, Vec<SelectItem>, &'static str) =
-        match stmt {
-            Statement::Insert(ins) => {
-                let ret = ins.returning.clone()?; // None → no RETURNING → return None
-                if ret.is_empty() {
-                    return None;
-                }
-                let table_sql = match &ins.table {
-                    sqlparser::ast::TableObject::TableName(name) => name.to_string(),
-                    _ => return None,
-                };
-                (table_sql, ret, "INSERT")
+    let (table_sql, returning_items, dml_verb): (String, Vec<SelectItem>, &'static str) = match stmt
+    {
+        Statement::Insert(ins) => {
+            let ret = ins.returning.clone()?; // None → no RETURNING → return None
+            if ret.is_empty() {
+                return None;
             }
-            Statement::Update(upd) => {
-                let ret = upd.returning.clone()?;
-                if ret.is_empty() {
-                    return None;
-                }
-                let table_sql = match &upd.table.relation {
-                    TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return None,
-                };
-                (table_sql, ret, "UPDATE")
+            let table_sql = match &ins.table {
+                sqlparser::ast::TableObject::TableName(name) => name.to_string(),
+                _ => return None,
+            };
+            (table_sql, ret, "INSERT")
+        }
+        Statement::Update(upd) => {
+            let ret = upd.returning.clone()?;
+            if ret.is_empty() {
+                return None;
             }
-            Statement::Delete(del) => {
-                let ret = del.returning.clone()?;
-                if ret.is_empty() {
-                    return None;
-                }
-                let tables = match &del.from {
-                    FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
-                };
-                let twj = tables.first()?;
-                let table_sql = match &twj.relation {
-                    TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return None,
-                };
-                (table_sql, ret, "DELETE")
+            let table_sql = match &upd.table.relation {
+                TableFactor::Table { name, .. } => name.to_string(),
+                _ => return None,
+            };
+            (table_sql, ret, "UPDATE")
+        }
+        Statement::Delete(del) => {
+            let ret = del.returning.clone()?;
+            if ret.is_empty() {
+                return None;
             }
-            _ => return None,
-        };
+            let tables = match &del.from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+            };
+            let twj = tables.first()?;
+            let table_sql = match &twj.relation {
+                TableFactor::Table { name, .. } => name.to_string(),
+                _ => return None,
+            };
+            (table_sql, ret, "DELETE")
+        }
+        _ => return None,
+    };
 
     // Build a safe probe: SELECT <returning_items> FROM <table> WHERE false.
     // This never modifies any row; it only plans and executes a schema-discovery
@@ -929,7 +930,8 @@ where
             // Bind/Execute is ever sent.
             if let Err(emsg) = validate_copy_at_parse(session, &cmd).await {
                 let (sqlstate, message) = decode_copy_error(&emsg);
-                let info = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
+                let info =
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
                 return vec![PgWireBackendMessage::ErrorResponse(info.into())];
             }
             let mut g = state.lock().await;
@@ -965,9 +967,7 @@ where
             // populate `schema.columns`. The probe is side-effect-free.
             let mut dml_tag_prefix: Option<String> = None;
             if schema.columns.is_empty() {
-                if let Some((fields, verb)) =
-                    probe_returning_schema(session, &msg.query).await
-                {
+                if let Some((fields, verb)) = probe_returning_schema(session, &msg.query).await {
                     schema.columns = fields;
                     dml_tag_prefix = Some(verb);
                     tracing::debug!(
@@ -1570,7 +1570,11 @@ where
                     Ok(pb) => pb,
                     Err(emsg) => {
                         let (sqlstate, message) = decode_copy_error(&emsg);
-                        let info = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
+                        let info = ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            sqlstate.to_owned(),
+                            message.to_owned(),
+                        );
                         return ExecuteOutcome::error_info(info);
                     }
                 };
@@ -1611,7 +1615,11 @@ where
                     Ok(pb) => pb,
                     Err(emsg) => {
                         let (sqlstate, message) = decode_copy_error(&emsg);
-                        let info = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
+                        let info = ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            sqlstate.to_owned(),
+                            message.to_owned(),
+                        );
                         return ExecuteOutcome::error_info(info);
                     }
                 };
@@ -1666,13 +1674,9 @@ where
             opts,
         } => {
             // Run the subquery and stream the result as CSV to STDOUT.
-            let mut msgs = crate::copy::copy_query_to_stdout_messages(
-                session,
-                &query,
-                with_header,
-                &opts,
-            )
-            .await;
+            let mut msgs =
+                crate::copy::copy_query_to_stdout_messages(session, &query, with_header, &opts)
+                    .await;
             if matches!(msgs.last(), Some(PgWireBackendMessage::ReadyForQuery(_))) {
                 msgs.pop();
             }
@@ -2503,7 +2507,8 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                         return finish_copy_error(client, info.into()).await;
                     }
                 };
-                let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header, opts);
+                let mut state =
+                    crate::copy::CopyInState::new(table.clone(), cols, with_header, opts);
                 if let Some(list) = columns.clone() {
                     state = state.with_column_list(list);
                 }
@@ -3498,15 +3503,9 @@ mod tests {
 
     #[test]
     fn write_dml_detects_insert() {
-        assert!(super::sql_is_write_dml(
-            "INSERT INTO t (a) VALUES (1)"
-        ));
-        assert!(super::sql_is_write_dml(
-            "  insert into t (a) values (1)"
-        ));
-        assert!(super::sql_is_write_dml(
-            "INSERT INTO t SELECT * FROM src"
-        ));
+        assert!(super::sql_is_write_dml("INSERT INTO t (a) VALUES (1)"));
+        assert!(super::sql_is_write_dml("  insert into t (a) values (1)"));
+        assert!(super::sql_is_write_dml("INSERT INTO t SELECT * FROM src"));
     }
 
     #[test]
@@ -3545,9 +3544,7 @@ mod tests {
             "-- seed row\nINSERT INTO t (a) VALUES (1)"
         ));
         // SELECT after a comment is still not a write.
-        assert!(!super::sql_is_write_dml(
-            "/* read */ SELECT * FROM t"
-        ));
+        assert!(!super::sql_is_write_dml("/* read */ SELECT * FROM t"));
     }
 
     #[test]

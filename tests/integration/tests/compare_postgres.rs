@@ -192,7 +192,14 @@ async fn build_basin_engine() -> BasinInstance {
         shard: Some(shard),
     });
     let project = ProjectId::new();
-    BasinInstance { engine, project, bg, wal, dir, _wal_dir: wal_dir }
+    BasinInstance {
+        engine,
+        project,
+        bg,
+        wal,
+        dir,
+        _wal_dir: wal_dir,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -276,7 +283,10 @@ async fn scaling_5_compare_postgres() {
             pg_point_ms.push(ms);
         }
     }
-    assert!(!pg_point_ms.is_empty(), "no PG execution time samples parsed (point)");
+    assert!(
+        !pg_point_ms.is_empty(),
+        "no PG execution time samples parsed (point)"
+    );
     let pg_point_p50 = median(&pg_point_ms);
 
     // ---- PG range scan latency (~10 000 rows) ------------------------------
@@ -292,7 +302,10 @@ async fn scaling_5_compare_postgres() {
             pg_range_ms.push(ms);
         }
     }
-    assert!(!pg_range_ms.is_empty(), "no PG execution time samples parsed (range)");
+    assert!(
+        !pg_range_ms.is_empty(),
+        "no PG execution time samples parsed (range)"
+    );
     let pg_range_p50 = median(&pg_range_ms);
 
     // ---- PG aggregate (COUNT + SUM with GROUP BY) --------------------------
@@ -307,12 +320,19 @@ async fn scaling_5_compare_postgres() {
             pg_agg_ms.push(ms);
         }
     }
-    assert!(!pg_agg_ms.is_empty(), "no PG execution time samples parsed (agg)");
+    assert!(
+        !pg_agg_ms.is_empty(),
+        "no PG execution time samples parsed (agg)"
+    );
     let pg_agg_p50 = median(&pg_agg_ms);
 
     // ---- Basin setup -------------------------------------------------------
     let instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
     )
@@ -394,9 +414,7 @@ async fn scaling_5_compare_postgres() {
     for _ in 0..5 {
         let started = Instant::now();
         let res = sess
-            .execute(
-                "SELECT ts/1000000 AS bucket, COUNT(*), SUM(id) FROM events GROUP BY bucket",
-            )
+            .execute("SELECT ts/1000000 AS bucket, COUNT(*), SUM(id) FROM events GROUP BY bucket")
             .await
             .unwrap();
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
@@ -414,11 +432,19 @@ async fn scaling_5_compare_postgres() {
     let pg_cold_ms = {
         // For PG, cold start is a DISCARD ALL + fresh connection's first query.
         // We use a fresh connection to approximate a cold server cache.
-        let conn_str_cold = format!("host=127.0.0.1 port=5432 user={} dbname=postgres",
-            if conn_str.contains("user=pc") { "pc" } else { "postgres" });
+        let conn_str_cold = format!(
+            "host=127.0.0.1 port=5432 user={} dbname=postgres",
+            if conn_str.contains("user=pc") {
+                "pc"
+            } else {
+                "postgres"
+            }
+        );
         let cold_start = Instant::now();
         if let Ok((cold_client, cold_conn)) = tokio_postgres::connect(&conn_str_cold, NoTls).await {
-            tokio::spawn(async move { let _ = cold_conn.await; });
+            tokio::spawn(async move {
+                let _ = cold_conn.await;
+            });
             let _ = cold_client
                 .simple_query(&format!(
                     "SELECT COUNT(*) FROM {schema}.events WHERE id = {target_id}"

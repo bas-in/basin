@@ -667,7 +667,8 @@ async fn ensure_audit_table_exists(sess: &ProjectSession, audit_table: &TableNam
         Ok(_) => Ok(()),
         Err(BasinError::NotFound(_)) => {
             let schema = audit_schema();
-            cat.create_table(&sess.project, audit_table, &schema).await?;
+            cat.create_table(&sess.project, audit_table, &schema)
+                .await?;
             crate::session::refresh_table(
                 &sess.engine,
                 &sess.project,
@@ -790,7 +791,12 @@ pub(crate) async fn write_audit_rows(
     let cat = sess.engine.config().catalog.clone();
     let expected = meta.current_snapshot;
     match cat
-        .append_data_files(&sess.project, &audit_table, expected, vec![file_ref.clone()])
+        .append_data_files(
+            &sess.project,
+            &audit_table,
+            expected,
+            vec![file_ref.clone()],
+        )
         .await
     {
         Ok(_) => {}

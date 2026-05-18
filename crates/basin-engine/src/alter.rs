@@ -31,8 +31,8 @@
 //! Project scoping: every catalog mutator is project-scoped already; the
 //! engine never sees a non-project-qualified `Catalog::set_*` call.
 
-use arrow_schema::{Field, Schema};
 use crate::schema_ddl::SchemaState;
+use arrow_schema::{Field, Schema};
 use basin_catalog::{Catalog, CheckConstraint};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::{
@@ -350,7 +350,9 @@ impl BasinAlterExtension {
                         )));
                     }
                 }
-                catalog.set_cluster_columns(project, &table, columns).await?;
+                catalog
+                    .set_cluster_columns(project, &table, columns)
+                    .await?;
                 Ok("ALTER TABLE")
             }
             BasinAlterExtension::ResetClusterColumns { table } => {
@@ -793,8 +795,10 @@ async fn drop_constraint(
     let mut checks = meta.check_constraints.clone();
     let mut foreign_keys = meta.foreign_keys.clone();
     let mut uniques = meta.unique_constraints.clone();
-    let n_before =
-        checks.len() + foreign_keys.len() + uniques.len() + usize::from(!meta.pk_columns.is_empty());
+    let n_before = checks.len()
+        + foreign_keys.len()
+        + uniques.len()
+        + usize::from(!meta.pk_columns.is_empty());
     checks.retain(|c| !c.name.eq_ignore_ascii_case(name));
     foreign_keys.retain(|f| !f.name.eq_ignore_ascii_case(name));
     uniques.retain(|u| !u.name.eq_ignore_ascii_case(name));
@@ -810,10 +814,8 @@ async fn drop_constraint(
             meta.pk_columns.clone()
         }
     };
-    let n_after = checks.len()
-        + foreign_keys.len()
-        + uniques.len()
-        + usize::from(!pk_columns.is_empty());
+    let n_after =
+        checks.len() + foreign_keys.len() + uniques.len() + usize::from(!pk_columns.is_empty());
     if n_before == n_after {
         if if_exists {
             return Ok(());
@@ -972,7 +974,10 @@ fn parse_eq_int(rest: &str, what: &str) -> Result<i64> {
     // duration literal such as `'7d'`, `'12h'`, `'30m'`, `'45s'`. The
     // latter shape is what every PG-compat migration tool emits for
     // `cold_after = '7d'` and similar.
-    if let Some(inner) = val_str.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+    if let Some(inner) = val_str
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    {
         return parse_duration_to_seconds(inner, what);
     }
     if let Some(inner) = val_str.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
@@ -1251,10 +1256,9 @@ mod tests {
     fn match_schema_qualified_cold_after() {
         // `myschema.events` — schema prefix must be stripped; result table
         // name must equal bare `events`.
-        let m =
-            match_basin_alter_extension("ALTER TABLE myschema.events SET cold_after = 86400")
-                .unwrap()
-                .unwrap();
+        let m = match_basin_alter_extension("ALTER TABLE myschema.events SET cold_after = 86400")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             m,
             BasinAlterExtension::SetColdAfter {
@@ -1266,10 +1270,9 @@ mod tests {
 
     #[test]
     fn match_schema_qualified_cluster_by() {
-        let m =
-            match_basin_alter_extension("ALTER TABLE public.metrics CLUSTER BY (ts, id)")
-                .unwrap()
-                .unwrap();
+        let m = match_basin_alter_extension("ALTER TABLE public.metrics CLUSTER BY (ts, id)")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             m,
             BasinAlterExtension::SetClusterColumns {
@@ -1281,10 +1284,9 @@ mod tests {
 
     #[test]
     fn match_schema_qualified_reset_cluster_by() {
-        let m =
-            match_basin_alter_extension("ALTER TABLE myschema.events RESET CLUSTER BY")
-                .unwrap()
-                .unwrap();
+        let m = match_basin_alter_extension("ALTER TABLE myschema.events RESET CLUSTER BY")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             m,
             BasinAlterExtension::ResetClusterColumns {
@@ -1311,10 +1313,11 @@ mod tests {
 
     #[test]
     fn match_schema_qualified_validate_constraint() {
-        let m =
-            match_basin_alter_extension("ALTER TABLE myschema.orders VALIDATE CONSTRAINT orders_pkey")
-                .unwrap()
-                .unwrap();
+        let m = match_basin_alter_extension(
+            "ALTER TABLE myschema.orders VALIDATE CONSTRAINT orders_pkey",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             m,
             BasinAlterExtension::ValidateConstraint {
@@ -1328,10 +1331,10 @@ mod tests {
 
     #[test]
     fn single_part_object_name_strips_known_schema() {
-        use crate::schema_ddl::SchemaState;
-        use std::sync::{Arc, RwLock};
-        use sqlparser::ast::{Ident, ObjectName};
         use crate::pg_ast::ObjectNamePartExt as _;
+        use crate::schema_ddl::SchemaState;
+        use sqlparser::ast::{Ident, ObjectName};
+        use std::sync::{Arc, RwLock};
 
         let mut st = SchemaState::default();
         st.insert("myschema".to_string());
@@ -1349,15 +1352,14 @@ mod tests {
     #[test]
     fn single_part_object_name_bare_still_works() {
         use crate::schema_ddl::SchemaState;
-        use std::sync::{Arc, RwLock};
         use sqlparser::ast::{Ident, ObjectName};
+        use std::sync::{Arc, RwLock};
 
-        let schema_state: Arc<RwLock<SchemaState>> =
-            Arc::new(RwLock::new(SchemaState::default()));
+        let schema_state: Arc<RwLock<SchemaState>> = Arc::new(RwLock::new(SchemaState::default()));
 
-        let name = ObjectName(vec![
-            sqlparser::ast::ObjectNamePart::Identifier(Ident::new("events")),
-        ]);
+        let name = ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+            Ident::new("events"),
+        )]);
         let result = single_part_object_name(&name, &schema_state).unwrap();
         assert_eq!(result.as_str(), "events");
     }
@@ -1365,12 +1367,11 @@ mod tests {
     #[test]
     fn single_part_object_name_unknown_schema_errors() {
         use crate::schema_ddl::SchemaState;
-        use std::sync::{Arc, RwLock};
         use sqlparser::ast::{Ident, ObjectName};
+        use std::sync::{Arc, RwLock};
 
         // Only "public" is known by default; "badschema" is not.
-        let schema_state: Arc<RwLock<SchemaState>> =
-            Arc::new(RwLock::new(SchemaState::default()));
+        let schema_state: Arc<RwLock<SchemaState>> = Arc::new(RwLock::new(SchemaState::default()));
 
         let name = ObjectName(vec![
             sqlparser::ast::ObjectNamePart::Identifier(Ident::new("badschema")),
@@ -1383,12 +1384,11 @@ mod tests {
     #[test]
     fn single_part_object_name_public_schema_works() {
         use crate::schema_ddl::SchemaState;
-        use std::sync::{Arc, RwLock};
         use sqlparser::ast::{Ident, ObjectName};
+        use std::sync::{Arc, RwLock};
 
         // "public" is always in the default SchemaState.
-        let schema_state: Arc<RwLock<SchemaState>> =
-            Arc::new(RwLock::new(SchemaState::default()));
+        let schema_state: Arc<RwLock<SchemaState>> = Arc::new(RwLock::new(SchemaState::default()));
 
         let name = ObjectName(vec![
             sqlparser::ast::ObjectNamePart::Identifier(Ident::new("public")),

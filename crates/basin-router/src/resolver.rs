@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 
 /// Resolves a pgwire `user` to a `ProjectId`. Implementations must be safe to
 /// share across connections; `&self` is the only handle the router holds.
@@ -55,10 +55,9 @@ impl StaticProjectResolver {
 #[async_trait]
 impl ProjectResolver for StaticProjectResolver {
     async fn resolve(&self, username: &str) -> Result<ProjectId> {
-        self.map
-            .get(username)
-            .copied()
-            .ok_or_else(|| BasinError::not_found(format!("no project mapped for user {username:?}")))
+        self.map.get(username).copied().ok_or_else(|| {
+            BasinError::not_found(format!("no project mapped for user {username:?}"))
+        })
     }
 }
 

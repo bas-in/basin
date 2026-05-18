@@ -46,7 +46,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use basin_catalog::{Catalog, DataFileRef, InMemoryCatalog};
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::{
     evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ReadOptions,

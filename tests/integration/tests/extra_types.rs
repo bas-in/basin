@@ -121,11 +121,7 @@ async fn decimal_synonym_accepted() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec_ok(
-        &sess,
-        "CREATE TABLE dec_test (v DECIMAL(6,3) NOT NULL)",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TABLE dec_test (v DECIMAL(6,3) NOT NULL)").await;
     exec_ok(&sess, "INSERT INTO dec_test VALUES (3.141)").await;
 
     let batches = rows(&sess, "SELECT v FROM dec_test").await;
@@ -190,11 +186,7 @@ async fn inet_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec_ok(
-        &sess,
-        "CREATE TABLE hosts (id BIGINT NOT NULL, addr INET)",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TABLE hosts (id BIGINT NOT NULL, addr INET)").await;
 
     exec_ok(
         &sess,
@@ -253,11 +245,7 @@ async fn cidr_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec_ok(
-        &sess,
-        "CREATE TABLE nets (id BIGINT NOT NULL, net CIDR)",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TABLE nets (id BIGINT NOT NULL, net CIDR)").await;
 
     exec_ok(
         &sess,
@@ -298,11 +286,7 @@ async fn macaddr_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec_ok(
-        &sess,
-        "CREATE TABLE nics (id BIGINT NOT NULL, mac MACADDR)",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TABLE nics (id BIGINT NOT NULL, mac MACADDR)").await;
 
     exec_ok(
         &sess,
@@ -397,7 +381,11 @@ async fn bit_fixed_round_trip() {
     )
     .await;
 
-    exec_ok(&sess, "INSERT INTO flags VALUES (1, '10101010'), (2, '00000000')").await;
+    exec_ok(
+        &sess,
+        "INSERT INTO flags VALUES (1, '10101010'), (2, '00000000')",
+    )
+    .await;
 
     let batches = rows(&sess, "SELECT id, bits FROM flags ORDER BY id").await;
     let schema0 = batches[0].schema();

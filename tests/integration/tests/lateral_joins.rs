@@ -93,7 +93,11 @@ async fn lateral_non_correlated_subquery() {
     .await;
 
     // 3 rows in t × 1 row from subquery → 3 output rows.
-    assert_eq!(total_rows(&batches), 3, "FROM t, LATERAL (constant) sub should produce one row per outer row");
+    assert_eq!(
+        total_rows(&batches),
+        3,
+        "FROM t, LATERAL (constant) sub should produce one row per outer row"
+    );
 
     // Verify the constant value flows through.
     if let Some(batch) = batches.first() {
@@ -215,7 +219,11 @@ async fn table_function_in_from() {
     let batches = exec_ok(&sess, "SELECT value FROM generate_series(1, 5)").await;
 
     // generate_series(1, 5) should emit 5 rows: 1, 2, 3, 4, 5.
-    assert_eq!(total_rows(&batches), 5, "generate_series(1, 5) should emit 5 rows");
+    assert_eq!(
+        total_rows(&batches),
+        5,
+        "generate_series(1, 5) should emit 5 rows"
+    );
 
     // Verify the values are correct: first batch, first column should be [1,2,3,4,5].
     if let Some(batch) = batches.first() {

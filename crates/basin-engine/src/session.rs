@@ -20,14 +20,14 @@
 //! the `basin://` synthetic scheme (simplest) or change paths to `s3://...`.
 //! The `register_object_store` call is the single switch point.
 
-use std::collections::HashMap;
 use crate::pg_ast::ObjectNamePartExt;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::AuthContext;
 
 use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId};
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
@@ -36,8 +36,8 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
 use sqlparser::ast::ValueWithSpan;
+use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::sync::Mutex;
@@ -246,10 +246,7 @@ impl SessionState {
 /// already active (matches PG behaviour for `WARNING: there is already a
 /// transaction in progress`).  Resets `aborted` and the savepoint stack.
 pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableName, SnapshotId>) {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     // Idempotent: if already active, leave state unchanged (matches PG
     // WARNING: there is already a transaction in progress).
     if !tx.active {
@@ -265,10 +262,7 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
 /// pending files map so the executor can flush them to the catalog.
 /// Clears all txn state afterwards.
 pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFileRef>> {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     let pending = std::mem::take(&mut tx.pending_files);
     tx.active = false;
     tx.aborted = false;
@@ -286,11 +280,11 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
 /// read-views).  Clears all txn state.
 pub(crate) fn tx_rollback(
     state: &SessionState,
-) -> (HashMap<TableName, Vec<DataFileRef>>, HashMap<TableName, SnapshotId>) {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+) -> (
+    HashMap<TableName, Vec<DataFileRef>>,
+    HashMap<TableName, SnapshotId>,
+) {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     let pending = std::mem::take(&mut tx.pending_files);
     let snapshots = std::mem::take(&mut tx.pre_tx_snapshots);
     tx.active = false;
@@ -326,20 +320,14 @@ pub(crate) fn tx_is_aborted(state: &SessionState) -> bool {
 /// Set the aborted flag on the current transaction. Called whenever any
 /// statement fails while `tx_is_active` is true.
 pub(crate) fn tx_set_aborted(state: &SessionState) {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     tx.aborted = true;
 }
 
 /// Append a pending data file for `table` during an active transaction.
 /// The file is visible only to this session until `COMMIT`.
 pub(crate) fn tx_push_pending_file(state: &SessionState, table: &TableName, file: DataFileRef) {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     tx.pending_files
         .entry(table.clone())
         .or_default()
@@ -349,26 +337,23 @@ pub(crate) fn tx_push_pending_file(state: &SessionState, table: &TableName, file
 /// Create a new savepoint with `name`, recording the current pending-file
 /// watermark for every touched table.
 pub(crate) fn tx_push_savepoint(state: &SessionState, name: String) {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     let offsets: HashMap<TableName, usize> = tx
         .pending_files
         .iter()
         .map(|(t, v)| (t.clone(), v.len()))
         .collect();
-    tx.savepoints.push(SavepointFrame { name, file_offsets: offsets });
+    tx.savepoints.push(SavepointFrame {
+        name,
+        file_offsets: offsets,
+    });
 }
 
 /// Release the named savepoint (PG: RELEASE SAVEPOINT <name>).
 /// The writes that happened after it remain pending. Returns `Err` if
 /// the savepoint name is not found.
 pub(crate) fn tx_release_savepoint(state: &SessionState, name: &str) -> Result<()> {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     // Find the last frame with this name (PG allows name reuse; RELEASE
     // removes the most-recently-created one with that name).
     let pos = tx.savepoints.iter().rposition(|f| f.name == name);
@@ -395,11 +380,11 @@ pub(crate) fn tx_release_savepoint(state: &SessionState, name: &str) -> Result<(
 pub(crate) fn tx_rollback_to_savepoint(
     state: &SessionState,
     name: &str,
-) -> Result<(HashMap<TableName, Vec<DataFileRef>>, HashMap<TableName, SnapshotId>)> {
-    let mut tx = state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned");
+) -> Result<(
+    HashMap<TableName, Vec<DataFileRef>>,
+    HashMap<TableName, SnapshotId>,
+)> {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     // Find the savepoint frame.
     let pos = tx.savepoints.iter().rposition(|f| f.name == name);
     let pos = match pos {
@@ -408,7 +393,7 @@ pub(crate) fn tx_rollback_to_savepoint(
             // PG: SQLSTATE 3B001 (no_such_savepoint).
             return Err(BasinError::InvalidSchema(format!(
                 "savepoint \"{name}\" does not exist (SQLSTATE 3B001)"
-            )))
+            )));
         }
     };
     // PG: keep the named savepoint, drop only the inner (later) ones.
@@ -439,10 +424,7 @@ pub(crate) fn tx_rollback_to_savepoint(
 }
 
 /// Returns the current pending files for `table` (for within-tx reads).
-pub(crate) fn tx_pending_files_for(
-    state: &SessionState,
-    table: &TableName,
-) -> Vec<DataFileRef> {
+pub(crate) fn tx_pending_files_for(state: &SessionState, table: &TableName) -> Vec<DataFileRef> {
     state
         .tx_state
         .lock()
@@ -1066,11 +1048,26 @@ fn literal_to_micros(expr: &Expr) -> Option<i64> {
         other => other,
     };
     match inner {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::DoubleQuotedString(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::EscapedStringLiteral(s), .. })
-        | Expr::Value(ValueWithSpan { value: Value::NationalStringLiteral(s), .. }) => parse_timestamp_string_for_pruning(s),
-        Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => n.parse().ok(),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::DoubleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::EscapedStringLiteral(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::NationalStringLiteral(s),
+            ..
+        }) => parse_timestamp_string_for_pruning(s),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse().ok(),
         _ => None,
     }
 }
@@ -1123,13 +1120,13 @@ mod tests {
         use std::sync::Arc;
         use std::time::Instant;
 
+        use crate::AuthContext;
+        use crate::{Engine, EngineConfig};
         use basin_catalog::{Catalog, InMemoryCatalog};
         use basin_common::ProjectId;
-        use crate::{Engine, EngineConfig};
-        use crate::AuthContext;
-        use datafusion::prelude::SessionContext;
         use datafusion::execution::config::SessionConfig;
         use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionContext;
         use object_store::local::LocalFileSystem;
         use tempfile::TempDir;
 
@@ -1142,7 +1139,11 @@ mod tests {
             page_cache: None,
         });
         let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-        let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+        let engine = Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        });
         let auth = Arc::new(AuthContext::anonymous());
 
         const ITERS: usize = 200;
@@ -1152,7 +1153,10 @@ mod tests {
         // Warm up.
         for _ in 0..10 {
             let cfg = SessionConfig::new()
-                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .set_str(
+                    "datafusion.execution.listing_table_ignore_subdirectory",
+                    "false",
+                )
                 .with_target_partitions(1);
             let ctx = SessionContext::new_with_config(cfg);
             crate::udf::register_distance_udfs(&ctx);
@@ -1173,7 +1177,10 @@ mod tests {
         for _ in 0..ITERS {
             let t0 = Instant::now();
             let cfg = SessionConfig::new()
-                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .set_str(
+                    "datafusion.execution.listing_table_ignore_subdirectory",
+                    "false",
+                )
                 .with_target_partitions(1);
             let ctx = SessionContext::new_with_config(cfg);
             crate::udf::register_distance_udfs(&ctx);
@@ -1206,7 +1213,10 @@ mod tests {
         // Warm up.
         for _ in 0..10 {
             let cfg = SessionConfig::new()
-                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .set_str(
+                    "datafusion.execution.listing_table_ignore_subdirectory",
+                    "false",
+                )
                 .with_target_partitions(1);
             let state = SessionStateBuilder::new()
                 .with_config(cfg)
@@ -1221,7 +1231,10 @@ mod tests {
         for _ in 0..ITERS {
             let t0 = Instant::now();
             let cfg = SessionConfig::new()
-                .set_str("datafusion.execution.listing_table_ignore_subdirectory", "false")
+                .set_str(
+                    "datafusion.execution.listing_table_ignore_subdirectory",
+                    "false",
+                )
                 .with_target_partitions(1);
             let state = SessionStateBuilder::new()
                 .with_config(cfg)
@@ -1242,9 +1255,7 @@ mod tests {
             "AFTER  (batched UDF cache, 3 individual register_udf for auth):  mean={after_mean:.3}ms  p50={after_p50:.3}ms  p95={after_p95:.3}ms"
         );
         let speedup = before_p50 / after_p50;
-        println!(
-            "Improvement: p50 {speedup:.1}x faster ({before_p50:.3}ms -> {after_p50:.3}ms)",
-        );
+        println!("Improvement: p50 {speedup:.1}x faster ({before_p50:.3}ms -> {after_p50:.3}ms)",);
     }
 
     // -------------------------------------------------------------------------
@@ -1320,7 +1331,11 @@ mod tests {
         tx_begin(&state, heads);
 
         // Push a pending file.
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/events/data/f1.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/events/data/f1.parquet"),
+        );
 
         let pending = tx_commit(&state);
 
@@ -1335,8 +1350,14 @@ mod tests {
         );
 
         let tx = state.tx_state.lock().expect("lock");
-        assert!(tx.pre_tx_snapshots.is_empty(), "tx_commit must clear pre_tx_snapshots");
-        assert!(tx.pending_files.is_empty(), "pending_files cleared inside TxState");
+        assert!(
+            tx.pre_tx_snapshots.is_empty(),
+            "tx_commit must clear pre_tx_snapshots"
+        );
+        assert!(
+            tx.pending_files.is_empty(),
+            "pending_files cleared inside TxState"
+        );
     }
 
     /// ROLLBACK clears the active flag and returns pending files + snapshots.
@@ -1349,7 +1370,11 @@ mod tests {
         heads.insert(table.clone(), basin_catalog::SnapshotId(99));
         tx_begin(&state, heads);
 
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/logs/data/f1.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/logs/data/f1.parquet"),
+        );
 
         let (pending, snapshots) = tx_rollback(&state);
 
@@ -1442,8 +1467,16 @@ mod tests {
         let table = TableName::new("t").unwrap();
         tx_begin(&state, HashMap::new());
 
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/a.parquet"),
+        );
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/b.parquet"),
+        );
 
         let files = tx_pending_files_for(&state, &table);
         assert_eq!(files.len(), 2);
@@ -1459,9 +1492,17 @@ mod tests {
         let table = TableName::new("t").unwrap();
         tx_begin(&state, HashMap::new());
 
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/a.parquet"),
+        );
         tx_push_savepoint(&state, "sp1".to_string());
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/b.parquet"),
+        );
 
         // Two files in pending.
         let files = tx_pending_files_for(&state, &table);
@@ -1480,10 +1521,22 @@ mod tests {
         let table = TableName::new("t").unwrap();
         tx_begin(&state, HashMap::new());
 
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/a.parquet"),
+        );
         tx_push_savepoint(&state, "sp1".to_string());
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/c.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/b.parquet"),
+        );
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/c.parquet"),
+        );
 
         // 3 files total; sp1 recorded offset=1.
         let (abandoned, _) = tx_rollback_to_savepoint(&state, "sp1").unwrap();
@@ -1505,9 +1558,17 @@ mod tests {
         let table = TableName::new("t").unwrap();
         tx_begin(&state, HashMap::new());
 
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/a.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/a.parquet"),
+        );
         tx_push_savepoint(&state, "sp1".to_string());
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/t/data/b.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/t/data/b.parquet"),
+        );
 
         tx_release_savepoint(&state, "sp1").unwrap();
 
@@ -1544,7 +1605,10 @@ mod tests {
         tx_set_aborted(&state);
         assert!(tx_is_aborted(&state));
         let _ = tx_rollback_to_savepoint(&state, "sp").unwrap();
-        assert!(!tx_is_aborted(&state), "ROLLBACK TO SAVEPOINT must clear aborted");
+        assert!(
+            !tx_is_aborted(&state),
+            "ROLLBACK TO SAVEPOINT must clear aborted"
+        );
     }
 
     /// COMMIT after BEGIN returns the pending files and leaves state clean.
@@ -1556,7 +1620,11 @@ mod tests {
         heads.insert(table.clone(), basin_catalog::SnapshotId(5));
         tx_begin(&state, heads);
 
-        tx_push_pending_file(&state, &table, make_file_ref("projects/p/tables/u/data/x.parquet"));
+        tx_push_pending_file(
+            &state,
+            &table,
+            make_file_ref("projects/p/tables/u/data/x.parquet"),
+        );
         let pending = tx_commit(&state);
         assert_eq!(pending.get(&table).map(|v| v.len()), Some(1));
 

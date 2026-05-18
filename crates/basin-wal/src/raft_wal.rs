@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, PartitionKey, Result, ProjectCounterRegistry, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectCounterRegistry, ProjectId, Result};
 use bytes::Bytes;
 use chrono::Utc;
 use openraft::error::{NetworkError, RPCError, RaftError, RemoteError};

@@ -33,14 +33,14 @@
 //! [`crate::dml`] (label / CHECK validation) and at
 //! `drop_enum_type` / `drop_domain` time by the catalog (refcounting).
 
-use std::collections::HashMap;
 use crate::pg_ast::ObjectNamePartExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::Field;
 use basin_catalog::{Catalog, DomainDef, EnumTypeDef, SqlArgType};
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use sqlparser::ast::{ColumnDef, DataType as SqlDataType, Ident, ObjectName};
 
 use crate::types::{BASIN_DOMAIN_KEY, BASIN_ENUM_TYPE_KEY};
@@ -1048,11 +1048,9 @@ fn pg_type_name_to_sql_arg(tn: &pg_query::protobuf::TypeName) -> Result<SqlArgTy
 /// between `CHECK (` and the matching `)`.
 ///
 /// Returns `None` when there are no CHECK constraints.
-fn extract_check_predicate(
-    constraints: &[pg_query::protobuf::Node],
-) -> Result<Option<String>> {
-    use pg_query::NodeEnum;
+fn extract_check_predicate(constraints: &[pg_query::protobuf::Node]) -> Result<Option<String>> {
     use pg_query::protobuf::ConstrType;
+    use pg_query::NodeEnum;
 
     for node in constraints {
         let Some(NodeEnum::Constraint(c)) = node.node.as_ref() else {
@@ -1291,7 +1289,10 @@ mod tests {
         // The CHECK predicate should contain the expression (exact form
         // depends on deparse output, but must mention the comparison).
         let pred = check.expect("should have CHECK predicate");
-        assert!(pred.contains('>') || pred.contains("value"), "pred={pred:?}");
+        assert!(
+            pred.contains('>') || pred.contains("value"),
+            "pred={pred:?}"
+        );
     }
 
     #[test]

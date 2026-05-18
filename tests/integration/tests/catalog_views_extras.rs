@@ -141,11 +141,7 @@ async fn pg_stat_activity_selectable() {
 async fn information_schema_check_constraints_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(
-        &sess,
-        "SELECT * FROM information_schema.check_constraints",
-    )
-    .await;
+    assert_no_error(&sess, "SELECT * FROM information_schema.check_constraints").await;
 }
 
 #[tokio::test]
@@ -180,22 +176,14 @@ async fn information_schema_parameters_selectable() {
 async fn information_schema_role_table_grants_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(
-        &sess,
-        "SELECT * FROM information_schema.role_table_grants",
-    )
-    .await;
+    assert_no_error(&sess, "SELECT * FROM information_schema.role_table_grants").await;
 }
 
 #[tokio::test]
 async fn information_schema_user_defined_types_selectable() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
-    assert_no_error(
-        &sess,
-        "SELECT * FROM information_schema.user_defined_types",
-    )
-    .await;
+    assert_no_error(&sess, "SELECT * FROM information_schema.user_defined_types").await;
 }
 
 #[tokio::test]

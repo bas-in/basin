@@ -53,12 +53,18 @@ async fn local_wal_implements_trait() {
 
     wal.flush().await.unwrap();
 
-    let entries = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
+    let entries = wal
+        .read_from(&project, &partition, Lsn::ZERO)
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 5);
     assert_eq!(wal.high_water(&project, &partition).await.unwrap(), Lsn(5));
 
     wal.truncate(&project, &partition, Lsn(3)).await.unwrap();
-    let remaining = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
+    let remaining = wal
+        .read_from(&project, &partition, Lsn::ZERO)
+        .await
+        .unwrap();
     // After truncate(<=3) only entries with lsn > 3 remain on durable storage.
     // Entries that were still in the in-RAM buffer are also returned.
     assert!(remaining.iter().all(|e| e.lsn > Lsn(0)));
@@ -89,7 +95,10 @@ async fn raft_wal_single_node_implements_trait() {
         .unwrap();
     assert_eq!(lsn, Lsn(1));
 
-    let entries = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
+    let entries = wal
+        .read_from(&project, &partition, Lsn::ZERO)
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(wal.high_water(&project, &partition).await.unwrap(), Lsn(1));
 
@@ -132,7 +141,10 @@ async fn arc_dyn_wal_is_cheap_to_clone() {
         .append(&project, &partition, Bytes::from("hello"))
         .await
         .unwrap();
-    let entries = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
+    let entries = wal
+        .read_from(&project, &partition, Lsn::ZERO)
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 1);
     wal.close().await.unwrap();
 }

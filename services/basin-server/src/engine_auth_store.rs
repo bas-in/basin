@@ -38,11 +38,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use basin_auth::store::{
     ApiKeyRow, AuthMagicLinkRow, AuthStore, AuthUser, EmailTokenRow, MagicLinkEmailTokenRow,
-    RefreshRevocationRow, ProjectCredentialRow,
+    ProjectCredentialRow, RefreshRevocationRow,
 };
 use basin_auth::{api_keys::ApiKeyDescriptor, project_credentials::ProjectCredentialDescriptor};
-use basin_common::{BasinError, Result, ProjectId};
-use basin_engine::{Engine, ExecResult, ScalarParam, ProjectSession};
+use basin_common::{BasinError, ProjectId, Result};
+use basin_engine::{Engine, ExecResult, ProjectSession, ScalarParam};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -406,7 +406,11 @@ impl AuthStore for EngineAuthStore {
         Ok(user_id)
     }
 
-    async fn find_user_by_email(&self, project: &ProjectId, email: &str) -> Result<Option<AuthUser>> {
+    async fn find_user_by_email(
+        &self,
+        project: &ProjectId,
+        email: &str,
+    ) -> Result<Option<AuthUser>> {
         let sql = format!(
             "SELECT user_id, email, password_hash, email_verified_at
              FROM {sch}_users
@@ -428,7 +432,11 @@ impl AuthStore for EngineAuthStore {
         })
     }
 
-    async fn find_user_by_id(&self, project: &ProjectId, user_id: Uuid) -> Result<Option<AuthUser>> {
+    async fn find_user_by_id(
+        &self,
+        project: &ProjectId,
+        user_id: Uuid,
+    ) -> Result<Option<AuthUser>> {
         let sql = format!(
             "SELECT user_id, email, password_hash, email_verified_at
              FROM {sch}_users
@@ -639,7 +647,10 @@ impl AuthStore for EngineAuthStore {
             sch = self.sch()
         );
         let (_, user_batches) = self
-            .query_params(&sql_user, vec![p_uuid(user_id), p_text(project.to_string())])
+            .query_params(
+                &sql_user,
+                vec![p_uuid(user_id), p_text(project.to_string())],
+            )
             .await
             .map_err(|e| BasinError::catalog(format!("find_magic_link_email_token user: {e}")))?;
         let email = match first_row_opt(&user_batches, |b, r| {
@@ -875,7 +886,10 @@ impl AuthStore for EngineAuthStore {
                 sch = self.sch()
             );
             let (_, batches) = self
-                .query_params(&sql_exists, vec![p_i64(key_id), p_text(project.to_string())])
+                .query_params(
+                    &sql_exists,
+                    vec![p_i64(key_id), p_text(project.to_string())],
+                )
                 .await
                 .map_err(|e| BasinError::catalog(format!("revoke_api_key check: {e}")))?;
             let exists = batches.iter().any(|b| b.num_rows() > 0);
@@ -1113,7 +1127,9 @@ impl AuthStore for EngineAuthStore {
         all_rows(&batches, |b, r| {
             let t_str = get_text(b, r, 0).unwrap_or_default();
             let t: ProjectId = t_str.parse().map_err(|e| {
-                BasinError::internal(format!("list_legacy_project_credentials project parse: {e}"))
+                BasinError::internal(format!(
+                    "list_legacy_project_credentials project parse: {e}"
+                ))
             })?;
             Ok((t, get_text(b, r, 1).unwrap_or_default()))
         })

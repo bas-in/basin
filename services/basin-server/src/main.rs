@@ -120,8 +120,8 @@ use basin_common::{
     ProjectId,
 };
 use basin_router::{
-    ApiKeyProjectResolver, JwtProjectResolver, ServerConfig, StackedProjectResolver,
-    StaticProjectResolver, ProjectCredentialsResolver, ProjectResolver, TlsConfig,
+    ApiKeyProjectResolver, JwtProjectResolver, ProjectCredentialsResolver, ProjectResolver,
+    ServerConfig, StackedProjectResolver, StaticProjectResolver, TlsConfig,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;

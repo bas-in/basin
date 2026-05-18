@@ -36,7 +36,8 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 use sha2::Digest;
@@ -1478,19 +1479,19 @@ fn pg_format_postprocess(s: String, dt: chrono::NaiveDateTime) -> String {
     // is JD 2440588.
     let julian = {
         let epoch_jd: i64 = 2_440_588;
-        let days_since_epoch = dt.signed_duration_since(
-            chrono::NaiveDateTime::new(
+        let days_since_epoch = dt
+            .signed_duration_since(chrono::NaiveDateTime::new(
                 chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
                 chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-            ),
-        ).num_days();
+            ))
+            .num_days();
         epoch_jd + days_since_epoch
     };
 
     s.replace("\x01CC\x01", &format!("{cc:02}"))
-     .replace("\x01Q\x01", &format!("{q}"))
-     .replace("\x01W\x01", &format!("{w}"))
-     .replace("\x01J\x01", &format!("{julian}"))
+        .replace("\x01Q\x01", &format!("{q}"))
+        .replace("\x01W\x01", &format!("{w}"))
+        .replace("\x01J\x01", &format!("{julian}"))
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1849,7 +1850,11 @@ impl ScalarUDFImpl for ToCharPgUdf {
         // Dispatch on the first argument type.
         let is_numeric = matches!(
             val_arr.data_type(),
-            DataType::Float64 | DataType::Float32 | DataType::Int64 | DataType::Int32 | DataType::Int16
+            DataType::Float64
+                | DataType::Float32
+                | DataType::Int64
+                | DataType::Int32
+                | DataType::Int16
         );
 
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
@@ -1857,8 +1862,12 @@ impl ScalarUDFImpl for ToCharPgUdf {
             // Numeric picture formatting path.
             let val_f64 = datafusion::arrow::compute::cast(&val_arr, &DataType::Float64)
                 .map_err(|e| DataFusionError::Execution(format!("to_char(numeric): {e}")))?;
-            let val_f64 = val_f64.as_any().downcast_ref::<Float64Array>()
-                .ok_or_else(|| DataFusionError::Execution("to_char(numeric): cast to Float64 failed".into()))?;
+            let val_f64 = val_f64
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("to_char(numeric): cast to Float64 failed".into())
+                })?;
             for i in 0..n {
                 if val_f64.is_null(i) || fmt.is_null(i) {
                     out.push(None);
@@ -2011,9 +2020,13 @@ impl ScalarUDFImpl for ToDatePgUdf {
             .unwrap_or(1);
         let txt = args[0].clone().into_array(n)?;
         let fmt = args[1].clone().into_array(n)?;
-        let txt = txt.as_any().downcast_ref::<StringArray>()
+        let txt = txt
+            .as_any()
+            .downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Execution("to_date: arg 1 must be Utf8".into()))?;
-        let fmt = fmt.as_any().downcast_ref::<StringArray>()
+        let fmt = fmt
+            .as_any()
+            .downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Execution("to_date: arg 2 must be Utf8".into()))?;
 
         let mut out = Date32Builder::with_capacity(n);
@@ -2029,10 +2042,14 @@ impl ScalarUDFImpl for ToDatePgUdf {
                     chrono::NaiveDateTime::parse_from_str(txt.value(i), &chrono_fmt)
                         .map(|dt| dt.date())
                 })
-                .map_err(|e| DataFusionError::Execution(format!(
-                    "to_date: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
-                    txt.value(i), fmt.value(i), chrono_fmt
-                )))?;
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "to_date: failed to parse {:?} with format {:?} (chrono {:?}): {e}",
+                        txt.value(i),
+                        fmt.value(i),
+                        chrono_fmt
+                    ))
+                })?;
             // Days since Unix epoch.
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             let days = (date - epoch).num_days() as i32;
@@ -2056,10 +2073,18 @@ struct ConvertBytesUdf {
 }
 
 impl ScalarUDFImpl for ConvertBytesUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "convert" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Binary) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "convert"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Binary)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2069,18 +2094,27 @@ impl ScalarUDFImpl for ConvertBytesUdf {
         }
         let n = args
             .iter()
-            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
             .max()
             .unwrap_or(1);
         let bytes_arr = args[0].clone().into_array(n)?;
         let src_arr = args[1].clone().into_array(n)?;
         let dst_arr = args[2].clone().into_array(n)?;
 
-        let bytes = bytes_arr.as_any().downcast_ref::<BinaryArray>()
+        let bytes = bytes_arr
+            .as_any()
+            .downcast_ref::<BinaryArray>()
             .ok_or_else(|| DataFusionError::Execution("convert: arg 1 must be Binary".into()))?;
-        let src = src_arr.as_any().downcast_ref::<StringArray>()
+        let src = src_arr
+            .as_any()
+            .downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Execution("convert: arg 2 must be Utf8".into()))?;
-        let dst = dst_arr.as_any().downcast_ref::<StringArray>()
+        let dst = dst_arr
+            .as_any()
+            .downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Execution("convert: arg 3 must be Utf8".into()))?;
 
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
@@ -2128,10 +2162,18 @@ struct LengthPgUdf {
 }
 
 impl ScalarUDFImpl for LengthPgUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "length" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int32) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "length"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int32)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -2139,22 +2181,31 @@ impl ScalarUDFImpl for LengthPgUdf {
         if args.len() != 1 {
             return exec_err!("length expects 1 argument, got {}", args.len());
         }
-        let n = match &args[0] { ColumnarValue::Array(arr) => arr.len(), _ => 1 };
+        let n = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            _ => 1,
+        };
         let arr = args[0].clone().into_array(n)?;
         let mut out = Int32Builder::with_capacity(n);
         match arr.data_type() {
             DataType::Binary => {
                 let bytes = arr.as_any().downcast_ref::<BinaryArray>().unwrap();
                 for i in 0..n {
-                    if bytes.is_null(i) { out.append_null(); }
-                    else { out.append_value(bytes.value(i).len() as i32); }
+                    if bytes.is_null(i) {
+                        out.append_null();
+                    } else {
+                        out.append_value(bytes.value(i).len() as i32);
+                    }
                 }
             }
             DataType::Utf8 => {
                 let strings = arr.as_any().downcast_ref::<StringArray>().unwrap();
                 for i in 0..n {
-                    if strings.is_null(i) { out.append_null(); }
-                    else { out.append_value(strings.value(i).chars().count() as i32); }
+                    if strings.is_null(i) {
+                        out.append_null();
+                    } else {
+                        out.append_value(strings.value(i).chars().count() as i32);
+                    }
                 }
             }
             other => return exec_err!("length: unsupported type {other:?}"),
@@ -2195,7 +2246,11 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
         let width = tpl.len();
         let v = value as i64;
         let s = format!("{v:0>width$X}", width = width, v = v.unsigned_abs() as u64);
-        let s = if fm { s.trim_start_matches('0').to_string() } else { s };
+        let s = if fm {
+            s.trim_start_matches('0').to_string()
+        } else {
+            s
+        };
         return Ok(s);
     }
 
@@ -2203,9 +2258,15 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
     if tpl.to_uppercase().contains("EEEE") {
         let before_e = &tpl[..tpl.to_uppercase().find("EEEE").unwrap()];
         let decimal_digits = before_e.chars().filter(|&c| c == '9' || c == '0').count();
-        let frac_digits = before_e.find('.').map(|p| {
-            before_e[p+1..].chars().filter(|&c| c == '9' || c == '0').count()
-        }).unwrap_or(0);
+        let frac_digits = before_e
+            .find('.')
+            .map(|p| {
+                before_e[p + 1..]
+                    .chars()
+                    .filter(|&c| c == '9' || c == '0')
+                    .count()
+            })
+            .unwrap_or(0);
         let _ = decimal_digits; // suppress warning
         let s = format!("{value:.frac_digits$e}");
         // Normalise Rust's `e` form to PG's `e+NN` form.
@@ -2223,7 +2284,7 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
     // General numeric picture.
     // Split template at decimal point.
     let (int_tpl, frac_tpl) = if let Some(dot) = tpl.find('.') {
-        (&tpl[..dot], &tpl[dot+1..])
+        (&tpl[..dot], &tpl[dot + 1..])
     } else {
         (tpl, "")
     };
@@ -2233,7 +2294,13 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
 
     // Determine sign.
     let has_sign_directive = int_tpl.contains('S') || int_tpl.contains('s');
-    let sign = if value < 0.0 { "-" } else if has_sign_directive { "+" } else { "" };
+    let sign = if value < 0.0 {
+        "-"
+    } else if has_sign_directive {
+        "+"
+    } else {
+        ""
+    };
     let abs_val = value.abs();
 
     // Round value to frac_digits.
@@ -2258,7 +2325,9 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
     // Walk the integer-part template right-to-left to find `,` / `G` positions
     // (counting only digit-placeholder positions).
     let int_tpl_chars: Vec<char> = int_tpl.chars().collect();
-    let digit_positions: Vec<usize> = int_tpl_chars.iter().enumerate()
+    let digit_positions: Vec<usize> = int_tpl_chars
+        .iter()
+        .enumerate()
         .filter(|(_, c)| **c == '9' || **c == '0')
         .map(|(i, _)| i)
         .collect();
@@ -2270,14 +2339,29 @@ fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
     let mut int_result = String::new();
     let need_digits = int_digits.len();
     // Pad with spaces if template has more digit slots than value digits.
-    let pad_count = if total_digit_slots > need_digits { total_digit_slots - need_digits } else { 0 };
+    let pad_count = if total_digit_slots > need_digits {
+        total_digit_slots - need_digits
+    } else {
+        0
+    };
 
     // Determine which digit-slot indices (from left) have a separator after them.
     // Walk through template left-to-right, tracking digit slot index.
     let mut digit_slot = 0usize;
     let mut sep_after_slot: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for &tpl_idx in &int_tpl_chars.iter().enumerate()
-        .filter(|(_, c)| **c == '9' || **c == '0' || **c == ',' || **c == 'G' || **c == 'g' || **c == 'S' || **c == 's' || **c == '$')
+    for &tpl_idx in &int_tpl_chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            **c == '9'
+                || **c == '0'
+                || **c == ','
+                || **c == 'G'
+                || **c == 'g'
+                || **c == 'S'
+                || **c == 's'
+                || **c == '$'
+        })
         .map(|(i, _)| i)
         .collect::<Vec<_>>()
     {
@@ -2432,9 +2516,7 @@ fn parse_pg_number(input: &str, fmt: &str) -> Result<f64, String> {
         cleaned.push(inp_chars[ii]);
         ii += 1;
         // Skip leading sign characters in format.
-        while fi < fmt_chars.len()
-            && matches!(fmt_chars[fi], 'S' | 's' | '+' | '-')
-        {
+        while fi < fmt_chars.len() && matches!(fmt_chars[fi], 'S' | 's' | '+' | '-') {
             fi += 1;
         }
     }
@@ -2521,7 +2603,9 @@ fn parse_pg_number(input: &str, fmt: &str) -> Result<f64, String> {
     if cleaned.is_empty() || cleaned == "-" || cleaned == "+" {
         return Err(format!("no numeric content found in {input:?}"));
     }
-    cleaned.parse::<f64>().map_err(|e| format!("parse error: {e}"))
+    cleaned
+        .parse::<f64>()
+        .map_err(|e| format!("parse error: {e}"))
 }
 
 #[cfg(test)]
@@ -3288,13 +3372,13 @@ pub(crate) fn rewrite_json_operators(sql: &str) -> String {
     // Operators ordered longest-first to avoid prefix collisions
     for &(op, func) in &[
         ("#>>", "json_path_extract_text"),
-        ("#>",  "json_path_extract"),
+        ("#>", "json_path_extract"),
         ("->>", "json_get_text"),
-        ("->",  "json_get"),
-        ("?&",  "jsonb_has_all_keys"),
-        ("?|",  "jsonb_has_any_key"),
-        ("?",   "jsonb_has_key"),
-        ("<@",  "jsonb_contained_by"),
+        ("->", "json_get"),
+        ("?&", "jsonb_has_all_keys"),
+        ("?|", "jsonb_has_any_key"),
+        ("?", "jsonb_has_key"),
+        ("<@", "jsonb_contained_by"),
     ] {
         // For `<@`, skip the rewrite when either operand looks like an ARRAY
         // literal or ARRAY constructor — those are handled later by
@@ -3352,12 +3436,16 @@ pub(crate) fn rewrite_row_to_json_subquery(sql: &str) -> String {
     while i + 5 <= len {
         // look for 'from' keyword (word boundary)
         if lower_b[i..].starts_with(b"from") {
-            let before_ok = i == 0 || !lower_b[i-1].is_ascii_alphanumeric() && lower_b[i-1] != b'_';
-            let after_ok = i + 4 < len && !lower_b[i+4].is_ascii_alphanumeric() && lower_b[i+4] != b'_';
+            let before_ok =
+                i == 0 || !lower_b[i - 1].is_ascii_alphanumeric() && lower_b[i - 1] != b'_';
+            let after_ok =
+                i + 4 < len && !lower_b[i + 4].is_ascii_alphanumeric() && lower_b[i + 4] != b'_';
             if before_ok && after_ok {
                 // skip whitespace
                 let mut j = i + 4;
-                while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
                 if j < len && bytes[j] == b'(' {
                     from_paren_pos = Some(j);
                     break;
@@ -3390,7 +3478,10 @@ pub(crate) fn rewrite_row_to_json_subquery(sql: &str) -> String {
                 k += 1;
                 while k < len {
                     if bytes[k] == b'\'' {
-                        if k + 1 < len && bytes[k+1] == b'\'' { k += 2; continue; }
+                        if k + 1 < len && bytes[k + 1] == b'\'' {
+                            k += 2;
+                            continue;
+                        }
                         break;
                     }
                     k += 1;
@@ -3416,13 +3507,16 @@ pub(crate) fn rewrite_row_to_json_subquery(sql: &str) -> String {
 
     // Parse the alias: skip whitespace after `)`
     let mut alias_start = paren_end + 1;
-    while alias_start < len && bytes[alias_start].is_ascii_whitespace() { alias_start += 1; }
+    while alias_start < len && bytes[alias_start].is_ascii_whitespace() {
+        alias_start += 1;
+    }
     // Read the alias identifier
     if alias_start >= len {
         return sql.to_string();
     }
     let mut alias_end = alias_start;
-    while alias_end < len && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_') {
+    while alias_end < len && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_')
+    {
         alias_end += 1;
     }
     if alias_end == alias_start {
@@ -3451,7 +3545,9 @@ pub(crate) fn rewrite_row_to_json_subquery(sql: &str) -> String {
     // Build `jsonb_build_object('col1', col1, 'col2', col2, ...)`.
     let mut args = String::new();
     for (idx, col) in col_aliases.iter().enumerate() {
-        if idx > 0 { args.push_str(", "); }
+        if idx > 0 {
+            args.push_str(", ");
+        }
         args.push('\'');
         args.push_str(col);
         args.push_str("', ");
@@ -3528,9 +3624,10 @@ fn find_from_boundary(s: &str) -> Option<usize> {
     let len = bytes.len();
     let mut i = 0usize;
     while i + 4 <= len {
-        if &bytes[i..i+4] == b"from" {
-            let before_ok = i == 0 || !bytes[i-1].is_ascii_alphanumeric() && bytes[i-1] != b'_';
-            let after_ok = i + 4 >= len || !bytes[i+4].is_ascii_alphanumeric() && bytes[i+4] != b'_';
+        if &bytes[i..i + 4] == b"from" {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+            let after_ok =
+                i + 4 >= len || !bytes[i + 4].is_ascii_alphanumeric() && bytes[i + 4] != b'_';
             if before_ok && after_ok {
                 return Some(i);
             }
@@ -3539,7 +3636,13 @@ fn find_from_boundary(s: &str) -> Option<usize> {
         if bytes[i] == b'\'' {
             i += 1;
             while i < len {
-                if bytes[i] == b'\'' { if i+1 < len && bytes[i+1] == b'\'' { i += 2; continue; } break; }
+                if bytes[i] == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
                 i += 1;
             }
         }
@@ -3560,11 +3663,21 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     while i < len {
         match bytes[i] {
             b'(' => depth += 1,
-            b')' => { if depth > 0 { depth -= 1; } }
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
             b'\'' => {
                 i += 1;
                 while i < len {
-                    if bytes[i] == b'\'' { if i+1 < len && bytes[i+1] == b'\'' { i += 2; continue; } break; }
+                    if bytes[i] == b'\'' {
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
                     i += 1;
                 }
             }
@@ -3588,9 +3701,9 @@ fn find_last_as(lower: &str) -> Option<usize> {
     let mut last = None;
     let mut i = 0usize;
     while i + 4 <= len {
-        if &bytes[i..i+2] == b"as" {
-            let before_ok = i == 0 || bytes[i-1].is_ascii_whitespace();
-            let after_ok = i + 2 < len && bytes[i+2].is_ascii_whitespace();
+        if &bytes[i..i + 2] == b"as" {
+            let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let after_ok = i + 2 < len && bytes[i + 2].is_ascii_whitespace();
             if before_ok && after_ok {
                 last = Some(i);
             }
@@ -3629,14 +3742,19 @@ pub(crate) fn rewrite_pg_multidim_array_literal(sql: &str) -> String {
         let content_start = i;
         // Skip whitespace then check for `{{`
         let mut scan = i;
-        while scan < len && bytes[scan] == b' ' { scan += 1; }
+        while scan < len && bytes[scan] == b' ' {
+            scan += 1;
+        }
         let is_multidim = scan + 1 < len && bytes[scan] == b'{' && bytes[scan + 1] == b'{';
 
         // Find closing quote
         let mut str_end = content_start;
         while str_end < len {
             if bytes[str_end] == b'\'' {
-                if str_end + 1 < len && bytes[str_end + 1] == b'\'' { str_end += 2; continue; }
+                if str_end + 1 < len && bytes[str_end + 1] == b'\'' {
+                    str_end += 2;
+                    continue;
+                }
                 break;
             }
             str_end += 1;
@@ -3669,9 +3787,7 @@ pub(crate) fn rewrite_pg_multidim_array_literal(sql: &str) -> String {
         let type_name = &sql[type_start..type_end];
 
         // Must be followed by `[][]`
-        if type_end + 4 > len
-            || &sql[type_end..type_end + 4] != "[][]"
-        {
+        if type_end + 4 > len || &sql[type_end..type_end + 4] != "[][]" {
             out.push_str(&sql[str_start..str_end + 1]);
             i = str_end + 1;
             continue;
@@ -3681,8 +3797,19 @@ pub(crate) fn rewrite_pg_multidim_array_literal(sql: &str) -> String {
         let type_lower = type_name.to_ascii_lowercase();
         let is_numeric = matches!(
             type_lower.as_str(),
-            "int" | "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint"
-            | "float4" | "float8" | "real" | "numeric" | "bool" | "boolean"
+            "int"
+                | "int2"
+                | "int4"
+                | "int8"
+                | "integer"
+                | "bigint"
+                | "smallint"
+                | "float4"
+                | "float8"
+                | "real"
+                | "numeric"
+                | "bool"
+                | "boolean"
         );
         if !is_numeric {
             out.push_str(&sql[str_start..str_end + 1]);
@@ -3707,10 +3834,13 @@ pub(crate) fn rewrite_pg_multidim_array_literal(sql: &str) -> String {
         let sub_arrays = split_multidim_rows(inner);
         let mut outer_args = String::new();
         for (idx, sub) in sub_arrays.iter().enumerate() {
-            if idx > 0 { outer_args.push_str(", "); }
+            if idx > 0 {
+                outer_args.push_str(", ");
+            }
             // sub is like `{1,2}` or `1,2`
             let sub_trimmed = sub.trim();
-            let sub_content = sub_trimmed.strip_prefix('{')
+            let sub_content = sub_trimmed
+                .strip_prefix('{')
                 .and_then(|s| s.strip_suffix('}'))
                 .unwrap_or(sub_trimmed);
             let elems: Vec<&str> = sub_content.split(',').map(|e| e.trim()).collect();
@@ -3744,7 +3874,9 @@ fn split_multidim_rows(s: &str) -> Vec<&str> {
                     parts.push(&s[start..i + 1]);
                     // Skip the `,` separator
                     let mut j = i + 1;
-                    while j < len && bytes[j] == b',' { j += 1; }
+                    while j < len && bytes[j] == b',' {
+                        j += 1;
+                    }
                     i = j;
                     start = i;
                     continue;
@@ -3796,9 +3928,15 @@ fn strip_jsonb_casts(sql: &str) -> String {
             i += 1;
             while i < len {
                 if bytes[i] == b'\'' {
-                    if i + 1 < len && bytes[i + 1] == b'\'' { i += 2; }
-                    else { i += 1; break; }
-                } else { i += 1; }
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
             }
             out.push_str(&sql[start..i]);
             continue;
@@ -3807,7 +3945,13 @@ fn strip_jsonb_casts(sql: &str) -> String {
         if b == b'"' {
             let start = i;
             i += 1;
-            while i < len { if bytes[i] == b'"' { i += 1; break; } i += 1; }
+            while i < len {
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
             out.push_str(&sql[start..i]);
             continue;
         }
@@ -3815,7 +3959,9 @@ fn strip_jsonb_casts(sql: &str) -> String {
         if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
             let start = i;
             i += 2;
-            while i < len && bytes[i] != b'\n' { i += 1; }
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
             out.push_str(&sql[start..i]);
             continue;
         }
@@ -3823,27 +3969,41 @@ fn strip_jsonb_casts(sql: &str) -> String {
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             let start = i;
             i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') { i += 1; }
-            if i + 1 < len { i += 2; }
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
             out.push_str(&sql[start..i]);
             continue;
         }
         // Handle `::jsonb` / `::json` cast suffix.
         if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
             let mut j = i + 2;
-            while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
             let name_start = j;
-            while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') { j += 1; }
+            while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
             let name = &sql[name_start..j];
             if name.eq_ignore_ascii_case("jsonb") || name.eq_ignore_ascii_case("json") {
                 let mut k = j;
-                while k < len && bytes[k].is_ascii_whitespace() { k += 1; }
+                while k < len && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
                 if k < len && bytes[k] == b'(' {
                     // `::jsonb(...)` — consume the parenthesised argument list.
                     let mut depth = 1i32;
                     k += 1;
                     while k < len && depth > 0 {
-                        match bytes[k] { b'(' => depth += 1, b')' => depth -= 1, _ => {} }
+                        match bytes[k] {
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            _ => {}
+                        }
                         k += 1;
                     }
                     i = k;
@@ -3883,7 +4043,10 @@ fn strip_jsonb_casts(sql: &str) -> String {
                         k += 1;
                         while k < len {
                             if bytes[k] == b'\'' {
-                                if k + 1 < len && bytes[k + 1] == b'\'' { k += 2; continue; }
+                                if k + 1 < len && bytes[k + 1] == b'\'' {
+                                    k += 2;
+                                    continue;
+                                }
                                 break;
                             }
                             k += 1;
@@ -3891,7 +4054,9 @@ fn strip_jsonb_casts(sql: &str) -> String {
                     }
                     _ => {}
                 }
-                if depth > 0 { k += 1; }
+                if depth > 0 {
+                    k += 1;
+                }
             }
             // k is now at the closing `)`.
             if depth == 0 && k < len {
@@ -3907,7 +4072,10 @@ fn strip_jsonb_casts(sql: &str) -> String {
                     || trimmed.ends_with("\nas json");
                 if is_jsonb_cast {
                     // Extract the expr part (everything before ` AS jsonb`).
-                    let as_pos = trimmed.rfind(" as ").or_else(|| trimmed.rfind("\tas ")).or_else(|| trimmed.rfind("\nas "));
+                    let as_pos = trimmed
+                        .rfind(" as ")
+                        .or_else(|| trimmed.rfind("\tas "))
+                        .or_else(|| trimmed.rfind("\nas "));
                     if let Some(pos) = as_pos {
                         let expr = inner[..pos].trim();
                         out.push_str(expr);
@@ -3922,7 +4090,17 @@ fn strip_jsonb_casts(sql: &str) -> String {
                 }
             }
         }
-        let char_len = if b < 0x80 { 1 } else if b < 0xC0 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
+        let char_len = if b < 0x80 {
+            1
+        } else if b < 0xC0 {
+            1
+        } else if b < 0xE0 {
+            2
+        } else if b < 0xF0 {
+            3
+        } else {
+            4
+        };
         let end = (i + char_len).min(len);
         out.push_str(&sql[i..end]);
         i = end;
@@ -3938,16 +4116,23 @@ fn rewrite_jsonb_delete_op(sql: &str) -> String {
     let mut out = sql.to_string();
     let mut search_from = 0usize;
     loop {
-        let Some(rel) = out[search_from..].find(" - ") else { break; };
+        let Some(rel) = out[search_from..].find(" - ") else {
+            break;
+        };
         let op_start = search_from + rel + 1;
         let op_end = op_start + 1;
         let bytes = out.as_bytes();
         let mut rhs_scan = op_end;
-        while rhs_scan < bytes.len() && bytes[rhs_scan].is_ascii_whitespace() { rhs_scan += 1; }
-        if rhs_scan >= bytes.len() { break; }
+        while rhs_scan < bytes.len() && bytes[rhs_scan].is_ascii_whitespace() {
+            rhs_scan += 1;
+        }
+        if rhs_scan >= bytes.len() {
+            break;
+        }
         let rhs_first = bytes[rhs_scan];
         let is_string_key = rhs_first == b'\'';
-        let is_array_key = out[rhs_scan..].starts_with("ARRAY") || out[rhs_scan..].starts_with("array");
+        let is_array_key =
+            out[rhs_scan..].starts_with("ARRAY") || out[rhs_scan..].starts_with("array");
         let is_int_idx = rhs_first.is_ascii_digit();
         if !is_string_key && !is_array_key && !is_int_idx {
             search_from = op_end;
@@ -3955,8 +4140,14 @@ fn rewrite_jsonb_delete_op(sql: &str) -> String {
         }
         let lhs_pre = op_start.saturating_sub(1);
         let mut lhs_end_scan = lhs_pre;
-        while lhs_end_scan > 0 && bytes[lhs_end_scan - 1].is_ascii_whitespace() { lhs_end_scan -= 1; }
-        let lhs_last = if lhs_end_scan == 0 { b' ' } else { bytes[lhs_end_scan - 1] };
+        while lhs_end_scan > 0 && bytes[lhs_end_scan - 1].is_ascii_whitespace() {
+            lhs_end_scan -= 1;
+        }
+        let lhs_last = if lhs_end_scan == 0 {
+            b' '
+        } else {
+            bytes[lhs_end_scan - 1]
+        };
         if lhs_last != b'\'' && lhs_last != b')' {
             search_from = op_end;
             continue;
@@ -3965,7 +4156,13 @@ fn rewrite_jsonb_delete_op(sql: &str) -> String {
         let (rhs_start, rhs_end) = extract_right_operand(&out, op_end);
         let lhs = out[lhs_start..lhs_end].to_string();
         let rhs = out[rhs_start..rhs_end].to_string();
-        let func = if is_array_key { "jsonb_delete_keys" } else if is_int_idx { "jsonb_delete_index" } else { "jsonb_delete_key" };
+        let func = if is_array_key {
+            "jsonb_delete_keys"
+        } else if is_int_idx {
+            "jsonb_delete_index"
+        } else {
+            "jsonb_delete_key"
+        };
         let replacement = format!("{func}({lhs}, {rhs})");
         out.replace_range(lhs_start..rhs_end, &replacement);
         search_from = lhs_start + replacement.len();
@@ -3978,7 +4175,9 @@ fn rewrite_json_at_gt(s: &str) -> String {
     let mut out = s.to_string();
     let mut search_from = 0usize;
     loop {
-        let Some(rel) = out[search_from..].find("@>") else { break; };
+        let Some(rel) = out[search_from..].find("@>") else {
+            break;
+        };
         let op_start = search_from + rel;
         let op_end = op_start + 2;
 
@@ -3986,7 +4185,9 @@ fn rewrite_json_at_gt(s: &str) -> String {
         let rhs_looks_json = {
             let bytes = out.as_bytes();
             let mut j = op_end;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
             j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'{' || bytes[j] == b'[')
         };
         if rhs_looks_json {
@@ -4019,9 +4220,7 @@ pub(crate) fn rewrite_pg_agg_aliases(sql: &str) -> String {
     // `every` is NOT listed here because `rewrite_every_to_bool_and` in
     // `pg_scalar_aliases` handles it (with an AS alias to avoid column name
     // collisions with sibling `bool_and(…)` calls).
-    const TARGETS: &[(&str, &str)] = &[
-        ("variance", "var("),
-    ];
+    const TARGETS: &[(&str, &str)] = &[("variance", "var(")];
     let mut out = sql.to_string();
     for (from_name, to_with_paren) in TARGETS {
         let mut scan_pos = 0usize;
@@ -4070,20 +4269,24 @@ fn rewrite_json_concat_op(s: &str) -> String {
     let mut out = s.to_string();
     let mut search_from = 0usize;
     loop {
-        let Some(rel) = out[search_from..].find("||") else { break; };
+        let Some(rel) = out[search_from..].find("||") else {
+            break;
+        };
         let op_start = search_from + rel;
         let op_end = op_start + 2;
         // Determine if RHS looks like JSON without holding a borrow into `out`
         let rhs_is_json = {
             let bytes = out.as_bytes();
             let mut j = op_end;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
-            j < bytes.len() && (
-                bytes[j] == b'{'
-                || bytes[j] == b'['
-                || (bytes[j] == b'\'' && j + 1 < bytes.len()
-                    && (bytes[j+1] == b'{' || bytes[j+1] == b'[' || bytes[j+1] == b'"'))
-            )
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            j < bytes.len()
+                && (bytes[j] == b'{'
+                    || bytes[j] == b'['
+                    || (bytes[j] == b'\''
+                        && j + 1 < bytes.len()
+                        && (bytes[j + 1] == b'{' || bytes[j + 1] == b'[' || bytes[j + 1] == b'"')))
         };
         if rhs_is_json {
             let (lhs_start, lhs_end) = extract_left_operand(&out, op_start);
@@ -4105,7 +4308,9 @@ fn rewrite_binary_op_to_fn(sql: &str, op: &str, func: &str) -> String {
     let mut s = sql.to_string();
     let mut search_from = 0usize;
     loop {
-        let Some(rel) = s[search_from..].find(op) else { break; };
+        let Some(rel) = s[search_from..].find(op) else {
+            break;
+        };
         let op_start = search_from + rel;
         let op_end = op_start + op.len();
 
@@ -4113,7 +4318,13 @@ fn rewrite_binary_op_to_fn(sql: &str, op: &str, func: &str) -> String {
         // (avoids matching inside a longer already-rewritten operator)
         let prev_ok = op_start == 0 || {
             let b = s.as_bytes()[op_start - 1];
-            !b.is_ascii_alphanumeric() && b != b'_' && b != b'#' && b != b'?' && b != b'@' && b != b'<' && b != b'>'
+            !b.is_ascii_alphanumeric()
+                && b != b'_'
+                && b != b'#'
+                && b != b'?'
+                && b != b'@'
+                && b != b'<'
+                && b != b'>'
         };
         let next_ok = op_end >= s.len() || {
             let b = s.as_bytes()[op_end];
@@ -4143,13 +4354,21 @@ fn rewrite_binary_op_skip_arrays(sql: &str, op: &str, func: &str) -> String {
     let mut s = sql.to_string();
     let mut search_from = 0usize;
     loop {
-        let Some(rel) = s[search_from..].find(op) else { break; };
+        let Some(rel) = s[search_from..].find(op) else {
+            break;
+        };
         let op_start = search_from + rel;
         let op_end = op_start + op.len();
 
         let prev_ok = op_start == 0 || {
             let b = s.as_bytes()[op_start - 1];
-            !b.is_ascii_alphanumeric() && b != b'_' && b != b'#' && b != b'?' && b != b'@' && b != b'<' && b != b'>'
+            !b.is_ascii_alphanumeric()
+                && b != b'_'
+                && b != b'#'
+                && b != b'?'
+                && b != b'@'
+                && b != b'<'
+                && b != b'>'
         };
         let next_ok = op_end >= s.len() || {
             let b = s.as_bytes()[op_end];
@@ -4402,9 +4621,7 @@ struct TableSampleKeepSeeded {
 // planner's UDF dedup is concerned (it never compares the live counter).
 impl PartialEq for TableSampleKeepSeeded {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.block == other.block
-            && self.signature == other.signature
+        self.name == other.name && self.block == other.block && self.signature == other.signature
     }
 }
 impl Eq for TableSampleKeepSeeded {}
@@ -4525,7 +4742,10 @@ mod json_op_rewrite_tests {
     #[test]
     fn test_hash_double_arrow_op() {
         let r = rewrite_json_operators("SELECT data #>> '{a,b}' FROM t");
-        assert!(r.contains("json_path_extract_text(data, '{a,b}')"), "got: {r}");
+        assert!(
+            r.contains("json_path_extract_text(data, '{a,b}')"),
+            "got: {r}"
+        );
     }
 
     #[test]
@@ -4542,7 +4762,10 @@ mod json_op_rewrite_tests {
             r.contains("jsonb_build_object('a', a)"),
             "expected jsonb_build_object rewrite, got: {r}"
         );
-        assert!(!r.contains("row_to_json(t)"), "row_to_json(t) should be gone: {r}");
+        assert!(
+            !r.contains("row_to_json(t)"),
+            "row_to_json(t) should be gone: {r}"
+        );
     }
 
     #[test]
@@ -4664,7 +4887,10 @@ mod json_op_rewrite_tests {
         // The `::jsonb` here is INSIDE a quoted string — must NOT be stripped.
         let sql = "SELECT '::jsonb' AS x";
         let r = rewrite_json_operators(sql);
-        assert!(r.contains("'::jsonb'"), "literal must be preserved, got: {r}");
+        assert!(
+            r.contains("'::jsonb'"),
+            "literal must be preserved, got: {r}"
+        );
     }
 }
 
@@ -4672,12 +4898,12 @@ mod json_op_rewrite_tests {
 
 #[cfg(test)]
 mod jsonb_text_column_runtime_tests {
-    use std::sync::Arc;
     use datafusion::arrow::array::{Array, ArrayRef, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
 
     /// Build a minimal SessionContext with JSONB UDFs registered and a single
     /// `t` table with a Utf8 `data` column.
@@ -4685,9 +4911,7 @@ mod jsonb_text_column_runtime_tests {
         let ctx = SessionContext::new();
         crate::jsonb_udf::register_jsonb_udfs(&ctx);
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("data", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, true)]));
         let data_arr: ArrayRef = Arc::new(StringArray::from(rows.to_vec()));
         let batch = RecordBatch::try_new(schema.clone(), vec![data_arr]).unwrap();
         let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
@@ -4712,7 +4936,11 @@ mod jsonb_text_column_runtime_tests {
                 .downcast_ref::<StringArray>()
                 .expect("expected StringArray");
             for i in 0..arr.len() {
-                if arr.is_null(i) { out.push(None); } else { out.push(Some(arr.value(i).to_string())); }
+                if arr.is_null(i) {
+                    out.push(None);
+                } else {
+                    out.push(Some(arr.value(i).to_string()));
+                }
             }
         }
         out
@@ -4757,7 +4985,7 @@ mod jsonb_text_column_runtime_tests {
     /// Literal path `'{"k":"hello"}'::jsonb->>'k'` must not regress.
     #[tokio::test]
     async fn literal_cast_jsonb_double_arrow_runtime() {
-        let ctx = make_ctx(&[Some("{}")]);  // row exists but we use a literal
+        let ctx = make_ctx(&[Some("{}")]); // row exists but we use a literal
         let rewritten = rewrite(r#"SELECT '{"k":"hello"}'::jsonb->>'k' FROM t"#);
         let result = run_str(&ctx, &rewritten).await;
         assert_eq!(result, vec![Some("hello".to_string())], "got: {result:?}");
@@ -4774,7 +5002,10 @@ mod jsonb_text_column_runtime_tests {
         let batches = df.collect().await.expect("execute");
         let batch = &batches[0];
         let col = batch.column(0);
-        let arr = col.as_any().downcast_ref::<LargeBinaryArray>().expect("LargeBinaryArray");
+        let arr = col
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("LargeBinaryArray");
         assert!(!arr.is_null(0), "expected non-null");
         let json_bytes = arr.value(0);
         let v: serde_json::Value = serde_json::from_slice(json_bytes).expect("valid json");
@@ -4800,8 +5031,15 @@ mod jsonb_text_column_runtime_tests {
         let batches = df.collect().await.expect("execute");
         let batch = &batches[0];
         let col = batch.column(0);
-        let arr = col.as_any().downcast_ref::<BooleanArray>().expect("BooleanArray");
+        let arr = col
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
         assert_eq!(arr.value(0), true, "first row should contain {{\"a\":1}}");
-        assert_eq!(arr.value(1), false, "second row should not contain {{\"a\":1}}");
+        assert_eq!(
+            arr.value(1),
+            false,
+            "second row should not contain {{\"a\":1}}"
+        );
     }
 }

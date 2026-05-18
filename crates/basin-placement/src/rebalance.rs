@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 
 /// Opaque shard identifier. In v0.2 this is `(ProjectId, PartitionKey)`
 /// flattened to a single string for placement-table rows; v0.3 promotes

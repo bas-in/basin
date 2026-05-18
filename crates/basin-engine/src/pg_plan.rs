@@ -244,9 +244,7 @@ enum TargetExpr {
     Expr(datafusion::logical_expr::Expr),
 }
 
-fn translate_target(
-    node: &pg_query::protobuf::Node,
-) -> Result<TargetExpr, TranslateError> {
+fn translate_target(node: &pg_query::protobuf::Node) -> Result<TargetExpr, TranslateError> {
     match node.node.as_ref() {
         Some(NodeEnum::ColumnRef(cr)) => {
             // Check for `*` (A_Star field)
@@ -455,8 +453,7 @@ mod tests {
 
     #[test]
     fn select_columns_where_order_limit() {
-        let node =
-            parse_first_node("SELECT a, b FROM t WHERE c = 1 ORDER BY a DESC LIMIT 10");
+        let node = parse_first_node("SELECT a, b FROM t WHERE c = 1 ORDER BY a DESC LIMIT 10");
         let l = MockLookup {
             name: "t",
             schema: three_col_schema(),
@@ -475,8 +472,7 @@ mod tests {
 
     #[test]
     fn join_is_unsupported() {
-        let node =
-            parse_first_node("SELECT * FROM t JOIN u ON t.id = u.id");
+        let node = parse_first_node("SELECT * FROM t JOIN u ON t.id = u.id");
         let l = lookup(two_col_schema());
         let err = translate(&node, &l).expect_err("should be unsupported");
         assert!(

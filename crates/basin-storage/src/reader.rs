@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::{new_null_array, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
-use basin_common::{BasinError, Result, TableName, ProjectId};
+use basin_common::{BasinError, ProjectId, Result, TableName};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -572,7 +572,16 @@ async fn read_one(
         tc.record_bytes_read(file_size);
     }
 
-    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key, catalog_schema).await
+    finalize_pipeline(
+        builder,
+        path,
+        opts,
+        counters,
+        page_cache,
+        cache_key,
+        catalog_schema,
+    )
+    .await
 }
 
 fn build_row_filter(
@@ -728,7 +737,11 @@ fn row_group_pruned_resolved(rg: &RowGroupMetaData, resolved: &[(usize, &Predica
 /// Check if a predicate can rule out a row group using the pre-resolved
 /// column index. Avoids the `index_of` schema scan and avoids cloning the
 /// scalar value (borrows it directly from the predicate).
-fn predicate_excludes_group_by_idx(rg: &RowGroupMetaData, col_idx: usize, filter: &Predicate) -> bool {
+fn predicate_excludes_group_by_idx(
+    rg: &RowGroupMetaData,
+    col_idx: usize,
+    filter: &Predicate,
+) -> bool {
     let Some(col_meta) = rg.columns().get(col_idx) else {
         return false;
     };
@@ -849,7 +862,16 @@ async fn finalize_encrypted_stream(
             .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
 
     let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(bytes_reader, arrow_meta);
-    finalize_pipeline(builder, path, opts, counters, page_cache, cache_key, catalog_schema).await
+    finalize_pipeline(
+        builder,
+        path,
+        opts,
+        counters,
+        page_cache,
+        cache_key,
+        catalog_schema,
+    )
+    .await
 }
 
 /// Shared post-builder pipeline: projection mask, row-group stats
@@ -897,8 +919,7 @@ where
     let projection_mask = match &opts.projection {
         Some(cols) => {
             let mut present_idxs = Vec::with_capacity(cols.len());
-            let mut missing_cols: Vec<(usize, arrow_schema::FieldRef)> =
-                Vec::new();
+            let mut missing_cols: Vec<(usize, arrow_schema::FieldRef)> = Vec::new();
 
             for (out_pos, c) in cols.iter().enumerate() {
                 match arrow_schema.index_of(c) {
@@ -913,9 +934,7 @@ where
                                 Err(_) => {
                                     // Not in catalog either — fall through to
                                     // the original error.
-                                    return Err(BasinError::storage(format!(
-                                        "unknown column {c}"
-                                    )));
+                                    return Err(BasinError::storage(format!("unknown column {c}")));
                                 }
                             }
                         } else {
@@ -945,8 +964,7 @@ where
                 // Build the full output schema (projection order) from the
                 // combination of present fields (from file) and missing fields
                 // (from catalog).
-                let mut output_fields: Vec<arrow_schema::FieldRef> =
-                    Vec::with_capacity(cols.len());
+                let mut output_fields: Vec<arrow_schema::FieldRef> = Vec::with_capacity(cols.len());
                 let mut missing_iter = missing_cols.iter().peekable();
                 let mut present_iter = present_names.iter();
                 for out_pos in 0..cols.len() {
@@ -1030,9 +1048,8 @@ where
                     .build()
                     .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
                 let mapped = stream.map(move |res| {
-                    let batch = res.map_err(|e| {
-                        BasinError::storage(format!("parquet read: {e}"))
-                    })?;
+                    let batch =
+                        res.map_err(|e| BasinError::storage(format!("parquet read: {e}")))?;
                     synthesise_missing_columns(
                         batch,
                         &present_names_arc,
@@ -1214,9 +1231,8 @@ fn synthesise_missing_columns(
     // The non-missing output positions, in order, correspond to `present_names`
     // in order (present_names was built by iterating cols in projection order
     // and skipping missing ones).
-    let present_out_positions: Vec<usize> = (0..num_out)
-        .filter(|p| !missing_set.contains(p))
-        .collect();
+    let present_out_positions: Vec<usize> =
+        (0..num_out).filter(|p| !missing_set.contains(p)).collect();
     // Double-check the lengths match to avoid a panic below.
     debug_assert_eq!(
         present_out_positions.len(),

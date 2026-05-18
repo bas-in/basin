@@ -23,7 +23,8 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -91,7 +92,9 @@ pub(crate) fn register_range_udfs(ctx: &SessionContext) {
         field: RangeField::Upper,
         sig: utf8_sig.clone(),
     }));
-    ctx.register_udf(ScalarUDF::from(IsEmptyUdf { sig: utf8_sig.clone() }));
+    ctx.register_udf(ScalarUDF::from(IsEmptyUdf {
+        sig: utf8_sig.clone(),
+    }));
     ctx.register_udf(ScalarUDF::from(BoundFlagUdf {
         name: "lower_inc",
         flag: BoundFlag::LowerInc,
@@ -152,8 +155,12 @@ pub(crate) fn register_range_udfs(ctx: &SessionContext) {
 
     // Arithmetic operators (pre-parse rewriter maps +/*/- to these).
     let two_utf8 = Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable);
-    ctx.register_udf(ScalarUDF::from(RangeUnionUdf { sig: two_utf8.clone() }));
-    ctx.register_udf(ScalarUDF::from(RangeIntersectionUdf { sig: two_utf8.clone() }));
+    ctx.register_udf(ScalarUDF::from(RangeUnionUdf {
+        sig: two_utf8.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(RangeIntersectionUdf {
+        sig: two_utf8.clone(),
+    }));
     ctx.register_udf(ScalarUDF::from(RangeDiffUdf { sig: two_utf8 }));
 
     // Multirange @> scalar containment.
@@ -256,16 +263,13 @@ impl ScalarUDFImpl for RangeConstructorUdf {
         }
         let bounds_text = if args.len() >= 3 {
             match &args[2] {
-                ColumnarValue::Scalar(sv) => {
-                    sv.to_string().trim_matches('\'').to_string()
-                }
+                ColumnarValue::Scalar(sv) => sv.to_string().trim_matches('\'').to_string(),
                 ColumnarValue::Array(arr) => {
-                    let sarr = arr
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| datafusion::error::DataFusionError::Execution(
+                    let sarr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(
                             "range: bounds arg must be Utf8".into(),
-                        ))?;
+                        )
+                    })?;
                     // Use first row's value (they should all be the same literal).
                     sarr.value(0).to_string()
                 }
@@ -288,7 +292,9 @@ impl ScalarUDFImpl for RangeConstructorUdf {
             let hi = upper_strings.get(i).and_then(|s| s.as_deref());
             out.push(Some(format_range(lo, hi, li, ui)));
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -318,20 +324,47 @@ fn columnar_to_strings(cv: &ColumnarValue, n: usize) -> DFResult<Vec<Option<Stri
             // Try StringArray first, then numeric downcasts.
             if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
                 return Ok((0..n)
-                    .map(|i| if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) })
+                    .map(|i| {
+                        if sa.is_null(i) {
+                            None
+                        } else {
+                            Some(sa.value(i).to_string())
+                        }
+                    })
                     .collect());
             }
-            if let Some(ia) = arr.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+            if let Some(ia) = arr
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            {
                 return Ok((0..n)
-                    .map(|i| if ia.is_null(i) { None } else { Some(ia.value(i).to_string()) })
+                    .map(|i| {
+                        if ia.is_null(i) {
+                            None
+                        } else {
+                            Some(ia.value(i).to_string())
+                        }
+                    })
                     .collect());
             }
-            if let Some(fa) = arr.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>() {
+            if let Some(fa) = arr
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            {
                 return Ok((0..n)
-                    .map(|i| if fa.is_null(i) { None } else { Some(fa.value(i).to_string()) })
+                    .map(|i| {
+                        if fa.is_null(i) {
+                            None
+                        } else {
+                            Some(fa.value(i).to_string())
+                        }
+                    })
                     .collect());
             }
-            exec_err!("range constructor: unsupported bound array type {:?}", arr.data_type())
+            exec_err!(
+                "range constructor: unsupported bound array type {:?}",
+                arr.data_type()
+            )
         }
     }
 }
@@ -407,7 +440,9 @@ impl ScalarUDFImpl for RangeAccessorUdf {
             });
             out.push(val);
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -463,7 +498,9 @@ impl ScalarUDFImpl for IsEmptyUdf {
             });
             out.push(empty);
         }
-        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -522,14 +559,14 @@ impl ScalarUDFImpl for BoundFlagUdf {
                         // Infinite if "l" is null.
                         Some(v.get("l").map(|b| b.is_null()).unwrap_or(true))
                     }
-                    BoundFlag::UpperInf => {
-                        Some(v.get("u").map(|b| b.is_null()).unwrap_or(true))
-                    }
+                    BoundFlag::UpperInf => Some(v.get("u").map(|b| b.is_null()).unwrap_or(true)),
                 }
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -577,15 +614,27 @@ impl ScalarUDFImpl for RangeContainsElemUdf {
                 let ui = v.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
                 let lower_ok = match v.get("l") {
                     Some(lv) if !lv.is_null() => {
-                        let lo: f64 = lv.as_f64().or_else(|| lv.as_str().and_then(|s| s.parse().ok()))?;
-                        if li { elem >= lo } else { elem > lo }
+                        let lo: f64 = lv
+                            .as_f64()
+                            .or_else(|| lv.as_str().and_then(|s| s.parse().ok()))?;
+                        if li {
+                            elem >= lo
+                        } else {
+                            elem > lo
+                        }
                     }
                     _ => true, // -infinity
                 };
                 let upper_ok = match v.get("u") {
                     Some(uv) if !uv.is_null() => {
-                        let hi: f64 = uv.as_f64().or_else(|| uv.as_str().and_then(|s| s.parse().ok()))?;
-                        if ui { elem <= hi } else { elem < hi }
+                        let hi: f64 = uv
+                            .as_f64()
+                            .or_else(|| uv.as_str().and_then(|s| s.parse().ok()))?;
+                        if ui {
+                            elem <= hi
+                        } else {
+                            elem < hi
+                        }
                     }
                     _ => true, // +infinity
                 };
@@ -593,7 +642,9 @@ impl ScalarUDFImpl for RangeContainsElemUdf {
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -650,14 +701,22 @@ impl ScalarUDFImpl for RangeOverlapsUdf {
                 // a ends before b starts?
                 let a_ends_before_b = match (a_hi, b_lo) {
                     (Some(ah), Some(bl)) => {
-                        if a_ui && b_li { ah < bl } else { ah <= bl }
+                        if a_ui && b_li {
+                            ah < bl
+                        } else {
+                            ah <= bl
+                        }
                     }
                     _ => false,
                 };
                 // b ends before a starts?
                 let b_ends_before_a = match (b_hi, a_lo) {
                     (Some(bh), Some(al)) => {
-                        if b_ui && a_li { bh < al } else { bh <= al }
+                        if b_ui && a_li {
+                            bh < al
+                        } else {
+                            bh <= al
+                        }
                     }
                     _ => false,
                 };
@@ -665,7 +724,9 @@ impl ScalarUDFImpl for RangeOverlapsUdf {
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -730,22 +791,30 @@ impl ScalarUDFImpl for RangeContainsRangeUdf {
                 let i_ui = inner.get("ui").and_then(|v| v.as_bool()).unwrap_or(false);
                 // Check lower: o_lo <= i_lo
                 let lower_ok = match (o_lo, i_lo) {
-                    (None, _) => true,  // outer is -inf
+                    (None, _) => true,        // outer is -inf
                     (Some(_), None) => false, // outer bounded, inner -inf
                     (Some(ol), Some(il)) => {
-                        if ol < il { true }
-                        else if ol == il { o_li || !i_li }
-                        else { false }
+                        if ol < il {
+                            true
+                        } else if ol == il {
+                            o_li || !i_li
+                        } else {
+                            false
+                        }
                     }
                 };
                 // Check upper: i_hi <= o_hi
                 let upper_ok = match (i_hi, o_hi) {
-                    (None, _) => false, // inner is +inf, outer can't contain unless also +inf
+                    (None, _) => false,      // inner is +inf, outer can't contain unless also +inf
                     (Some(_), None) => true, // outer is +inf
                     (Some(ih), Some(oh)) => {
-                        if ih < oh { true }
-                        else if ih == oh { o_ui || !i_ui }
-                        else { false }
+                        if ih < oh {
+                            true
+                        } else if ih == oh {
+                            o_ui || !i_ui
+                        } else {
+                            false
+                        }
                     }
                 };
                 // Handle inner +inf case
@@ -758,7 +827,9 @@ impl ScalarUDFImpl for RangeContainsRangeUdf {
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -825,8 +896,11 @@ impl ScalarUDFImpl for RangeRelationalUdf {
                         // A << B: A's upper bound is <= B's lower bound (exclusive)
                         match (a_hi, b_lo) {
                             (Some(ah), Some(bl)) => {
-                                if a_ui && b_li { Some(ah < bl) }
-                                else { Some(ah <= bl) }
+                                if a_ui && b_li {
+                                    Some(ah < bl)
+                                } else {
+                                    Some(ah <= bl)
+                                }
                             }
                             _ => Some(false),
                         }
@@ -835,8 +909,11 @@ impl ScalarUDFImpl for RangeRelationalUdf {
                         // A >> B: B's upper bound <= A's lower bound
                         match (b_hi, a_lo) {
                             (Some(bh), Some(al)) => {
-                                if b_ui && a_li { Some(bh < al) }
-                                else { Some(bh <= al) }
+                                if b_ui && a_li {
+                                    Some(bh < al)
+                                } else {
+                                    Some(bh <= al)
+                                }
                             }
                             _ => Some(false),
                         }
@@ -846,16 +923,12 @@ impl ScalarUDFImpl for RangeRelationalUdf {
                         // or B's upper == A's lower similarly.
                         let adj_a_b = match (a_hi, b_lo) {
                             (Some(ah), Some(bl)) => {
-                                (ah - bl).abs() < 1e-12
-                                    && (a_ui != b_li) // exactly one inclusive
+                                (ah - bl).abs() < 1e-12 && (a_ui != b_li) // exactly one inclusive
                             }
                             _ => false,
                         };
                         let adj_b_a = match (b_hi, a_lo) {
-                            (Some(bh), Some(al)) => {
-                                (bh - al).abs() < 1e-12
-                                    && (b_ui != a_li)
-                            }
+                            (Some(bh), Some(al)) => (bh - al).abs() < 1e-12 && (b_ui != a_li),
                             _ => false,
                         };
                         Some(adj_a_b || adj_b_a)
@@ -864,7 +937,9 @@ impl ScalarUDFImpl for RangeRelationalUdf {
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -921,9 +996,13 @@ impl ScalarUDFImpl for RangeMergeUdf {
                     (None, _) => (None, false),
                     (_, None) => (None, false),
                     (Some(al), Some(bl)) => {
-                        if al < bl { (Some(al), a_li) }
-                        else if al > bl { (Some(bl), b_li) }
-                        else { (Some(al), a_li || b_li) }
+                        if al < bl {
+                            (Some(al), a_li)
+                        } else if al > bl {
+                            (Some(bl), b_li)
+                        } else {
+                            (Some(al), a_li || b_li)
+                        }
                     }
                 };
                 // Upper: max of the two upper bounds.
@@ -931,9 +1010,13 @@ impl ScalarUDFImpl for RangeMergeUdf {
                     (None, _) => (None, false),
                     (_, None) => (None, false),
                     (Some(ah), Some(bh)) => {
-                        if ah > bh { (Some(ah), a_ui) }
-                        else if ah < bh { (Some(bh), b_ui) }
-                        else { (Some(ah), a_ui || b_ui) }
+                        if ah > bh {
+                            (Some(ah), a_ui)
+                        } else if ah < bh {
+                            (Some(bh), b_ui)
+                        } else {
+                            (Some(ah), a_ui || b_ui)
+                        }
                     }
                 };
                 let lo_str = new_lo.map(|v| v.to_string());
@@ -947,7 +1030,9 @@ impl ScalarUDFImpl for RangeMergeUdf {
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -967,17 +1052,35 @@ struct RangeParts {
 fn parse_range_parts(s: &str) -> Option<RangeParts> {
     // Special "empty" sentinel (stored as `{"empty":true}` or the raw string "empty").
     if s.trim() == "empty" {
-        return Some(RangeParts { lo: None, hi: None, li: false, ui: false, empty: true });
+        return Some(RangeParts {
+            lo: None,
+            hi: None,
+            li: false,
+            ui: false,
+            empty: true,
+        });
     }
     let v = parse_range(s)?;
     if v.get("empty").and_then(|e| e.as_bool()).unwrap_or(false) {
-        return Some(RangeParts { lo: None, hi: None, li: false, ui: false, empty: true });
+        return Some(RangeParts {
+            lo: None,
+            hi: None,
+            li: false,
+            ui: false,
+            empty: true,
+        });
     }
     let lo = range_bound_f64(&v, "l");
     let hi = range_bound_f64(&v, "u");
     let li = v.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
     let ui = v.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
-    Some(RangeParts { lo, hi, li, ui, empty: false })
+    Some(RangeParts {
+        lo,
+        hi,
+        li,
+        ui,
+        empty: false,
+    })
 }
 
 fn format_range_parts(p: &RangeParts) -> String {
@@ -1012,13 +1115,21 @@ fn ranges_contiguous(a: &RangeParts, b: &RangeParts) -> bool {
     // Do they overlap?
     let a_ends_before_b = match (a.hi, b.lo) {
         (Some(ah), Some(bl)) => {
-            if a.ui && b.li { ah < bl } else { ah <= bl }
+            if a.ui && b.li {
+                ah < bl
+            } else {
+                ah <= bl
+            }
         }
         _ => false,
     };
     let b_ends_before_a = match (b.hi, a.lo) {
         (Some(bh), Some(al)) => {
-            if b.ui && a.li { bh < al } else { bh <= al }
+            if b.ui && a.li {
+                bh < al
+            } else {
+                bh <= al
+            }
         }
         _ => false,
     };
@@ -1027,23 +1138,35 @@ fn ranges_contiguous(a: &RangeParts, b: &RangeParts) -> bool {
     }
     // Adjacent: a_hi == b_lo (exactly one inclusive) or b_hi == a_lo.
     let adj_a_b = match (a.hi, b.lo) {
-        (Some(ah), Some(bl)) => {
-            (ah - bl).abs() < 1e-12 && (a.ui != b.li)
-        }
+        (Some(ah), Some(bl)) => (ah - bl).abs() < 1e-12 && (a.ui != b.li),
         _ => false,
     };
     let adj_b_a = match (b.hi, a.lo) {
-        (Some(bh), Some(al)) => {
-            (bh - al).abs() < 1e-12 && (b.ui != a.li)
-        }
+        (Some(bh), Some(al)) => (bh - al).abs() < 1e-12 && (b.ui != a.li),
         _ => false,
     };
     adj_a_b || adj_b_a
 }
 
 fn range_union_impl(a: &RangeParts, b: &RangeParts) -> DFResult<RangeParts> {
-    if a.empty { return Ok(RangeParts { lo: b.lo, hi: b.hi, li: b.li, ui: b.ui, empty: b.empty }); }
-    if b.empty { return Ok(RangeParts { lo: a.lo, hi: a.hi, li: a.li, ui: a.ui, empty: a.empty }); }
+    if a.empty {
+        return Ok(RangeParts {
+            lo: b.lo,
+            hi: b.hi,
+            li: b.li,
+            ui: b.ui,
+            empty: b.empty,
+        });
+    }
+    if b.empty {
+        return Ok(RangeParts {
+            lo: a.lo,
+            hi: a.hi,
+            li: a.li,
+            ui: a.ui,
+            empty: a.empty,
+        });
+    }
     if !ranges_contiguous(a, b) {
         return exec_err!("result of range union would not be contiguous");
     }
@@ -1051,35 +1174,59 @@ fn range_union_impl(a: &RangeParts, b: &RangeParts) -> DFResult<RangeParts> {
     let (new_lo, new_li) = match (a.lo, b.lo) {
         (None, _) | (_, None) => (None, false),
         (Some(al), Some(bl)) => {
-            if al < bl { (Some(al), a.li) }
-            else if al > bl { (Some(bl), b.li) }
-            else { (Some(al), a.li || b.li) }
+            if al < bl {
+                (Some(al), a.li)
+            } else if al > bl {
+                (Some(bl), b.li)
+            } else {
+                (Some(al), a.li || b.li)
+            }
         }
     };
     // Upper: max
     let (new_hi, new_ui) = match (a.hi, b.hi) {
         (None, _) | (_, None) => (None, false),
         (Some(ah), Some(bh)) => {
-            if ah > bh { (Some(ah), a.ui) }
-            else if ah < bh { (Some(bh), b.ui) }
-            else { (Some(ah), a.ui || b.ui) }
+            if ah > bh {
+                (Some(ah), a.ui)
+            } else if ah < bh {
+                (Some(bh), b.ui)
+            } else {
+                (Some(ah), a.ui || b.ui)
+            }
         }
     };
-    Ok(RangeParts { lo: new_lo, hi: new_hi, li: new_li, ui: new_ui, empty: false })
+    Ok(RangeParts {
+        lo: new_lo,
+        hi: new_hi,
+        li: new_li,
+        ui: new_ui,
+        empty: false,
+    })
 }
 
 fn range_intersection_impl(a: &RangeParts, b: &RangeParts) -> RangeParts {
     if a.empty || b.empty {
-        return RangeParts { lo: None, hi: None, li: false, ui: false, empty: true };
+        return RangeParts {
+            lo: None,
+            hi: None,
+            li: false,
+            ui: false,
+            empty: true,
+        };
     }
     // Lower: max of the two lower bounds.
     let (new_lo, new_li) = match (a.lo, b.lo) {
         (None, blo) => (blo, b.li),
         (alo, None) => (alo, a.li),
         (Some(al), Some(bl)) => {
-            if al > bl { (Some(al), a.li) }
-            else if al < bl { (Some(bl), b.li) }
-            else { (Some(al), a.li && b.li) }
+            if al > bl {
+                (Some(al), a.li)
+            } else if al < bl {
+                (Some(bl), b.li)
+            } else {
+                (Some(al), a.li && b.li)
+            }
         }
     };
     // Upper: min of the two upper bounds.
@@ -1087,34 +1234,60 @@ fn range_intersection_impl(a: &RangeParts, b: &RangeParts) -> RangeParts {
         (None, bhi) => (bhi, b.ui),
         (ahi, None) => (ahi, a.ui),
         (Some(ah), Some(bh)) => {
-            if ah < bh { (Some(ah), a.ui) }
-            else if ah > bh { (Some(bh), b.ui) }
-            else { (Some(ah), a.ui && b.ui) }
+            if ah < bh {
+                (Some(ah), a.ui)
+            } else if ah > bh {
+                (Some(bh), b.ui)
+            } else {
+                (Some(ah), a.ui && b.ui)
+            }
         }
     };
     // Check if intersection is empty.
     let is_empty = match (new_lo, new_hi) {
-        (Some(lo), Some(hi)) => {
-            lo > hi || (lo == hi && (!new_li || !new_ui))
-        }
+        (Some(lo), Some(hi)) => lo > hi || (lo == hi && (!new_li || !new_ui)),
         _ => false,
     };
     if is_empty {
-        RangeParts { lo: None, hi: None, li: false, ui: false, empty: true }
+        RangeParts {
+            lo: None,
+            hi: None,
+            li: false,
+            ui: false,
+            empty: true,
+        }
     } else {
-        RangeParts { lo: new_lo, hi: new_hi, li: new_li, ui: new_ui, empty: false }
+        RangeParts {
+            lo: new_lo,
+            hi: new_hi,
+            li: new_li,
+            ui: new_ui,
+            empty: false,
+        }
     }
 }
 
 fn range_diff_impl(a: &RangeParts, b: &RangeParts) -> DFResult<RangeParts> {
     if a.empty || b.empty {
-        return Ok(RangeParts { lo: a.lo, hi: a.hi, li: a.li, ui: a.ui, empty: a.empty });
+        return Ok(RangeParts {
+            lo: a.lo,
+            hi: a.hi,
+            li: a.li,
+            ui: a.ui,
+            empty: a.empty,
+        });
     }
     // Compute intersection to determine the overlap.
     let inter = range_intersection_impl(a, b);
     if inter.empty {
         // No overlap — return a unchanged.
-        return Ok(RangeParts { lo: a.lo, hi: a.hi, li: a.li, ui: a.ui, empty: a.empty });
+        return Ok(RangeParts {
+            lo: a.lo,
+            hi: a.hi,
+            li: a.li,
+            ui: a.ui,
+            empty: a.empty,
+        });
     }
     // b fully covers a → result is empty.
     // Check: inter == a (b contains a).
@@ -1133,18 +1306,24 @@ fn range_diff_impl(a: &RangeParts, b: &RangeParts) -> DFResult<RangeParts> {
         lo_match && hi_match
     };
     if b_covers_a {
-        return Ok(RangeParts { lo: None, hi: None, li: false, ui: false, empty: true });
+        return Ok(RangeParts {
+            lo: None,
+            hi: None,
+            li: false,
+            ui: false,
+            empty: true,
+        });
     }
     // If b splits a in the middle → contiguity error.
     // b is "in the middle" if both a.lo < inter.lo (a has stuff left of b) AND
     // inter.hi < a.hi (a has stuff right of b).
     let left_remains = match (a.lo, inter.lo) {
-        (None, _) => true,      // a has -inf lower
+        (None, _) => true, // a has -inf lower
         (_, None) => false,
         (Some(al), Some(il)) => al < il || (al == il && a.li && !inter.li),
     };
     let right_remains = match (a.hi, inter.hi) {
-        (None, _) => true,      // a has +inf upper
+        (None, _) => true, // a has +inf upper
         (_, None) => false,
         (Some(ah), Some(ih)) => ah > ih || (ah == ih && a.ui && !inter.ui),
     };
@@ -1158,14 +1337,26 @@ fn range_diff_impl(a: &RangeParts, b: &RangeParts) -> DFResult<RangeParts> {
             None => (None, false),
             Some(bl) => (Some(bl), !b.li), // complement b's lower inclusivity
         };
-        Ok(RangeParts { lo: a.lo, hi: new_hi, li: a.li, ui: new_ui, empty: false })
+        Ok(RangeParts {
+            lo: a.lo,
+            hi: new_hi,
+            li: a.li,
+            ui: new_ui,
+            empty: false,
+        })
     } else {
         // b cuts the left end — result is (b.hi, a.hi]
         let (new_lo, new_li) = match b.hi {
             None => (None, false),
             Some(bh) => (Some(bh), !b.ui),
         };
-        Ok(RangeParts { lo: new_lo, hi: a.hi, li: new_li, ui: a.ui, empty: false })
+        Ok(RangeParts {
+            lo: new_lo,
+            hi: a.hi,
+            li: new_li,
+            ui: a.ui,
+            empty: false,
+        })
     }
 }
 
@@ -1185,10 +1376,18 @@ impl std::fmt::Debug for RangeUnionUdf {
 }
 
 impl ScalarUDFImpl for RangeUnionUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "range_union" }
-    fn signature(&self) -> &Signature { &self.sig }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "range_union"
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
         let a_strs = columnar_to_strings(&args.args[0], n)?;
@@ -1196,16 +1395,32 @@ impl ScalarUDFImpl for RangeUnionUdf {
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
             let result = (|| -> DFResult<Option<String>> {
-                let as_ = match a_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
-                let bs = match b_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
-                let a = parse_range_parts(as_).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_union: invalid range A".into()))?;
-                let b = parse_range_parts(bs).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_union: invalid range B".into()))?;
+                let as_ = match a_strs[i].as_deref() {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                let bs = match b_strs[i].as_deref() {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                let a = parse_range_parts(as_).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "range_union: invalid range A".into(),
+                    )
+                })?;
+                let b = parse_range_parts(bs).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "range_union: invalid range B".into(),
+                    )
+                })?;
                 let res = range_union_impl(&a, &b)?;
                 Ok(Some(format_range_parts(&res)))
             })()?;
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -1225,10 +1440,18 @@ impl std::fmt::Debug for RangeIntersectionUdf {
 }
 
 impl ScalarUDFImpl for RangeIntersectionUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "range_intersection" }
-    fn signature(&self) -> &Signature { &self.sig }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "range_intersection"
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
         let a_strs = columnar_to_strings(&args.args[0], n)?;
@@ -1243,7 +1466,9 @@ impl ScalarUDFImpl for RangeIntersectionUdf {
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -1263,10 +1488,18 @@ impl std::fmt::Debug for RangeDiffUdf {
 }
 
 impl ScalarUDFImpl for RangeDiffUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "range_diff" }
-    fn signature(&self) -> &Signature { &self.sig }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "range_diff"
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
         let a_strs = columnar_to_strings(&args.args[0], n)?;
@@ -1274,16 +1507,32 @@ impl ScalarUDFImpl for RangeDiffUdf {
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
             let result = (|| -> DFResult<Option<String>> {
-                let as_ = match a_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
-                let bs = match b_strs[i].as_deref() { Some(s) => s, None => return Ok(None) };
-                let a = parse_range_parts(as_).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_diff: invalid range A".into()))?;
-                let b = parse_range_parts(bs).ok_or_else(|| datafusion::error::DataFusionError::Execution("range_diff: invalid range B".into()))?;
+                let as_ = match a_strs[i].as_deref() {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                let bs = match b_strs[i].as_deref() {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                let a = parse_range_parts(as_).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "range_diff: invalid range A".into(),
+                    )
+                })?;
+                let b = parse_range_parts(bs).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "range_diff: invalid range B".into(),
+                    )
+                })?;
                 let res = range_diff_impl(&a, &b)?;
                 Ok(Some(format_range_parts(&res)))
             })()?;
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -1309,10 +1558,18 @@ impl std::fmt::Debug for MultirangeConstructorUdf {
 }
 
 impl ScalarUDFImpl for MultirangeConstructorUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { self.name }
-    fn signature(&self) -> &Signature { &self.sig }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
         // Collect each argument (range JSON string) into a Vec.
@@ -1326,13 +1583,17 @@ impl ScalarUDFImpl for MultirangeConstructorUdf {
             let mut any_null = false;
             for col in &arg_string_cols {
                 match col[row].as_deref() {
-                    None => { any_null = true; break; }
-                    Some(s) => {
-                        match parse_range(s) {
-                            Some(v) => ranges.push(v),
-                            None => { any_null = true; break; }
-                        }
+                    None => {
+                        any_null = true;
+                        break;
                     }
+                    Some(s) => match parse_range(s) {
+                        Some(v) => ranges.push(v),
+                        None => {
+                            any_null = true;
+                            break;
+                        }
+                    },
                 }
             }
             if any_null {
@@ -1346,13 +1607,17 @@ impl ScalarUDFImpl for MultirangeConstructorUdf {
                         (None, None) => std::cmp::Ordering::Equal,
                         (None, _) => std::cmp::Ordering::Less,
                         (_, None) => std::cmp::Ordering::Greater,
-                        (Some(av), Some(bv)) => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
+                        (Some(av), Some(bv)) => {
+                            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                        }
                     }
                 });
                 out.push(Some(serde_json::Value::Array(ranges).to_string()));
             }
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -1373,10 +1638,18 @@ impl std::fmt::Debug for MultirangeContainsUdf {
 }
 
 impl ScalarUDFImpl for MultirangeContainsUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "multirange_contains_elem" }
-    fn signature(&self) -> &Signature { &self.sig }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "multirange_contains_elem"
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
         let mrange_strs = columnar_to_strings(&args.args[0], n)?;
@@ -1389,21 +1662,37 @@ impl ScalarUDFImpl for MultirangeContainsUdf {
                 // Parse as JSON array of range objects.
                 let arr: Vec<serde_json::Value> = serde_json::from_str(ms).ok()?;
                 for range_val in &arr {
-                    let li = range_val.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
-                    let ui = range_val.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let li = range_val
+                        .get("li")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(true);
+                    let ui = range_val
+                        .get("ui")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
                     let lower_ok = match range_val.get("l") {
                         Some(lv) if !lv.is_null() => {
-                            let lo: f64 = lv.as_f64()
+                            let lo: f64 = lv
+                                .as_f64()
                                 .or_else(|| lv.as_str().and_then(|s| s.parse().ok()))?;
-                            if li { elem >= lo } else { elem > lo }
+                            if li {
+                                elem >= lo
+                            } else {
+                                elem > lo
+                            }
                         }
                         _ => true,
                     };
                     let upper_ok = match range_val.get("u") {
                         Some(uv) if !uv.is_null() => {
-                            let hi: f64 = uv.as_f64()
+                            let hi: f64 = uv
+                                .as_f64()
                                 .or_else(|| uv.as_str().and_then(|s| s.parse().ok()))?;
-                            if ui { elem <= hi } else { elem < hi }
+                            if ui {
+                                elem <= hi
+                            } else {
+                                elem < hi
+                            }
                         }
                         _ => true,
                     };
@@ -1415,7 +1704,9 @@ impl ScalarUDFImpl for MultirangeContainsUdf {
             });
             out.push(result);
         }
-        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
     }
 }
 
@@ -1427,13 +1718,16 @@ impl ScalarUDFImpl for MultirangeContainsUdf {
 /// the rewriter to distinguish range `@>` / `<@` / `&&` from the JSONB
 /// operators of the same name.
 const RANGE_CTOR_KEYWORDS: &[&str] = &[
-    "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+    "int4range",
+    "int8range",
+    "numrange",
+    "daterange",
+    "tsrange",
+    "tstzrange",
 ];
 
 /// Multirange constructor keywords.
-const MULTIRANGE_CTOR_KEYWORDS: &[&str] = &[
-    "int4multirange", "int8multirange", "nummultirange",
-];
+const MULTIRANGE_CTOR_KEYWORDS: &[&str] = &["int4multirange", "int8multirange", "nummultirange"];
 
 /// Rewrite range type cast suffixes like `'[1,10)'::int4range` to just
 /// `'[1,10)'`. Basin stores range values as plain Utf8 strings; the cast
@@ -1478,17 +1772,17 @@ pub(crate) fn rewrite_range_casts(sql: &str) -> String {
 pub(crate) fn rewrite_range_operators(sql: &str) -> String {
     let ops: &[(&str, &str)] = &[
         ("-|-", "range_adjacent"),
-        ("@>", "__range_at_gt"),         // placeholder, see below
-        ("<@", "__range_lt_at"),          // placeholder, see below
+        ("@>", "__range_at_gt"), // placeholder, see below
+        ("<@", "__range_lt_at"), // placeholder, see below
         ("&&", "range_overlaps"),
         ("<<", "range_strictly_left"),
         (">>", "range_strictly_right"),
         // Arithmetic operators: only rewrite when both operands look like
         // range constructors (heuristic), so we don't rewrite plain numeric
         // `a + b`, `a * b`, `a - b` expressions.
-        ("+", "__range_plus"),            // placeholder
-        ("*", "__range_star"),            // placeholder
-        ("-", "__range_minus"),           // placeholder
+        ("+", "__range_plus"),  // placeholder
+        ("*", "__range_star"),  // placeholder
+        ("-", "__range_minus"), // placeholder
     ];
     let mut s = sql.to_string();
     for &(op, func) in ops {
@@ -1607,7 +1901,9 @@ fn looks_like_range(expr: &str) -> bool {
 /// Return `true` if `expr` looks like a multirange constructor call.
 fn looks_like_multirange(expr: &str) -> bool {
     let trimmed = expr.trim().to_ascii_lowercase();
-    MULTIRANGE_CTOR_KEYWORDS.iter().any(|kw| trimmed.starts_with(kw))
+    MULTIRANGE_CTOR_KEYWORDS
+        .iter()
+        .any(|kw| trimmed.starts_with(kw))
 }
 
 /// Find the first occurrence of `op` that is not inside a single-quoted
@@ -1815,8 +2111,14 @@ mod tests {
     #[test]
     fn lower_upper_accessor() {
         let range = make_range(5, 15);
-        let lower_udf = RangeAccessorUdf { field: RangeField::Lower, sig: utf8_sig() };
-        let upper_udf = RangeAccessorUdf { field: RangeField::Upper, sig: utf8_sig() };
+        let lower_udf = RangeAccessorUdf {
+            field: RangeField::Lower,
+            sig: utf8_sig(),
+        };
+        let upper_udf = RangeAccessorUdf {
+            field: RangeField::Upper,
+            sig: utf8_sig(),
+        };
         let lo = lower_udf.invoke_batch(&[range.clone()], 1).unwrap();
         let hi = upper_udf.invoke_batch(&[range], 1).unwrap();
         if let (ColumnarValue::Array(la), ColumnarValue::Array(ua)) = (lo, hi) {
@@ -1859,7 +2161,11 @@ mod tests {
     #[test]
     fn lower_inc_flag() {
         let range = make_range(1, 10); // li=true
-        let udf = BoundFlagUdf { name: "lower_inc", flag: BoundFlag::LowerInc, sig: utf8_sig() };
+        let udf = BoundFlagUdf {
+            name: "lower_inc",
+            flag: BoundFlag::LowerInc,
+            sig: utf8_sig(),
+        };
         let result = udf.invoke_batch(&[range], 1).unwrap();
         if let ColumnarValue::Array(arr) = result {
             let ba = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -1872,7 +2178,11 @@ mod tests {
     #[test]
     fn upper_inc_flag() {
         let range = make_range(1, 10); // ui=false
-        let udf = BoundFlagUdf { name: "upper_inc", flag: BoundFlag::UpperInc, sig: utf8_sig() };
+        let udf = BoundFlagUdf {
+            name: "upper_inc",
+            flag: BoundFlag::UpperInc,
+            sig: utf8_sig(),
+        };
         let result = udf.invoke_batch(&[range], 1).unwrap();
         if let ColumnarValue::Array(arr) = result {
             let ba = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -1885,7 +2195,11 @@ mod tests {
     #[test]
     fn lower_inf_false_for_bounded() {
         let range = make_range(1, 10);
-        let udf = BoundFlagUdf { name: "lower_inf", flag: BoundFlag::LowerInf, sig: utf8_sig() };
+        let udf = BoundFlagUdf {
+            name: "lower_inf",
+            flag: BoundFlag::LowerInf,
+            sig: utf8_sig(),
+        };
         let result = udf.invoke_batch(&[range], 1).unwrap();
         if let ColumnarValue::Array(arr) = result {
             let ba = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -1899,7 +2213,11 @@ mod tests {
     fn lower_inf_true_for_unbounded() {
         let json = r#"{"l":null,"u":10,"li":false,"ui":false}"#;
         let range = ColumnarValue::Scalar(ScalarValue::Utf8(Some(json.to_string())));
-        let udf = BoundFlagUdf { name: "lower_inf", flag: BoundFlag::LowerInf, sig: utf8_sig() };
+        let udf = BoundFlagUdf {
+            name: "lower_inf",
+            flag: BoundFlag::LowerInf,
+            sig: utf8_sig(),
+        };
         let result = udf.invoke_batch(&[range], 1).unwrap();
         if let ColumnarValue::Array(arr) = result {
             let ba = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -2067,7 +2385,10 @@ mod tests {
         let b = make_range(10, 15);
         let udf = make_union_udf();
         let err = udf.invoke_batch(&[a, b], 1).unwrap_err();
-        assert!(err.to_string().contains("contiguous"), "expected contiguity error, got: {err}");
+        assert!(
+            err.to_string().contains("contiguous"),
+            "expected contiguity error, got: {err}"
+        );
     }
 
     /// `int4range(1,10) * int4range(5,15)` → `[5,10)`
@@ -2091,7 +2412,10 @@ mod tests {
         let b = make_range(20, 30);
         let udf = make_intersection_udf();
         let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
-        assert!(is_empty_json(&result), "expected empty range, got: {result}");
+        assert!(
+            is_empty_json(&result),
+            "expected empty range, got: {result}"
+        );
     }
 
     /// `int4range(1,10) - int4range(5,15)` → `[1,5)`
@@ -2129,7 +2453,10 @@ mod tests {
         let b = make_range(3, 7);
         let udf = make_diff_udf();
         let err = udf.invoke_batch(&[a, b], 1).unwrap_err();
-        assert!(err.to_string().contains("contiguous"), "expected contiguity error, got: {err}");
+        assert!(
+            err.to_string().contains("contiguous"),
+            "expected contiguity error, got: {err}"
+        );
     }
 
     /// `int4range(1,10) - int4range(0,20)` → empty (b fully covers a)
@@ -2139,7 +2466,10 @@ mod tests {
         let b = make_range(0, 20);
         let udf = make_diff_udf();
         let result = extract_string(udf.invoke_batch(&[a, b], 1).unwrap());
-        assert!(is_empty_json(&result), "expected empty range, got: {result}");
+        assert!(
+            is_empty_json(&result),
+            "expected empty range, got: {result}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2210,7 +2540,10 @@ mod tests {
             rewritten.contains("range_union("),
             "expected range_union rewrite, got: {rewritten}"
         );
-        assert!(!rewritten.contains(" + "), "original + should be gone: {rewritten}");
+        assert!(
+            !rewritten.contains(" + "),
+            "original + should be gone: {rewritten}"
+        );
     }
 
     #[test]

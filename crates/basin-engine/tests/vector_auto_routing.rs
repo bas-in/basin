@@ -20,7 +20,7 @@ use std::time::Instant;
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::ProjectId;
-use basin_engine::{Engine, EngineConfig, ExecResult, ScalarParam, ProjectSession};
+use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession, ScalarParam};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 

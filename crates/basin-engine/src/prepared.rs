@@ -30,20 +30,20 @@
 //!   substitution path, but we handle it for completeness.
 //! - NULL: literal `NULL`.
 
+use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
 
+use arrow_schema::Schema;
+use arrow_schema::TimeUnit;
 use arrow_schema::{DataType, Field};
 use basin_common::{BasinError, Result, TableName};
+use sqlparser::ast::DataType as SqlDataType;
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CastKind, Expr, FromTable, ObjectName, Query,
     SelectItem, SetExpr, Statement, TableFactor, Value,
 };
-use sqlparser::ast::DataType as SqlDataType;
-use arrow_schema::Schema;
-use arrow_schema::TimeUnit;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::sync::RwLock;
@@ -431,9 +431,10 @@ fn name_to_table(name: &ObjectName) -> Result<TableName> {
 
 fn placeholder_index(e: &Expr) -> Option<usize> {
     match e {
-        Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. }) => {
-            s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok())
-        }
+        Expr::Value(ValueWithSpan {
+            value: Value::Placeholder(s),
+            ..
+        }) => s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()),
         _ => None,
     }
 }
@@ -459,9 +460,9 @@ fn cast_data_type_to_arrow(sql: &SqlDataType) -> Option<DataType> {
     match sql {
         // ── Integer family ──────────────────────────────────────────────────
         SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Some(DataType::Int16),
-        SqlDataType::Int(_)
-        | SqlDataType::Integer(_)
-        | SqlDataType::Int4(_) => Some(DataType::Int32),
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
+            Some(DataType::Int32)
+        }
         SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Some(DataType::Int64),
 
         // ── Floating-point ──────────────────────────────────────────────────
@@ -493,9 +494,9 @@ fn cast_data_type_to_arrow(sql: &SqlDataType) -> Option<DataType> {
             Some(DataType::Time64(TimeUnit::Microsecond))
         }
         SqlDataType::Timestamp(_, tz) => match tz {
-            sqlparser::ast::TimezoneInfo::Tz | sqlparser::ast::TimezoneInfo::WithTimeZone => {
-                Some(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
-            }
+            sqlparser::ast::TimezoneInfo::Tz | sqlparser::ast::TimezoneInfo::WithTimeZone => Some(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
             _ => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
         },
 
@@ -573,16 +574,14 @@ fn pin_cast_placeholder(expr: &Expr, out: &mut [DataType], is_uuid_out: &mut [bo
                     }
                 }
                 // UUID needs the metadata flag regardless of whether we set the type.
-                let is_uuid = matches!(
-                    data_type,
-                    SqlDataType::Uuid
-                ) || matches!(
-                    data_type,
-                    SqlDataType::Custom(name, modifiers)
-                    if name.0.len() == 1
-                        && name.0[0].id_val().eq_ignore_ascii_case("uuid")
-                        && modifiers.is_empty()
-                );
+                let is_uuid = matches!(data_type, SqlDataType::Uuid)
+                    || matches!(
+                        data_type,
+                        SqlDataType::Custom(name, modifiers)
+                        if name.0.len() == 1
+                            && name.0[0].id_val().eq_ignore_ascii_case("uuid")
+                            && modifiers.is_empty()
+                    );
                 if is_uuid {
                     if let Some(s) = is_uuid_out.get_mut(n - 1) {
                         *s = true;
@@ -616,8 +615,8 @@ async fn walk_select_for_predicates(
         for cte in &with.cte_tables {
             if let SetExpr::Insert(Statement::Insert(ins)) = cte.query.body.as_ref() {
                 // Best-effort: ignore errors (table may not exist yet, etc.).
-                if let Ok(table_name) = crate::pg_ast::insert_object_name(ins)
-                    .and_then(|n| name_to_table(n))
+                if let Ok(table_name) =
+                    crate::pg_ast::insert_object_name(ins).and_then(|n| name_to_table(n))
                 {
                     if let Ok(meta) = sess
                         .engine
@@ -648,11 +647,13 @@ async fn walk_select_for_predicates(
                                                         *slot = field.data_type().clone();
                                                     }
                                                     if field_is_jsonb(field) {
-                                                        if let Some(s) = is_jsonb_out.get_mut(n - 1) {
+                                                        if let Some(s) = is_jsonb_out.get_mut(n - 1)
+                                                        {
                                                             *s = true;
                                                         }
                                                     } else if field_is_uuid(field) {
-                                                        if let Some(s) = is_uuid_out.get_mut(n - 1) {
+                                                        if let Some(s) = is_uuid_out.get_mut(n - 1)
+                                                        {
                                                             *s = true;
                                                         }
                                                     }
@@ -714,7 +715,11 @@ async fn walk_select_for_predicates(
     // LIMIT $N and OFFSET $N — Postgres types these as int8 (BIGINT). Drivers
     // that don't get this hint refuse to bind i64 values for them. Without
     // this, every ORM with `.limit(?)` / `.offset(?)` breaks at the client.
-    if let Some(Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. })) = q.ext_limit() {
+    if let Some(Expr::Value(ValueWithSpan {
+        value: Value::Placeholder(s),
+        ..
+    })) = q.ext_limit()
+    {
         if let Some(idx) = s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
             if let Some(slot) = out.get_mut(idx.saturating_sub(1)) {
                 *slot = DataType::Int64;
@@ -722,7 +727,11 @@ async fn walk_select_for_predicates(
         }
     }
     if let Some(off) = q.ext_offset() {
-        if let Expr::Value(ValueWithSpan { value: Value::Placeholder(s), .. }) = &off.value {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Placeholder(s),
+            ..
+        }) = &off.value
+        {
             if let Some(idx) = s.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
                 if let Some(slot) = out.get_mut(idx.saturating_sub(1)) {
                     *slot = DataType::Int64;
@@ -759,11 +768,21 @@ async fn walk_pred_with_subqueries(
         } => {
             // Box the future to avoid infinitely-sized recursive types.
             Box::pin(walk_pred_with_subqueries(
-                sess, left, tables, out, is_jsonb_out, is_uuid_out,
+                sess,
+                left,
+                tables,
+                out,
+                is_jsonb_out,
+                is_uuid_out,
             ))
             .await;
             Box::pin(walk_pred_with_subqueries(
-                sess, right, tables, out, is_jsonb_out, is_uuid_out,
+                sess,
+                right,
+                tables,
+                out,
+                is_jsonb_out,
+                is_uuid_out,
             ))
             .await;
         }
@@ -771,11 +790,8 @@ async fn walk_pred_with_subqueries(
         // recurse into its WHERE clause.
         Expr::Exists { subquery, .. } => {
             let sub_tables = load_query_from_tables(sess, subquery).await;
-            let combined: Vec<(String, Schema)> = tables
-                .iter()
-                .cloned()
-                .chain(sub_tables)
-                .collect();
+            let combined: Vec<(String, Schema)> =
+                tables.iter().cloned().chain(sub_tables).collect();
             if let SetExpr::Select(sel) = subquery.body.as_ref() {
                 if let Some(pred) = &sel.selection {
                     Box::pin(walk_pred_with_subqueries(
@@ -794,11 +810,8 @@ async fn walk_pred_with_subqueries(
         // its WHERE clause.
         Expr::InSubquery { subquery, .. } => {
             let sub_tables = load_query_from_tables(sess, subquery).await;
-            let combined: Vec<(String, Schema)> = tables
-                .iter()
-                .cloned()
-                .chain(sub_tables)
-                .collect();
+            let combined: Vec<(String, Schema)> =
+                tables.iter().cloned().chain(sub_tables).collect();
             if let SetExpr::Select(sel) = subquery.body.as_ref() {
                 if let Some(pred) = &sel.selection {
                     Box::pin(walk_pred_with_subqueries(
@@ -821,10 +834,7 @@ async fn walk_pred_with_subqueries(
 /// Load the `(label, Schema)` pairs for every direct `Table` factor in a
 /// query's FROM clause.  Used to resolve placeholder types inside subqueries.
 /// Errors are silently ignored — this is best-effort inference.
-async fn load_query_from_tables(
-    sess: &ProjectSession,
-    query: &Query,
-) -> Vec<(String, Schema)> {
+async fn load_query_from_tables(sess: &ProjectSession, query: &Query) -> Vec<(String, Schema)> {
     let mut result = Vec::new();
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -879,7 +889,11 @@ fn walk_pred(
         // `<col> IN ($1, $2, ...)` — type each placeholder in the list
         // to the column's type. Both `col IN (...)` and `$N IN (col)` are
         // handled; ORMs almost always use the former.
-        Expr::InList { expr: col_expr, list, negated: _ } => {
+        Expr::InList {
+            expr: col_expr,
+            list,
+            negated: _,
+        } => {
             if let Some((dt, is_jsonb, is_uuid)) = resolve_column_meta(col_expr, tables) {
                 for item in list {
                     if let Some(n) = placeholder_index(item) {
@@ -1374,8 +1388,7 @@ async fn probe_dml_cte_schema(sess: &ProjectSession, sql: &str) -> Option<Vec<Fi
 
         // Determine the RETURNING columns: explicit list or default to all table columns.
         let returning = ins.returning.as_deref().unwrap_or(&[]);
-        let table_name = match crate::pg_ast::insert_object_name(ins)
-            .and_then(|n| name_to_table(n))
+        let table_name = match crate::pg_ast::insert_object_name(ins).and_then(|n| name_to_table(n))
         {
             Ok(tn) => tn,
             Err(_) => continue,
@@ -1402,14 +1415,18 @@ async fn probe_dml_cte_schema(sess: &ProjectSession, sql: &str) -> Option<Vec<Fi
                     SelectItem::Wildcard(_) => {
                         // RETURNING * — all table columns.
                         for f in meta.schema.fields() {
-                            let ws_dt = crate::convert::schema_df_to_ws(
-                                &Schema::new(vec![f.as_ref().clone()])
-                            )
+                            let ws_dt = crate::convert::schema_df_to_ws(&Schema::new(vec![f
+                                .as_ref()
+                                .clone()]))
                             .ok()
                             .and_then(|s| s.fields().first().map(|f2| f2.data_type().clone()));
                             if let Some(_dt) = ws_dt {
                                 // Convert ws field → df field for MemTable.
-                                if let Ok(df_schema) = crate::convert::schema_ws_to_df(&Schema::new(vec![f.as_ref().clone()])) {
+                                if let Ok(df_schema) =
+                                    crate::convert::schema_ws_to_df(&Schema::new(vec![f
+                                        .as_ref()
+                                        .clone()]))
+                                {
                                     if let Some(df_f) = df_schema.fields().first() {
                                         fields.push(Arc::clone(df_f));
                                     }
@@ -1419,20 +1436,23 @@ async fn probe_dml_cte_schema(sess: &ProjectSession, sql: &str) -> Option<Vec<Fi
                     }
                     SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
                         if let Some(f) = column_field(meta.schema.as_ref(), &id.value) {
-                            if let Ok(df_schema) = crate::convert::schema_ws_to_df(
-                                &Schema::new(vec![f.clone()])
-                            ) {
+                            if let Ok(df_schema) =
+                                crate::convert::schema_ws_to_df(&Schema::new(vec![f.clone()]))
+                            {
                                 if let Some(df_f) = df_schema.fields().first() {
                                     fields.push(Arc::clone(df_f));
                                 }
                             }
                         }
                     }
-                    SelectItem::ExprWithAlias { expr: Expr::Identifier(id), alias } => {
+                    SelectItem::ExprWithAlias {
+                        expr: Expr::Identifier(id),
+                        alias,
+                    } => {
                         if let Some(f) = column_field(meta.schema.as_ref(), &id.value) {
-                            if let Ok(df_schema) = crate::convert::schema_ws_to_df(
-                                &Schema::new(vec![f.clone()])
-                            ) {
+                            if let Ok(df_schema) =
+                                crate::convert::schema_ws_to_df(&Schema::new(vec![f.clone()]))
+                            {
                                 if let Some(df_f) = df_schema.fields().first() {
                                     // Rename the field to the alias.
                                     let renamed = dfa::Field::new(
@@ -1460,7 +1480,9 @@ async fn probe_dml_cte_schema(sess: &ProjectSession, sql: &str) -> Option<Vec<Fi
         let provider = MemTable::try_new(df_schema, vec![vec![]]).ok()?;
         // Deregister any existing table with this name first.
         let _ = sess.ctx.deregister_table(&cte_name);
-        sess.ctx.register_table(&cte_name, Arc::new(provider)).ok()?;
+        sess.ctx
+            .register_table(&cte_name, Arc::new(provider))
+            .ok()?;
         registered.push(cte_name);
     }
 
@@ -1474,9 +1496,14 @@ async fn probe_dml_cte_schema(sess: &ProjectSession, sql: &str) -> Option<Vec<Fi
     let result = match sess.ctx.sql(&outer_sql).await {
         Ok(logical) => {
             let df_schema = logical.schema().inner().clone();
-            crate::convert::schema_df_to_ws(df_schema.as_ref()).ok().map(|ws| {
-                ws.fields().iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>()
-            })
+            crate::convert::schema_df_to_ws(df_schema.as_ref())
+                .ok()
+                .map(|ws| {
+                    ws.fields()
+                        .iter()
+                        .map(|f| f.as_ref().clone())
+                        .collect::<Vec<_>>()
+                })
         }
         Err(_) => None,
     };
@@ -1756,7 +1783,11 @@ mod tests {
         let mut is_uuid = vec![false];
         walk_projection_for_casts(&select.projection, &mut out, &mut is_uuid);
         // Int64 must survive; projection cast cannot overwrite a non-TEXT slot.
-        assert_eq!(out[0], DataType::Int64, "catalog type must not be overwritten");
+        assert_eq!(
+            out[0],
+            DataType::Int64,
+            "catalog type must not be overwritten"
+        );
     }
 
     #[test]

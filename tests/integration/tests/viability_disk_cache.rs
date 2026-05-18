@@ -45,7 +45,7 @@ use std::time::Duration;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::workload::{run_workload, LatencyDistribution, WorkloadConfig};
 use basin_storage::{DiskCacheConfig, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};

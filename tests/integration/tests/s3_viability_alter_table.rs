@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use basin_catalog::{InMemoryCatalog, PolicyCommand};
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};

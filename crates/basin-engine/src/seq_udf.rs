@@ -32,7 +32,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use basin_catalog::Catalog;
-use basin_common::{BasinError, Result, ProjectId};
+use basin_common::{BasinError, ProjectId, Result};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{

@@ -81,8 +81,12 @@ async fn set_op_union_deduplicates() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
+    s.execute("CREATE TABLE a (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("CREATE TABLE b (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
     s.execute("INSERT INTO a VALUES (1), (2)").await.unwrap();
     s.execute("INSERT INTO b VALUES (2), (3)").await.unwrap();
 
@@ -101,8 +105,12 @@ async fn set_op_union_all_keeps_duplicates() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
+    s.execute("CREATE TABLE a (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("CREATE TABLE b (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
     s.execute("INSERT INTO a VALUES (1), (2)").await.unwrap();
     s.execute("INSERT INTO b VALUES (2), (3)").await.unwrap();
 
@@ -125,17 +133,29 @@ async fn set_op_intersect() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("INSERT INTO a VALUES (1), (2), (3)").await.unwrap();
-    s.execute("INSERT INTO b VALUES (2), (3), (4)").await.unwrap();
+    s.execute("CREATE TABLE a (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("CREATE TABLE b (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("INSERT INTO a VALUES (1), (2), (3)")
+        .await
+        .unwrap();
+    s.execute("INSERT INTO b VALUES (2), (3), (4)")
+        .await
+        .unwrap();
 
     let res = s
         .execute("SELECT v FROM a INTERSECT SELECT v FROM b")
         .await
         .expect("INTERSECT should execute");
     let rows = collect_i64_sorted(res);
-    assert_eq!(rows, vec![2, 3], "INTERSECT must return common rows: got {rows:?}");
+    assert_eq!(
+        rows,
+        vec![2, 3],
+        "INTERSECT must return common rows: got {rows:?}"
+    );
 }
 
 /// `INTERSECT ALL` keeps per-occurrence minimums:
@@ -146,12 +166,20 @@ async fn set_op_intersect_all() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
+    s.execute("CREATE TABLE a (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("CREATE TABLE b (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
     // a = {1, 2, 2, 3}
-    s.execute("INSERT INTO a VALUES (1), (2), (2), (3)").await.unwrap();
+    s.execute("INSERT INTO a VALUES (1), (2), (2), (3)")
+        .await
+        .unwrap();
     // b = {2, 2, 2, 4}
-    s.execute("INSERT INTO b VALUES (2), (2), (2), (4)").await.unwrap();
+    s.execute("INSERT INTO b VALUES (2), (2), (2), (4)")
+        .await
+        .unwrap();
 
     let res = s
         .execute("SELECT v FROM a INTERSECT ALL SELECT v FROM b")
@@ -173,17 +201,29 @@ async fn set_op_except() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("INSERT INTO a VALUES (1), (2), (3)").await.unwrap();
-    s.execute("INSERT INTO b VALUES (2), (3), (4)").await.unwrap();
+    s.execute("CREATE TABLE a (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("CREATE TABLE b (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("INSERT INTO a VALUES (1), (2), (3)")
+        .await
+        .unwrap();
+    s.execute("INSERT INTO b VALUES (2), (3), (4)")
+        .await
+        .unwrap();
 
     let res = s
         .execute("SELECT v FROM a EXCEPT SELECT v FROM b")
         .await
         .expect("EXCEPT should execute");
     let rows = collect_i64_sorted(res);
-    assert_eq!(rows, vec![1], "EXCEPT must subtract right set: got {rows:?}");
+    assert_eq!(
+        rows,
+        vec![1],
+        "EXCEPT must subtract right set: got {rows:?}"
+    );
 }
 
 /// `EXCEPT ALL` subtracts per-occurrence (PG multiset semantics).
@@ -202,10 +242,16 @@ async fn set_op_except_all() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute("CREATE TABLE a (v BIGINT NOT NULL)").await.unwrap();
-    s.execute("CREATE TABLE b (v BIGINT NOT NULL)").await.unwrap();
+    s.execute("CREATE TABLE a (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("CREATE TABLE b (v BIGINT NOT NULL)")
+        .await
+        .unwrap();
     // a = {1, 2, 2, 3}
-    s.execute("INSERT INTO a VALUES (1), (2), (2), (3)").await.unwrap();
+    s.execute("INSERT INTO a VALUES (1), (2), (2), (3)")
+        .await
+        .unwrap();
     // b = {2, 4}
     s.execute("INSERT INTO b VALUES (2), (4)").await.unwrap();
 
@@ -247,7 +293,11 @@ async fn cte_simple() {
         .await
         .expect("simple CTE should execute");
     let rows = collect_i64_sorted(res);
-    assert_eq!(rows, vec![2, 3], "simple CTE filter must work: got {rows:?}");
+    assert_eq!(
+        rows,
+        vec![2, 3],
+        "simple CTE filter must work: got {rows:?}"
+    );
 }
 
 /// Multiple CTEs: `WITH a AS (…), b AS (…) SELECT * FROM a JOIN b ON …`.
@@ -260,9 +310,11 @@ async fn cte_multiple_with_join() {
     s.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
         .unwrap();
-    s.execute("CREATE TABLE orders (id BIGINT NOT NULL, user_id BIGINT NOT NULL, amount BIGINT NOT NULL)")
-        .await
-        .unwrap();
+    s.execute(
+        "CREATE TABLE orders (id BIGINT NOT NULL, user_id BIGINT NOT NULL, amount BIGINT NOT NULL)",
+    )
+    .await
+    .unwrap();
     s.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
         .await
         .unwrap();
@@ -312,10 +364,7 @@ async fn cte_recursive() {
         )
         SELECT n FROM counter
     ";
-    let res = s
-        .execute(sql)
-        .await
-        .expect("recursive CTE should execute");
+    let res = s.execute(sql).await.expect("recursive CTE should execute");
     let rows = collect_i64_sorted(res);
     assert_eq!(
         rows,
@@ -336,8 +385,12 @@ async fn cte_materialized_hint() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute("CREATE TABLE nums (n BIGINT NOT NULL)").await.unwrap();
-    s.execute("INSERT INTO nums VALUES (10), (20), (30)").await.unwrap();
+    s.execute("CREATE TABLE nums (n BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("INSERT INTO nums VALUES (10), (20), (30)")
+        .await
+        .unwrap();
 
     let sql = "WITH src AS MATERIALIZED (SELECT n FROM nums WHERE n >= 20) SELECT n FROM src";
     let result = s.execute(sql).await;

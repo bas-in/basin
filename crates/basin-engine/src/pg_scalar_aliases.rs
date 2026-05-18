@@ -41,13 +41,14 @@ use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveTime, Timelike, Utc};
 use datafusion::arrow::array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    ListArray, StringArray, StringBuilder, TimestampMicrosecondBuilder,
+    Array, ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, ListArray,
+    StringArray, StringBuilder, TimestampMicrosecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
@@ -97,26 +98,10 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(MakeTimeUdf {
         signature: Signature::one_of(
             vec![
-                TypeSignature::Exact(vec![
-                    DataType::Int64,
-                    DataType::Int64,
-                    DataType::Float64,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Int32,
-                    DataType::Int32,
-                    DataType::Float64,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Int64,
-                    DataType::Int64,
-                    DataType::Int64,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Int32,
-                    DataType::Int32,
-                    DataType::Int32,
-                ]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64, DataType::Float64]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32, DataType::Float64]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32, DataType::Int32]),
             ],
             Volatility::Immutable,
         ),
@@ -210,13 +195,7 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(MakeIntervalUdf {
         signature: Signature::one_of(
             (0usize..=7)
-                .map(|n| {
-                    TypeSignature::Exact(
-                        (0..n)
-                            .map(|_| DataType::Int64)
-                            .collect::<Vec<_>>(),
-                    )
-                })
+                .map(|n| TypeSignature::Exact((0..n).map(|_| DataType::Int64).collect::<Vec<_>>()))
                 .collect(),
             Volatility::Immutable,
         ),
@@ -247,10 +226,7 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
     // PG: to_number('12,345.67', '99G999D99') → numeric.
     // We parse the numeric part of the text and return Float64.
     ctx.register_udf(ScalarUDF::from(ToNumberUdf {
-        signature: Signature::exact(
-            vec![DataType::Utf8, DataType::Utf8],
-            Volatility::Immutable,
-        ),
+        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
 
     // ── current_database() → TEXT ────────────────────────────────────────────
@@ -395,23 +371,13 @@ impl ScalarUDFImpl for AliasF64Udf {
                     .downcast_ref::<Float64Array>()
                     .unwrap()
                     .value(i),
-                DataType::Int64 => arr
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .value(i) as f64,
-                DataType::Int32 => arr
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .value(i) as f64,
-                _ => {
-                    return exec_err!(
-                        "{}: unsupported arg type {:?}",
-                        self.name,
-                        arr.data_type()
-                    )
+                DataType::Int64 => {
+                    arr.as_any().downcast_ref::<Int64Array>().unwrap().value(i) as f64
                 }
+                DataType::Int32 => {
+                    arr.as_any().downcast_ref::<Int32Array>().unwrap().value(i) as f64
+                }
+                _ => return exec_err!("{}: unsupported arg type {:?}", self.name, arr.data_type()),
             };
             out.append_value(f(v));
         }
@@ -441,7 +407,10 @@ impl ScalarUDFImpl for NowStubUdf {
         &self.signature
     }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+        Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ))
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -455,8 +424,9 @@ impl ScalarUDFImpl for NowStubUdf {
             .max()
             .unwrap_or(1);
         let now_us = Utc::now().timestamp_micros();
-        let mut b = TimestampMicrosecondBuilder::with_capacity(n)
-            .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+        let mut b = TimestampMicrosecondBuilder::with_capacity(n).with_data_type(
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        );
         for _ in 0..n {
             b.append_value(now_us);
         }
@@ -492,9 +462,9 @@ impl ScalarUDFImpl for LocaltimeUdf {
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let t = Utc::now();
         let s = format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second());
-        Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(
-            Some(s),
-        )))
+        Ok(ColumnarValue::Scalar(
+            datafusion::scalar::ScalarValue::Utf8(Some(s)),
+        ))
     }
 }
 
@@ -517,9 +487,7 @@ fn extract_i64(args: &[ColumnarValue], idx: usize, n: usize) -> DFResult<Vec<Opt
         }
         let v = match arr.data_type() {
             DataType::Int64 => arr.as_any().downcast_ref::<Int64Array>().unwrap().value(i),
-            DataType::Int32 => {
-                arr.as_any().downcast_ref::<Int32Array>().unwrap().value(i) as i64
-            }
+            DataType::Int32 => arr.as_any().downcast_ref::<Int32Array>().unwrap().value(i) as i64,
             _ => return exec_err!("make_time: arg {idx} must be integer"),
         };
         out.push(Some(v));
@@ -536,15 +504,13 @@ fn extract_f64(args: &[ColumnarValue], idx: usize, n: usize) -> DFResult<Vec<Opt
             continue;
         }
         let v = match arr.data_type() {
-            DataType::Float64 => {
-                arr.as_any().downcast_ref::<Float64Array>().unwrap().value(i)
-            }
-            DataType::Int64 => {
-                arr.as_any().downcast_ref::<Int64Array>().unwrap().value(i) as f64
-            }
-            DataType::Int32 => {
-                arr.as_any().downcast_ref::<Int32Array>().unwrap().value(i) as f64
-            }
+            DataType::Float64 => arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(i),
+            DataType::Int64 => arr.as_any().downcast_ref::<Int64Array>().unwrap().value(i) as f64,
+            DataType::Int32 => arr.as_any().downcast_ref::<Int32Array>().unwrap().value(i) as f64,
             _ => return exec_err!("make_time: arg {idx} must be numeric"),
         };
         out.push(Some(v));
@@ -595,10 +561,7 @@ impl ScalarUDFImpl for MakeTimeUdf {
                     if frac == 0 {
                         out.append_value(format!("{:02}:{:02}:{:02}", h, m, whole));
                     } else {
-                        out.append_value(format!(
-                            "{:02}:{:02}:{:02}.{:06}",
-                            h, m, whole, frac
-                        ));
+                        out.append_value(format!("{:02}:{:02}:{:02}.{:06}", h, m, whole, frac));
                     }
                 }
                 _ => out.append_null(),
@@ -654,12 +617,13 @@ impl ScalarUDFImpl for MakeTimestampUdf {
         for i in 0..n {
             match (years[i], months[i], days[i], hours[i], mins[i], secs[i]) {
                 (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) => {
-                    let date = NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32)
-                        .ok_or_else(|| {
+                    let date = NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32).ok_or_else(
+                        || {
                             datafusion::common::DataFusionError::Execution(
                                 "make_timestamp: invalid date".into(),
                             )
-                        })?;
+                        },
+                    )?;
                     let whole_s = s as u32;
                     let micros = (s.fract() * 1_000_000.0).round() as u32;
                     let time = NaiveTime::from_hms_micro_opt(h as u32, mi as u32, whole_s, micros)
@@ -668,10 +632,7 @@ impl ScalarUDFImpl for MakeTimestampUdf {
                                 "make_timestamp: invalid time".into(),
                             )
                         })?;
-                    let dt = date
-                        .and_time(time)
-                        .and_utc()
-                        .timestamp_micros();
+                    let dt = date.and_time(time).and_utc().timestamp_micros();
                     out.append_value(dt);
                 }
                 _ => out.append_null(),
@@ -701,13 +662,19 @@ impl ScalarUDFImpl for MakeTimestamptzUdf {
         &self.signature
     }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+        Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ))
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() < 6 || args.len() > 7 {
-            return exec_err!("make_timestamptz expects 6 or 7 arguments, got {}", args.len());
+            return exec_err!(
+                "make_timestamptz expects 6 or 7 arguments, got {}",
+                args.len()
+            );
         }
         let n = args
             .iter()
@@ -727,12 +694,13 @@ impl ScalarUDFImpl for MakeTimestamptzUdf {
         for i in 0..n {
             match (years[i], months[i], days[i], hours[i], mins[i], secs[i]) {
                 (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) => {
-                    let date = NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32)
-                        .ok_or_else(|| {
+                    let date = NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32).ok_or_else(
+                        || {
                             datafusion::common::DataFusionError::Execution(
                                 "make_timestamptz: invalid date".into(),
                             )
-                        })?;
+                        },
+                    )?;
                     let whole_s = s as u32;
                     let micros = (s.fract() * 1_000_000.0).round() as u32;
                     let time = NaiveTime::from_hms_micro_opt(h as u32, mi as u32, whole_s, micros)
@@ -741,10 +709,7 @@ impl ScalarUDFImpl for MakeTimestamptzUdf {
                                 "make_timestamptz: invalid time".into(),
                             )
                         })?;
-                    let dt = date
-                        .and_time(time)
-                        .and_utc()
-                        .timestamp_micros();
+                    let dt = date.and_time(time).and_utc().timestamp_micros();
                     out.append_value(dt);
                 }
                 _ => out.append_null(),
@@ -779,7 +744,9 @@ pub(crate) fn rewrite_make_interval_named_args(sql: &str) -> String {
     let mut search_from = 0usize;
     loop {
         let lower_slice = out[search_from..].to_ascii_lowercase();
-        let Some(rel) = lower_slice.find("make_interval") else { break; };
+        let Some(rel) = lower_slice.find("make_interval") else {
+            break;
+        };
         let name_start = search_from + rel;
         let name_end = name_start + "make_interval".len();
 
@@ -796,7 +763,9 @@ pub(crate) fn rewrite_make_interval_named_args(sql: &str) -> String {
         // Skip whitespace then look for `(`.
         let bytes = out.as_bytes();
         let mut j = name_end;
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= bytes.len() || bytes[j] != b'(' {
             search_from = name_end;
             continue;
@@ -814,7 +783,10 @@ pub(crate) fn rewrite_make_interval_named_args(sql: &str) -> String {
                     k += 1;
                     while k < bytes.len() {
                         if bytes[k] == b'\'' {
-                            if k + 1 < bytes.len() && bytes[k + 1] == b'\'' { k += 2; continue; }
+                            if k + 1 < bytes.len() && bytes[k + 1] == b'\'' {
+                                k += 2;
+                                continue;
+                            }
                             k += 1;
                             break;
                         }
@@ -856,8 +828,12 @@ pub(crate) fn rewrite_make_interval_named_args(sql: &str) -> String {
         // Build replacement: make_interval(y, mo, w, d, h, mi, s)
         let replacement = format!(
             "make_interval({}, {}, {}, {}, {}, {}, {})",
-            positional[0] as i64, positional[1] as i64, positional[2] as i64,
-            positional[3] as i64, positional[4] as i64, positional[5] as i64,
+            positional[0] as i64,
+            positional[1] as i64,
+            positional[2] as i64,
+            positional[3] as i64,
+            positional[4] as i64,
+            positional[5] as i64,
             positional[6] as i64,
         );
         out.replace_range(name_start..=close, &replacement);
@@ -881,7 +857,10 @@ fn split_at_top_level_commas(s: &str) -> Vec<String> {
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
                         break;
                     }
                     i += 1;
@@ -928,20 +907,22 @@ impl ScalarUDFImpl for MakeIntervalUdf {
         // Returns an ISO-8601-style interval text that DataFusion can parse
         // (e.g. "1 year 30 days 0 seconds").
         let get_i64 = |idx: usize| -> i64 {
-            if idx >= args.args.len() { return 0; }
+            if idx >= args.args.len() {
+                return 0;
+            }
             match &args.args[idx] {
                 ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => *v,
                 ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => *v as i64,
                 _ => 0,
             }
         };
-        let years  = get_i64(0);
+        let years = get_i64(0);
         let months = get_i64(1);
-        let weeks  = get_i64(2);
-        let days   = get_i64(3);
-        let hours  = get_i64(4);
-        let mins   = get_i64(5);
-        let secs   = get_i64(6);
+        let weeks = get_i64(2);
+        let days = get_i64(3);
+        let hours = get_i64(4);
+        let mins = get_i64(5);
+        let secs = get_i64(6);
 
         // Convert to total seconds for a simple interval text representation.
         let total_days = years * 365 + months * 30 + weeks * 7 + days;
@@ -951,12 +932,18 @@ impl ScalarUDFImpl for MakeIntervalUdf {
             "0 seconds".to_string()
         } else {
             let mut parts = Vec::new();
-            if total_days != 0 { parts.push(format!("{total_days} days")); }
-            if total_secs != 0 { parts.push(format!("{total_secs} seconds")); }
+            if total_days != 0 {
+                parts.push(format!("{total_days} days"));
+            }
+            if total_secs != 0 {
+                parts.push(format!("{total_secs} seconds"));
+            }
             parts.join(" ")
         };
 
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(interval_text))))
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            interval_text,
+        ))))
     }
 }
 
@@ -1132,9 +1119,15 @@ impl ConstTextUdf {
 }
 
 impl ScalarUDFImpl for ConstTextUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { self.fn_name }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.fn_name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
@@ -1168,9 +1161,15 @@ impl ConstInt32Udf {
 }
 
 impl ScalarUDFImpl for ConstInt32Udf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { self.fn_name }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.fn_name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Int32)
     }
@@ -1202,15 +1201,23 @@ impl ConstBoolUdf {
 }
 
 impl ScalarUDFImpl for ConstBoolUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { self.fn_name }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.fn_name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(self.value))))
+        Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(
+            self.value,
+        ))))
     }
 }
 
@@ -1225,21 +1232,33 @@ struct CurrentSettingUdf {
 }
 
 impl ScalarUDFImpl for CurrentSettingUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "current_setting" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "current_setting"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let n = args.args.iter()
-            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
+        let n = args
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
             .max()
             .unwrap_or(1);
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(
-            vec![""; n],
-        ))))
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(vec![
+            "";
+            n
+        ]))))
     }
 }
 
@@ -1254,9 +1273,15 @@ struct SetConfigUdf {
 }
 
 impl ScalarUDFImpl for SetConfigUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "set_config" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "set_config"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
@@ -1264,7 +1289,9 @@ impl ScalarUDFImpl for SetConfigUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // Return the second argument (the value).
         if args.args.len() < 2 {
-            return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(String::new()))));
+            return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+                Some(String::new()),
+            )));
         }
         Ok(args.args[1].clone())
     }
@@ -1282,9 +1309,15 @@ struct TimeofdayUdf {
 }
 
 impl ScalarUDFImpl for TimeofdayUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "timeofday" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "timeofday"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
@@ -1308,9 +1341,15 @@ struct DivUdf {
 }
 
 impl ScalarUDFImpl for DivUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "div" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "div"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         if arg_types.is_empty() {
             return Ok(DataType::Int64);
@@ -1323,8 +1362,12 @@ impl ScalarUDFImpl for DivUdf {
         if args.len() != 2 {
             return exec_err!("div expects 2 arguments, got {}", args.len());
         }
-        let n = args.iter()
-            .filter_map(|a| match a { ColumnarValue::Array(arr) => Some(arr.len()), _ => None })
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
             .max()
             .unwrap_or(1);
         let a = args[0].clone().into_array(n)?;
@@ -1453,7 +1496,9 @@ pub(crate) fn rewrite_every_to_bool_and(sql: &str) -> String {
                 // a unique output column name.
                 // Skip whitespace between function name and `(`.
                 let ws_start = i;
-                while i < len && bytes[i].is_ascii_whitespace() { i += 1; }
+                while i < len && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
                 if i < len && bytes[i] == b'(' {
                     // Emit whitespace + `(` + body + `)`.
                     let open = i;
@@ -1470,9 +1515,11 @@ pub(crate) fn rewrite_every_to_bool_and(sql: &str) -> String {
                                 while i < len {
                                     if bytes[i] == b'\'' {
                                         if i + 1 < len && bytes[i + 1] == b'\'' {
-                                            i += 2; continue;
+                                            i += 2;
+                                            continue;
                                         }
-                                        i += 1; break;
+                                        i += 1;
+                                        break;
                                     }
                                     i += 1;
                                 }
@@ -1499,8 +1546,14 @@ pub(crate) fn rewrite_every_to_bool_and(sql: &str) -> String {
         // full char (or copying the raw bytes for non-char-boundary positions)
         // preserves the original encoding.
         let char_len = match bytes[i] {
-            b if b < 0x80 => { out.push(b as char); 1 }
-            b if b < 0xC0 => { out.push(b as char); 1 } // stray continuation — pass through
+            b if b < 0x80 => {
+                out.push(b as char);
+                1
+            }
+            b if b < 0xC0 => {
+                out.push(b as char);
+                1
+            } // stray continuation — pass through
             _ => {
                 // Lead byte: find char boundary end and push_str the slice.
                 let ch_width = match bytes[i] {
@@ -1535,10 +1588,8 @@ pub(crate) fn rewrite_agg_unique_aliases(sql: &str) -> String {
     // name would collide with another function that resolves to the same UDAF.
     // We always add the alias for these known-alias names; the extra AS clause
     // is harmless when only one of the pair appears.
-    const ALWAYS_ALIAS: &[(&str, &str)] = &[
-        ("stddev_samp", "stddev_samp"),
-        ("var_samp",    "var_samp"),
-    ];
+    const ALWAYS_ALIAS: &[(&str, &str)] =
+        &[("stddev_samp", "stddev_samp"), ("var_samp", "var_samp")];
     let mut s = sql.to_string();
     for (func_name, alias) in ALWAYS_ALIAS {
         s = add_alias_after_call(&s, func_name, alias);
@@ -1553,7 +1604,9 @@ fn add_alias_after_call(sql: &str, func_name: &str, alias: &str) -> String {
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
-        let Some(rel) = lower[search_from..].find(func_name) else { break; };
+        let Some(rel) = lower[search_from..].find(func_name) else {
+            break;
+        };
         let name_start = search_from + rel;
         let name_end = name_start + func_name.len();
         let bytes = s.as_bytes();
@@ -1574,7 +1627,9 @@ fn add_alias_after_call(sql: &str, func_name: &str, alias: &str) -> String {
 
         // Find the opening `(`.
         let mut j = name_end;
-        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() { j += 1; }
+        while j < s.len() && s.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
         if j >= s.len() || s.as_bytes()[j] != b'(' {
             search_from = name_end;
             continue;
@@ -1591,8 +1646,12 @@ fn add_alias_after_call(sql: &str, func_name: &str, alias: &str) -> String {
                     k += 1;
                     while k < s.len() {
                         if s.as_bytes()[k] == b'\'' {
-                            if k + 1 < s.len() && s.as_bytes()[k + 1] == b'\'' { k += 2; continue; }
-                            k += 1; break;
+                            if k + 1 < s.len() && s.as_bytes()[k + 1] == b'\'' {
+                                k += 2;
+                                continue;
+                            }
+                            k += 1;
+                            break;
                         }
                         k += 1;
                     }
@@ -1606,7 +1665,10 @@ fn add_alias_after_call(sql: &str, func_name: &str, alias: &str) -> String {
 
         // Check if already has an `AS` alias right after the `)`.
         let after = s[close + 1..].trim_start();
-        if after.to_ascii_lowercase().starts_with("as ") || after.starts_with("as\t") || after.starts_with("as\n") {
+        if after.to_ascii_lowercase().starts_with("as ")
+            || after.starts_with("as\t")
+            || after.starts_with("as\n")
+        {
             // Already aliased — skip.
             search_from = close + 1;
             continue;
@@ -1642,9 +1704,15 @@ struct ArrayFillUdf {
 }
 
 impl ScalarUDFImpl for ArrayFillUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "array_fill" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "array_fill"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         // Return type is List<fill_value_type>.
@@ -1653,14 +1721,19 @@ impl ScalarUDFImpl for ArrayFillUdf {
         } else {
             arg_types[0].clone()
         };
-        Ok(DataType::List(Arc::new(Field::new_list_field(elem_type, true))))
+        Ok(DataType::List(Arc::new(Field::new_list_field(
+            elem_type, true,
+        ))))
     }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 2 {
-            return exec_err!("array_fill requires exactly 2 arguments, got {}", args.len());
+            return exec_err!(
+                "array_fill requires exactly 2 arguments, got {}",
+                args.len()
+            );
         }
 
         // ── arg 0: fill value ──────────────────────────────────────────────
@@ -1708,23 +1781,30 @@ fn extract_dims_from_list(arr: &ArrayRef) -> DFResult<Vec<i64>> {
     match arr.data_type() {
         DataType::List(_) => {
             let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                datafusion::common::DataFusionError::Execution("array_fill: dims not a ListArray".into())
+                datafusion::common::DataFusionError::Execution(
+                    "array_fill: dims not a ListArray".into(),
+                )
             })?;
             if list.len() == 0 {
                 return Ok(vec![]);
             }
             // The first (and only, for a scalar) row.
             let values = list.value(0);
-            let ints = values.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                datafusion::common::DataFusionError::Execution(
-                    "array_fill: dims list must contain Int64 values".into()
-                )
-            })?;
+            let ints = values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Execution(
+                        "array_fill: dims list must contain Int64 values".into(),
+                    )
+                })?;
             Ok((0..ints.len()).map(|i| ints.value(i)).collect())
         }
         DataType::Int64 => {
             let ints = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                datafusion::common::DataFusionError::Execution("array_fill: dims not Int64Array".into())
+                datafusion::common::DataFusionError::Execution(
+                    "array_fill: dims not Int64Array".into(),
+                )
             })?;
             Ok((0..ints.len()).map(|i| ints.value(i)).collect())
         }
@@ -1762,37 +1842,43 @@ mod tests {
         use datafusion::arrow::array::ListArray;
         use datafusion::arrow::datatypes::Field;
         use datafusion::config::ConfigOptions;
-        use datafusion::scalar::ScalarValue;
         use datafusion::logical_expr::ScalarFunctionArgs;
+        use datafusion::scalar::ScalarValue;
 
-        let udf = ArrayFillUdf { signature: Signature::any(2, Volatility::Immutable) };
+        let udf = ArrayFillUdf {
+            signature: Signature::any(2, Volatility::Immutable),
+        };
 
         // Simulate: array_fill(0, ARRAY[3])
         // dims = List<Int64> with value [3]
         let fill = ColumnarValue::Scalar(ScalarValue::Int64(Some(0)));
-        let dim_list = ScalarValue::new_list(
-            &[ScalarValue::Int64(Some(3))],
-            &DataType::Int64,
-            true,
-        );
+        let dim_list =
+            ScalarValue::new_list(&[ScalarValue::Int64(Some(3))], &DataType::Int64, true);
         let dims = ColumnarValue::Scalar(ScalarValue::List(dim_list));
-        let return_field = Arc::new(Field::new("_", DataType::List(
-            Arc::new(Field::new_list_field(DataType::Int64, true)),
-        ), true));
+        let return_field = Arc::new(Field::new(
+            "_",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            true,
+        ));
 
-        let result = udf.invoke_with_args(ScalarFunctionArgs {
-            args: vec![fill, dims],
-            arg_fields: vec![],
-            number_rows: 1,
-            return_field,
-            config_options: Arc::new(ConfigOptions::default()),
-        }).unwrap();
+        let result = udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args: vec![fill, dims],
+                arg_fields: vec![],
+                number_rows: 1,
+                return_field,
+                config_options: Arc::new(ConfigOptions::default()),
+            })
+            .unwrap();
 
         match result {
             ColumnarValue::Scalar(ScalarValue::List(list_arr)) => {
                 assert_eq!(list_arr.len(), 1, "outer list has 1 row");
                 let inner = list_arr.value(0);
-                let ints = inner.as_any().downcast_ref::<Int64Array>().expect("Int64Array");
+                let ints = inner
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64Array");
                 assert_eq!(ints.len(), 3, "should have 3 elements");
                 assert_eq!(ints.value(0), 0);
                 assert_eq!(ints.value(1), 0);
@@ -1804,12 +1890,14 @@ mod tests {
 
     #[test]
     fn array_fill_2d_total_six_elements() {
-        use datafusion::config::ConfigOptions;
-        use datafusion::scalar::ScalarValue;
-        use datafusion::logical_expr::ScalarFunctionArgs;
         use datafusion::arrow::datatypes::Field;
+        use datafusion::config::ConfigOptions;
+        use datafusion::logical_expr::ScalarFunctionArgs;
+        use datafusion::scalar::ScalarValue;
 
-        let udf = ArrayFillUdf { signature: Signature::any(2, Volatility::Immutable) };
+        let udf = ArrayFillUdf {
+            signature: Signature::any(2, Volatility::Immutable),
+        };
 
         // Simulate: array_fill(0, ARRAY[2,3]) — total 6 elements
         let fill = ColumnarValue::Scalar(ScalarValue::Int64(Some(0)));
@@ -1819,17 +1907,21 @@ mod tests {
             true,
         );
         let dims = ColumnarValue::Scalar(ScalarValue::List(dim_list));
-        let return_field = Arc::new(Field::new("_", DataType::List(
-            Arc::new(Field::new_list_field(DataType::Int64, true)),
-        ), true));
+        let return_field = Arc::new(Field::new(
+            "_",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            true,
+        ));
 
-        let result = udf.invoke_with_args(ScalarFunctionArgs {
-            args: vec![fill, dims],
-            arg_fields: vec![],
-            number_rows: 1,
-            return_field,
-            config_options: Arc::new(ConfigOptions::default()),
-        }).unwrap();
+        let result = udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args: vec![fill, dims],
+                arg_fields: vec![],
+                number_rows: 1,
+                return_field,
+                config_options: Arc::new(ConfigOptions::default()),
+            })
+            .unwrap();
 
         match result {
             ColumnarValue::Scalar(ScalarValue::List(list_arr)) => {

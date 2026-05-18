@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{
     info_schema::InfoSchemaQuery, Catalog, CvDef, InMemoryCatalog, Policy, PolicyCommand,
 };
-use basin_common::{TableName, ProjectId};
+use basin_common::{ProjectId, TableName};
 
 fn schema(cols: &[(&str, DataType)]) -> Arc<Schema> {
     Arc::new(Schema::new(

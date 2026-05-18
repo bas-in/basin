@@ -56,11 +56,9 @@ async fn i64_column(engine: &Engine, sql: &str, col: &str) -> Vec<i64> {
     s.execute("CREATE TABLE t (id BIGINT NOT NULL, cat TEXT NOT NULL, val BIGINT NOT NULL)")
         .await
         .unwrap();
-    s.execute(
-        "INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40)",
-    )
-    .await
-    .unwrap();
+    s.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40)")
+        .await
+        .unwrap();
     collect_i64(&s.execute(sql).await.unwrap(), col)
 }
 
@@ -116,11 +114,9 @@ async fn distinct_on_returns_one_row_per_key() {
     s.execute("CREATE TABLE events (id BIGINT NOT NULL, cat TEXT NOT NULL, val BIGINT NOT NULL)")
         .await
         .unwrap();
-    s.execute(
-        "INSERT INTO events VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40)",
-    )
-    .await
-    .unwrap();
+    s.execute("INSERT INTO events VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40)")
+        .await
+        .unwrap();
 
     let res = s
         .execute("SELECT DISTINCT ON (cat) id, cat, val FROM events ORDER BY cat, id")
@@ -128,7 +124,11 @@ async fn distinct_on_returns_one_row_per_key() {
         .unwrap();
     // Should return one row per category (cat='a' → id=1, cat='b' → id=3).
     let ids = collect_i64(&res, "id");
-    assert_eq!(ids, vec![1, 3], "DISTINCT ON should pick the first row per cat");
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "DISTINCT ON should pick the first row per cat"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -140,12 +140,7 @@ async fn distinct_on_returns_one_row_per_key() {
 async fn for_update_advisory_executes_normally() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let ids = i64_column(
-        &engine,
-        "SELECT id FROM t ORDER BY id FOR UPDATE",
-        "id",
-    )
-    .await;
+    let ids = i64_column(&engine, "SELECT id FROM t ORDER BY id FOR UPDATE", "id").await;
     assert_eq!(ids, vec![1, 2, 3, 4]);
 }
 
@@ -182,12 +177,7 @@ async fn for_update_nowait_executes_normally() {
 async fn for_share_advisory_executes_normally() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let ids = i64_column(
-        &engine,
-        "SELECT id FROM t ORDER BY id FOR SHARE",
-        "id",
-    )
-    .await;
+    let ids = i64_column(&engine, "SELECT id FROM t ORDER BY id FOR SHARE", "id").await;
     assert_eq!(ids, vec![1, 2, 3, 4]);
 }
 
@@ -228,12 +218,7 @@ async fn for_no_key_update_skip_locked_executes() {
 async fn for_key_share_rewrites_and_executes() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
-    let ids = i64_column(
-        &engine,
-        "SELECT id FROM t ORDER BY id FOR KEY SHARE",
-        "id",
-    )
-    .await;
+    let ids = i64_column(&engine, "SELECT id FROM t ORDER BY id FOR KEY SHARE", "id").await;
     assert_eq!(ids, vec![1, 2, 3, 4]);
 }
 

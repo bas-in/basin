@@ -87,7 +87,11 @@ async fn fixture() -> (TempDir, Engine, ProjectSession) {
 async fn with_no_data_creates_empty_table_with_query_schema() {
     let (_d, _e, sess) = fixture().await;
 
-    exec(&sess, "CREATE TABLE clone AS SELECT a, b FROM src WITH NO DATA").await;
+    exec(
+        &sess,
+        "CREATE TABLE clone AS SELECT a, b FROM src WITH NO DATA",
+    )
+    .await;
 
     // Correct columns + types, exactly as a populated CTAS would produce.
     assert_eq!(
@@ -211,11 +215,7 @@ async fn column_name_list_renames_positionally() {
     );
     assert_eq!(row_count(&sess, "SELECT * FROM r1").await, 0);
 
-    exec(
-        &sess,
-        "CREATE TABLE r2 (foo, bar) AS SELECT a, b FROM src",
-    )
-    .await;
+    exec(&sess, "CREATE TABLE r2 (foo, bar) AS SELECT a, b FROM src").await;
     assert_eq!(
         schema_of(&sess, "SELECT * FROM r2").await,
         vec![

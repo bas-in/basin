@@ -55,7 +55,9 @@ pub fn evaluate(
     predicate: &Predicate,
 ) -> Result<arrow_array::BooleanArray> {
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt64Type};
+    use arrow_array::types::{
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt64Type,
+    };
     use arrow_array::Array;
     use arrow_array::BooleanArray;
     use arrow_schema::DataType as Dt;

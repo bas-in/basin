@@ -48,61 +48,88 @@ fn engine_in(dir: &TempDir) -> Engine {
 
 /// Helper: run a SELECT returning one row / one column of type i64.
 async fn select_i64(s: &basin_engine::ProjectSession, sql: &str) -> i64 {
-    let ExecResult::Rows { batches, .. } = s.execute(sql).await.unwrap_or_else(|e| {
-        panic!("query failed: {sql:?} — {e}")
-    }) else {
+    let ExecResult::Rows { batches, .. } = s
+        .execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {sql:?} — {e}"))
+    else {
         panic!("expected Rows from {sql:?}");
     };
     let mut vals = Vec::new();
     for b in &batches {
-        let arr = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap_or_else(|| {
-            panic!("expected Int64Array from {sql:?}")
-        });
+        let arr = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap_or_else(|| panic!("expected Int64Array from {sql:?}"));
         for i in 0..arr.len() {
             vals.push(arr.value(i));
         }
     }
-    assert_eq!(vals.len(), 1, "expected 1 row from {sql:?}, got {}", vals.len());
+    assert_eq!(
+        vals.len(),
+        1,
+        "expected 1 row from {sql:?}, got {}",
+        vals.len()
+    );
     vals[0]
 }
 
 /// Helper: run a SELECT returning one row / one column of type f64.
 async fn select_f64(s: &basin_engine::ProjectSession, sql: &str) -> f64 {
-    let ExecResult::Rows { batches, .. } = s.execute(sql).await.unwrap_or_else(|e| {
-        panic!("query failed: {sql:?} — {e}")
-    }) else {
+    let ExecResult::Rows { batches, .. } = s
+        .execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {sql:?} — {e}"))
+    else {
         panic!("expected Rows from {sql:?}");
     };
     let mut vals = Vec::new();
     for b in &batches {
-        let arr = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap_or_else(|| {
-            panic!("expected Float64Array from {sql:?}")
-        });
+        let arr = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap_or_else(|| panic!("expected Float64Array from {sql:?}"));
         for i in 0..arr.len() {
             vals.push(arr.value(i));
         }
     }
-    assert_eq!(vals.len(), 1, "expected 1 row from {sql:?}, got {}", vals.len());
+    assert_eq!(
+        vals.len(),
+        1,
+        "expected 1 row from {sql:?}, got {}",
+        vals.len()
+    );
     vals[0]
 }
 
 /// Helper: run a SELECT returning one row / one column of type text.
 async fn select_str(s: &basin_engine::ProjectSession, sql: &str) -> String {
-    let ExecResult::Rows { batches, .. } = s.execute(sql).await.unwrap_or_else(|e| {
-        panic!("query failed: {sql:?} — {e}")
-    }) else {
+    let ExecResult::Rows { batches, .. } = s
+        .execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {sql:?} — {e}"))
+    else {
         panic!("expected Rows from {sql:?}");
     };
     let mut vals = Vec::new();
     for b in &batches {
-        let arr = b.column(0).as_any().downcast_ref::<StringArray>().unwrap_or_else(|| {
-            panic!("expected StringArray from {sql:?}")
-        });
+        let arr = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("expected StringArray from {sql:?}"));
         for i in 0..arr.len() {
             vals.push(arr.value(i).to_owned());
         }
     }
-    assert_eq!(vals.len(), 1, "expected 1 row from {sql:?}, got {}", vals.len());
+    assert_eq!(
+        vals.len(),
+        1,
+        "expected 1 row from {sql:?}, got {}",
+        vals.len()
+    );
     vals[0].clone()
 }
 
@@ -172,7 +199,11 @@ async fn cast_string_to_float() {
     assert!((v - 1.5).abs() < 1e-10, "'1.5'::FLOAT8 == 1.5");
 
     let v = select_f64(&s, "SELECT CAST('3.14' AS DOUBLE PRECISION)").await;
-    assert!((v - 3.14).abs() < 1e-10, "CAST('3.14' AS DOUBLE PRECISION)");
+    // 3.14 is the literal being cast, not an approximation of π.
+    #[allow(clippy::approx_constant)]
+    {
+        assert!((v - 3.14).abs() < 1e-10, "CAST('3.14' AS DOUBLE PRECISION)");
+    }
 }
 
 // ─── string literal → numeric ────────────────────────────────────────────────
@@ -192,10 +223,10 @@ async fn cast_string_to_numeric_in_table() {
         .await
         .unwrap();
 
-    let ExecResult::Rows { batches, .. } =
-        s.execute("SELECT id FROM prices WHERE price = '1.50'::NUMERIC(10,2)")
-            .await
-            .expect("cast string to numeric in WHERE")
+    let ExecResult::Rows { batches, .. } = s
+        .execute("SELECT id FROM prices WHERE price = '1.50'::NUMERIC(10,2)")
+        .await
+        .expect("cast string to numeric in WHERE")
     else {
         panic!("expected Rows");
     };
@@ -239,16 +270,20 @@ async fn cast_int4_to_int8_promotion() {
         .unwrap();
 
     // Selecting the INTEGER column and casting it to BIGINT.
-    let ExecResult::Rows { batches, .. } =
-        s.execute("SELECT CAST(small AS BIGINT) FROM nums WHERE id = 1")
-            .await
-            .expect("int4 -> int8 cast")
+    let ExecResult::Rows { batches, .. } = s
+        .execute("SELECT CAST(small AS BIGINT) FROM nums WHERE id = 1")
+        .await
+        .expect("int4 -> int8 cast")
     else {
         panic!("expected Rows");
     };
     let mut vals = Vec::new();
     for b in &batches {
-        let arr = b.column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array");
+        let arr = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
         for i in 0..arr.len() {
             vals.push(arr.value(i));
         }
@@ -268,10 +303,10 @@ async fn cast_string_to_date() {
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Verify the cast doesn't error. DataFusion returns Date32 (days since epoch).
-    let ExecResult::Rows { batches, .. } =
-        s.execute("SELECT '2024-01-15'::DATE AS d")
-            .await
-            .expect("string ::date cast")
+    let ExecResult::Rows { batches, .. } = s
+        .execute("SELECT '2024-01-15'::DATE AS d")
+        .await
+        .expect("string ::date cast")
     else {
         panic!("expected Rows");
     };
@@ -281,13 +316,20 @@ async fn cast_string_to_date() {
     // Confirm the returned type is Date32 and the value is 2024-01-15.
     // 2024-01-15 is day 19737 since 1970-01-01.
     let batch = &batches[0];
-    let arr = batch.column(0).as_any().downcast_ref::<Date32Array>()
+    let arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
         .expect("Date32Array for ::date cast");
     // 2024-01-15: days from 1970-01-01. Compute via chrono.
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     let expected = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
     let expected_days = expected.signed_duration_since(epoch).num_days() as i32;
-    assert_eq!(arr.value(0), expected_days, "'2024-01-15'::date days-since-epoch");
+    assert_eq!(
+        arr.value(0),
+        expected_days,
+        "'2024-01-15'::date days-since-epoch"
+    );
 }
 
 // ─── float → integer truncating cast ────────────────────────────────────────
@@ -307,16 +349,20 @@ async fn cast_float_to_integer_truncates() {
         .await
         .unwrap();
 
-    let ExecResult::Rows { batches, .. } =
-        s.execute("SELECT CAST(score AS BIGINT) FROM scores ORDER BY id")
-            .await
-            .expect("float -> bigint cast")
+    let ExecResult::Rows { batches, .. } = s
+        .execute("SELECT CAST(score AS BIGINT) FROM scores ORDER BY id")
+        .await
+        .expect("float -> bigint cast")
     else {
         panic!("expected Rows");
     };
     let mut vals = Vec::new();
     for b in &batches {
-        let arr = b.column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array");
+        let arr = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
         for i in 0..arr.len() {
             vals.push(arr.value(i));
         }
@@ -337,10 +383,16 @@ async fn to_number_with_format() {
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
     let v = select_f64(&s, "SELECT to_number('1234.56', '9999.99')").await;
-    assert!((v - 1234.56).abs() < 1e-6, "to_number without separator: {v}");
+    assert!(
+        (v - 1234.56).abs() < 1e-6,
+        "to_number without separator: {v}"
+    );
 
     let v = select_f64(&s, "SELECT to_number('1,234.56', '9,999.99')").await;
-    assert!((v - 1234.56).abs() < 1e-6, "to_number with thousands sep: {v}");
+    assert!(
+        (v - 1234.56).abs() < 1e-6,
+        "to_number with thousands sep: {v}"
+    );
 
     let v = select_f64(&s, "SELECT to_number('-42', 'S99')").await;
     assert!((v - (-42.0)).abs() < 1e-6, "to_number negative: {v}");
@@ -357,14 +409,17 @@ async fn to_date_with_format() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let ExecResult::Rows { batches, .. } =
-        s.execute("SELECT to_date('2024-01-15', 'YYYY-MM-DD')")
-            .await
-            .expect("to_date query")
+    let ExecResult::Rows { batches, .. } = s
+        .execute("SELECT to_date('2024-01-15', 'YYYY-MM-DD')")
+        .await
+        .expect("to_date query")
     else {
         panic!("expected Rows");
     };
-    let arr = batches[0].column(0).as_any().downcast_ref::<Date32Array>()
+    let arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
         .expect("Date32Array from to_date");
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     let expected = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
@@ -372,14 +427,17 @@ async fn to_date_with_format() {
     assert_eq!(arr.value(0), expected_days, "to_date: days since epoch");
 
     // Alternative format.
-    let ExecResult::Rows { batches: b2, .. } =
-        s.execute("SELECT to_date('15/01/2024', 'DD/MM/YYYY')")
-            .await
-            .expect("to_date alt format")
+    let ExecResult::Rows { batches: b2, .. } = s
+        .execute("SELECT to_date('15/01/2024', 'DD/MM/YYYY')")
+        .await
+        .expect("to_date alt format")
     else {
         panic!("expected Rows");
     };
-    let arr2 = b2[0].column(0).as_any().downcast_ref::<Date32Array>()
+    let arr2 = b2[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
         .expect("Date32Array from to_date alt");
     assert_eq!(arr2.value(0), expected_days, "to_date alt format same day");
 }
@@ -402,7 +460,11 @@ async fn to_char_date_format() {
         .await
         .unwrap();
 
-    let v = select_str(&s, "SELECT to_char(dt, 'YYYY-MM-DD') FROM events WHERE id = 1").await;
+    let v = select_str(
+        &s,
+        "SELECT to_char(dt, 'YYYY-MM-DD') FROM events WHERE id = 1",
+    )
+    .await;
     assert_eq!(v, "2024-03-07", "to_char date formatting");
 }
 
@@ -416,6 +478,13 @@ async fn cast_int_to_double_precision() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let v = select_f64(&s, "SELECT CAST(7 AS DOUBLE PRECISION) / CAST(2 AS DOUBLE PRECISION)").await;
-    assert!((v - 3.5).abs() < 1e-10, "CAST int to double: 7/2 = 3.5, got {v}");
+    let v = select_f64(
+        &s,
+        "SELECT CAST(7 AS DOUBLE PRECISION) / CAST(2 AS DOUBLE PRECISION)",
+    )
+    .await;
+    assert!(
+        (v - 3.5).abs() < 1e-10,
+        "CAST int to double: 7/2 = 3.5, got {v}"
+    );
 }

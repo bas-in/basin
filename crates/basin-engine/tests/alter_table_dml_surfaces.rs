@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array};
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, TableName, ProjectId};
+use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, ProjectId, TableName};
 use basin_engine::reactor_ddl::{
     exec_drop_reactor, exec_react_constraint, exec_react_on, match_alter_table_react_constraint,
     match_alter_table_react_on, match_drop_reactor,
@@ -327,7 +327,9 @@ async fn drop_reactor_works() {
     let drop_intent = match_drop_reactor(&format!("DROP REACTOR {reactor_name} ON src"))
         .unwrap()
         .unwrap();
-    exec_drop_reactor(drop_intent, &project, &cat).await.unwrap();
+    exec_drop_reactor(drop_intent, &project, &cat)
+        .await
+        .unwrap();
 
     sess.execute("INSERT INTO src VALUES (2)").await.unwrap();
     let res = sess

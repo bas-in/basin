@@ -552,9 +552,7 @@ async fn make_runner(server: &TestServer) -> Option<DifferentialRunner> {
     let dsn = match std::env::var("PG_DIFF_TEST_DSN") {
         Ok(v) if !v.is_empty() => v,
         _ => {
-            eprintln!(
-                "[differential] PG_DIFF_TEST_DSN not set — skipping differential tests"
-            );
+            eprintln!("[differential] PG_DIFF_TEST_DSN not set — skipping differential tests");
             return None;
         }
     };
@@ -935,9 +933,7 @@ async fn diff_jsonb_each_srf() {
     runner
         .run_setup(&[
             &format!("CREATE TABLE {t} (id INT, data JSONB)"),
-            &format!(
-                "INSERT INTO {t} VALUES (1, '{{\"x\":1,\"y\":2,\"z\":3}}')"
-            ),
+            &format!("INSERT INTO {t} VALUES (1, '{{\"x\":1,\"y\":2,\"z\":3}}')"),
         ])
         .await
         .unwrap();
@@ -1110,9 +1106,7 @@ async fn diff_agg_filter_plain() {
     runner
         .run_setup(&[
             &format!("CREATE TABLE {t} (id INT, x INT)"),
-            &format!(
-                "INSERT INTO {t} VALUES (1, 10), (2, -5), (3, 20), (4, -1), (5, 15)"
-            ),
+            &format!("INSERT INTO {t} VALUES (1, 10), (2, -5), (3, 20), (4, -1), (5, 15)"),
         ])
         .await
         .unwrap();
@@ -1555,9 +1549,7 @@ async fn diff_serial_nextval_currval() {
     let seq = format!("{pfx}_seq");
 
     runner
-        .run_setup(&[&format!(
-            "CREATE SEQUENCE {seq} START 10 INCREMENT 5"
-        )])
+        .run_setup(&[&format!("CREATE SEQUENCE {seq} START 10 INCREMENT 5")])
         .await
         .unwrap();
 
@@ -1659,9 +1651,7 @@ async fn diff_recursive_tree_traversal() {
     runner
         .run_setup(&[
             &format!("CREATE TABLE {t} (id INT, parent_id INT)"),
-            &format!(
-                "INSERT INTO {t} VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 3)"
-            ),
+            &format!("INSERT INTO {t} VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 3)"),
         ])
         .await
         .unwrap();
@@ -1782,9 +1772,7 @@ async fn diff_cte_delete_returning() {
     runner
         .run_setup(&[
             &format!("CREATE TABLE {t} (id INT, active BOOLEAN)"),
-            &format!(
-                "INSERT INTO {t} VALUES (1, true), (2, false), (3, false), (4, true)"
-            ),
+            &format!("INSERT INTO {t} VALUES (1, true), (2, false), (3, false), (4, true)"),
         ])
         .await
         .unwrap();
@@ -1823,9 +1811,7 @@ async fn diff_corr_scalar_count() {
             &format!("CREATE TABLE {parent} (id INT)"),
             &format!("INSERT INTO {parent} VALUES (1), (2), (3)"),
             &format!("CREATE TABLE {child} (id INT, parent_id INT)"),
-            &format!(
-                "INSERT INTO {child} VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 2)"
-            ),
+            &format!("INSERT INTO {child} VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 2)"),
         ])
         .await
         .unwrap();
@@ -2042,9 +2028,7 @@ async fn diff_str_regexp_match() {
     };
 
     runner
-        .run_assert_match(
-            "SELECT regexp_match('abc-def', '(\\w+)-(\\w+)')",
-        )
+        .run_assert_match("SELECT regexp_match('abc-def', '(\\w+)-(\\w+)')")
         .await
         .unwrap();
 }
@@ -2847,9 +2831,7 @@ async fn diff_search_path_fallback_to_public() {
     // current_schema() should resolve to 'public' since nonexistent_schema_xyzzy
     // doesn't exist. PG returns 'public'; basin may return something different.
     runner
-        .run_assert_match(
-            "SELECT current_schema()",
-        )
+        .run_assert_match("SELECT current_schema()")
         .await
         .unwrap();
 

@@ -1489,9 +1489,7 @@ pub(crate) fn match_refresh_materialized_view_ast(
     stmt: &pg_query::protobuf::RefreshMatViewStmt,
 ) -> Result<(String, bool)> {
     let rel = stmt.relation.as_ref().ok_or_else(|| {
-        BasinError::InvalidSchema(
-            "REFRESH MATERIALIZED VIEW: missing relation in AST".into(),
-        )
+        BasinError::InvalidSchema("REFRESH MATERIALIZED VIEW: missing relation in AST".into())
     })?;
     if rel.relname.is_empty() {
         return Err(BasinError::InvalidSchema(
@@ -1547,7 +1545,9 @@ pub(crate) fn match_create_materialized_view_ast(
         BasinError::InvalidSchema("CREATE MATERIALIZED VIEW: missing INTO clause in AST".into())
     })?;
     let rel = into.rel.as_ref().ok_or_else(|| {
-        BasinError::InvalidSchema("CREATE MATERIALIZED VIEW: missing relation in INTO clause".into())
+        BasinError::InvalidSchema(
+            "CREATE MATERIALIZED VIEW: missing relation in INTO clause".into(),
+        )
     })?;
     if rel.relname.is_empty() {
         return Err(BasinError::InvalidSchema(
@@ -1821,7 +1821,10 @@ mod tests {
         // Basin's custom WITH (full=true) is not valid PG syntax — ensure
         // libpg_query rejects it so callers must use the textual pre-screen.
         let result = pg_query::parse("REFRESH MATERIALIZED VIEW mv WITH (full = true)");
-        assert!(result.is_err(), "expected parse failure for Basin-only syntax");
+        assert!(
+            result.is_err(),
+            "expected parse failure for Basin-only syntax"
+        );
     }
 
     #[test]

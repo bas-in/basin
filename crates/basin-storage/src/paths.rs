@@ -2,7 +2,7 @@
 //! impossible to bypass — all writers and listers must go through these
 //! helpers.
 
-use basin_common::{PartitionKey, TableName, ProjectId};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use chrono::{DateTime, Datelike, Utc};
 use object_store::path::Path as ObjectPath;
 use ulid::Ulid;
@@ -174,7 +174,14 @@ mod tests {
         let table = TableName::new("t").unwrap();
         let part = PartitionKey::default_key();
         let root = ObjectPath::from("warehouse");
-        let key = data_file_key(Some(&root), &project, &table, &part, Utc::now(), Ulid::new());
+        let key = data_file_key(
+            Some(&root),
+            &project,
+            &table,
+            &part,
+            Utc::now(),
+            Ulid::new(),
+        );
         assert!(key.as_ref().starts_with("warehouse/projects/"));
     }
 

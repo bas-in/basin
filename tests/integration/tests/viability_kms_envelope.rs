@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
 use basin_storage::encryption::{EncryptionProvider, WrappedKey};
 use basin_storage::{ReadOptions, Storage, StorageConfig};

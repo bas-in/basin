@@ -7,7 +7,7 @@
 //! independently of `basin-common::events` (which is a stable Tier 0
 //! contract).
 
-use basin_common::{ChangeEvent, ChangeOp, TableName, ProjectId};
+use basin_common::{ChangeEvent, ChangeOp, ProjectId, TableName};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

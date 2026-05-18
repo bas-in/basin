@@ -68,7 +68,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::{BasinError, PartitionKey, TableName, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_router::{PgRateLimit, ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;

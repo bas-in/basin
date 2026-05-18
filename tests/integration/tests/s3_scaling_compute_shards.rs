@@ -165,7 +165,12 @@ async fn s3_scaling_compute_shards() {
     for (_, project) in &projects {
         let mut hits = 0;
         for shard in cluster.shards.iter() {
-            if shard.stats.snapshot_per_project().await.contains_key(project) {
+            if shard
+                .stats
+                .snapshot_per_project()
+                .await
+                .contains_key(project)
+            {
                 hits += 1;
             }
         }

@@ -83,11 +83,7 @@ async fn create_type_enum_invalid_label_rejected() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session(&engine).await;
 
-    exec_ok(
-        &sess,
-        "CREATE TYPE status AS ENUM ('active', 'inactive')",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TYPE status AS ENUM ('active', 'inactive')").await;
     exec_ok(
         &sess,
         "CREATE TABLE t (id BIGINT NOT NULL, s status NOT NULL)",
@@ -96,7 +92,9 @@ async fn create_type_enum_invalid_label_rejected() {
 
     let err = exec_err(&sess, "INSERT INTO t VALUES (1, 'deleted')").await;
     assert!(
-        err.contains("22P02") || err.contains("invalid_text_representation") || err.contains("deleted"),
+        err.contains("22P02")
+            || err.contains("invalid_text_representation")
+            || err.contains("deleted"),
         "expected label-validation error, got: {err}"
     );
 }
@@ -106,15 +104,15 @@ async fn alter_type_add_value_appends_label() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session(&engine).await;
 
-    exec_ok(
-        &sess,
-        "CREATE TYPE mood AS ENUM ('happy', 'sad')",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TYPE mood AS ENUM ('happy', 'sad')").await;
     exec_ok(&sess, "ALTER TYPE mood ADD VALUE 'neutral'").await;
 
     // Neutral is now a valid label.
-    exec_ok(&sess, "CREATE TABLE t (id BIGINT NOT NULL, m mood NOT NULL)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE t (id BIGINT NOT NULL, m mood NOT NULL)",
+    )
+    .await;
     exec_ok(&sess, "INSERT INTO t VALUES (1, 'neutral')").await;
 }
 
@@ -123,11 +121,7 @@ async fn drop_type_removes_enum() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session(&engine).await;
 
-    exec_ok(
-        &sess,
-        "CREATE TYPE color AS ENUM ('red', 'green', 'blue')",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TYPE color AS ENUM ('red', 'green', 'blue')").await;
     exec_ok(&sess, "DROP TYPE color").await;
 
     // After drop, the type name should no longer exist.
@@ -179,11 +173,7 @@ async fn create_domain_with_check_enforced_on_insert() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session(&engine).await;
 
-    exec_ok(
-        &sess,
-        "CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)",
-    )
-    .await;
+    exec_ok(&sess, "CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)").await;
     exec_ok(
         &sess,
         "CREATE TABLE t (id BIGINT NOT NULL, n positive_int NOT NULL)",
@@ -225,10 +215,7 @@ async fn create_sequence_ddl_and_nextval() {
     exec_ok(&sess, "CREATE SEQUENCE my_seq START 10 INCREMENT 2").await;
 
     // First nextval returns START.
-    let res = sess
-        .execute("SELECT nextval('my_seq')")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT nextval('my_seq')").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         let b = batches.first().unwrap();
         assert_eq!(b.num_rows(), 1);
@@ -328,7 +315,9 @@ async fn drop_sequence_ddl() {
 
     let err = exec_err(&sess, "SELECT nextval('s')").await;
     assert!(
-        err.contains("not found") || err.contains("does_not_exist") || err.to_lowercase().contains("sequence"),
+        err.contains("not found")
+            || err.contains("does_not_exist")
+            || err.to_lowercase().contains("sequence"),
         "expected sequence-not-found error, got: {err}"
     );
 }
@@ -374,7 +363,10 @@ async fn create_continuous_view_stores_spec() {
         ExecResult::Rows { batches, .. } => {
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             // Seed data spans 2 distinct days → 2 row-buckets.
-            assert_eq!(total_rows, 2, "CV should contain 2 day-buckets for seed data");
+            assert_eq!(
+                total_rows, 2,
+                "CV should contain 2 day-buckets for seed data"
+            );
         }
         other => panic!("expected Rows result, got: {other:?}"),
     }
@@ -391,11 +383,7 @@ async fn drop_materialized_view() {
     )
     .await;
     // Seed a row so the source query returns rows for schema inference.
-    exec_ok(
-        &sess,
-        "INSERT INTO src VALUES (1, '2026-01-01T00:00:00Z')",
-    )
-    .await;
+    exec_ok(&sess, "INSERT INTO src VALUES (1, '2026-01-01T00:00:00Z')").await;
     exec_ok(
         &sess,
         "CREATE MATERIALIZED VIEW mv \

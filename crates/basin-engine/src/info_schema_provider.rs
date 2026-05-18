@@ -48,10 +48,10 @@ use basin_catalog::{info_schema::InfoSchemaQuery, Catalog};
 use basin_common::ProjectId;
 use datafusion::arrow::datatypes::SchemaRef as DfSchemaRef;
 use datafusion::catalog::{SchemaProvider, Session};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{Expr, TableType};
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::convert::{batch_ws_to_df, schema_ws_to_df};
@@ -127,7 +127,11 @@ impl TableProvider for InfoSchemaTablesProvider {
         // partition. We always emit a single partition (the catalog scan
         // is cheap enough that splitting wouldn't help).
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -190,7 +194,11 @@ impl TableProvider for InfoSchemaColumnsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -253,7 +261,11 @@ impl TableProvider for PgAttributeProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -315,7 +327,11 @@ impl TableProvider for PgNamespaceProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -376,7 +392,11 @@ impl TableProvider for PgClassProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -440,7 +460,11 @@ impl TableProvider for PgProcProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -503,7 +527,11 @@ impl TableProvider for RoutinesProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -567,7 +595,11 @@ impl TableProvider for PgIndexProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -629,7 +661,11 @@ impl TableProvider for PgConstraintProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -692,7 +728,11 @@ impl TableProvider for InfoSchemaViewsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -753,7 +793,11 @@ impl TableProvider for PgViewsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -814,7 +858,11 @@ impl TableProvider for InfoSchemaSchemataProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -878,7 +926,11 @@ impl TableProvider for TableConstraintsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -940,7 +992,11 @@ impl TableProvider for KeyColumnUsageProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -1003,7 +1059,11 @@ impl TableProvider for ReferentialConstraintsProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -1066,7 +1126,11 @@ impl TableProvider for PgTypeProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -1128,7 +1192,11 @@ impl TableProvider for PgDependProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -1191,7 +1259,11 @@ impl TableProvider for PgAuthidProvider {
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&self.schema), projection.cloned())?;
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(exec)
     }
 }
@@ -1219,10 +1291,7 @@ macro_rules! simple_provider {
         }
 
         impl $struct_name {
-            pub(crate) fn new(
-                catalog: Arc<dyn Catalog>,
-                project: ProjectId,
-            ) -> DfResult<Self> {
+            pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
                 let ws_schema = InfoSchemaQuery::$query_schema();
                 let df_schema = schema_ws_to_df(ws_schema.as_ref())
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1255,12 +1324,9 @@ macro_rules! simple_provider {
                 _filters: &[Expr],
                 _limit: Option<usize>,
             ) -> DfResult<Arc<dyn ExecutionPlan>> {
-                let ws_batch = InfoSchemaQuery::$query_fn(
-                    self.catalog.as_ref(),
-                    &self.project,
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let ws_batch = InfoSchemaQuery::$query_fn(self.catalog.as_ref(), &self.project)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let df_batch = batch_ws_to_df(&ws_batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let partitions = vec![vec![df_batch]];
@@ -1276,56 +1342,276 @@ macro_rules! simple_provider {
 }
 
 // pg_catalog new views
-simple_provider!(PgDatabaseProvider, pg_database_schema, pg_database, "PgDatabaseProvider");
-simple_provider!(PgRolesProvider, pg_roles_schema, pg_roles, "PgRolesProvider");
-simple_provider!(PgIndexesProvider, pg_indexes_schema, pg_indexes, "PgIndexesProvider");
-simple_provider!(PgTablesProvider, pg_tables_schema, pg_tables, "PgTablesProvider");
-simple_provider!(PgSettingsProvider, pg_settings_schema, pg_settings, "PgSettingsProvider");
-simple_provider!(PgExtensionProvider, pg_extension_schema, pg_extension, "PgExtensionProvider");
-simple_provider!(PgDescriptionProvider, pg_description_schema, pg_description, "PgDescriptionProvider");
-simple_provider!(PgStatUserTablesProvider, pg_stat_user_tables_schema, pg_stat_user_tables, "PgStatUserTablesProvider");
-simple_provider!(PgStatUserIndexesProvider, pg_stat_user_indexes_schema, pg_stat_user_indexes, "PgStatUserIndexesProvider");
-simple_provider!(PgLocksProvider, pg_locks_schema, pg_locks, "PgLocksProvider");
-simple_provider!(PgStatActivityProvider, pg_stat_activity_schema, pg_stat_activity, "PgStatActivityProvider");
+simple_provider!(
+    PgDatabaseProvider,
+    pg_database_schema,
+    pg_database,
+    "PgDatabaseProvider"
+);
+simple_provider!(
+    PgRolesProvider,
+    pg_roles_schema,
+    pg_roles,
+    "PgRolesProvider"
+);
+simple_provider!(
+    PgIndexesProvider,
+    pg_indexes_schema,
+    pg_indexes,
+    "PgIndexesProvider"
+);
+simple_provider!(
+    PgTablesProvider,
+    pg_tables_schema,
+    pg_tables,
+    "PgTablesProvider"
+);
+simple_provider!(
+    PgSettingsProvider,
+    pg_settings_schema,
+    pg_settings,
+    "PgSettingsProvider"
+);
+simple_provider!(
+    PgExtensionProvider,
+    pg_extension_schema,
+    pg_extension,
+    "PgExtensionProvider"
+);
+simple_provider!(
+    PgDescriptionProvider,
+    pg_description_schema,
+    pg_description,
+    "PgDescriptionProvider"
+);
+simple_provider!(
+    PgStatUserTablesProvider,
+    pg_stat_user_tables_schema,
+    pg_stat_user_tables,
+    "PgStatUserTablesProvider"
+);
+simple_provider!(
+    PgStatUserIndexesProvider,
+    pg_stat_user_indexes_schema,
+    pg_stat_user_indexes,
+    "PgStatUserIndexesProvider"
+);
+simple_provider!(
+    PgLocksProvider,
+    pg_locks_schema,
+    pg_locks,
+    "PgLocksProvider"
+);
+simple_provider!(
+    PgStatActivityProvider,
+    pg_stat_activity_schema,
+    pg_stat_activity,
+    "PgStatActivityProvider"
+);
 
 // information_schema new views
-simple_provider!(CheckConstraintsProvider, check_constraints_schema, check_constraints, "CheckConstraintsProvider");
-simple_provider!(TriggersProvider, triggers_schema, triggers, "TriggersProvider");
-simple_provider!(SequencesProvider, sequences_schema, sequences, "SequencesProvider");
+simple_provider!(
+    CheckConstraintsProvider,
+    check_constraints_schema,
+    check_constraints,
+    "CheckConstraintsProvider"
+);
+simple_provider!(
+    TriggersProvider,
+    triggers_schema,
+    triggers,
+    "TriggersProvider"
+);
+simple_provider!(
+    SequencesProvider,
+    sequences_schema,
+    sequences,
+    "SequencesProvider"
+);
 simple_provider!(DomainsProvider, domains_schema, domains, "DomainsProvider");
-simple_provider!(ParametersProvider, parameters_schema, parameters, "ParametersProvider");
-simple_provider!(RoleTableGrantsProvider, role_table_grants_schema, role_table_grants, "RoleTableGrantsProvider");
-simple_provider!(UserDefinedTypesProvider, user_defined_types_schema, user_defined_types, "UserDefinedTypesProvider");
-simple_provider!(ColumnDomainUsageProvider, column_domain_usage_schema, column_domain_usage, "ColumnDomainUsageProvider");
-simple_provider!(ColumnUdtUsageProvider, column_udt_usage_schema, column_udt_usage, "ColumnUdtUsageProvider");
+simple_provider!(
+    ParametersProvider,
+    parameters_schema,
+    parameters,
+    "ParametersProvider"
+);
+simple_provider!(
+    RoleTableGrantsProvider,
+    role_table_grants_schema,
+    role_table_grants,
+    "RoleTableGrantsProvider"
+);
+simple_provider!(
+    UserDefinedTypesProvider,
+    user_defined_types_schema,
+    user_defined_types,
+    "UserDefinedTypesProvider"
+);
+simple_provider!(
+    ColumnDomainUsageProvider,
+    column_domain_usage_schema,
+    column_domain_usage,
+    "ColumnDomainUsageProvider"
+);
+simple_provider!(
+    ColumnUdtUsageProvider,
+    column_udt_usage_schema,
+    column_udt_usage,
+    "ColumnUdtUsageProvider"
+);
 // New pg_stat_* views
-simple_provider!(PgStatDatabaseProvider, pg_stat_database_schema, pg_stat_database, "PgStatDatabaseProvider");
-simple_provider!(PgStatBgwriterProvider, pg_stat_bgwriter_schema, pg_stat_bgwriter, "PgStatBgwriterProvider");
-simple_provider!(PgStatReplicationProvider, pg_stat_replication_schema, pg_stat_replication, "PgStatReplicationProvider");
-simple_provider!(PgStatArchiverProvider, pg_stat_archiver_schema, pg_stat_archiver, "PgStatArchiverProvider");
-simple_provider!(PgStatWalReceiverProvider, pg_stat_wal_receiver_schema, pg_stat_wal_receiver, "PgStatWalReceiverProvider");
-simple_provider!(PgStatSubscriptionProvider, pg_stat_subscription_schema, pg_stat_subscription, "PgStatSubscriptionProvider");
-simple_provider!(PgStatUserFunctionsProvider, pg_stat_user_functions_schema, pg_stat_user_functions, "PgStatUserFunctionsProvider");
-simple_provider!(PgStatProgressVacuumProvider, pg_stat_progress_vacuum_schema, pg_stat_progress_vacuum, "PgStatProgressVacuumProvider");
-simple_provider!(PgStatProgressCreateIndexProvider, pg_stat_progress_create_index_schema, pg_stat_progress_create_index, "PgStatProgressCreateIndexProvider");
-simple_provider!(PgStatProgressAnalyzeProvider, pg_stat_progress_analyze_schema, pg_stat_progress_analyze, "PgStatProgressAnalyzeProvider");
+simple_provider!(
+    PgStatDatabaseProvider,
+    pg_stat_database_schema,
+    pg_stat_database,
+    "PgStatDatabaseProvider"
+);
+simple_provider!(
+    PgStatBgwriterProvider,
+    pg_stat_bgwriter_schema,
+    pg_stat_bgwriter,
+    "PgStatBgwriterProvider"
+);
+simple_provider!(
+    PgStatReplicationProvider,
+    pg_stat_replication_schema,
+    pg_stat_replication,
+    "PgStatReplicationProvider"
+);
+simple_provider!(
+    PgStatArchiverProvider,
+    pg_stat_archiver_schema,
+    pg_stat_archiver,
+    "PgStatArchiverProvider"
+);
+simple_provider!(
+    PgStatWalReceiverProvider,
+    pg_stat_wal_receiver_schema,
+    pg_stat_wal_receiver,
+    "PgStatWalReceiverProvider"
+);
+simple_provider!(
+    PgStatSubscriptionProvider,
+    pg_stat_subscription_schema,
+    pg_stat_subscription,
+    "PgStatSubscriptionProvider"
+);
+simple_provider!(
+    PgStatUserFunctionsProvider,
+    pg_stat_user_functions_schema,
+    pg_stat_user_functions,
+    "PgStatUserFunctionsProvider"
+);
+simple_provider!(
+    PgStatProgressVacuumProvider,
+    pg_stat_progress_vacuum_schema,
+    pg_stat_progress_vacuum,
+    "PgStatProgressVacuumProvider"
+);
+simple_provider!(
+    PgStatProgressCreateIndexProvider,
+    pg_stat_progress_create_index_schema,
+    pg_stat_progress_create_index,
+    "PgStatProgressCreateIndexProvider"
+);
+simple_provider!(
+    PgStatProgressAnalyzeProvider,
+    pg_stat_progress_analyze_schema,
+    pg_stat_progress_analyze,
+    "PgStatProgressAnalyzeProvider"
+);
 // information_schema bulk views
-simple_provider!(UsagePrivilegesProvider, usage_privileges_schema, usage_privileges, "UsagePrivilegesProvider");
-simple_provider!(TablePrivilegesProvider, table_privileges_schema, table_privileges, "TablePrivilegesProvider");
-simple_provider!(ColumnPrivilegesProvider, column_privileges_schema, column_privileges, "ColumnPrivilegesProvider");
-simple_provider!(RoleColumnGrantsProvider, role_column_grants_schema, role_column_grants, "RoleColumnGrantsProvider");
-simple_provider!(RoleRoutineGrantsProvider, role_routine_grants_schema, role_routine_grants, "RoleRoutineGrantsProvider");
-simple_provider!(ApplicableRolesProvider, applicable_roles_schema, applicable_roles, "ApplicableRolesProvider");
-simple_provider!(EnabledRolesProvider, enabled_roles_schema, enabled_roles, "EnabledRolesProvider");
+simple_provider!(
+    UsagePrivilegesProvider,
+    usage_privileges_schema,
+    usage_privileges,
+    "UsagePrivilegesProvider"
+);
+simple_provider!(
+    TablePrivilegesProvider,
+    table_privileges_schema,
+    table_privileges,
+    "TablePrivilegesProvider"
+);
+simple_provider!(
+    ColumnPrivilegesProvider,
+    column_privileges_schema,
+    column_privileges,
+    "ColumnPrivilegesProvider"
+);
+simple_provider!(
+    RoleColumnGrantsProvider,
+    role_column_grants_schema,
+    role_column_grants,
+    "RoleColumnGrantsProvider"
+);
+simple_provider!(
+    RoleRoutineGrantsProvider,
+    role_routine_grants_schema,
+    role_routine_grants,
+    "RoleRoutineGrantsProvider"
+);
+simple_provider!(
+    ApplicableRolesProvider,
+    applicable_roles_schema,
+    applicable_roles,
+    "ApplicableRolesProvider"
+);
+simple_provider!(
+    EnabledRolesProvider,
+    enabled_roles_schema,
+    enabled_roles,
+    "EnabledRolesProvider"
+);
 // FDW stubs
-simple_provider!(ForeignDataWrappersProvider, foreign_data_wrappers_schema, foreign_data_wrappers, "ForeignDataWrappersProvider");
-simple_provider!(ForeignDataWrapperOptionsProvider, foreign_data_wrapper_options_schema, foreign_data_wrapper_options, "ForeignDataWrapperOptionsProvider");
-simple_provider!(ForeignServersProvider, foreign_servers_schema, foreign_servers, "ForeignServersProvider");
-simple_provider!(ForeignServerOptionsProvider, foreign_server_options_schema, foreign_server_options, "ForeignServerOptionsProvider");
-simple_provider!(ForeignTablesProvider, foreign_tables_schema, foreign_tables, "ForeignTablesProvider");
-simple_provider!(ForeignTableOptionsProvider, foreign_table_options_schema, foreign_table_options, "ForeignTableOptionsProvider");
-simple_provider!(UserMappingsProvider, user_mappings_schema, user_mappings, "UserMappingsProvider");
-simple_provider!(UserMappingOptionsProvider, user_mapping_options_schema, user_mapping_options, "UserMappingOptionsProvider");
+simple_provider!(
+    ForeignDataWrappersProvider,
+    foreign_data_wrappers_schema,
+    foreign_data_wrappers,
+    "ForeignDataWrappersProvider"
+);
+simple_provider!(
+    ForeignDataWrapperOptionsProvider,
+    foreign_data_wrapper_options_schema,
+    foreign_data_wrapper_options,
+    "ForeignDataWrapperOptionsProvider"
+);
+simple_provider!(
+    ForeignServersProvider,
+    foreign_servers_schema,
+    foreign_servers,
+    "ForeignServersProvider"
+);
+simple_provider!(
+    ForeignServerOptionsProvider,
+    foreign_server_options_schema,
+    foreign_server_options,
+    "ForeignServerOptionsProvider"
+);
+simple_provider!(
+    ForeignTablesProvider,
+    foreign_tables_schema,
+    foreign_tables,
+    "ForeignTablesProvider"
+);
+simple_provider!(
+    ForeignTableOptionsProvider,
+    foreign_table_options_schema,
+    foreign_table_options,
+    "ForeignTableOptionsProvider"
+);
+simple_provider!(
+    UserMappingsProvider,
+    user_mappings_schema,
+    user_mappings,
+    "UserMappingsProvider"
+);
+simple_provider!(
+    UserMappingOptionsProvider,
+    user_mapping_options_schema,
+    user_mapping_options,
+    "UserMappingOptionsProvider"
+);
 
 /// Register `information_schema.tables` and `pg_catalog.pg_class` with the
 /// session's default catalog (`datafusion`). Must be called once per
@@ -1475,10 +1761,16 @@ pub(crate) fn register_info_schema_providers(
     pg_catalog_schema.register_table("pg_description".to_string(), pg_description_provider)?;
     let pg_stat_user_tables_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatUserTablesProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_user_tables".to_string(), pg_stat_user_tables_provider)?;
+    pg_catalog_schema.register_table(
+        "pg_stat_user_tables".to_string(),
+        pg_stat_user_tables_provider,
+    )?;
     let pg_stat_user_indexes_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatUserIndexesProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_user_indexes".to_string(), pg_stat_user_indexes_provider)?;
+    pg_catalog_schema.register_table(
+        "pg_stat_user_indexes".to_string(),
+        pg_stat_user_indexes_provider,
+    )?;
     let pg_locks_provider: Arc<dyn TableProvider> =
         Arc::new(PgLocksProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_locks".to_string(), pg_locks_provider)?;
@@ -1496,28 +1788,51 @@ pub(crate) fn register_info_schema_providers(
     pg_catalog_schema.register_table("pg_stat_bgwriter".to_string(), pg_stat_bgwriter_provider)?;
     let pg_stat_replication_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatReplicationProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_replication".to_string(), pg_stat_replication_provider)?;
+    pg_catalog_schema.register_table(
+        "pg_stat_replication".to_string(),
+        pg_stat_replication_provider,
+    )?;
     let pg_stat_archiver_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatArchiverProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_stat_archiver".to_string(), pg_stat_archiver_provider)?;
     let pg_stat_wal_receiver_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatWalReceiverProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_wal_receiver".to_string(), pg_stat_wal_receiver_provider)?;
+    pg_catalog_schema.register_table(
+        "pg_stat_wal_receiver".to_string(),
+        pg_stat_wal_receiver_provider,
+    )?;
     let pg_stat_subscription_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatSubscriptionProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_subscription".to_string(), pg_stat_subscription_provider)?;
+    pg_catalog_schema.register_table(
+        "pg_stat_subscription".to_string(),
+        pg_stat_subscription_provider,
+    )?;
     let pg_stat_user_functions_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatUserFunctionsProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_user_functions".to_string(), pg_stat_user_functions_provider)?;
+    pg_catalog_schema.register_table(
+        "pg_stat_user_functions".to_string(),
+        pg_stat_user_functions_provider,
+    )?;
     let pg_stat_progress_vacuum_provider: Arc<dyn TableProvider> =
         Arc::new(PgStatProgressVacuumProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_progress_vacuum".to_string(), pg_stat_progress_vacuum_provider)?;
-    let pg_stat_progress_create_index_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatProgressCreateIndexProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_progress_create_index".to_string(), pg_stat_progress_create_index_provider)?;
-    let pg_stat_progress_analyze_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatProgressAnalyzeProvider::new(catalog.clone(), project)?);
-    pg_catalog_schema.register_table("pg_stat_progress_analyze".to_string(), pg_stat_progress_analyze_provider)?;
+    pg_catalog_schema.register_table(
+        "pg_stat_progress_vacuum".to_string(),
+        pg_stat_progress_vacuum_provider,
+    )?;
+    let pg_stat_progress_create_index_provider: Arc<dyn TableProvider> = Arc::new(
+        PgStatProgressCreateIndexProvider::new(catalog.clone(), project)?,
+    );
+    pg_catalog_schema.register_table(
+        "pg_stat_progress_create_index".to_string(),
+        pg_stat_progress_create_index_provider,
+    )?;
+    let pg_stat_progress_analyze_provider: Arc<dyn TableProvider> = Arc::new(
+        PgStatProgressAnalyzeProvider::new(catalog.clone(), project)?,
+    );
+    pg_catalog_schema.register_table(
+        "pg_stat_progress_analyze".to_string(),
+        pg_stat_progress_analyze_provider,
+    )?;
 
     // information_schema additions: check_constraints, triggers
     let check_constraints_provider: Arc<dyn TableProvider> =
@@ -1540,10 +1855,16 @@ pub(crate) fn register_info_schema_providers(
     info_schema.register_table("role_table_grants".to_string(), role_table_grants_provider)?;
     let user_defined_types_provider: Arc<dyn TableProvider> =
         Arc::new(UserDefinedTypesProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("user_defined_types".to_string(), user_defined_types_provider)?;
+    info_schema.register_table(
+        "user_defined_types".to_string(),
+        user_defined_types_provider,
+    )?;
     let column_domain_usage_provider: Arc<dyn TableProvider> =
         Arc::new(ColumnDomainUsageProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("column_domain_usage".to_string(), column_domain_usage_provider)?;
+    info_schema.register_table(
+        "column_domain_usage".to_string(),
+        column_domain_usage_provider,
+    )?;
     let column_udt_usage_provider: Arc<dyn TableProvider> =
         Arc::new(ColumnUdtUsageProvider::new(catalog.clone(), project)?);
     info_schema.register_table("column_udt_usage".to_string(), column_udt_usage_provider)?;
@@ -1560,10 +1881,16 @@ pub(crate) fn register_info_schema_providers(
     info_schema.register_table("column_privileges".to_string(), column_privileges_provider)?;
     let role_column_grants_provider: Arc<dyn TableProvider> =
         Arc::new(RoleColumnGrantsProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("role_column_grants".to_string(), role_column_grants_provider)?;
+    info_schema.register_table(
+        "role_column_grants".to_string(),
+        role_column_grants_provider,
+    )?;
     let role_routine_grants_provider: Arc<dyn TableProvider> =
         Arc::new(RoleRoutineGrantsProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("role_routine_grants".to_string(), role_routine_grants_provider)?;
+    info_schema.register_table(
+        "role_routine_grants".to_string(),
+        role_routine_grants_provider,
+    )?;
     let applicable_roles_provider: Arc<dyn TableProvider> =
         Arc::new(ApplicableRolesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("applicable_roles".to_string(), applicable_roles_provider)?;
@@ -1574,28 +1901,44 @@ pub(crate) fn register_info_schema_providers(
     // information_schema FDW stubs
     let foreign_data_wrappers_provider: Arc<dyn TableProvider> =
         Arc::new(ForeignDataWrappersProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("foreign_data_wrappers".to_string(), foreign_data_wrappers_provider)?;
-    let foreign_data_wrapper_options_provider: Arc<dyn TableProvider> =
-        Arc::new(ForeignDataWrapperOptionsProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("foreign_data_wrapper_options".to_string(), foreign_data_wrapper_options_provider)?;
+    info_schema.register_table(
+        "foreign_data_wrappers".to_string(),
+        foreign_data_wrappers_provider,
+    )?;
+    let foreign_data_wrapper_options_provider: Arc<dyn TableProvider> = Arc::new(
+        ForeignDataWrapperOptionsProvider::new(catalog.clone(), project)?,
+    );
+    info_schema.register_table(
+        "foreign_data_wrapper_options".to_string(),
+        foreign_data_wrapper_options_provider,
+    )?;
     let foreign_servers_provider: Arc<dyn TableProvider> =
         Arc::new(ForeignServersProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_servers".to_string(), foreign_servers_provider)?;
     let foreign_server_options_provider: Arc<dyn TableProvider> =
         Arc::new(ForeignServerOptionsProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("foreign_server_options".to_string(), foreign_server_options_provider)?;
+    info_schema.register_table(
+        "foreign_server_options".to_string(),
+        foreign_server_options_provider,
+    )?;
     let foreign_tables_provider: Arc<dyn TableProvider> =
         Arc::new(ForeignTablesProvider::new(catalog.clone(), project)?);
     info_schema.register_table("foreign_tables".to_string(), foreign_tables_provider)?;
     let foreign_table_options_provider: Arc<dyn TableProvider> =
         Arc::new(ForeignTableOptionsProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("foreign_table_options".to_string(), foreign_table_options_provider)?;
+    info_schema.register_table(
+        "foreign_table_options".to_string(),
+        foreign_table_options_provider,
+    )?;
     let user_mappings_provider: Arc<dyn TableProvider> =
         Arc::new(UserMappingsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("user_mappings".to_string(), user_mappings_provider)?;
     let user_mapping_options_provider: Arc<dyn TableProvider> =
         Arc::new(UserMappingOptionsProvider::new(catalog.clone(), project)?);
-    info_schema.register_table("user_mapping_options".to_string(), user_mapping_options_provider)?;
+    info_schema.register_table(
+        "user_mapping_options".to_string(),
+        user_mapping_options_provider,
+    )?;
 
     Ok(())
 }

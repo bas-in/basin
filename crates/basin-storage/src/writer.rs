@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use arrow_array::RecordBatch;
-use basin_common::{BasinError, PartitionKey, Result, TableName, ProjectId};
+use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::{ObjectStoreExt, PutPayload};
@@ -219,8 +219,14 @@ pub(crate) async fn write_batch_with_options(
     // Build and persist HNSW sidecars for any FixedSizeList<Float32> columns
     // in the batch. One sidecar per Parquet write, mirroring the data-file
     // pattern; merging across writes is deferred to the future compactor.
-    crate::vector_index::build_indexes_for_batch(storage, project, table, batch_to_write, data_ulid)
-        .await?;
+    crate::vector_index::build_indexes_for_batch(
+        storage,
+        project,
+        table,
+        batch_to_write,
+        data_ulid,
+    )
+    .await?;
 
     Ok(DataFile {
         path: key,

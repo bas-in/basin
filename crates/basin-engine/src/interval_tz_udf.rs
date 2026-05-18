@@ -59,15 +59,15 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, Date32Array, IntervalMonthDayNanoArray, StringArray,
-    TimestampMicrosecondArray,
-};
 use datafusion::arrow::array::types::IntervalMonthDayNano;
+use datafusion::arrow::array::{
+    Array, ArrayRef, Date32Array, IntervalMonthDayNanoArray, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -238,19 +238,14 @@ fn to_interval_vec(
                 .downcast_ref::<IntervalMonthDayNanoArray>()
                 .unwrap();
             Ok((0..n)
-                .map(|i| {
-                    if a.is_null(i) { None } else { Some(a.value(i)) }
-                })
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
                 .collect())
         }
         // DayTime: ms_in_upper16 (days<<32 | millis), stored as i64.
         // We convert to MonthDayNano with months=0.
         DataType::Interval(IntervalUnit::DayTime) => {
             use datafusion::arrow::array::IntervalDayTimeArray;
-            let a = arr
-                .as_any()
-                .downcast_ref::<IntervalDayTimeArray>()
-                .unwrap();
+            let a = arr.as_any().downcast_ref::<IntervalDayTimeArray>().unwrap();
             Ok((0..n)
                 .map(|i| {
                     if a.is_null(i) {
@@ -315,9 +310,15 @@ struct JustifyUdf {
 }
 
 impl ScalarUDFImpl for JustifyUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Interval(IntervalUnit::MonthDayNano))
     }
@@ -343,11 +344,7 @@ fn justify_days(iv: IntervalMonthDayNano) -> IntervalMonthDayNano {
     let total_days = iv.days;
     let extra_months = total_days / 30;
     let remaining_days = total_days % 30;
-    IntervalMonthDayNano::new(
-        iv.months + extra_months,
-        remaining_days,
-        iv.nanoseconds,
-    )
+    IntervalMonthDayNano::new(iv.months + extra_months, remaining_days, iv.nanoseconds)
 }
 
 /// PG `justify_hours`: convert nanoseconds ≥ 24h into whole days.
@@ -357,11 +354,7 @@ fn justify_hours(iv: IntervalMonthDayNano) -> IntervalMonthDayNano {
     let total_ns = iv.nanoseconds;
     let extra_days = total_ns / NS_PER_DAY;
     let remaining_ns = total_ns % NS_PER_DAY;
-    IntervalMonthDayNano::new(
-        iv.months,
-        iv.days + extra_days as i32,
-        remaining_ns,
-    )
+    IntervalMonthDayNano::new(iv.months, iv.days + extra_days as i32, remaining_ns)
 }
 
 fn justify(iv: IntervalMonthDayNano, kind: JustifyKind) -> IntervalMonthDayNano {
@@ -385,10 +378,18 @@ struct ToCharIntervalUdf {
 }
 
 impl ScalarUDFImpl for ToCharIntervalUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "to_char_interval" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "to_char_interval"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -504,9 +505,15 @@ struct TimezoneUdf {
 }
 
 impl ScalarUDFImpl for TimezoneUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "timezone" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "timezone"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         // Return timestamptz (UTC-annotated).
         match &arg_types[1] {
@@ -531,9 +538,9 @@ impl ScalarUDFImpl for TimezoneUdf {
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .unwrap();
-                let vals: Vec<Option<i64>> = (0..n).map(|i| {
-                    if a.is_null(i) { None } else { Some(a.value(i)) }
-                }).collect();
+                let vals: Vec<Option<i64>> = (0..n)
+                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                    .collect();
                 Arc::new(TimestampMicrosecondArray::from(vals).with_timezone("UTC"))
             }
             DataType::Timestamp(TimeUnit::Nanosecond, _) => {
@@ -542,9 +549,9 @@ impl ScalarUDFImpl for TimezoneUdf {
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .unwrap();
-                let vals: Vec<Option<i64>> = (0..n).map(|i| {
-                    if a.is_null(i) { None } else { Some(a.value(i)) }
-                }).collect();
+                let vals: Vec<Option<i64>> = (0..n)
+                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                    .collect();
                 Arc::new(TimestampNanosecondArray::from(vals).with_timezone("UTC"))
             }
             other => return exec_err!("timezone: unsupported ts type {other:?}"),
@@ -567,9 +574,15 @@ struct AtTimeZoneUdf {
 }
 
 impl ScalarUDFImpl for AtTimeZoneUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "at_time_zone" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "at_time_zone"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         match &arg_types[0] {
             DataType::Timestamp(unit, _) => Ok(DataType::Timestamp(*unit, Some("UTC".into()))),
@@ -591,9 +604,9 @@ impl ScalarUDFImpl for AtTimeZoneUdf {
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .unwrap();
-                let vals: Vec<Option<i64>> = (0..n).map(|i| {
-                    if a.is_null(i) { None } else { Some(a.value(i)) }
-                }).collect();
+                let vals: Vec<Option<i64>> = (0..n)
+                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                    .collect();
                 Arc::new(TimestampMicrosecondArray::from(vals).with_timezone("UTC"))
             }
             DataType::Timestamp(TimeUnit::Nanosecond, _) => {
@@ -602,9 +615,9 @@ impl ScalarUDFImpl for AtTimeZoneUdf {
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .unwrap();
-                let vals: Vec<Option<i64>> = (0..n).map(|i| {
-                    if a.is_null(i) { None } else { Some(a.value(i)) }
-                }).collect();
+                let vals: Vec<Option<i64>> = (0..n)
+                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                    .collect();
                 Arc::new(TimestampNanosecondArray::from(vals).with_timezone("UTC"))
             }
             other => return exec_err!("at_time_zone: unsupported ts type {other:?}"),
@@ -618,7 +631,10 @@ impl ScalarUDFImpl for AtTimeZoneUdf {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum DateIntOp { Add, Sub }
+enum DateIntOp {
+    Add,
+    Sub,
+}
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct DateIntUdf {
@@ -628,10 +644,18 @@ struct DateIntUdf {
 }
 
 impl ScalarUDFImpl for DateIntUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Date32) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Date32)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -646,7 +670,9 @@ impl ScalarUDFImpl for DateIntUdf {
         let dates = date_arr
             .as_any()
             .downcast_ref::<Date32Array>()
-            .ok_or_else(|| DataFusionError::Execution(format!("{}: arg 1 must be Date32", self.name)))?;
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("{}: arg 1 must be Date32", self.name))
+            })?;
 
         let op = self.op;
         let mut out = Date32Array::builder(n);
@@ -690,10 +716,18 @@ struct DateDiffDaysUdf {
 }
 
 impl ScalarUDFImpl for DateDiffDaysUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "date_diff_days" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int32) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "date_diff_days"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int32)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -704,10 +738,18 @@ impl ScalarUDFImpl for DateDiffDaysUdf {
         let n = num_rows(args);
         let a_arr = args[0].clone().into_array(n)?;
         let b_arr = args[1].clone().into_array(n)?;
-        let a = a_arr.as_any().downcast_ref::<Date32Array>()
-            .ok_or_else(|| DataFusionError::Execution("date_diff_days: arg 1 must be Date32".into()))?;
-        let b = b_arr.as_any().downcast_ref::<Date32Array>()
-            .ok_or_else(|| DataFusionError::Execution("date_diff_days: arg 2 must be Date32".into()))?;
+        let a = a_arr
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("date_diff_days: arg 1 must be Date32".into())
+            })?;
+        let b = b_arr
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("date_diff_days: arg 2 must be Date32".into())
+            })?;
 
         use datafusion::arrow::array::Int32Array;
         let mut out = Int32Array::builder(n);
@@ -732,10 +774,18 @@ struct EpochFromIntervalUdf {
 }
 
 impl ScalarUDFImpl for EpochFromIntervalUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "extract_epoch_from_interval" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Float64) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "extract_epoch_from_interval"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
 
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -852,13 +902,17 @@ fn extract_lhs_expr(s: &str) -> (&str, &str) {
         // Balanced paren scan backwards.
         let mut depth = 0i32;
         loop {
-            if i == 0 { break; }
+            if i == 0 {
+                break;
+            }
             i -= 1;
             match chars[i] {
                 ')' => depth += 1,
                 '(' => {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -1017,7 +1071,10 @@ mod tests {
     fn test_rewrite_at_time_zone_current_timestamp() {
         let sql = "SELECT current_timestamp AT TIME ZONE 'UTC'";
         let out = rewrite_at_time_zone(sql);
-        assert_eq!(out, "SELECT at_time_zone(current_timestamp, 'UTC')", "got: {out}");
+        assert_eq!(
+            out, "SELECT at_time_zone(current_timestamp, 'UTC')",
+            "got: {out}"
+        );
     }
 
     #[test]
