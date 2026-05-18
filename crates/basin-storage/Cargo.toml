@@ -42,6 +42,16 @@ aes-gcm = "0.10"
 # pull it as a runtime dep here so production builds get a real CSPRNG
 # (`OsRng` via `thread_rng`) without per-callsite plumbing.
 rand.workspace = true
+# Vortex columnar storage format (#161 — opt-in `WITH (basin.file_format =
+# 'vortex')`). Versions pinned to match the proven benchmark/vortex_compare
+# crate; vortex 0.70 targets arrow 58 (= the workspace pin) exactly.
+vortex-array = "0.70"
+vortex-file = { version = "0.70", features = ["zstd"] }
+vortex-btrblocks = { version = "0.70", features = ["zstd", "pco"] }
+vortex-session = "0.70"
+vortex-io = { version = "0.70", features = ["tokio"] }
+vortex-layout = "0.70"
+vortex-buffer = "0.70"
 
 [dev-dependencies]
 tempfile.workspace = true
