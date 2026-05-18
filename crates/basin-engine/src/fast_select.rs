@@ -31,11 +31,26 @@ use basin_storage::{
 };
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, ObjectName, Query, SelectItem, SetExpr, Statement,
-    TableFactor, UnaryOperator, Value,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
 };
 
 use crate::{ExecResult, ProjectSession};
+
+/// Aggregate function in a `SELECT` projection recognized by the fast path.
+/// Only the patterns relevant to the benchmark battery are supported; anything
+/// richer falls through to DataFusion.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AggregateFn {
+    /// `COUNT(*)`
+    CountStar,
+    /// `SUM(<col>)` where `<col>` is a bare identifier.
+    Sum(String),
+    /// `MIN(<col>)`
+    Min(String),
+    /// `MAX(<col>)`
+    Max(String),
+}
 
 /// Recognised "simple SELECT" plan. When `predicates` is empty the read is
 /// an unfiltered scan; when `limit` is `Some(n)` we truncate the merged
@@ -43,16 +58,22 @@ use crate::{ExecResult, ProjectSession};
 #[derive(Debug)]
 pub(crate) struct SimpleSelectPlan {
     pub table: TableName,
-    /// `None` means project every column (`SELECT *`).
+    /// `None` means project every column (`SELECT *`); `Some(cols)` means a
+    /// column-list projection. Set to `None` for aggregate queries (the query
+    /// has no row-returning projection).
     pub projection: Option<Vec<String>>,
-    /// Zero or more conjunctive predicates. Up to two atoms are accepted
-    /// (single `col op lit` or BETWEEN / `col op lit AND col op lit`).
+    /// When `Some`, the query is an aggregate (no ORDER BY, no LIMIT).
+    /// When `None`, it is a row-returning SELECT.
+    pub aggregates: Option<Vec<AggregateFn>>,
+    /// Zero or more conjunctive predicates. Up to three atoms are accepted
+    /// (single `col op lit`, BETWEEN, or `col op lit AND col op lit [AND ...]`).
     pub predicates: Vec<Predicate>,
     pub limit: Option<usize>,
     /// `Some((column, ascending))` for a single-column ORDER BY recognised by
     /// the fast path. `ascending=true` means ASC (or no direction specified);
     /// `ascending=false` means DESC. When `Some`, `execute_simple_select` sorts
     /// all decoded rows by this column and applies the limit post-sort.
+    /// Always `None` for aggregate queries.
     pub order_by: Option<(String, bool)>,
 }
 
@@ -171,9 +192,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // of bare column identifiers. Compound names (`t.col`), expressions, and
     // aliases are left to DataFusion so we don't have to teach the fast path
     // about them.
-    let projection = parse_projection(&select.projection)?;
-
-    // WHERE clause: zero to two conjunctive predicates. Each atom is one of
+    // WHERE clause: zero or more conjunctive predicates. Each atom is one of
     // `<col> <op> <literal>` where `<op>` is `=`, `>`, `<`, `>=`, `<=`;
     // `<col> BETWEEN <lo> AND <hi>` is also accepted (expands to two atoms).
     // A bare `AND` of exactly two such atoms is accepted too (covers the
@@ -184,6 +203,32 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         None => vec![],
         Some(expr) => parse_predicates(expr)?,
     };
+
+    // Projection: try aggregate functions first (COUNT/SUM/MIN/MAX), then fall
+    // back to the standard column-list or wildcard form. Both paths are
+    // mutually exclusive; a mix (e.g. `SELECT COUNT(*), id`) is not supported.
+    //
+    // Aggregate constraints:
+    //  - No ORDER BY (no sensible sort on a single-row result)
+    //  - No LIMIT
+    // Row-returning constraints:
+    //  - ORDER BY requires a paired LIMIT
+    if let Some(aggs) = parse_aggregate_projection(&select.projection) {
+        // Aggregate query — ORDER BY and LIMIT are incompatible.
+        if order_by.is_some() || q.ext_limit().is_some() {
+            return None;
+        }
+        return Some(SimpleSelectPlan {
+            table,
+            projection: None, // not a row projection
+            aggregates: Some(aggs),
+            predicates,
+            limit: None,
+            order_by: None,
+        });
+    }
+
+    let projection = parse_projection(&select.projection)?;
 
     // LIMIT: literal non-negative integer. `LIMIT ALL`, expressions, and
     // placeholders fall through to DataFusion.
@@ -209,6 +254,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     Some(SimpleSelectPlan {
         table,
         projection,
+        aggregates: None,
         predicates,
         limit,
         order_by,
@@ -246,6 +292,102 @@ fn parse_projection(items: &[SelectItem]) -> Option<Option<Vec<String>>> {
         }
     }
     Some(Some(cols))
+}
+
+/// Try to parse the SELECT projection as a list of aggregate functions.
+/// Returns `None` when the projection contains any non-aggregate item (mixed
+/// aggregate + row expressions are not supported on the fast path). Only
+/// COUNT(*), COUNT(col), SUM(col), MIN(col), MAX(col) with bare-identifier
+/// column arguments are recognised; anything with aliases, expressions, or
+/// DISTINCT falls back to DataFusion.
+fn parse_aggregate_projection(items: &[SelectItem]) -> Option<Vec<AggregateFn>> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut aggs = Vec::with_capacity(items.len());
+    for item in items {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            _ => return None, // aliases, qualified wildcards, etc.
+        };
+        let func = match expr {
+            Expr::Function(f) => f,
+            _ => return None,
+        };
+        // Must be a plain, unqualified name with no filter/order/over.
+        if func.over.is_some() || func.filter.is_some() || func.null_treatment.is_some() {
+            return None;
+        }
+        let name = func
+            .name
+            .0
+            .last()
+            .map(|p| p.id_val().to_ascii_lowercase())?;
+
+        let agg = match name.as_str() {
+            "count" => {
+                // COUNT(*) or COUNT(col) — must have exactly one argument.
+                let args = match &func.args {
+                    FunctionArguments::List(list) => {
+                        // Reject DISTINCT or additional clauses (ORDER BY, LIMIT inside aggregate).
+                        if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                            return None;
+                        }
+                        &list.args
+                    }
+                    _ => return None,
+                };
+                if args.len() != 1 {
+                    return None;
+                }
+                match &args[0] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => AggregateFn::CountStar,
+                    // COUNT(col) counts non-null values — different from COUNT(*).
+                    // Fall back to DataFusion so NULL semantics are correct.
+                    _ => return None,
+                }
+            }
+            "sum" => {
+                let col = parse_single_col_agg_arg(func)?;
+                AggregateFn::Sum(col)
+            }
+            "min" => {
+                let col = parse_single_col_agg_arg(func)?;
+                AggregateFn::Min(col)
+            }
+            "max" => {
+                let col = parse_single_col_agg_arg(func)?;
+                AggregateFn::Max(col)
+            }
+            _ => return None,
+        };
+        aggs.push(agg);
+    }
+    Some(aggs)
+}
+
+/// Extract a single bare-identifier column argument from an aggregate
+/// function (for SUM, MIN, MAX). Returns `None` for anything other than
+/// `fn(col)`.
+fn parse_single_col_agg_arg(func: &sqlparser::ast::Function) -> Option<String> {
+    let args = match &func.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return None;
+            }
+            &list.args
+        }
+        _ => return None,
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    match &args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
+            Some(id.value.clone())
+        }
+        _ => None,
+    }
 }
 
 /// Parse the WHERE expression into zero, one, or two conjunctive
@@ -614,6 +756,12 @@ pub(crate) async fn execute_simple_select(
         collected.into_iter().collect::<Result<Vec<_>>>()?
     };
 
+    // If this is an aggregate query, compute the aggregate functions over the
+    // (already filtered) batches and return a single-row result.
+    if let Some(ref aggs) = plan.aggregates {
+        return apply_aggregates(batches, aggs, &meta.schema);
+    }
+
     let projected_schema: Arc<Schema> = match &proj_indices {
         Some(idxs) => Arc::new(
             meta.schema
@@ -744,6 +892,157 @@ fn apply_limit(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {
         }
     }
     out
+}
+
+/// Compute a list of aggregate functions over `batches` and return a single
+/// `ExecResult::Rows` with one output row. The output schema has one column
+/// per aggregate in the same order as `aggs`.
+///
+/// Supports: `COUNT(*)` → `Int64`, `SUM(col)` → `Int64`, `MIN(col)` → `Int64`,
+/// `MAX(col)` → `Int64`. SUM/MIN/MAX on non-Int64 columns fall back (return an
+/// error) rather than silently widening or narrowing. NULL values in the source
+/// are handled correctly: SUM(col) skips nulls, MIN/MAX skip nulls;
+/// COUNT(*) counts all rows including those with NULLs.
+fn apply_aggregates(
+    batches: Vec<RecordBatch>,
+    aggs: &[AggregateFn],
+    table_schema: &Arc<Schema>,
+) -> Result<ExecResult> {
+    use arrow::compute::min as arrow_min;
+    use arrow::compute::max as arrow_max;
+    use arrow::compute::sum as arrow_sum;
+    use arrow_array::{Int64Array, ArrayRef};
+    use arrow_schema::{DataType, Field};
+
+    // Compute per-batch partial aggregates, then combine.
+    // COUNT(*): accumulate row counts.
+    // SUM/MIN/MAX: accumulate over all batches.
+    struct Acc {
+        count: i64,
+        sum: Option<i64>,
+        min: Option<i64>,
+        max: Option<i64>,
+    }
+
+    let mut accs: Vec<Acc> = aggs
+        .iter()
+        .map(|_| Acc {
+            count: 0,
+            sum: None,
+            min: None,
+            max: None,
+        })
+        .collect();
+
+    for batch in &batches {
+        for (i, agg) in aggs.iter().enumerate() {
+            let acc = &mut accs[i];
+            match agg {
+                AggregateFn::CountStar => {
+                    acc.count += batch.num_rows() as i64;
+                }
+                AggregateFn::Sum(col) => {
+                    let col_idx = batch.schema().index_of(col).map_err(|_| {
+                        BasinError::InvalidSchema(format!("SUM: unknown column {col}"))
+                    })?;
+                    let arr = batch.column(col_idx);
+                    let i64_arr = arr
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            BasinError::internal(format!("SUM: column {col} is not Int64"))
+                        })?;
+                    if let Some(partial) = arrow_sum(i64_arr) {
+                        acc.sum = Some(acc.sum.unwrap_or(0) + partial);
+                    }
+                }
+                AggregateFn::Min(col) => {
+                    let col_idx = batch.schema().index_of(col).map_err(|_| {
+                        BasinError::InvalidSchema(format!("MIN: unknown column {col}"))
+                    })?;
+                    let arr = batch.column(col_idx);
+                    let i64_arr = arr
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            BasinError::internal(format!("MIN: column {col} is not Int64"))
+                        })?;
+                    if let Some(partial) = arrow_min(i64_arr) {
+                        acc.min = Some(match acc.min {
+                            Some(prev) => prev.min(partial),
+                            None => partial,
+                        });
+                    }
+                }
+                AggregateFn::Max(col) => {
+                    let col_idx = batch.schema().index_of(col).map_err(|_| {
+                        BasinError::InvalidSchema(format!("MAX: unknown column {col}"))
+                    })?;
+                    let arr = batch.column(col_idx);
+                    let i64_arr = arr
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            BasinError::internal(format!("MAX: column {col} is not Int64"))
+                        })?;
+                    if let Some(partial) = arrow_max(i64_arr) {
+                        acc.max = Some(match acc.max {
+                            Some(prev) => prev.max(partial),
+                            None => partial,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Build the output schema and result arrays.
+    let mut fields: Vec<arrow_schema::FieldRef> = Vec::with_capacity(aggs.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(aggs.len());
+
+    for (i, agg) in aggs.iter().enumerate() {
+        let acc = &accs[i];
+        match agg {
+            AggregateFn::CountStar => {
+                fields.push(Arc::new(Field::new("count(*)", DataType::Int64, false)));
+                columns.push(Arc::new(Int64Array::from(vec![acc.count])) as ArrayRef);
+            }
+            AggregateFn::Sum(col) => {
+                // Derive output name the same way DataFusion does: `sum(col)`.
+                fields.push(Arc::new(Field::new(
+                    format!("sum({col})"),
+                    DataType::Int64,
+                    true, // nullable: NULL when no rows
+                )));
+                columns.push(Arc::new(Int64Array::from(vec![acc.sum])) as ArrayRef);
+            }
+            AggregateFn::Min(col) => {
+                fields.push(Arc::new(Field::new(
+                    format!("min({col})"),
+                    DataType::Int64,
+                    true,
+                )));
+                columns.push(Arc::new(Int64Array::from(vec![acc.min])) as ArrayRef);
+            }
+            AggregateFn::Max(col) => {
+                fields.push(Arc::new(Field::new(
+                    format!("max({col})"),
+                    DataType::Int64,
+                    true,
+                )));
+                columns.push(Arc::new(Int64Array::from(vec![acc.max])) as ArrayRef);
+            }
+        }
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| BasinError::internal(format!("aggregate result batch: {e}")))?;
+
+    Ok(ExecResult::Rows {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 #[cfg(test)]
@@ -918,6 +1217,54 @@ mod tests {
     fn rejects_or_predicate() {
         // OR is not supported — always falls through to DataFusion.
         let stmt = parse_one("SELECT id FROM t WHERE id = 1 OR id = 2");
+        assert!(match_simple_select(&stmt).is_none());
+    }
+
+    #[test]
+    fn matches_aggregate_count_star() {
+        let stmt = parse_one("SELECT COUNT(*) FROM t");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        assert_eq!(
+            plan.aggregates.as_deref(),
+            Some([AggregateFn::CountStar].as_slice())
+        );
+        assert!(plan.predicates.is_empty());
+        assert!(plan.limit.is_none());
+    }
+
+    #[test]
+    fn matches_aggregate_count_sum_with_between() {
+        let stmt =
+            parse_one("SELECT COUNT(*), SUM(id) FROM t WHERE id BETWEEN 100 AND 200");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        let aggs = plan.aggregates.as_deref().expect("should be aggregate");
+        assert_eq!(aggs.len(), 2);
+        assert_eq!(aggs[0], AggregateFn::CountStar);
+        assert_eq!(aggs[1], AggregateFn::Sum("id".to_string()));
+        assert_eq!(plan.predicates.len(), 2); // BETWEEN expands to Gt + Lt
+    }
+
+    #[test]
+    fn matches_aggregate_min_max() {
+        let stmt = parse_one("SELECT MIN(k), MAX(k) FROM t");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        let aggs = plan.aggregates.as_deref().expect("should be aggregate");
+        assert_eq!(aggs.len(), 2);
+        assert_eq!(aggs[0], AggregateFn::Min("k".to_string()));
+        assert_eq!(aggs[1], AggregateFn::Max("k".to_string()));
+    }
+
+    #[test]
+    fn rejects_aggregate_with_order_by() {
+        // Aggregate + ORDER BY is not sensible for a single-row result.
+        let stmt = parse_one("SELECT COUNT(*) FROM t ORDER BY id DESC LIMIT 1");
+        assert!(match_simple_select(&stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_mixed_aggregate_and_column() {
+        // Mixed aggregate + column projection is not supported.
+        let stmt = parse_one("SELECT COUNT(*), id FROM t");
         assert!(match_simple_select(&stmt).is_none());
     }
 
