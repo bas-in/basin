@@ -68,6 +68,12 @@ pub(crate) struct SimpleSelectPlan {
     /// Zero or more conjunctive predicates. Up to three atoms are accepted
     /// (single `col op lit`, BETWEEN, or `col op lit AND col op lit [AND ...]`).
     pub predicates: Vec<Predicate>,
+    /// `IS NULL` checks that cannot be represented as a [`Predicate`] (the
+    /// storage-layer enum has no `IsNull` variant). Each entry is a column
+    /// name; the execution path applies them as a post-read Arrow filter.
+    /// Catalog-level pruning uses `CompoundPredicate::IsNull` to skip files
+    /// where `null_count == 0` for the column.
+    pub is_null_cols: Vec<String>,
     pub limit: Option<usize>,
     /// `Some((column, ascending))` for a single-column ORDER BY recognised by
     /// the fast path. `ascending=true` means ASC (or no direction specified);
@@ -195,13 +201,13 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // WHERE clause: zero or more conjunctive predicates. Each atom is one of
     // `<col> <op> <literal>` where `<op>` is `=`, `>`, `<`, `>=`, `<=`;
     // `<col> BETWEEN <lo> AND <hi>` is also accepted (expands to two atoms).
-    // A bare `AND` of exactly two such atoms is accepted too (covers the
-    // compound-filter benchmark shape `BETWEEN … AND b = true`). Anything
-    // richer — OR, IS NULL, expressions, nested ANDs — falls through to
-    // DataFusion.
-    let predicates: Vec<Predicate> = match &select.selection {
-        None => vec![],
-        Some(expr) => parse_predicates(expr)?,
+    // `<col> IS NULL` is accepted (pruned at catalog layer, filtered in-RAM).
+    // A bare `AND` of up to three such atoms is accepted. Anything richer —
+    // OR, IS NOT NULL, expressions, nested ANDs beyond the cap — falls through
+    // to DataFusion.
+    let parsed_where: ParsedWhere = match &select.selection {
+        None => ParsedWhere { predicates: vec![], is_null_cols: vec![] },
+        Some(expr) => parse_where(expr)?,
     };
 
     // Projection: try aggregate functions first (COUNT/SUM/MIN/MAX), then fall
@@ -222,7 +228,8 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
             table,
             projection: None, // not a row projection
             aggregates: Some(aggs),
-            predicates,
+            predicates: parsed_where.predicates,
+            is_null_cols: parsed_where.is_null_cols,
             limit: None,
             order_by: None,
         });
@@ -255,7 +262,8 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         table,
         projection,
         aggregates: None,
-        predicates,
+        predicates: parsed_where.predicates,
+        is_null_cols: parsed_where.is_null_cols,
         limit,
         order_by,
     })
@@ -390,21 +398,50 @@ fn parse_single_col_agg_arg(func: &sqlparser::ast::Function) -> Option<String> {
     }
 }
 
-/// Parse the WHERE expression into zero, one, or two conjunctive
-/// `Predicate`s. Returns `None` to fall back to DataFusion on anything
-/// we cannot represent cleanly:
+/// Parsed WHERE clause: a conjunction of typed atoms.
 ///
-/// * A single `<col> <op> <literal>` → one `Predicate`
-/// * `<col> BETWEEN <lo> AND <hi>` → two `Predicate`s (`Gt(col, lo-1)` +
-///   `Lt(col, hi+1)`) — only for `Int64` literals
-/// * `<left> AND <right>` where both sides are simple atoms → two
-///   `Predicate`s (enables compound shapes like `BETWEEN … AND b = true`)
+/// Two kinds of atoms:
+/// * `predicates` — `col op lit` comparisons representable as [`Predicate`]
+///   (pushed into the storage layer for Parquet/Vortex pruning).
+/// * `is_null_cols` — `col IS NULL` checks (no [`Predicate`] variant exists
+///   for these; handled via post-read Arrow filter + catalog pruning only).
+struct ParsedWhere {
+    predicates: Vec<Predicate>,
+    is_null_cols: Vec<String>,
+}
+
+/// Parse the WHERE expression into a [`ParsedWhere`]. Returns `None` to fall
+/// back to DataFusion on anything we cannot represent cleanly.
 ///
-/// More than two atoms, OR, IS NULL, sub-queries, etc. all return `None`.
-fn parse_predicates(expr: &Expr) -> Option<Vec<Predicate>> {
+/// Accepted atoms:
+/// * `<col> <op> <literal>` where `<op>` ∈ {`=`, `>`, `<`, `>=`, `<=`}
+/// * `<col> BETWEEN <lo> AND <hi>` (Int64 only, expands to two `Predicate`s)
+/// * `<col> IS NULL` (stored separately in `is_null_cols`)
+/// * `<left> AND <right>` — at most three combined atoms from the above
+///
+/// OR, sub-queries, IS NOT NULL, etc. all return `None`.
+fn parse_where(expr: &Expr) -> Option<ParsedWhere> {
+    let mut out = ParsedWhere {
+        predicates: Vec::new(),
+        is_null_cols: Vec::new(),
+    };
+    parse_where_into(expr, &mut out)?;
+    Some(out)
+}
+
+/// Recursively populate `out` with atoms from `expr`. Returns `None` to
+/// signal "fall through to DataFusion" when a non-fast-path expression is
+/// encountered or when the combined atom count exceeds the cap.
+fn parse_where_into(expr: &Expr, out: &mut ParsedWhere) -> Option<()> {
+    // `col IS NULL`
+    if let Expr::IsNull(inner) = expr {
+        let col = as_identifier(inner.as_ref())?;
+        out.is_null_cols.push(col);
+        return Some(());
+    }
+
     // `col BETWEEN lo AND hi` — sqlparser represents this as `Between { expr, low, high }`.
-    // It expands to `col > lo-1 AND col < hi+1` for Int64, which our
-    // Predicate type can represent without a new variant.
+    // Expands to `col > lo-1 AND col < hi+1` for Int64.
     if let Expr::Between {
         expr: col_expr,
         negated: false,
@@ -413,7 +450,6 @@ fn parse_predicates(expr: &Expr) -> Option<Vec<Predicate>> {
     } = expr
     {
         let col = as_identifier(col_expr)?;
-        // Only integer BETWEEN for now — float/string BETWEEN stays in DataFusion.
         let lo = match literal_value(low)? {
             ScalarValue::Int64(v) => v.checked_sub(1)?,
             _ => return None,
@@ -422,36 +458,32 @@ fn parse_predicates(expr: &Expr) -> Option<Vec<Predicate>> {
             ScalarValue::Int64(v) => v.checked_add(1)?,
             _ => return None,
         };
-        return Some(vec![
-            Predicate::Gt(col.clone(), ScalarValue::Int64(lo)),
-            Predicate::Lt(col, ScalarValue::Int64(hi)),
-        ]);
+        out.predicates.push(Predicate::Gt(col.clone(), ScalarValue::Int64(lo)));
+        out.predicates.push(Predicate::Lt(col, ScalarValue::Int64(hi)));
+        return Some(());
     }
 
-    // `<left> AND <right>` — accept when both sides are parseable as a single
-    // atom OR as a BETWEEN (which expands to two atoms). Cap at two atoms total
-    // so we don't fan out too much complexity.
+    // `<left> AND <right>` — recurse into both sides. Cap at 3 atoms total.
     if let Expr::BinaryOp {
         op: BinaryOperator::And,
         left,
         right,
     } = expr
     {
-        let left_preds = parse_predicates(left)?;
-        let right_preds = parse_predicates(right)?;
-        // Reject if the combined total exceeds three atoms — keeps the logic
-        // conservative and avoids building huge conjunctive filters.
-        if left_preds.len() + right_preds.len() > 3 {
+        parse_where_into(left, out)?;
+        parse_where_into(right, out)?;
+        if out.predicates.len() + out.is_null_cols.len() > 3 {
             return None;
         }
-        let mut out = left_preds;
-        out.extend(right_preds);
-        return Some(out);
+        return Some(());
     }
 
-    // Single atom.
-    parse_predicate(expr).map(|p| vec![p])
+    // Single comparison atom.
+    let p = parse_predicate(expr)?;
+    out.predicates.push(p);
+    Some(())
 }
+
 
 /// Parse a single `<col> <op> <literal>` predicate where `<op>` is one of
 /// `=`, `>`, `<`, `>=`, `<=` (and their mirror forms). Anything else returns
@@ -660,6 +692,7 @@ pub(crate) async fn execute_simple_select(
     // actual decode small no matter how big the table is, so the
     // `spawn_blocking` round-trip would be pure overhead.
     let heavy = plan.predicates.is_empty()
+        && plan.is_null_cols.is_empty()
         && meta
             .current()
             .map(|s| {
@@ -680,24 +713,33 @@ pub(crate) async fn execute_simple_select(
     // (`PruneOutcome::NoMatch`). Done BEFORE `read_paths` so a pruned file
     // is never opened — decisive for Vortex, whose per-file open is far
     // heavier than a Parquet footer read, and a win for Parquet too
-    // (point/range/compound queries touch one file instead of all).
+    // (point/range/compound/IS NULL queries touch fewer files).
     let live_files = meta.live_data_files();
-    let live_paths: Vec<object_store::path::Path> = if plan.predicates.is_empty() {
+    let live_paths: Vec<object_store::path::Path> = if plan.predicates.is_empty()
+        && plan.is_null_cols.is_empty()
+    {
         live_files
             .into_iter()
             .map(|f| object_store::path::Path::from(f.path.as_str()))
             .collect()
     } else {
-        // Build a compound AND predicate for catalog-level file pruning.
-        let cp = if plan.predicates.len() == 1 {
-            CompoundPredicate::Atom(plan.predicates[0].clone())
-        } else {
-            CompoundPredicate::And(
-                plan.predicates
+        // Build a compound AND predicate for catalog-level file pruning. The
+        // compound predicate includes both comparison atoms and IS NULL checks.
+        // `CompoundPredicate::IsNull` can prune files where null_count == 0.
+        let mut cp_children: Vec<CompoundPredicate> = plan
+            .predicates
+            .iter()
+            .map(|p| CompoundPredicate::Atom(p.clone()))
+            .chain(
+                plan.is_null_cols
                     .iter()
-                    .map(|p| CompoundPredicate::Atom(p.clone()))
-                    .collect(),
+                    .map(|c| CompoundPredicate::IsNull(c.clone())),
             )
+            .collect();
+        let cp = if cp_children.len() == 1 {
+            cp_children.pop().unwrap()
+        } else {
+            CompoundPredicate::And(cp_children)
         };
         let schema = meta.schema.as_ref();
         live_files
@@ -754,6 +796,18 @@ pub(crate) async fn execute_simple_select(
             .await?;
         let collected: Vec<Result<RecordBatch>> = stream.collect().await;
         collected.into_iter().collect::<Result<Vec<_>>>()?
+    };
+
+    // Apply post-read IS NULL filters. `Predicate` has no `IsNull` variant so
+    // these cannot be pushed into the storage layer; we apply them here using
+    // Arrow's `is_null` compute kernel after the decode. The per-file catalog
+    // pruning above already skipped files where `null_count == 0`, so the
+    // remaining files are known to have at least one NULL — the post-filter
+    // only removes non-null rows, which is typically cheap.
+    let batches = if plan.is_null_cols.is_empty() {
+        batches
+    } else {
+        apply_is_null_filter(batches, &plan.is_null_cols)?
     };
 
     // If this is an aggregate query, compute the aggregate functions over the
@@ -868,6 +922,56 @@ fn apply_order_by_limit(
         .map_err(|e| BasinError::internal(format!("order_by result batch: {e}")))?;
 
     Ok(vec![result])
+}
+
+/// Apply one or more `IS NULL` column filters to `batches`. For each
+/// column named in `is_null_cols`, rows where the column is NOT null are
+/// excluded. Multiple column names are AND-ed (a row survives only when
+/// ALL listed columns are null).
+///
+/// Uses `arrow::compute::is_null` (from `arrow-arith`) to build a boolean
+/// mask and `arrow_select::filter::filter_record_batch` to select the
+/// passing rows.
+fn apply_is_null_filter(
+    batches: Vec<RecordBatch>,
+    is_null_cols: &[String],
+) -> Result<Vec<RecordBatch>> {
+    use arrow::compute::is_null as arrow_is_null;
+    use arrow_select::filter::filter_record_batch;
+
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // Build an AND mask over all IS NULL columns.
+        let mut mask: Option<arrow_array::BooleanArray> = None;
+        for col_name in is_null_cols {
+            let col = batch
+                .column_by_name(col_name)
+                .ok_or_else(|| BasinError::InvalidSchema(format!("IS NULL: unknown column {col_name}")))?;
+            let col_mask = arrow_is_null(col.as_ref())
+                .map_err(|e| BasinError::internal(format!("is_null kernel: {e}")))?;
+            mask = Some(match mask {
+                None => col_mask,
+                Some(prev) => {
+                    // AND: row survives only when BOTH masks are true.
+                    arrow::compute::and(&prev, &col_mask)
+                        .map_err(|e| BasinError::internal(format!("is_null and: {e}")))?
+                }
+            });
+        }
+        if let Some(m) = mask {
+            let filtered = filter_record_batch(&batch, &m)
+                .map_err(|e| BasinError::internal(format!("is_null filter: {e}")))?;
+            if filtered.num_rows() > 0 {
+                out.push(filtered);
+            }
+        } else {
+            out.push(batch);
+        }
+    }
+    Ok(out)
 }
 
 /// Truncate the merged batches to at most `limit` rows total. Empty batches
@@ -1185,6 +1289,30 @@ mod tests {
         let stmt = parse_one("SELECT * FROM t WHERE id = 1 AND k > 5");
         let plan = match_simple_select(&stmt).expect("fast path should match");
         assert_eq!(plan.predicates.len(), 2);
+        assert!(plan.is_null_cols.is_empty());
+    }
+
+    #[test]
+    fn matches_is_null_predicate() {
+        let stmt = parse_one("SELECT * FROM t WHERE s IS NULL");
+        let plan = match_simple_select(&stmt).expect("fast path should match IS NULL");
+        assert!(plan.predicates.is_empty());
+        assert_eq!(plan.is_null_cols, vec!["s".to_string()]);
+    }
+
+    #[test]
+    fn matches_is_null_combined_with_comparison() {
+        let stmt = parse_one("SELECT * FROM t WHERE s IS NULL AND id > 5");
+        let plan = match_simple_select(&stmt).expect("fast path should match IS NULL AND compare");
+        assert_eq!(plan.predicates.len(), 1);
+        assert_eq!(plan.is_null_cols, vec!["s".to_string()]);
+    }
+
+    #[test]
+    fn rejects_is_not_null() {
+        // IS NOT NULL is not supported — falls through to DataFusion.
+        let stmt = parse_one("SELECT * FROM t WHERE s IS NOT NULL");
+        assert!(match_simple_select(&stmt).is_none());
     }
 
     #[test]
