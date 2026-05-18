@@ -305,11 +305,13 @@ async fn viability_cluster_by_sort_overhead() {
         bloom_filter_columns: vec![],
         max_row_group_size: None,
         cluster_columns: vec![],
+        ..Default::default()
     };
     let with_cluster = WriteOptions {
         bloom_filter_columns: vec![],
         max_row_group_size: None,
         cluster_columns: vec!["id".to_string()],
+        ..Default::default()
     };
 
     const ROWS: usize = 10_000;

@@ -51,7 +51,7 @@ pub use predicate::{
 pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
-pub use writer::WriteOptions;
+pub use writer::{FileFormat, WriteOptions};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;

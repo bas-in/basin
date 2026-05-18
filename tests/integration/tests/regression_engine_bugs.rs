@@ -409,6 +409,7 @@ async fn bug42_perf_stack_layer_isolation_invariant() {
                 bloom_filter_columns: vec![],
                 cluster_columns: vec![],
                 max_row_group_size: None,
+                ..Default::default()
             },
         )
         .await

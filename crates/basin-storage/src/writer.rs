@@ -88,11 +88,36 @@ const DEFAULT_BLOOM_NDV: u64 = 1024;
 /// it costs in the footer.
 const DEFAULT_BLOOM_FPP: f64 = 0.01;
 
+/// On-disk storage format for a table's data files. `Parquet` (the default)
+/// preserves the legacy behaviour byte-for-byte and Iceberg / Athena / Spark
+/// read-compat; `Vortex` is the opt-in columnar format (#161). A table is
+/// single-format (mixed Parquet+Vortex within one table is a deferred
+/// feature), so the read path selects one format per table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileFormat {
+    #[default]
+    Parquet,
+    Vortex,
+}
+
+impl FileFormat {
+    /// Object-key file extension (no leading dot).
+    pub fn extension(&self) -> &'static str {
+        match self {
+            FileFormat::Parquet => "parquet",
+            FileFormat::Vortex => "vortex",
+        }
+    }
+}
+
 /// Knobs for [`write_batch_with_options`]. All defaults preserve the legacy
 /// behaviour exactly, so callers that don't care about bloom filters can
 /// keep using [`write_batch`] without churn.
 #[derive(Clone, Debug, Default)]
 pub struct WriteOptions {
+    /// On-disk format for this write. Default [`FileFormat::Parquet`] keeps
+    /// the legacy path byte-for-byte.
+    pub file_format: FileFormat,
     /// Columns that should get a native Parquet bloom filter section. Empty
     /// (the default) is the pre-bloom behaviour: no filter is written, the
     /// reader's pruning is driven by min/max stats alone.
@@ -147,6 +172,21 @@ pub(crate) async fn write_batch_with_options(
         Utc::now(),
         data_ulid,
     );
+    // `data_file_key` hardcodes the `.parquet` extension. For a Vortex
+    // table swap the trailing extension (the filename is `{ulid}.vortex`;
+    // ULIDs contain no `.`, so the suffix swap is unambiguous). Tables are
+    // single-format, so this is a clean per-file rename, not a mixed set.
+    let key = match opts.file_format {
+        FileFormat::Parquet => key,
+        FileFormat::Vortex => {
+            let s = key.to_string();
+            let swapped = s
+                .strip_suffix(".parquet")
+                .map(|base| format!("{base}.{}", FileFormat::Vortex.extension()))
+                .unwrap_or(s);
+            object_store::path::Path::from(swapped)
+        }
+    };
 
     // Phase 5.7 B2: physically sort the batch by `cluster_columns` before
     // flushing so related rows live in the same row group. Skipped when
@@ -160,14 +200,23 @@ pub(crate) async fn write_batch_with_options(
         &sorted_batch_owned
     };
 
-    let bytes = encode_parquet(batch_to_write, opts)?;
+    let bytes = match opts.file_format {
+        FileFormat::Parquet => encode_parquet(batch_to_write, opts)?,
+        FileFormat::Vortex => crate::vortex_format::encode(batch_to_write).await?,
+    };
     let row_count = batch_to_write.num_rows() as u64;
 
-    // Stats are extracted from the *plaintext* parquet bytes regardless of
-    // whether envelope encryption is on — the catalog's per-file
-    // ColumnStats need to round-trip the typed min/max, and we don't want
-    // to re-decrypt at commit time.
-    let column_stats = extract_column_stats(&bytes, batch_to_write)?;
+    // Stats are extracted from the *plaintext* bytes regardless of whether
+    // envelope encryption is on — the catalog's per-file ColumnStats need
+    // to round-trip the typed min/max, and we don't want to re-decrypt at
+    // commit time. For Vortex, min/max stat extraction is a later
+    // increment: an empty map means "no per-file pruning info", which the
+    // catalog treats conservatively (scan the file) — correct, just less
+    // pruning. Parquet behaviour is unchanged.
+    let column_stats = match opts.file_format {
+        FileFormat::Parquet => extract_column_stats(&bytes, batch_to_write)?,
+        FileFormat::Vortex => BTreeMap::new(),
+    };
 
     // Envelope-encrypt the body if a provider is attached. The on-disk
     // layout in that case is `nonce(12) || ciphertext_with_tag` and a

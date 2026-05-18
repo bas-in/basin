@@ -2153,6 +2153,8 @@ async fn write_replacement(
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
         cluster_columns: meta.cluster_columns.clone(),
+        // Phase 2: Parquet (default). Phase 3 wires meta.file_format.
+        file_format: basin_storage::FileFormat::default(),
     };
     let df = sess
         .engine

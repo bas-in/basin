@@ -13,18 +13,17 @@ use arrow_schema::Schema;
 use basin_common::{BasinError, Result};
 use futures::StreamExt;
 use vortex_array::arrow::FromArrowArray;
+use vortex_array::scalar_fn::session::ScalarFnSession;
+use vortex_array::session::ArraySession;
 use vortex_array::{ArrayRef, ToCanonical};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
 use vortex_file::{
-    OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder,
-    register_default_encodings,
+    register_default_encodings, OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder,
 };
 use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
-use vortex_array::scalar_fn::session::ScalarFnSession;
-use vortex_array::session::ArraySession;
 
 /// Process-wide Vortex session. Built once (encoding registration is not free)
 /// and reused for every encode/decode call. Mirrors
@@ -134,10 +133,7 @@ mod tests {
             ),
             Field::new(
                 "embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, false)),
-                    4,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 4),
                 false,
             ),
         ]));
@@ -272,7 +268,10 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        assert_eq!(g_flag, o_flag, "Boolean column (incl. nulls) must round-trip");
+        assert_eq!(
+            g_flag, o_flag,
+            "Boolean column (incl. nulls) must round-trip"
+        );
 
         let g_ts = got
             .column(4)

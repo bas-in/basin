@@ -265,11 +265,13 @@ async fn viability_perf_stack() {
         bloom_filter_columns: vec![],
         cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
+        ..Default::default()
     };
     let bloom_opts = WriteOptions {
         bloom_filter_columns: vec!["id".to_string()],
         cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
+        ..Default::default()
     };
     for b in 0..BATCHES {
         let batch = make_batch(0xCAFEBABE_DEAD_BEEFu64, b);

@@ -7,7 +7,7 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{DataFileRef, TableMetadata};
 use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName};
-use basin_storage::WriteOptions;
+use basin_storage::{FileFormat, WriteOptions};
 use sqlparser::ast::{
     AssignmentTarget, ConflictTarget, Expr, ObjectName, OnConflictAction, OnInsert, SetExpr,
     Statement,
@@ -3801,6 +3801,9 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
         cluster_columns: meta.cluster_columns.clone(),
+        // Phase 2: always Parquet. Phase 3 wires this to meta.file_format
+        // once TableMetadata carries the per-table format.
+        file_format: FileFormat::default(),
     }
 }
 
