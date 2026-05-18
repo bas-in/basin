@@ -90,7 +90,11 @@ pub(crate) fn column_stats_from_batch(
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
         let null_count = Some(col.null_count() as u64);
-        let (min_bytes, max_bytes) = match field.data_type() {
+        // sum_bytes uses the SAME 8-byte-LE i64/f64 contract as min/max
+        // (the fast_aggregate decoder reads it identically). Type-gated to
+        // exact Int64/Float64 — anything else stays None so the
+        // metadata-only SUM path correctly bails to a full scan.
+        let (min_bytes, max_bytes, sum_bytes) = match field.data_type() {
             DataType::Int64 => {
                 let a = col
                     .as_any()
@@ -99,6 +103,7 @@ pub(crate) fn column_stats_from_batch(
                 (
                     arrow::compute::min(a).map(|v| v.to_le_bytes().to_vec()),
                     arrow::compute::max(a).map(|v| v.to_le_bytes().to_vec()),
+                    arrow::compute::sum(a).map(|v| v.to_le_bytes().to_vec()),
                 )
             }
             DataType::Float64 => {
@@ -109,9 +114,10 @@ pub(crate) fn column_stats_from_batch(
                 (
                     arrow::compute::min(a).map(|v| v.to_le_bytes().to_vec()),
                     arrow::compute::max(a).map(|v| v.to_le_bytes().to_vec()),
+                    arrow::compute::sum(a).map(|v| v.to_le_bytes().to_vec()),
                 )
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
         out.insert(
             field.name().clone(),
@@ -119,11 +125,7 @@ pub(crate) fn column_stats_from_batch(
                 null_count,
                 min_bytes,
                 max_bytes,
-                // Not populated here — exact column SUM is a separate
-                // writer-side task. `None` = "unknown", which keeps the
-                // metadata-only SUM fast path correctly bailing to a full
-                // scan until that task lands.
-                sum_bytes: None,
+                sum_bytes,
             },
         );
     }
@@ -180,9 +182,14 @@ pub(crate) async fn footer_meta(
             .and_then(|nc_dt| ss.get_as::<u64>(Stat::NullCount, &nc_dt))
             .and_then(|p| p.as_exact());
 
-        // Only exact i64 / f64 columns get min/max, in the 8-byte LE
-        // contract `reader::decode_le_i64` / `decode_le_f64` expect.
-        let (min_bytes, max_bytes) = match col_dt {
+        // Only exact i64 / f64 columns get min/max/sum, in the 8-byte LE
+        // contract `reader::decode_le_i64` / `decode_le_f64` (and the
+        // fast_aggregate SUM decoder) expect. If the Vortex footer's Sum
+        // stat isn't representable as the column's i64/f64 (e.g. a wider
+        // accumulator), `get_as` yields None → sum_bytes None → the
+        // metadata SUM path bails to a correct full scan; the differential
+        // harness gates this.
+        let (min_bytes, max_bytes, sum_bytes) = match col_dt {
             DType::Primitive(PType::I64, _) => {
                 let mn = ss
                     .get_as::<i64>(Stat::Min, col_dt)
@@ -192,7 +199,11 @@ pub(crate) async fn footer_meta(
                     .get_as::<i64>(Stat::Max, col_dt)
                     .and_then(|p| p.as_exact())
                     .map(|v| v.to_le_bytes().to_vec());
-                (mn, mx)
+                let sm = ss
+                    .get_as::<i64>(Stat::Sum, col_dt)
+                    .and_then(|p| p.as_exact())
+                    .map(|v| v.to_le_bytes().to_vec());
+                (mn, mx, sm)
             }
             DType::Primitive(PType::F64, _) => {
                 let mn = ss
@@ -203,21 +214,27 @@ pub(crate) async fn footer_meta(
                     .get_as::<f64>(Stat::Max, col_dt)
                     .and_then(|p| p.as_exact())
                     .map(|v| v.to_le_bytes().to_vec());
-                (mn, mx)
+                let sm = ss
+                    .get_as::<f64>(Stat::Sum, col_dt)
+                    .and_then(|p| p.as_exact())
+                    .map(|v| v.to_le_bytes().to_vec());
+                (mn, mx, sm)
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
 
-        if null_count.is_some() || min_bytes.is_some() || max_bytes.is_some() {
+        if null_count.is_some()
+            || min_bytes.is_some()
+            || max_bytes.is_some()
+            || sum_bytes.is_some()
+        {
             out.insert(
                 name.clone(),
                 crate::data_file::ColumnStats {
                     null_count,
                     min_bytes,
                     max_bytes,
-                    // See note above: SUM population is a separate task;
-                    // `None` keeps the SUM fast path bailing safely.
-                    sum_bytes: None,
+                    sum_bytes,
                 },
             );
         }
