@@ -878,6 +878,10 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
+ "datafusion-datasource",
+ "datafusion-physical-expr",
+ "datafusion-physical-plan",
+ "datafusion-session",
  "futures",
  "hex",
  "md-5 0.10.6",
@@ -898,6 +902,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "vortex",
  "vortex-datafusion",
 ]
 

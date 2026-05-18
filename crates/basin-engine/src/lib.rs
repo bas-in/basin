@@ -620,6 +620,7 @@ mod udf;
 mod vector_planner;
 mod vector_search;
 mod view_ddl;
+mod vortex_listing_format;
 pub mod webhook_ddl;
 pub mod webhook_registry;
 mod window_extras;

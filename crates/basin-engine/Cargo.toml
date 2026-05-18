@@ -27,6 +27,17 @@ datafusion.workspace = true
 # Vortex DataFusion integration (#162 — read path for opt-in Vortex tables).
 # 0.70 targets datafusion 53 / arrow 58 = the workspace pins exactly.
 vortex-datafusion = "0.70"
+# vortex core — needed by vortex_listing_format (W2-1) to call
+# VortexSession::default() and to name types in BasinVortexFormat.
+# Already a transitive dep of vortex-datafusion 0.70.
+vortex = "0.70"
+# Sub-crates used by vortex_listing_format's FileFormat impl; they must be
+# direct deps to name their types in method signatures.  Versions match the
+# datafusion = "53" workspace entry exactly.
+datafusion-datasource = "53"
+datafusion-physical-expr = "53"
+datafusion-physical-plan = "53"
+datafusion-session = "53"
 sqlparser.workspace = true
 object_store.workspace = true
 thiserror.workspace = true

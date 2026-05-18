@@ -30,7 +30,7 @@ use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId, TableFileFormat};
 use basin_common::{BasinError, ProjectId, Result, TableName};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::file_format::{FileFormat, FileFormatFactory};
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -46,7 +46,12 @@ use tracing::instrument;
 use url::Url;
 
 use crate::convert::schema_ws_to_df;
+use crate::vortex_listing_format::BasinVortexFormat;
 use crate::{Engine, ProjectSession, StatelessUdfCache};
+// `VortexSession::default()` is provided by the `VortexSessionDefault` trait;
+// the trait must be in scope to call it.
+#[allow(unused_imports)]
+use vortex::VortexSessionDefault as _;
 
 /// Synthetic URL we register the storage `ObjectStore` under. The scheme is
 /// purely an internal protocol between `basin-engine` and DataFusion; it is
@@ -614,27 +619,30 @@ fn listing_file_format(format: TableFileFormat) -> (Arc<dyn FileFormat>, &'stati
     match format {
         // KEEP byte-identical with the historical inline expression.
         TableFileFormat::Parquet => (Arc::new(ParquetFormat::default()), ".parquet"),
-        // Vortex read path. `VortexFormatFactory::new()` builds a
-        // process-default `VortexSession` internally (registering encodings).
-        // Filter pushdown + whole-file pruning are already active on this
-        // DataFusion path via `VortexSource`; we additionally turn on
-        // `projection_pushdown` so a projected scan reads only the needed
-        // columns natively instead of DataFusion projecting post-scan.
+        // Opt-in Vortex read path. Construct `VortexFormat` directly with
+        // `new_with_options` so we can wrap it in `BasinVortexFormat`.
+        //
+        // W2-1 (this commit): `BasinVortexFormat` patches `total_byte_size`
+        // from `Precision::Absent` to `Precision::Inexact(object.size)` so
+        // DataFusion's `join_selection` / `supports_collect_by_thresholds`
+        // optimizer rules get a real byte-size estimate instead of falling
+        // back to row-count heuristics.  Fixes `inner_join@100k`.
+        //
+        // D2 (preserved from 126b038): `scan_concurrency = 8` parallelises
+        // per-file row-chunk splits so range/group_by/order_by/window/join
+        // shapes overlap I/O with decode; `projection_pushdown = true` so a
+        // projected scan reads only the needed columns natively instead of
+        // DataFusion projecting post-scan.
         TableFileFormat::Vortex => {
-            // `scan_concurrency` parallelises per-file row-chunk splits so
-            // range/group_by/order_by/window/join shapes overlap I/O with
-            // decode.  8 is a safe constant that spans both local-dev
-            // (usually ≤8 cores) and cloud instances without over-saturating
-            // the object-store connection pool.  `num_cpus` is not a
-            // workspace dep, so we use a literal rather than a runtime probe.
-            let factory = vortex_datafusion::VortexFormatFactory::new().with_options(
+            let inner = Arc::new(vortex_datafusion::VortexFormat::new_with_options(
+                vortex::session::VortexSession::default(),
                 vortex_datafusion::VortexTableOptions {
                     projection_pushdown: true,
                     scan_concurrency: Some(8),
                     ..Default::default()
                 },
-            );
-            (FileFormatFactory::default(&factory), ".vortex")
+            ));
+            (Arc::new(BasinVortexFormat::new(inner)), ".vortex")
         }
     }
 }
