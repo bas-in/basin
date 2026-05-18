@@ -46,6 +46,7 @@ struct TableState {
     row_group_rows: Option<usize>,
     continuous_aggregate: Option<CvDef>,
     cluster_columns: Vec<String>,
+    file_format: TableFileFormat,
     home_region: Option<String>,
     indexes: Vec<SecondaryIndex>,
     pk_columns: Vec<String>,
@@ -84,6 +85,7 @@ impl TableState {
             row_group_rows: None,
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
+            file_format: TableFileFormat::default(),
             home_region: None,
             indexes: Vec::new(),
             pk_columns: Vec::new(),
@@ -242,7 +244,7 @@ impl InMemoryCatalog {
             row_group_rows: state.row_group_rows,
             continuous_aggregate: state.continuous_aggregate.clone(),
             cluster_columns: state.cluster_columns.clone(),
-            file_format: TableFileFormat::default(),
+            file_format: state.file_format,
             home_region: state.home_region.clone(),
             indexes: state.indexes.clone(),
             pk_columns: state.pk_columns.clone(),
@@ -558,6 +560,22 @@ impl Catalog for InMemoryCatalog {
         let qtable = QualifiedTableName::in_public(table.clone());
         self.set_cluster_columns_qualified(project, &qtable, columns)
             .await
+    }
+
+    /// #161: real impl — persist the table's on-disk data-file format
+    /// into the in-memory table state so `load_table` returns it.
+    /// Mirrors `set_cluster_columns_qualified`'s state-mutation pattern.
+    async fn set_file_format(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        format: TableFileFormat,
+    ) -> Result<()> {
+        let qtable = QualifiedTableName::in_public(table.clone());
+        let state_arc = self.get_table_qualified(project, &qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.file_format = format;
+        Ok(())
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
@@ -1325,6 +1343,7 @@ impl Catalog for InMemoryCatalog {
                 row_group_rows: s.row_group_rows,
                 continuous_aggregate: s.continuous_aggregate.clone(),
                 cluster_columns: s.cluster_columns.clone(),
+                file_format: s.file_format,
                 home_region: s.home_region.clone(),
                 indexes: s.indexes.clone(),
                 pk_columns: s.pk_columns.clone(),
@@ -2236,6 +2255,31 @@ mod tests {
         cat.set_cluster_columns(&t, &tbl, Vec::new()).await.unwrap();
         let cleared = cat.load_table(&t, &tbl).await.unwrap();
         assert!(cleared.cluster_columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_file_format_round_trip() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("fmt_tbl").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+
+        // Default: Parquet (back-compat — every fresh table).
+        let pre = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(pre.file_format, TableFileFormat::Parquet);
+
+        cat.set_file_format(&t, &tbl, TableFileFormat::Vortex)
+            .await
+            .unwrap();
+        let after = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(after.file_format, TableFileFormat::Vortex);
+
+        // Switch back is also honoured.
+        cat.set_file_format(&t, &tbl, TableFileFormat::Parquet)
+            .await
+            .unwrap();
+        let reverted = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(reverted.file_format, TableFileFormat::Parquet);
     }
 
     #[tokio::test]
