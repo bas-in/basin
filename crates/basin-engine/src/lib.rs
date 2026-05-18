@@ -573,6 +573,7 @@ mod enum_ordinal;
 mod events;
 mod executor;
 mod explain;
+mod fast_aggregate;
 mod fast_select;
 mod fts_udf;
 mod function_ddl;

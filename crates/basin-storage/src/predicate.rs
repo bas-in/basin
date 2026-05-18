@@ -779,6 +779,7 @@ mod compound_tests {
                 null_count: Some(nulls),
                 min_bytes: Some(min.to_le_bytes().to_vec()),
                 max_bytes: Some(max.to_le_bytes().to_vec()),
+                ..Default::default()
             },
         );
         m

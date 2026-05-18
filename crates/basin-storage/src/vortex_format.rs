@@ -119,6 +119,11 @@ pub(crate) fn column_stats_from_batch(
                 null_count,
                 min_bytes,
                 max_bytes,
+                // Not populated here — exact column SUM is a separate
+                // writer-side task. `None` = "unknown", which keeps the
+                // metadata-only SUM fast path correctly bailing to a full
+                // scan until that task lands.
+                sum_bytes: None,
             },
         );
     }
@@ -210,6 +215,9 @@ pub(crate) async fn footer_meta(
                     null_count,
                     min_bytes,
                     max_bytes,
+                    // See note above: SUM population is a separate task;
+                    // `None` keeps the SUM fast path bailing safely.
+                    sum_bytes: None,
                 },
             );
         }

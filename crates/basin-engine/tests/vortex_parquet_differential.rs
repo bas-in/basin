@@ -164,6 +164,12 @@ async fn vortex_matches_parquet_across_query_battery() {
         "SELECT * FROM {Q} WHERE b IS NULL",
         "SELECT * FROM {Q} WHERE id BETWEEN 50 AND 250 AND b = true",
         "SELECT COUNT(*), SUM(id), MIN(k), MAX(k) FROM {Q}",
+        // Metadata-only aggregate fast path (no WHERE): COUNT(*) and a
+        // MIN/MAX-only mix. These exercise `fast_aggregate` directly and
+        // must stay byte-identical to the DataFusion oracle (and to each
+        // other across Vortex/Parquet).
+        "SELECT COUNT(*) FROM {Q}",
+        "SELECT MIN(k), MAX(k) FROM {Q}",
         "SELECT COUNT(*), SUM(id) FROM {Q} WHERE id BETWEEN 75 AND 225",
         "SELECT k, COUNT(*) FROM {Q} GROUP BY k",
         "SELECT s, COUNT(*) FROM {Q} WHERE s IS NOT NULL GROUP BY s",

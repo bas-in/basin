@@ -1195,6 +1195,57 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // the DataFusion path so the RLS rewrite can fire. Tables with
             // RLS off see the fast path exactly as before — same one-`bool`
             // catalog read the existing path already pays.
+            // Metadata-only aggregate fast path — tried FIRST because it is
+            // the most specific and by far the cheapest (answers bare
+            // COUNT/MIN/MAX, and SUM once sum_bytes is populated, from
+            // catalog stats with ZERO file decode — ~30x). It MUST precede
+            // `match_simple_select`, whose recogniser also matches bare
+            // aggregates and would otherwise shadow this path entirely. It
+            // returns `None`/`Ok(None)` for anything it can't answer from
+            // metadata (WHERE present, unpopulated `sum_bytes`, unsupported
+            // type, …), falling through to the recognisers below.
+            //
+            // Same view/RLS/soft-delete gate as the fast path (file-level
+            // stats are invalid under row-level filtering). Transaction
+            // gate: inside an explicit txn the session holds uncommitted
+            // writes in `TxState::pending_files` that are NOT in the
+            // catalog's `live_data_files()`; a metadata-only aggregate
+            // would miss them, so any active txn takes the DataFusion path
+            // (which merges the pending tail). Pure flag read — no I/O.
+            if !crate::session::tx_is_active(&sess.state) {
+                if let Some(plan) = crate::fast_aggregate::match_metadata_aggregate(&stmt) {
+                    let table_meta = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.project, &plan.table)
+                        .await
+                        .ok();
+                    if let Some(ref meta) = table_meta {
+                        let is_view = sess
+                            .engine
+                            .config()
+                            .catalog
+                            .lookup_view(&sess.project, plan.table.as_str())
+                            .await
+                            .is_some();
+                        let has_rls = meta.rls_enabled;
+                        let has_soft_delete =
+                            crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
+                        if !is_view && !has_rls && !has_soft_delete {
+                            if let Some(result) =
+                                crate::fast_aggregate::execute_metadata_aggregate(
+                                    sess, plan, table_meta,
+                                )
+                                .await?
+                            {
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(plan) = match_simple_select(&stmt) {
                 // Fast-path gate: load the table metadata exactly once and
                 // derive all three guard conditions from that single result.
@@ -1236,6 +1287,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     }
                 }
             }
+
             exec_select(sess, sql, include_deleted).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,

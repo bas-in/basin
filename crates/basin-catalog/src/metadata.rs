@@ -199,6 +199,17 @@ pub struct ColumnStats {
     /// according to the Arrow schema.
     pub min_bytes: Option<Vec<u8>>,
     pub max_bytes: Option<Vec<u8>>,
+    /// Best-effort exact column SUM, encoded little-endian by the writer
+    /// (8-byte LE `i64` for `Int64`, 8-byte LE `f64` for `Float64`). `None`
+    /// — the back-compat default for every catalog row written before this
+    /// field existed (and until the writer/Vortex side starts populating
+    /// it) — means "unknown". `#[serde(default)]` so historic rows
+    /// deserialise to `None`. The metadata-only aggregate fast path only
+    /// answers `SUM(col)` from the catalog when EVERY live file carries
+    /// `Some(_)` here; any `None` falls the whole query back to a full
+    /// scan, so the result stays correct while population lands later.
+    #[serde(default)]
+    pub sum_bytes: Option<Vec<u8>>,
 }
 
 /// Reference to a single Parquet data file already written by `basin-storage`.
