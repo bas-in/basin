@@ -70,6 +70,18 @@ pub(crate) async fn encode(batch: &RecordBatch) -> Result<Vec<u8>> {
     Ok(buf.as_slice().to_vec())
 }
 
+/// Total logical row count of a Vortex blob, read from the file footer
+/// (no data decode — symmetric with reading a Parquet footer's row count).
+/// Used by `list_data_files_with_stats` so DELETE/UPDATE row math and the
+/// constraint scans see the real per-file row count for Vortex tables.
+pub(crate) async fn row_count(bytes: &[u8]) -> Result<u64> {
+    let vf = session()
+        .open_options()
+        .open_buffer(bytes.to_vec())
+        .map_err(|e| BasinError::storage(format!("vortex: open_buffer (row_count): {e}")))?;
+    Ok(vf.row_count())
+}
+
 /// Decode a Vortex byte blob back to `RecordBatch`es. One `RecordBatch` is
 /// produced per Vortex chunk in the file.
 ///
@@ -163,8 +175,12 @@ fn normalize_view_dtype(dt: &DataType) -> DataType {
 }
 
 fn normalize_view_field(f: &Field) -> Field {
-    Field::new(f.name(), normalize_view_dtype(f.data_type()), f.is_nullable())
-        .with_metadata(f.metadata().clone())
+    Field::new(
+        f.name(),
+        normalize_view_dtype(f.data_type()),
+        f.is_nullable(),
+    )
+    .with_metadata(f.metadata().clone())
 }
 
 /// Normalise every field of an inferred Vortex schema (see

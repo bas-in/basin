@@ -471,10 +471,30 @@ impl InProcessShard {
             let merged = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| BasinError::storage(format!("concat batches: {e}")))?;
 
+            // Honour the table's persisted on-disk format. The shard
+            // compactor previously wrote `WriteOptions::default()` (format-
+            // unaware), so a Vortex table's drained tail was written as the
+            // default format and the catalog/reader (which branch on the
+            // recorded per-table format + file extension) saw a mismatch —
+            // recent rows became invisible to constraint/FK/UNIQUE scans and
+            // post-INSERT UPDATE/DELETE. Resolve the format from the catalog
+            // and write the matching format, exactly like the executor /
+            // copy-on-write rewrite paths do.
+            let file_format = match self.cfg.catalog.load_table(project, &table).await {
+                Ok(m) => shard_map_file_format(m.file_format),
+                // A table with a tail but no catalog row shouldn't happen;
+                // fall back to the storage default rather than erroring out
+                // the whole compaction.
+                Err(_) => basin_storage::FileFormat::default(),
+            };
+            let write_opts = basin_storage::WriteOptions {
+                file_format,
+                ..Default::default()
+            };
             let data_file = self
                 .cfg
                 .storage
-                .write_batch(project, &table, partition, &merged)
+                .write_batch_with_options(project, &table, partition, &merged, &write_opts)
                 .await?;
 
             let file_ref = DataFileRef {
@@ -670,6 +690,16 @@ impl ShardImpl for InProcessShard {
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))
+    }
+}
+
+/// Map the catalog's per-table format to the storage writer's format.
+/// Mirrors `basin_engine::executor::map_file_format` (kept local — the
+/// shard crate must not depend on basin-engine).
+fn shard_map_file_format(f: basin_catalog::TableFileFormat) -> basin_storage::FileFormat {
+    match f {
+        basin_catalog::TableFileFormat::Parquet => basin_storage::FileFormat::Parquet,
+        basin_catalog::TableFileFormat::Vortex => basin_storage::FileFormat::Vortex,
     }
 }
 

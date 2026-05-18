@@ -820,7 +820,9 @@ pub(crate) async fn exec_update(
             (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
                 let catalog = &sess.engine.config().catalog;
                 let (mut new_batches, before_batches, all_true_masks) = if capture_events {
-                    let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
+                    let befores =
+                        read_file_to_batches(&storage, &sess.project, &f.path, schema.as_ref())
+                            .await?;
                     let mut all_masks = Vec::with_capacity(befores.len());
                     for b in &befores {
                         all_masks.push(BooleanArray::from(vec![true; b.num_rows()]));
@@ -841,6 +843,7 @@ pub(crate) async fn exec_update(
                         &f.path,
                         None,
                         &assignments,
+                        schema.as_ref(),
                     )
                     .await?;
                     (news, Vec::new(), Vec::new())
@@ -884,7 +887,8 @@ pub(crate) async fn exec_update(
                 let (rows_matched, mut new_batches, before_batches, mask_per_batch) =
                     if capture_events {
                         let befores =
-                            read_file_to_batches(&storage, &sess.project, &f.path).await?;
+                            read_file_to_batches(&storage, &sess.project, &f.path, schema.as_ref())
+                                .await?;
                         let mut masks = Vec::with_capacity(befores.len());
                         let mut news = Vec::with_capacity(befores.len());
                         let mut matched = 0usize;
@@ -908,6 +912,7 @@ pub(crate) async fn exec_update(
                             &f.path,
                             p,
                             &assignments,
+                            schema.as_ref(),
                         )
                         .await?;
                         (matched, news, Vec::new(), Vec::new())
@@ -1889,17 +1894,71 @@ fn sanitize_mask_local(mask: &BooleanArray) -> BooleanArray {
     b.finish()
 }
 
+/// Re-attach the catalog schema's per-field metadata onto a batch read
+/// back from storage.
+///
+/// Parquet preserves Arrow field metadata in its key-value footer, so a
+/// batch read from a `.parquet` file already carries the Basin logical-
+/// type markers (`BASIN_CHARLEN`, `BASIN_GENERATED_AS`, enum/domain/UUID
+/// tags, …). Vortex's on-disk `DType` is structural only — when
+/// `Storage::read_file` decodes a `.vortex` file it has no catalog schema
+/// to graft onto and recovers the Arrow schema from the file's own DType,
+/// which drops all field metadata. Downstream UPDATE-path validators
+/// (`enforce_charlen_array` via `parse_charlen`, generated-column
+/// recompute via `field_is_generated`) key entirely off that metadata, so
+/// a Vortex-backed table would silently skip the CHAR/VARCHAR length
+/// limit and never recompute GENERATED columns on UPDATE.
+///
+/// This restores parity: for every batch field that exists in the catalog
+/// schema by name *and* has the same Arrow data type, swap in the catalog
+/// field (carrying its metadata). Fields without a catalog match, or
+/// whose physical type differs, are left exactly as read so this is a
+/// no-op on the Parquet path (the metadata is already identical) and on
+/// any column the catalog doesn't describe.
+fn reattach_catalog_metadata(catalog_schema: &Schema, batch: RecordBatch) -> Result<RecordBatch> {
+    let read_schema = batch.schema();
+    let mut fields: Vec<Arc<Field>> = Vec::with_capacity(read_schema.fields().len());
+    let mut changed = false;
+    for f in read_schema.fields() {
+        match catalog_schema.field_with_name(f.name()) {
+            Ok(cat_f) if cat_f.data_type() == f.data_type() => {
+                // Keep the read-back nullability (Vortex/Parquet decode is
+                // authoritative on physical nullability) but adopt the
+                // catalog field's metadata.
+                if cat_f.metadata() != f.metadata() {
+                    changed = true;
+                }
+                fields.push(Arc::new(
+                    Field::new(f.name(), f.data_type().clone(), f.is_nullable())
+                        .with_metadata(cat_f.metadata().clone()),
+                ));
+            }
+            _ => fields.push(f.clone()),
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    let merged = Arc::new(Schema::new_with_metadata(
+        fields,
+        read_schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(merged, batch.columns().to_vec())
+        .map_err(|e| BasinError::internal(format!("reattach catalog metadata: {e}")))
+}
+
 /// Read a file into in-memory batches. Used by the event-capturing
 /// UPDATE path so we can pair before/after row-by-row without re-reading.
 async fn read_file_to_batches(
     storage: &Storage,
     project: &basin_common::ProjectId,
     path: &object_store::path::Path,
+    catalog_schema: &Schema,
 ) -> Result<Vec<RecordBatch>> {
     let mut stream = storage.read_file(project, path).await?;
     let mut out = Vec::new();
     while let Some(batch) = stream.next().await {
-        out.push(batch?);
+        out.push(reattach_catalog_metadata(catalog_schema, batch?)?);
     }
     Ok(out)
 }
@@ -1994,11 +2053,12 @@ async fn read_and_apply_assignments(
     path: &object_store::path::Path,
     pred: Option<&CompoundPredicate>,
     assignments: &[(usize, AssignmentRhs)],
+    catalog_schema: &Schema,
 ) -> Result<Vec<RecordBatch>> {
     let mut stream = storage.read_file(project, path).await?;
     let mut out = Vec::new();
     while let Some(batch) = stream.next().await {
-        let batch = batch?;
+        let batch = reattach_catalog_metadata(catalog_schema, batch?)?;
         let mask = match pred {
             Some(p) => evaluate_compound(&batch, p)
                 .map_err(|e| BasinError::internal(format!("update predicate eval: {e}")))?,
@@ -2020,12 +2080,13 @@ async fn read_and_apply_assignments_mixed(
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
     assignments: &[(usize, AssignmentRhs)],
+    catalog_schema: &Schema,
 ) -> Result<(usize, Vec<RecordBatch>)> {
     let mut stream = storage.read_file(project, path).await?;
     let mut matched = 0usize;
     let mut out = Vec::new();
     while let Some(batch) = stream.next().await {
-        let batch = batch?;
+        let batch = reattach_catalog_metadata(catalog_schema, batch?)?;
         let mask = evaluate_compound(&batch, pred)
             .map_err(|e| BasinError::internal(format!("update predicate eval: {e}")))?;
         matched += mask.iter().filter(|b| matches!(b, Some(true))).count();
@@ -3437,7 +3498,8 @@ async fn exec_soft_delete(
             PruneOutcome::NoMatch => {}
             PruneOutcome::AllMatch => {
                 let catalog = &sess.engine.config().catalog;
-                let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
+                let befores =
+                    read_file_to_batches(&storage, &sess.project, &f.path, schema.as_ref()).await?;
                 let news =
                     apply_assignments_all(catalog, &sess.project, &befores, &assignments).await?;
                 updated_total += f.row_count as usize;
@@ -3454,7 +3516,8 @@ async fn exec_soft_delete(
             }
             PruneOutcome::Mixed => {
                 let catalog = &sess.engine.config().catalog;
-                let befores = read_file_to_batches(&storage, &sess.project, &f.path).await?;
+                let befores =
+                    read_file_to_batches(&storage, &sess.project, &f.path, schema.as_ref()).await?;
                 let mut masks = Vec::with_capacity(befores.len());
                 let mut news = Vec::with_capacity(befores.len());
                 let mut matched = 0usize;

@@ -2264,9 +2264,9 @@ mod tests {
         let tbl = TableName::new("fmt_tbl").unwrap();
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
-        // Default: Parquet (back-compat — every fresh table).
+        // #161: Vortex is the default for every fresh table.
         let pre = cat.load_table(&t, &tbl).await.unwrap();
-        assert_eq!(pre.file_format, TableFileFormat::Parquet);
+        assert_eq!(pre.file_format, TableFileFormat::Vortex);
 
         cat.set_file_format(&t, &tbl, TableFileFormat::Vortex)
             .await

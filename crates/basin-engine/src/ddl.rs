@@ -1460,8 +1460,9 @@ fn with_option_key(entry: &str) -> String {
 /// * `vortex`  → [`TableFileFormat::Vortex`]
 /// * `parquet` → [`TableFileFormat::Parquet`]
 ///
-/// Defaults to [`TableFileFormat::Parquet`] when the key is absent OR the
-/// value is unrecognised. This never errors: an unparseable / malformed
+/// Defaults to the crate default ([`TableFileFormat::default`] = Vortex,
+/// #161) when the key is absent OR the value is unrecognised; an explicit
+/// `parquet` still opts out. This never errors: an unparseable / malformed
 /// WITH clause simply yields the default, leaving the real diagnostic to
 /// sqlparser downstream.
 ///
@@ -1559,7 +1560,8 @@ pub fn parse_create_table_file_format(sql: &str) -> basin_catalog::TableFileForm
 /// `WITH (...)` clause for a `basin.file_format` / `file_format` option
 /// and map its value to a [`TableFileFormat`]. Returns `None` when the
 /// key is absent so the caller can apply the crate default; returns
-/// `Some(Parquet)` for a present-but-unrecognised value.
+/// `Some(default)` (Vortex) for a present-but-unrecognised value and
+/// `Some(Parquet)` only for an explicit `parquet`.
 fn file_format_from_with_body(inside: &str) -> Option<basin_catalog::TableFileFormat> {
     use basin_catalog::TableFileFormat;
 
@@ -1589,9 +1591,13 @@ fn file_format_from_with_body(inside: &str) -> Option<basin_catalog::TableFileFo
         let val = unquote_with_token(raw_val);
         let mapped = if val.eq_ignore_ascii_case("vortex") {
             TableFileFormat::Vortex
-        } else {
-            // 'parquet' or anything unrecognised → Parquet.
+        } else if val.eq_ignore_ascii_case("parquet") {
+            // Explicit opt-out — stays Parquet regardless of the default.
             TableFileFormat::Parquet
+        } else {
+            // Unrecognised value behaves like an absent key: the crate
+            // default (Vortex, #161).
+            TableFileFormat::default()
         };
         *found = Some(mapped);
     };
@@ -2315,30 +2321,26 @@ mod file_format_tests {
     }
 
     #[test]
-    fn key_absent_defaults_parquet() {
+    fn key_absent_defaults_vortex() {
+        // #161: a plain CREATE TABLE with no format option defaults to
+        // Vortex (the new default storage format).
         let sql = "CREATE TABLE foo (id BIGINT)";
-        assert_eq!(
-            parse_create_table_file_format(sql),
-            TableFileFormat::Parquet
-        );
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
     }
 
     #[test]
-    fn key_absent_with_other_options_defaults_parquet() {
+    fn key_absent_with_other_options_defaults_vortex() {
         let sql = "CREATE TABLE foo (id BIGINT) WITH (fillfactor = 70, autovacuum_enabled = true)";
-        assert_eq!(
-            parse_create_table_file_format(sql),
-            TableFileFormat::Parquet
-        );
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
     }
 
     #[test]
-    fn unrecognised_value_defaults_parquet() {
+    fn unrecognised_value_defaults_vortex() {
+        // Unrecognised behaves like an absent key → crate default
+        // (Vortex). Explicit 'parquet' still opts out (see
+        // `explicit_parquet`).
         let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format = 'orc')";
-        assert_eq!(
-            parse_create_table_file_format(sql),
-            TableFileFormat::Parquet
-        );
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
     }
 
     #[test]
@@ -2362,14 +2364,14 @@ mod file_format_tests {
 
     #[test]
     fn with_in_string_literal_ignored() {
-        // A `WITH (...)` buried inside a column DEFAULT literal must not
-        // be mistaken for a real storage-parameter clause.
+        // A `WITH (...)` buried inside a column DEFAULT literal must not be
+        // mistaken for a real storage-parameter clause. Spoof an explicit
+        // `parquet` inside the literal: if the parser wrongly read it the
+        // result would be Parquet, but it correctly ignores the literal and
+        // falls through to the crate default (Vortex, #161).
         let sql = "CREATE TABLE foo (id BIGINT, note TEXT DEFAULT \
-                   'WITH (basin.file_format=vortex)')";
-        assert_eq!(
-            parse_create_table_file_format(sql),
-            TableFileFormat::Parquet
-        );
+                   'WITH (basin.file_format=parquet)')";
+        assert_eq!(parse_create_table_file_format(sql), TableFileFormat::Vortex);
     }
 
     #[test]

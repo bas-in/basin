@@ -267,8 +267,8 @@ pub struct CvDef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TableFileFormat {
-    #[default]
     Parquet,
+    #[default]
     Vortex,
 }
 

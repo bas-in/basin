@@ -1472,10 +1472,25 @@ mod tests {
         // Need ≥ 2 row groups for pruning to do work. Writer's row-group
         // cap is 65_536, so 200_000 rows splits into ~3 groups; a point
         // query for the last id lands in only one of them.
+        //
+        // Row-group / footer-stats pruning is a Parquet-format feature
+        // (Vortex has no Parquet row groups; its native chunk pruning is a
+        // separate path). This test validates the Parquet pruning path
+        // specifically, so it pins the Parquet format explicitly rather
+        // than relying on the default (which is Vortex, #161).
         let batch = small_batch(0, 200_000, "v");
-        s.write_batch(&project, &table, &part, &batch)
-            .await
-            .unwrap();
+        s.write_batch_with_options(
+            &project,
+            &table,
+            &part,
+            &batch,
+            &WriteOptions {
+                file_format: FileFormat::Parquet,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         // Reset counters so we measure only the read path.
         counting.range_gets.store(0, Ordering::Relaxed);

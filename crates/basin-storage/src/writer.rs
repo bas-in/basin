@@ -95,8 +95,8 @@ const DEFAULT_BLOOM_FPP: f64 = 0.01;
 /// feature), so the read path selects one format per table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FileFormat {
-    #[default]
     Parquet,
+    #[default]
     Vortex,
 }
 

@@ -46,7 +46,15 @@ pub(crate) async fn list_data_files(
         let mut stream = store.list(Some(&prefix));
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
-            if !meta.location.as_ref().ends_with(".parquet") {
+            // Data files are `.parquet` or (opt-in) `.vortex`. List both;
+            // skip everything else (e.g. `.wrapped` encryption sidecars).
+            // Filtering to `.parquet` only made every Vortex data file
+            // invisible to the constraint / FK / UNIQUE / PK and
+            // UPDATE/DELETE row-matching scans (list-then-read), so a dup
+            // INSERT was accepted and post-INSERT UPDATEs matched zero rows.
+            if !(meta.location.as_ref().ends_with(".parquet")
+                || meta.location.as_ref().ends_with(".vortex"))
+            {
                 continue;
             }
             let resolved_tier = Tier::from_path(meta.location.as_ref());
@@ -83,9 +91,17 @@ pub(crate) async fn list_data_files_with_stats(
     // `list_data_files`) instead of issuing a HEAD per file: object-store
     // LIST responses already include the object size, so the HEAD would be
     // a redundant round-trip that duplicates work the LIST already did.
+    // Only `.parquet` files carry a Parquet footer to fetch. `.vortex`
+    // files keep the listing defaults (row_count 0, empty column_stats):
+    // Vortex stats-pruning is intentionally a no-op (the writer records no
+    // per-file Parquet-shaped stats for Vortex), and every caller
+    // (constraint / FK / UNIQUE / UPDATE / DELETE / TRUNCATE) reads the
+    // file contents to enforce — they need the path, not the stats — so
+    // empty stats only disables an optimisation, never correctness.
     let work: Vec<_> = files
         .iter()
         .enumerate()
+        .filter(|(_, f)| f.path.as_ref().ends_with(".parquet"))
         .map(|(i, f)| {
             let store = store.clone();
             let cache = cache.clone();
@@ -133,6 +149,51 @@ pub(crate) async fn list_data_files_with_stats(
         files[i].row_count = rows;
         files[i].column_stats = stats;
     }
+
+    // Vortex files carry no Parquet footer, but DELETE/UPDATE row math and
+    // the constraint/FK/UNIQUE scans rely on `row_count` (e.g. exec_delete
+    // does `deleted += f.row_count` and `removed = f.row_count - kept`). The
+    // Vortex footer has a cheap logical row count — read it so those paths
+    // are correct. `column_stats` stays empty (Vortex stats-pruning is a
+    // deliberate no-op; absent stats only disables an optimisation). The
+    // GET is best-effort: a failure (e.g. an envelope-encrypted blob, which
+    // this listing path does not decrypt — the same limitation the Parquet
+    // footer read here has) leaves row_count at 0, no worse than before.
+    let vortex_idxs: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.path.as_ref().ends_with(".vortex"))
+        .map(|(i, _)| i)
+        .collect();
+    if !vortex_idxs.is_empty() {
+        let vwork: Vec<_> = vortex_idxs
+            .into_iter()
+            .map(|i| {
+                let store = store.clone();
+                let path = files[i].path.clone();
+                async move {
+                    let rc = match store.get(&path).await {
+                        Ok(obj) => match obj.bytes().await {
+                            Ok(b) => crate::vortex_format::row_count(&b).await.ok(),
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
+                    };
+                    (i, rc)
+                }
+            })
+            .collect();
+        let vresolved: Vec<(usize, Option<u64>)> = futures::stream::iter(vwork)
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        for (i, rc) in vresolved {
+            if let Some(rows) = rc {
+                files[i].row_count = rows;
+            }
+        }
+    }
+
     Ok(files)
 }
 
@@ -291,7 +352,15 @@ pub(crate) async fn read(
         let mut s = store.list(Some(&prefix));
         while let Some(meta) = s.next().await {
             let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
-            if !meta.location.as_ref().ends_with(".parquet") {
+            // Data files are `.parquet` or (opt-in) `.vortex`. List both;
+            // skip everything else (e.g. `.wrapped` encryption sidecars).
+            // Filtering to `.parquet` only made every Vortex data file
+            // invisible to the constraint / FK / UNIQUE / PK and
+            // UPDATE/DELETE row-matching scans (list-then-read), so a dup
+            // INSERT was accepted and post-INSERT UPDATEs matched zero rows.
+            if !(meta.location.as_ref().ends_with(".parquet")
+                || meta.location.as_ref().ends_with(".vortex"))
+            {
                 continue;
             }
             // Belt-and-braces: never read a file whose key isn't under the
@@ -553,12 +622,27 @@ async fn read_one(
             tc.record_bytes_read(bytes.len() as u64);
         }
 
-        // TODO: native Vortex predicate/projection pushdown is deferred —
-        // v1 decodes every chunk and returns all rows/columns, then relies
-        // on the engine's higher-level filtering. A follow-up should push
-        // `opts.projection` / `opts.filters` into the Vortex scan so we
-        // skip chunks and columns the query doesn't need.
+        // Decode, then apply `opts.filters` and `opts.projection`
+        // post-decode. The Parquet path pushes these into the reader
+        // (RowFilter + ProjectionMask); Vortex decodes the chunks and we
+        // filter/project the resulting batches. Semantically identical
+        // results — callers (`fast_select`, the constraint/UNIQUE/FK and
+        // RLS row-matching scans, DELETE/UPDATE) delegate predicate
+        // application to the storage layer exactly as they do for Parquet,
+        // so this is correctness-critical, not an optimisation. Native
+        // chunk/zone-map pushdown is still a follow-up; correctness here is
+        // not. Filtering runs BEFORE projection so predicate columns are
+        // still present (mirrors Parquet's RowFilter ordering).
         let batches = crate::vortex_format::decode(&bytes, schema).await?;
+        let batches = vortex_project_and_filter(batches, opts.as_ref(), catalog_schema.as_ref())?;
+
+        // Page-cache write-through, keyed by the same (path, projection,
+        // filters) cache key the Parquet path uses, so a repeat of the
+        // identical read is served from cache and stays consistent.
+        if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key) {
+            let cached: Vec<Arc<RecordBatch>> = batches.iter().cloned().map(Arc::new).collect();
+            pc.insert(key, cached);
+        }
         let stream = futures::stream::iter(batches.into_iter().map(Ok));
         return Ok(stream.boxed());
     }
@@ -1276,6 +1360,87 @@ where
 ///
 /// `output_schema`: the full Arrow schema for the output batch (projection
 ///   order, all columns including synthesised ones).
+/// Post-decode projection + predicate application for Vortex data files.
+///
+/// The Parquet pipeline pushes `opts.filters` into a `RowFilter` and
+/// `opts.projection` into a `ProjectionMask`; the Vortex codec has no
+/// equivalent pushdown yet, so we reproduce the *result* here: filter the
+/// decoded batches with the same `predicate::evaluate` the Parquet
+/// `RowFilter` uses, then subset/reorder columns by name. Filtering runs
+/// before projection so predicate columns are still present (matching the
+/// Parquet ordering). A projected column absent from the file is
+/// synthesised as a typed NULL column from the catalog schema (mirrors
+/// `synthesise_missing_columns` for the post-`ALTER TABLE ADD COLUMN`
+/// case). Correctness-critical: every predicate-driven read (SELECT …
+/// WHERE, and the constraint/UNIQUE/FK/RLS/UPDATE/DELETE row-matching
+/// scans) delegates the predicate to the storage layer just as it does
+/// for Parquet.
+fn vortex_project_and_filter(
+    batches: Vec<RecordBatch>,
+    opts: &ReadOptions,
+    catalog_schema: Option<&SchemaRef>,
+) -> Result<Vec<RecordBatch>> {
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        // 1) Filter (predicate columns referenced by name; pre-projection).
+        let filtered = if opts.filters.is_empty() {
+            batch
+        } else {
+            let mut mask: Option<arrow_array::BooleanArray> = None;
+            for f in &opts.filters {
+                let m = predicate::evaluate(&batch, f)?;
+                mask = Some(match mask {
+                    None => m,
+                    Some(prev) => arrow::compute::and(&prev, &m)
+                        .map_err(|e| BasinError::storage(format!("vortex filter AND: {e}")))?,
+                });
+            }
+            match mask {
+                Some(m) => arrow::compute::filter_record_batch(&batch, &m)
+                    .map_err(|e| BasinError::storage(format!("vortex filter: {e}")))?,
+                None => batch,
+            }
+        };
+
+        // 2) Projection (subset + reorder by name; missing → typed NULL).
+        let projected = match &opts.projection {
+            None => filtered,
+            Some(cols) => {
+                let in_schema = filtered.schema();
+                let mut fields: Vec<arrow_schema::FieldRef> = Vec::with_capacity(cols.len());
+                let mut arrays: Vec<arrow_array::ArrayRef> = Vec::with_capacity(cols.len());
+                for name in cols {
+                    if let Some((idx, _)) = in_schema.column_with_name(name) {
+                        fields.push(in_schema.field(idx).clone().into());
+                        arrays.push(filtered.column(idx).clone());
+                    } else {
+                        let field = catalog_schema
+                            .and_then(|s| s.column_with_name(name).map(|(i, _)| s.field(i).clone()))
+                            .ok_or_else(|| {
+                                BasinError::storage(format!(
+                                    "vortex projection: column '{name}' absent from file \
+                                     and from the catalog schema"
+                                ))
+                            })?;
+                        arrays.push(new_null_array(field.data_type(), filtered.num_rows()));
+                        fields.push(field.into());
+                    }
+                }
+                let pschema = Arc::new(Schema::new(
+                    fields
+                        .iter()
+                        .map(|f| f.as_ref().clone())
+                        .collect::<Vec<_>>(),
+                ));
+                RecordBatch::try_new(pschema, arrays)
+                    .map_err(|e| BasinError::storage(format!("vortex projection assemble: {e}")))?
+            }
+        };
+        out.push(projected);
+    }
+    Ok(out)
+}
+
 fn synthesise_missing_columns(
     parquet_batch: RecordBatch,
     present_names: &[String],
