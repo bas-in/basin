@@ -641,6 +641,125 @@ async fn vortex_vs_parquet_many_shapes() {
              WHERE COALESCE(s, 'X') <> 'X' AND NULLIF(k, 0) IS NOT NULL"
                 .to_string(),
         ),
+        // ---- HARDER VARIETY shapes — broaden coverage: recursion, math fns,
+        // set-multiset semantics, multi-col DISTINCT, ordinal GROUP BY,
+        // multi-condition self-join, 4-way join, OFFSET/LIMIT, nested CASE,
+        // expression GROUP/ORDER, IS DISTINCT FROM, string composition. ----
+        (
+            "recursive_cte_chain",
+            "WITH RECURSIVE chain(n) AS ( \
+               SELECT 0 UNION ALL SELECT n + 1 FROM chain WHERE n < 200 \
+             ) SELECT COUNT(*) FROM chain"
+                .to_string(),
+        ),
+        (
+            "math_chain",
+            "SELECT SUM(ROUND(SQRT(ABS(f)) + MOD(id, 7), 3)) FROM {Q}"
+                .to_string(),
+        ),
+        (
+            "abs_mod_filter",
+            "SELECT COUNT(*) FROM {Q} WHERE ABS(MOD(id, 100)) BETWEEN 10 AND 50"
+                .to_string(),
+        ),
+        (
+            "stddev_grouped",
+            "SELECT k, STDDEV(f) sd FROM {Q} GROUP BY k ORDER BY k"
+                .to_string(),
+        ),
+        (
+            "min_max_float",
+            format!(
+                "SELECT k, MIN(f) mn, MAX(f) mx FROM {{Q}} WHERE id < {hi} \
+                 GROUP BY k ORDER BY k"
+            ),
+        ),
+        (
+            "intersect_all",
+            "SELECT k FROM {Q} INTERSECT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50"
+                .to_string(),
+        ),
+        (
+            "except_all",
+            "SELECT k FROM {Q} EXCEPT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50"
+                .to_string(),
+        ),
+        (
+            "order_by_expr",
+            format!(
+                "SELECT id, k FROM {{Q}} WHERE id < {lo} \
+                 ORDER BY (id % 100), k DESC, id LIMIT 50"
+            ),
+        ),
+        (
+            "group_by_expr_mod",
+            "SELECT (k % 5) g, COUNT(*) c FROM {Q} GROUP BY (k % 5) ORDER BY g"
+                .to_string(),
+        ),
+        (
+            "self_join_multi_col",
+            format!(
+                "SELECT a.id FROM {{Q}} a JOIN {{Q}} b \
+                 ON a.k = b.k AND a.b IS NOT DISTINCT FROM b.b AND a.id < b.id \
+                 WHERE a.id < {lo} ORDER BY a.id LIMIT 100"
+            ),
+        ),
+        (
+            "four_way_join",
+            format!(
+                "SELECT q.id, d1.label, d2.label, d3.label \
+                 FROM {{Q}} q \
+                 JOIN {{D}} d1 ON d1.dk = q.k \
+                 JOIN {{D}} d2 ON d2.dk = q.k % 7 \
+                 JOIN {{D}} d3 ON d3.dk = q.k % 3 \
+                 WHERE q.id < {lo} ORDER BY q.id LIMIT 50"
+            ),
+        ),
+        (
+            "multi_having",
+            "SELECT k, COUNT(*) c, AVG(f) a FROM {Q} GROUP BY k \
+             HAVING COUNT(*) > 100 AND AVG(f) > 100.0 ORDER BY k"
+                .to_string(),
+        ),
+        (
+            "is_distinct_from",
+            "SELECT COUNT(*) FROM {Q} WHERE b IS DISTINCT FROM TRUE"
+                .to_string(),
+        ),
+        (
+            "multi_col_distinct",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT k, b FROM {Q}) t"
+                .to_string(),
+        ),
+        (
+            "group_by_ordinal",
+            "SELECT k, b, COUNT(*) c FROM {Q} GROUP BY 1, 2 \
+             ORDER BY 1 NULLS LAST, 2 NULLS LAST"
+                .to_string(),
+        ),
+        (
+            "substring_concat",
+            format!(
+                "SELECT k, concat(SUBSTR(s, 1, 2), '-', CAST(k AS TEXT)) lbl \
+                 FROM {{Q}} WHERE s IS NOT NULL AND id < {lo} \
+                 ORDER BY id LIMIT 50"
+            ),
+        ),
+        (
+            "case_chain_nested",
+            "SELECT CASE WHEN k = 0 THEN 'a' \
+                         WHEN k IN (1, 2, 3) THEN \
+                           CASE WHEN b IS TRUE THEN 'b' ELSE 'c' END \
+                         WHEN k > 10 THEN 'd' \
+                         ELSE 'e' END g, \
+                    COUNT(*) c FROM {Q} GROUP BY 1 ORDER BY 1"
+                .to_string(),
+        ),
+        (
+            "limit_offset_large",
+            "SELECT id, k FROM {Q} ORDER BY id LIMIT 100 OFFSET 1000"
+                .to_string(),
+        ),
     ];
 
     let subst = |t: &str, fact: &str, dim: &str| t.replace("{Q}", fact).replace("{D}", dim);
