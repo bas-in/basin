@@ -37,7 +37,7 @@ use sqlparser::ast::{
 
 use crate::{ExecResult, ProjectSession};
 
-/// Recognised "simple SELECT" plan. When `predicate` is `None` the read is
+/// Recognised "simple SELECT" plan. When `predicates` is empty the read is
 /// an unfiltered scan; when `limit` is `Some(n)` we truncate the merged
 /// batches to `n` rows total.
 #[derive(Debug)]
@@ -45,7 +45,9 @@ pub(crate) struct SimpleSelectPlan {
     pub table: TableName,
     /// `None` means project every column (`SELECT *`).
     pub projection: Option<Vec<String>>,
-    pub predicate: Option<Predicate>,
+    /// Zero or more conjunctive predicates. Up to two atoms are accepted
+    /// (single `col op lit` or BETWEEN / `col op lit AND col op lit`).
+    pub predicates: Vec<Predicate>,
     pub limit: Option<usize>,
     /// `Some((column, ascending))` for a single-column ORDER BY recognised by
     /// the fast path. `ascending=true` means ASC (or no direction specified);
@@ -171,12 +173,16 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // about them.
     let projection = parse_projection(&select.projection)?;
 
-    // WHERE clause: an optional single `<col> <op> <literal>` predicate where
-    // `<op>` is `=`, `>`, `<`, `>=`, `<=`. Anything more complex (AND/OR,
-    // IS NULL, BETWEEN, expressions) falls through to DataFusion.
-    let predicate = match &select.selection {
-        Some(expr) => Some(parse_predicate(expr)?),
-        None => None,
+    // WHERE clause: zero to two conjunctive predicates. Each atom is one of
+    // `<col> <op> <literal>` where `<op>` is `=`, `>`, `<`, `>=`, `<=`;
+    // `<col> BETWEEN <lo> AND <hi>` is also accepted (expands to two atoms).
+    // A bare `AND` of exactly two such atoms is accepted too (covers the
+    // compound-filter benchmark shape `BETWEEN … AND b = true`). Anything
+    // richer — OR, IS NULL, expressions, nested ANDs — falls through to
+    // DataFusion.
+    let predicates: Vec<Predicate> = match &select.selection {
+        None => vec![],
+        Some(expr) => parse_predicates(expr)?,
     };
 
     // LIMIT: literal non-negative integer. `LIMIT ALL`, expressions, and
@@ -203,7 +209,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     Some(SimpleSelectPlan {
         table,
         projection,
-        predicate,
+        predicates,
         limit,
         order_by,
     })
@@ -240,6 +246,69 @@ fn parse_projection(items: &[SelectItem]) -> Option<Option<Vec<String>>> {
         }
     }
     Some(Some(cols))
+}
+
+/// Parse the WHERE expression into zero, one, or two conjunctive
+/// `Predicate`s. Returns `None` to fall back to DataFusion on anything
+/// we cannot represent cleanly:
+///
+/// * A single `<col> <op> <literal>` → one `Predicate`
+/// * `<col> BETWEEN <lo> AND <hi>` → two `Predicate`s (`Gt(col, lo-1)` +
+///   `Lt(col, hi+1)`) — only for `Int64` literals
+/// * `<left> AND <right>` where both sides are simple atoms → two
+///   `Predicate`s (enables compound shapes like `BETWEEN … AND b = true`)
+///
+/// More than two atoms, OR, IS NULL, sub-queries, etc. all return `None`.
+fn parse_predicates(expr: &Expr) -> Option<Vec<Predicate>> {
+    // `col BETWEEN lo AND hi` — sqlparser represents this as `Between { expr, low, high }`.
+    // It expands to `col > lo-1 AND col < hi+1` for Int64, which our
+    // Predicate type can represent without a new variant.
+    if let Expr::Between {
+        expr: col_expr,
+        negated: false,
+        low,
+        high,
+    } = expr
+    {
+        let col = as_identifier(col_expr)?;
+        // Only integer BETWEEN for now — float/string BETWEEN stays in DataFusion.
+        let lo = match literal_value(low)? {
+            ScalarValue::Int64(v) => v.checked_sub(1)?,
+            _ => return None,
+        };
+        let hi = match literal_value(high)? {
+            ScalarValue::Int64(v) => v.checked_add(1)?,
+            _ => return None,
+        };
+        return Some(vec![
+            Predicate::Gt(col.clone(), ScalarValue::Int64(lo)),
+            Predicate::Lt(col, ScalarValue::Int64(hi)),
+        ]);
+    }
+
+    // `<left> AND <right>` — accept when both sides are parseable as a single
+    // atom OR as a BETWEEN (which expands to two atoms). Cap at two atoms total
+    // so we don't fan out too much complexity.
+    if let Expr::BinaryOp {
+        op: BinaryOperator::And,
+        left,
+        right,
+    } = expr
+    {
+        let left_preds = parse_predicates(left)?;
+        let right_preds = parse_predicates(right)?;
+        // Reject if the combined total exceeds three atoms — keeps the logic
+        // conservative and avoids building huge conjunctive filters.
+        if left_preds.len() + right_preds.len() > 3 {
+            return None;
+        }
+        let mut out = left_preds;
+        out.extend(right_preds);
+        return Some(out);
+    }
+
+    // Single atom.
+    parse_predicate(expr).map(|p| vec![p])
 }
 
 /// Parse a single `<col> <op> <literal>` predicate where `<op>` is one of
@@ -438,17 +507,17 @@ pub(crate) async fn execute_simple_select(
 
     let opts = ReadOptions {
         projection: plan.projection.clone(),
-        filters: plan.predicate.clone().into_iter().collect(),
+        filters: plan.predicates.clone(),
         partition: None,
     };
 
     // Gate Change C off the catalog's reported snapshot size. We treat a read
-    // as "heavy" only when there's no predicate (i.e. we're scanning rather
+    // as "heavy" only when there are no predicates (i.e. we're scanning rather
     // than point-looking up) and the table is large enough that the decode
-    // loop will dominate. With a predicate, row-group pruning keeps the
+    // loop will dominate. With predicates, row-group pruning keeps the
     // actual decode small no matter how big the table is, so the
     // `spawn_blocking` round-trip would be pure overhead.
-    let heavy = plan.predicate.is_none()
+    let heavy = plan.predicates.is_empty()
         && meta
             .current()
             .map(|s| {
@@ -471,30 +540,34 @@ pub(crate) async fn execute_simple_select(
     // heavier than a Parquet footer read, and a win for Parquet too
     // (point/range/compound queries touch one file instead of all).
     let live_files = meta.live_data_files();
-    let live_paths: Vec<object_store::path::Path> = match &plan.predicate {
-        Some(pred) => {
-            let cp = CompoundPredicate::Atom(pred.clone());
-            let schema = meta.schema.as_ref();
-            live_files
-                .into_iter()
-                .filter(|f| {
-                    !matches!(
-                        evaluate_compound_for_pruning(
-                            &cp,
-                            &f.column_stats,
-                            schema,
-                            f.row_count,
-                        ),
-                        PruneOutcome::NoMatch
-                    )
-                })
-                .map(|f| object_store::path::Path::from(f.path.as_str()))
-                .collect()
-        }
-        None => live_files
+    let live_paths: Vec<object_store::path::Path> = if plan.predicates.is_empty() {
+        live_files
             .into_iter()
             .map(|f| object_store::path::Path::from(f.path.as_str()))
-            .collect(),
+            .collect()
+    } else {
+        // Build a compound AND predicate for catalog-level file pruning.
+        let cp = if plan.predicates.len() == 1 {
+            CompoundPredicate::Atom(plan.predicates[0].clone())
+        } else {
+            CompoundPredicate::And(
+                plan.predicates
+                    .iter()
+                    .map(|p| CompoundPredicate::Atom(p.clone()))
+                    .collect(),
+            )
+        };
+        let schema = meta.schema.as_ref();
+        live_files
+            .into_iter()
+            .filter(|f| {
+                !matches!(
+                    evaluate_compound_for_pruning(&cp, &f.column_stats, schema, f.row_count),
+                    PruneOutcome::NoMatch
+                )
+            })
+            .map(|f| object_store::path::Path::from(f.path.as_str()))
+            .collect()
     };
 
     let batches = if let Some(shard) = sess.engine.config().shard.as_ref() {
@@ -693,10 +766,11 @@ mod tests {
             plan.projection.as_ref().map(|v| v.as_slice()),
             Some(["id".to_string(), "name".to_string()].as_slice()),
         );
-        match plan.predicate {
-            Some(Predicate::Eq(col, ScalarValue::Int64(v))) => {
+        assert_eq!(plan.predicates.len(), 1);
+        match &plan.predicates[0] {
+            Predicate::Eq(col, ScalarValue::Int64(v)) => {
                 assert_eq!(col, "id");
-                assert_eq!(v, 5);
+                assert_eq!(*v, 5);
             }
             other => panic!("unexpected predicate: {other:?}"),
         }
@@ -711,8 +785,9 @@ mod tests {
             plan.projection.is_none(),
             "wildcard should mean no projection"
         );
-        match plan.predicate {
-            Some(Predicate::Eq(col, ScalarValue::Utf8(v))) => {
+        assert_eq!(plan.predicates.len(), 1);
+        match &plan.predicates[0] {
+            Predicate::Eq(col, ScalarValue::Utf8(v)) => {
                 assert_eq!(col, "name");
                 assert_eq!(v, "alice");
             }
@@ -725,15 +800,16 @@ mod tests {
     fn matches_select_without_where() {
         let stmt = parse_one("SELECT id FROM t");
         let plan = match_simple_select(&stmt).expect("fast path should match");
-        assert!(plan.predicate.is_none());
+        assert!(plan.predicates.is_empty());
     }
 
     #[test]
     fn matches_gt_predicate() {
         let stmt = parse_one("SELECT id FROM t WHERE k > 10");
         let plan = match_simple_select(&stmt).expect("fast path should match");
-        match plan.predicate {
-            Some(Predicate::Gt(col, ScalarValue::Int64(10))) => assert_eq!(col, "k"),
+        assert_eq!(plan.predicates.len(), 1);
+        match &plan.predicates[0] {
+            Predicate::Gt(col, ScalarValue::Int64(10)) => assert_eq!(col, "k"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -742,8 +818,9 @@ mod tests {
     fn matches_lt_predicate() {
         let stmt = parse_one("SELECT id FROM t WHERE k < 5");
         let plan = match_simple_select(&stmt).expect("fast path should match");
-        match plan.predicate {
-            Some(Predicate::Lt(col, ScalarValue::Int64(5))) => assert_eq!(col, "k"),
+        assert_eq!(plan.predicates.len(), 1);
+        match &plan.predicates[0] {
+            Predicate::Lt(col, ScalarValue::Int64(5)) => assert_eq!(col, "k"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -753,8 +830,9 @@ mod tests {
         let stmt = parse_one("SELECT * FROM t WHERE id >= 6000");
         let plan = match_simple_select(&stmt).expect("fast path should match");
         // >=6000 is encoded as >5999 so existing Predicate::Gt handles it.
-        match plan.predicate {
-            Some(Predicate::Gt(col, ScalarValue::Int64(5999))) => assert_eq!(col, "id"),
+        assert_eq!(plan.predicates.len(), 1);
+        match &plan.predicates[0] {
+            Predicate::Gt(col, ScalarValue::Int64(5999)) => assert_eq!(col, "id"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -764,8 +842,9 @@ mod tests {
         let stmt = parse_one("SELECT * FROM t WHERE id <= 100");
         let plan = match_simple_select(&stmt).expect("fast path should match");
         // <=100 is encoded as <101.
-        match plan.predicate {
-            Some(Predicate::Lt(col, ScalarValue::Int64(101))) => assert_eq!(col, "id"),
+        assert_eq!(plan.predicates.len(), 1);
+        match &plan.predicates[0] {
+            Predicate::Lt(col, ScalarValue::Int64(101)) => assert_eq!(col, "id"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -777,10 +856,44 @@ mod tests {
         let plan = match_simple_select(&stmt).expect("fast path should match");
         assert_eq!(plan.limit, Some(10));
         assert_eq!(plan.order_by, Some(("id".to_string(), false)));
-        match plan.predicate {
-            Some(Predicate::Gt(col, ScalarValue::Int64(5999))) => assert_eq!(col, "id"),
+        assert_eq!(plan.predicates.len(), 1);
+        match &plan.predicates[0] {
+            Predicate::Gt(col, ScalarValue::Int64(5999)) => assert_eq!(col, "id"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn matches_between_as_two_predicates() {
+        let stmt = parse_one("SELECT * FROM t WHERE id BETWEEN 100 AND 200");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        assert_eq!(plan.predicates.len(), 2);
+        // BETWEEN 100 AND 200 → Gt(id, 99) AND Lt(id, 201)
+        match (&plan.predicates[0], &plan.predicates[1]) {
+            (
+                Predicate::Gt(c1, ScalarValue::Int64(99)),
+                Predicate::Lt(c2, ScalarValue::Int64(201)),
+            ) => {
+                assert_eq!(c1, "id");
+                assert_eq!(c2, "id");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_and_of_two_atoms() {
+        let stmt = parse_one("SELECT * FROM t WHERE id = 1 AND k > 5");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        assert_eq!(plan.predicates.len(), 2);
+    }
+
+    #[test]
+    fn rejects_four_atom_conjunction() {
+        // Four atoms (BETWEEN = 2 + two more) exceeds the cap → DataFusion.
+        let stmt =
+            parse_one("SELECT * FROM t WHERE id BETWEEN 1 AND 10 AND k > 2 AND s = 'x'");
+        assert!(match_simple_select(&stmt).is_none());
     }
 
     #[test]
@@ -802,8 +915,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_complex_predicate() {
-        let stmt = parse_one("SELECT id FROM t WHERE id = 1 AND name = 'x'");
+    fn rejects_or_predicate() {
+        // OR is not supported — always falls through to DataFusion.
+        let stmt = parse_one("SELECT id FROM t WHERE id = 1 OR id = 2");
         assert!(match_simple_select(&stmt).is_none());
     }
 
