@@ -432,6 +432,29 @@ pub(crate) async fn read_paths(
     read_paths_inner(storage, project, paths, opts, None).await
 }
 
+/// Like [`read_paths`] but accepts an explicit `catalog_schema` so the
+/// Vortex filter-pushdown optimisation can fire even on the paths-only
+/// read path. Callers that already hold the table schema (e.g.
+/// `fast_select`) should prefer this over `read_paths` to avoid the Arrow
+/// post-filter pass when all predicates were type-safe-pushed.
+pub(crate) async fn read_paths_with_schema(
+    storage: &Storage,
+    project: &ProjectId,
+    paths: Vec<ObjectPath>,
+    opts: ReadOptions,
+    catalog_schema: Option<SchemaRef>,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    let expected = format!("projects/{}/", project.as_prefix());
+    for p in &paths {
+        if !p.as_ref().contains(&expected) {
+            return Err(BasinError::isolation(format!(
+                "read_paths_with_schema: {p} does not contain {expected}"
+            )));
+        }
+    }
+    read_paths_inner(storage, project, paths, opts, catalog_schema).await
+}
+
 async fn read_paths_inner(
     storage: &Storage,
     project: &ProjectId,
@@ -600,7 +623,10 @@ async fn read_one(
         //       attached, or no provider configured) — GET the raw bytes.
         // Either way we end up with the fully decrypted/plaintext Vortex
         // blob and route it through the same decoder.
-        let bytes: Vec<u8> = match encryption.as_ref() {
+        // Fetch bytes as `bytes::Bytes` to avoid a redundant Vec copy:
+        // object_store returns `Bytes` natively; the encrypted path returns
+        // `Vec<u8>` which converts zero-copy via `Bytes::from(vec)`.
+        let bytes: bytes::Bytes = match encryption.as_ref() {
             Some(provider) => match try_load_encrypted(
                 &store,
                 &path,
@@ -610,15 +636,14 @@ async fn read_one(
             )
             .await?
             {
-                Some(plaintext) => plaintext,
+                Some(plaintext) => bytes::Bytes::from(plaintext),
                 None => store
                     .get(&path)
                     .await
                     .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?
                     .bytes()
                     .await
-                    .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?
-                    .to_vec(),
+                    .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?,
             },
             None => store
                 .get(&path)
@@ -626,8 +651,7 @@ async fn read_one(
                 .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?
                 .bytes()
                 .await
-                .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?
-                .to_vec(),
+                .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?,
         };
 
         if let Some(tc) = project_counters.as_ref() {
@@ -637,25 +661,27 @@ async fn read_one(
         // Push projection + filter into the Vortex scan: read only the
         // needed columns and let Vortex's native zone maps prune chunks the
         // predicate excludes (the analogue of Parquet's ProjectionMask +
-        // row-group stats pruning). This is a pure optimisation —
-        // `vortex_project_and_filter` below still re-applies the
-        // authoritative `opts.filters`/`opts.projection` post-decode, and
-        // `decode` transparently falls back to a full decode on any
-        // pushdown error, so the result is correctness-identical to the
-        // decode-then-filter path while skipping most of the I/O + decode
-        // for selective queries. The read projection deliberately includes
-        // filter-only columns so the post-decode re-verification still has
-        // them before they are projected away.
+        // row-group stats pruning). When every predicate was type-safe and
+        // the scan did not fall back to a full decode, skip the Arrow
+        // post-filter pass entirely (projection + missing-column synthesis
+        // still run). The smoke gate proves correctness: a wrong skip
+        // would produce results that differ from Parquet.
         let read_proj = vortex_read_projection(opts.as_ref());
-        let push_filter = vortex_filter_expr(&opts.filters, catalog_schema.as_deref());
-        let batches = crate::vortex_format::decode(
-            &bytes,
+        let (push_filter, all_filters_pushed) =
+            vortex_filter_expr(&opts.filters, catalog_schema.as_deref());
+        let (batches, decode_used_filter) = crate::vortex_format::decode(
+            bytes,
             schema,
             read_proj.as_deref(),
             push_filter,
         )
         .await?;
-        let batches = vortex_project_and_filter(batches, opts.as_ref(), catalog_schema.as_ref())?;
+        // Skip the Arrow re-filter only when Vortex handled ALL predicates
+        // natively (all_filters_pushed) AND the scan actually ran with
+        // pushdown (decode_used_filter, i.e. did not fall back).
+        let apply_filter = !(all_filters_pushed && decode_used_filter);
+        let batches =
+            vortex_project_and_filter(batches, opts.as_ref(), catalog_schema.as_ref(), apply_filter)?;
 
         // Page-cache write-through, keyed by the same (path, projection,
         // filters) cache key the Parquet path uses, so a repeat of the
@@ -1396,15 +1422,21 @@ where
 /// WHERE, and the constraint/UNIQUE/FK/RLS/UPDATE/DELETE row-matching
 /// scans) delegates the predicate to the storage layer just as it does
 /// for Parquet.
+///
+/// `apply_filter`: when `false` the Arrow filter pass is skipped entirely
+/// (caller has confirmed all predicates were pushed into Vortex natively
+/// and the scan did not fall back). The projection + missing-column
+/// synthesis always runs.
 fn vortex_project_and_filter(
     batches: Vec<RecordBatch>,
     opts: &ReadOptions,
     catalog_schema: Option<&SchemaRef>,
+    apply_filter: bool,
 ) -> Result<Vec<RecordBatch>> {
     let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
         // 1) Filter (predicate columns referenced by name; pre-projection).
-        let filtered = if opts.filters.is_empty() {
+        let filtered = if !apply_filter || opts.filters.is_empty() {
             batch
         } else {
             let mut mask: Option<arrow_array::BooleanArray> = None;
@@ -1478,14 +1510,24 @@ fn vortex_project_and_filter(
 /// post-decode, so correctness is unaffected and only the zone-prune
 /// optimisation is skipped for that predicate. Returns `None` when nothing
 /// is safely pushable.
+///
+/// Also returns `all_pushed: bool` — true iff every predicate in `filters`
+/// was type-safe-pushed (or `filters` is empty). When `all_pushed` is true
+/// AND `decode` reports it actually ran with pushdown (no fallback), the
+/// caller can skip the Arrow post-filter pass entirely.
 fn vortex_filter_expr(
     filters: &[Predicate],
     catalog_schema: Option<&Schema>,
-) -> Option<vortex_array::expr::Expression> {
+) -> (Option<vortex_array::expr::Expression>, bool) {
     use arrow_schema::DataType;
     use vortex_array::expr::{and_collect, col, eq, gt, lit, lt, Expression};
 
-    let schema = catalog_schema?;
+    if filters.is_empty() {
+        return (None, true);
+    }
+    let Some(schema) = catalog_schema else {
+        return (None, false);
+    };
     let type_safe_lit = |c: &str, v: &ScalarValue| -> Option<Expression> {
         let dt = schema.field_with_name(c).ok()?.data_type();
         match (v, dt) {
@@ -1498,12 +1540,36 @@ fn vortex_filter_expr(
             _ => None,
         }
     };
-    let terms = filters.iter().filter_map(|p| match p {
-        Predicate::Eq(c, v) => type_safe_lit(c, v).map(|l| eq(col(c.as_str()), l)),
-        Predicate::Gt(c, v) => type_safe_lit(c, v).map(|l| gt(col(c.as_str()), l)),
-        Predicate::Lt(c, v) => type_safe_lit(c, v).map(|l| lt(col(c.as_str()), l)),
-    });
-    and_collect(terms)
+
+    let mut all_pushed = true;
+    let terms: Vec<Expression> = filters
+        .iter()
+        .filter_map(|p| match p {
+            Predicate::Eq(c, v) => {
+                let e = type_safe_lit(c, v).map(|l| eq(col(c.as_str()), l));
+                if e.is_none() {
+                    all_pushed = false;
+                }
+                e
+            }
+            Predicate::Gt(c, v) => {
+                let e = type_safe_lit(c, v).map(|l| gt(col(c.as_str()), l));
+                if e.is_none() {
+                    all_pushed = false;
+                }
+                e
+            }
+            Predicate::Lt(c, v) => {
+                let e = type_safe_lit(c, v).map(|l| lt(col(c.as_str()), l));
+                if e.is_none() {
+                    all_pushed = false;
+                }
+                e
+            }
+        })
+        .collect();
+
+    (and_collect(terms.into_iter()), all_pushed)
 }
 
 /// The set of columns the Vortex scan must materialise: the requested

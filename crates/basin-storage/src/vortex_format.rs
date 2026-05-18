@@ -236,26 +236,34 @@ pub(crate) async fn footer_meta(
 /// projection post-decode (see `reader::vortex_project_and_filter`), and any
 /// pushdown error transparently falls back to a full decode, so results are
 /// always correct.
+///
+/// Returns `(batches, filter_was_pushed)` where `filter_was_pushed` is `true`
+/// iff a filter was supplied AND `decode_inner` succeeded with pushdown active
+/// (i.e. did not fall back to a full decode). Callers use this to decide
+/// whether the Arrow post-filter pass can be skipped.
 pub(crate) async fn decode(
-    bytes: &[u8],
+    bytes: bytes::Bytes,
     schema: Option<Arc<Schema>>,
     projection: Option<&[String]>,
     filter: Option<vortex_array::expr::Expression>,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<(Vec<RecordBatch>, bool)> {
     // Pushdown is best-effort: a literal/column dtype mismatch or any other
     // scan error must never change results. Try with pushdown; on failure
     // retry once with a plain full decode (the path the engine post-filters
     // anyway). Only retry when pushdown was actually requested.
-    let pushed = projection.is_some() || filter.is_some();
-    match decode_inner(bytes, schema.clone(), projection, filter).await {
-        Ok(b) => Ok(b),
-        Err(_) if pushed => decode_inner(bytes, schema, None, None).await,
+    // `bytes::Bytes` is cheap to clone (reference count bump only) so the
+    // fallback path can reuse the same backing allocation.
+    let has_filter = filter.is_some();
+    let pushed = projection.is_some() || has_filter;
+    match decode_inner(bytes.clone(), schema.clone(), projection, filter).await {
+        Ok(b) => Ok((b, has_filter)),
+        Err(_) if pushed => decode_inner(bytes, schema, None, None).await.map(|b| (b, false)),
         Err(e) => Err(e),
     }
 }
 
 async fn decode_inner(
-    bytes: &[u8],
+    bytes: bytes::Bytes,
     schema: Option<Arc<Schema>>,
     projection: Option<&[String]>,
     filter: Option<vortex_array::expr::Expression>,
@@ -264,7 +272,7 @@ async fn decode_inner(
 
     let vf = session()
         .open_options()
-        .open_buffer(bytes.to_vec())
+        .open_buffer(bytes)
         .map_err(|e| BasinError::storage(format!("vortex: open_buffer: {e}")))?;
 
     // Inferred (self-describing) full schema, normalised so Vortex's
@@ -481,7 +489,7 @@ mod tests {
         let bytes = encode(&original).await.expect("encode");
         assert!(!bytes.is_empty(), "encoded blob must be non-empty");
 
-        let decoded = decode(&bytes, Some(schema.clone()), None, None)
+        let (decoded, _) = decode(bytes::Bytes::from(bytes), Some(schema.clone()), None, None)
             .await
             .expect("decode");
 
@@ -628,7 +636,7 @@ mod tests {
         let (_schema, original) = sample_batch();
         let bytes = encode(&original).await.expect("encode");
 
-        let decoded = decode(&bytes, None, None, None)
+        let (decoded, _) = decode(bytes::Bytes::from(bytes), None, None, None)
             .await
             .expect("schema-less decode");
 

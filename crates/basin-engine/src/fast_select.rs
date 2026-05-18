@@ -437,20 +437,24 @@ pub(crate) async fn execute_simple_select(
     } else if heavy {
         let storage = sess.engine.config().storage.clone();
         let project = sess.project;
+        let schema = Some(meta.schema.clone());
         run_blocking(move || async move {
             use futures::StreamExt;
-            let stream = storage.read_paths(&project, live_paths, opts).await?;
+            let stream = storage
+                .read_paths_with_schema(&project, live_paths, opts, schema)
+                .await?;
             let collected: Vec<Result<RecordBatch>> = stream.collect().await;
             collected.into_iter().collect::<Result<Vec<_>>>()
         })
         .await?
     } else {
         use futures::StreamExt;
+        let schema = Some(meta.schema.clone());
         let stream = sess
             .engine
             .config()
             .storage
-            .read_paths(&sess.project, live_paths, opts)
+            .read_paths_with_schema(&sess.project, live_paths, opts, schema)
             .await?;
         let collected: Vec<Result<RecordBatch>> = stream.collect().await;
         collected.into_iter().collect::<Result<Vec<_>>>()?

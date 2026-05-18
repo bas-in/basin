@@ -711,6 +711,22 @@ impl Storage {
         reader::read_paths(self, project, paths, opts).await
     }
 
+    /// Like [`read_paths`] but accepts a `catalog_schema` for callers that
+    /// already hold the table schema. The Vortex filter-pushdown skip
+    /// optimisation (avoiding the Arrow post-filter pass when all predicates
+    /// were type-safe-pushed into the Vortex scan) requires the schema to
+    /// verify column types. Passing `None` is identical to [`read_paths`].
+    #[tracing::instrument(skip(self, paths, opts, catalog_schema), fields(project=%project, n_paths=paths.len()))]
+    pub async fn read_paths_with_schema(
+        &self,
+        project: &ProjectId,
+        paths: Vec<ObjectPath>,
+        opts: ReadOptions,
+        catalog_schema: Option<arrow_schema::SchemaRef>,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        reader::read_paths_with_schema(self, project, paths, opts, catalog_schema).await
+    }
+
     /// Read every batch from a single Parquet data file. Used by the
     /// UPDATE/DELETE pruner when only some files need processing — the
     /// table-wide [`read`](Self::read) would force us to merge all files
