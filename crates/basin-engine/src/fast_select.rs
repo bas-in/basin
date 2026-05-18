@@ -37,6 +37,29 @@ use sqlparser::ast::{
 
 use crate::{ExecResult, ProjectSession};
 
+/// A single item in the user-requested SELECT projection.
+///
+/// Plain column references keep their fast-path identity; aliased scalar
+/// arithmetic expressions are carried as a parsed AST fragment so the
+/// execution path can evaluate them via Arrow compute kernels without
+/// re-parsing SQL or touching DataFusion.
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectionItem {
+    /// A bare column reference: `SELECT col`.
+    Column(String),
+    /// An aliased scalar arithmetic expression: `SELECT expr AS alias`.
+    ///
+    /// `sql_expr` is the validated subtree (only `BinaryOp` with `+`, `-`,
+    /// `*`, `/` over `Identifier`/`Number` leaves). `alias` is the output
+    /// column name. `source_cols` lists every table column referenced by
+    /// `sql_expr` so the storage layer can be asked to decode them.
+    Computed {
+        sql_expr: Expr,
+        alias: String,
+        source_cols: Vec<String>,
+    },
+}
+
 /// Aggregate function in a `SELECT` projection recognized by the fast path.
 /// Only the patterns relevant to the benchmark battery are supported; anything
 /// richer falls through to DataFusion.
@@ -58,10 +81,18 @@ pub(crate) enum AggregateFn {
 #[derive(Debug)]
 pub(crate) struct SimpleSelectPlan {
     pub table: TableName,
-    /// `None` means project every column (`SELECT *`); `Some(cols)` means a
-    /// column-list projection. Set to `None` for aggregate queries (the query
-    /// has no row-returning projection).
-    pub projection: Option<Vec<String>>,
+    /// `None` means project every column (`SELECT *`); `Some(items)` is the
+    /// user-requested output list in SELECT order. Items may be plain column
+    /// references or aliased computed expressions. Set to `None` for aggregate
+    /// queries (which have no row-returning projection).
+    pub projection: Option<Vec<ProjectionItem>>,
+    /// The superset of table columns that must be decoded from storage so
+    /// that every `ProjectionItem` (and any filter references) can be
+    /// satisfied. `None` means read all columns (wildcard or aggregate path).
+    /// When all projection items are plain `Column` references this equals
+    /// the column names from `projection`; when computed items are present it
+    /// is the union of all referenced source columns plus filter columns.
+    pub read_cols: Option<Vec<String>>,
     /// When `Some`, the query is an aggregate (no ORDER BY, no LIMIT).
     /// When `None`, it is a row-returning SELECT.
     pub aggregates: Option<Vec<AggregateFn>>,
@@ -227,6 +258,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         return Some(SimpleSelectPlan {
             table,
             projection: None, // not a row projection
+            read_cols: None,   // read all columns for aggregates
             aggregates: Some(aggs),
             predicates: parsed_where.predicates,
             is_null_cols: parsed_where.is_null_cols,
@@ -235,7 +267,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         });
     }
 
-    let projection = parse_projection(&select.projection)?;
+    let (projection, read_cols) = parse_projection(&select.projection, &parsed_where)?;
 
     // LIMIT: literal non-negative integer. `LIMIT ALL`, expressions, and
     // placeholders fall through to DataFusion.
@@ -261,6 +293,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     Some(SimpleSelectPlan {
         table,
         projection,
+        read_cols,
         aggregates: None,
         predicates: parsed_where.predicates,
         is_null_cols: parsed_where.is_null_cols,
@@ -276,30 +309,134 @@ fn single_part_table(name: &ObjectName) -> Option<TableName> {
     TableName::new(name.0[0].id_val().clone()).ok()
 }
 
-fn parse_projection(items: &[SelectItem]) -> Option<Option<Vec<String>>> {
+/// Parse the SELECT item list into a `(projection, read_cols)` pair.
+///
+/// Returns `None` to fall through to DataFusion for anything we don't handle.
+///
+/// `projection` is `None` for a bare `SELECT *`; otherwise it is the
+/// user-requested output list in SELECT order. `read_cols` is the union of
+/// all table columns that must be fetched from storage: plain column refs +
+/// every computed expression's source columns + every filter-referenced
+/// column (from `where_info`). `read_cols` is `None` for the wildcard path
+/// (read every column).
+fn parse_projection(
+    items: &[SelectItem],
+    where_info: &ParsedWhere,
+) -> Option<(Option<Vec<ProjectionItem>>, Option<Vec<String>>)> {
     if items.len() == 1 {
         if let SelectItem::Wildcard(opts) = &items[0] {
-            // The wildcard helper carries options like ILIKE / EXCLUDE; we
-            // only handle the bare `*` case here.
             if opts.opt_ilike.is_none()
                 && opts.opt_exclude.is_none()
                 && opts.opt_except.is_none()
                 && opts.opt_replace.is_none()
                 && opts.opt_rename.is_none()
             {
-                return Some(None);
+                return Some((None, None));
             }
             return None;
         }
     }
-    let mut cols = Vec::with_capacity(items.len());
+
+    let mut proj_items: Vec<ProjectionItem> = Vec::with_capacity(items.len());
+    let mut has_computed = false;
+
     for item in items {
         match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => cols.push(ident.value.clone()),
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                proj_items.push(ProjectionItem::Column(ident.value.clone()));
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                // Only accept aliased scalar arithmetic: BinaryOp trees over
+                // Identifier leaves (columns) and Number literals.
+                let mut src_cols: Vec<String> = Vec::new();
+                if !validate_arithmetic_expr(expr, &mut src_cols) {
+                    return None;
+                }
+                src_cols.sort_unstable();
+                src_cols.dedup();
+                has_computed = true;
+                proj_items.push(ProjectionItem::Computed {
+                    sql_expr: expr.clone(),
+                    alias: alias.value.clone(),
+                    source_cols: src_cols,
+                });
+            }
             _ => return None,
         }
     }
-    Some(Some(cols))
+
+    // Build read_cols = union of (all column refs) ∪ (filter cols).
+    // Only materialise when there are computed items; for plain column
+    // lists the set equals the projection list so we build it either way.
+    let read_cols = {
+        let mut set: Vec<String> = Vec::new();
+        for item in &proj_items {
+            match item {
+                ProjectionItem::Column(c) => set.push(c.clone()),
+                ProjectionItem::Computed { source_cols, .. } => {
+                    set.extend(source_cols.iter().cloned());
+                }
+            }
+        }
+        // Add columns referenced by WHERE predicates / IS NULL so Vortex
+        // doesn't have to decode them separately.
+        for p in &where_info.predicates {
+            let col = match p {
+                Predicate::Eq(c, _)
+                | Predicate::Gt(c, _)
+                | Predicate::Lt(c, _) => c.clone(),
+            };
+            set.push(col);
+        }
+        for c in &where_info.is_null_cols {
+            set.push(c.clone());
+        }
+        set.sort_unstable();
+        set.dedup();
+        Some(set)
+    };
+
+    // If there are no computed items the projection is a plain column list.
+    // We still build `read_cols` above for the filter-column superset but
+    // return a flag so the caller can decide whether to run the compute pass.
+    let _ = has_computed; // consumed implicitly via ProjectionItem variants
+
+    Some((Some(proj_items), read_cols))
+}
+
+/// Recursively validate that `expr` is a scalar arithmetic tree:
+/// `BinaryOp { +, -, *, / }` over leaves that are `Identifier` (table
+/// column) or `Value(Number)` (integer/float literal). On success the set
+/// of referenced column names is accumulated into `cols`. Returns `false`
+/// for anything else (functions, casts, strings, NULLs, nested sub-queries).
+fn validate_arithmetic_expr(expr: &Expr, cols: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::Identifier(id) => {
+            cols.push(id.value.clone());
+            true
+        }
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(_, _),
+            ..
+        }) => true,
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } => validate_arithmetic_expr(inner, cols),
+        Expr::BinaryOp { op, left, right } => {
+            matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+            ) && validate_arithmetic_expr(left, cols)
+                && validate_arithmetic_expr(right, cols)
+        }
+        // Parenthesised expressions (sqlparser wraps `(expr)` as Nested).
+        Expr::Nested(inner) => validate_arithmetic_expr(inner, cols),
+        _ => false,
+    }
 }
 
 /// Try to parse the SELECT projection as a list of aggregate functions.
@@ -660,27 +797,49 @@ pub(crate) async fn execute_simple_select(
         }
     };
 
-    // Validate the projection against the cached schema. Doing it here means
-    // unknown columns surface as a clean `NotFound` instead of an opaque
-    // storage error, and lets us build a projected schema without hitting
-    // Parquet at all.
-    let proj_indices: Option<Vec<usize>> = match &plan.projection {
-        Some(cols) => {
-            let mut idxs = Vec::with_capacity(cols.len());
-            for c in cols {
-                let i = meta
-                    .schema
-                    .index_of(c)
-                    .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
-                idxs.push(i);
+    // Validate the read-superset columns against the schema. For computed
+    // projections `read_cols` is the union of all source columns + filter
+    // columns; for plain projections it equals the column list; for wildcard
+    // it is `None`. Also guard that every computed source column is Int64 or
+    // Float64 — other types fall through to DataFusion.
+    if let Some(ref items) = plan.projection {
+        for item in items {
+            if let ProjectionItem::Computed { source_cols, .. } = item {
+                for c in source_cols {
+                    let idx = meta
+                        .schema
+                        .index_of(c)
+                        .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                    let dt = meta.schema.field(idx).data_type();
+                    match dt {
+                        arrow_schema::DataType::Int64 | arrow_schema::DataType::Float64 => {}
+                        _ => {
+                            // Non-numeric column in arithmetic — bail to DataFusion.
+                            return Err(BasinError::internal(format!(
+                                "fast_select: computed expr on non-numeric column {c} ({dt}); \
+                                 use DataFusion path"
+                            )));
+                        }
+                    }
+                }
             }
-            Some(idxs)
         }
-        None => None,
-    };
+    }
 
+    // Validate read_cols so unknown columns surface as a clean error.
+    if let Some(ref cols) = plan.read_cols {
+        for c in cols {
+            meta.schema
+                .index_of(c)
+                .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+        }
+    }
+
+    // Build read options using the storage-superset column list. For plain
+    // column projections this is identical to the user list; for computed
+    // projections it is the union of all source columns + filter columns.
     let opts = ReadOptions {
-        projection: plan.projection.clone(),
+        projection: plan.read_cols.clone(),
         filters: plan.predicates.clone(),
         partition: None,
     };
@@ -816,14 +975,59 @@ pub(crate) async fn execute_simple_select(
         return apply_aggregates(batches, aggs, &meta.schema);
     }
 
-    let projected_schema: Arc<Schema> = match &proj_indices {
-        Some(idxs) => Arc::new(
-            meta.schema
-                .project(idxs)
-                .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
-        ),
-        None => meta.schema.clone(),
-    };
+    // Build the output schema and apply computed projections. For wildcard
+    // queries `plan.projection` is `None` and the schema is the full table
+    // schema. For plain column lists with no computed items we project by
+    // index. For lists that include computed items we evaluate the
+    // arithmetic expressions per-batch and rebuild each batch with the
+    // user-requested output columns and aliases.
+    let (projected_schema, batches): (Arc<Schema>, Vec<RecordBatch>) =
+        match &plan.projection {
+            None => (meta.schema.clone(), batches),
+            Some(items) => {
+                // Check whether any item is a Computed variant.
+                let has_computed = items
+                    .iter()
+                    .any(|it| matches!(it, ProjectionItem::Computed { .. }));
+
+                if has_computed {
+                    // Build the output schema from the projection list.
+                    // Computed columns get the alias as name and the type
+                    // determined by the first non-empty batch (we verify
+                    // Int64/Float64 above so it is safe to infer at runtime).
+                    let out_schema =
+                        build_computed_schema(items, &batches, &meta.schema)?;
+                    let out_schema = Arc::new(out_schema);
+
+                    let evaluated: Vec<RecordBatch> = batches
+                        .into_iter()
+                        .map(|b| evaluate_computed_projections(&b, items, &out_schema))
+                        .collect::<Result<Vec<_>>>()?;
+
+                    (out_schema, evaluated)
+                } else {
+                    // Plain column list — derive schema by index, same as before.
+                    let mut idxs = Vec::with_capacity(items.len());
+                    for item in items {
+                        let c = match item {
+                            ProjectionItem::Column(c) => c,
+                            ProjectionItem::Computed { .. } => unreachable!(),
+                        };
+                        let i = meta
+                            .schema
+                            .index_of(c)
+                            .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                        idxs.push(i);
+                    }
+                    let schema = Arc::new(
+                        meta.schema
+                            .project(&idxs)
+                            .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
+                    );
+                    (schema, batches)
+                }
+            }
+        };
 
     // ORDER BY + LIMIT: merge batches into one, sort by the column, take
     // the first `limit` rows. We only reach here when `order_by.is_some()`
@@ -842,6 +1046,364 @@ pub(crate) async fn execute_simple_select(
         schema: projected_schema,
         batches: trimmed,
     })
+}
+
+/// Build the Arrow output schema for a projection that contains at least one
+/// `ProjectionItem::Computed` item.
+///
+/// Plain `Column` items take their type from `table_schema`. Computed items
+/// take their type from the first non-empty batch's evaluated array (since
+/// Arrow's numeric kernels return the same type as the operands for
+/// integer-only expressions, and the widest float type for mixed). We fall
+/// back to the table schema column type for the first source column when
+/// `batches` is empty.
+fn build_computed_schema(
+    items: &[ProjectionItem],
+    batches: &[RecordBatch],
+    table_schema: &Arc<Schema>,
+) -> Result<Schema> {
+    use arrow_schema::Field;
+
+    let mut fields: Vec<arrow_schema::FieldRef> = Vec::with_capacity(items.len());
+
+    for item in items {
+        match item {
+            ProjectionItem::Column(c) => {
+                let idx = table_schema
+                    .index_of(c)
+                    .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                fields.push(table_schema.field(idx).clone().into());
+            }
+            ProjectionItem::Computed {
+                sql_expr,
+                alias,
+                source_cols,
+            } => {
+                // Determine the output data type by evaluating the expression
+                // on the first non-empty batch, or fall back to schema inference
+                // when no batches (or only empty batches) are available.
+                let dt = 'dt: {
+                    for batch in batches {
+                        if batch.num_rows() > 0 {
+                            let v = eval_arithmetic_expr(sql_expr, batch)
+                                .map_err(|e| BasinError::internal(format!("infer type: {e}")))?;
+                            break 'dt v.data_type();
+                        }
+                    }
+                    // All batches empty or no batches — infer from schema.
+                    let c = source_cols.first().map(|s| s.as_str()).unwrap_or("");
+                    infer_expr_output_type(sql_expr, table_schema, c)?
+                };
+                // Nullable: arithmetic on nullable columns propagates NULLs.
+                fields.push(Arc::new(Field::new(alias.as_str(), dt, true)));
+            }
+        }
+    }
+
+    Ok(Schema::new(fields))
+}
+
+/// Infer the output `DataType` of an arithmetic expression when no batch
+/// is available, based on the declared column types in `table_schema`. Falls
+/// back to `Int64` for number literals. Mixed Int64+Float64 expressions
+/// infer `Float64` (matching Arrow kernel behaviour).
+fn infer_expr_output_type(
+    expr: &Expr,
+    schema: &Arc<Schema>,
+    _hint_col: &str,
+) -> Result<arrow_schema::DataType> {
+    use arrow_schema::DataType;
+    fn walk(expr: &Expr, schema: &Arc<Schema>) -> Result<DataType> {
+        match expr {
+            Expr::Identifier(id) => {
+                let idx = schema
+                    .index_of(&id.value)
+                    .map_err(|_| BasinError::InvalidSchema(format!("unknown column {}", id.value)))?;
+                Ok(schema.field(idx).data_type().clone())
+            }
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(_, _),
+                ..
+            }) => Ok(DataType::Int64),
+            Expr::UnaryOp { expr: inner, .. } => walk(inner, schema),
+            Expr::BinaryOp { left, right, .. } => {
+                let lt = walk(left, schema)?;
+                let rt = walk(right, schema)?;
+                if lt == DataType::Float64 || rt == DataType::Float64 {
+                    Ok(DataType::Float64)
+                } else {
+                    Ok(lt)
+                }
+            }
+            Expr::Nested(inner) => walk(inner, schema),
+            _ => Ok(DataType::Int64),
+        }
+    }
+    walk(expr, schema)
+}
+
+/// Thin wrapper so both a full-length `ArrayRef` (batch column) and a
+/// single-element scalar array can be threaded through the recursive
+/// evaluator and handed to the Arrow numeric kernels as `&dyn Datum`.
+///
+/// `Array(arr)` — non-scalar; length equals `batch.num_rows()`.
+/// `ScalarI64(v)` / `ScalarF64(v)` — will be wrapped in `Scalar<>` before
+/// being passed to the kernel so the kernel broadcasts correctly.
+enum EvalVal {
+    Array(arrow_array::ArrayRef),
+    ScalarI64(i64),
+    ScalarF64(f64),
+}
+
+impl EvalVal {
+    /// Return the Arrow `DataType` of this value.
+    fn data_type(&self) -> arrow_schema::DataType {
+        match self {
+            EvalVal::Array(a) => a.data_type().clone(),
+            EvalVal::ScalarI64(_) => arrow_schema::DataType::Int64,
+            EvalVal::ScalarF64(_) => arrow_schema::DataType::Float64,
+        }
+    }
+
+    /// Materialise as a concrete `ArrayRef`. Arrays are returned as-is;
+    /// scalar values become a single-element array (NOT broadcast — caller
+    /// must use the `datum` helper when passing to kernels).
+    fn into_array(self) -> arrow_array::ArrayRef {
+        match self {
+            EvalVal::Array(a) => a,
+            EvalVal::ScalarI64(v) => {
+                Arc::new(arrow_array::Int64Array::from(vec![v])) as arrow_array::ArrayRef
+            }
+            EvalVal::ScalarF64(v) => {
+                Arc::new(arrow_array::Float64Array::from(vec![v])) as arrow_array::ArrayRef
+            }
+        }
+    }
+}
+
+/// Apply an Arrow numeric kernel to two `EvalVal`s, producing an `ArrayRef`.
+/// Scalars are wrapped in `Scalar<>` so the kernel broadcasts them correctly.
+fn apply_kernel(
+    op: &BinaryOperator,
+    lhs: EvalVal,
+    rhs: EvalVal,
+) -> std::result::Result<arrow_array::ArrayRef, String> {
+    use arrow::compute::kernels::numeric::{add_wrapping, div, mul_wrapping, sub_wrapping};
+
+    // Materially, we need `&dyn Datum` for both sides. We dispatch on the
+    // combination of (lhs_is_scalar, rhs_is_scalar) to set up the correct
+    // Datum representation.
+    macro_rules! call_kernel {
+        ($kernel:ident, $l:expr, $r:expr) => {
+            $kernel($l, $r).map_err(|e| e.to_string())
+        };
+    }
+
+    let result = match (lhs, rhs) {
+        (EvalVal::Array(la), EvalVal::Array(ra)) => match op {
+            BinaryOperator::Plus => call_kernel!(add_wrapping, &la.as_ref(), &ra.as_ref()),
+            BinaryOperator::Minus => call_kernel!(sub_wrapping, &la.as_ref(), &ra.as_ref()),
+            BinaryOperator::Multiply => call_kernel!(mul_wrapping, &la.as_ref(), &ra.as_ref()),
+            BinaryOperator::Divide => call_kernel!(div, &la.as_ref(), &ra.as_ref()),
+            _ => Err(format!("unsupported operator {op}")),
+        },
+        (EvalVal::Array(la), EvalVal::ScalarI64(rv)) => {
+            let rs = arrow_array::Int64Array::new_scalar(rv);
+            match op {
+                BinaryOperator::Plus => call_kernel!(add_wrapping, &la.as_ref(), &rs),
+                BinaryOperator::Minus => call_kernel!(sub_wrapping, &la.as_ref(), &rs),
+                BinaryOperator::Multiply => call_kernel!(mul_wrapping, &la.as_ref(), &rs),
+                BinaryOperator::Divide => call_kernel!(div, &la.as_ref(), &rs),
+                _ => Err(format!("unsupported operator {op}")),
+            }
+        }
+        (EvalVal::Array(la), EvalVal::ScalarF64(rv)) => {
+            let rs = arrow_array::Float64Array::new_scalar(rv);
+            match op {
+                BinaryOperator::Plus => {
+                    let la_f = cast_to_f64(&la)?;
+                    call_kernel!(add_wrapping, &la_f.as_ref(), &rs)
+                }
+                BinaryOperator::Minus => {
+                    let la_f = cast_to_f64(&la)?;
+                    call_kernel!(sub_wrapping, &la_f.as_ref(), &rs)
+                }
+                BinaryOperator::Multiply => {
+                    let la_f = cast_to_f64(&la)?;
+                    call_kernel!(mul_wrapping, &la_f.as_ref(), &rs)
+                }
+                BinaryOperator::Divide => {
+                    let la_f = cast_to_f64(&la)?;
+                    call_kernel!(div, &la_f.as_ref(), &rs)
+                }
+                _ => Err(format!("unsupported operator {op}")),
+            }
+        }
+        (EvalVal::ScalarI64(lv), EvalVal::Array(ra)) => {
+            let ls = arrow_array::Int64Array::new_scalar(lv);
+            match op {
+                BinaryOperator::Plus => call_kernel!(add_wrapping, &ls, &ra.as_ref()),
+                BinaryOperator::Minus => call_kernel!(sub_wrapping, &ls, &ra.as_ref()),
+                BinaryOperator::Multiply => call_kernel!(mul_wrapping, &ls, &ra.as_ref()),
+                BinaryOperator::Divide => call_kernel!(div, &ls, &ra.as_ref()),
+                _ => Err(format!("unsupported operator {op}")),
+            }
+        }
+        (EvalVal::ScalarF64(lv), EvalVal::Array(ra)) => {
+            let ls = arrow_array::Float64Array::new_scalar(lv);
+            match op {
+                BinaryOperator::Plus => {
+                    let ra_f = cast_to_f64(&ra)?;
+                    call_kernel!(add_wrapping, &ls, &ra_f.as_ref())
+                }
+                BinaryOperator::Minus => {
+                    let ra_f = cast_to_f64(&ra)?;
+                    call_kernel!(sub_wrapping, &ls, &ra_f.as_ref())
+                }
+                BinaryOperator::Multiply => {
+                    let ra_f = cast_to_f64(&ra)?;
+                    call_kernel!(mul_wrapping, &ls, &ra_f.as_ref())
+                }
+                BinaryOperator::Divide => {
+                    let ra_f = cast_to_f64(&ra)?;
+                    call_kernel!(div, &ls, &ra_f.as_ref())
+                }
+                _ => Err(format!("unsupported operator {op}")),
+            }
+        }
+        // Both scalars: materialise and operate element-wise (1-element arrays).
+        (lhs, rhs) => {
+            let la = lhs.into_array();
+            let ra = rhs.into_array();
+            match op {
+                BinaryOperator::Plus => call_kernel!(add_wrapping, &la.as_ref(), &ra.as_ref()),
+                BinaryOperator::Minus => call_kernel!(sub_wrapping, &la.as_ref(), &ra.as_ref()),
+                BinaryOperator::Multiply => call_kernel!(mul_wrapping, &la.as_ref(), &ra.as_ref()),
+                BinaryOperator::Divide => call_kernel!(div, &la.as_ref(), &ra.as_ref()),
+                _ => Err(format!("unsupported operator {op}")),
+            }
+        }
+    }?;
+    Ok(result)
+}
+
+/// Cast an `ArrayRef` to `Float64`. Used when mixing Int64 columns with
+/// Float64 literals so the kernel sees matching types.
+fn cast_to_f64(arr: &arrow_array::ArrayRef) -> std::result::Result<arrow_array::ArrayRef, String> {
+    use arrow_schema::DataType;
+    if arr.data_type() == &DataType::Float64 {
+        return Ok(arr.clone());
+    }
+    arrow::compute::cast(arr.as_ref(), &DataType::Float64).map_err(|e| e.to_string())
+}
+
+/// Evaluate a single validated arithmetic expression against a `RecordBatch`
+/// and return an `EvalVal`. Uses the wrapping variants of the Arrow numeric
+/// kernels for integer arithmetic (matching DataFusion's wrapping-i64
+/// semantics). Returns `Err` on kernel errors (e.g. division by zero, type
+/// mismatch) so the caller can propagate as a `BasinError`.
+fn eval_arithmetic_expr(
+    expr: &Expr,
+    batch: &RecordBatch,
+) -> std::result::Result<EvalVal, String> {
+    match expr {
+        Expr::Identifier(id) => {
+            let idx = batch
+                .schema()
+                .index_of(&id.value)
+                .map_err(|_| format!("column not in batch: {}", id.value))?;
+            Ok(EvalVal::Array(batch.column(idx).clone()))
+        }
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => {
+            if let Ok(i) = s.parse::<i64>() {
+                Ok(EvalVal::ScalarI64(i))
+            } else if let Ok(f) = s.parse::<f64>() {
+                Ok(EvalVal::ScalarF64(f))
+            } else {
+                Err(format!("cannot parse numeric literal: {s}"))
+            }
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => {
+            let v = eval_arithmetic_expr(inner, batch)?;
+            match v {
+                EvalVal::ScalarI64(i) => Ok(EvalVal::ScalarI64(-i)),
+                EvalVal::ScalarF64(f) => Ok(EvalVal::ScalarF64(-f)),
+                EvalVal::Array(arr) => {
+                    use arrow_schema::DataType;
+                    let result = match arr.data_type() {
+                        DataType::Int64 => {
+                            let zero = arrow_array::Int64Array::new_scalar(0i64);
+                            arrow::compute::kernels::numeric::sub_wrapping(&zero, &arr.as_ref())
+                                .map_err(|e| e.to_string())?
+                        }
+                        DataType::Float64 => {
+                            let zero = arrow_array::Float64Array::new_scalar(0.0f64);
+                            arrow::compute::kernels::numeric::sub(&zero, &arr.as_ref())
+                                .map_err(|e| e.to_string())?
+                        }
+                        dt => return Err(format!("unary minus on unsupported type {dt}")),
+                    };
+                    Ok(EvalVal::Array(result))
+                }
+            }
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr: inner,
+        } => eval_arithmetic_expr(inner, batch),
+        Expr::BinaryOp { op, left, right } => {
+            let lv = eval_arithmetic_expr(left, batch)?;
+            let rv = eval_arithmetic_expr(right, batch)?;
+            let arr = apply_kernel(op, lv, rv)?;
+            Ok(EvalVal::Array(arr))
+        }
+        Expr::Nested(inner) => eval_arithmetic_expr(inner, batch),
+        _ => Err(format!("unsupported expression in arithmetic eval: {expr}")),
+    }
+}
+
+/// Apply the user-requested projection (with computed expressions) to a
+/// single `RecordBatch` and return a new batch in SELECT-list order.
+///
+/// For `ProjectionItem::Column` items the column is taken directly from the
+/// input batch. For `ProjectionItem::Computed` items the arithmetic
+/// expression is evaluated via Arrow compute kernels. Columns that were
+/// read only to satisfy filter predicates or computed-expression sources
+/// but are NOT in the user projection list are dropped.
+///
+/// The output batch schema must match `out_schema` exactly.
+fn evaluate_computed_projections(
+    batch: &RecordBatch,
+    items: &[ProjectionItem],
+    out_schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut columns: Vec<arrow_array::ArrayRef> = Vec::with_capacity(items.len());
+
+    for item in items {
+        match item {
+            ProjectionItem::Column(c) => {
+                let idx = batch.schema().index_of(c).map_err(|_| {
+                    BasinError::InvalidSchema(format!("output column {c} not in batch"))
+                })?;
+                columns.push(batch.column(idx).clone());
+            }
+            ProjectionItem::Computed { sql_expr, alias, .. } => {
+                let val = eval_arithmetic_expr(sql_expr, batch).map_err(|e| {
+                    BasinError::internal(format!("compute expr for {alias}: {e}"))
+                })?;
+                columns.push(val.into_array());
+            }
+        }
+    }
+
+    RecordBatch::try_new(out_schema.clone(), columns)
+        .map_err(|e| BasinError::internal(format!("computed projection batch: {e}")))
 }
 
 /// Run an async closure on the blocking thread pool, driving it through a
@@ -1010,7 +1572,7 @@ fn apply_limit(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {
 fn apply_aggregates(
     batches: Vec<RecordBatch>,
     aggs: &[AggregateFn],
-    table_schema: &Arc<Schema>,
+    _table_schema: &Arc<Schema>,
 ) -> Result<ExecResult> {
     use arrow::compute::min as arrow_min;
     use arrow::compute::max as arrow_max;
