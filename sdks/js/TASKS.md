@@ -188,7 +188,11 @@ break today.
 
 ---
 
-### T-007 — `basin.admin` namespace scaffold
+### T-007 — `basin.admin` namespace scaffold ✅
+
+**Status:** done 2026-05-19. `AdminClient` + `AdminProjectsClient` + types
+shipped; `./admin` sub-path exports wired; root barrel re-exports added;
+3 stub-shape tests green. Agent also fixed T-100 in the same commit.
 
 **Files:** new `src/admin/index.ts`, `src/admin/client.ts`,
 `src/admin/types.ts`, `src/admin/client.test.ts`; wire `admin: AdminClient`
@@ -551,7 +555,13 @@ mono-repo vs sub-path. Sonnet agent should write a short
 
 ## Phase 0.0 — Pre-existing hygiene (discovered during T-001)
 
-### T-100 — Fix pre-existing typecheck + lint failures
+### T-100 — Fix pre-existing typecheck + lint failures ✅
+
+**Status:** done 2026-05-19 as part of T-007's acceptance gate.
+`src/functions/client.ts:106` fetch-body `undefined → null` for
+`exactOptionalPropertyTypes`; `src/auth/client.test.ts` unused-`phase`
+renames; new flat `eslint.config.js` shipped; `@typescript-eslint` devDeps
+added; `package-lock.json` regenerated.
 
 **Files:** `src/functions/client.ts`, repo root.
 
