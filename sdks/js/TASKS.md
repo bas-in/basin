@@ -140,7 +140,10 @@ NDJSON branch despite worktree base divergence.
 
 ---
 
-### T-005 — OpenAPI fetch helper
+### T-005 — OpenAPI fetch helper ✅
+
+**Status:** done 2026-05-19. `fetchOpenAPI(url, anonKey, opts?)` ships in
+`src/openapi/`. 7 tests green; `./openapi` sub-path export wired.
 
 **Files:** new `src/openapi/index.ts`, `src/openapi/fetch.ts`,
 `src/openapi/fetch.test.ts`; add `./openapi` sub-path export in
@@ -286,7 +289,10 @@ stub to a real network call. **Do not start these until the engine route
 exists** — check `basin/crates/basin-rest/src/server.rs` for the route
 table. If the route isn't there, leave the stub and move on.
 
-### T-020 — Wire `signInWithOAuth`
+### T-020 — Wire `signInWithOAuth` 🔒
+
+**Status:** blocked 2026-05-19. Engine `/auth/v1/oauth/*` routes do not exist
+in `basin-rest/src/server.rs`. Stub remains in place. Flip when engine ships.
 
 **Files:** `src/auth/client.ts`, `src/auth/client.test.ts`
 
@@ -306,7 +312,9 @@ basin-rest.
 
 ---
 
-### T-021 — Wire `auth.mfa.{enroll, verify, unenroll}`
+### T-021 — Wire `auth.mfa.{enroll, verify, unenroll}` 🔒
+
+**Status:** blocked 2026-05-19. Engine `/auth/v1/mfa/*` routes do not exist.
 
 **Files:** `src/auth/mfa.ts`, `src/auth/client.test.ts`
 
@@ -329,7 +337,9 @@ routes in basin-rest.
 
 ---
 
-### T-022 — Wire storage `.upload()` + `.download()`
+### T-022 — Wire storage `.upload()` + `.download()` 🔒
+
+**Status:** blocked 2026-05-19. Engine `/object/*` routes do not exist.
 
 **Files:** `src/storage/client.ts`, `src/storage/client.test.ts`
 
