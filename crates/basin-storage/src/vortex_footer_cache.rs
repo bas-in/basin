@@ -100,7 +100,7 @@ mod tests {
         .expect("build test batch");
 
         let bytes = bytes::Bytes::from(
-            crate::vortex_format::encode(&batch)
+            crate::vortex_format::encode(&batch, None)
                 .await
                 .expect("encode"),
         );

@@ -246,6 +246,12 @@ pub(crate) async fn write_batch_with_options(
     let bloom_filters =
         compute_bloom_filters(batch_to_write, &opts.bloom_columns, row_count);
 
+    // Phase 5.14.B2: compute per-column HLL and t-digest sketches for all
+    // eligible columns in the batch. HLL covers cardinality-meaningful types
+    // (int, string, bytes, date, timestamp); t-digest covers numeric types
+    // (int, float, decimal). Both are keyed by column name.
+    let (hll_sketches, tdigest_sketches) = compute_sketches(batch_to_write);
+
     // Envelope-encrypt the body if a provider is attached. The on-disk
     // layout in that case is `nonce(12) || ciphertext_with_tag` and a
     // `<key>.wrapped` sidecar carrying the wrapped data key. With no
@@ -314,8 +320,8 @@ pub(crate) async fn write_batch_with_options(
         // to cold later via `Storage::migrate_to_cold`.
         tier: crate::tier::Tier::Hot,
         bloom_filters,
-        hll_sketches: std::collections::BTreeMap::new(),
-        tdigest_sketches: std::collections::BTreeMap::new(),
+        hll_sketches,
+        tdigest_sketches,
     })
 }
 
@@ -549,6 +555,342 @@ fn merge_typed_stats(entry: &mut ColumnStats, stats: &parquet::file::statistics:
     }
 }
 
+/// Phase 5.14.B2: compute per-column HLL and t-digest sketches.
+///
+/// **HLL** (cardinality): computed for `Int8`, `Int16`, `Int32`, `Int64`,
+/// `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Utf8`, `LargeUtf8`, `Binary`,
+/// `LargeBinary`, `Date32`, `Date64`, `Timestamp(*, _)`. Skipped for
+/// `Float*`, `Boolean`, `Null`, and any complex types — APPROX_COUNT_DISTINCT
+/// is not meaningful there.
+///
+/// **t-digest** (quantiles): computed for `Int*`, `UInt*`, `Float32`,
+/// `Float64`, `Decimal128`. Skipped for string/bytes/bool/null/date/timestamp
+/// — quantile queries on those types use min/max, not t-digest.
+///
+/// Returns `(hll_sketches, tdigest_sketches)` keyed by column name.
+/// Columns that are all-null still produce a (zero-filled) sketch entry —
+/// the downstream merging path needs a consistent schema.
+fn compute_sketches(
+    batch: &RecordBatch,
+) -> (BTreeMap<String, Vec<u8>>, BTreeMap<String, Vec<u8>>) {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    use arrow_schema::DataType;
+    use basin_sketch::hll::Hll;
+    use basin_sketch::tdigest::TDigest;
+
+    let mut hlls: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut tdigests: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let schema = batch.schema();
+
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let col_name = field.name().clone();
+        let col = batch.column(col_idx);
+        let dtype = col.data_type();
+
+        // ── HLL (cardinality) ────────────────────────────────────────────
+        let hll_eligible = matches!(
+            dtype,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Date32
+                | DataType::Date64
+        ) || matches!(dtype, DataType::Timestamp(_, _));
+
+        if hll_eligible {
+            let mut hll = Hll::new();
+            match dtype {
+                DataType::Int8 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int8Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::Int16 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int16Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int32Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int64Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::UInt8 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt8Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::UInt16 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt16Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::UInt32 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt32Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::UInt64 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt64Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::Date32 => {
+                    let arr = col.as_primitive::<arrow_array::types::Date32Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::Date64 => {
+                    let arr = col.as_primitive::<arrow_array::types::Date64Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(&arr.value(i).to_le_bytes());
+                        }
+                    }
+                }
+                DataType::Timestamp(unit, _) => {
+                    use arrow_schema::TimeUnit;
+                    match unit {
+                        TimeUnit::Second => {
+                            let arr = col.as_primitive::<arrow_array::types::TimestampSecondType>();
+                            for i in 0..arr.len() {
+                                if arr.is_valid(i) {
+                                    hll.insert(&arr.value(i).to_le_bytes());
+                                }
+                            }
+                        }
+                        TimeUnit::Millisecond => {
+                            let arr = col
+                                .as_primitive::<arrow_array::types::TimestampMillisecondType>();
+                            for i in 0..arr.len() {
+                                if arr.is_valid(i) {
+                                    hll.insert(&arr.value(i).to_le_bytes());
+                                }
+                            }
+                        }
+                        TimeUnit::Microsecond => {
+                            let arr = col
+                                .as_primitive::<arrow_array::types::TimestampMicrosecondType>();
+                            for i in 0..arr.len() {
+                                if arr.is_valid(i) {
+                                    hll.insert(&arr.value(i).to_le_bytes());
+                                }
+                            }
+                        }
+                        TimeUnit::Nanosecond => {
+                            let arr = col
+                                .as_primitive::<arrow_array::types::TimestampNanosecondType>();
+                            for i in 0..arr.len() {
+                                if arr.is_valid(i) {
+                                    hll.insert(&arr.value(i).to_le_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+                DataType::Utf8 => {
+                    let arr = col.as_string::<i32>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(arr.value(i).as_bytes());
+                        }
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    let arr = col.as_string::<i64>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(arr.value(i).as_bytes());
+                        }
+                    }
+                }
+                DataType::Binary => {
+                    let arr = col.as_binary::<i32>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(arr.value(i));
+                        }
+                    }
+                }
+                DataType::LargeBinary => {
+                    let arr = col.as_binary::<i64>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            hll.insert(arr.value(i));
+                        }
+                    }
+                }
+                _ => {} // already gated by hll_eligible above
+            }
+            hlls.insert(col_name.clone(), hll.to_bytes());
+        }
+
+        // ── t-digest (quantiles) ─────────────────────────────────────────
+        let tdigest_eligible = matches!(
+            dtype,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float32
+                | DataType::Float64
+        ) || matches!(dtype, DataType::Decimal128(_, _));
+
+        if tdigest_eligible {
+            let mut td = TDigest::new();
+            match dtype {
+                DataType::Int8 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int8Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::Int16 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int16Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int32Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    let arr = col.as_primitive::<arrow_array::types::Int64Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::UInt8 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt8Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::UInt16 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt16Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::UInt32 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt32Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::UInt64 => {
+                    let arr = col.as_primitive::<arrow_array::types::UInt64Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64);
+                        }
+                    }
+                }
+                DataType::Float32 => {
+                    let arr = col.as_primitive::<arrow_array::types::Float32Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            let v = arr.value(i) as f64;
+                            if v.is_finite() {
+                                td.add(v);
+                            }
+                        }
+                    }
+                }
+                DataType::Float64 => {
+                    let arr = col.as_primitive::<arrow_array::types::Float64Type>();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            let v = arr.value(i);
+                            if v.is_finite() {
+                                td.add(v);
+                            }
+                        }
+                    }
+                }
+                DataType::Decimal128(_, scale) => {
+                    let scale = *scale;
+                    let arr = col.as_primitive::<arrow_array::types::Decimal128Type>();
+                    let divisor = 10f64.powi(scale as i32);
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            td.add(arr.value(i) as f64 / divisor);
+                        }
+                    }
+                }
+                _ => {} // already gated by tdigest_eligible above
+            }
+            td.compress();
+            tdigests.insert(col_name, td.to_bytes());
+        }
+    }
+
+    (hlls, tdigests)
+}
+
 /// Phase 5.14.A2: compute fastbloom filters for the specified columns.
 ///
 /// For each column in `bloom_cols` that exists in `batch` and has a supported
@@ -678,7 +1020,7 @@ fn decode_le_f64(b: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -740,5 +1082,130 @@ mod tests {
         let b = batch(&[], &[]);
         let sorted = sort_batch_by_cluster_cols(&b, &["id".into()]).unwrap();
         assert_eq!(sorted.num_rows(), 0);
+    }
+
+    /// Phase 5.14.B2 gate: write 10k rows with mixed dtypes; assert that
+    /// hll_sketches and tdigest_sketches are non-empty for eligible columns
+    /// and absent for skipped dtypes (Float and Bool).
+    #[test]
+    fn sketches_present_for_eligible_absent_for_skipped() {
+        use basin_sketch::hll::Hll;
+        use basin_sketch::tdigest::TDigest;
+
+        const N: usize = 10_000;
+
+        // Build a batch with: Int64 (eligible both), Float64 (tdigest only),
+        // Utf8 (HLL only), Boolean (neither).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("score", DataType::Float64, false),
+            Field::new("label", DataType::Utf8, false),
+            Field::new("flag", DataType::Boolean, false),
+        ]));
+        let id_arr: Int64Array = (0i64..N as i64).collect();
+        let score_arr: Float64Array = (0..N).map(|i| (i as f64) * 0.1).collect();
+        let label_arr: StringArray = (0..N).map(|i| Some(format!("label_{}", i % 500))).collect();
+        let flag_arr: BooleanArray = (0..N).map(|i| Some(i % 2 == 0)).collect();
+
+        let b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_arr),
+                Arc::new(score_arr),
+                Arc::new(label_arr),
+                Arc::new(flag_arr),
+            ],
+        )
+        .unwrap();
+
+        let (hlls, tdigests) = compute_sketches(&b);
+
+        // Int64: both HLL and t-digest
+        assert!(hlls.contains_key("id"), "id must have HLL sketch");
+        assert!(tdigests.contains_key("id"), "id must have t-digest sketch");
+
+        // Float64: t-digest only, no HLL
+        assert!(!hlls.contains_key("score"), "score (Float64) must NOT have HLL sketch");
+        assert!(tdigests.contains_key("score"), "score (Float64) must have t-digest sketch");
+
+        // Utf8: HLL only, no t-digest
+        assert!(hlls.contains_key("label"), "label must have HLL sketch");
+        assert!(!tdigests.contains_key("label"), "label (Utf8) must NOT have t-digest sketch");
+
+        // Boolean: neither
+        assert!(!hlls.contains_key("flag"), "flag (Boolean) must NOT have HLL sketch");
+        assert!(!tdigests.contains_key("flag"), "flag (Boolean) must NOT have t-digest sketch");
+
+        // Validate byte lengths are non-zero and round-trip correctly.
+        let hll_bytes = hlls.get("id").unwrap();
+        assert!(!hll_bytes.is_empty(), "HLL bytes must be non-empty");
+        Hll::from_bytes(hll_bytes).expect("HLL bytes must deserialise");
+
+        let td_bytes = tdigests.get("id").unwrap();
+        assert!(!td_bytes.is_empty(), "t-digest bytes must be non-empty");
+        TDigest::from_bytes(td_bytes).expect("t-digest bytes must deserialise");
+    }
+
+    /// Phase 5.14.B2 differential gate: HLL count_distinct ±5% of actual;
+    /// t-digest bytes round-trip cleanly and median estimate is ±5% of true.
+    #[test]
+    fn sketches_round_trip_and_accuracy() {
+        use basin_sketch::hll::Hll;
+        use basin_sketch::tdigest::TDigest;
+
+        const N: usize = 10_000;
+        // 2 500 distinct string labels out of 10 000 rows.
+        const N_DISTINCT_LABELS: usize = 2_500;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let id_arr: Int64Array = (0i64..N as i64).collect();
+        let label_arr: StringArray = (0..N)
+            .map(|i| Some(format!("lbl_{}", i % N_DISTINCT_LABELS)))
+            .collect();
+
+        let b = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(id_arr), Arc::new(label_arr)],
+        )
+        .unwrap();
+
+        let (hlls, tdigests) = compute_sketches(&b);
+
+        // ── HLL accuracy: id has N distinct values ──────────────────────
+        let hll_bytes = hlls.get("id").unwrap();
+        let hll = Hll::from_bytes(hll_bytes).expect("HLL round-trip");
+        let est = hll.cardinality() as f64;
+        let err = (est - N as f64).abs() / N as f64;
+        assert!(
+            err <= 0.05,
+            "HLL(id): estimate={est} actual={N} err={:.2}%",
+            err * 100.0
+        );
+
+        // ── HLL accuracy: label has N_DISTINCT_LABELS distinct values ───
+        let hll_bytes = hlls.get("label").unwrap();
+        let hll = Hll::from_bytes(hll_bytes).expect("HLL label round-trip");
+        let est = hll.cardinality() as f64;
+        let err = (est - N_DISTINCT_LABELS as f64).abs() / N_DISTINCT_LABELS as f64;
+        assert!(
+            err <= 0.05,
+            "HLL(label): estimate={est} actual={N_DISTINCT_LABELS} err={:.2}%",
+            err * 100.0
+        );
+
+        // ── t-digest round-trip and median accuracy ──────────────────────
+        // id is 0..10000; true median is 4999.5
+        let td_bytes = tdigests.get("id").unwrap();
+        let mut td = TDigest::from_bytes(td_bytes).expect("t-digest round-trip");
+        let median = td.quantile(0.5);
+        let err = (median - 4999.5).abs() / N as f64;
+        assert!(
+            err <= 0.05,
+            "t-digest(id) median={median:.2} true=4999.5 err={:.2}%",
+            err * 100.0
+        );
     }
 }
