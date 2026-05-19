@@ -570,7 +570,6 @@ describe("postgrest .stream()", () => {
   it("sets stream=true on the URL when .stream() is called", async () => {
     const captured: { request?: Request } = {};
     const basin = newClient(stubStreamFetch(makeNdjsonStream([]), captured));
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     for await (const _ of basin.from("events").select().stream()) {
       /* drain */
     }
@@ -612,5 +611,95 @@ describe("postgrest .stream()", () => {
     await expect(iter.next()).rejects.toMatchObject({
       code: "invalid_response",
     });
+  });
+});
+
+describe("T-027: DELETE 501 wrap", () => {
+  it("wraps engine 501 on DELETE as not_implemented BasinError", async () => {
+    const basin = newClient(stubFetch({ status: 501, bodyText: "Not Implemented" }));
+    const { data, error } = await basin.from("t").delete().eq("id", 1);
+    expect(data).toBeNull();
+    expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("DELETE");
+    expect(error?.message).toContain("v0.2");
+    expect(error?.status).toBe(501);
+  });
+
+  it("does NOT wrap 501 on GET as not_implemented (surfaces as internal)", async () => {
+    const basin = newClient(stubFetch({ status: 501, body: { code: "internal", message: "server bug" } }));
+    const { data, error } = await basin.from("t").select("*");
+    expect(data).toBeNull();
+    expect(error?.code).not.toBe("not_implemented");
+    expect(error?.status).toBe(501);
+  });
+});
+
+describe("T-043: .headers() Prefer pass-through", () => {
+  it("caller-provided Prefer header reaches the fetch", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ status: 204 }, captured));
+    await basin.from("t").insert({ a: 1 }).headers({ Prefer: "tx=rollback" });
+    const prefer = captured.request?.headers.get("Prefer") ?? "";
+    expect(prefer).toContain("tx=rollback");
+  });
+
+  it("SDK-set Prefer (return=representation) is preserved when caller adds their own", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ status: 204 }, captured));
+    await basin.from("t").insert({ a: 1 }).headers({ Prefer: "tx=rollback" });
+    const prefer = captured.request?.headers.get("Prefer") ?? "";
+    expect(prefer).toContain("return=representation");
+    expect(prefer).toContain("tx=rollback");
+  });
+
+  it("non-Prefer caller headers overwrite SDK headers", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ body: [] }, captured));
+    await basin.from("t").select("*").headers({ "X-Custom": "hello" });
+    expect(captured.request?.headers.get("X-Custom")).toBe("hello");
+  });
+});
+
+describe("T-044: terminal coverage — csv / geojson / explain(json)", () => {
+  it("csv() returns raw string body and sets Accept: text/csv", async () => {
+    const captured: { request?: Request } = {};
+    const csvBody = "id,name\n1,alice\n2,bob\n";
+    const basin = newClient(
+      stubFetch({ bodyText: csvBody, headers: { "Content-Type": "text/csv" } }, captured),
+    );
+    const { data, error } = await basin.from("t").select("*").csv();
+    expect(error).toBeNull();
+    expect(typeof data).toBe("string");
+    expect(data).toBe(csvBody);
+    expect(captured.request?.headers.get("Accept")).toBe("text/csv");
+  });
+
+  it("geojson() returns raw string body and sets Accept: application/geo+json", async () => {
+    const captured: { request?: Request } = {};
+    const geoBody = '{"type":"FeatureCollection","features":[{"type":"Feature","geometry":null,"properties":{}}]}';
+    const basin = newClient(
+      stubFetch({ bodyText: geoBody, headers: { "Content-Type": "application/geo+json" } }, captured),
+    );
+    const { data, error } = await basin.from("t").select("*").geojson();
+    expect(error).toBeNull();
+    expect(typeof data).toBe("string");
+    expect(data).toBe(geoBody);
+    expect(captured.request?.headers.get("Accept")).toBe("application/geo+json");
+  });
+
+  it("explain() with format:json returns raw plan string and sets Accept: application/vnd.pgrst.plan+json", async () => {
+    const captured: { request?: Request } = {};
+    const planBody = '[{"Plan":{"Node Type":"Seq Scan","Relation Name":"t"}}]';
+    const basin = newClient(
+      stubFetch(
+        { bodyText: planBody, headers: { "Content-Type": "application/vnd.pgrst.plan+json" } },
+        captured,
+      ),
+    );
+    const { data, error } = await basin.from("t").select("*").explain({ format: "json" });
+    expect(error).toBeNull();
+    expect(typeof data).toBe("string");
+    expect(data).toBe(planBody);
+    expect(captured.request?.headers.get("Accept")).toBe("application/vnd.pgrst.plan+json");
   });
 });

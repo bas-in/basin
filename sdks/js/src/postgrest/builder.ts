@@ -52,6 +52,7 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
   #explainFormat: "text" | "json" = "text";
   #asOf: string | null = null;
   #vector = false;
+  #extraHeaders: Record<string, string> = {};
 
   constructor(deps: PostgrestDeps) {
     this.#deps = deps;
@@ -291,6 +292,15 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
     return this;
   }
 
+  // Prefer is merged (comma-joined) rather than overwritten because
+  // basin-rest reads multiple directives from a single Prefer header and
+  // the SDK may already have set return= or count= before the caller
+  // adds their own (e.g. tx=rollback). All other keys the caller wins.
+  headers(extra: Record<string, string>): this {
+    this.#extraHeaders = { ...this.#extraHeaders, ...extra };
+    return this;
+  }
+
   // ─── basin extensions ──────────────────────────────────────────────
 
   /**
@@ -526,6 +536,16 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
       headers["Prefer"] = prefer.join(",");
     }
 
+    // Merge caller-supplied extra headers. Prefer is comma-joined so
+    // basin-rest sees all directives; every other key the caller wins.
+    for (const [key, value] of Object.entries(this.#extraHeaders)) {
+      if (key.toLowerCase() === "prefer" && headers["Prefer"]) {
+        headers["Prefer"] = `${headers["Prefer"]},${value}`;
+      } else {
+        headers[key] = value;
+      }
+    }
+
     return headers;
   }
 
@@ -580,6 +600,22 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
     }
 
     const count = parseContentRangeCount(res.headers.get("Content-Range"));
+
+    // basin engine v0.1 returns 501 for DELETE. Surface a clear error
+    // rather than a confusing raw 501 — other methods with 501 are
+    // genuine server bugs and flow through the generic error path below.
+    if (res.status === 501 && this.#pending.method === "DELETE") {
+      return {
+        data: null,
+        error: new BasinError(
+          "not_implemented",
+          "DELETE in basin REST v0.1 is not implemented yet — see basin engine v0.2 roadmap",
+          501,
+        ),
+        count: null,
+        status: 501,
+      };
+    }
 
     // 204 No Content — common for return=minimal mutations.
     if (res.status === 204) {
