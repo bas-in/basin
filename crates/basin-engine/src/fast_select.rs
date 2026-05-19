@@ -1719,9 +1719,17 @@ mod tests {
         let stmt = parse_one("SELECT id, name FROM users WHERE id = 5");
         let plan = match_simple_select(&stmt).expect("fast path should match");
         assert_eq!(plan.table.as_str(), "users");
+        let col_names: Option<Vec<String>> = plan.projection.as_ref().map(|v| {
+            v.iter()
+                .map(|item| match item {
+                    ProjectionItem::Column(c) => c.clone(),
+                    ProjectionItem::Computed { alias, .. } => alias.clone(),
+                })
+                .collect()
+        });
         assert_eq!(
-            plan.projection.as_ref().map(|v| v.as_slice()),
-            Some(["id".to_string(), "name".to_string()].as_slice()),
+            col_names.as_deref(),
+            Some(["id", "name"].as_slice()),
         );
         assert_eq!(plan.predicates.len(), 1);
         match &plan.predicates[0] {
