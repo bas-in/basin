@@ -570,7 +570,6 @@ describe("postgrest .stream()", () => {
   it("sets stream=true on the URL when .stream() is called", async () => {
     const captured: { request?: Request } = {};
     const basin = newClient(stubStreamFetch(makeNdjsonStream([]), captured));
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     for await (const _ of basin.from("events").select().stream()) {
       /* drain */
     }
@@ -612,5 +611,136 @@ describe("postgrest .stream()", () => {
     await expect(iter.next()).rejects.toMatchObject({
       code: "invalid_response",
     });
+  });
+});
+
+describe("postgrest .cursor()", () => {
+  it("cursor('abc') sets cursor=abc on the URL", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ body: [] }, captured));
+    await basin.from("t").select("*").cursor("abc");
+    expect(captured.request?.url).toContain("cursor=abc");
+  });
+
+  it("chained eq + limit + cursor preserves all three params", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ body: [] }, captured));
+    await basin.from("t").select("*").eq("status", "active").limit(100).cursor("tok_xyz");
+    const url = decodeURIComponent(captured.request?.url ?? "");
+    expect(url).toContain("status=eq.active");
+    expect(url).toContain("limit=100");
+    expect(url).toContain("cursor=tok_xyz");
+  });
+
+  it("cursor() with no argument is a no-op", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ body: [] }, captured));
+    await basin.from("t").select("*").cursor();
+    expect(captured.request?.url).not.toContain("cursor=");
+  });
+});
+
+describe("postgrest .paginate()", () => {
+  function stubSequenceFetch(
+    pages: Array<{ rows: unknown[]; next_cursor: string | null }>,
+    captured?: { requests: Request[] },
+  ): typeof fetch {
+    let call = 0;
+    return async (input: Request | string | URL, init?: RequestInit): Promise<Response> => {
+      if (captured) {
+        captured.requests.push(new Request(input as RequestInfo, init));
+      }
+      const page = pages[call++];
+      if (!page) throw new Error("unexpected extra fetch call");
+      return new Response(JSON.stringify(page), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+  }
+
+  it("3 pages happy path — yields all 6 rows in order then terminates", async () => {
+    const pages = [
+      { rows: [{ id: 1 }, { id: 2 }], next_cursor: "a" },
+      { rows: [{ id: 3 }, { id: 4 }], next_cursor: "b" },
+      { rows: [{ id: 5 }, { id: 6 }], next_cursor: null },
+    ];
+    const basin = newClient(stubSequenceFetch(pages));
+    const collected: unknown[] = [];
+    for await (const row of basin.from<{ id: number }>("t").select("*").paginate()) {
+      collected.push(row);
+    }
+    expect(collected).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }, { id: 6 }]);
+  });
+
+  it("single page — terminates after that page without a second fetch", async () => {
+    let calls = 0;
+    const basin = newClient(async () => {
+      calls++;
+      return new Response(JSON.stringify({ rows: [{ id: 1 }, { id: 2 }, { id: 3 }], next_cursor: null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    const collected: unknown[] = [];
+    for await (const row of basin.from("t").select("*").paginate()) {
+      collected.push(row);
+    }
+    expect(collected).toHaveLength(3);
+    expect(calls).toBe(1);
+  });
+
+  it("empty first page — yields nothing and terminates cleanly", async () => {
+    const basin = newClient(async () =>
+      new Response(JSON.stringify({ rows: [], next_cursor: null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const collected: unknown[] = [];
+    for await (const row of basin.from("t").select("*").paginate()) {
+      collected.push(row);
+    }
+    expect(collected).toHaveLength(0);
+  });
+
+  it("mid-pagination error — iterator rejects with BasinError-shaped error", async () => {
+    const pages = [
+      { rows: [{ id: 1 }, { id: 2 }], next_cursor: "a" },
+    ];
+    let call = 0;
+    const basin = newClient(async () => {
+      if (call++ === 0) {
+        return new Response(JSON.stringify(pages[0]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error("connection dropped");
+    });
+    const iter = basin.from("t").select("*").paginate()[Symbol.asyncIterator]();
+    // Drain page 1
+    await iter.next(); // row {id:1}
+    await iter.next(); // row {id:2}
+    // Next call triggers page 2 fetch which errors
+    await expect(iter.next()).rejects.toMatchObject({
+      code: "network",
+      message: expect.stringContaining("connection dropped"),
+    });
+  });
+
+  it("cursor param is sent on subsequent pages", async () => {
+    const captured: { requests: Request[] } = { requests: [] };
+    const pages = [
+      { rows: [{ id: 1 }], next_cursor: "a" },
+      { rows: [{ id: 2 }], next_cursor: null },
+    ];
+    const basin = newClient(stubSequenceFetch(pages, captured));
+    for await (const _ of basin.from("t").select("*").paginate()) {
+      /* drain */
+    }
+    expect(captured.requests).toHaveLength(2);
+    const page2Url = decodeURIComponent(captured.requests[1]?.url ?? "");
+    expect(page2Url).toContain("cursor=a");
   });
 });

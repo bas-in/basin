@@ -334,6 +334,50 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
     return this.#execute().then(onfulfilled, onrejected);
   }
 
+  /**
+   * Set the cursor token for keyset pagination. Used to advance to the
+   * next page after reading `nextCursor` from a previous response.
+   * Calling without an argument is a no-op.
+   */
+  cursor(token?: string): this {
+    if (token != null) this.#search.set("cursor", token);
+    return this;
+  }
+
+  /**
+   * Walk all pages transparently, yielding each row across pages.
+   *
+   * Uses the wrapped JSON `{rows, next_cursor}` shape (not NDJSON) because
+   * each page must be fully received before the next cursor is known.
+   * Callers who want row-level streaming should use `.stream()` instead.
+   */
+  paginate(): AsyncIterable<T> {
+    // Ensure a page-size limit is set. Default to 1000 if the caller
+    // hasn't called .limit() already.
+    if (!this.#search.has("limit")) {
+      this.#search.set("limit", "1000");
+    }
+
+    const self = this;
+
+    async function* run(): AsyncGenerator<T> {
+      // The iterator is sequential — no concurrent consumers — so we can
+      // safely mutate #search between pages without cloning state.
+      while (true) {
+        const result = await self.#executePaginated();
+        if (result.error) throw result.error;
+        const rows = result.rows ?? [];
+        for (const row of rows) {
+          yield row;
+        }
+        if (result.nextCursor == null) break;
+        self.#search.set("cursor", result.nextCursor);
+      }
+    }
+
+    return { [Symbol.asyncIterator]: () => run() };
+  }
+
   stream(): AsyncIterable<T> {
     this.#search.set("stream", "true");
     const deps = this.#deps;
@@ -469,6 +513,51 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
   }
 
   // ── private ────────────────────────────────────────────────────────
+
+  async #executePaginated(): Promise<{ rows: T[] | null; nextCursor: string | null; error: BasinError | null }> {
+    const qs = this.#search.toString();
+    const url = qs ? `${this.#deps.url}?${qs}` : this.#deps.url;
+    const headers = this.#buildHeaders();
+    const init: RequestInit = { method: this.#pending.method, headers };
+    if (this.#pending.body !== undefined) {
+      init.body = JSON.stringify(this.#pending.body);
+    }
+
+    let res: Response;
+    try {
+      res = await this.#deps.fetch(url, init);
+    } catch (e) {
+      return { rows: null, nextCursor: null, error: new BasinError("network", networkErrorMessage(e)) };
+    }
+
+    if (!res.ok) {
+      let text = "";
+      try { text = await res.text(); } catch { /* ignore */ }
+      return {
+        rows: null,
+        nextCursor: null,
+        error: new BasinError(errorCodeForStatus(res.status), text || `request failed (HTTP ${res.status})`, res.status),
+      };
+    }
+
+    let raw: unknown;
+    try {
+      raw = await res.json();
+    } catch (e) {
+      return { rows: null, nextCursor: null, error: new BasinError("invalid_response", networkErrorMessage(e), res.status) };
+    }
+
+    if (raw && typeof raw === "object" && !Array.isArray(raw) && "rows" in (raw as object)) {
+      const obj = raw as { rows: unknown; next_cursor?: unknown };
+      const rows = Array.isArray(obj.rows) ? (obj.rows as T[]) : [];
+      const nextCursor = typeof obj.next_cursor === "string" ? obj.next_cursor : null;
+      return { rows, nextCursor, error: null };
+    }
+
+    // Flat array fallback — no next_cursor available.
+    const rows = Array.isArray(raw) ? (raw as T[]) : raw === null ? [] : ([raw] as T[]);
+    return { rows, nextCursor: null, error: null };
+  }
 
   #filter(column: string, operator: string, encodedValue: string): this {
     this.#search.append(column, `${operator}.${encodedValue}`);
