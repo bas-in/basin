@@ -406,7 +406,7 @@ mod tests {
         let err = (est - n as f64).abs() / n as f64;
         assert!(
             err <= tolerance,
-            "n={n}: estimate={est}, error={err:.2%} > {tolerance:.2%}"
+            "n={n}: estimate={est}, error={:.2} > {:.2}", err * 100.0, tolerance * 100.0
         );
     }
 
@@ -440,7 +440,7 @@ mod tests {
         a.merge(&b);
         let est = a.cardinality() as f64;
         let err = (est - 1000.0).abs() / 1000.0;
-        assert!(err <= 0.05, "merged estimate={est}, error={err:.2%}");
+        assert!(err <= 0.05, "merged estimate={est}, error={:.2}", err * 100.0);
     }
 
     #[test]
