@@ -12,6 +12,7 @@ export default defineConfig({
     "src/storage/index.ts",
     "src/realtime/index.ts",
     "src/functions/index.ts",
+    "src/admin/index.ts",
   ],
   format: ["esm", "cjs"],
   target: "es2022",

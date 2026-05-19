@@ -65,3 +65,6 @@ export type {
 
 export { FunctionsClient } from "./functions/index.js";
 export type { InvokeOptions, InvokeResult } from "./functions/index.js";
+
+export { AdminClient, AdminProjectsClient } from "./admin/index.js";
+export type { Credential, ProvisionResult } from "./admin/index.js";

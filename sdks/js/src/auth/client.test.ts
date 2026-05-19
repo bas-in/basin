@@ -808,12 +808,12 @@ describe("auth.refreshSession", () => {
 
   it("fires TOKEN_REFRESHED on success", async () => {
     const events: string[] = [];
-    let phase: "login" | "refresh" = "login";
+    let _phase: "login" | "refresh" = "login";
     const basin = createClient("https://api.basin.run", "anon", {
       fetch: async (input: Request | string | URL) => {
         const url = typeof input === "string" ? input : (input as URL | Request).toString();
         if (url.endsWith("/signin")) {
-          phase = "refresh";
+          _phase = "refresh";
           return new Response(
             JSON.stringify({
               data: {
@@ -847,12 +847,12 @@ describe("auth.refreshSession", () => {
   });
 
   it("returns invalid_response when refresh body is incomplete", async () => {
-    let phase: "login" | "refresh" = "login";
+    let _phase: "login" | "refresh" = "login";
     const basin = createClient("https://api.basin.run", "anon", {
       fetch: async (input: Request | string | URL) => {
         const url = typeof input === "string" ? input : (input as URL | Request).toString();
         if (url.endsWith("/signin")) {
-          phase = "refresh";
+          _phase = "refresh";
           return new Response(
             JSON.stringify({
               data: {
