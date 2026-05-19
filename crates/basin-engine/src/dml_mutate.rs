@@ -2220,6 +2220,7 @@ async fn write_replacement(
         // legacy rewrite path for every Parquet table.
         file_format: crate::executor::map_file_format(meta.file_format),
         row_block_size: meta.row_block_size,
+        bloom_columns: meta.global_sort_order.clone().unwrap_or_default(),
     };
     let df = sess
         .engine
@@ -2232,7 +2233,7 @@ async fn write_replacement(
         size_bytes: df.size_bytes,
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
-        bloom_filters: ::std::collections::BTreeMap::new(),
+        bloom_filters: df.bloom_filters.clone(),
     }])
 }
 

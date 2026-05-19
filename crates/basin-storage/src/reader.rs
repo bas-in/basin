@@ -64,6 +64,7 @@ pub(crate) async fn list_data_files(
                 size_bytes: meta.size as u64,
                 row_count: 0,
                 column_stats: BTreeMap::new(),
+                bloom_filters: BTreeMap::new(),
                 tier: resolved_tier,
             });
         }

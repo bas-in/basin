@@ -52,6 +52,11 @@ vortex-session = "0.70"
 vortex-io = { version = "0.70", features = ["tokio"] }
 vortex-layout = "0.70"
 vortex-buffer = "0.70"
+# Per-file bloom filters for point_eq miss-path pruning (Phase 5.14.A2/A3).
+# fastbloom 0.7.x: block-Bloom implementation with Hash-based insert/contains;
+# serialises via as_slice() (Vec<u64>) — stable across restarts on the same
+# platform (little-endian u64, deterministic DefaultHasher seed).
+fastbloom = "0.7"
 
 [dev-dependencies]
 tempfile.workspace = true

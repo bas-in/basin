@@ -2457,7 +2457,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
                 size_bytes: df.size_bytes,
                 row_count: df.row_count,
                 column_stats: df.column_stats.clone(),
-                bloom_filters: ::std::collections::BTreeMap::new(),
+                bloom_filters: df.bloom_filters.clone(),
             });
         }
 
@@ -2567,7 +2567,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         size_bytes: df.size_bytes,
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
-        bloom_filters: ::std::collections::BTreeMap::new(),
+        bloom_filters: df.bloom_filters.clone(),
     };
 
     // ── Transaction-deferred path ────────────────────────────────────────
@@ -2886,7 +2886,7 @@ async fn exec_insert_select(
         size_bytes: written.size_bytes,
         row_count: written.row_count,
         column_stats: written.column_stats.clone(),
-        bloom_filters: ::std::collections::BTreeMap::new(),
+        bloom_filters: written.bloom_filters.clone(),
     };
 
     // Pre-commit: expose the new file to DataFusion so reactor hooks can
@@ -3052,7 +3052,7 @@ async fn exec_insert_default_values(
         size_bytes: df.size_bytes,
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
-        bloom_filters: ::std::collections::BTreeMap::new(),
+        bloom_filters: df.bloom_filters.clone(),
     };
 
     // Pre-commit: register the new file as "extra" so reactor hooks see it
@@ -3973,6 +3973,14 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
         // byte-identical for every Parquet table.
         file_format: map_file_format(meta.file_format),
         row_block_size: meta.row_block_size,
+        // Phase 5.14.A2: bloom columns are the global sort-order columns
+        // declared via `WITH (basin.sort_by = '...')`. The writer builds a
+        // fastbloom per column and stores it in DataFile::bloom_filters so
+        // the reader can skip files on point_eq miss without opening them.
+        bloom_columns: meta
+            .global_sort_order
+            .clone()
+            .unwrap_or_default(),
     }
 }
 

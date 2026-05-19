@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use bytes::Bytes;
 use chrono::Utc;
@@ -144,6 +144,13 @@ pub struct WriteOptions {
     /// TABLE time). `None` keeps the writer's built-in default for each
     /// format.
     pub row_block_size: Option<u32>,
+    /// Phase 5.14.A2 — columns for which the writer should compute a
+    /// fastbloom filter and store in `DataFile::bloom_filters`. Typically
+    /// the table's `global_sort_order` columns (from `basin.sort_by`).
+    /// Empty (the default) preserves the pre-5.14 write path exactly.
+    /// Only `Int64` and `Utf8` columns are bloomed; all others are silently
+    /// skipped.
+    pub bloom_columns: Vec<String>,
 }
 
 pub(crate) async fn write_batch(
@@ -233,6 +240,12 @@ pub(crate) async fn write_batch_with_options(
         FileFormat::Vortex => crate::vortex_format::column_stats_from_batch(batch_to_write),
     };
 
+    // Phase 5.14.A2: compute per-column fastbloom filters for columns named
+    // in WriteOptions::bloom_columns. Only Int64 and Utf8 are supported in
+    // phase 1; other types are silently skipped (no entry in bloom_filters).
+    let bloom_filters =
+        compute_bloom_filters(batch_to_write, &opts.bloom_columns, row_count);
+
     // Envelope-encrypt the body if a provider is attached. The on-disk
     // layout in that case is `nonce(12) || ciphertext_with_tag` and a
     // `<key>.wrapped` sidecar carrying the wrapped data key. With no
@@ -300,6 +313,7 @@ pub(crate) async fn write_batch_with_options(
         // New writes always land in the hot tier. The compactor migrates files
         // to cold later via `Storage::migrate_to_cold`.
         tier: crate::tier::Tier::Hot,
+        bloom_filters,
     })
 }
 
@@ -531,6 +545,106 @@ fn merge_typed_stats(entry: &mut ColumnStats, stats: &parquet::file::statistics:
             }
         }
     }
+}
+
+/// Phase 5.14.A2: compute fastbloom filters for the specified columns.
+///
+/// For each column in `bloom_cols` that exists in `batch` and has a supported
+/// Arrow type (`Int64` or `Utf8`), we:
+///   1. Build a `BloomFilter` sized for `n` items at 1% FPP.
+///   2. Insert every non-null value (serialised to bytes as documented on
+///      `DataFile::bloom_filters`).
+///   3. Serialise to our wire format:
+///        `[num_hashes: u32 LE (4 bytes)] || [u64 words, each 8 bytes LE]`
+///
+/// The serialisation is stable across restarts because fastbloom's
+/// `DefaultHasher` is seeded deterministically (seed = 0 by default) and
+/// the u64 words are native-endian on write. We force LE on wire by
+/// iterating words and calling `to_le_bytes()`.
+fn compute_bloom_filters(
+    batch: &RecordBatch,
+    bloom_cols: &[String],
+    n: u64,
+) -> BTreeMap<String, Vec<u8>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    use arrow_schema::DataType;
+    use fastbloom::BloomFilter;
+
+    let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    if bloom_cols.is_empty() {
+        return out;
+    }
+    // Clamp n to at least 1 to avoid a zero-size bloom.
+    let n_items = (n as usize).max(1);
+    let schema = batch.schema();
+
+    for col_name in bloom_cols {
+        let Some(col_idx) = schema.index_of(col_name.as_str()).ok() else {
+            continue;
+        };
+        let col = batch.column(col_idx);
+        let mut filter =
+            BloomFilter::with_false_pos(DEFAULT_BLOOM_FPP).expected_items(n_items);
+
+        match col.data_type() {
+            DataType::Int64 => {
+                let arr = col.as_primitive::<arrow_array::types::Int64Type>();
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        let bytes = arr.value(i).to_le_bytes();
+                        filter.insert(bytes.as_ref());
+                    }
+                }
+            }
+            DataType::Utf8 => {
+                let arr = col.as_string::<i32>();
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        filter.insert(arr.value(i).as_bytes());
+                    }
+                }
+            }
+            // Phase 1: only Int64 and Utf8 are bloomed; skip all other types.
+            _ => continue,
+        }
+
+        out.insert(col_name.clone(), bloom_to_bytes(&filter));
+    }
+    out
+}
+
+/// Serialise a `BloomFilter` to the wire format used by `DataFile::bloom_filters`:
+///   `[num_hashes: u32 LE (4 bytes)] || [u64 words, each 8 bytes LE]`
+pub fn bloom_to_bytes(filter: &fastbloom::BloomFilter) -> Vec<u8> {
+    let num_hashes = filter.num_hashes();
+    let words = filter.as_slice();
+    let mut buf = Vec::with_capacity(4 + words.len() * 8);
+    buf.extend_from_slice(&num_hashes.to_le_bytes());
+    for &w in words {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    buf
+}
+
+/// Deserialise bytes written by `bloom_to_bytes` back into a `BloomFilter`.
+/// Returns `None` if the bytes are malformed (wrong length, zero words).
+pub fn bloom_from_bytes(bytes: &[u8]) -> Option<fastbloom::BloomFilter> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let num_hashes = u32::from_le_bytes(bytes[..4].try_into().ok()?);
+    let rest = &bytes[4..];
+    if rest.len() % 8 != 0 || rest.is_empty() {
+        return None;
+    }
+    let words: Vec<u64> = rest
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    Some(
+        fastbloom::BloomFilter::from_vec(words).hashes(num_hashes),
+    )
 }
 
 fn decode_le_i64(b: &[u8]) -> Option<i64> {

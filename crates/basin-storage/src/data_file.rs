@@ -32,6 +32,14 @@ pub struct DataFile {
     /// stale snapshot recorded otherwise.
     #[serde(default)]
     pub tier: Tier,
+    /// Phase 5.14.A2 — per-column bloom filters for `point_eq` miss-path
+    /// pruning. Keyed by column name; the value is a fastbloom serialised as:
+    ///   [num_hashes: u32 LE (4 bytes)] || [u64 words LE, each 8 bytes]
+    /// Built at write time for columns listed in `WriteOptions::bloom_columns`.
+    /// Empty (the default) means no bloom was computed — fall through to
+    /// min/max pruning.
+    #[serde(default)]
+    pub bloom_filters: BTreeMap<String, Vec<u8>>,
 }
 
 mod object_path_str {

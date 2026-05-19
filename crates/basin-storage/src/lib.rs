@@ -53,7 +53,7 @@ pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 pub use vortex_footer_cache::VortexFooterCache;
-pub use writer::{FileFormat, WriteOptions};
+pub use writer::{bloom_from_bytes, FileFormat, WriteOptions};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -803,6 +803,7 @@ impl Storage {
                 size_bytes: head.size as u64,
                 row_count: 0,
                 column_stats: std::collections::BTreeMap::new(),
+                bloom_filters: std::collections::BTreeMap::new(),
                 tier: Tier::Cold,
             });
         }
@@ -839,6 +840,7 @@ impl Storage {
             size_bytes: head.size as u64,
             row_count: 0,
             column_stats: std::collections::BTreeMap::new(),
+            bloom_filters: std::collections::BTreeMap::new(),
             tier: Tier::Cold,
         })
     }

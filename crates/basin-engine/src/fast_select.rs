@@ -26,8 +26,8 @@ use arrow_schema::Schema;
 use basin_catalog::TableMetadata;
 use basin_common::{BasinError, PartitionKey, Result, TableName};
 use basin_storage::{
-    evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ReadOptions,
-    ScalarValue,
+    bloom_from_bytes, evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome,
+    ReadOptions, ScalarValue,
 };
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
@@ -904,10 +904,45 @@ pub(crate) async fn execute_simple_select(
         live_files
             .into_iter()
             .filter(|f| {
-                !matches!(
+                // Min/max catalog-stats pruning — the existing pass.
+                if matches!(
                     evaluate_compound_for_pruning(&cp, &f.column_stats, schema, f.row_count),
                     PruneOutcome::NoMatch
-                )
+                ) {
+                    return false;
+                }
+                // Phase 5.14.A3 — bloom probe: for each Eq predicate atom,
+                // if the file carries a bloom filter for the column, probe it.
+                // A definitive miss (contains == false) lets us skip the file
+                // without opening it. False positives fall through as normal.
+                // A bloom result of true (may-contain) is not sufficient to
+                // KEEP the file on its own — we only use it to SKIP; the
+                // existing min/max check already passed, so we keep the file
+                // unless a bloom says "definitely absent".
+                for pred in &plan.predicates {
+                    if let Predicate::Eq(col, val) = pred {
+                        if let Some(bloom_bytes) = f.bloom_filters.get(col.as_str()) {
+                            if let Some(filter) = bloom_from_bytes(bloom_bytes) {
+                                let absent = match val {
+                                    ScalarValue::Int64(v) => {
+                                        let bytes = v.to_le_bytes();
+                                        !filter.contains(bytes.as_ref())
+                                    }
+                                    ScalarValue::Utf8(s) => {
+                                        !filter.contains(s.as_bytes())
+                                    }
+                                    // Other types: no bloom encoding defined —
+                                    // fall through (do not prune).
+                                    _ => false,
+                                };
+                                if absent {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                true
             })
             .map(|f| object_store::path::Path::from(f.path.as_str()))
             .collect()
