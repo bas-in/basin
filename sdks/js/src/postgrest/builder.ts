@@ -334,6 +334,140 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
     return this.#execute().then(onfulfilled, onrejected);
   }
 
+  stream(): AsyncIterable<T> {
+    this.#search.set("stream", "true");
+    const deps = this.#deps;
+    const search = this.#search;
+    const buildHeaders = this.#buildHeaders.bind(this);
+    const pending = this.#pending;
+
+    return {
+      [Symbol.asyncIterator](): AsyncIterator<T> {
+        const qs = search.toString();
+        const url = qs ? `${deps.url}?${qs}` : deps.url;
+        const headers = buildHeaders();
+        const init: RequestInit = { method: pending.method, headers };
+        if (pending.body !== undefined) {
+          init.body = JSON.stringify(pending.body);
+        }
+
+        let readerState: ReadableStreamDefaultReader<string> | null = null;
+        let done = false;
+        let lineBuffer = "";
+        let fetchError: unknown = null;
+        let fetchResponse: Response | null = null;
+        let fetchReady: Promise<void> | null = null;
+
+        function initFetch(): Promise<void> {
+          if (fetchReady) return fetchReady;
+          fetchReady = deps.fetch(url, init).then(
+            (res) => { fetchResponse = res; },
+            (err) => { fetchError = err; },
+          );
+          return fetchReady;
+        }
+
+        return {
+          async next(): Promise<IteratorResult<T>> {
+            if (done) return { value: undefined as unknown as T, done: true };
+
+            await initFetch();
+
+            if (fetchError !== null) {
+              done = true;
+              throw new BasinError("network", networkErrorMessage(fetchError));
+            }
+
+            const res = fetchResponse!;
+
+            if (!res.ok) {
+              done = true;
+              const text = await res.text().catch(() => "");
+              throw new BasinError(
+                errorCodeForStatus(res.status),
+                text || `request failed (HTTP ${res.status})`,
+                res.status,
+              );
+            }
+
+            if (!readerState) {
+              if (!res.body) {
+                done = true;
+                return { value: undefined as unknown as T, done: true };
+              }
+              const textStream = res.body
+                .pipeThrough(new TextDecoderStream());
+              readerState = textStream.getReader();
+            }
+
+            while (true) {
+              const newlineIdx = lineBuffer.indexOf("\n");
+              if (newlineIdx !== -1) {
+                const line = lineBuffer.slice(0, newlineIdx).trimEnd();
+                lineBuffer = lineBuffer.slice(newlineIdx + 1);
+                if (!line) continue;
+                if (line.includes("_basin_next_cursor")) {
+                  try { JSON.parse(line); } catch { /* not a valid sentinel */ }
+                  const parsed = (() => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return null; } })();
+                  if (parsed && "_basin_next_cursor" in parsed) {
+                    done = true;
+                    return { value: undefined as unknown as T, done: true };
+                  }
+                }
+                let row: T;
+                try {
+                  row = JSON.parse(line) as T;
+                } catch (e) {
+                  done = true;
+                  throw new BasinError("invalid_response", `failed to parse NDJSON line: ${e instanceof Error ? e.message : String(e)}`);
+                }
+                return { value: row, done: false };
+              }
+
+              let chunk: ReadableStreamReadResult<string>;
+              try {
+                chunk = await readerState.read();
+              } catch (e) {
+                done = true;
+                throw new BasinError("network", networkErrorMessage(e));
+              }
+
+              if (chunk.done) {
+                const remaining = lineBuffer.trimEnd();
+                lineBuffer = "";
+                done = true;
+                if (!remaining) return { value: undefined as unknown as T, done: true };
+                if (remaining.includes("_basin_next_cursor")) {
+                  const parsed = (() => { try { return JSON.parse(remaining) as Record<string, unknown>; } catch { return null; } })();
+                  if (parsed && "_basin_next_cursor" in parsed) {
+                    return { value: undefined as unknown as T, done: true };
+                  }
+                }
+                let row: T;
+                try {
+                  row = JSON.parse(remaining) as T;
+                } catch (e) {
+                  throw new BasinError("invalid_response", `failed to parse NDJSON line: ${e instanceof Error ? e.message : String(e)}`);
+                }
+                return { value: row, done: false };
+              }
+
+              lineBuffer += chunk.value;
+            }
+          },
+
+          async return(): Promise<IteratorResult<T>> {
+            done = true;
+            if (readerState) {
+              try { await readerState.cancel(); } catch { /* ignore */ }
+            }
+            return { value: undefined as unknown as T, done: true };
+          },
+        };
+      },
+    };
+  }
+
   // ── private ────────────────────────────────────────────────────────
 
   #filter(column: string, operator: string, encodedValue: string): this {
