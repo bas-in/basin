@@ -59,12 +59,28 @@ func mockServer(t *testing.T) *httptest.Server {
 
 // captureStdout swaps os.Stdout with an os.Pipe and returns a func
 // that restores stdout and reads everything that was written.
+//
+// Also registers a t.Cleanup that restores os.Stdout unconditionally
+// so a test that fatals (or otherwise skips the read() call) doesn't
+// leave os.Stdout pointing at a closed pipe — which would surface as
+// "write |1: broken pipe" in the next test that touches stdout.
 func captureStdout(t *testing.T) (restore func() string) {
 	t.Helper()
 	pr, pw, _ := os.Pipe()
 	prev := os.Stdout
 	os.Stdout = pw
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			_ = pw.Close()
+			os.Stdout = prev
+		}
+	})
 	return func() string {
+		if restored {
+			return ""
+		}
+		restored = true
 		_ = pw.Close()
 		b, _ := io.ReadAll(pr)
 		os.Stdout = prev
