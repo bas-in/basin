@@ -14,6 +14,8 @@ export default defineConfig({
     "src/functions/index.ts",
     "src/admin/index.ts",
     "src/openapi/index.ts",
+    "src/codegen/index.ts",
+    "bin/gen-types.ts",
   ],
   format: ["esm", "cjs"],
   target: "es2022",
