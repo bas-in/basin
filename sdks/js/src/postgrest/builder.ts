@@ -238,11 +238,6 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
     return this;
   }
 
-  cursor(token: string): this {
-    this.#search.set("cursor", token);
-    return this;
-  }
-
   single(): PostgrestSinglePromise<T> {
     this.#single = "row";
     this.#accept = "single";

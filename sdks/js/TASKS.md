@@ -119,7 +119,10 @@ NDJSON branch despite worktree base divergence.
 
 ---
 
-### T-004 — `.paginate()` AsyncIterable walker
+### T-004 — `.paginate()` AsyncIterable walker ✅
+
+**Status:** done 2026-05-19. `paginate()` walks `next_cursor` through JSON pages.
+5 tests green. Default page size 1000 when no `.limit()` set.
 
 **Files:** `src/postgrest/builder.ts`, `src/postgrest/builder.test.ts`
 
@@ -170,7 +173,10 @@ NDJSON branch despite worktree base divergence.
 
 ---
 
-### T-006 — `database.types.ts` codegen from OpenAPI
+### T-006 — `database.types.ts` codegen from OpenAPI ✅
+
+**Status:** done 2026-05-19. `npx basin-js-gen-types --url --key --out` CLI ships;
+pure `openAPIDocToTypes()` function in `src/codegen/`. 14 tests green.
 
 **Files:** new `bin/gen-types.ts` (CLI entrypoint), wire into
 `package.json` `bin` field as `basin-js-gen-types`, plus
@@ -228,7 +234,9 @@ into `src/client.ts`; add `./admin` sub-path export in `package.json` +
 
 ---
 
-### T-008 — `basin.admin.projects.provision()`
+### T-008 — `basin.admin.projects.provision()` ✅
+
+**Status:** done 2026-05-19. POST `/admin/v1/projects`; 401/403 → `unauthorized`. Tested.
 
 **Files:** `src/admin/client.ts`, `src/admin/client.test.ts`
 
@@ -249,7 +257,9 @@ into `src/client.ts`; add `./admin` sub-path export in `package.json` +
 
 ---
 
-### T-009 — `basin.admin.projects.rotateCredentials()`
+### T-009 — `basin.admin.projects.rotateCredentials()` ✅
+
+**Status:** done 2026-05-19. POST `/admin/v1/projects/:user/rotate`; 404 → `not_found`.
 
 **Files:** `src/admin/client.ts`, `src/admin/client.test.ts`
 
@@ -267,7 +277,9 @@ into `src/client.ts`; add `./admin` sub-path export in `package.json` +
 
 ---
 
-### T-010 — `basin.admin.projects.listCredentials()`
+### T-010 — `basin.admin.projects.listCredentials()` ✅
+
+**Status:** done 2026-05-19. GET `/admin/v1/projects/:id/credentials`; empty list returns `[]`.
 
 **Files:** `src/admin/client.ts`, `src/admin/client.test.ts`
 
@@ -449,7 +461,10 @@ once the engine route shape is known.
 
 ---
 
-### T-027 — Engine DELETE 501 — fix or wrap
+### T-027 — Engine DELETE 501 — fix or wrap ✅
+
+**Status:** done 2026-05-19 (SDK-side wrap). `.delete()` on 501 surfaces
+`BasinError("not_implemented", "DELETE in basin REST v0.1 ...", 501)`.
 
 **Files:** EITHER `basin/crates/basin-rest/src/...` (engine side, route the
 DELETE) OR `src/postgrest/builder.ts` (clearer client-side error).
@@ -468,7 +483,11 @@ not? Check with the engine team / TASK.md in the basin repo.
 
 ## Phase 0.4 — DX polish
 
-### T-040 — Configurable retry + exponential backoff
+### T-040 — Configurable retry + exponential backoff ✅
+
+**Status:** done 2026-05-19. `withRetry(fetch, opts)` wraps the user fetch; defaults
+3 attempts, 250ms base, 5s cap, retries network + 5xx + 429 (honours `Retry-After`).
+7 tests with fake timers. `retry: false` opt-out wired via `BasinClientOptions`.
 
 **Files:** new `src/internal/retry.ts`, `src/client.ts` (wire into fetch
 adapter), `src/internal/retry.test.ts`.
@@ -541,7 +560,10 @@ basin engine roadmap, not standalone SDK work.
 
 ---
 
-### T-043 — Per-request `Prefer` header pass-through audit
+### T-043 — Per-request `Prefer` header pass-through audit ✅
+
+**Status:** done 2026-05-19. Added `.headers(extra)` modifier on the builder; `Prefer`
+values merge (comma-join) with SDK-set Prefer; other keys overwrite. 3 tests.
 
 **Files:** `src/postgrest/builder.ts`, `src/postgrest/builder.test.ts`
 
@@ -557,7 +579,10 @@ basin engine roadmap, not standalone SDK work.
 
 ---
 
-### T-044 — Coverage hole audit: `.csv()` / `.geojson()` / `.explain()`
+### T-044 — Coverage hole audit: `.csv()` / `.geojson()` / `.explain()` ✅
+
+**Status:** done 2026-05-19. Runtime tests for all three terminals + `explain({format:'json'})`.
+Existing terminals had runtime tests; added the missing `application/vnd.pgrst.plan+json` case.
 
 **Files:** `src/postgrest/builder.test.ts`
 
