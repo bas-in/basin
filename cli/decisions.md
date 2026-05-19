@@ -251,4 +251,41 @@ trivially deconflictable for ≥3 batches in a row, try 3 agents.
 
 ---
 
+---
+
+## 2026-05-19 — Migrations CLI sticks with `/admin/v1/projects/{ref}/migrations`
+
+**Chosen:** all migration calls from the CLI use `/admin/v1/projects/{ref}/migrations`
+(list, apply, new, get, diff, rollback). This includes the migration drift
+check inside `cmd_status.go`.
+
+**Context:** the cloud router (`basin-cloud/backend/internal/router/server.go`)
+mounts the migration handlers under `r.Route("/admin/v1/projects/{ref}", …)`
+at line ~1163 — `ListProjectMigrations`, `DiffProjectMigrations`,
+`GetProjectMigration`, `RollbackProjectMigration`. The `/v1/projects/{ref}`
+route group at line ~610 does **not** duplicate those routes. A previous
+draft of this entry chose `/v1/` as the "canonical" path on the bet that
+the cloud would mirror them under `/v1/` shortly; reverted because
+shipping a CLI that 404s against the production cloud is a worse failure
+mode than path-family asymmetry.
+
+**Rejected:** (1) putting `/v1/` in the CLI and filing a parallel cloud-side
+PR to add the alias — couples CLI shipping to a cross-repo round-trip we
+don't need; (2) shipping a fallback that tries `/v1/` then `/admin/v1/` —
+twice the requests, hides the mismatch instead of fixing it.
+
+**Endpoint set settled on:**
+- `GET  /admin/v1/projects/{ref}/migrations` — list
+- `POST /admin/v1/projects/{ref}/migrations/{id}/rollback` — apply / rollback
+- `GET  /admin/v1/projects/{ref}/migrations/{id}` — get
+- `GET  /admin/v1/projects/{ref}/migrations/diff` — diff
+
+**Trigger to revisit:** if the cloud router migrates these handlers to the
+`/v1/projects/{ref}` group (e.g., as part of a public-API consolidation
+pass), bump CLI to match in the same commit that the cloud route lands.
+Track via a `// TODO(cloud-route-move):` annotation at each call site so a
+later grep finds them all.
+
+---
+
 *Last updated: 2026-05-19.*

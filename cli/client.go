@@ -246,6 +246,7 @@ type Project struct {
 	Name           string `json:"name,omitempty"`
 	Region         string `json:"region,omitempty"`
 	Status         string `json:"status,omitempty"`
+	DefaultBranch  string `json:"default_branch,omitempty"`
 	EngineTenantID string `json:"engine_tenant_id,omitempty"`
 	CreatedAt      string `json:"created_at,omitempty"`
 }
