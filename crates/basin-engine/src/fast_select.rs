@@ -1079,21 +1079,13 @@ fn build_computed_schema(
                 alias,
                 source_cols,
             } => {
-                // Determine the output data type by evaluating the expression
-                // on the first non-empty batch, or fall back to schema inference
-                // when no batches (or only empty batches) are available.
-                let dt = 'dt: {
-                    for batch in batches {
-                        if batch.num_rows() > 0 {
-                            let v = eval_arithmetic_expr(sql_expr, batch)
-                                .map_err(|e| BasinError::internal(format!("infer type: {e}")))?;
-                            break 'dt v.data_type();
-                        }
-                    }
-                    // All batches empty or no batches — infer from schema.
-                    let c = source_cols.first().map(|s| s.as_str()).unwrap_or("");
-                    infer_expr_output_type(sql_expr, table_schema, c)?
-                };
+                // Infer output type purely from the schema — no batch allocation.
+                // For integer-only expressions Arrow's kernels return the operand
+                // type; mixed Int64+Float64 returns Float64. infer_expr_output_type
+                // mirrors that rule walk-wise. Evaluating on a batch just to read
+                // its DataType allocated a full ArrayRef per Computed item.
+                let c = source_cols.first().map(|s| s.as_str()).unwrap_or("");
+                let dt = infer_expr_output_type(sql_expr, table_schema, c)?;
                 // Nullable: arithmetic on nullable columns propagates NULLs.
                 fields.push(Arc::new(Field::new(alias.as_str(), dt, true)));
             }
