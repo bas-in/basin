@@ -81,6 +81,7 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     crate::pg_scalar_aliases::register_pg_scalar_aliases(&ctx);
     crate::pg_catalog_udf::register_pg_catalog_udfs(&ctx);
     crate::pg_agg_udf::register_json_agg_udafs(&ctx);
+    crate::approx_count_distinct::register_approx_count_distinct(&ctx);
     crate::range_udf::register_range_udfs(&ctx);
     crate::jsonb_path_udf::register_jsonb_path_udfs(&ctx);
     crate::jsonb_modify_udf::register_jsonb_modify_udfs(&ctx);
