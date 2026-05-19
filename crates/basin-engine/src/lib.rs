@@ -606,7 +606,6 @@ mod jsonb_udf;
 mod lifecycle;
 mod net_glue;
 mod noisy_detector;
-mod nullif_rewrite;
 pub mod noop_accept;
 mod pg_agg_udf;
 pub mod pg_ast;
