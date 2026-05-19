@@ -327,6 +327,7 @@ impl InProcessShard {
                 // already have on `f` keeps the catalog row consistent
                 // with what the reader would observe post-migration.
                 column_stats: f.column_stats.clone(),
+                bloom_filters: ::std::collections::BTreeMap::new(),
             };
             let removed = vec![f.path.as_ref().to_string()];
             match self
@@ -502,6 +503,7 @@ impl InProcessShard {
                 size_bytes: data_file.size_bytes,
                 row_count: data_file.row_count,
                 column_stats: data_file.column_stats.clone(),
+                bloom_filters: ::std::collections::BTreeMap::new(),
             };
 
             self.commit_with_retry(project, &table, &merged, file_ref)

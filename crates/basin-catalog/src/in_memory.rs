@@ -1800,6 +1800,7 @@ mod tests {
             size_bytes: bytes,
             row_count: rows,
             column_stats: std::collections::BTreeMap::new(),
+            bloom_filters: ::std::collections::BTreeMap::new(),
         }
     }
 

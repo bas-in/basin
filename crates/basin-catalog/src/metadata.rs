@@ -231,6 +231,20 @@ pub struct DataFileRef {
     /// `basin_storage::DataFile::column_stats`.
     #[serde(default)]
     pub column_stats: BTreeMap<String, ColumnStats>,
+    /// Phase 5.14.A — per-column bloom filters for `point_eq` miss-path
+    /// pruning.  Keyed by column name; the value is the column's bloom
+    /// serialised as raw bytes (format owned by `basin-storage`'s bloom
+    /// helper).  Empty (the back-compat default) means "no bloom recorded
+    /// — fall through to existing min/max pruning".  Populated at write
+    /// commit time for columns named in `TableMetadata::global_sort_order`
+    /// only; other tables and other columns carry an empty map.
+    ///
+    /// Probed in `fast_select.rs::execute_simple_select` before the Vortex
+    /// file is opened: a bloom that says "definitely not present" lets us
+    /// skip the file entirely.  False-positives fall through to the
+    /// existing open + decode path (no correctness risk).
+    #[serde(default)]
+    pub bloom_filters: BTreeMap<String, Vec<u8>>,
 }
 
 /// Definition of a TimescaleDB-style continuous aggregate ("CV").

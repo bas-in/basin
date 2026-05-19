@@ -387,6 +387,7 @@ impl CvRefresher {
             size_bytes: written.size_bytes,
             row_count: written.row_count,
             column_stats: written.column_stats.clone(),
+            bloom_filters: ::std::collections::BTreeMap::new(),
         }];
         catalog
             .replace_data_files(
@@ -538,6 +539,7 @@ impl CvRefresher {
             size_bytes: written.size_bytes,
             row_count: written.row_count,
             column_stats: written.column_stats.clone(),
+            bloom_filters: ::std::collections::BTreeMap::new(),
         }];
         catalog
             .replace_data_files(

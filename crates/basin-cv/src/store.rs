@@ -158,6 +158,7 @@ impl CvStore {
                     size_bytes: written.size_bytes,
                     row_count: written.row_count,
                     column_stats: written.column_stats.clone(),
+                    bloom_filters: ::std::collections::BTreeMap::new(),
                 }],
             )
             .await?;

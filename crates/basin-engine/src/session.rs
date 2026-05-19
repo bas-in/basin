@@ -1399,6 +1399,7 @@ mod tests {
             size_bytes: 100,
             row_count: 1,
             column_stats: std::collections::BTreeMap::new(),
+            bloom_filters: ::std::collections::BTreeMap::new(),
         }
     }
 

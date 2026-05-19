@@ -2457,6 +2457,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
                 size_bytes: df.size_bytes,
                 row_count: df.row_count,
                 column_stats: df.column_stats.clone(),
+                bloom_filters: ::std::collections::BTreeMap::new(),
             });
         }
 
@@ -2566,6 +2567,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         size_bytes: df.size_bytes,
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
+        bloom_filters: ::std::collections::BTreeMap::new(),
     };
 
     // ── Transaction-deferred path ────────────────────────────────────────
@@ -2884,6 +2886,7 @@ async fn exec_insert_select(
         size_bytes: written.size_bytes,
         row_count: written.row_count,
         column_stats: written.column_stats.clone(),
+        bloom_filters: ::std::collections::BTreeMap::new(),
     };
 
     // Pre-commit: expose the new file to DataFusion so reactor hooks can
@@ -3049,6 +3052,7 @@ async fn exec_insert_default_values(
         size_bytes: df.size_bytes,
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
+        bloom_filters: ::std::collections::BTreeMap::new(),
     };
 
     // Pre-commit: register the new file as "extra" so reactor hooks see it
