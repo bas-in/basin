@@ -205,7 +205,7 @@ mod tests {
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_physical_expr::LexOrdering;
     use datafusion_physical_expr::expressions::Column;
-    use datafusion_physical_expr::sort_expr::PhysicalSortExpr;
+    use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_plan::Partitioning;
 
     // -----------------------------------------------------------------------
