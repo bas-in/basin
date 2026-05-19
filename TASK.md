@@ -915,6 +915,89 @@ gated on Phase 2 completion.
       lands. Acceptance gate: env var removed; sqlparser dependency
       gated to translator-only.
 
+## Phase 5.15 — Unified docs platform (HIGHEST PRIORITY — blocks 5.14)
+
+**Why first.** Contributor and customer onboarding both go through documentation.
+Today docs sit in three places (`README.md`, `CAPABILITIES.md`, `docs/*.md` in
+this repo) with no rendered surface. As OSS surface grows (future `basin-js`,
+`basin-cli`) and `basin-cloud` ships its own admin docs, we need a single
+rendered site that pulls each product's markdown into a unified UI without
+forcing contributors to leave their own repo.
+
+**Architecture.** Each OSS repo keeps its `docs/` as standard markdown with
+YAML frontmatter. `basin-cloud`'s webapp runs `npm run dev:docs` (or its CI
+equivalent) which build-time-fetches each OSS repo via `git clone --depth=1`,
+copies `docs/` into `basin-cloud/webapp/content/oss/<product>/`, and renders
+the union via Docusaurus or Mintlify. `basin-cloud` keeps its own
+cloud-specific docs under `content/cloud/`, separate from imported OSS
+content. Pin by git tag for versioned docs per OSS release.
+
+Eight items, ordered for incremental shipping. Items 5.15.A–5.15.D land in
+this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
+
+- [ ] **5.15.A** Frontmatter spec — define the YAML schema OSS markdown
+      files use (`title`, `nav_section`, `sidebar_position`, `summary`,
+      optional `version_since` and `version_until`). Files:
+      `docs/frontmatter-spec.md` (new) + cross-reference in
+      `docs/decisions/README.md`. Acceptance gate: schema documented;
+      one ADR-eligible decision recorded ("why YAML frontmatter, not
+      MDX or sidecar TOML").
+- [ ] **5.15.B** Migrate existing Basin OSS docs to the frontmatter
+      spec. Files: `docs/architecture.md`, `docs/deployment.md`,
+      `docs/multi-project.md`, `docs/sql-compatibility.md`,
+      `docs/sql-support.md`, `docs/scaling/*.md`, every ADR in
+      `docs/decisions/*.md`. Acceptance gate: every `.md` under
+      `docs/` parses with the spec; one CI check enforces it on every
+      PR (`scripts/check-frontmatter.sh` or similar).
+- [ ] **5.15.C** Top-level docs index — `docs/README.md` becomes the
+      OSS-repo-internal navigation manifest, ordered by `nav_section` +
+      `sidebar_position`. Used both by GitHub's directory rendering
+      (humans browsing the OSS repo) and by basin-cloud's fetcher.
+      Acceptance gate: every `.md` referenced; clicking any link works
+      from `https://github.com/basin/basin/blob/main/docs/README.md`.
+- [ ] **5.15.D** Stub repository skeletons for `basin-js` and
+      `basin-cli` — even before either ships code, set up their
+      `docs/` folder with placeholder frontmatter so basin-cloud's
+      fetcher has a target. Files: separate repos (not this one).
+      Acceptance gate: each repo's `docs/` has at least a
+      `getting-started.md` with valid frontmatter; basin-cloud's
+      fetcher can pull both without 404.
+- [ ] **5.15.E** `basin-cloud` webapp: pick Docusaurus or Mintlify.
+      Lives in the separate cloud repo. Acceptance gate: locally
+      `npm run dev` renders a "hello world" docs page.
+- [ ] **5.15.F** `basin-cloud` webapp: `npm run dev:docs` script —
+      build-time fetch of each OSS repo's `docs/` into
+      `webapp/content/oss/<product>/`. Files: cloud repo. Acceptance
+      gate: fresh checkout + `npm install` + `npm run dev:docs` +
+      `npm run dev` shows OSS docs at `/docs/basin/architecture` etc.
+- [ ] **5.15.G** `basin-cloud` webapp: cloud-only docs namespace under
+      `webapp/content/cloud/` — billing, dashboards, security,
+      scaling-as-a-service. Acceptance gate: cloud docs render at
+      `/docs/cloud/*` without colliding with imported OSS content.
+- [ ] **5.15.H** Cross-product link resolver — `[[basin-js:auth/login]]`
+      → canonical URL on the rendered site. Files: cloud repo
+      (Docusaurus plugin or Mintlify config). Acceptance gate: a
+      cross-reference from a Basin doc resolves to the right
+      basin-js page in the rendered site.
+- [ ] **5.15.I** CI sync — webhook on each OSS repo's `main` triggers
+      basin-cloud rebuild; nightly cron as a safety net. Files:
+      `.github/workflows/notify-cloud-docs.yml` in each OSS repo +
+      basin-cloud receiver. Acceptance gate: merging a docs-only PR
+      in this OSS repo causes the cloud rendered site to update
+      within ~15 minutes.
+
+**Out of scope for 5.15:** search (post-launch via Algolia or built-in),
+versioned docs UI dropdown (post-launch — Docusaurus + Mintlify both
+support; deferred until we cut v0.2), localisation, in-page edit links
+back to the OSS repo (nice-to-have for contributor flow; track as
+follow-up).
+
+**Why before 5.14:** the storage / HTAP / sketches work in 5.14 will
+generate new docs (API reference for new SQL surfaces like
+`APPROX_COUNT_DISTINCT`, `WITH (basin.row_block_size = …)`, hot-buffer
+operator notes). Landing 5.15 first means every new feature is
+documented from day one in the place customers and contributors look.
+
 ## Phase 5.14 — Durable Basin moat: HTAP + catalog-driven optimization (next 3 months)
 
 **Strategic framing (2026-05-19 stakeholder discussion):** Basin's
