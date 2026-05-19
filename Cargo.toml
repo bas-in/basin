@@ -21,6 +21,7 @@ members = [
     "crates/basin-trgm",
     "crates/basin-iceberg-rest",
     "crates/basin-sketch",
+    "crates/basin-hottier",
     "services/basin-server",
     "services/basinctl",
     "tests/integration",
@@ -48,6 +49,7 @@ basin-engine = { path = "crates/basin-engine" }
 # AND basin-engine (query-time merge fast path, B5).  See
 # docs/decisions/0017-query-shape-privacy.md and TASK.md 5.14.B1.
 basin-sketch = { path = "crates/basin-sketch" }
+basin-hottier = { path = "crates/basin-hottier" }
 basin-cron = { path = "crates/basin-cron" }
 basin-vector = { path = "crates/basin-vector" }
 basin-pool = { path = "crates/basin-pool" }

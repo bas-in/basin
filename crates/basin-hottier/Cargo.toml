@@ -1,0 +1,30 @@
+[package]
+name = "basin-hottier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "memtable_bench"
+harness = false
+
+[dependencies]
+basin-common = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = "58"
+parking_lot = "0.12"
+dashmap = "6"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+crossbeam-skiplist = "0.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = { workspace = true }
