@@ -21,7 +21,11 @@ Conventions:
 
 ## Phase 0.2 — basin-distinctive surface
 
-### T-001 — Fix NDJSON auto-streaming in `then()` (bug, highest priority)
+### T-001 — Fix NDJSON auto-streaming in `then()` (bug, highest priority) ✅
+
+**Status:** done 2026-05-19. NDJSON branch added to `#execute()` after the
+204 check; `nextCursor` threaded onto `PostgrestResponse`. 3 new tests in
+`src/postgrest/builder.test.ts`, all 55 builder tests green.
 
 **Why this is a bug, not a feature:** the engine auto-promotes any response
 larger than ~1 MiB or 10,000 rows to NDJSON, even when the caller didn't
@@ -542,6 +546,30 @@ mono-repo vs sub-path. Sonnet agent should write a short
 
 **Acceptance criteria:**
 - `decisions.md` updated with the choice + the reasoning.
+
+---
+
+## Phase 0.0 — Pre-existing hygiene (discovered during T-001)
+
+### T-100 — Fix pre-existing typecheck + lint failures
+
+**Files:** `src/functions/client.ts`, repo root.
+
+**Scope:**
+- `src/functions/client.ts` has a TS2769 type mismatch (caught by T-001
+  agent during acceptance gate). Read the error, fix the signature.
+- `eslint.config.js` is missing — `npm run lint` errors out before linting
+  anything. Either add a minimal flat config (`tseslint.config(…)` style)
+  or remove the `lint` script if we're not enforcing it yet.
+- After fixing, `npm run typecheck` and `npm run lint` both run clean.
+
+**Acceptance criteria:**
+- `npm run typecheck` exits 0.
+- `npm run lint` exits 0 (or the script is intentionally removed and the
+  CI workflow updated to match).
+
+**Why this matters:** every future task's acceptance gate hits these
+failures. Fixing once unblocks every subsequent agent.
 
 ---
 
