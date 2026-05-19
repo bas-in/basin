@@ -47,15 +47,15 @@ basin --token=bso_org_… orgs list
 ## Examples
 
 ```sh
-basin orgs list
-basin projects list --org=acme
-basin projects create --org=acme --name=staging --region=jnb
-basin secrets set --project=staging DATABASE_URL=postgres://…
-basin migrations apply --project=staging ./migrations
-basin sql --project=staging "select count(*) from users"
-basin tables list --project=staging
-basin logs --project=staging --follow
-basin snapshots create --project=staging --label="pre-launch"
+basin init && basin link --project=staging          # scaffold + bind directory
+basin db push                                        # apply local migrations
+basin db url --reveal                                # print full pgwire DSN
+basin branches create preview-x --kind=preview       # spin up a preview environment
+basin branches merge preview-x --project=staging --yes  # merge and retire branch
+basin gen types typescript --output=src/database.ts  # emit TypeScript types
+basin tables import-csv users < users.csv            # stream CSV into a table
+basin alerts rules create --project=staging          # create an alert rule
+basin byo bucket put --project=staging               # configure BYO S3 bucket
 ```
 
 Every command honours:

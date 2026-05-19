@@ -40,6 +40,10 @@ func cmdOrgs(g *globalFlags, args []string) error {
 		return cmdOrgsDelete(g, args[1:])
 	case "branding":
 		return cmdOrgsBranding(g, args[1:])
+	case "ownership-transfers":
+		return cmdOrgsOwnershipTransfers(g, args[1:])
+	case "incoming-project-transfers":
+		return cmdOrgsIncomingProjectTransfers(g, args[1:])
 	case "--help", "-h", "help":
 		helpForCommand("orgs", "List, show, create, update, delete organizations and manage branding.", []string{
 			"list                                    List orgs the caller can see.",

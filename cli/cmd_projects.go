@@ -36,6 +36,8 @@ func cmdProjects(g *globalFlags, args []string) error {
 		return cmdProjectsPauseResume(g, args[1:], "pause")
 	case "resume":
 		return cmdProjectsPauseResume(g, args[1:], "resume")
+	case "transfers":
+		return cmdProjectsTransfers(g, args[1:])
 	case "--help", "-h", "help":
 		helpForCommand("projects", "List / get / create / delete / pause / resume projects.", []string{
 			"list   [--org <slug>]                                List projects.",
