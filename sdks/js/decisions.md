@@ -6,6 +6,28 @@ that would let someone re-litigate it later.
 
 ---
 
+## 2026-05-19 — Iceberg JS client deferred (T-050)
+
+**Choice:** No JS-side Iceberg client in this SDK or as a sibling package
+for now. Document pyiceberg / Spark / Trino / DuckDB as the supported
+Iceberg paths; basin-js stays focused on the auth + REST + admin surfaces.
+
+**Alternatives considered:**
+- Ship `basin.iceberg.*` inside `@bas-in/basin-js` — rejected. The Iceberg
+  ecosystem in JS is thin (no production-grade `iceberg-js`); we'd be
+  writing a catalog client from scratch and a parquet reader is a
+  significant dependency. Wrong package to carry that weight.
+- Ship `@bas-in/basin-iceberg` as a separate package — rejected for the
+  same reason; the work isn't ready and there's no signal users need it.
+- Skip and document the alternatives — chosen. Spark / Trino / DuckDB /
+  pyiceberg all already speak Lakekeeper REST and basin's
+  `/iceberg/v1/:warehouse/*` is compatible. Point users there.
+
+**Re-litigation trigger:** revisit if (a) a community `iceberg-js` matures,
+or (b) users ask for in-process Iceberg reads from Node/browser.
+
+---
+
 ## 2026-05-19 — Worktree base divergence: merge --no-ff handles it, but watch for conflicts
 
 **Observation:** Worker agents launched in worktree isolation get a working

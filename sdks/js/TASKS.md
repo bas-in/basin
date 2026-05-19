@@ -96,7 +96,10 @@ NDJSON branch despite worktree base divergence.
 
 ---
 
-### T-003 — `.cursor(token?)` modifier
+### T-003 — `.cursor(token?)` modifier ✅
+
+**Status:** done 2026-05-19. `cursor(token)` ships next to `.range()`.
+3 new tests in `builder.test.ts`.
 
 **Files:** `src/postgrest/builder.ts`, `src/postgrest/builder.test.ts`
 
@@ -359,7 +362,9 @@ routes in basin-rest.
 
 ---
 
-### T-023 — Wire storage `.list()` + `.remove()`
+### T-023 — Wire storage `.list()` + `.remove()` 🔒
+
+**Status:** blocked 2026-05-19. Engine `/object/*` routes do not exist.
 
 **Files:** `src/storage/client.ts`, `src/storage/client.test.ts`
 
@@ -376,7 +381,9 @@ routes in basin-rest.
 
 ---
 
-### T-024 — Wire storage `.createSignedUrl()`
+### T-024 — Wire storage `.createSignedUrl()` 🔒
+
+**Status:** blocked 2026-05-19. Engine `/object/sign/*` route does not exist.
 
 **Files:** `src/storage/client.ts`, `src/storage/client.test.ts`
 
@@ -394,7 +401,9 @@ routes in basin-rest.
 
 ---
 
-### T-025 — Realtime WebSocket transport
+### T-025 — Realtime WebSocket transport 🔒
+
+**Status:** blocked 2026-05-19. Engine has no broadcast surface in v0.1.
 
 **Files:** `src/realtime/client.ts`, `src/realtime/client.test.ts`
 
@@ -418,7 +427,9 @@ once the engine route shape is known.
 
 ---
 
-### T-026 — Wire `functions.invoke()`
+### T-026 — Wire `functions.invoke()` 🔒
+
+**Status:** blocked 2026-05-19. Engine `/functions/*` routes do not exist.
 
 **Files:** `src/functions/client.ts`, `src/functions/client.test.ts`
 
@@ -477,7 +488,11 @@ adapter), `src/internal/retry.test.ts`.
 
 ---
 
-### T-041 — `@bas-in/ssr` cookie helpers for Next.js / SvelteKit
+### T-041 — `@bas-in/ssr` cookie helpers for Next.js / SvelteKit ⏸
+
+**Status:** deferred 2026-05-19. Needs structural decision: monorepo vs
+sub-path vs separate repo. Not blocking v0.2 ship. Re-litigate when a user
+files a Next.js / SvelteKit issue.
 
 **Files:** consider a new package directory `packages/ssr/` if the
 current repo is single-package, OR a sub-path `src/ssr/`. Decide
@@ -501,7 +516,13 @@ mono-repo vs sub-path. Sonnet agent should write a short
 
 ---
 
-### T-042 — Stop shipping stubs that throw — decision + execution
+### T-042 — Stop shipping stubs that throw — decision + execution ⏸
+
+**Status:** deferred 2026-05-19. Needs paired decision with the Phase 0.3
+engine-route ramp: if 0.3 routes are landing soon, leaving the stubs in
+place is correct (so app code can be written against the future shape). If
+0.3 slips, remove the stubs and re-add when engine routes ship. Coupled to
+basin engine roadmap, not standalone SDK work.
 
 **Files:** all `*/client.ts` files with `not_implemented` stubs.
 
@@ -553,7 +574,11 @@ mono-repo vs sub-path. Sonnet agent should write a short
 
 ## Phase 0.5 — Iceberg catalog client
 
-### T-050 — Iceberg client: decide scope
+### T-050 — Iceberg client: decide scope ✅
+
+**Status:** decided 2026-05-19. JS Iceberg client deferred — point users at
+pyiceberg / Spark / Trino / DuckDB against `/iceberg/v1/:warehouse/*`. Full
+reasoning in `decisions.md`.
 
 **Files:** new `decisions.md` entry.
 
