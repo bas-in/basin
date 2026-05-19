@@ -452,6 +452,55 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
       return { data: null, error: null, count, status: res.status };
     }
 
+    // NDJSON auto-promoted by the engine (>1 MiB or >10k rows).
+    const contentType = res.headers.get("Content-Type") ?? "";
+    if (contentType.includes("application/x-ndjson") || contentType.includes("application/jsonl")) {
+      let text: string;
+      try {
+        text = await res.text();
+      } catch (e) {
+        return {
+          data: null,
+          error: new BasinError("invalid_response", networkErrorMessage(e), res.status),
+          count: null,
+          status: res.status,
+        };
+      }
+      if (!res.ok) {
+        return {
+          data: null,
+          error: new BasinError(errorCodeForStatus(res.status), `request failed (HTTP ${res.status})`, res.status),
+          count: null,
+          status: res.status,
+        };
+      }
+      const lines = text.split("\n").filter((l) => l.trim() !== "");
+      const parsed: unknown[] = [];
+      for (const line of lines) {
+        let obj: unknown;
+        try {
+          obj = JSON.parse(line);
+        } catch {
+          return {
+            data: null,
+            error: new BasinError("invalid_response", `NDJSON line is not valid JSON: ${line}`, res.status),
+            count: null,
+            status: res.status,
+          };
+        }
+        parsed.push(obj);
+      }
+      let nextCursor: string | null = null;
+      if (parsed.length > 0) {
+        const last = parsed[parsed.length - 1];
+        if (last && typeof last === "object" && !Array.isArray(last) && "_basin_next_cursor" in (last as object)) {
+          nextCursor = (last as Record<string, unknown>)["_basin_next_cursor"] as string | null;
+          parsed.pop();
+        }
+      }
+      return { data: parsed as T[], error: null, count, status: res.status, nextCursor };
+    }
+
     // CSV / GeoJSON / explain — return the raw text body as data. For
     // explain(json), the body is JSON but consumers want the unparsed
     // plan string; pass it through verbatim and let them JSON.parse if

@@ -485,6 +485,35 @@ describe("postgrest basin extensions", () => {
   });
 });
 
+describe("postgrest NDJSON auto-streaming", () => {
+  it("3 rows + cursor sentinel → data is rows, nextCursor is set", async () => {
+    const ndjson = '{"id":1}\n{"id":2}\n{"id":3}\n{"_basin_next_cursor":"abc"}\n';
+    const basin = newClient(stubFetch({ bodyText: ndjson, headers: { "Content-Type": "application/x-ndjson" } }));
+    const { data, error, nextCursor } = await basin.from<{ id: number }>("t").select("*");
+    expect(error).toBeNull();
+    expect(data).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(nextCursor).toBe("abc");
+  });
+
+  it("0 rows + cursor sentinel → data is [], nextCursor is set", async () => {
+    const ndjson = '{"_basin_next_cursor":"xyz"}\n';
+    const basin = newClient(stubFetch({ bodyText: ndjson, headers: { "Content-Type": "application/x-ndjson" } }));
+    const { data, error, nextCursor } = await basin.from("t").select("*");
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+    expect(nextCursor).toBe("xyz");
+  });
+
+  it("rows with no cursor sentinel → nextCursor is null", async () => {
+    const ndjson = '{"id":1}\n{"id":2}\n';
+    const basin = newClient(stubFetch({ bodyText: ndjson, headers: { "Content-Type": "application/x-ndjson" } }));
+    const { data, error, nextCursor } = await basin.from<{ id: number }>("t").select("*");
+    expect(error).toBeNull();
+    expect(data).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(nextCursor).toBeNull();
+  });
+});
+
 describe("postgrest URL construction", () => {
   it("targets /rest/v1/<table> (engine-direct, no /v1 prefix)", async () => {
     const captured: { request?: Request } = {};
