@@ -936,6 +936,7 @@ pub(crate) async fn execute_simple_select(
                                     _ => false,
                                 };
                                 if absent {
+                                    sess.engine.note_bloom_skipped();
                                     return false;
                                 }
                             }

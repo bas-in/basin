@@ -1186,6 +1186,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Phase 5.14.D2: record ORDER BY / GROUP BY patterns for adaptive
+            // sort.  Best-effort; only fires for simple single-table SELECTs.
+            record_query_patterns(sess, query);
+
             // Try the point-query fast path first. It only matches a tightly
             // constrained shape; on any rejection we fall back to DataFusion.
             //
@@ -5411,6 +5415,86 @@ fn build_outer_select_sql(query: &sqlparser::ast::Query) -> Result<String> {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!("WITH {ctes_sql} {body_sql}{suffix}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.14.D2 — query history recording
+// ---------------------------------------------------------------------------
+
+/// Best-effort ORDER BY / GROUP BY column recorder for adaptive sort.
+///
+/// Fires for simple single-table `SELECT … FROM <table>` shapes.  Multi-table
+/// joins, CTEs, and subqueries in the FROM clause are skipped (too ambiguous
+/// to attribute to a single table).  Non-column expressions in ORDER BY (e.g.
+/// `ORDER BY 1`, `ORDER BY col + 1`) are silently excluded from the recorded
+/// tuple; if the resulting tuple is empty after filtering, nothing is recorded.
+fn record_query_patterns(sess: &ProjectSession, query: &sqlparser::ast::Query) {
+    use crate::pg_ast::OrderByExt;
+    use sqlparser::ast::{Expr, GroupByExpr, TableFactor};
+
+    // Skip queries with CTEs — the table attribution is ambiguous.
+    if query.with.is_some() {
+        return;
+    }
+
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return,
+    };
+
+    // Only single-table FROM (no joins).
+    if select.from.len() != 1 {
+        return;
+    }
+    let from = &select.from[0];
+    if !from.joins.is_empty() {
+        return;
+    }
+    let table_name = match &from.relation {
+        TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return;
+            }
+            match basin_common::TableName::new(name.0[0].id_val().clone()) {
+                Ok(t) => t,
+                Err(_) => return,
+            }
+        }
+        _ => return,
+    };
+
+    let history = sess.engine.query_history();
+
+    // Record ORDER BY column names (identifier-only expressions).
+    if let Some(order_by) = &query.order_by {
+        let cols: Vec<String> = order_by
+            .ext_exprs()
+            .iter()
+            .filter_map(|ob| match &ob.expr {
+                Expr::Identifier(ident) => Some(ident.value.clone()),
+                Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
+                    Some(parts[0].value.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        history.record_order_by(&sess.project, &table_name, cols);
+    }
+
+    // Record GROUP BY column names (identifier-only expressions).
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        let cols: Vec<String> = exprs
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Identifier(ident) => Some(ident.value.clone()),
+                Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
+                    Some(parts[0].value.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        history.record_group_by(&sess.project, &table_name, cols);
     }
 }
 
