@@ -592,6 +592,7 @@ mod explain;
 mod fast_aggregate;
 mod fast_select;
 mod fts_udf;
+mod is_distinct_rewrite;
 mod function_ddl;
 mod generated_cols;
 mod geo_glue;
