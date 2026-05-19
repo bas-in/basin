@@ -86,4 +86,5 @@ table.
 | 0013 | Auth per-project schema | Accepted | Removes loopback pgwire; auth data in per-project storage; auth.uid/role/jwt |
 | 0014 | pg_query as canonical parser | Accepted, in progress | libpg_query frontend; sqlparser-rs demoted to transitional fallback; DataFusion-sql to executor-only |
 | 0015 | Vortex storage format | Accepted | Vortex default since 2026-05-18; Parquet first-class selectable; ~1.95× smaller, on-par-to-better scan |
-| 0016 | HTAP hot tier architecture | Accepted 2026-05-19 | Row-format LSM memtable (`basin-hottier` crate) per (project, table); closes OLTP point_eq + single-row UPDATE gap; 6 sub-items C1-C6 in TASK.md Phase 5.14.C |
+| 0016 | HTAP hot tier architecture | Accepted 2026-05-19 | Row-format LSM memtable (`basin-hottier` crate) per (project, table); closes OLTP point_eq + single-row UPDATE gap; 6 sub-items C1-C6 in TASK.md Phase 5.14.C; schema-evolution policy addendum 2026-05-19 |
+| 0017 | Query-shape stats privacy + stability | Accepted 2026-05-19 | xxhash3 64-bit seeded; literal-stripping at LogicalPlan; per-customer template uses real names; cross-tenant template anonymised (`t1.c0` form); k-anonymity ≥ 5; ADR for Phase 5.16 |

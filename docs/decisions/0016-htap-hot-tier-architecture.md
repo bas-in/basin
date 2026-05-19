@@ -308,6 +308,32 @@ scopes + acceptance gates in [`TASK.md`](../../TASK.md) Phase 5.14.C.
    in Phase 5.14.C; per-table caps deferred)
 6. Vectorised/SIMD memtable scans (plain Rust BTreeMap iteration)
 
+## Schema evolution policy (addendum 2026-05-19)
+
+`ALTER TABLE` semantics when memtable rows are present.  The earlier
+draft noted this as an open question; this addendum locks it.
+
+| ALTER form | Memtable handling |
+|---|---|
+| `ADD COLUMN col TYPE` (no default) | Read NULL for pre-ALTER memtable rows; no rewrite needed. |
+| `ADD COLUMN col TYPE DEFAULT <constant>` | Read the literal constant for pre-ALTER rows; catalog stores the DEFAULT alongside the column schema; merge reader applies at read time. |
+| `ADD COLUMN col TYPE DEFAULT <non-constant>` (e.g. `now()`, `random()`) | **Reject** with `cannot ALTER while hot tier non-empty; flush first` if any project memtable for the table is non-empty.  User invokes `SELECT pg_force_flush('schema.table')` (Phase 5.14.C4 ships this helper) then retries.  Same path Postgres takes internally when it must rewrite the heap. |
+| `DROP COLUMN` | Hide the column on read.  Catalog records the column as dropped at `schema_version`; merge reader skips it. |
+| `ALTER COLUMN ... TYPE ...` | Same as non-constant DEFAULT: reject if memtable non-empty, force flush. |
+
+Implementation: every memtable row carries a `schema_version: u32`
+written at insert time (cheap — 4 bytes, fits in row metadata).  The
+catalog tracks `schema_version -> SchemaDelta { added: Vec<(name,
+type, default)>, dropped: Vec<name>, retyped: ... }`.  On read, the
+merge path applies the delta chain forward from the row's
+`schema_version` to the current schema.  This is the same pattern
+Iceberg uses for schema evolution at the file level — we're applying
+it to in-memory rows.
+
+The catalog DDL path already serialises with the engine's write path
+(both go through `Catalog::commit_with_retry`), so there is no
+race where ALTER lands mid-write.
+
 ## What would change our mind
 
 - **BTreeMap benchmark fails the 500 µs p99 target at 1M rows** → switch

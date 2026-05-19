@@ -24,37 +24,111 @@ Companion to OSS Phase 5.15 (frontmatter spec, OSS migration, top-level
 index — all shipped in commit `d5ffbe1`).  The cloud side ships the
 rendered surface that consumes OSS docs.
 
-Architecture (decided in OSS-side ADR-style block of Phase 5.15):
-each OSS repo (`basin`, future `basin-js`, future `basin-cli`) keeps its
-`docs/` as standard markdown with YAML frontmatter.  `basin-cloud`'s
-webapp has `npm run dev:docs` which build-time-fetches each OSS repo via
-`git clone --depth=1` into `webapp/content/oss/<product>/`, then renders
-the union via Docusaurus or Mintlify.  `basin-cloud` keeps its own
-cloud-specific docs under `webapp/content/cloud/` separate from imported
-OSS content.  CI hook on each OSS repo's `main` triggers basin-cloud
-rebuild; pinning by git tag gives versioned docs per OSS release.
+**Architecture (decided 2026-05-19 — supersedes the earlier
+git-clone-during-build draft).**
 
-Items (mirror of TASK.md Phase 5.15.E – 5.15.I):
+Each OSS repo (`basin`, future `basin-js`, future `basin-cli`) keeps
+its `docs/` as standard markdown with YAML frontmatter (see
+[`frontmatter-spec.md`](./frontmatter-spec.md)).  `basin-cloud`'s
+webapp has an `npm run dev:docs` script that reads docs from **local
+sibling folders**, not from a git clone during build:
+
+```text
+~/code/exo/
+├── basin/        ← this OSS repo
+│   └── docs/
+├── basin-js/     ← future OSS repo
+│   └── docs/
+├── basin-cli/    ← future OSS repo
+│   └── docs/
+└── basin-cloud/  ← cloud repo
+    └── webapp/
+        ├── content/
+        │   ├── oss/        ← populated by `npm run dev:docs`
+        │   │   ├── basin/
+        │   │   ├── basin-js/
+        │   │   └── basin-cli/
+        │   └── cloud/      ← basin-cloud's own docs (live in
+        │       └── ...       basin-cloud repo, not OSS)
+        └── package.json
+```
+
+**Why sibling-folder rather than `git clone --depth=1`?**
+
+1. **Live reload during dev.** Editing a doc in `basin/docs/` and
+   seeing it update on the basin-cloud preview without re-running a
+   clone is the only sane authoring loop.  `npm run dev:docs --watch`
+   recopies on every save.
+2. **Single source of truth.** OSS contributors edit one markdown
+   file; basin-cloud reads it.  No build-time race where the cloud
+   site renders a stale clone.
+3. **No CI shell-out to git.** The cloud webapp build is pure npm —
+   no need for git binaries on every build agent, no SSH key
+   management for private mirrors.
+
+**Fallback when a sibling repo is missing.**  `dev:docs` checks for
+each sibling (`../basin/docs/`, `../basin-js/docs/`, `../basin-cli/docs/`)
+relative to the basin-cloud checkout.  If any are missing, the script
+**fails fast** with a clear message:
+
+```
+[basin-cloud dev:docs] ../basin-js not found.
+Clone the OSS repos as siblings of basin-cloud before running:
+  cd ..
+  git clone https://github.com/bas-in/basin
+  git clone https://github.com/bas-in/basin-js
+  git clone https://github.com/bas-in/basin-cli
+Then re-run `npm run dev:docs`.
+```
+
+The user fix is one shell command per missing repo, predictable and
+documented.
+
+**CI / production deployment.**  CI does not run `dev:docs` directly;
+instead a `npm run build:docs` variant clones the OSS repos by tag
+(production wants pinned versions, not `main` HEAD) into a temp
+directory and points the same fetcher at those paths.  Same code
+path, different inputs.
+
+**Items (mirror of TASK.md Phase 5.15.E – 5.15.I):**
 
 - **5.15.E** — basin-cloud webapp scaffold (pick Docusaurus or Mintlify).
   Acceptance gate: `npm install && npm run dev` renders a "hello world"
-  docs page locally.
-- **5.15.F** — `npm run dev:docs` script.  Build-time fetch of each OSS
-  repo's `docs/` into `webapp/content/oss/<product>/`.  Acceptance gate:
-  fresh checkout → `npm install` → `npm run dev:docs` → `npm run dev`
-  shows OSS docs at `/docs/basin/architecture` etc.
-- **5.15.G** — Cloud-only docs namespace under `webapp/content/cloud/`
-  (billing, dashboards, security, scaling-as-a-service).  Acceptance
-  gate: cloud docs render at `/docs/cloud/*` without colliding with
-  imported OSS content.
+  docs page locally with no OSS docs imported yet.
+- **5.15.F** — `npm run dev:docs` script (local sibling-folder mode).
+  Files: `webapp/scripts/fetch-docs.mjs` (or similar), `package.json`
+  script entries.  Reads `../basin/docs/`, `../basin-js/docs/`,
+  `../basin-cli/docs/`; copies each into
+  `webapp/content/oss/<product>/`; preserves frontmatter; fails fast
+  with the "clone these first" message if any sibling is missing.
+  Acceptance gate: with all 4 repos checked out as siblings, fresh
+  checkout → `npm install` → `npm run dev:docs` → `npm run dev` shows
+  OSS docs at `/docs/basin/architecture`, `/docs/basin-js/getting-started`,
+  etc.  With basin-cli missing: script exits non-zero with the
+  clone-these-first message verbatim.
+- **5.15.F.2** — `npm run build:docs` script (CI / production mode).
+  Same fetcher as 5.15.F but accepts a `BASIN_DOCS_SOURCES` env or
+  config file: `{ basin: { mode: "git-tag", tag: "v0.1.9" }, ... }`.
+  Clones each repo at the specified tag into a temp dir, points the
+  fetcher there.  Acceptance gate: CI builds the cloud site without
+  any sibling folders present, pulling each OSS repo at its pinned
+  tag.
+- **5.15.G** — Cloud-only docs namespace under
+  `webapp/content/cloud/` — billing, dashboards, security,
+  scaling-as-a-service.  basin-cloud owns these files in its own
+  repo; the fetcher never touches them.  Acceptance gate: cloud docs
+  render at `/docs/cloud/*` without colliding with imported OSS
+  content.
 - **5.15.H** — Cross-product link resolver — `[[basin-js:auth/login]]`
-  → canonical URL on the rendered site.  Docusaurus plugin or Mintlify
-  config.  Acceptance gate: a cross-reference from a Basin doc resolves
-  to the right basin-js page in the rendered site.
-- **5.15.I** — CI sync — webhook on each OSS repo's `main` triggers
-  basin-cloud rebuild; nightly cron as safety net.  Acceptance gate:
-  merging a docs-only PR in the OSS repo causes the cloud rendered site
-  to update within ~15 minutes.
+  → canonical URL on the rendered site.  Docusaurus plugin or
+  Mintlify config.  Acceptance gate: a cross-reference from a Basin
+  doc resolves to the right basin-js page in the rendered site.
+- **5.15.I** — Auto-rebuild on OSS docs change.  In the local dev
+  loop, `npm run dev:docs -- --watch` re-copies on every save.  In
+  CI / production, a GitHub Action on each OSS repo's `main` ping
+  basin-cloud to pull the latest tag and rebuild.  Acceptance gate:
+  editing `basin/docs/architecture.md` and saving causes the
+  basin-cloud preview to update within 2 s.
 
 **Out of scope (post-launch follow-ups, both sides):** search (Algolia or
 built-in), versioned-docs UI dropdown, localisation, in-page edit links

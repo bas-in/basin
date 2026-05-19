@@ -939,16 +939,27 @@ Privacy invariant: literals are stripped at the LogicalPlan layer before
 anything is persisted or exported.  Plan-shape hash is over operator tree
 + column refs + literal type slots, never literal values.
 
-ADR 0017 (planned) records the privacy / anonymisation model.
+Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-privacy.md).
 
-- [ ] **5.16.A** Plan-shape canonical hash.  Files:
-      `crates/basin-engine/src/query_shape.rs` (new); hooks into
-      `executor.rs::exec_select` and the fast-path entry points.
-      Acceptance gate: `WHERE id = 5` and `WHERE id = 99` hash to the same
-      shape; `WHERE id = $1` (parameterised) hashes to the same shape;
-      `WHERE id = 5 AND k = 3` hashes to a different shape; benchmark
-      `query_shape_hash` ≤ 5 µs/query on a representative LogicalPlan.
-      Estimate: ~1 week.
+- [ ] **5.16.A** Plan-shape canonical hash.  **Locked decision
+      (2026-05-19) per ADR 0017:** use `xxhash-rust` crate's
+      `xxh3_64`, seeded with the fixed constant
+      `BASIN_QUERY_SHAPE_SEED = 0xBA51_4145_7E11_5A95`.  Cross-version
+      stable (required for the OSS → cloud → cross-tenant aggregate
+      pipeline that follows in 5.16.D – H).  Reject `std::DefaultHasher`
+      (unstable across Rust versions), `fnv1a-64` (too weak at cloud
+      scale), `siphash13` (slower; reserved as fallback if
+      xxhash-rust ever drops maintenance).
+      Files: `crates/basin-engine/src/query_shape.rs` (new); hooks into
+      `executor.rs::exec_select` and the fast-path entry points;
+      `Cargo.toml` workspace adds `xxhash-rust = "0.8"`.
+      Acceptance gate: `WHERE id = 5` and `WHERE id = 99` hash to the
+      same shape; `WHERE id = $1` (parameterised) hashes to the same
+      shape; `WHERE id = 5 AND k = 3` hashes to a different shape;
+      benchmark `query_shape_hash` ≤ 5 µs/query on a representative
+      LogicalPlan; **same plan hashes to the same value across two
+      independent process invocations** (cross-process stability gate).
+      Estimate: ~4 days.
 - [ ] **5.16.B** Per-shape rolling histograms.  Files:
       `crates/basin-engine/src/query_stats.rs` (new); `QueryStatRegistry`
       with HDR histograms (use the `hdrhistogram` crate) for latency, rows
@@ -1137,16 +1148,38 @@ for Basin — sketches are catalog-layer state, not query-engine state.
 Closes `count_distinct` and `percentile_cont` gaps via an
 approximation alternative. Sketches merge across files at query time.
 
-- [ ] **5.14.B1** Add `hll_sketches: HashMap<ColumnName, SerializedHll>`
-      and `tdigest_sketches: HashMap<ColumnName, SerializedTDigest>`
-      to `DataFileRef`. Files: `crates/basin-catalog/src/metadata.rs`.
-      Acceptance gate: round-trip serialise/deserialise via InMemory +
-      Postgres impls.
-- [ ] **5.14.B2** Writer-side sketch computation: HLL for every column,
-      t-digest for numeric columns. Use `hyperloglog-rs` + `tdigest`
-      crates (or established equivalents — pick at PR time). Files:
-      `crates/basin-storage/src/writer.rs`. Acceptance gate: every
-      committed file carries sketches.
+- [ ] **5.14.B1** Hoist HLL and t-digest types to a new `basin-sketch`
+      crate, then add `hll_sketches: BTreeMap<String, Vec<u8>>` and
+      `tdigest_sketches: BTreeMap<String, Vec<u8>>` to `DataFileRef`
+      (mirroring the bloom field pattern).  **Locked decision
+      (2026-05-19):** sketches MUST live in their own crate because
+      `basin-storage` (B2 writer-side) cannot depend on `basin-engine`
+      (where the inline `Hll` and `TDigest` types currently live)
+      without inverting the engine→storage dependency direction.  Both
+      crates take a fresh dep on `basin-sketch`.  Wire format unchanged
+      from the existing inline impls (HLL: 16 384 raw register bytes;
+      t-digest: 8-byte LE count + 16 bytes per centroid).
+      Files: `crates/basin-sketch/Cargo.toml` (new), `crates/basin-sketch/src/{lib.rs,hll.rs,tdigest.rs}` (new — hoist 350 LOC from
+      `approx_count_distinct.rs` + `approx_percentile.rs`),
+      `crates/basin-catalog/src/metadata.rs` (add fields),
+      `crates/basin-storage/src/data_file.rs` (add fields),
+      `crates/basin-engine/src/approx_count_distinct.rs` (re-export from
+      basin-sketch), `crates/basin-engine/src/approx_percentile.rs`
+      (same).  Acceptance gate: round-trip serialise/deserialise via
+      InMemory + Postgres impls; existing UDF unit tests still pass.
+- [ ] **5.14.B2** Writer-side sketch computation.  `WriteOptions::
+      sketch_columns: Vec<String>` (defaults to `global_sort_order`,
+      consistent with `bloom_columns`); writer's
+      `compute_bloom_filters` companion `compute_sketches` runs in the
+      same column-iteration pass.  Numeric-column detection: Arrow
+      `DataType::Int*` / `UInt*` / `Float32` / `Float64` get t-digest;
+      non-numeric only get HLL.  Files: `crates/basin-storage/src/writer.rs`,
+      `crates/basin-engine/src/{executor,dml_mutate}.rs` (thread the
+      `sketch_columns` field through, mirror the 5.14.A2 bloom
+      threading).  Acceptance gate: every file committed for a table
+      with `basin.sort_by` set carries sketches for those columns;
+      writer overhead ≤ 5 % of total write time on a 100 k-row insert;
+      `vortex_parquet_differential` continues to pass.  Depends on B1.
 - [ ] **5.14.B3** `APPROX_COUNT_DISTINCT(col)` UDF — merges HLLs from
       catalog-pruned files and returns estimate. Files:
       `crates/basin-engine/src/udfs/approx.rs` (new module).
@@ -1293,18 +1326,35 @@ Two write-time / planner pieces that rely on Basin's catalog as a
 planning input that upstream cannot see. Closes `order_by_multi`,
 `window_partition_sum`, and `lag_lead_window`.
 
-- [ ] **5.14.D1** Query-history collector — record observed
-      `ORDER BY` / `PARTITION BY` shapes per `(project, table)` in
-      catalog metadata. Files:
-      `crates/basin-catalog/src/query_history.rs` (new). Acceptance
-      gate: top-N shapes per table queryable via internal API.
+- [x] **5.14.D1** Query-history collector — shipped at commit
+      `caa43e6` (Phase 5.14.D2 in the commit message is the
+      *collector* per the opus 2026-05-19 decomposition; the open
+      work below is the *compactor consumer*).  `QueryHistory` lives
+      at `crates/basin-engine/src/query_history.rs`; executor records
+      ORDER BY and GROUP BY shapes via `record_query_patterns`.
 - [ ] **5.14.D2** Compaction-time multi-sort — compactor consults the
-      query-history top-N and re-sorts the output Vortex file by the
-      most common shape (currently the compactor only emits insertion
-      order or the declared `basin.sort_by`). Files:
-      `crates/basin-shard/src/compactor.rs`. Depends on 5.14.D1.
-      Acceptance gate: `order_by_multi` shape in
-      `vortex_vs_parquet_smoke` improves ≥2× after a compaction sweep.
+      query-history `top_pattern` and re-sorts output files when
+      threshold met (≥ 30 % share, ≥ 100 queries observed).
+      **Locked priority decision (2026-05-19):** user-declared
+      `CLUSTER BY` always wins by default — if `TableMetadata::
+      cluster_columns` is non-empty, D2 does not override.  When
+      `top_pattern` differs from `cluster_columns`, emit a structured
+      event into the registry so Phase 5.16.G's anti-pattern engine
+      surfaces it as a suggestion ("your queries would benefit from
+      CLUSTER BY (c, d) — currently (a, b)").  Add a per-table opt-in
+      `basin.adaptive_sort_override = true` DDL option (default
+      `false`) for power users who want D2 to override their declared
+      cluster.  Files: `crates/basin-shard/src/in_process.rs`
+      (compactor — same function 5.14.C4 flush will touch, so land D2
+      before C4 starts), `crates/basin-engine/src/ddl.rs` (parse the
+      new `basin.adaptive_sort_override` WITH option, mirror the
+      `basin.row_block_size` parser pattern),
+      `crates/basin-catalog/src/metadata.rs` (`TableMetadata::
+      adaptive_sort_override: bool` with `#[serde(default)]`).
+      Depends on D1 (shipped).  Acceptance gate: `order_by_multi`
+      shape in `vortex_vs_parquet_smoke` improves ≥ 2× after a
+      compaction sweep on a table with `adaptive_sort_override=true`
+      and no `cluster_columns`.
 - [ ] **5.14.D3** Catalog-aware `WindowExec` — custom DataFusion
       `ExecutionPlan` that consults `basin.sort_by` / discovered
       file-sort-order via the catalog and skips the full sort when the
